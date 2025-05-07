@@ -10,6 +10,7 @@ grpo:
   val_at_start: false
   max_val_samples: 480
   val_batch_size: 32
+  seed: 42
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -118,6 +119,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "DeepScaler"
+  shuffle: true
 
 env:
   math:

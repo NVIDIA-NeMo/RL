@@ -146,6 +146,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "OpenMathInstruct-2"
+  shuffle: true
 
 env:
   math:

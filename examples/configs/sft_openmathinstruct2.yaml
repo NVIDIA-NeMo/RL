@@ -67,6 +67,7 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  shuffle: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
