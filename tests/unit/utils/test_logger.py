@@ -439,6 +439,36 @@ class TestRayGpuMonitorLogger:
         # Verify the result
         assert result == {"node.1.gpu.0.mem_gb": 80.0}
 
+        # Create a sample with system memory metric
+        system_memory_sample = Sample(
+            name="ray_node_mem_used",
+            labels={"InstanceId": "n/a"},
+            value=100.0 * 1024 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(system_memory_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {"node.1.mem_gb": 100.0}
+
+        # Create a sample with total system memory metric
+        total_memory_sample = Sample(
+            name="ray_node_mem_total",
+            labels={"InstanceId": "n/a"},
+            value=200.0 * 1024 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(total_memory_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {"node.1.mem_total_gb": 200.0}
+
         # Test with an unexpected metric name
         other_sample = Sample(
             name="ray_node_cpu_utilization",
