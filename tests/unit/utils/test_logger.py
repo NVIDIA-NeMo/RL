@@ -424,11 +424,11 @@ class TestRayGpuMonitorLogger:
         # Verify the result
         assert result == {"node.1.gpu.0.util": 75.5}
 
-        # Create a sample with GPU memory metric
+        # Create a sample with GPU memory metric (in MB)
         memory_sample = Sample(
             name="ray_node_gram_used",
             labels={"GpuIndex": "0", "GpuDeviceName": "NVIDIA Test GPU"},
-            value=80.0 * 1024 * 1024 * 1024,
+            value=80.0 * 1024,
             timestamp=None,
             exemplar=None,
         )
@@ -501,7 +501,7 @@ class TestRayGpuMonitorLogger:
 ray_node_gpus_utilization{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} 75.5
 # HELP ray_node_gram_used GPU memory used
 # TYPE ray_node_gram_used gauge
-ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024 * 1024 * 1024}
+ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         """
 
         # Initialize the monitor

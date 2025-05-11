@@ -323,7 +323,8 @@ class RayGpuMonitorLogger:
         elif metric_name == "ray_node_gram_used":
             index = labels["GpuIndex"]
             metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
-            value /= 1024 * 1024 * 1024
+            # NOTE: It appears their docs say bytes, but it appears to be MB
+            value /= 1024
         elif metric_name == "ray_node_mem_used":
             metric_name = f"node.{node_idx}.mem_gb"
             value /= 1024 * 1024 * 1024
