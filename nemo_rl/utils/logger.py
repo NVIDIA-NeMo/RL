@@ -303,8 +303,8 @@ class RayGpuMonitorLogger:
                 )
                 time.sleep(self.collection_interval)  # Continue despite errors
 
-    def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
-        """Parse a GPU metric sample into a standardized format.
+    def _parse_metric(self, sample: Sample, node_idx: int) -> Dict[str, Any]:
+        """Parse a metric sample into a standardized format.
 
         Args:
             sample: Prometheus metric sample
