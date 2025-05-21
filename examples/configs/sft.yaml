@@ -72,7 +72,7 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
-  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"

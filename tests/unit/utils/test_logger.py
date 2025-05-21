@@ -841,6 +841,49 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         mock_wandb_instance = mock_wandb_logger.return_value
         assert not mock_wandb_instance.define_metric.called
 
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
+    def test_gpu_monitoring_no_main_loggers(
+        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test GPU monitoring initialization when no main loggers (wandb/tensorboard) are enabled."""
+        cfg = {
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "monitor_gpus": True,
+            "gpu_monitoring": {
+                "collection_interval": 15.0,
+                "flush_interval": 45.0,
+            },
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        # Check that regular loggers were NOT initialized
+        assert len(logger.loggers) == 0
+        mock_wandb_logger.assert_not_called()
+        mock_tb_logger.assert_not_called()
+
+        # Check that GPU monitor was initialized with correct parameters
+        mock_gpu_monitor.assert_called_once_with(
+            collection_interval=15.0,
+            flush_interval=45.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=logger,  # Logger instance is passed as parent
+        )
+
+        # Check that GPU monitor was started
+        mock_gpu_instance = mock_gpu_monitor.return_value
+        mock_gpu_instance.start.assert_called_once()
+
+        # Since wandb is disabled, self.wandb_logger would be None,
+        # and define_metric should not be called on it.
+        # We access the mock_wandb_logger.return_value which is the mock object itself.
+        mock_wandb_instance = mock_wandb_logger.return_value
+        assert not mock_wandb_instance.define_metric.called
+
 
 class TestLogger:
     """Test the main Logger class."""
