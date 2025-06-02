@@ -48,7 +48,7 @@ def _temp_run(sample, generation, debug, result, metadata_list, timeout):
             metadata_list.append({})
 
 
-def check_correctness(generation, in_outs: Optional[dict], timeout=10, debug=True):
+def check_correctness(generation, in_outs: Optional[dict], timeout=10, debug=False):
     """Check correctness of code generation with a global timeout.
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
     inside `run_test`"""
