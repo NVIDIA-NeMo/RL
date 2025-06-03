@@ -59,10 +59,7 @@ def check_correctness( generation: str, sample: dict, timeout: int = 30, debug: 
             e = False
         fixed.append(e)
     res = fixed
-    # print(res)
     if not np.all(res):
-        print("fail")
         return dict(ispass=0, results=res, metadata=metadata)
     else:
-        print("pass")
         return dict(ispass=1, results=res, metadata=metadata)
