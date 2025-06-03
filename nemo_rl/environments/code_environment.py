@@ -42,19 +42,12 @@ class CodeEnvironmentMetadata(TypedDict):
     unittests: Optional[List[Dict[str, str]]]
     fn_name: Optional[str]
     
-@contextlib.contextmanager
-def _mute_output():
-    devnull_out, devnull_err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(devnull_out), contextlib.redirect_stderr(devnull_err):
-        yield
-
 @ray.remote
 class CodeVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
-    def __init__(self):
-        logging.getLogger("code_verify").setLevel(logging.CRITICAL)
-
+    def __init__(self, verbose: bool = False):
+        logging.getLogger("code_verify").setLevel(logging.INFO if verbose else logging.WARNING)
         self.verify_func = check_correctness
 
     def verify(
@@ -76,20 +69,26 @@ class CodeVerifyWorker:
         results = []
         for response, metadata_item in zip(pred_responses, metadata):
             try:
-                with _mute_output():
-                    try:
-                        final_response = response.split("</think>")[-1].strip() # exclude <think> </think> tags
-                        code_str = extract_code(final_response)
-                        verify_result = self.verify_func(
-                            code_str, metadata_item, timeout
-                        )
-                        ret_score = verify_result["ispass"]
-                    except Exception:
-                        ret_score = 0.0
+                # No more output muting - let errors and debug info show!
+                final_response = response.split("</think>")[-1].strip() # exclude <think> </think> tags
+                code_str = extract_code(final_response)
+                
+                if self.verbose:
+                    print(f"Executing code:\n{code_str}")
+                
+                verify_result = self.verify_func(
+                    code_str, metadata_item, timeout
+                )
+                ret_score = verify_result["ispass"]
+                
+                if self.verbose and not ret_score:
+                    print(f"Test failed for code: {code_str[:100]}...")
+                    
+            except Exception as e:
 
-                results.append(float(ret_score))
-            except Exception:
-                results.append(0.0)
+                ret_score = 0.0
+
+            results.append(float(ret_score))
         return results
 
 
@@ -102,7 +101,10 @@ class CodeEnvironment(EnvironmentInterface):
         self.num_workers = cfg["num_workers"]
         self.workers = [
             CodeVerifyWorker.options(
-                runtime_env={"py_executable": CodeVerifyWorker.DEFAULT_PY_EXECUTABLE}
+                runtime_env={
+                    "py_executable": CodeVerifyWorker.DEFAULT_PY_EXECUTABLE,
+                    "env_vars": {"OMP_NUM_THREADS": "1"}
+                }
             ).remote()
             for _ in range(self.num_workers)
         ]

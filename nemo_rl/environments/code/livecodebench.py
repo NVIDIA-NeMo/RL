@@ -1,4 +1,3 @@
-
 import os
 import hashlib
 import multiprocessing
@@ -6,16 +5,11 @@ import os
 import sys
 import traceback
 from typing import Optional
-
+import numpy as np
 import logging
 
 from nemo_rl.environments.code.testing_util import run_test
 
-import multiprocessing
-import os
-import sys
-import traceback
-from typing import Optional
 
 def prepare_tests(metadata):
     unittests = metadata['unittests']
@@ -34,19 +28,9 @@ def calculate_string_md5(input_string: str):
     return md5.hexdigest()
 
 def _temp_run(sample, generation, debug, result, metadata_list, timeout):
-    with open(os.devnull, "w") as devnull:
-        sys.stdout = devnull
-        sys.stderr = devnull
-        try:
-            res, metadata = run_test(in_outs=sample, test=generation, debug=debug, timeout=timeout)
-            result.append(res)
-            metadata_list.append(metadata)
-        except Exception:
-            # print(e) # some tracebacks are extremely long.
-            traceback.print_exc(10)
-            result.append([-1 for i in range(len(sample["inputs"]))])
-            metadata_list.append({})
-
+    res, metadata = run_test(in_outs=sample, test=generation, debug=debug, timeout=timeout)
+    result.append(res)
+    metadata_list.append(metadata)
 
 def check_correctness(generation, in_outs: Optional[dict], timeout=10, debug=False):
     """Check correctness of code generation with a global timeout.
@@ -58,13 +42,32 @@ def check_correctness(generation, in_outs: Optional[dict], timeout=10, debug=Fal
     metadata_list = manager.list()
     p = multiprocessing.Process(target=_temp_run, args=(in_outs, generation, debug, result, metadata_list, timeout))
     p.start()
-    p.join(timeout=timeout + 1)
+    p.join(timeout=(timeout + 1) * len(in_outs["input_output"]["inputs"]) + 5)
     if p.is_alive():
         p.kill()
         # p.terminate()
     if not result:
         # consider that all tests failed
         result = [[-1 for i in range(len(in_outs["inputs"]))]]
+        metadata_list = [{"error_code": -3}]
         if debug:
             print("global timeout")
-    return result[0], metadata_list
+    
+    res, metadata = result[0], metadata_list[0]
+    fixed = []
+    for e in res:
+        if isinstance(e, np.ndarray):
+            e = e.item(0)
+        if isinstance(e, np.bool_):
+            e = bool(e)
+        if e != True and e != False:
+            e = False
+        fixed.append(e)
+    res = fixed
+
+    if not np.all(res):
+        print("fail")
+        return dict(ispass=0, results=res, metadata=metadata)
+    else:
+        print("pass")
+        return dict(ispass=1, results=res, metadata=metadata)

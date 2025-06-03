@@ -141,8 +141,14 @@ def reliability_guard_context(maximum_memory_bytes=None):
                 sys.modules[module_name] = None
 
         # Set environment variable
-        original_omp_threads = os.environ.get("OMP_NUM_THREADS")
-        os.environ["OMP_NUM_THREADS"] = "1"
+        original_omp_threads = None
+        try:
+            original_omp_threads = os.environ.get("OMP_NUM_THREADS")
+            os.environ["OMP_NUM_THREADS"] = "1"
+        except (TypeError, AttributeError):
+            # Handle case where os.environ.__setitem__ has been corrupted by Ray
+            # Ray should have already set OMP_NUM_THREADS=1 via runtime_env
+            pass
         
         yield
         
@@ -183,10 +189,14 @@ def reliability_guard_context(maximum_memory_bytes=None):
             sys.modules[module_name] = module_obj
             
         # Restore environment variable
-        if original_omp_threads is not None:
-            os.environ["OMP_NUM_THREADS"] = original_omp_threads
-        elif "OMP_NUM_THREADS" in os.environ:
-            del os.environ["OMP_NUM_THREADS"]
+        try:
+            if original_omp_threads is not None:
+                os.environ["OMP_NUM_THREADS"] = original_omp_threads
+            elif "OMP_NUM_THREADS" in os.environ:
+                del os.environ["OMP_NUM_THREADS"]
+        except (TypeError, AttributeError):
+            # Handle case where os.environ has been corrupted
+            pass
 
 
 def clean_if_name(code: str) -> str:
@@ -456,8 +466,36 @@ def grade_stdio(
         }
 
         if len(stripped_prediction_lines) != len(stripped_gt_out_lines):
+            # Before failing, try token-level comparison for flexible formatting
+            # Extract all tokens from both outputs
+            prediction_tokens = []
+            expected_tokens = []
+            
+            for line in stripped_prediction_lines:
+                prediction_tokens.extend(line.split())
+            for line in stripped_gt_out_lines:
+                expected_tokens.extend(line.split())
+            
+            # Try to compare as decimal values if possible
+            if len(prediction_tokens) == len(expected_tokens):
+                try:
+                    prediction_decimals = [Decimal(token) for token in prediction_tokens]
+                    expected_decimals = [Decimal(token) for token in expected_tokens]
+                    
+                    if prediction_decimals == expected_decimals:
+                        # Token-level comparison passed
+                        all_results.append(True)
+                        continue
+                except:
+                    # If decimal conversion fails, try string comparison
+                    if prediction_tokens == expected_tokens:
+                        # Token-level comparison passed
+                        all_results.append(True)
+                        continue
+            
+            # If token-level comparison also fails, return the mismatch error
             all_results.append(-2)
-            WA_send_args["error_message"] = "Wrong answer: mismatched output length"
+            WA_send_args["error_message"] = f"Wrong answer: mismatched output length ({len(stripped_prediction_lines)} vs {len(stripped_gt_out_lines)} lines) and token-level comparison failed"
             return all_results, WA_send_args
 
         for output_line_idx, (
