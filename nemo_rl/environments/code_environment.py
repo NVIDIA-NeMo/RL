@@ -170,7 +170,6 @@ class CodeEnvironment(EnvironmentInterface):
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
-        print(f"rewards: {rewards}")
 
         next_stop_strings = [None] * len(message_log_batch)
 
