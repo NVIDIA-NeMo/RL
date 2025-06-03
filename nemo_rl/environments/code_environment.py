@@ -73,17 +73,11 @@ class CodeVerifyWorker:
                 final_response = response.split("</think>")[-1].strip() # exclude <think> </think> tags
                 code_str = extract_code(final_response)
                 
-                if self.verbose:
-                    print(f"Executing code:\n{code_str}")
-                
                 verify_result = self.verify_func(
                     code_str, metadata_item, timeout
                 )
                 ret_score = verify_result["ispass"]
                 
-                if self.verbose and not ret_score:
-                    print(f"Test failed for code: {code_str[:100]}...")
-                    
             except Exception as e:
 
                 ret_score = 0.0
