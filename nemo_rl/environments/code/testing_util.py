@@ -23,8 +23,6 @@ from types import ModuleType
 from enum import Enum
 from decimal import Decimal
 import time
-import contextlib
-import copy
 
 import_string = "from string import *\nfrom re import *\nfrom datetime import *\nfrom collections import *\nfrom heapq import *\nfrom bisect import *\nfrom copy import *\nfrom math import *\nfrom random import *\nfrom statistics import *\nfrom itertools import *\nfrom functools import *\nfrom operator import *\nfrom io import *\nfrom sys import *\nfrom json import *\nfrom builtins import *\nfrom typing import *\nimport string\nimport re\nimport datetime\nimport collections\nimport heapq\nimport bisect\nimport copy\nimport math\nimport random\nimport statistics\nimport itertools\nimport functools\nimport operator\nimport io\nimport sys\nimport json\nsys.setrecursionlimit(50000)\n"
 
@@ -71,132 +69,6 @@ class Capturing(list):
         self.append(self._stringio.getvalue())
         del self._stringio  # free up some memory
         sys.stdout = self._stdout
-
-
-@contextlib.contextmanager
-def reliability_guard_context(maximum_memory_bytes=None):
-    """
-    Context manager version of reliability_guard that restores the original functions
-    when exiting the context. This prevents the guard from affecting the Ray worker
-    process after user code execution is complete.
-    """
-    # Store original functions and modules
-    original_funcs = {}
-    original_modules = {}
-    
-    try:
-        # Set memory limits if specified
-        if maximum_memory_bytes is not None:
-            import resource
-            resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-            resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
-            if not platform.uname().system == "Darwin":
-                resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
-
-        faulthandler.disable()
-
-        # Store and disable builtins
-        import builtins
-        original_funcs['builtins.quit'] = builtins.quit
-        builtins.quit = None
-
-        # Store and disable os functions
-        import os
-        os_funcs_to_disable = [
-            'kill', 'system', 'putenv', 'remove', 'removedirs', 'rmdir',
-            'fchdir', 'setuid', 'fork', 'forkpty', 'killpg', 'rename',
-            'renames', 'truncate', 'replace', 'unlink', 'fchmod', 'fchown',
-            'chmod', 'chown', 'chroot', 'lchflags', 'lchmod', 'lchown',
-            'getcwd', 'chdir'
-        ]
-        
-        for func_name in os_funcs_to_disable:
-            if hasattr(os, func_name):
-                original_funcs[f'os.{func_name}'] = getattr(os, func_name)
-                setattr(os, func_name, None)
-
-        # Store and disable shutil functions
-        import shutil
-        shutil_funcs_to_disable = ['rmtree', 'move', 'chown']
-        for func_name in shutil_funcs_to_disable:
-            if hasattr(shutil, func_name):
-                original_funcs[f'shutil.{func_name}'] = getattr(shutil, func_name)
-                setattr(shutil, func_name, None)
-
-        # Store and disable subprocess
-        import subprocess
-        original_funcs['subprocess.Popen'] = subprocess.Popen
-        subprocess.Popen = None  # type: ignore
-
-        # Store and disable builtins help
-        original_funcs['__builtins__.help'] = __builtins__.get('help')
-        __builtins__["help"] = None
-
-        # Store and disable sys modules
-        import sys
-        modules_to_disable = ['ipdb', 'joblib', 'resource', 'psutil', 'tkinter']
-        for module_name in modules_to_disable:
-            if module_name in sys.modules:
-                original_modules[module_name] = sys.modules[module_name]
-                sys.modules[module_name] = None
-
-        # Set environment variable
-        original_omp_threads = None
-        try:
-            original_omp_threads = os.environ.get("OMP_NUM_THREADS")
-            os.environ["OMP_NUM_THREADS"] = "1"
-        except (TypeError, AttributeError):
-            # Handle case where os.environ.__setitem__ has been corrupted by Ray
-            # Ray should have already set OMP_NUM_THREADS=1 via runtime_env
-            pass
-        
-        yield
-        
-    finally:
-        # Restore all original functions and modules
-        import builtins
-        import os
-        import shutil
-        import subprocess
-        import sys
-        
-        # Restore builtins
-        if 'builtins.quit' in original_funcs:
-            builtins.quit = original_funcs['builtins.quit']
-            
-        # Restore os functions
-        for key, value in original_funcs.items():
-            if key.startswith('os.'):
-                func_name = key[3:]  # Remove 'os.' prefix
-                setattr(os, func_name, value)
-                
-        # Restore shutil functions
-        for key, value in original_funcs.items():
-            if key.startswith('shutil.'):
-                func_name = key[7:]  # Remove 'shutil.' prefix
-                setattr(shutil, func_name, value)
-                
-        # Restore subprocess
-        if 'subprocess.Popen' in original_funcs:
-            subprocess.Popen = original_funcs['subprocess.Popen']
-            
-        # Restore builtins help
-        if '__builtins__.help' in original_funcs:
-            __builtins__["help"] = original_funcs['__builtins__.help']
-            
-        # Restore sys modules
-        for module_name, module_obj in original_modules.items():
-            sys.modules[module_name] = module_obj
-            
-        # Restore environment variable
-        try:
-            if original_omp_threads is not None:
-                os.environ["OMP_NUM_THREADS"] = original_omp_threads
-            elif "OMP_NUM_THREADS" in os.environ:
-                del os.environ["OMP_NUM_THREADS"]
-        except (TypeError, AttributeError):
-            # Handle case where os.environ has been corrupted
-            pass
 
 
 def clean_if_name(code: str) -> str:
@@ -282,14 +154,24 @@ def compile_code(code: str, timeout: int):
     try:
         tmp_sol = ModuleType("tmp_sol", "")
         exec(code, tmp_sol.__dict__)
-        if "class Solution" in code:
-            # leetcode wraps solutions in `Solution`
-            # this is a hack to check if it is leetcode solution or not
-            # currently livecodebench only supports LeetCode but
-            # else condition allows future extensibility to other platforms
+        
+        # Check if code contains a Solution class by parsing the AST
+        has_solution_class = False
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == "Solution":
+                    has_solution_class = True
+                    break
+        except:
+            # Fallback to string search if AST parsing fails
+            has_solution_class = "class Solution" in code
+        
+        if has_solution_class:
+            # LeetCode-style solutions wrap code in a Solution class
             compiled_sol = tmp_sol.Solution()
         else:
-            # do nothing in the other case since function is accesible
+            # For other platforms, functions are directly accessible
             compiled_sol = tmp_sol
 
         assert compiled_sol is not None
@@ -328,9 +210,7 @@ def grade_call_based(code: str, all_inputs: list, all_outputs: list, fn_name: st
     if method is None:
         return
 
-    all_inputs = [[json.loads(line) for line in inputs.split("\n")] for inputs in all_inputs]
-
-    all_outputs = [json.loads(output) for output in all_outputs]
+    # all_inputs and all_outputs are already Python objects, no need for JSON parsing
 
     total_execution = 0
     all_results = []
@@ -466,36 +346,8 @@ def grade_stdio(
         }
 
         if len(stripped_prediction_lines) != len(stripped_gt_out_lines):
-            # Before failing, try token-level comparison for flexible formatting
-            # Extract all tokens from both outputs
-            prediction_tokens = []
-            expected_tokens = []
-            
-            for line in stripped_prediction_lines:
-                prediction_tokens.extend(line.split())
-            for line in stripped_gt_out_lines:
-                expected_tokens.extend(line.split())
-            
-            # Try to compare as decimal values if possible
-            if len(prediction_tokens) == len(expected_tokens):
-                try:
-                    prediction_decimals = [Decimal(token) for token in prediction_tokens]
-                    expected_decimals = [Decimal(token) for token in expected_tokens]
-                    
-                    if prediction_decimals == expected_decimals:
-                        # Token-level comparison passed
-                        all_results.append(True)
-                        continue
-                except:
-                    # If decimal conversion fails, try string comparison
-                    if prediction_tokens == expected_tokens:
-                        # Token-level comparison passed
-                        all_results.append(True)
-                        continue
-            
-            # If token-level comparison also fails, return the mismatch error
             all_results.append(-2)
-            WA_send_args["error_message"] = f"Wrong answer: mismatched output length ({len(stripped_prediction_lines)} vs {len(stripped_gt_out_lines)} lines) and token-level comparison failed"
+            WA_send_args["error_message"] = "Wrong answer: mismatched output length"
             return all_results, WA_send_args
 
         for output_line_idx, (
@@ -540,15 +392,15 @@ def run_test(sample, test=None, debug=False, timeout=6):
     """
     signal.signal(signal.SIGALRM, timeout_handler)
 
+    # Disable functionalities that can make destructive changes to the test.
+    # max memory is set to 4GB
+    reliability_guard()
+
     if debug:
         print(f"start = {datetime.now().time()}")
 
-    try:
-        in_outs = sample["input_output"]        
-    except ValueError as e:
-        raise e
-        in_outs = None
-
+    in_outs = sample["input_output"]
+    
     if in_outs:
         if in_outs.get("fn_name") is None:
             which_type = CODE_TYPE.standard_input  # Standard input
@@ -570,46 +422,44 @@ def run_test(sample, test=None, debug=False, timeout=6):
         if debug:
             print(f"loading test code = {datetime.now().time()}")
 
-        # Use context manager for reliability guard to avoid affecting Ray worker
-        with reliability_guard_context(maximum_memory_bytes=4*1024*1024*1024):  # 4GB
-            if which_type == CODE_TYPE.call_based:
-                signal.alarm(timeout)
-                try:
-                    results, metadata = grade_call_based(
-                        code=test,
-                        all_inputs=in_outs["inputs"],
-                        all_outputs=in_outs["outputs"],
-                        fn_name=method_name,
-                        timeout=timeout,
-                    )
-                    return results, metadata
-                except Exception as e:
-                    return [-4], {
-                        "error_code": -4,
-                        "error_message": f"Error during testing: {e}",
-                    }
-                finally:
-                    signal.alarm(0)
-            elif which_type == CODE_TYPE.standard_input:
-                # sol
-                # if code has if __name__ == "__main__": then remove it
+        if which_type == CODE_TYPE.call_based:
+            signal.alarm(timeout)
+            try:
+                results, metadata = grade_call_based(
+                    code=test,
+                    all_inputs=in_outs["inputs"],
+                    all_outputs=in_outs["outputs"],
+                    fn_name=method_name,
+                    timeout=timeout,
+                )
+                return results, metadata
+            except Exception as e:
+                return [-4], {
+                    "error_code": -4,
+                    "error_message": f"Error during testing: {e}",
+                }
+            finally:
+                signal.alarm(0)
+        elif which_type == CODE_TYPE.standard_input:
+            # sol
+            # if code has if __name__ == "__main__": then remove it
 
-                signal.alarm(timeout)
-                try:
-                    results, metadata = grade_stdio(
-                        code=test,
-                        all_inputs=in_outs["inputs"],
-                        all_outputs=in_outs["outputs"],
-                        timeout=timeout,
-                    )
-                    return results, metadata
-                except Exception as e:
-                    return [-4], {
-                        "error_code": -4,
-                        "error_message": f"Error during testing: {e}",
-                    }
-                finally:
-                    signal.alarm(0)
+            signal.alarm(timeout)
+            try:
+                results, metadata = grade_stdio(
+                    code=test,
+                    all_inputs=in_outs["inputs"],
+                    all_outputs=in_outs["outputs"],
+                    timeout=timeout,
+                )
+                return results, metadata
+            except Exception as e:
+                return [-4], {
+                    "error_code": -4,
+                    "error_message": f"Error during testing: {e}",
+                }
+            finally:
+                signal.alarm(0)
 
 
 def reliability_guard(maximum_memory_bytes=None):
@@ -622,9 +472,6 @@ def reliability_guard(maximum_memory_bytes=None):
     generated code, should not be blindly executed outside of one. See the
     Codex paper for more information about OpenAI's code sandbox, and proceed
     with caution.
-    
-    NOTE: This function is deprecated in favor of reliability_guard_context()
-    which properly restores system functions after use.
     """
 
     if maximum_memory_bytes is not None:
