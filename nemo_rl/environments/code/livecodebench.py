@@ -48,7 +48,7 @@ def check_correctness(generation, in_outs: Optional[dict], timeout=10, debug=Fal
         # p.terminate()
     if not result:
         # consider that all tests failed
-        result = [[-1 for i in range(len(in_outs["inputs"]))]]
+        result = [[-1 for i in range(len(in_outs["input_output"]["inputs"]))]]
         metadata_list = [{"error_code": -3}]
         if debug:
             print("global timeout")
