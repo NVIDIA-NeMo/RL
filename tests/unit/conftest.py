@@ -544,14 +544,14 @@ def tiny_nemotron5_h_model_path():
     config = AutoConfig.from_pretrained(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
     )
-
-    # TODO: how to set this config properly?
-    config = type(config)(
-        ...
-        # num_hidden_layers=9,
-        # hybrid_override_pattern="M-M-M-M*-",
-        # hidden_size=64,
-    )
+    config.hybrid_override_pattern = "M*-"
+    config.num_hidden_layers = 3
+    config.intermediate_size = 32
+    config.hidden_size = 256
+    config.num_attention_heads = 8
+    config.mamba_num_heads = 8
+    config.num_key_value_heads = 8
+    config.n_groups = 1
 
     model_path = TEST_ASSETS.TINY_NEMOTRON5_H_MODEL_PATH
 
