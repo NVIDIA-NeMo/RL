@@ -43,6 +43,8 @@ dependencies = [
     "nvtx",
     "matplotlib",
     "plotly"
+    "mamba-ssm",
+    "causal-conv1d",
 ]
 
 [project.optional-dependencies]
