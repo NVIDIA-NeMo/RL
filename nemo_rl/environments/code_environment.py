@@ -30,7 +30,7 @@ from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
 from nemo_rl.environments.utils import chunk_list_to_workers
-from nemo_rl.environments.code.livecodebench import check_correctness, prepare_tests
+from nemo_rl.environments.code.livecodebench import compute_score, prepare_tests
 from nemo_rl.environments.utils import extract_code
 
 class CodeEnvConfig(TypedDict):
@@ -48,7 +48,7 @@ class CodeVerifyWorker:
 
     def __init__(self, verbose: bool = False):
         logging.getLogger("code_verify").setLevel(logging.INFO if verbose else logging.WARNING)
-        self.verify_func = check_correctness
+        self.verify_func = compute_score
 
     def verify(
         self, 
@@ -73,13 +73,11 @@ class CodeVerifyWorker:
                 final_response = response.split("</think>")[-1].strip() # exclude <think> </think> tags
                 code_str = extract_code(final_response)
                 
-                verify_result = self.verify_func(
+                ret_score, execution_metadata = self.verify_func(
                     code_str, metadata_item, timeout
                 )
-                ret_score = verify_result["ispass"]
                 
             except Exception as e:
-
                 ret_score = 0.0
 
             results.append(float(ret_score))
