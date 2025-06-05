@@ -23,6 +23,7 @@ checkpointing:
   save_period: 10000
 
 policy:
+  training_backend: "hf"
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
   tokenizer:
     name: ${policy.model_name}

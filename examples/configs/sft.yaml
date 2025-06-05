@@ -21,6 +21,7 @@ checkpointing:
   save_period: 10
 
 policy:
+  training_backend: "hf"
   model_name: "meta-llama/Llama-3.2-1B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
