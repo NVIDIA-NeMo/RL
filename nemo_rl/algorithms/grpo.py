@@ -59,6 +59,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 # ===============================================================================
@@ -502,6 +503,9 @@ def grpo_train(
         print(
             f"\n{'=' * 25} Step {step + 1}/{min(len(dataloader), master_config['grpo']['max_num_steps'])} {'=' * 25}"
         )
+        maybe_gpu_profile_step(policy, step + 1)
+        if policy != policy_generation:
+            maybe_gpu_profile_step(policy_generation, step + 1)
         val_metrics, validation_timings = None, None
 
         with timer.time("total_step_time"):

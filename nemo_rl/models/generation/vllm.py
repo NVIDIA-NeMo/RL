@@ -42,10 +42,10 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.distributed.worker_groups import (
     RayWorkerBuilder,
     RayWorkerGroup,
-    get_nsight_config_if_pattern_matches,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -1050,6 +1050,14 @@ class VllmGenerationWorker:
 
         await self.llm.wake_up(**wake_up_args)
 
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()
+
 
 class VllmGeneration(GenerationInterface):
     def __init__(
@@ -1538,6 +1546,16 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
+        ray.get(futures)
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

@@ -64,6 +64,9 @@ def _patch_nsight_file():
     is up to date before the nsight.py is actually needed.
     """
     # Only apply patch if user intends to use nsys profiling
+
+    # Don't rely on nemo_rl.utils.nsys.NRL_NSYS_WORKER_PATTERNS since nemo_rl may not be available
+    # on the node that imports nemo_rl.
     if not os.environ.get("NRL_NSYS_WORKER_PATTERNS"):
         return
 

@@ -755,97 +755,155 @@ def test_nsight_configuration_forwarding(register_test_actor, virtual_cluster):
 
 def test_get_nsight_config_if_pattern_matches():
     """Test the get_nsight_config_if_pattern_matches utility function."""
-    from nemo_rl.distributed.worker_groups import get_nsight_config_if_pattern_matches
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
 
     # Test 1: No environment variable set
-    if "NRL_NSYS_WORKER_PATTERNS" in os.environ:
-        del os.environ["NRL_NSYS_WORKER_PATTERNS"]
-
-    result = get_nsight_config_if_pattern_matches("test_worker")
-    assert result == {}
+    with (
+        patch("nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS", ""),
+        patch("nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", ""),
+    ):
+        result = get_nsight_config_if_pattern_matches("test_worker")
+        assert result == {}
 
     # Test 2: Environment variable set but no pattern matches
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "*critic*,*inference*"
-    result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
-    assert result == {}
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*critic*,*inference*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert result == {}
 
     # Test 3: Pattern matches with wildcard
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "*policy*,*critic*"
-    result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
-    assert "nsight" in result
-    assert result["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
-    assert result["nsight"]["o"] == "'dtensor_policy_worker_%p'"
-    assert result["nsight"]["stop-on-exit"] == "true"
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*,*critic*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert "nsight" in result
+        assert result["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
+        assert result["nsight"]["stop-on-exit"] == "true"
 
     # Test 4: Exact name match
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "exact-worker,another-worker"
-    result = get_nsight_config_if_pattern_matches("exact-worker")
-    assert "nsight" in result
-    assert result["nsight"]["o"] == "'exact-worker_%p'"
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "exact-worker,another-worker",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "3:8"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("exact-worker")
+        assert "nsight" in result
+        assert result["nsight"]["o"] == "'exact-worker_3:8_%p'"
 
     # Test 5: Multiple patterns, first one matches
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "*vllm*,*policy*,*critic*"
-    result = get_nsight_config_if_pattern_matches("vllm_inference_worker")
-    assert "nsight" in result
-    assert result["nsight"]["o"] == "'vllm_inference_worker_%p'"
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*vllm*,*policy*,*critic*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "2:10"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("vllm_inference_worker")
+        assert "nsight" in result
+        assert result["nsight"]["o"] == "'vllm_inference_worker_2:10_%p'"
 
     # Test 6: CSV parsing with whitespace
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "  *train*  ,  exact-name  ,  *test*  "
-    result = get_nsight_config_if_pattern_matches("training_worker")
-    assert "nsight" in result
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "  *train*  ,  exact-name  ,  *test*  ",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "5:15"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("training_worker")
+        assert "nsight" in result
 
-    result = get_nsight_config_if_pattern_matches("exact-name")
-    assert "nsight" in result
+        result = get_nsight_config_if_pattern_matches("exact-name")
+        assert "nsight" in result
 
-    result = get_nsight_config_if_pattern_matches("some_test_worker")
-    assert "nsight" in result
+        result = get_nsight_config_if_pattern_matches("some_test_worker")
+        assert "nsight" in result
 
-    result = get_nsight_config_if_pattern_matches("no_match")
-    assert result == {}
+        result = get_nsight_config_if_pattern_matches("no_match")
+        assert result == {}
 
     # Test 7: Empty patterns in CSV
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "*policy*,,*critic*,"
-    result = get_nsight_config_if_pattern_matches("policy_worker")
-    assert "nsight" in result
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*,,*critic*,",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:3"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("policy_worker")
+        assert "nsight" in result
 
-    result = get_nsight_config_if_pattern_matches("critic_worker")
-    assert "nsight" in result
+        result = get_nsight_config_if_pattern_matches("critic_worker")
+        assert "nsight" in result
 
-    result = get_nsight_config_if_pattern_matches("other_worker")
-    assert result == {}
-
-    # Clean up
-    if "NRL_NSYS_WORKER_PATTERNS" in os.environ:
-        del os.environ["NRL_NSYS_WORKER_PATTERNS"]
+        result = get_nsight_config_if_pattern_matches("other_worker")
+        assert result == {}
 
 
 def test_get_nsight_config_output_format():
     """Test that the nsight config output can be directly unpacked into runtime_env."""
-    from nemo_rl.distributed.worker_groups import get_nsight_config_if_pattern_matches
+    from unittest.mock import patch
 
-    os.environ["NRL_NSYS_WORKER_PATTERNS"] = "*test*"
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
 
-    # Test the unpacking behavior
-    base_runtime_env = {"env_vars": {"SOME_VAR": "value"}, "py_executable": "python"}
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS", "*test*"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        # Test the unpacking behavior
+        base_runtime_env = {
+            "env_vars": {"SOME_VAR": "value"},
+            "py_executable": "python",
+        }
 
-    nsight_config = get_nsight_config_if_pattern_matches("test_worker")
+        nsight_config = get_nsight_config_if_pattern_matches("test_worker")
 
-    # This should work without errors
-    combined_runtime_env = {**base_runtime_env, **nsight_config}
+        # This should work without errors
+        combined_runtime_env = {**base_runtime_env, **nsight_config}
 
-    assert "env_vars" in combined_runtime_env
-    assert "py_executable" in combined_runtime_env
-    assert "nsight" in combined_runtime_env
-    assert combined_runtime_env["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert "env_vars" in combined_runtime_env
+        assert "py_executable" in combined_runtime_env
+        assert "nsight" in combined_runtime_env
+        assert combined_runtime_env["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
 
-    # Test with no match
-    no_match_config = get_nsight_config_if_pattern_matches("no_match_worker")
-    combined_runtime_env_no_match = {**base_runtime_env, **no_match_config}
+        # Test with no match
+        no_match_config = get_nsight_config_if_pattern_matches("no_match_worker")
+        combined_runtime_env_no_match = {**base_runtime_env, **no_match_config}
 
-    assert "env_vars" in combined_runtime_env_no_match
-    assert "py_executable" in combined_runtime_env_no_match
-    assert "nsight" not in combined_runtime_env_no_match
-
-    # Clean up
-    if "NRL_NSYS_WORKER_PATTERNS" in os.environ:
-        del os.environ["NRL_NSYS_WORKER_PATTERNS"]
+        assert "env_vars" in combined_runtime_env_no_match
+        assert "py_executable" in combined_runtime_env_no_match
+        assert "nsight" not in combined_runtime_env_no_match

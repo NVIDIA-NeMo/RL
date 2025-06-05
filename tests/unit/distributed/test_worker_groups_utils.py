@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 
-from nemo_rl.distributed.worker_groups import recursive_merge_options
+from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 
 
 class TestRecursiveMergeOptions:
