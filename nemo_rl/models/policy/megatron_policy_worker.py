@@ -723,11 +723,9 @@ class MegatronPolicyWorker:
                     data_iterator_len = (
                         batch.get_microbatch_iterator_dynamic_shapes_len()
                     )
-                    micro_batch_size = self.cfg["train_micro_batch_size"]
                 else:
                     data_iterator = batch.make_microbatch_iterator(mbs)
                     data_iterator_len = local_gbs // mbs
-                    micro_batch_size = self.cfg["train_micro_batch_size"]
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -748,7 +746,7 @@ class MegatronPolicyWorker:
                         model=self.model,
                         num_microbatches=data_iterator_len,
                         seq_length=seq_dim_size,
-                        micro_batch_size=micro_batch_size,
+                        micro_batch_size=mbs,
                         decoder_seq_length=seq_dim_size,
                         forward_only=eval_mode,
                         do_not_average_loss=True,
@@ -924,11 +922,10 @@ class MegatronPolicyWorker:
         if self.cfg["dynamic_batching"]["enabled"]:
             mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
             data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-            micro_batch_size = logprob_batch_size
         else:
             mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
             data_iterator_len = max(1, data.size // logprob_batch_size)
-            micro_batch_size = logprob_batch_size
+        micro_batch_size = logprob_batch_size
 
         forward_backward_func = get_forward_backward_func()
         list_of_logprobs = forward_backward_func(
