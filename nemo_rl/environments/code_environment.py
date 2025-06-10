@@ -11,17 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
-import io
 import logging
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import ray
 import torch
-import os
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.environments.code.livecodebench import compute_score, prepare_tests
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -29,30 +27,33 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
-from nemo_rl.environments.utils import chunk_list_to_workers
-from nemo_rl.environments.code.livecodebench import compute_score, prepare_tests
-from nemo_rl.environments.utils import extract_code
+from nemo_rl.environments.utils import chunk_list_to_workers, extract_code
+
 
 class CodeEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
-    timeout: int = 10 # Timeout for the code execution
+    timeout: int = 10  # Timeout for the code execution
+
 
 class CodeEnvironmentMetadata(TypedDict):
     unittests: Optional[List[Dict[str, str]]]
     fn_name: Optional[str]
-    
+
+
 @ray.remote
 class CodeVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
     def __init__(self, verbose: bool = False):
-        logging.getLogger("code_verify").setLevel(logging.INFO if verbose else logging.WARNING)
+        logging.getLogger("code_verify").setLevel(
+            logging.INFO if verbose else logging.WARNING
+        )
         self.verify_func = compute_score
 
     def verify(
-        self, 
-        pred_responses: List[str], 
+        self,
+        pred_responses: List[str],
         metadata: List[CodeEnvironmentMetadata],
         timeout: int,
     ) -> List[float]:
@@ -70,13 +71,15 @@ class CodeVerifyWorker:
         for response, metadata_item in zip(pred_responses, metadata):
             try:
                 # No more output muting - let errors and debug info show!
-                final_response = response.split("</think>")[-1].strip() # exclude <think> </think> tags
+                final_response = response.split("</think>")[
+                    -1
+                ].strip()  # exclude <think> </think> tags
                 code_str = extract_code(final_response)
-                
+
                 ret_score, execution_metadata = self.verify_func(
                     code_str, metadata_item, timeout
                 )
-                
+
             except Exception as e:
                 ret_score = 0.0
 
@@ -95,7 +98,7 @@ class CodeEnvironment(EnvironmentInterface):
             CodeVerifyWorker.options(
                 runtime_env={
                     "py_executable": CodeVerifyWorker.DEFAULT_PY_EXECUTABLE,
-                    "env_vars": {"OMP_NUM_THREADS": "1"}
+                    "env_vars": {"OMP_NUM_THREADS": "1"},
                 }
             ).remote()
             for _ in range(self.num_workers)

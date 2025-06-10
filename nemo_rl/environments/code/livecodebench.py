@@ -1,27 +1,31 @@
-import sys
-import os
-import traceback
 import json
 import multiprocessing
+import os
+import sys
+import traceback
 from typing import Optional
 
 from nemo_rl.environments.code.testing_util import run_test
 
 
 def prepare_tests(metadata):
-    unittests = metadata['unittests']
-    fn_name = metadata.get('fn_name', None)
-    return {"inputs": [t['inputs'] for t in unittests],
-            "outputs": [t['outputs'] for t in unittests],
-            "fn_name": fn_name,         
+    unittests = metadata["unittests"]
+    fn_name = metadata.get("fn_name", None)
+    return {
+        "inputs": [t["inputs"] for t in unittests],
+        "outputs": [t["outputs"] for t in unittests],
+        "fn_name": fn_name,
     }
-    
+
+
 def _temp_run(sample, generation, debug, result, metadata_list, timeout):
     with open(os.devnull, "w") as devnull:
         sys.stdout = devnull
         sys.stderr = devnull
         try:
-            res, metadata = run_test(in_outs=sample, test=generation, debug=debug, timeout=timeout)
+            res, metadata = run_test(
+                in_outs=sample, test=generation, debug=debug, timeout=timeout
+            )
             result.append(res)
             metadata_list.append(metadata)
         except Exception:
@@ -29,18 +33,22 @@ def _temp_run(sample, generation, debug, result, metadata_list, timeout):
             traceback.print_exc(10)
             result.append([-1 for i in range(len(sample["inputs"]))])
             metadata_list.append({})
-            
+
+
 def check_correctness(in_outs: Optional[dict], generation, timeout=10, debug=True):
     """Check correctness of code generation with a global timeout.
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
-    inside `run_test`"""
-
+    inside `run_test`
+    """
     manager = multiprocessing.Manager()
     result = manager.list()
     metadata_list = manager.list()
-    p = multiprocessing.Process(target=_temp_run, args=(in_outs, generation, debug, result, metadata_list, timeout))
+    p = multiprocessing.Process(
+        target=_temp_run,
+        args=(in_outs, generation, debug, result, metadata_list, timeout),
+    )
     p.start()
-    #p.join(timeout=timeout + 1)
+    # p.join(timeout=timeout + 1)
     p.join(timeout=(timeout + 1) * len(in_outs["inputs"]) + 5)
     if p.is_alive():
         p.kill()
@@ -52,9 +60,10 @@ def check_correctness(in_outs: Optional[dict], generation, timeout=10, debug=Tru
             print("global timeout")
     return result[0], metadata_list
 
+
 def compute_score(solution, test_cases, timeout=5, debug=False, continuous=False):
     # try to get code solution from completion. if the completion is pure code, this will not take effect.
-    #solution = completion.split("```python")[-1].split("```")[0]
+    # solution = completion.split("```python")[-1].split("```")[0]
     success = False
     metadata_list = []
     try:
@@ -66,7 +75,9 @@ def compute_score(solution, test_cases, timeout=5, debug=False, continuous=False
 
         # Complete check on all in-out pairs first. If there is no failure, per-sample test can be skipped.
         try:
-            res, metadata = check_correctness(in_outs=test_cases, generation=solution, timeout=timeout, debug=debug)
+            res, metadata = check_correctness(
+                in_outs=test_cases, generation=solution, timeout=timeout, debug=debug
+            )
             metadata = dict(enumerate(metadata))[0]
             success = all(map(lambda x: x is True, res))
             if success:
@@ -86,9 +97,13 @@ def compute_score(solution, test_cases, timeout=5, debug=False, continuous=False
             metadata_list = []
             res_list = []
             for test_case_id, test_case in enumerate(test_cases_list):
-                res, metadata = check_correctness(in_outs=test_case, generation=solution, timeout=timeout, debug=debug)
+                res, metadata = check_correctness(
+                    in_outs=test_case, generation=solution, timeout=timeout, debug=debug
+                )
                 try:
-                    metadata = dict(enumerate(metadata))[0]  # metadata can be empty occasionally
+                    metadata = dict(enumerate(metadata))[
+                        0
+                    ]  # metadata can be empty occasionally
                 except Exception:
                     metadata = {}
                 metadata["test_case"] = {}

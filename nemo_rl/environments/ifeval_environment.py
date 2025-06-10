@@ -56,7 +56,10 @@ class IFEvalVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.IFEVAL
 
     def __init__(self):
-        from nemo_rl.environments.instruction_following.instructions_registry import INSTRUCTION_DICT
+        from nemo_rl.environments.instruction_following.instructions_registry import (
+            INSTRUCTION_DICT,
+        )
+
         self.INSTRUCTION_DICT = INSTRUCTION_DICT
         logging.getLogger("ifeval_verify").setLevel(logging.CRITICAL)
 
