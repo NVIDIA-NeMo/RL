@@ -527,25 +527,25 @@ class VllmGenerationWorker:
         return return_data
 
     async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> AsyncGenerator[BatchedDataDict[GenerationOutputSpec], None]:
+        self,
+        data: tuple[BatchedDataDict[GenerationDatumSpec], int],
+        greedy: bool = False,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
-            data: BatchedDataDict containing input_ids and input_lengths tensors
+            data: Tuple containing (BatchedDataDict with input_ids and input_lengths, start_original_index_for_this_shard)
             greedy: Whether to use greedy decoding instead of sampling
 
         Yields:
-            BatchedDataDict conforming to GenerationOutputSpec for each completed sequence:
-                - output_ids: input + generated token IDs with proper padding for the single sequence
-                - logprobs: Log probabilities for tokens for the single sequence
-                - generation_lengths: Lengths of each response for the single sequence
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence for the single sequence
+            Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
                 "generate_async can only be used when async_engine is enabled in vLLM config."
             )
+
+        data, start_original_index = data
 
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -561,32 +561,22 @@ class VllmGenerationWorker:
             "stop_strings", [[] for _ in range(batch_size)]
         )
 
-        request_id_to_context = {}
-        task_futures = []
-
-        # Helper coroutine to consume the vLLM's async generator for a single request
-        async def get_single_request_output(vllm_request_async_gen):
-            # The vLLM AsyncLLMEngine.generate() is an async generator.
-            final_request_output = None
-            async for req_output in vllm_request_async_gen:
-                final_request_output = req_output
-            return final_request_output
-
-        for i in range(batch_size):
-            # Prepare prompt token IDs for this specific sample
-            current_input_actual_length = input_lengths_batch[i].item()
+        # Create tasks for each sample in the batch
+        async def process_single_sample(sample_idx):
+            """Process a single sample and return the result."""
+            current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt_token_ids_list = (
-                input_ids_batch[i, :current_input_actual_length].tolist()
+                input_ids_batch[sample_idx, :current_input_actual_length].tolist()
                 if current_input_actual_length > 0
                 else []
             )
             prompt = {"prompt_token_ids": prompt_token_ids_list}
 
             per_sample_stop_strings = None
-            if batch_specific_stop_strings_list and i < len(
+            if batch_specific_stop_strings_list and sample_idx < len(
                 batch_specific_stop_strings_list
             ):
-                per_sample_stop_strings = batch_specific_stop_strings_list[i]
+                per_sample_stop_strings = batch_specific_stop_strings_list[sample_idx]
 
             final_stop_strings_for_sample = self._merge_stop_strings(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
@@ -605,49 +595,28 @@ class VllmGenerationWorker:
 
             request_id = str(uuid.uuid4())
 
-            # self.llm.generate() returns an async generator for a single request
+            # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
                 prompt=prompt,
                 sampling_params=sampling_params_for_request,
                 request_id=request_id,
             )
-            # Create a task for the helper coroutine that consumes this generator
-            task = asyncio.create_task(
-                get_single_request_output(vllm_request_generator)
-            )
 
-            context_for_this_task = {
-                "original_input_ids_row": input_ids_batch[i],
-                "original_input_length_scalar": current_input_actual_length,
-            }
-            request_id_to_context[request_id] = context_for_this_task
-            task_futures.append(task)
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
 
-        # Wait for all tasks to finish in the original request order to preserve deterministic
-        # alignment between inputs and outputs.
-        finished_task_results = await asyncio.gather(
-            *task_futures, return_exceptions=True
-        )
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
 
-        for i, task_result in enumerate(finished_task_results):
-            if isinstance(task_result, Exception):
-                print(f"Error in a generation task (index {i}): {task_result}")
-                continue
-
-            vllm_output_single = task_result
-            request_id_from_output = vllm_output_single.request_id
-            context = request_id_to_context[request_id_from_output]
-            original_input_ids_single_row = context["original_input_ids_row"]
-            original_input_actual_length = context["original_input_length_scalar"]
-
-            # Process the single vLLM output
-            generation_details = vllm_output_single.outputs[0]
+            # Process the output
+            generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
 
-            final_output_tensor_len = (
-                original_input_actual_length + num_generated_tokens
-            )
+            original_input_ids_single_row = input_ids_batch[sample_idx]
+            final_output_tensor_len = current_input_actual_length + num_generated_tokens
 
             # Create output_ids tensor for this single item
             output_ids_single_item = torch.full(
@@ -657,12 +626,12 @@ class VllmGenerationWorker:
                 device=original_input_ids_single_row.device,
             )
             # Copy original input (up to its actual length)
-            output_ids_single_item[:original_input_actual_length] = (
-                original_input_ids_single_row[:original_input_actual_length]
+            output_ids_single_item[:current_input_actual_length] = (
+                original_input_ids_single_row[:current_input_actual_length]
             )
             # Add generated tokens after the actual input
             output_ids_single_item[
-                original_input_actual_length : original_input_actual_length
+                current_input_actual_length : current_input_actual_length
                 + num_generated_tokens
             ] = torch.tensor(
                 generated_token_ids,
@@ -690,7 +659,7 @@ class VllmGenerationWorker:
                                 token_id_at_idx
                             ].logprob
                             position_in_output_tensor = (
-                                original_input_actual_length + idx
+                                current_input_actual_length + idx
                             )
                             if position_in_output_tensor < final_output_tensor_len:
                                 logprobs_single_item[0, position_in_output_tensor] = (
@@ -705,14 +674,14 @@ class VllmGenerationWorker:
             )
 
             # Unpadded sequence lengths (actual_input + actual_generated)
-            unpadded_total_length = original_input_actual_length + num_generated_tokens
+            unpadded_total_length = current_input_actual_length + num_generated_tokens
             unpadded_sequence_lengths_tensor = torch.tensor(
                 [unpadded_total_length],
                 dtype=torch.long,
                 device=original_input_ids_single_row.device,
             )
 
-            yielded_batch = BatchedDataDict[GenerationOutputSpec](
+            result_batch = BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": output_ids_single_item_batched,
                     "logprobs": logprobs_single_item,
@@ -720,7 +689,27 @@ class VllmGenerationWorker:
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 }
             )
-            yield yielded_batch
+
+            global_index = start_original_index + sample_idx
+            return (global_index, result_batch)
+
+        # Create tasks for all samples and yield results as they complete
+        sample_tasks = [
+            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        for completed_task in asyncio.as_completed(sample_tasks):
+            try:
+                result = await completed_task
+                yield result
+            except Exception as e:
+                # Cancel remaining tasks
+                for task in sample_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*sample_tasks, return_exceptions=True)
+                raise e
 
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1295,9 +1284,14 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
-    def generate_async(
+    async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> BatchedDataDict[GenerationOutputSpec]:
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate responses asynchronously, yielding individual samples as they complete.
+
+        This method provides true per-sample streaming across all workers, yielding each
+        sample result as soon as it's ready, regardless of which worker processed it.
+        """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
                 "generate_async can only be used when async_engine is enabled in VllmConfig."
@@ -1310,43 +1304,94 @@ class VllmGeneration(GenerationInterface):
             "input_ids and input_lengths are required in data for vLLM generation"
         )
 
+        # Handle empty input case
+        if len(data["input_ids"]) == 0:
+            return
+
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+        sharded_data_list: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
 
+        # Prepare data for workers with global indices
+        processed_shards_data = []
+        global_start_index = 0
+
+        for shard_data in sharded_data_list:
+            if shard_data and len(shard_data.get("input_ids", [])) > 0:
+                processed_shards_data.append((shard_data, global_start_index))
+                global_start_index += len(shard_data.get("input_ids", []))
+
+        if not processed_shards_data:
+            return
+
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_async",
-            sharded_data,
+            processed_shards_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
             common_kwargs={"greedy": greedy},
         )
 
-        # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
-        results = self.worker_group.get_all_worker_results(future_bundle)
-
-        # Combine results from all tied worker groups
-        combined = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+        worker_generator_proxies = self.worker_group.get_all_worker_results(
+            future_bundle, return_generators_as_proxies=True
         )
 
-        # Verify the output has all required fields
-        required_keys = [
-            "output_ids",
-            "generation_lengths",
-            "unpadded_sequence_lengths",
-            "logprobs",
-        ]
-        missing_keys = [key for key in required_keys if key not in combined]
-        if missing_keys:
-            raise ValueError(
-                f"Missing required keys for GenerationOutputSpec: {missing_keys}"
-            )
+        if not worker_generator_proxies:
+            return
 
-        return combined
+        # Create a queue to collect sample results from all workers as they complete
+        result_queue = asyncio.Queue()
+        finished_workers = 0
+        total_workers = len(
+            [proxy for proxy in worker_generator_proxies if proxy is not None]
+        )
+
+        async def consume_worker_generator(worker_gen):
+            """Consume a single worker generator and put sample results in the queue."""
+            nonlocal finished_workers
+            try:
+                async for sample_result_ref in worker_gen:
+                    sample_result = await sample_result_ref
+                    await result_queue.put(("sample", sample_result))
+            except Exception as e:
+                await result_queue.put(("error", e))
+            finally:
+                finished_workers += 1
+                await result_queue.put(("worker_done", None))
+
+        # Start tasks for all worker generators
+        worker_tasks = [
+            asyncio.create_task(consume_worker_generator(proxy))
+            for proxy in worker_generator_proxies
+            if proxy is not None
+        ]
+
+        if not worker_tasks:
+            return
+
+        # Yield sample results as they become available from any worker
+        while finished_workers < total_workers:
+            msg_type, item = await result_queue.get()
+
+            if msg_type == "sample":
+                # Yield individual sample result immediately
+                yield item
+            elif msg_type == "error":
+                # Cancel all remaining tasks and propagate error
+                for task in worker_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                raise item
+            elif msg_type == "worker_done":
+                # Worker finished, continue until all are done
+                pass
+
+        # Wait for all tasks to complete
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up."""

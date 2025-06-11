@@ -38,7 +38,9 @@ class MultiWorkerFuture:
     return_from_workers: Optional[list[int]] = None
     called_workers: Optional[list[int]] = None
 
-    def get_results(self, worker_group: "RayWorkerGroup") -> list[Any]:
+    def get_results(
+        self, worker_group: "RayWorkerGroup", return_generators_as_proxies: bool = False
+    ) -> list[Any]:
         """Get results from the futures, optionally respecting tied workers.
 
         When respect_tied_workers is True, this method deduplicates results by returning
@@ -51,53 +53,75 @@ class MultiWorkerFuture:
             worker_group: The RayWorkerGroup that spawned the futures.  The
                 mapping contained in worker_group.worker_to_tied_group_index
                 is required for the deduplication path.
+            return_generators_as_proxies: If True, and a future is an ObjectRefGenerator,
+                                          return the ObjectRefGenerator itself instead of consuming it.
 
         Returns:
             List of results, deduplicated by tied workers if respect_tied_workers is True
         """
         from ray._raylet import ObjectRef, ObjectRefGenerator
 
-        # Flatten futures into a list of ObjectRefs
+        if return_generators_as_proxies:
+            # Directly return the futures, which are expected to be ObjectRefGenerators (or other proxies).
+            # No ray.get() is called on them. The consumer is responsible for handling the proxies.
+            if self.return_from_workers is None:
+                return self.futures
+
+            if self.called_workers is not None:
+                map_called_worker_to_future_idx = {
+                    global_idx: i for i, global_idx in enumerate(self.called_workers)
+                }
+                final_proxies = []
+                for global_worker_to_return in self.return_from_workers:
+                    if global_worker_to_return in map_called_worker_to_future_idx:
+                        future_idx = map_called_worker_to_future_idx[
+                            global_worker_to_return
+                        ]
+                        if future_idx < len(self.futures):
+                            final_proxies.append(self.futures[future_idx])
+                return final_proxies
+            else:
+                return [
+                    self.futures[i]
+                    for i in self.return_from_workers
+                    if i < len(self.futures)
+                ]
+
+        # --- Fallback to original logic if not returning proxies ---
         object_refs: list[ObjectRef] = []
-
         has_generator = False
-
         for idx, fut in enumerate(self.futures):
             if isinstance(fut, ObjectRefGenerator):
-                # ray.get cannot be called directly on the generator object – it must be iterated to obtain the individual ObjectRef instances first.
                 for generated_ref in fut:
                     object_refs.append(generated_ref)
                     has_generator = True
             else:
                 object_refs.append(fut)
 
-        # Retrieve the concrete results.
         all_results = ray.get(object_refs)
 
-        # If expanded generator was present we are in streaming mode.
-        # Every ObjectRef now corresponds to a unique, ordered chunk of data
+        # When generators are consumed, the result is a flat list of all yielded items.
+        # The filtering logic below that relies on indices might not work as intended
+        # because the number of results can be different from the number of workers.
+        # For now, if generators were consumed, we return the flat list.
         if has_generator:
             return all_results
 
         if self.return_from_workers is not None:
             if self.called_workers is not None:
-                # Create a mapping from global worker indices to local indices in all_results
                 worker_to_result_idx = {
                     worker: idx for idx, worker in enumerate(self.called_workers)
                 }
-
-                # Filter return_from_workers to only include workers that were actually called
                 valid_return_workers = [
                     w for w in self.return_from_workers if w in worker_to_result_idx
                 ]
-
-                # Map global worker indices to local result indices and get results
                 return [
                     all_results[worker_to_result_idx[worker]]
                     for worker in valid_return_workers
                 ]
             else:
                 return [all_results[worker] for worker in self.return_from_workers]
+
         return all_results
 
 
@@ -271,6 +295,27 @@ class RayWorkerBuilder:
         # We hold onto a reference to the initializer actor to avoid gc (would kill the child, 'real' actor)
         worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = isolated_initializer
         return worker
+
+    def get_all_worker_results(
+        self,
+        future_bundle: MultiWorkerFuture,
+        return_generators_as_proxies: bool = False,
+    ) -> list[Any]:
+        """Get results from all workers, optionally filtering to get just one result per tied worker group.
+
+        Args:
+            future_bundle: MultiWorkerFuture containing futures and worker information.
+                          When future_bundle.respect_tied_workers is True, only results from
+                          the leaders of tied worker groups are returned.
+            return_generators_as_proxies: If True, and a future in the bundle is an ObjectRefGenerator,
+                                          return the ObjectRefGenerator itself instead of consuming it.
+
+        Returns:
+            List of results, deduplicated as specified in the future_bundle
+        """
+        return future_bundle.get_results(
+            self, return_generators_as_proxies=return_generators_as_proxies
+        )
 
 
 class RayWorkerGroup:
@@ -757,18 +802,26 @@ class RayWorkerGroup:
             return_from_workers=return_from_workers,
         )
 
-    def get_all_worker_results(self, future_bundle: MultiWorkerFuture) -> list[Any]:
+    def get_all_worker_results(
+        self,
+        future_bundle: MultiWorkerFuture,
+        return_generators_as_proxies: bool = False,
+    ) -> list[Any]:
         """Get results from all workers, optionally filtering to get just one result per tied worker group.
 
         Args:
             future_bundle: MultiWorkerFuture containing futures and worker information.
                           When future_bundle.respect_tied_workers is True, only results from
                           the leaders of tied worker groups are returned.
+            return_generators_as_proxies: If True, and a future in the bundle is an ObjectRefGenerator,
+                                          return the ObjectRefGenerator itself instead of consuming it.
 
         Returns:
             List of results, deduplicated as specified in the future_bundle
         """
-        return future_bundle.get_results(self)
+        return future_bundle.get_results(
+            self, return_generators_as_proxies=return_generators_as_proxies
+        )
 
     def shutdown(
         self,

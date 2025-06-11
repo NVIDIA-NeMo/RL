@@ -100,10 +100,10 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
+      async_engine: true # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
       precision: ${policy.precision}
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 2
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
@@ -132,5 +132,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
-  num_nodes: 1
+  gpus_per_node: 8
+  num_nodes: 2
