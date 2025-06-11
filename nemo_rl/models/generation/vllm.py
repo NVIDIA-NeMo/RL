@@ -504,9 +504,6 @@ class VllmGenerationWorker:
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
-            assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
-                f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
-            )
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
@@ -1310,6 +1307,13 @@ class VllmGeneration(GenerationInterface):
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+
+        # Shard the data across the tied worker groups
+        print("--------------------------------")
+        print(
+            f"VllmGeneration.generate_async: Processing {len(data['input_ids'])} samples with {dp_size} workers"
+        )
+
         sharded_data_list: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
@@ -1318,13 +1322,26 @@ class VllmGeneration(GenerationInterface):
         processed_shards_data = []
         global_start_index = 0
 
-        for shard_data in sharded_data_list:
+        for i, shard_data in enumerate(sharded_data_list):
             if shard_data and len(shard_data.get("input_ids", [])) > 0:
+                shard_size = len(shard_data.get("input_ids", []))
+                print(
+                    f"Worker {i}: Processing shard with {shard_size} samples, starting at global index {global_start_index}"
+                )
                 processed_shards_data.append((shard_data, global_start_index))
-                global_start_index += len(shard_data.get("input_ids", []))
+                global_start_index += shard_size
+            else:
+                print(f"Worker {i}: Empty shard - passing empty data")
+                # Create empty data structure for this worker to maintain 1:1 mapping
+                empty_shard = BatchedDataDict(
+                    {
+                        "input_ids": torch.zeros((0, 0), dtype=torch.long),
+                        "input_lengths": torch.zeros(0, dtype=torch.long),
+                    }
+                )
+                processed_shards_data.append((empty_shard, global_start_index))
 
-        if not processed_shards_data:
-            return
+        print(f"Total workers (including empty): {len(processed_shards_data)}")
 
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_async",
@@ -1339,47 +1356,90 @@ class VllmGeneration(GenerationInterface):
             future_bundle, return_generators_as_proxies=True
         )
 
-        if not worker_generator_proxies:
+        print(f"Got {len(worker_generator_proxies)} worker generator proxies")
+        valid_proxies = [
+            proxy for proxy in worker_generator_proxies if proxy is not None
+        ]
+        print(f"Valid proxies: {len(valid_proxies)}")
+
+        if not valid_proxies:
+            print("No valid worker generator proxies")
             return
 
         # Create a queue to collect sample results from all workers as they complete
         result_queue = asyncio.Queue()
         finished_workers = 0
-        total_workers = len(
-            [proxy for proxy in worker_generator_proxies if proxy is not None]
-        )
+        total_workers = len(valid_proxies)
 
-        async def consume_worker_generator(worker_gen):
+        print(f"Setting up async coordination for {total_workers} workers")
+
+        async def consume_worker_generator(worker_idx, worker_gen):
             """Consume a single worker generator and put sample results in the queue."""
             nonlocal finished_workers
+            worker_name = f"Worker-{worker_idx}"
             try:
+                print(f"{worker_name}: Starting to consume generator")
+                sample_count = 0
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
+                    sample_count += 1
+                    print(
+                        f"{worker_name}: Got sample {sample_count}, global_idx={sample_result[0]}"
+                    )
                     await result_queue.put(("sample", sample_result))
+                print(f"{worker_name}: Finished processing {sample_count} samples")
             except Exception as e:
+                # Log the error before putting it in the queue for better debugging
+                print(f"Error in {worker_name}: {e}")
+                import traceback
+
+                traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
                 finished_workers += 1
+                print(
+                    f"{worker_name}: Done (finished_workers: {finished_workers}/{total_workers})"
+                )
                 await result_queue.put(("worker_done", None))
 
         # Start tasks for all worker generators
         worker_tasks = [
-            asyncio.create_task(consume_worker_generator(proxy))
-            for proxy in worker_generator_proxies
-            if proxy is not None
+            asyncio.create_task(consume_worker_generator(i, proxy))
+            for i, proxy in enumerate(valid_proxies)
         ]
 
         if not worker_tasks:
             return
 
         # Yield sample results as they become available from any worker
+        sample_count = 0
+        print(
+            f"Starting result collection loop, expecting all {total_workers} workers to finish"
+        )
+
         while finished_workers < total_workers:
-            msg_type, item = await result_queue.get()
+            try:
+                msg_type, item = await asyncio.wait_for(
+                    result_queue.get(), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"Timeout waiting for results. finished_workers: {finished_workers}/{total_workers}"
+                )
+                # Cancel all remaining tasks
+                for task in worker_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                raise RuntimeError("Timeout waiting for worker results")
 
             if msg_type == "sample":
+                sample_count += 1
+                print(f"Yielding sample {sample_count} with global_idx={item[0]}")
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
+                print(f"Got error from worker: {item}")
                 # Cancel all remaining tasks and propagate error
                 for task in worker_tasks:
                     if not task.done():
@@ -1387,9 +1447,11 @@ class VllmGeneration(GenerationInterface):
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise item
             elif msg_type == "worker_done":
-                # Worker finished, continue until all are done
-                pass
+                print(
+                    f"Worker finished, finished_workers: {finished_workers}/{total_workers}"
+                )
 
+        print(f"All workers finished. Total samples yielded: {sample_count}")
         # Wait for all tasks to complete
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 

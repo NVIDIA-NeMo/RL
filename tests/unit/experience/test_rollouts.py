@@ -62,9 +62,9 @@ def rollout_cluster():
         # Use 1 GPU for simplicity
         cluster_instance = RayVirtualCluster(
             name=cluster_name,
-            bundle_ct_per_node_list=[1],
+            bundle_ct_per_node_list=[8],
             use_gpus=True,
-            num_gpus_per_node=1,
+            num_gpus_per_node=8,
             max_colocated_worker_groups=2,  # Allow policy and env
         )
         yield cluster_instance
