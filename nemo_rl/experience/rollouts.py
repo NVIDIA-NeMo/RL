@@ -15,6 +15,7 @@
 # Generate rollouts for arbitrary environments
 # Supports multi-turn rollouts and many simultaneous environments (E.g. you can train on math, code, multi-turn games and more at once)
 
+import asyncio
 import copy
 from typing import Any
 
@@ -157,14 +158,17 @@ async def generate_responses_async(
         # Sort by original_idx to ensure order matches generation_input_data
         collected_indexed_outputs.sort(key=lambda x: x[0])
 
-        # Extract BDDs in correct order
-        ordered_bdds = [item_bdd for _, item_bdd in collected_indexed_outputs]
+        # Extract in correct order
+        ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
 
-        assert ordered_bdds, "Generation returned no outputs for a non-empty batch."
+        assert ordered_batched_data_dicts, (
+            "Generation returned no outputs for a non-empty batch."
+        )
 
         pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
         generation_outputs = BatchedDataDict.from_batches(
-            ordered_bdds, pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0}
+            ordered_batched_data_dicts,
+            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
         )
     else:
         # Use synchronous generation
@@ -626,8 +630,10 @@ async def run_sample_multi_turn_rollout(
 
     # Track per-turn metrics
     turn_gen_tokens = []
+    import time
 
     for turn in range(max_rollout_turns):
+        print(f"Turn {turn} of {max_rollout_turns} at time {time.time()}")
         if terminated or truncated:
             break
 
@@ -801,9 +807,9 @@ async def run_async_multi_turn_rollout(
         }
         sample_initial_states.append(sample_state)
 
-    # Run samples sequentially for now (could be enhanced to run concurrently later)
-    sample_results = []
-    for i, sample_state in enumerate(sample_initial_states):
+    # Run all samples concurrently
+    async def run_single_sample_with_error_handling(i, sample_state):
+        """Wrapper to handle errors for individual sample rollouts."""
         try:
             result = await run_sample_multi_turn_rollout(
                 sample_idx=i,
@@ -815,29 +821,19 @@ async def run_async_multi_turn_rollout(
                 max_rollout_turns=max_rollout_turns,
                 greedy=greedy,
             )
-            sample_results.append(result)
+            return result
         except Exception as e:
-            print(f"Error in sample {i} rollout: {e}")
-            # Create a fallback state
-            fallback_state = {
-                "message_log": input_batch["message_log"][i],
-                "extra_env_info": input_batch["extra_env_info"][i],
-                "task_name": input_batch["task_name"][i],
-                "total_reward": torch.tensor(0.0),
-                "idx": i,
-            }
-            fallback_metrics = {
-                "turn_count": 0,
-                "total_tokens": 0,
-                "assistant_tokens": 0,
-                "env_tokens": 0,
-                "terminated": False,
-                "truncated": False,
-                "max_turns_reached": False,
-                "total_reward": 0.0,
-                "turn_gen_tokens": [],
-            }
-            sample_results.append((fallback_state, fallback_metrics))
+            assert False, f"Error in sample {i} rollout: {e}"
+            return None
+
+    # Create tasks for all samples and run them concurrently
+    sample_tasks = [
+        run_single_sample_with_error_handling(i, sample_state)
+        for i, sample_state in enumerate(sample_initial_states)
+    ]
+
+    # Execute all sample rollouts concurrently
+    sample_results = await asyncio.gather(*sample_tasks, return_exceptions=True)
 
     # Process results
     final_sample_states = []

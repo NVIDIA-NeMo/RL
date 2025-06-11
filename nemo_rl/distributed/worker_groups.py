@@ -87,7 +87,6 @@ class MultiWorkerFuture:
                     if i < len(self.futures)
                 ]
 
-        # --- Fallback to original logic if not returning proxies ---
         object_refs: list[ObjectRef] = []
         has_generator = False
         for idx, fut in enumerate(self.futures):
@@ -100,10 +99,6 @@ class MultiWorkerFuture:
 
         all_results = ray.get(object_refs)
 
-        # When generators are consumed, the result is a flat list of all yielded items.
-        # The filtering logic below that relies on indices might not work as intended
-        # because the number of results can be different from the number of workers.
-        # For now, if generators were consumed, we return the flat list.
         if has_generator:
             return all_results
 
