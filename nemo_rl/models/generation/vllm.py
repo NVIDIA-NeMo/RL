@@ -584,6 +584,44 @@ class VllmGenerationWorker:
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
+            # Handle case where no tokens can be generated due to length constraints
+            if allowed_new_tokens == 0:
+                # Access the input data directly from the function parameters
+                input_ids_single_row = input_ids_batch[sample_idx]
+
+                # Create output tensors with just the input (no generated tokens)
+                output_ids_single_item_batched = input_ids_single_row[
+                    :current_input_actual_length
+                ].unsqueeze(0)
+
+                logprobs_single_item = torch.zeros(
+                    (1, current_input_actual_length),
+                    dtype=torch.float32,
+                    device=input_ids_single_row.device,
+                )
+
+                generation_lengths_tensor = torch.tensor(
+                    [0], dtype=torch.long, device=input_ids_single_row.device
+                )
+
+                unpadded_sequence_lengths_tensor = torch.tensor(
+                    [current_input_actual_length],
+                    dtype=torch.long,
+                    device=input_ids_single_row.device,
+                )
+
+                result_batch = BatchedDataDict[GenerationOutputSpec](
+                    {
+                        "output_ids": output_ids_single_item_batched,
+                        "logprobs": logprobs_single_item,
+                        "generation_lengths": generation_lengths_tensor,
+                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    }
+                )
+
+                global_index = start_original_index + sample_idx
+                return (global_index, result_batch)
+
             sampling_params_for_request = self._build_sampling_params(
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
@@ -1309,10 +1347,10 @@ class VllmGeneration(GenerationInterface):
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
 
         # Shard the data across the tied worker groups
-        print("--------------------------------")
-        print(
-            f"VllmGeneration.generate_async: Processing {len(data['input_ids'])} samples with {dp_size} workers"
-        )
+        # print("--------------------------------")
+        # print(
+        #     f"VllmGeneration.generate_async: Processing {len(data['input_ids'])} samples with {dp_size} workers"
+        # )
 
         sharded_data_list: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
@@ -1325,13 +1363,13 @@ class VllmGeneration(GenerationInterface):
         for i, shard_data in enumerate(sharded_data_list):
             if shard_data and len(shard_data.get("input_ids", [])) > 0:
                 shard_size = len(shard_data.get("input_ids", []))
-                print(
-                    f"Worker {i}: Processing shard with {shard_size} samples, starting at global index {global_start_index}"
-                )
+                # print(
+                #     f"Worker {i}: Processing shard with {shard_size} samples, starting at global index {global_start_index}"
+                # )
                 processed_shards_data.append((shard_data, global_start_index))
                 global_start_index += shard_size
             else:
-                print(f"Worker {i}: Empty shard - passing empty data")
+                # print(f"Worker {i}: Empty shard - passing empty data")
                 # Create empty data structure for this worker to maintain 1:1 mapping
                 empty_shard = BatchedDataDict(
                     {
@@ -1341,7 +1379,7 @@ class VllmGeneration(GenerationInterface):
                 )
                 processed_shards_data.append((empty_shard, global_start_index))
 
-        print(f"Total workers (including empty): {len(processed_shards_data)}")
+        # print(f"Total workers (including empty): {len(processed_shards_data)}")
 
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_async",
@@ -1356,14 +1394,14 @@ class VllmGeneration(GenerationInterface):
             future_bundle, return_generators_as_proxies=True
         )
 
-        print(f"Got {len(worker_generator_proxies)} worker generator proxies")
+        # print(f"Got {len(worker_generator_proxies)} worker generator proxies")
         valid_proxies = [
             proxy for proxy in worker_generator_proxies if proxy is not None
         ]
-        print(f"Valid proxies: {len(valid_proxies)}")
+        # print(f"Valid proxies: {len(valid_proxies)}")
 
         if not valid_proxies:
-            print("No valid worker generator proxies")
+            # print("No valid worker generator proxies")
             return
 
         # Create a queue to collect sample results from all workers as they complete
@@ -1371,35 +1409,35 @@ class VllmGeneration(GenerationInterface):
         finished_workers = 0
         total_workers = len(valid_proxies)
 
-        print(f"Setting up async coordination for {total_workers} workers")
+        # print(f"Setting up async coordination for {total_workers} workers")
 
         async def consume_worker_generator(worker_idx, worker_gen):
             """Consume a single worker generator and put sample results in the queue."""
             nonlocal finished_workers
             worker_name = f"Worker-{worker_idx}"
             try:
-                print(f"{worker_name}: Starting to consume generator")
+                # print(f"{worker_name}: Starting to consume generator")
                 sample_count = 0
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
                     sample_count += 1
-                    print(
-                        f"{worker_name}: Got sample {sample_count}, global_idx={sample_result[0]}"
-                    )
+                    # print(
+                    #     f"{worker_name}: Got sample {sample_count}, global_idx={sample_result[0]}"
+                    # )
                     await result_queue.put(("sample", sample_result))
-                print(f"{worker_name}: Finished processing {sample_count} samples")
+                # print(f"{worker_name}: Finished processing {sample_count} samples")
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging
-                print(f"Error in {worker_name}: {e}")
+                # print(f"Error in {worker_name}: {e}")
                 import traceback
 
                 traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
                 finished_workers += 1
-                print(
-                    f"{worker_name}: Done (finished_workers: {finished_workers}/{total_workers})"
-                )
+                # print(
+                #     f"{worker_name}: Done (finished_workers: {finished_workers}/{total_workers})"
+                # )
                 await result_queue.put(("worker_done", None))
 
         # Start tasks for all worker generators
@@ -1413,9 +1451,9 @@ class VllmGeneration(GenerationInterface):
 
         # Yield sample results as they become available from any worker
         sample_count = 0
-        print(
-            f"Starting result collection loop, expecting all {total_workers} workers to finish"
-        )
+        # print(
+        #     f"Starting result collection loop, expecting all {total_workers} workers to finish"
+        # )
 
         while finished_workers < total_workers:
             try:
@@ -1435,23 +1473,23 @@ class VllmGeneration(GenerationInterface):
 
             if msg_type == "sample":
                 sample_count += 1
-                print(f"Yielding sample {sample_count} with global_idx={item[0]}")
+                # print(f"Yielding sample {sample_count} with global_idx={item[0]}")
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
-                print(f"Got error from worker: {item}")
+                # print(f"Got error from worker: {item}")
                 # Cancel all remaining tasks and propagate error
                 for task in worker_tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise item
-            elif msg_type == "worker_done":
-                print(
-                    f"Worker finished, finished_workers: {finished_workers}/{total_workers}"
-                )
+            # elif msg_type == "worker_done":
+            #     print(
+            #         f"Worker finished, finished_workers: {finished_workers}/{total_workers}"
+            #     )
 
-        print(f"All workers finished. Total samples yielded: {sample_count}")
+        # print(f"All workers finished. Total samples yielded: {sample_count}")
         # Wait for all tasks to complete
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 

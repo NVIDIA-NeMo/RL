@@ -630,10 +630,9 @@ async def run_sample_multi_turn_rollout(
 
     # Track per-turn metrics
     turn_gen_tokens = []
-    import time
 
     for turn in range(max_rollout_turns):
-        print(f"Turn {turn} of {max_rollout_turns} at time {time.time()}")
+        # print(f"Turn {turn} of {max_rollout_turns} at time {time.time()}")
         if terminated or truncated:
             break
 
@@ -858,6 +857,11 @@ async def run_async_multi_turn_rollout(
             "idx": [state.get("idx", i) for i, state in enumerate(final_sample_states)],
         }
     )
+
+    # Preserve additional fields from the original input_batch
+    for key in input_batch.keys():
+        if key not in final_batch:
+            final_batch[key] = input_batch[key]
 
     # Aggregate metrics across all samples
     rollout_metrics = {

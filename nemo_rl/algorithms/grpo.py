@@ -41,7 +41,10 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
 )
-from nemo_rl.experience.rollouts import run_multi_turn_rollout
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
@@ -283,6 +286,23 @@ def setup(
 # ===============================================================================
 
 
+def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
+    """Determine if async rollouts should be used based on the configuration.
+
+    Returns True if vLLM backend is used with async_engine enabled.
+    """
+    generation_config = master_config["policy"]["generation"]
+    if generation_config is None:
+        return False
+
+    backend = generation_config.get("backend", "")
+    if backend != "vllm":
+        return False
+
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    return vllm_cfg.get("async_engine", False)
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -322,7 +342,7 @@ def refit_policy_generation(
 # ===============================================================================
 
 
-def grpo_train(
+async def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
@@ -360,7 +380,7 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        val_metrics, validation_timings = validate(
+        val_metrics, validation_timings = await validate(
             policy_generation,
             val_dataloader,
             tokenizer,
@@ -405,15 +425,34 @@ def grpo_train(
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
-                repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
+                # Use async rollouts if vLLM async engine is enabled
+                if _should_use_async_rollouts(master_config):
+                    (
+                        repeated_batch,
+                        rollout_metrics,
+                    ) = await run_async_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+                else:
+                    repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
                 policy_generation.finish_generation()
 
             # Calculate rewards & advantages
@@ -515,7 +554,7 @@ def grpo_train(
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
-                val_metrics, validation_timings = validate(
+                val_metrics, validation_timings = await validate(
                     policy_generation,
                     val_dataloader,
                     tokenizer,
@@ -614,7 +653,7 @@ def grpo_train(
             break
 
 
-def validate(
+async def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
@@ -644,15 +683,27 @@ def validate(
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            val_batch, gen_metrics = run_multi_turn_rollout(
-                policy_generation,
-                val_batch,
-                tokenizer,
-                val_task_to_env,
-                max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                greedy=False,
-            )
+            # Use async rollouts if vLLM async engine is enabled
+            if _should_use_async_rollouts(master_config):
+                val_batch, gen_metrics = await run_async_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
+            else:
+                val_batch, gen_metrics = run_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
             rewards = val_batch["total_reward"]
 
             total_rewards.extend(rewards.tolist())
