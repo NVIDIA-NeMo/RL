@@ -36,6 +36,8 @@ dependencies = [
     "nvidia-ml-py",
     "hydra-core",
     "debugpy",
+    "matplotlib",
+    "plotly"
 ]
 
 [project.optional-dependencies]

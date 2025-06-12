@@ -609,7 +609,6 @@ async def grpo_train(
         log_data["input_lengths"] = input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
-        print("\n📊 Training Results:")
         metrics = {
             "loss": train_results["loss"].numpy(),
             "reward": rewards.numpy(),
@@ -624,6 +623,22 @@ async def grpo_train(
         metrics.update(rollout_metrics)
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+        # track example with high token mult prob error above 1.05
+        if metrics["token_mult_prob_error"] > 1.05:
+            logger.log_plot_token_mult_prob_error(
+                {
+                    "prompt_lengths": repeated_batch["length"],
+                    "full_lengths": input_lengths,
+                    "generation_logprobs": train_data["generation_logprobs"],
+                    "prev_logprobs": train_data["prev_logprobs"],
+                    "token_mask": train_data["token_mask"],
+                    "sample_mask": train_data["sample_mask"],
+                },
+                step + 1,
+                name="train/token_mult_prob_error_plot_sample",
+            )
+
+        print("\n📊 Training Results:")
 
         print(f"  • Loss: {metrics['loss']:.4f}")
         print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")

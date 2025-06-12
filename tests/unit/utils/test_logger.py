@@ -17,6 +17,7 @@ import tempfile
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from nemo_rl.utils.logger import (
     Logger,
@@ -1042,3 +1043,58 @@ class TestLogger:
         mock_tb_instance.log_metrics.assert_called_once_with(
             metrics, step, prefix, step_metric
         )
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_log_plot_token_mult_prob_error(
+        self, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test logging token probability error plots."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": True,
+            "monitor_gpus": False,
+            "wandb": {"project": "test-project"},
+            "tensorboard": {"log_dir": "test_logs"},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        # Create mock logger instances
+        mock_wandb_instance = mock_wandb_logger.return_value
+        mock_tb_instance = mock_tb_logger.return_value
+
+        # Create sample data
+        data = {
+            "token_mask": torch.ones((1, 10)),
+            "sample_mask": torch.ones(1),
+            "generation_logprobs": torch.randn((1, 10)),
+            "prev_logprobs": torch.randn((1, 10)),
+            "prompt_lengths": torch.tensor([2]),
+            "full_lengths": torch.tensor([8]),
+        }
+        step = 10
+        name = "test_plot"
+
+        # Log the plot
+        logger.log_plot_token_mult_prob_error(data, step, name)
+
+        # Check that log_plot was called on both loggers
+        mock_wandb_instance.log_plot.assert_called_once()
+        mock_tb_instance.log_plot.assert_called_once()
+
+        # Verify the plot was created with correct data
+        wandb_call_args = mock_wandb_instance.log_plot.call_args[0]
+        fig = wandb_call_args[0]
+        ax = fig.axes[0]
+
+        # Check plot elements
+        assert len(ax.lines) == 5  # Three lines for data + two points for max errors
+        assert ax.get_xlabel() == "Token Position (starting from prompt end)"
+        assert ax.get_ylabel() == "Log Probability/Difference"
+        assert ax.get_legend() is not None  # Legend should exist
+
+        # Verify the legend labels
+        legend_texts = [text.get_text() for text in ax.get_legend().get_texts()]
+        assert any("Max abs error" in text for text in legend_texts)
+        assert any("Max rel error (prob)" in text for text in legend_texts)
