@@ -51,6 +51,13 @@ large_model_vllm_config: VllmConfig = {
         "skip_tokenizer_init": False,
         "load_format": "auto",
     },
+    "colocated": {
+        "enabled": True,
+        "resources": {
+            "gpus_per_node": None,
+            "num_nodes": None,
+        },
+    },
     "vllm_kwargs": {},
 }
 

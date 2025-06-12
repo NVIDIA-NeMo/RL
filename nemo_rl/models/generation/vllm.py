@@ -342,6 +342,19 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
+    def init_collective(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
+        self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                rank_prefix,
+                ip,
+                port,
+                world_size,
+            ),
+        )
+
     def llm(self):
         return self.llm
 
@@ -945,6 +958,42 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+        """Update the model weights from collective communication."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_collective", args=(info,)
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def reset_prefix_cache(self):
+        """Reset the prefix cache of vLLM engine."""
+        self.llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def sleep(self):
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
@@ -1229,6 +1278,29 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def init_collective(
+        self, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Prepare rank
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = len(self.worker_group.tied_workers_groups[0])
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        # Send world_size and rank for init collective to all workers
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_collective",
+            data=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+        )
+
+        # this function should co-work with hf_policy, so we should wait for all futures to complete outside
+        return futures
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1445,7 +1517,11 @@ class VllmGeneration(GenerationInterface):
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Wake workers up."""
+        """Wake workers up for colocated inference."""
+        # non-colocated no need to wake up
+        if not self.cfg["colocated"]["enabled"]:
+            return True
+
         try:
             # Choose the appropriate method based on async_engine setting
             method_name = (
@@ -1465,12 +1541,16 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers."""
+        """Sleep workers and reset prefix cache."""
         try:
-            # Choose the appropriate method based on async_engine setting
-            method_name = (
-                "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
-            )
+            # Choose the appropriate method based on setting
+            # non-colocated only needs reset prefix cache, no need to sleep.
+            if not self.cfg["colocated"]["enabled"]:
+                method_name = "reset_prefix_cache"
+            else:
+                method_name = (
+                    "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+                )
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
@@ -1533,8 +1613,25 @@ class VllmGeneration(GenerationInterface):
             results = ray.get(futures)
             return all(result for result in results if result is not None)
         except Exception as e:
-            print(f"Error updating weights: {e}")
+            print(f"Error during update weights: {e}")
             return False
+
+    def update_weights_from_collective(
+        self, info: dict[str, Any]
+    ) -> list[ray.ObjectRef]:
+        """Update weights of the policy using collective communication."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Use run_all_workers_single_data to send data to all workers
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_from_collective",
+            info=info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+        # this function should co-work with hf_policy, so we should wait for all futures to complete outside
+        return futures
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

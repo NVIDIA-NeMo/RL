@@ -106,6 +106,14 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len

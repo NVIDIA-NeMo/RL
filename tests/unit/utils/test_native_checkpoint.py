@@ -66,7 +66,9 @@ simple_policy_config = {
     },
     "max_grad_norm": 1.0,
     "generation": {
+        "backend": "vllm",
         "temperature": 1.0,
+        "colocated": {"enabled": True},
     },
 }
 

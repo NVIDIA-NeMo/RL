@@ -128,7 +128,7 @@ class DTensorPolicyWorker:
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
-        rank = torch.distributed.get_rank()
+        self.rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
 
@@ -144,7 +144,7 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        print(f"[Rank {rank}] Loading model {model_name} on CPU...")
+        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="cpu",  # load weights onto CPU initially
@@ -261,6 +261,23 @@ class DTensorPolicyWorker:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
+
+    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        # keep the same behavior as vllm
+        # see https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/env_override.py#L25
+        if not os.path.exists("/dev/nvidia-caps-imex-channels"):
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+        if self.rank == 0:
+            pg = StatelessProcessGroup.create(
+                host=ip, port=port, rank=0, world_size=world_size
+            )
+            device = torch.cuda.current_device()
+            self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self) -> bool:
         return True
@@ -752,6 +769,34 @@ class DTensorPolicyWorker:
             all_handles.append((key, handle))
 
         return {device_uuid: all_handles}
+
+    @torch.no_grad()
+    def prepare_info_for_collective(self) -> dict[str, Any]:
+        """Prepare the info for collective communication.
+
+        Returns:
+            dict: A dictionary containing the info for collective communication.
+        """
+        # Get state_dict
+        self.model = self.move_to_cuda(self.model)
+        state_dict = self.model.state_dict()
+
+        # Collect info for collective communication
+        state_dict_info = {}
+        for name, tensor in state_dict.items():
+            state_dict_info[name] = (tensor.shape, self.dtype)
+
+        return state_dict_info
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(self) -> None:
+        """Broadcast the weights for collective communication."""
+        for _, tensor in self.model.state_dict().items():
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            if self.rank == 0:
+                tensor = tensor.to(self.dtype, non_blocking=True)
+                self.model_update_group.broadcast(tensor.data, src=0)
 
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
