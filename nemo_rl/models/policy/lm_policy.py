@@ -43,13 +43,13 @@ from nemo_rl.models.policy.interfaces import (
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
-class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
+class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __init__(
         self,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
         tokenizer: PreTrainedTokenizerBase,
-        name_prefix: str = "hf_policy",
+        name_prefix: str = "lm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
         weights_path: Optional[PathLike] = None,

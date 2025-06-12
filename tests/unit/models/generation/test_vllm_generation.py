@@ -29,7 +29,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -167,7 +167,7 @@ def _create_ray_virtual_cluster_for_test(name: str) -> RayVirtualCluster:
 
 @pytest.fixture(scope="function")
 def policy_cluster_separate():
-    """Create a virtual cluster for the HfPolicy, using 1 GPU."""
+    """Create a virtual cluster for the Policy, using 1 GPU."""
     cluster = _create_ray_virtual_cluster_for_test("vllm-test-policy-cluster-separate")
     yield cluster
     try:
@@ -302,7 +302,7 @@ async def test_vllm_policy_generation_async(
     """Test vLLM policy async generation capabilities."""
     # Ensure the policy is configured for async generation
     # Create separate configs for each policy
-    hf_policy = None
+    lm_policy = None
     async_policy = None
     try:
         vllm_config = deepcopy(basic_vllm_test_config)
@@ -311,15 +311,15 @@ async def test_vllm_policy_generation_async(
         vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
         vllm_config["vllm_cfg"]["pipeline_parallel_size"] = pipeline_parallel_size
         hf_config = get_basic_hf_test_config(enable_dtensor=True)
-        from nemo_rl.models.policy.hf_policy import HfPolicy
+        from nemo_rl.models.policy.lm_policy import Policy
 
         async_policy = VllmGeneration(cluster, vllm_config)
         async_policy.finish_generation()
         print("creating hf policy...")
 
-        hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+        lm_policy = Policy(cluster, hf_config, tokenizer)
         refit_policy_generation(
-            hf_policy, async_policy, vllm_config["colocated"]["enabled"]
+            lm_policy, async_policy, vllm_config["colocated"]["enabled"]
         )
 
         outputs = async_policy.generate_async(test_input_data)
@@ -359,8 +359,8 @@ async def test_vllm_policy_generation_async(
         print("Cleaning up resources...")
         if async_policy:
             async_policy.shutdown()
-        if hf_policy and hasattr(hf_policy, "shutdown"):
-            hf_policy.shutdown()
+        if lm_policy and hasattr(lm_policy, "shutdown"):
+            lm_policy.shutdown()
 
 
 @pytest.mark.skip(
@@ -409,13 +409,13 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     policy = VllmGeneration(cluster, vllm_config)
     policy.finish_generation()
 
-    from nemo_rl.models.policy.hf_policy import HfPolicy
+    from nemo_rl.models.policy.lm_policy import Policy
 
     hf_config = get_basic_hf_test_config(enable_dtensor=False)
-    hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+    lm_policy = Policy(cluster, hf_config, tokenizer)
 
     print("refitting vllm policy...")
-    refit_policy_generation(hf_policy, policy, vllm_config["colocated"]["enabled"])
+    refit_policy_generation(lm_policy, policy, vllm_config["colocated"]["enabled"])
 
     try:
         # Generate with duplicated prompts
@@ -517,7 +517,7 @@ def test_vllm_generation_with_hf_training(
 
     This test validates that the two policies can work together.
     """
-    from nemo_rl.models.policy.hf_policy import HfPolicy
+    from nemo_rl.models.policy.lm_policy import Policy
     from tests.unit.test_utils import SimpleNLLLoss
 
     # Create separate configs for each policy
@@ -529,7 +529,7 @@ def test_vllm_generation_with_hf_training(
     hf_config["train_global_batch_size"] = 4
 
     vllm_policy = None
-    hf_policy = None
+    lm_policy = None
 
     try:
         prompts = [
@@ -568,11 +568,11 @@ def test_vllm_generation_with_hf_training(
         vllm_policy.finish_generation()
 
         print("Creating HF policy...")
-        hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+        lm_policy = Policy(cluster, hf_config, tokenizer)
 
         print("refitting vllm policy...")
         refit_policy_generation(
-            hf_policy, vllm_policy, vllm_config["colocated"]["enabled"]
+            lm_policy, vllm_policy, vllm_config["colocated"]["enabled"]
         )
 
         # Step 1: Use vLLM for generation
@@ -606,8 +606,8 @@ def test_vllm_generation_with_hf_training(
             }
         )
         # Get logprobs from HF policy
-        hf_policy.prepare_for_lp_inference()
-        fprop_results = hf_policy.get_logprobs(fprop_logprob_data)
+        lm_policy.prepare_for_lp_inference()
+        fprop_results = lm_policy.get_logprobs(fprop_logprob_data)
         # Zero out logprobs for input tokens
 
         print(f"HF logprobs: {fprop_results['logprobs']}")
@@ -666,14 +666,14 @@ def test_vllm_generation_with_hf_training(
 
         # Step 3: Try a minimal training step with HF policy
         print("Training with HF policy (single step)...")
-        hf_policy.prepare_for_training()
+        lm_policy.prepare_for_training()
 
         # Just do one training step to verify it works
-        results = hf_policy.train(train_data, SimpleNLLLoss())
+        results = lm_policy.train(train_data, SimpleNLLLoss())
         print(f"Training loss: {results['loss']}")
 
-        hf_policy.finish_training()
-        hf_policy.offload_after_refit()
+        lm_policy.finish_training()
+        lm_policy.offload_after_refit()
 
         # Step 4: Use vLLM for generation again to complete the workflow
         print("Using vLLM for generation again...")
@@ -694,8 +694,8 @@ def test_vllm_generation_with_hf_training(
         print("Cleaning up resources...")
         if vllm_policy:
             vllm_policy.shutdown()
-        if hf_policy and hasattr(hf_policy, "shutdown"):
-            hf_policy.shutdown()
+        if lm_policy and hasattr(lm_policy, "shutdown"):
+            lm_policy.shutdown()
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
@@ -797,7 +797,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, enable_dtensor
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
-    from nemo_rl.models.policy.hf_policy import HfPolicy
+    from nemo_rl.models.policy.lm_policy import Policy
 
     # Create configs
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -810,10 +810,10 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 
     # Create policies
     vllm_policy = None
-    hf_policy = None
+    lm_policy = None
     try:
         print(f"Creating HF policy for TP={tensor_parallel_size}...")
-        hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+        lm_policy = Policy(cluster, hf_config, tokenizer)
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
@@ -846,14 +846,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         ray.get(
             [
                 worker._add_noise_to_weights.remote()
-                for worker in hf_policy.worker_group.workers
+                for worker in lm_policy.worker_group.workers
             ]
         )
 
         print("Updating vLLM weights from HF policy...")
-        grouped_param_keys = hf_policy.prepare_weights_for_ipc()
+        grouped_param_keys = lm_policy.prepare_weights_for_ipc()
         for keys in grouped_param_keys:
-            ipc_handles = hf_policy.get_weights_ipc_handles(keys)
+            ipc_handles = lm_policy.get_weights_ipc_handles(keys)
             update_success = vllm_policy.update_weights(ipc_handles)
             assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
@@ -884,8 +884,8 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         print("Cleaning up resources...")
         if vllm_policy:
             vllm_policy.shutdown()
-        if hf_policy:
-            hf_policy.shutdown()
+        if lm_policy:
+            lm_policy.shutdown()
         # Force garbage collection to help release resources
         import gc
 
@@ -896,7 +896,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 @pytest.mark.parametrize("enable_dtensor", [True, False])
 def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
     """Test that vLLM streaming weight update and can save memory."""
-    from nemo_rl.models.policy.hf_policy import HfPolicy
+    from nemo_rl.models.policy.lm_policy import Policy
 
     if cluster.num_gpus_per_node < 2:
         pytest.skip("Need at least 2 GPUs per node for this test")
@@ -917,16 +917,16 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
 
     print("Creating HF policy...")
     hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
-    hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+    lm_policy = Policy(cluster, hf_config, tokenizer)
 
     print("refitting vllm policy...")
     # take it outside statistics to get clean peak memory during refit
-    hf_policy.offload_before_refit()
+    lm_policy.offload_before_refit()
     # reset peak memory stats before refit
-    workers = hf_policy.worker_group.workers
+    workers = lm_policy.worker_group.workers
     ray.get([w.reset_peak_memory_stats.remote() for w in workers])
     refit_policy_generation(
-        hf_policy,
+        lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
         _refit_buffer_size_gb=1,
@@ -958,7 +958,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
 
     # Clean up
     vllm_policy.shutdown()
-    hf_policy.shutdown()
+    lm_policy.shutdown()
 
 
 @pytest.mark.parametrize("is_eval", [True, False])
@@ -967,7 +967,7 @@ def test_vllm_generation_with_stop(
     cluster, test_input_data, tokenizer, is_eval, enable_dtensor
 ):
     """Test vLLM generation with stop."""
-    from nemo_rl.models.policy.hf_policy import HfPolicy
+    from nemo_rl.models.policy.lm_policy import Policy
 
     # Create separate configs for each policy
     vllm_config = basic_vllm_test_config.copy()
@@ -994,11 +994,11 @@ def test_vllm_generation_with_stop(
 
         print("Creating HF policy...")
         hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
-        hf_policy = HfPolicy(cluster, hf_config, tokenizer)
+        lm_policy = Policy(cluster, hf_config, tokenizer)
 
         print("refitting vllm policy...")
         refit_policy_generation(
-            hf_policy, vllm_generation, vllm_config["colocated"]["enabled"]
+            lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
         )
 
     # test generate
@@ -1025,7 +1025,7 @@ def test_vllm_generation_with_stop(
     # Clean up
     vllm_generation.shutdown()
     if not is_eval:
-        hf_policy.shutdown()
+        lm_policy.shutdown()
 
 
 def test_vllm_non_divisible_batch_handling(policy):
@@ -1072,11 +1072,11 @@ def test_vllm_refit_non_collocated_handles_update(
             "Test requires at least two GPUs to run policies on separate clusters."
         )
 
-    # Create HfPolicy on its own cluster
+    # Create Policy on its own cluster
     hf_config = get_basic_hf_test_config(enable_dtensor=True)
     hf_config["dtensor_cfg"]["tensor_parallel_size"] = 1
     hf_config["generation"]["colocated"]["enabled"] = False
-    hf_policy = HfPolicy(policy_cluster_separate, hf_config, tokenizer)
+    lm_policy = Policy(policy_cluster_separate, hf_config, tokenizer)
 
     # Create VllmGeneration policy on its own cluster
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -1087,13 +1087,13 @@ def test_vllm_refit_non_collocated_handles_update(
 
     # initialize collective communication for update weights
     ip, port = ray.get(_get_node_ip_and_free_port.remote())
-    futures_train = hf_policy.init_collective(ip, port, world_size=2)
+    futures_train = lm_policy.init_collective(ip, port, world_size=2)
     futures_inference = vllm_generation.init_collective(ip, port, world_size=2)
     ray.get(futures_train + futures_inference)
 
     print("refitting vllm policy...")
     refit_policy_generation(
-        hf_policy, vllm_generation, vllm_config["colocated"]["enabled"]
+        lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
     )
 
     # test generate
@@ -1107,4 +1107,4 @@ def test_vllm_refit_non_collocated_handles_update(
 
     # Clean up
     vllm_generation.shutdown()
-    hf_policy.shutdown()
+    lm_policy.shutdown()

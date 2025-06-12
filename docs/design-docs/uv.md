@@ -40,7 +40,7 @@ This section outlines how workers define their required executables, details the
 
 ### Worker Configuration
 
-In our codebase, workers (classes decorated with `@ray.remote`, e.g., `HFPolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are set in a global registry in [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py). This allows different parts of our application to have their own tailored environments.
+In our codebase, workers (classes decorated with `@ray.remote`, e.g., `PolicyWorker`) are associated with a `PY_EXECUTABLE` which specifies what dependencies the worker needs. These are set in a global registry in [`ACTOR_ENVIRONMENT_REGISTRY`](../../nemo_rl/distributed/ray_actor_environment_registry.py). This allows different parts of our application to have their own tailored environments.
 
 ### Supported Python Executables
 

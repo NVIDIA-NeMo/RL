@@ -1298,7 +1298,7 @@ class VllmGeneration(GenerationInterface):
             common_kwargs={"ip": ip, "port": port, "world_size": world_size},
         )
 
-        # this function should co-work with hf_policy, so we should wait for all futures to complete outside
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
     def generate(
@@ -1630,7 +1630,7 @@ class VllmGeneration(GenerationInterface):
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
-        # this function should co-work with hf_policy, so we should wait for all futures to complete outside
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
     def __del__(self) -> None:

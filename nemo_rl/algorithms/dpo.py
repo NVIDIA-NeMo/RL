@@ -32,8 +32,8 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
 from nemo_rl.models.policy.interfaces import PolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import Timer
@@ -95,7 +95,7 @@ def setup(
     train_dataset: AllTaskProcessedDataset,
     val_dataset: AllTaskProcessedDataset,
 ) -> tuple[
-    HfPolicy,
+    Policy,
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
@@ -202,7 +202,7 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    policy = HfPolicy(
+    policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
