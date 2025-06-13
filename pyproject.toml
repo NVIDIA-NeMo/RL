@@ -23,6 +23,7 @@ dependencies = [
     "setuptools",
     "torch==2.7.0",
     "triton",
+    "flash-attn",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     "transformers>=4.51.0",
@@ -74,6 +75,8 @@ build = [
     "hatchling",
     # Build requirement for mcore
     "pybind11",
+    # Build requirement for flash-attn
+    "psutil",
 ]
 docs = [
     "sphinx",
@@ -112,6 +115,7 @@ torchvision = [
 triton = [
   { index = "pytorch-cu128" },
 ]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12'" }
 
 [tool.uv.workspace]
 members = [
@@ -125,8 +129,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-# Currently, TE must be built with no build-isolation b/c it requires torch
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "megatron-core"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -136,6 +139,11 @@ default-groups = ["dev", "build"]
 #  --link-mode=copy (slower but more reliable; supresses warning)
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
+
+# Needed when building from source
+#[[tool.uv.dependency-metadata]]
+#name = "flash-attn"
+#requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [tool.black]
 line-length = 120

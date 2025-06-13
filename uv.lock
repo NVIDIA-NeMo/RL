@@ -590,7 +590,7 @@ wheels = [
 
 [[package]]
 name = "coverage"
-version = "7.8.2"
+version = "7.9.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ba/07/998afa4a0ecdf9b1981ae05415dad2d4e7716e1b1f00abbd91691ac09ac9/coverage-7.8.2.tar.gz", hash = "sha256:a886d531373a1f6ff9fad2a2ba4a045b68467b779ae729ee0b3b10ac20033b27", size = 812759, upload-time = "2025-05-23T11:39:57.856Z" }
 wheels = [
@@ -1189,7 +1189,7 @@ wheels = [
 
 [[package]]
 name = "google-api-core"
-version = "2.25.0"
+version = "2.25.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-auth" },
@@ -1378,7 +1378,7 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "0.32.5"
+version = "0.33.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -2049,7 +2049,7 @@ requires-dist = [
 
 [[package]]
 name = "mistral-common"
-version = "1.6.0"
+version = "1.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonschema" },
@@ -2284,11 +2284,11 @@ wheels = [
 
 [[package]]
 name = "narwhals"
-version = "1.41.0"
+version = "1.42.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/32/fc/7b9a3689911662be59889b1b0b40e17d5dba6f98080994d86ca1f3154d41/narwhals-1.41.0.tar.gz", hash = "sha256:0ab2e5a1757a19b071e37ca74b53b0b5426789321d68939738337dfddea629b5", size = 488446, upload-time = "2025-05-26T12:46:07.43Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/d6/168a787b7800d6c89846b791e4f5ee6b94998a80c8c2838a019d3d71984d/narwhals-1.42.1.tar.gz", hash = "sha256:50a5635b11aeda98cf9c37e839fd34b0a24159f59a4dfae930290ad698320494", size = 492865, upload-time = "2025-06-12T15:15:13.222Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/e0/ade8619846645461c012498f02b93a659e50f07d9d9a6ffefdf5ea2c02a0/narwhals-1.41.0-py3-none-any.whl", hash = "sha256:d958336b40952e4c4b7aeef259a7074851da0800cf902186a58f2faeff97be02", size = 357968, upload-time = "2025-05-26T12:46:05.207Z" },
+    { url = "https://files.pythonhosted.org/packages/79/3f/8d450588206b437dd239a6d44230c63095e71135bd95d5a74347d07adbd5/narwhals-1.42.1-py3-none-any.whl", hash = "sha256:7a270d44b94ccdb277a799ae890c42e8504c537c1849f195eb14717c6184977a", size = 359888, upload-time = "2025-06-12T15:15:11.643Z" },
 ]
 
 [[package]]
@@ -2300,6 +2300,8 @@ dependencies = [
     { name = "colored" },
     { name = "datasets" },
     { name = "debugpy" },
+    { name = "flash-attn", version = "2.8.0.post2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or sys_platform != 'linux'" },
+    { name = "flash-attn", version = "2.8.0.post2", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }, marker = "python_full_version < '3.13' and sys_platform == 'linux'" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2335,6 +2337,7 @@ build = [
     { name = "einops" },
     { name = "hatchling" },
     { name = "packaging" },
+    { name = "psutil" },
     { name = "pybind11" },
     { name = "setuptools" },
     { name = "torch" },
@@ -2368,6 +2371,8 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "debugpy" },
+    { name = "flash-attn", marker = "python_full_version != '3.12.*' or sys_platform != 'linux'" },
+    { name = "flash-attn", marker = "python_full_version == '3.12.*' and sys_platform == 'linux'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2398,6 +2403,7 @@ build = [
     { name = "einops" },
     { name = "hatchling" },
     { name = "packaging" },
+    { name = "psutil" },
     { name = "pybind11" },
     { name = "setuptools" },
     { name = "torch", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" },
@@ -3706,10 +3712,11 @@ wheels = [
 
 [[package]]
 name = "pytest-cov"
-version = "6.1.1"
+version = "6.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coverage" },
+    { name = "pluggy" },
     { name = "pytest" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/25/69/5f1e57f6c5a39f81411b550027bf72842c4567ff5fd572bed1edc9e4b5d9/pytest_cov-6.1.1.tar.gz", hash = "sha256:46935f7aaefba760e716c2ebfbe1c216240b9592966e7da99ea8292d4d3e2a0a", size = 66857, upload-time = "2025-04-05T14:07:51.592Z" }
@@ -4263,7 +4270,7 @@ wheels = [
 
 [[package]]
 name = "sentry-sdk"
-version = "2.29.1"
+version = "2.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -4894,7 +4901,7 @@ name = "triton"
 version = "3.3.0"
 source = { registry = "https://download.pytorch.org/whl/cu128" }
 dependencies = [
-    { name = "setuptools" },
+    { name = "setuptools", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/triton-3.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" },

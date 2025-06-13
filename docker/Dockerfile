@@ -53,8 +53,8 @@ COPY --link 3rdparty/ ./3rdparty/
 
 # Variables to control the build of TE. If there are issues with parallelization, consider
 # setting these to 1.
-ARG MAX_JOBS=4
-ARG NVTE_BUILD_THREADS_PER_JOB=1
+ARG MAX_JOBS
+ARG NVTE_BUILD_THREADS_PER_JOB
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -62,6 +62,8 @@ ENV UV_LINK_MODE=copy
 # Create and activate virtual environment
 RUN <<"EOF" bash -exu
 uv venv ${UV_PROJECT_ENVIRONMENT}
+# Install setuptools since uv venv --seed may not install it
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -70,6 +72,8 @@ uv venv ${UV_PROJECT_ENVIRONMENT}
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install ninja  # to speed up flash-attn build
+uv sync --link-mode symlink --locked --extra fattn --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
