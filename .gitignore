@@ -17,6 +17,7 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+3rdparty/vllm
 
 # Test
 coverage.json
