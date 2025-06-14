@@ -856,11 +856,11 @@ class VllmGenerationWorker:
 
         return cast(list[str], list_of_worker_results)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -876,7 +876,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
+                "update_weights_from_ipc_handles", args=(data,)
             )
             worker_result = result_or_coro[0]
 
@@ -1510,7 +1510,7 @@ class VllmGeneration(GenerationInterface):
             # Directly pass ipc_handles to the method
             futures = self.worker_group.run_all_workers_multiple_data(
                 method_name,
-                data=ipc_handles_list,
+                ipc_handles_list,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             # Wait for all futures to complete

@@ -225,7 +225,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "hf"
+            if generation_config["backend"] in ("hf", "megatron")
             else 2,
         )
         train_cluster = cluster
@@ -233,8 +233,8 @@ def setup(
         print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
     else:
-        assert generation_config["backend"] != "hf", (
-            "Non-colocated inference is not supported for HF generation backend. "
+        assert generation_config["backend"] not in ("hf", "megatron"), (
+            "Non-colocated inference is not supported for either the HF or Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
 
@@ -310,9 +310,11 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    if backend == "hf":
+    if backend in ("hf", "megatron"):
         policy_generation = None
-        print(f"  ✓ Using HF backend for generation with {policy_config['model_name']}")
+        print(
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}"
+        )
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
         policy_generation = VllmGeneration(
@@ -325,16 +327,19 @@ def setup(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}"
         )
 
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
+
     policy = Policy(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
     )
 
@@ -700,7 +705,7 @@ def grpo_train(
         }
         metrics.update(train_results["all_mb_metrics"])
         for k, v in metrics.items():
-            if k in {"lr", "reward", "global_valid_seqs", "global_valid_toks"}:
+            if k in {"lr", "wd", "reward", "global_valid_seqs", "global_valid_toks"}:
                 metrics[k] = np.mean(v).item()
             else:
                 metrics[k] = np.sum(v).item()

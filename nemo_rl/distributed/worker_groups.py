@@ -590,7 +590,7 @@ class RayWorkerGroup:
 
             if should_run:
                 method = getattr(worker, method_name)
-                futures.append(method.remote(data[data_idx], **common_kwargs))
+                futures.append(method.remote(data=data[data_idx], **common_kwargs))
                 data_idx += 1
 
         assert data_idx == len(data), (
@@ -736,7 +736,7 @@ class RayWorkerGroup:
 
                 # Call the method on the worker with its data slice
                 future = getattr(worker, method_name).remote(
-                    worker_data, **common_kwargs
+                    data=worker_data, **common_kwargs
                 )
                 futures.append(future)
                 called_workers.append(worker_idx)
@@ -744,7 +744,9 @@ class RayWorkerGroup:
                 # If this worker doesn't need data:
                 if make_dummy_calls_to_free_axes:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
-                    future = getattr(worker, method_name).remote(None, **common_kwargs)
+                    future = getattr(worker, method_name).remote(
+                        data=None, **common_kwargs
+                    )
                     futures.append(future)
                     called_workers.append(worker_idx)
                 else:

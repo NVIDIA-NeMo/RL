@@ -1,0 +1,38 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+def import_model_from_hf_name(hf_model_name: str, output_path: str):
+    if "llama" in hf_model_name.lower():
+        from nemo.tron.converter.llama import HFLlamaImporter
+
+        print(f"Importing model {hf_model_name} to {output_path}...")
+        importer = HFLlamaImporter(
+            hf_model_name,
+            output_path=output_path,
+        )
+    elif "qwen" in hf_model_name.lower():
+        from nemo.tron.converter.qwen import HFQwen2Importer
+
+        print(f"Importing model {hf_model_name} to {output_path}...")
+        importer = HFQwen2Importer(
+            hf_model_name,
+            output_path=output_path,
+        )
+    else:
+        raise ValueError(f"Unknown model: {hf_model_name}")
+    importer.apply()
+    import megatron.core.rerun_state_machine
+
+    megatron.core.rerun_state_machine.destroy_rerun_state_machine()
