@@ -184,7 +184,7 @@ class DTensorPolicyWorker:
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
-                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations."
+                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
 
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
