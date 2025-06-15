@@ -63,6 +63,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         node_bundle_indices = None
         tp_size = 1
+        cp_size = 1
 
         worker_builder_cls: str
         if config["dtensor_cfg"]["enabled"]:
@@ -70,6 +71,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
             )
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            cp_size = config["dtensor_cfg"]["context_parallel_size"]
         else:
             worker_builder_cls = (
                 "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
@@ -78,9 +80,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 -1,  # DP
+                cp_size,  # CP
                 tp_size,  # TP
             ),
-            names=["data_parallel", "tensor_parallel"],
+            names=["data_parallel", "context_parallel", "tensor_parallel"],
         )
 
         worker_builder = RayWorkerBuilder(
@@ -140,27 +143,39 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
+
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
             )
 
+        sharded_data_2d = []
+        shard_idx = 0
+        # Convert to 2d dim array
+        for _ in range(dp_size):
+            cp_data = []
+            for _ in range(cp_size):
+                cp_data.append(sharded_data[shard_idx])
+                shard_idx += 1
+            sharded_data_2d.append(cp_data)
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_logprobs",
-            sharded_data,
-            in_sharded_axes=["data_parallel"],
+            sharded_data_2d,
+            in_sharded_axes=["data_parallel", "context_parallel"],
             replicate_on_axes=["tensor_parallel"],
             output_is_replicated=["tensor_parallel"],
         )
@@ -185,6 +200,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         Returns: Identical to get_logprobs.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
         if self.use_dynamic_batches:
@@ -192,20 +208,30 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
             )
 
+        sharded_data_2d = []
+        shard_idx = 0
+        # Convert to 2d dim array
+        for _ in range(dp_size):
+            cp_data = []
+            for _ in range(cp_size):
+                cp_data.append(sharded_data[shard_idx])
+                shard_idx += 1
+            sharded_data_2d.append(cp_data)
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_reference_policy_logprobs",
-            sharded_data,
-            in_sharded_axes=["data_parallel"],
+            sharded_data_2d,
+            in_sharded_axes=["data_parallel", "context_parallel"],
             replicate_on_axes=["tensor_parallel"],
             output_is_replicated=["tensor_parallel"],
             common_kwargs={"micro_batch_size": micro_batch_size},
@@ -256,8 +282,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "train",
             sharded_data,
             in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel"],
-            output_is_replicated=["tensor_parallel"],
+            replicate_on_axes=["context_parallel", "tensor_parallel"],
+            output_is_replicated=["context_parallel", "tensor_parallel"],
             common_kwargs={
                 "loss_fn": loss_fn,
                 "eval_mode": eval_mode,

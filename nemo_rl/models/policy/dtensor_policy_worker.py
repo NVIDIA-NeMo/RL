@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional, Union, cast
+from typing import Any, Generator, Iterable, List, Optional, Set, Union, cast
 
 import ray
 import torch
@@ -24,9 +25,14 @@ from torch import nn
 from torch.distributed.fsdp import (
     FSDPModule,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import (
+    set_rotate_method,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.integrations.accelerate import find_tied_parameters
+from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -170,21 +176,36 @@ class DTensorPolicyWorker:
         # ------------------------------------------------
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        dp_size = world_size // tp_size
-        assert world_size % tp_size == 0, (
-            f"World size({world_size}) must be divisible by TP size({tp_size}) to use DTensor"
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        dp_size = world_size // tp_size // cp_size
+        assert world_size == dp_size * tp_size * cp_size, (
+            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )
 
-        mesh_2d = torch.distributed.device_mesh.init_device_mesh(
-            "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+        if cp_size > 1:
+            assert not isinstance(self.model, Gemma3ForCausalLM), (
+                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+
+        device_mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
         )
-        self.dp_mesh, self.tp_mesh = mesh_2d["dp"], mesh_2d["tp"]
+
+        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+
+        self.dp_mesh, self.tp_mesh, self.cp_mesh = (
+            device_mesh["dp"],
+            device_mesh["tp"],
+            device_mesh["cp"],
+        )
         self.dp_size = dp_size
         self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.device_mesh = device_mesh
 
         self.model = _parallelize_model(
             self.model,
-            self.dp_mesh,
+            self.dp_cp_mesh,
             self.tp_mesh,
             param_dtype=self.dtype,
             sequence_parallel=self.cfg["dtensor_cfg"]["sequence_parallel"],
@@ -261,6 +282,58 @@ class DTensorPolicyWorker:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
+
+    # Refer to nemo impl. Below is original comment.
+    # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
+    @staticmethod
+    def create_context_parallel_ctx(
+        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
+        cp_buffers: List[torch.Tensor],
+        cp_seq_dims: List[int],
+        cp_no_restore_buffers: Set[torch.Tensor],
+        cp_rotate_method: Optional[str] = None,
+    ):
+        """Create a context parallel context.
+
+        Args:
+            cp_mesh (DeviceMesh): The device mesh for context parallel.
+            cp_buffers (List[torch.Tensor]): The buffers for context parallel.
+            cp_seq_dims (List[int]): The sequence dimensions for context parallel.
+            cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
+            cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
+        """
+        if cp_rotate_method is not None:
+            set_rotate_method(cp_rotate_method)
+
+        return context_parallel(
+            cp_mesh,
+            buffers=cp_buffers,
+            buffer_seq_dims=cp_seq_dims,
+            no_restore_buffers=cp_no_restore_buffers,
+        )
+
+    # Refer to nemo impl. Below is original comment.
+    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
+    @staticmethod
+    @contextlib.contextmanager
+    def train_context(cp_context: Optional[Generator[None, None, None]] = None):
+        with contextlib.ExitStack() as stack:
+            if cp_context is not None:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                # TODO (xilunwu): support cuDNN backend
+
+                stack.enter_context(
+                    sdpa_kernel(
+                        [
+                            SDPBackend.FLASH_ATTENTION,
+                            SDPBackend.EFFICIENT_ATTENTION,
+                        ]
+                    )
+                )
+
+                stack.enter_context(cp_context)
+
+            yield
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
@@ -404,45 +477,107 @@ class DTensorPolicyWorker:
                             seq_len, device=input_ids.device
                         ).repeat(batch_size, 1)
 
-                        outputs = self.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask_input_all_ones,
-                            position_ids=position_ids,
-                            use_cache=False,
+                    context_parallel_ctx = None
+                    if self.cp_size > 1:
+                        seq_index = torch.arange(
+                            seq_len, device=input_ids.device
+                        ).repeat(1, 1)
+                        cp_buffers = (
+                            [input_ids, position_ids, seq_index]
+                            if self.cp_size > 1
+                            else []
                         )
 
-                    # Get logprobs
-                    if not hasattr(outputs, "logits"):
-                        logits = self.model.lm_head(outputs.last_hidden_state)
-                    else:
-                        logits = outputs.logits
+                        # Create context parallel context
+                        context_parallel_ctx = self.create_context_parallel_ctx(
+                            cp_mesh=self.cp_mesh,
+                            cp_buffers=cp_buffers,
+                            cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                            cp_no_restore_buffers=set(cp_buffers),
+                        )
 
-                    # Divide logits by temperature
-                    if "generation" in self.cfg and self.cfg["generation"] is not None:
-                        logits.div_(self.cfg["generation"]["temperature"])
+                    with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                        with torch.autocast(device_type="cuda", dtype=self.dtype):
+                            outputs = self.model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask_input_all_ones,
+                                position_ids=position_ids,
+                                use_cache=False,
+                            )
 
-                    loss, loss_metrics = loss_fn(
-                        logits, mb, global_valid_seqs, global_valid_toks
-                    )
-                    ## scale by the number of global batches so we get the correct
-                    ## value when summing metrics across all microbatches
-                    for k in loss_metrics.keys():
-                        loss_metrics[k] /= num_global_batches
-                    num_valid_samples = loss_metrics["num_valid_samples"]
-                    loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                    loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                    loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        # Get logprobs
+                        if not hasattr(outputs, "logits"):
+                            logits = self.model.lm_head(outputs.last_hidden_state)
+                        else:
+                            logits = outputs.logits
 
-                    # Backward pass
-                    if not eval_mode:
-                        ## NOTE: invalid samples should be multiplied
-                        ## by zero in the loss function to prevent them
-                        ## from affecting the gradient calculation
+                        # Divide logits by temperature
+                        if (
+                            "generation" in self.cfg
+                            and self.cfg["generation"] is not None
+                        ):
+                            logits.div_(self.cfg["generation"]["temperature"])
 
-                        # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                        # but we want to sum them so we cancel out the average here
-                        loss *= self.dp_size
-                        loss.backward()
+                        if self.cp_size > 1:
+                            seq_index_dtensor = (
+                                DTensor.from_local(
+                                    seq_index,
+                                    device_mesh=self.cp_mesh,
+                                    placements=[Shard(1)],
+                                )
+                                .full_tensor()
+                                .squeeze(0)
+                            )
+                            _, sorted_indices = torch.sort(seq_index_dtensor)
+
+                            for tensor_name in mb:
+                                current_tensor = mb[tensor_name]
+                                for buffer in cp_buffers:
+                                    if current_tensor is buffer:
+                                        assert type(current_tensor) == torch.Tensor, (
+                                            f"tensor {tensor_name} is not a tensor"
+                                        )
+                                        mb[tensor_name] = DTensor.from_local(
+                                            current_tensor,
+                                            device_mesh=self.cp_mesh,
+                                            placements=[Shard(sequence_dim)],
+                                        ).full_tensor()[:, sorted_indices]
+                                        break
+
+                            if isinstance(logits, DTensor):
+                                logits = logits.full_tensor()
+
+                            logits_dtensor = DTensor.from_local(
+                                logits,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(sequence_dim)],
+                            )
+                            logits = logits_dtensor.full_tensor()[:, sorted_indices]
+
+                        loss, loss_metrics = loss_fn(
+                            logits, mb, global_valid_seqs, global_valid_toks
+                        )
+
+                        ## scale by the number of global batches so we get the correct
+                        ## value when summing metrics across all microbatches
+                        for k in loss_metrics.keys():
+                            loss_metrics[k] /= num_global_batches
+                        num_valid_samples = loss_metrics["num_valid_samples"]
+                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+
+                        # Backward pass
+                        if not eval_mode:
+                            ## NOTE: invalid samples should be multiplied
+                            ## by zero in the loss function to prevent them
+                            ## from affecting the gradient calculation
+
+                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+                            # but we want to sum them so we cancel out the average here
+                            loss *= self.dp_size * self.cp_size
+                            loss.backward()
+
                     if num_valid_samples > 0:
                         mb_losses.append(loss.item())
                         all_mb_metrics.append(loss_metrics)
@@ -452,7 +587,7 @@ class DTensorPolicyWorker:
                     with torch.no_grad():
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
-                            dp_group=self.dp_mesh.get_group(),
+                            dp_cp_group=self.dp_cp_mesh.get_group(),
                             tp_group=self.tp_mesh.get_group(),
                             dtype=torch.float32,
                         )
