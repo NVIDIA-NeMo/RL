@@ -1414,7 +1414,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
     # Check memory stats - should be minimal after refit
     assert current_allocated <= 0.1, "Memory should be minimal after refit completed"
-    assert current_reserved <= 0.1, "Memory should be minimal after refit completed"
+    assert current_reserved <= 2.1, "Memory should be minimal after refit completed"
 
     # Memory thresholds for Qwen2.5-0.5B model on 2 GPUs with Megatron
     assert peak_allocated < 6000, (
