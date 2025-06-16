@@ -584,6 +584,49 @@ class RayWorkerGroup:
         """Number of tied worker groups."""
         return len(self.tied_workers_groups)
 
+    def run_single_group_single_data(
+        self,
+        method_name: str,
+        group_idx: int,
+        *args,
+        run_rank_0_only_axes: list[str] | None = None,
+        **kwargs,
+    ) -> list[ray.ObjectRef]:
+        """Run a method on a single tied worker group with the same data.
+
+        Args:
+            method_name: Name of the method to call on each worker
+            group_idx: Index of the tied worker group to run on
+            *args, **kwargs: Arguments to pass to the method
+            run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
+
+        Returns:
+            list[ray.ObjectRef]: A list of ray futures
+        """
+        futures = []
+
+        if run_rank_0_only_axes is None:
+            run_rank_0_only_axes = []
+
+        for worker_idx in self.tied_workers_groups[group_idx]:
+            worker = self.workers[worker_idx]
+            worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
+
+            # Determine if this worker should receive data
+            should_run = True
+            for axis in self.sharding_annotations.names:
+                if axis not in worker_coords:
+                    continue
+                if axis in run_rank_0_only_axes and worker_coords[axis] != 0:
+                    should_run = False
+                    break
+
+            if should_run:
+                method = getattr(worker, method_name)
+                futures.append(method.remote(*args, **kwargs))
+
+        return futures
+
     def run_all_workers_multiple_data(
         self,
         method_name: str,

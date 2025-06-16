@@ -525,13 +525,13 @@ class VllmGenerationWorker:
 
     async def generate_async(
         self,
-        data: tuple[BatchedDataDict[GenerationDatumSpec], int],
+        data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
-            data: Tuple containing (BatchedDataDict with input_ids and input_lengths, start_original_index_for_this_shard)
+            data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
 
         Yields:
@@ -541,8 +541,6 @@ class VllmGenerationWorker:
             raise RuntimeError(
                 "generate_async can only be used when async_engine is enabled in vLLM config."
             )
-
-        data, start_original_index = data
 
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -619,8 +617,7 @@ class VllmGenerationWorker:
                     }
                 )
 
-                global_index = start_original_index + sample_idx
-                return (global_index, result_batch)
+                return (sample_idx, result_batch)
 
             sampling_params_for_request = self._build_sampling_params(
                 greedy=greedy,
@@ -725,8 +722,7 @@ class VllmGenerationWorker:
                 }
             )
 
-            global_index = start_original_index + sample_idx
-            return (global_index, result_batch)
+            return (sample_idx, result_batch)
 
         # Create tasks for all samples and yield results as they complete
         sample_tasks = [
@@ -1096,6 +1092,9 @@ class VllmGeneration(GenerationInterface):
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.group_count
 
+        # Used to track the round-robin selection of worker groups for generate_async
+        self.current_generate_worker_group_idx = 0
+
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
 
@@ -1343,71 +1342,23 @@ class VllmGeneration(GenerationInterface):
         if len(data["input_ids"]) == 0:
             return
 
-        # Shard the data across the tied worker groups
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-
-        # Shard the data across the tied worker groups
-        # print("--------------------------------")
-        # print(
-        #     f"VllmGeneration.generate_async: Processing {len(data['input_ids'])} samples with {dp_size} workers"
-        # )
-
-        sharded_data_list: list[SlicedDataDict] = data.shard_by_batch_size(
-            dp_size, allow_uneven_shards=True
+        # Run the generate_async method on the selected worker group
+        future_bundle = self.worker_group.run_single_group_single_data(
+            method_name="generate_async",
+            group_idx=self.current_generate_worker_group_idx,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            data=data,
+            greedy=greedy,
         )
 
-        # Prepare data for workers with global indices
-        processed_shards_data = []
-        global_start_index = 0
-
-        for i, shard_data in enumerate(sharded_data_list):
-            if shard_data and len(shard_data.get("input_ids", [])) > 0:
-                shard_size = len(shard_data.get("input_ids", []))
-                # print(
-                #     f"Worker {i}: Processing shard with {shard_size} samples, starting at global index {global_start_index}"
-                # )
-                processed_shards_data.append((shard_data, global_start_index))
-                global_start_index += shard_size
-            else:
-                # print(f"Worker {i}: Empty shard - passing empty data")
-                # Create empty data structure for this worker to maintain 1:1 mapping
-                empty_shard = BatchedDataDict(
-                    {
-                        "input_ids": torch.zeros((0, 0), dtype=torch.long),
-                        "input_lengths": torch.zeros(0, dtype=torch.long),
-                    }
-                )
-                processed_shards_data.append((empty_shard, global_start_index))
-
-        # print(f"Total workers (including empty): {len(processed_shards_data)}")
-
-        future_bundle = self.worker_group.run_all_workers_sharded_data(
-            "generate_async",
-            processed_shards_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=None,  # just run on tp rank 0
-            output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
-        )
-
-        worker_generator_proxies = self.worker_group.get_all_worker_results(
-            future_bundle, return_generators_as_proxies=True
-        )
-
-        # print(f"Got {len(worker_generator_proxies)} worker generator proxies")
-        valid_proxies = [
-            proxy for proxy in worker_generator_proxies if proxy is not None
-        ]
-        # print(f"Valid proxies: {len(valid_proxies)}")
-
-        if not valid_proxies:
-            # print("No valid worker generator proxies")
-            return
+        # Increment the round-robin worker group index
+        self.current_generate_worker_group_idx += 1
+        self.current_generate_worker_group_idx %= self.worker_group.group_count
 
         # Create a queue to collect sample results from all workers as they complete
         result_queue = asyncio.Queue()
         finished_workers = 0
-        total_workers = len(valid_proxies)
+        total_workers = len(future_bundle)
 
         # print(f"Setting up async coordination for {total_workers} workers")
 
@@ -1443,7 +1394,7 @@ class VllmGeneration(GenerationInterface):
         # Start tasks for all worker generators
         worker_tasks = [
             asyncio.create_task(consume_worker_generator(i, proxy))
-            for i, proxy in enumerate(valid_proxies)
+            for i, proxy in enumerate(future_bundle)
         ]
 
         if not worker_tasks:
