@@ -1219,6 +1219,11 @@ def test_vllm_generation_with_megatron_training(
     megatron_config = get_basic_megatron_test_config(
         tp=tensor_parallel_size, pp=1, precision="float32"
     )
+    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["megatron_cfg"]["converter_type"] = (
+        "Qwen2ForCausalLM"  # Qwen3 works with Qwen2 converter
+    )
 
     vllm_policy = None
     megatron_policy = None
@@ -1350,6 +1355,11 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=False)
 
     megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["megatron_cfg"]["converter_type"] = (
+        "Qwen2ForCausalLM"  # Qwen3 works with Qwen2 converter
+    )
 
     # Create policies
     print("Creating vLLM policy...")
@@ -1423,6 +1433,11 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         tp=1,
         pp=2,  # Pipeline parallel
         precision="float32",
+    )
+    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    megatron_config["megatron_cfg"]["converter_type"] = (
+        "Qwen2ForCausalLM"  # Qwen3 works with Qwen2 converter
     )
 
     vllm_policy = None
