@@ -15,6 +15,7 @@ policy:
     sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 4
+    context_parallel_size: 1
     custom_parallel_plan: null
 
   dynamic_batching:

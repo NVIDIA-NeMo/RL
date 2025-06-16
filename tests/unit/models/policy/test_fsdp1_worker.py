@@ -58,6 +58,7 @@ basic_llama_test_config: PolicyConfig = {
         "sequence_parallel": False,
         "activation_checkpointing": False,
         "tensor_parallel_size": 1,
+        "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
     "dynamic_batching": {
