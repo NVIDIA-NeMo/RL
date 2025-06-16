@@ -95,7 +95,7 @@ def main():
             f"Processed sequence length {len(sequence)} with lp error {lp_error} and max abs error {max_abs_error}"
         )
         assert (
-            lp_error < 1.0636
+            lp_error < 1.05
         ), f"lp error is higher than expected (1.0636): {lp_error}"
 
     print(f"[{args.model}] ALL GOOD!")
