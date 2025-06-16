@@ -619,6 +619,9 @@ class MegatronPolicyWorker:
     def is_alive(self):
         return True
 
+    def reset_peak_memory_stats(self) -> None:
+        torch.cuda.reset_peak_memory_stats()
+
     def get_gpu_info(self):
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
