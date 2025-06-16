@@ -1,0 +1,21 @@
+# Sample sweep configuration for deepscaler experiments
+# Each parameter can have a list of values to sweep over
+# The launcher will generate all possible combinations
+
+# Required parameter that must match the target script name
+script_path: "examples/run_grpo_math.py"
+
+# Optional: Path to the base YAML config file
+# Can be overridden by the --config command-line argument
+# If null and --config is not provided, no base config will be used
+config_path: "examples/configs/grpo-deepscaler-1.5b-8K.yaml" 
+
+
+# ------------------------------------------------------------
+# hyperparameters
+# ------------------------------------------------------------
+policy.model_name: ["deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"]
+
+grpo.num_generations_per_prompt: [8, 16, 32]
+
+# ------------------------------------------------------------
