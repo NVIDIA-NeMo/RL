@@ -144,7 +144,7 @@ uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py Qwen/Qw
 
 ## [2.long_generation_decode_vs_prefill](https://github.com/NVIDIA/NeMo-RL/blob/main/tools/model_diagnostics/2.long_generation_decode_vs_prefill.py)
 
-Test that vLLM yields near-identical token log-probabilities when comparing decoding with a single prefill pass across multiple prompts
+Test that vLLM yields near-identical token log-probabilities when comparing decoding with a single prefill pass across multiple prompts.
 
 ```sh
 # Run that is expected to pass
