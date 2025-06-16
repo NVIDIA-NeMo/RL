@@ -110,7 +110,7 @@ def get_basic_hf_test_config(enable_dtensor: bool = False) -> PolicyConfig:
         },
         "max_grad_norm": 1.0,
         "make_sequence_length_divisible_by": 1,
-        "generation": basic_vllm_test_config,
+        "generation": deepcopy(basic_vllm_test_config),
     }
 
 
@@ -319,7 +319,7 @@ def skip_tied_weight_check_for_all():
 def test_vllm_missing_required_config_key(cluster):
     """Test that an assertion error is raised when a required config key is missing."""
     # Create a config missing a required key by removing 'model_name'
-    incomplete_config = basic_vllm_test_config.copy()
+    incomplete_config = deepcopy(basic_vllm_test_config)
     del incomplete_config["model_name"]  # Remove a required key
 
     # Also need to ensure skip_tokenizer_init and load_format are there
@@ -490,7 +490,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
     # Part 1: Test that different workers generate different outputs due to different seeds
     print("Creating vLLM policy with default seed behavior...")
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     policy = VllmGeneration(cluster, vllm_config)
     policy.finish_generation()
@@ -607,7 +607,7 @@ def test_vllm_generation_with_hf_training(
     from tests.unit.test_utils import SimpleNLLLoss
 
     # Create separate configs for each policy
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config = configure_generation_config(vllm_config, tokenizer)
 
@@ -851,7 +851,7 @@ def test_vllm_generate_text(cluster, tokenizer):
     test_prompts = BatchedDataDict({"prompts": test_prompts})
 
     # Create separate configs for each policy
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
 
     # Ensure we can get same output
@@ -988,7 +988,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
         pytest.skip("Need at least 2 GPUs per node for this test")
 
     # Create separate configs for each policy
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=False)
 
     # Ensure we can get same peak memory
@@ -1056,7 +1056,7 @@ def test_vllm_generation_with_stop(
     from nemo_rl.models.policy.lm_policy import Policy
 
     # Create separate configs for each policy
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["stop_token_ids"] = [6722]  # 'Ġcapital'
     vllm_config["stop_strings"] = ["I'm"]
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=is_eval)
@@ -1216,7 +1216,7 @@ def test_vllm_generation_with_megatron_training(
     test_tokenizer = get_tokenizer({"name": model_name})
 
     # vLLM config with Qwen2.5-0.5B
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
@@ -1365,7 +1365,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     test_tokenizer = get_tokenizer({"name": model_name})
 
     # vLLM config with Qwen2.5-0.5B
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config = configure_generation_config(
@@ -1447,7 +1447,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     test_tokenizer = get_tokenizer({"name": model_name})
 
     # vLLM config with Qwen2.5-0.5B
-    vllm_config = basic_vllm_test_config.copy()
+    vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
