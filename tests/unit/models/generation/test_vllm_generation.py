@@ -20,8 +20,8 @@ import ray
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
-from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -1205,7 +1205,6 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    from tests.unit.test_utils import SimpleNLLLoss
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
