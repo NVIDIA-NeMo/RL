@@ -77,8 +77,9 @@ def generate_responses(
     generated_ids = []
     for i in range(len(input_lengths)):
         input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
         full_output = output_ids[i]
-        generated_part = full_output[input_len:]
+        generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
     # Update the message log with generated responses
@@ -185,8 +186,9 @@ async def generate_responses_async(
     generated_ids = []
     for i in range(len(input_lengths)):
         input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
         full_output = output_ids[i]
-        generated_part = full_output[input_len:]
+        generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
     # Update the message log with generated responses
@@ -699,12 +701,9 @@ async def run_sample_multi_turn_rollout(
                 )["input_ids"][0]
 
                 # Check for sequence length overflow
-                if (
-                    input_lengths + len(generated_tokens) + len(tokenized_obs)
-                    >= max_seq_len
-                ):
+                if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
                     # Truncate environment observation
-                    max_env_tokens = max_seq_len - input_lengths - len(generated_tokens)
+                    max_env_tokens = max_seq_len - input_lengths - gen_token_count
                     if max_env_tokens > 0:
                         tokenized_obs = tokenized_obs[:max_env_tokens]
                     else:
