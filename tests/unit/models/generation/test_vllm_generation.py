@@ -21,6 +21,7 @@ import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.loss_functions import NLLLoss
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
@@ -1222,10 +1223,6 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["vllm_cfg"]["async_engine"] = False
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
-    # Add required vLLM configuration for tensor parallelism
-    if tensor_parallel_size > 1:
-        vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
-
     # Megatron config with same model
     megatron_config = get_basic_megatron_test_config(
         tp=tensor_parallel_size, pp=1, precision="float32"
@@ -1319,7 +1316,7 @@ def test_vllm_generation_with_megatron_training(
                 "input_lengths": megatron_tokenized["attention_mask"]
                 .sum(dim=1)
                 .to(torch.int32),
-                "token_loss_mask": token_loss_mask,
+                "token_mask": token_loss_mask,
                 "sample_mask": torch.ones(train_input_ids.shape[0]),
             }
         )
@@ -1329,7 +1326,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy.prepare_for_training()
 
         # Do one training step to verify it works
-        results = megatron_policy.train(train_data, SimpleNLLLoss())
+        results = megatron_policy.train(train_data, NLLLoss())
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
