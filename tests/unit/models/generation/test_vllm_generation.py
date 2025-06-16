@@ -30,7 +30,6 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.conftest import TEST_ASSETS
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -122,8 +121,8 @@ def get_basic_megatron_test_config(
     sequence_parallel: bool = False,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
-    # Use a tiny model for testing
-    model_name = TEST_ASSETS.TINY_LLAMA_MODEL_PATH
+    # Use the exact same model as vLLM tests for perfect compatibility
+    model_name = basic_vllm_test_config["model_name"]  # Use same model as vLLM config
 
     return {
         "model_name": model_name,
@@ -153,7 +152,7 @@ def get_basic_megatron_test_config(
             "enabled": True,
             "empty_unused_memory_level": 0,
             "activation_checkpointing": activation_checkpointing,
-            "converter_type": "LlamaForCausalLM",
+            "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
             "pipeline_model_parallel_size": pp,
             "num_layers_in_first_pipeline_stage": None,
@@ -1210,25 +1209,29 @@ def test_vllm_generation_with_megatron_training(
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
 
-    # Create separate configs for each policy
-    # IMPORTANT: Both policies must use the same model for weight transfer to work
-    # Use tiny Qwen2 model (has proven Megatron support) instead of full Qwen/Qwen3-0.6B
+    # Both policies must use the same model (Qwen2.5-0.5B) for weight transfer compatibility
+    model_name = "Qwen/Qwen2.5-0.5B"
+
+    # Create tokenizer for both policies
+    test_tokenizer = get_tokenizer({"name": model_name})
+
+    # vLLM config with Qwen2.5-0.5B
     vllm_config = basic_vllm_test_config.copy()
-    vllm_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    vllm_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
+    vllm_config["model_name"] = model_name
+    vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
-    # Create tokenizer for the tiny Qwen2 model
-    tiny_qwen2_tokenizer = get_tokenizer({"name": TEST_ASSETS.TINY_QWEN2_MODEL_PATH})
-    vllm_config = configure_generation_config(vllm_config, tiny_qwen2_tokenizer)
+    # Add required vLLM configuration for tensor parallelism
+    if tensor_parallel_size > 1:
+        vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
-    # Use same tiny Qwen2 model for Megatron
+    # Megatron config with same model
     megatron_config = get_basic_megatron_test_config(
         tp=tensor_parallel_size, pp=1, precision="float32"
     )
-    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["megatron_cfg"]["converter_type"] = "Qwen2ForCausalLM"
+    megatron_config["model_name"] = model_name
+    megatron_config["tokenizer"]["name"] = model_name
 
     vllm_policy = None
     megatron_policy = None
@@ -1241,8 +1244,8 @@ def test_vllm_generation_with_megatron_training(
             "Explain quantum physics in simple terms:",
         ]
 
-        # Tokenize the prompts with the tiny Qwen2 tokenizer
-        tokenized = tiny_qwen2_tokenizer(
+        # Tokenize the prompts with the shared tokenizer
+        tokenized = test_tokenizer(
             prompts,
             padding=True,
             truncation=True,
@@ -1265,7 +1268,7 @@ def test_vllm_generation_with_megatron_training(
         vllm_policy.finish_generation()
 
         print("Creating Megatron policy...")
-        megatron_policy = Policy(cluster, megatron_config, tiny_qwen2_tokenizer)
+        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("Refitting vLLM policy with Megatron weights...")
         refit_policy_generation(
@@ -1286,32 +1289,36 @@ def test_vllm_generation_with_megatron_training(
         )
 
         # Decode generations
-        generated_texts = tiny_qwen2_tokenizer.batch_decode(
+        generated_texts = test_tokenizer.batch_decode(
             generation_results["output_ids"], skip_special_tokens=True
         )
         print(f"vLLM generated texts: {generated_texts}")
 
-        # Step 2: Prepare training data (smaller sequence for Megatron)
-        max_seq_len = min(32, generation_results["output_ids"].shape[1])
-        train_input_ids = generation_results["output_ids"][:, :max_seq_len]
+        # Step 2: Prepare training data for Megatron (convert tokens to Megatron tokenizer space)
+        # Re-tokenize with Megatron tokenizer for training
+        megatron_tokenized = test_tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=32,
+            return_tensors="pt",
+            padding_side="right",
+        )
+
+        max_seq_len = min(32, megatron_tokenized["input_ids"].shape[1])
+        train_input_ids = megatron_tokenized["input_ids"][:, :max_seq_len]
         token_loss_mask = torch.ones_like(train_input_ids)
 
         # Only compute loss on generated tokens, not input
-        input_len = test_input_data.get("input_ids").size(1)
+        input_len = megatron_tokenized["input_ids"].size(1)
         token_loss_mask[:, :input_len] = 0
-
-        # Clamp generation lengths to max_seq_len
-        clamped_lengths = torch.clamp(
-            generation_results["unpadded_sequence_lengths"], max=max_seq_len
-        )
-
-        for idx, length in enumerate(clamped_lengths):
-            token_loss_mask[idx, length:] = 0
 
         train_data = BatchedDataDict(
             {
                 "input_ids": train_input_ids,
-                "input_lengths": clamped_lengths,
+                "input_lengths": megatron_tokenized["attention_mask"]
+                .sum(dim=1)
+                .to(torch.int32),
                 "token_loss_mask": token_loss_mask,
                 "sample_mask": torch.ones(train_input_ids.shape[0]),
             }
@@ -1355,22 +1362,24 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     if cluster.num_gpus_per_node < 2:
         pytest.skip("Need at least 2 GPUs per node for this test")
 
-    # Create configs - both policies must use the same model
-    # Use tiny Qwen2 model (has proven Megatron support) for both policies
-    vllm_config = basic_vllm_test_config.copy()
-    vllm_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    vllm_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
+    # Both policies must use the same model (Qwen2.5-0.5B) for weight transfer compatibility
+    model_name = "Qwen/Qwen2.5-0.5B"
 
-    # Create tokenizer for the tiny Qwen2 model
-    tiny_qwen2_tokenizer = get_tokenizer({"name": TEST_ASSETS.TINY_QWEN2_MODEL_PATH})
+    # Create tokenizer for both policies
+    test_tokenizer = get_tokenizer({"name": model_name})
+
+    # vLLM config with Qwen2.5-0.5B
+    vllm_config = basic_vllm_test_config.copy()
+    vllm_config["model_name"] = model_name
+    vllm_config["tokenizer"]["name"] = model_name
     vllm_config = configure_generation_config(
-        vllm_config, tiny_qwen2_tokenizer, is_eval=False
+        vllm_config, test_tokenizer, is_eval=False
     )
 
+    # Megatron config with same model
     megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
-    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["megatron_cfg"]["converter_type"] = "Qwen2ForCausalLM"
+    megatron_config["model_name"] = model_name
+    megatron_config["tokenizer"]["name"] = model_name
 
     # Create policies
     print("Creating vLLM policy...")
@@ -1378,7 +1387,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     vllm_policy.finish_generation()
 
     print("Creating Megatron policy...")
-    megatron_policy = Policy(cluster, megatron_config, tiny_qwen2_tokenizer)
+    megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("Refitting vLLM policy with Megatron...")
     # Take it outside statistics to get clean peak memory during refit
@@ -1411,13 +1420,12 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     assert current_allocated == 0.0, "Memory should be 0 after refit completed"
     assert current_reserved == 0.0, "Memory should be 0 after refit completed"
 
-    # Memory thresholds for tiny model on 2 GPUs with Megatron
-    # These should be much lower than the full model thresholds
-    assert peak_allocated < 2000, (
-        f"Peak allocated memory should < 2000 MB, got {peak_allocated}"
+    # Memory thresholds for Qwen2.5-0.5B model on 2 GPUs with Megatron
+    assert peak_allocated < 6000, (
+        f"Peak allocated memory should < 6000 MB, got {peak_allocated}"
     )
-    assert peak_reserved < 2000, (
-        f"Peak reserved memory should < 2000 MB, got {peak_reserved}"
+    assert peak_reserved < 6000, (
+        f"Peak reserved memory should < 6000 MB, got {peak_reserved}"
     )
 
     print(
@@ -1436,24 +1444,25 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     if cluster.num_gpus_per_node < 2:
         pytest.skip("Need at least 2 GPUs for pipeline parallel test")
 
-    # Create configs for pipeline parallel - both policies must use the same model
-    # Use tiny Qwen2 model (has proven Megatron support) for both policies
-    vllm_config = basic_vllm_test_config.copy()
-    vllm_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    vllm_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
+    # Both policies must use the same model (Qwen2.5-0.5B) for weight transfer compatibility
+    model_name = "Qwen/Qwen2.5-0.5B"
 
-    # Create tokenizer for the tiny Qwen2 model
-    tiny_qwen2_tokenizer = get_tokenizer({"name": TEST_ASSETS.TINY_QWEN2_MODEL_PATH})
-    vllm_config = configure_generation_config(vllm_config, tiny_qwen2_tokenizer)
+    # Create tokenizer for both policies
+    test_tokenizer = get_tokenizer({"name": model_name})
+
+    # vLLM config with Qwen2.5-0.5B
+    vllm_config = basic_vllm_test_config.copy()
+    vllm_config["model_name"] = model_name
+    vllm_config["tokenizer"]["name"] = model_name
+    vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     megatron_config = get_basic_megatron_test_config(
         tp=1,
         pp=2,  # Pipeline parallel
         precision="float32",
     )
-    megatron_config["model_name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["tokenizer"]["name"] = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
-    megatron_config["megatron_cfg"]["converter_type"] = "Qwen2ForCausalLM"
+    megatron_config["model_name"] = model_name
+    megatron_config["tokenizer"]["name"] = model_name
 
     vllm_policy = None
     megatron_policy = None
@@ -1461,7 +1470,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     try:
         # Create simple test data
         prompts = ["Hello, world!", "How are you?"]
-        tokenized = tiny_qwen2_tokenizer(
+        tokenized = test_tokenizer(
             prompts,
             padding=True,
             truncation=True,
@@ -1477,7 +1486,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         )
 
         print("Creating Megatron policy with PP=2...")
-        megatron_policy = Policy(cluster, megatron_config, tiny_qwen2_tokenizer)
+        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("Creating vLLM policy...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
@@ -1496,7 +1505,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         assert "output_ids" in outputs, "output_ids not found in generation output"
         assert outputs["output_ids"].shape[0] == len(prompts), "Wrong batch size"
 
-        generated_texts = tiny_qwen2_tokenizer.batch_decode(
+        generated_texts = test_tokenizer.batch_decode(
             outputs["output_ids"], skip_special_tokens=True
         )
         print(f"Generated texts with PP=2: {generated_texts}")
