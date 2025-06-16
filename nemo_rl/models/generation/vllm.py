@@ -1458,7 +1458,7 @@ class VllmGeneration(GenerationInterface):
         while finished_workers < total_workers:
             try:
                 msg_type, item = await asyncio.wait_for(
-                    result_queue.get(), timeout=30.0
+                    result_queue.get(), timeout=120.0
                 )
             except asyncio.TimeoutError:
                 print(
