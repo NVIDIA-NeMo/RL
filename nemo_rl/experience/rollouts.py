@@ -77,39 +77,29 @@ def generate_responses(
     generated_ids = []
     for i in range(len(input_lengths)):
         input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
         full_output = output_ids[i]
-        generated_part = full_output[input_len:]
+        generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
-    # Update the message log with generated responses
-    def update_message_log_batch(
-        message_logs: list[list[dict]], generated_sequences: list[torch.Tensor]
-    ) -> list[list[dict]]:
-        """Update the message log with generated assistant responses."""
-        updated_logs = []
-        for i, message_log in enumerate(message_logs):
-            new_log = copy.deepcopy(message_log)
-            generated_sequence = generated_sequences[i]
+    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-            # Decode the generated sequence
-            generated_text = tokenizer.decode(
-                generated_sequence, skip_special_tokens=True
-            )
+    # Append to message log
+    for i, (text, input_length, total_length) in enumerate(
+        zip(generated_texts, input_lengths, unpadded_sequence_lengths)
+    ):
+        assistant_message = {
+            "role": "assistant",
+            "content": text,
+            "token_ids": output_ids[i, input_length:total_length],
+        }
 
-            # Add the assistant response to the message log
-            assistant_message = {
-                "role": "assistant",
-                "content": generated_text,
-                "token_ids": generated_sequence,
-            }
-            new_log.append(assistant_message)
-            updated_logs.append(new_log)
+        if include_logprobs and "logprobs" in generation_outputs:
+            assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
 
-        return updated_logs
-
-    # Update the batch with the new message logs
-    updated_message_logs = update_message_log_batch(batch["message_log"], generated_ids)
-    batch["message_log"] = updated_message_logs
+        batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
     gen_metrics = {
@@ -185,39 +175,29 @@ async def generate_responses_async(
     generated_ids = []
     for i in range(len(input_lengths)):
         input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
         full_output = output_ids[i]
-        generated_part = full_output[input_len:]
+        generated_part = full_output[input_len:total_length]
         generated_ids.append(generated_part)
 
-    # Update the message log with generated responses
-    def update_message_log_batch(
-        message_logs: list[list[dict]], generated_sequences: list[torch.Tensor]
-    ) -> list[list[dict]]:
-        """Update the message log with generated assistant responses."""
-        updated_logs = []
-        for i, message_log in enumerate(message_logs):
-            new_log = copy.deepcopy(message_log)
-            generated_sequence = generated_sequences[i]
+    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-            # Decode the generated sequence
-            generated_text = tokenizer.decode(
-                generated_sequence, skip_special_tokens=True
-            )
+    # Append to message log
+    for i, (text, input_length, total_length) in enumerate(
+        zip(generated_texts, input_lengths, unpadded_sequence_lengths)
+    ):
+        assistant_message = {
+            "role": "assistant",
+            "content": text,
+            "token_ids": output_ids[i, input_length:total_length],
+        }
 
-            # Add the assistant response to the message log
-            assistant_message = {
-                "role": "assistant",
-                "content": generated_text,
-                "token_ids": generated_sequence,
-            }
-            new_log.append(assistant_message)
-            updated_logs.append(new_log)
+        if include_logprobs and "logprobs" in generation_outputs:
+            assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
 
-        return updated_logs
-
-    # Update the batch with the new message logs
-    updated_message_logs = update_message_log_batch(batch["message_log"], generated_ids)
-    batch["message_log"] = updated_message_logs
+        batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
     gen_metrics = {
@@ -509,7 +489,12 @@ def run_multi_turn_rollout(
         "truncation_rate": float(sample_truncated.float().mean().item()),
         "max_turns_reached_rate": float(sample_max_turns_reached.float().mean().item()),
         # Token usage metrics
-        "mean_gen_tokens_per_sample": float(sample_token_counts.float().mean().item()),
+        "mean_total_tokens_per_sample": float(
+            sample_token_counts.float().mean().item()
+        ),
+        "mean_gen_tokens_per_sample": float(
+            sample_assistant_token_counts.float().mean().item()
+        ),
         "mean_env_tokens_per_sample": float(
             sample_env_token_counts.float().mean().item()
         ),
@@ -581,7 +566,7 @@ async def async_generate_response_for_sample_turn(
     updated_message_log = updated_batch["message_log"][0]
     generated_tokens = generated_ids[0] if generated_ids else torch.empty(0)
 
-    return updated_message_log, generated_tokens, gen_metrics
+    return updated_message_log, generated_tokens, input_lengths, gen_metrics
 
 
 async def run_sample_multi_turn_rollout(
@@ -643,6 +628,7 @@ async def run_sample_multi_turn_rollout(
             (
                 updated_message_log,
                 generated_tokens,
+                input_lengths,
                 gen_metrics,
             ) = await async_generate_response_for_sample_turn(
                 policy_generation,
@@ -693,19 +679,9 @@ async def run_sample_multi_turn_rollout(
                 )["input_ids"][0]
 
                 # Check for sequence length overflow
-                current_length = (
-                    len(current_message_log[-1]["token_ids"])
-                    if current_message_log
-                    else 0
-                )
-                if (
-                    current_length + len(generated_tokens) + len(tokenized_obs)
-                    >= max_seq_len
-                ):
+                if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
                     # Truncate environment observation
-                    max_env_tokens = (
-                        max_seq_len - current_length - len(generated_tokens)
-                    )
+                    max_env_tokens = max_seq_len - input_lengths - gen_token_count
                     if max_env_tokens > 0:
                         tokenized_obs = tokenized_obs[:max_env_tokens]
                     else:
@@ -882,7 +858,7 @@ async def run_async_multi_turn_rollout(
             m["total_tokens"] for m in all_sample_metrics
         )
         / batch_size,
-        "mean_assistant_tokens_per_sample": sum(
+        "mean_gen_tokens_per_sample": sum(
             m["assistant_tokens"] for m in all_sample_metrics
         )
         / batch_size,
