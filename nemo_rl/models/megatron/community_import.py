@@ -33,6 +33,7 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
     else:
         raise ValueError(f"Unknown model: {hf_model_name}")
     importer.apply()
+    # resetting mcore state
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()

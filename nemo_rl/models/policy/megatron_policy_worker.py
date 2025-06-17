@@ -1442,16 +1442,13 @@ class MegatronPolicyWorker:
         self,
         weights_path: str,
         optimizer_path: Optional[str] = None,
-        tokenizer_path: Optional[str] = None,
-        offload_to_cpu: bool = True,
+        **kwargs,
     ):
         """Save a training checkpoint.
 
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
-            offload_to_cpu: bool = True. NeMo's distributed checkpointing saves from device.
-                            This flag is noted but doesn't change distributed save behavior.
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(

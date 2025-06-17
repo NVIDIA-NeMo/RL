@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import re
+import time
 
 import torch
 from megatron.core import parallel_state
@@ -78,8 +79,6 @@ def gather_params(
     model,
     keys,
 ):
-    import time
-
     st = time.time()
 
     tp_group = parallel_state.get_tensor_model_parallel_group()
