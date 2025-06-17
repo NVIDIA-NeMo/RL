@@ -39,6 +39,7 @@ dependencies = [
     "tiktoken",
     "blobfile",
     "debugpy",
+    "nvtx",
     "matplotlib",
     "plotly"
 ]
