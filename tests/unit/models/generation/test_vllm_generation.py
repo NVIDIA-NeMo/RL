@@ -409,7 +409,23 @@ async def test_vllm_policy_generation_async(
             lm_policy, async_policy, vllm_config["colocated"]["enabled"]
         )
 
-        outputs = async_policy.generate_async(test_input_data)
+        collected_indexed_outputs = []
+        async for original_idx, single_item_output in async_policy.generate_async(
+            test_input_data
+        ):
+            collected_indexed_outputs.append((original_idx, single_item_output))
+
+        # Sort by original_idx to ensure order matches generation_input_data
+        collected_indexed_outputs.sort(key=lambda x: x[0])
+
+        # Extract in correct order
+        outputs = [item for _, item in collected_indexed_outputs]
+        pad_token_id = async_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+        outputs = BatchedDataDict.from_batches(
+            outputs,
+            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+        )
+
         # Validate outputs format
         assert "output_ids" in outputs, "output_ids not found in generation output"
         assert "logprobs" in outputs, "logprobs not found in generation output"
@@ -594,9 +610,10 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 @pytest.mark.timeout(140)
+@pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("enable_dtensor", [True, False])
-def test_vllm_generation_with_hf_training(
+async def test_vllm_generation_with_hf_training(
     cluster, tokenizer, enable_dtensor, async_engine
 ):
     """1. Use vLLM for generation
@@ -665,9 +682,24 @@ def test_vllm_generation_with_hf_training(
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
         if async_engine:
-            generation_results = vllm_policy.generate_async(
-                test_input_data, greedy=True
+            collected_indexed_outputs = []
+            async for original_idx, single_item_output in vllm_policy.generate_async(
+                test_input_data
+            ):
+                collected_indexed_outputs.append((original_idx, single_item_output))
+
+            # Sort by original_idx to ensure order matches generation_input_data
+            collected_indexed_outputs.sort(key=lambda x: x[0])
+
+            # Extract in correct order
+            outputs = [item for _, item in collected_indexed_outputs]
+            pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+            outputs = BatchedDataDict.from_batches(
+                outputs,
+                pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
             )
+
+            generation_results = outputs
         else:
             generation_results = vllm_policy.generate(test_input_data, greedy=True)
         vllm_policy.finish_generation()
@@ -766,7 +798,23 @@ def test_vllm_generation_with_hf_training(
         print("Using vLLM for generation again...")
         vllm_policy.prepare_for_generation()
         if async_engine:
-            final_generation = vllm_policy.generate_async(test_input_data)
+            collected_indexed_outputs = []
+            async for original_idx, single_item_output in vllm_policy.generate_async(
+                test_input_data
+            ):
+                collected_indexed_outputs.append((original_idx, single_item_output))
+
+            # Sort by original_idx to ensure order matches generation_input_data
+            collected_indexed_outputs.sort(key=lambda x: x[0])
+
+            # Extract in correct order
+            outputs = [item for _, item in collected_indexed_outputs]
+            pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+            final_generation = BatchedDataDict.from_batches(
+                outputs,
+                pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+            )
+
         else:
             final_generation = vllm_policy.generate(test_input_data)
 
