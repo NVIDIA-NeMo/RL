@@ -393,8 +393,8 @@ class TestRayGpuMonitorLogger:
             assert monitor.is_running is False
 
     @patch("nemo_rl.utils.logger.ray")
-    def test_parse_gpu_metric(self, mock_ray):
-        """Test _parse_gpu_metric method."""
+    def test_parse_metric(self, mock_ray):
+        """Test _parse_metric method."""
         # Mock ray.is_initialized to return True
         mock_ray.is_initialized.return_value = True
 
@@ -419,25 +419,55 @@ class TestRayGpuMonitorLogger:
         )
 
         # Parse the sample
-        result = monitor._parse_gpu_metric(utilization_sample, node_idx=1)
+        result = monitor._parse_metric(utilization_sample, node_idx=1)
 
         # Verify the result
-        assert result == {"node.1.gpu.0.gpu": 75.5}
+        assert result == {"node.1.gpu.0.util": 75.5}
 
-        # Create a sample with GPU memory metric
+        # Create a sample with GPU memory metric (in MB)
         memory_sample = Sample(
             name="ray_node_gram_used",
             labels={"GpuIndex": "0", "GpuDeviceName": "NVIDIA Test GPU"},
-            value=4096.0,
+            value=80.0 * 1024,
             timestamp=None,
             exemplar=None,
         )
 
         # Parse the sample
-        result = monitor._parse_gpu_metric(memory_sample, node_idx=1)
+        result = monitor._parse_metric(memory_sample, node_idx=1)
 
         # Verify the result
-        assert result == {"node.1.gpu.0.memory": 4096.0}
+        assert result == {"node.1.gpu.0.mem_gb": 80.0}
+
+        # Create a sample with system memory metric
+        system_memory_sample = Sample(
+            name="ray_node_mem_used",
+            labels={"InstanceId": "n/a"},
+            value=100.0 * 1024 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(system_memory_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {"node.1.mem_gb": 100.0}
+
+        # Create a sample with total system memory metric
+        total_memory_sample = Sample(
+            name="ray_node_mem_total",
+            labels={"InstanceId": "n/a"},
+            value=200.0 * 1024 * 1024 * 1024,
+            timestamp=None,
+            exemplar=None,
+        )
+
+        # Parse the sample
+        result = monitor._parse_metric(total_memory_sample, node_idx=1)
+
+        # Verify the result
+        assert result == {"node.1.mem_total_gb": 200.0}
 
         # Test with an unexpected metric name
         other_sample = Sample(
@@ -449,22 +479,7 @@ class TestRayGpuMonitorLogger:
         )
 
         # Parse the sample
-        result = monitor._parse_gpu_metric(other_sample, node_idx=1)
-
-        # Verify the result is empty
-        assert result == {}
-
-        # Test with missing GpuIndex label
-        invalid_sample = Sample(
-            name="ray_node_gpus_utilization",
-            labels={"OtherLabel": "value"},
-            value=75.5,
-            timestamp=None,
-            exemplar=None,
-        )
-
-        # Parse the sample
-        result = monitor._parse_gpu_metric(invalid_sample, node_idx=1)
+        result = monitor._parse_metric(other_sample, node_idx=1)
 
         # Verify the result is empty
         assert result == {}
@@ -480,13 +495,13 @@ class TestRayGpuMonitorLogger:
         mock_response = mock_get.return_value
         mock_response.status_code = 200
         # Simplified Prometheus format text with GPU metrics
-        mock_response.text = """
+        mock_response.text = f"""
 # HELP ray_node_gpus_utilization GPU utilization
 # TYPE ray_node_gpus_utilization gauge
-ray_node_gpus_utilization{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 75.5
+ray_node_gpus_utilization{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} 75.5
 # HELP ray_node_gram_used GPU memory used
 # TYPE ray_node_gram_used gauge
-ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
+ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         """
 
         # Initialize the monitor
@@ -498,18 +513,18 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
             parent_logger=None,
         )
 
-        # Mock the _parse_gpu_metric method to return expected values
-        with patch.object(monitor, "_parse_gpu_metric") as mock_parse:
+        # Mock the _parse_metric method to return expected values
+        with patch.object(monitor, "_parse_metric") as mock_parse:
             mock_parse.side_effect = [
-                {"node.2.gpu.0.gpu": 75.5},
-                {"node.2.gpu.0.memory": 4096.0},
+                {"node.2.gpu.0.util": 75.5},
+                {"node.2.gpu.0.mem_gb": 80.0},
             ]
 
             # Call the method
             result = monitor._fetch_and_parse_metrics(
                 node_idx=2,
                 metric_address="test_ip:test_port",
-                parser_fn=monitor._parse_gpu_metric,
+                parser_fn=monitor._parse_metric,
             )
 
             # Verify request was made correctly
@@ -521,7 +536,10 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
             assert mock_parse.call_count == 2
 
             # Verify the result combines both metrics
-            assert result == {"node.2.gpu.0.gpu": 75.5, "node.2.gpu.0.memory": 4096.0}
+            assert result == {
+                "node.2.gpu.0.util": 75.5,
+                "node.2.gpu.0.mem_gb": 80.0,
+            }
 
     @patch("nemo_rl.utils.logger.ray")
     def test_collect_metrics(self, mock_ray):
@@ -547,8 +565,8 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
         # Mock the _fetch_and_parse_metrics method
         with patch.object(monitor, "_fetch_and_parse_metrics") as mock_fetch:
             mock_fetch.side_effect = [
-                {"node.0.gpu.0.gpu": 75.5, "node.0.gpu.0.memory": 4096.0},
-                {"node.1.gpu.0.gpu": 50.0, "node.1.gpu.0.memory": 2048.0},
+                {"node.0.gpu.0.util": 75.5, "node.0.gpu.0.mem_gb": 80.0},
+                {"node.1.gpu.0.util": 50.0, "node.1.gpu.0.mem_gb": 20.0},
             ]
 
             # Call the method
@@ -556,15 +574,15 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
 
             # Verify _fetch_and_parse_metrics was called for each node
             assert mock_fetch.call_count == 2
-            mock_fetch.assert_any_call(0, "10.0.0.1:8080", monitor._parse_gpu_metric)
-            mock_fetch.assert_any_call(1, "10.0.0.2:8080", monitor._parse_gpu_metric)
+            mock_fetch.assert_any_call(0, "10.0.0.1:8080", monitor._parse_metric)
+            mock_fetch.assert_any_call(1, "10.0.0.2:8080", monitor._parse_metric)
 
             # Verify the result combines metrics from all nodes
             assert result == {
-                "node.0.gpu.0.gpu": 75.5,
-                "node.0.gpu.0.memory": 4096.0,
-                "node.1.gpu.0.gpu": 50.0,
-                "node.1.gpu.0.memory": 2048.0,
+                "node.0.gpu.0.util": 75.5,
+                "node.0.gpu.0.mem_gb": 80.0,
+                "node.1.gpu.0.util": 50.0,
+                "node.1.gpu.0.mem_gb": 20.0,
             }
 
     @patch("nemo_rl.utils.logger.ray")
@@ -607,11 +625,11 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
         monitor.metrics_buffer = [
             {
                 "step": 10,
-                "metrics": {"node.0.gpu.0.gpu": 75.5, "node.0.gpu.0.memory": 4096.0},
+                "metrics": {"node.0.gpu.0.util": 75.5, "node.0.gpu.0.mem_gb": 80.0},
             },
             {
                 "step": 20,
-                "metrics": {"node.0.gpu.0.gpu": 80.0, "node.0.gpu.0.memory": 5120.0},
+                "metrics": {"node.0.gpu.0.util": 80.0, "node.0.gpu.0.mem_gb": 5120.0},
             },
         ]
 
@@ -623,8 +641,8 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
 
         # First metrics entry should include the step metric
         expected_first_metrics = {
-            "node.0.gpu.0.gpu": 75.5,
-            "node.0.gpu.0.memory": 4096.0,
+            "node.0.gpu.0.util": 75.5,
+            "node.0.gpu.0.mem_gb": 80.0,
             "ray/ray_step": 10,  # Step metric added
         }
         assert mock_parent_logger.logged_metrics[0] == expected_first_metrics
@@ -634,8 +652,8 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
 
         # Second metrics entry should include the step metric
         expected_second_metrics = {
-            "node.0.gpu.0.gpu": 80.0,
-            "node.0.gpu.0.memory": 5120.0,
+            "node.0.gpu.0.util": 80.0,
+            "node.0.gpu.0.mem_gb": 5120.0,
             "ray/ray_step": 20,  # Step metric added
         }
         assert mock_parent_logger.logged_metrics[1] == expected_second_metrics
@@ -667,7 +685,7 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
         monitor.metrics_buffer = [
             {
                 "step": 15,
-                "metrics": {"node.0.gpu.0.gpu": 60.0},
+                "metrics": {"node.0.gpu.0.util": 60.0},
             }
         ]
 
@@ -676,7 +694,7 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
 
         # Verify parent logger's log_metrics was called with the custom prefix
         assert len(mock_parent_logger.logged_metrics) == 1
-        expected_metrics = {"node.0.gpu.0.gpu": 60.0, "custom_metrics/step": 15}
+        expected_metrics = {"node.0.gpu.0.util": 60.0, "custom_metrics/step": 15}
         assert mock_parent_logger.logged_metrics[0] == expected_metrics
         assert mock_parent_logger.logged_steps[0] == 15
         assert mock_parent_logger.logged_prefixes[0] == custom_prefix
@@ -716,7 +734,7 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
         def side_effect():
             if not monitor.iteration_done:
                 monitor.iteration_done = True
-                return {"node.0.gpu.0.gpu": 75.5}
+                return {"node.0.gpu.0.util": 75.5}
             else:
                 monitor.is_running = False
                 return {}
@@ -734,7 +752,7 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
                     monitor.metrics_buffer[0]["step"] == 10
                 )  # relative time (110 - 100)
                 assert monitor.metrics_buffer[0]["metrics"] == {
-                    "node.0.gpu.0.gpu": 75.5
+                    "node.0.gpu.0.util": 75.5
                 }
 
                 # Verify flush was called (flush_interval elapsed)
@@ -820,6 +838,49 @@ ray_node_gram_used{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"} 4096.0
         )
 
         # Since wandb is disabled, define_metric should not be called
+        mock_wandb_instance = mock_wandb_logger.return_value
+        assert not mock_wandb_instance.define_metric.called
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
+    def test_gpu_monitoring_no_main_loggers(
+        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Test GPU monitoring initialization when no main loggers (wandb/tensorboard) are enabled."""
+        cfg = {
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "monitor_gpus": True,
+            "gpu_monitoring": {
+                "collection_interval": 15.0,
+                "flush_interval": 45.0,
+            },
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+
+        # Check that regular loggers were NOT initialized
+        assert len(logger.loggers) == 0
+        mock_wandb_logger.assert_not_called()
+        mock_tb_logger.assert_not_called()
+
+        # Check that GPU monitor was initialized with correct parameters
+        mock_gpu_monitor.assert_called_once_with(
+            collection_interval=15.0,
+            flush_interval=45.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=logger,  # Logger instance is passed as parent
+        )
+
+        # Check that GPU monitor was started
+        mock_gpu_instance = mock_gpu_monitor.return_value
+        mock_gpu_instance.start.assert_called_once()
+
+        # Since wandb is disabled, self.wandb_logger would be None,
+        # and define_metric should not be called on it.
+        # We access the mock_wandb_logger.return_value which is the mock object itself.
         mock_wandb_instance = mock_wandb_logger.return_value
         assert not mock_wandb_instance.define_metric.called
 

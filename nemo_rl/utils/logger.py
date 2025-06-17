@@ -303,8 +303,8 @@ class RayGpuMonitorLogger:
                 )
                 time.sleep(self.collection_interval)  # Continue despite errors
 
-    def _parse_gpu_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
-        """Parse a GPU metric sample into a standardized format.
+    def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
+        """Parse a metric sample into a standardized format.
 
         Args:
             sample: Prometheus metric sample
@@ -313,28 +313,28 @@ class RayGpuMonitorLogger:
         Returns:
             Dictionary with metric name and value
         """
-        # Expected labels for GPU metrics
-        expected_labels = ["GpuIndex"]
-        for label in expected_labels:
-            if label not in sample.labels:
-                # This is probably a CPU node
-                return {}
-
         metric_name = sample.name
-        # Rename known metrics to match wandb naming convention
+        labels = sample.labels
+        value = sample.value
+
         if metric_name == "ray_node_gpus_utilization":
-            metric_name = "gpu"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.util"
         elif metric_name == "ray_node_gram_used":
-            metric_name = "memory"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
+            # NOTE: It appears their docs say bytes, but it appears to be MB
+            value /= 1024
+        elif metric_name == "ray_node_mem_used":
+            metric_name = f"node.{node_idx}.mem_gb"
+            value /= 1024 * 1024 * 1024
+        elif metric_name == "ray_node_mem_total":
+            metric_name = f"node.{node_idx}.mem_total_gb"
+            value /= 1024 * 1024 * 1024
         else:
             # Skip unexpected metrics
             return {}
 
-        labels = sample.labels
-        index = labels["GpuIndex"]
-        value = sample.value
-
-        metric_name = f"node.{node_idx}.gpu.{index}.{metric_name}"
         return {metric_name: value}
 
     def _parse_gpu_sku(self, sample: Sample, node_idx: int) -> dict[str, str]:
@@ -401,7 +401,7 @@ class RayGpuMonitorLogger:
         assert metrics ^ sku, (
             f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
         )
-        parser_fn = self._parse_gpu_metric if metrics else self._parse_gpu_sku
+        parser_fn = self._parse_metric if metrics else self._parse_gpu_sku
 
         if not ray.is_initialized():
             print("Ray is not initialized. Cannot collect GPU metrics.")
@@ -426,10 +426,10 @@ class RayGpuMonitorLogger:
             # Process each node's metrics
             collected_metrics = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                gpu_metrics = self._fetch_and_parse_metrics(
+                metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
                 )
-                collected_metrics.update(gpu_metrics)
+                collected_metrics.update(metrics)
 
             return collected_metrics
 
@@ -462,13 +462,6 @@ class RayGpuMonitorLogger:
 
             # Parse the Prometheus format
             for family in text_string_to_metric_families(metrics_text):
-                # Skip non-GPU metrics
-                if family.name not in (
-                    "ray_node_gram_used",
-                    "ray_node_gpus_utilization",
-                ):
-                    continue
-
                 for sample in family.samples:
                     metrics = parser_fn(sample, node_idx)
                     gpu_metrics.update(metrics)
