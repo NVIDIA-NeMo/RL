@@ -1145,7 +1145,7 @@ def test_vllm_non_divisible_batch_handling(policy):
     )
 
 
-def test_vllm_refit_non_collocated_handles_update(
+def test_vllm_refit_non_collocated_update_weights(
     policy_cluster_separate,
     generation_cluster_separate,
     tokenizer,
@@ -1185,6 +1185,60 @@ def test_vllm_refit_non_collocated_handles_update(
 
     # test generate
     outputs = vllm_generation.generate(test_input_data, greedy=True)
+    output_ids = outputs["output_ids"]
+    generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    assert generated_texts == [
+        "Hello, my name is Lina. I'm",
+        "The capital of France is Paris. The capital of",
+    ], "Output should be the same as the expected output"
+
+    # Clean up
+    vllm_generation.shutdown()
+    lm_policy.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_vllm_refit_non_collocated_update_weights_async(
+    policy_cluster_separate,
+    generation_cluster_separate,
+    tokenizer,
+    test_input_data,
+):
+    if (
+        policy_cluster_separate.num_gpus_per_node < 1
+        or generation_cluster_separate.num_gpus_per_node < 1
+    ):
+        pytest.skip(
+            "Test requires at least two GPUs to run policies on separate clusters."
+        )
+
+    # Create Policy on its own cluster
+    hf_config = get_basic_hf_test_config(enable_dtensor=True)
+    hf_config["dtensor_cfg"]["tensor_parallel_size"] = 1
+    hf_config["generation"]["colocated"]["enabled"] = False
+    lm_policy = Policy(policy_cluster_separate, hf_config, tokenizer)
+
+    # Create VllmGeneration policy on its own cluster
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    vllm_config["vllm_cfg"]["tensor_parallel_size"] = 1
+    vllm_config["colocated"]["enabled"] = False
+    vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
+
+    # initialize collective communication for update weights
+    ip, port = ray.get(_get_node_ip_and_free_port.remote())
+    futures_train = lm_policy.init_collective(ip, port, world_size=2)
+    futures_inference = vllm_generation.init_collective(ip, port, world_size=2)
+    ray.get(futures_train + futures_inference)
+
+    print("refitting vllm policy...")
+    refit_policy_generation(
+        lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
+    )
+
+    # test generate
+    outputs = vllm_generation.generate_async(test_input_data, greedy=True)
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
     assert generated_texts == [
