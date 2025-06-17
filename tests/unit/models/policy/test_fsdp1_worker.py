@@ -27,7 +27,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLoss, SimpleNLLLoss
 
 basic_llama_test_config: PolicyConfig = {
@@ -58,6 +58,7 @@ basic_llama_test_config: PolicyConfig = {
         "sequence_parallel": False,
         "activation_checkpointing": False,
         "tensor_parallel_size": 1,
+        "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
     "dynamic_batching": {
@@ -176,8 +177,8 @@ def policy_setup(tokenizer, num_gpus):
     config = basic_llama_test_config
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
-    print("Creating HfPolicy...")
-    policy = HfPolicy(cluster=cluster, config=config, tokenizer=tokenizer)
+    print("Creating Policy...")
+    policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
     yield policy, cluster
 
@@ -189,7 +190,7 @@ def policy_setup(tokenizer, num_gpus):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("num_gpus", [1, 2], ids=["1gpu", "2gpu"])
-def test_hf_policy_init(policy_setup, num_gpus):
+def test_lm_policy_init(policy_setup, num_gpus):
     policy, cluster = policy_setup
 
     # Verify cluster and policy were properly created
@@ -322,8 +323,8 @@ def training_setup(tokenizer, request, num_gpus):
         if config_updates:
             config.update(config_updates)
 
-        print("Creating training HfPolicy...")
-        policy = HfPolicy(
+        print("Creating training Policy...")
+        policy = Policy(
             cluster=cluster,
             config=config,
             init_reference_model=False,
@@ -395,7 +396,7 @@ def get_max_gpu_utilization(policy):
         "2gpu_activation_checkpointing",
     ],
 )
-def test_hf_policy_training(training_setup, tracker, num_gpus, config_name):
+def test_lm_policy_training(training_setup, tracker, num_gpus, config_name):
     def verify_loss_tensor(loss_tensor):
         assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
         assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
@@ -510,8 +511,8 @@ def generation_setup(request, test_input_data, tokenizer, num_gpus):
             config["generation"], tokenizer
         )
 
-        print("Creating generation HfPolicy...")
-        policy = HfPolicy(
+        print("Creating generation Policy...")
+        policy = Policy(
             cluster=cluster,
             config=config,
             tokenizer=tokenizer,
@@ -541,7 +542,7 @@ def generation_setup(request, test_input_data, tokenizer, num_gpus):
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("num_gpus", [1, 2], ids=["1gpu", "2gpu"])
 @pytest.mark.parametrize("generation_setup", [False], indirect=True)
-def test_hf_policy_generation(generation_setup, tokenizer, num_gpus, tracker):
+def test_lm_policy_generation(generation_setup, tokenizer, num_gpus, tracker):
     policy, cluster, data, prompts, expected_generations = generation_setup
 
     # Verify resources were created properly
@@ -629,7 +630,7 @@ def test_hf_policy_generation(generation_setup, tokenizer, num_gpus, tracker):
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("num_gpus", [1, 2], ids=["1gpu", "2gpu"])
 @pytest.mark.parametrize("generation_setup", [True], indirect=True)
-def test_all_hf_policy_generation_lps_ref_training(generation_setup):
+def test_all_lm_policy_generation_lps_ref_training(generation_setup):
     policy, cluster, data, prompts, expected_generations = generation_setup
 
     # Verify resources were created properly
@@ -706,7 +707,7 @@ def test_all_hf_policy_generation_lps_ref_training(generation_setup):
     assert losses[0] > losses[-1], "Loss should decrease over training iterations"
 
 
-def test_hf_policy_generation_with_stop(test_input_data, tokenizer):
+def test_lm_policy_generation_with_stop(test_input_data, tokenizer):
     # Create resources with unique name
     cluster_name = "test-generate-with-stop"
     print(f"Creating training virtual cluster '{cluster_name}'...")
@@ -732,7 +733,7 @@ def test_hf_policy_generation_with_stop(test_input_data, tokenizer):
     )
 
     # Create policy
-    policy = HfPolicy(cluster=cluster, config=config, tokenizer=tokenizer)
+    policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
     # Call prepare_for_generation if available
     print("Preparing for generation...")
@@ -817,8 +818,8 @@ def test_loss_independent_of_microbatch_size(num_gpus, tokenizer):
 
     config = basic_llama_test_config
 
-    print("Creating training HfPolicy...")
-    policy_mbs1 = HfPolicy(
+    print("Creating training Policy...")
+    policy_mbs1 = Policy(
         cluster=cluster,
         config=config,
         init_reference_model=False,
@@ -854,8 +855,8 @@ def test_loss_independent_of_microbatch_size(num_gpus, tokenizer):
     config["train_micro_batch_size"] = 2
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
-    print("Creating training HfPolicy...")
-    policy_mbs2 = HfPolicy(
+    print("Creating training Policy...")
+    policy_mbs2 = Policy(
         cluster=cluster,
         config=config,
         init_reference_model=False,

@@ -27,6 +27,7 @@ import ray
 import requests
 import torch
 import wandb
+from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from rich.box import ROUNDED
@@ -122,6 +123,15 @@ class TensorboardLogger(LoggerInterface):
         # Flatten the params because add_hparams does not support nested dicts
         self.writer.add_hparams(flatten_dict(params), {})
 
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to Tensorboard.
+
+        Args:
+            plot_data: Dictionary of plot data
+            step: Global step value
+        """
+        self.writer.add_figure(name, figure, step)
+
 
 class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
@@ -181,6 +191,15 @@ class WandbLogger(LoggerInterface):
             params: Dict of hyperparameters to log
         """
         self.run.config.update(params)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to wandb.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+        """
+        self.run.log({name: figure}, step=step)
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -284,8 +303,8 @@ class RayGpuMonitorLogger:
                 )
                 time.sleep(self.collection_interval)  # Continue despite errors
 
-    def _parse_gpu_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
-        """Parse a GPU metric sample into a standardized format.
+    def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
+        """Parse a metric sample into a standardized format.
 
         Args:
             sample: Prometheus metric sample
@@ -294,28 +313,28 @@ class RayGpuMonitorLogger:
         Returns:
             Dictionary with metric name and value
         """
-        # Expected labels for GPU metrics
-        expected_labels = ["GpuIndex"]
-        for label in expected_labels:
-            if label not in sample.labels:
-                # This is probably a CPU node
-                return {}
-
         metric_name = sample.name
-        # Rename known metrics to match wandb naming convention
+        labels = sample.labels
+        value = sample.value
+
         if metric_name == "ray_node_gpus_utilization":
-            metric_name = "gpu"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.util"
         elif metric_name == "ray_node_gram_used":
-            metric_name = "memory"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
+            # NOTE: It appears their docs say bytes, but it appears to be MB
+            value /= 1024
+        elif metric_name == "ray_node_mem_used":
+            metric_name = f"node.{node_idx}.mem_gb"
+            value /= 1024 * 1024 * 1024
+        elif metric_name == "ray_node_mem_total":
+            metric_name = f"node.{node_idx}.mem_total_gb"
+            value /= 1024 * 1024 * 1024
         else:
             # Skip unexpected metrics
             return {}
 
-        labels = sample.labels
-        index = labels["GpuIndex"]
-        value = sample.value
-
-        metric_name = f"node.{node_idx}.gpu.{index}.{metric_name}"
         return {metric_name: value}
 
     def _parse_gpu_sku(self, sample: Sample, node_idx: int) -> dict[str, str]:
@@ -382,7 +401,7 @@ class RayGpuMonitorLogger:
         assert metrics ^ sku, (
             f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
         )
-        parser_fn = self._parse_gpu_metric if metrics else self._parse_gpu_sku
+        parser_fn = self._parse_metric if metrics else self._parse_gpu_sku
 
         if not ray.is_initialized():
             print("Ray is not initialized. Cannot collect GPU metrics.")
@@ -407,10 +426,10 @@ class RayGpuMonitorLogger:
             # Process each node's metrics
             collected_metrics = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                gpu_metrics = self._fetch_and_parse_metrics(
+                metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
                 )
-                collected_metrics.update(gpu_metrics)
+                collected_metrics.update(metrics)
 
             return collected_metrics
 
@@ -443,13 +462,6 @@ class RayGpuMonitorLogger:
 
             # Parse the Prometheus format
             for family in text_string_to_metric_families(metrics_text):
-                # Skip non-GPU metrics
-                if family.name not in (
-                    "ray_node_gram_used",
-                    "ray_node_gpus_utilization",
-                ):
-                    continue
-
                 for sample in family.samples:
                     metrics = parser_fn(sample, node_idx)
                     gpu_metrics.update(metrics)
@@ -598,6 +610,98 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_plot_token_mult_prob_error(
+        self, data: dict[str, Any], step: int, name: str
+    ) -> None:
+        """Log a plot of log probability errors in samples.
+
+        This function logs & plots the per-token log-probabilities and errors over the sequence
+        for the sample with the highest multiplicative probability error in the batch.
+
+        Args:
+            log_data: Dictionary of log probability samples
+            step: Global step value
+            name: Name of the plot
+        """
+        # find the sample with the highest log probability error
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        generation_logprobs = data["generation_logprobs"][:, 1:]
+        prev_logprobs = data["prev_logprobs"][:, 1:]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+
+        sample_idx = torch.argmax(mult_prob_error)
+        sample_error = mult_prob_error[sample_idx]
+
+        # plot the sample with the highest log probability error
+        # offset by 1 token for next token prediction
+        generation_start_idx, generation_end_idx = (
+            data["prompt_lengths"][sample_idx] - 1,
+            data["full_lengths"][sample_idx] - 1,
+        )
+
+        generation_logprob = generation_logprobs[
+            sample_idx, generation_start_idx:generation_end_idx
+        ]
+        prev_logprob = (
+            prev_logprobs[sample_idx, generation_start_idx:generation_end_idx]
+            * mask[sample_idx, generation_start_idx:generation_end_idx]
+        )
+        diff_i = diff[sample_idx, generation_start_idx:generation_end_idx]
+
+        # Find max absolute error token
+        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error = diff_i[max_abs_error_idx].item()
+
+        # Find max relative error token (ratio of probabilities)
+        gen_prob = torch.exp(generation_logprob)
+        prev_prob = torch.exp(prev_logprob)
+        relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
+        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error = relative_error[max_rel_error_idx].item()
+
+        fig = plt.figure()
+        step_idx = torch.arange(generation_start_idx, generation_end_idx)
+
+        plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
+        plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")
+        plt.plot(
+            step_idx,
+            diff_i,
+            label=f"abs diff (token_mult_prob_error={sample_error:.2f})",
+        )
+
+        # Highlight max errors with points
+        plt.plot(
+            step_idx[max_abs_error_idx],
+            diff_i[max_abs_error_idx],
+            "ro",
+            markersize=8,
+            label=f"Max abs error: {max_abs_error:.4f}",
+        )
+        plt.plot(
+            step_idx[max_rel_error_idx],
+            diff_i[max_rel_error_idx],
+            "bo",
+            markersize=8,
+            label=f"Max rel error (prob): {max_rel_error:.4f}",
+        )
+
+        plt.xlabel("Token Position (starting from prompt end)")
+        plt.ylabel("Log Probability/Difference")
+        plt.legend()
+        plt.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, name)
+
+        plt.close(fig)
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""

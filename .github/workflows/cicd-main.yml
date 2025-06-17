@@ -167,7 +167,7 @@ jobs:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     with:
       RUNNER: self-hosted-azure
-      TIMEOUT: 90
+      TIMEOUT: 120
       UNIT_TEST_SCRIPT: |
         cd /opt/nemo-rl
         if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
@@ -188,6 +188,7 @@ jobs:
           time uv run --no-sync bash ./tests/functional/sft.sh
           time uv run --no-sync bash ./tests/functional/grpo.sh
           time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
+          time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
           time uv run --no-sync bash ./tests/functional/dpo.sh
           time uv run --no-sync bash ./tests/functional/eval.sh
           time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh

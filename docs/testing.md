@@ -69,7 +69,7 @@ Which would produce this file in `tests/unit/unit_results.json`:
   "git_commit": "f1062bd3fd95fc64443e2d9ee4a35fc654ba897e",
   "start_time": "2025-03-24 23:34:12",
   "metrics": {
-    "test_hf_ray_policy::test_hf_policy_generation": {
+    "test_hf_ray_policy::test_lm_policy_generation": {
       "avg_prob_mult_error": 1.0000039339065552,
       "mean_lps": -1.5399343967437744,
       "_elapsed": 17.323044061660767
@@ -88,7 +88,7 @@ Past unit test results are logged in `tests/unit/unit_results/`. These are helpf
 Here's an example `jq` command to view trends:
 
 ```sh
-jq -r '[.start_time, .git_commit, .metrics["test_hf_ray_policy::test_hf_policy_generation"].avg_prob_mult_error] | @tsv' tests/unit/unit_results/*
+jq -r '[.start_time, .git_commit, .metrics["test_hf_ray_policy::test_lm_policy_generation"].avg_prob_mult_error] | @tsv' tests/unit/unit_results/*
 
 # Example output:
 #2025-03-24 23:35:39     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552

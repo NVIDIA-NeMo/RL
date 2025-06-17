@@ -28,6 +28,7 @@ uv run $PROJECT_ROOT/examples/run_dpo.py \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
+    logger.monitor_gpus=true \
     checkpointing.enabled=false \
     $@ \
     2>&1 | tee $RUN_LOG

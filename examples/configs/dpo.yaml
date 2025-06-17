@@ -51,6 +51,7 @@ policy:
     sequence_parallel: false
     activation_checkpointing: false
     tensor_parallel_size: 1
+    context_parallel_size: 1
     custom_parallel_plan: null
 
   dynamic_batching:
@@ -92,7 +93,7 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: false
-  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "dpo-dev"
     name: "dpo"
