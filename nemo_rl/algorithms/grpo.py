@@ -504,7 +504,6 @@ async def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-
         val_metrics, validation_timings = await validate(
             policy_generation,
             val_dataloader,
