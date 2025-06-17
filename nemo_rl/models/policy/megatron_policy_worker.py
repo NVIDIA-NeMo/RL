@@ -614,7 +614,7 @@ class MegatronPolicyWorker:
         self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
 
     def configure_worker(self, num_gpus: int, bundle_indices: Optional[tuple] = None):
-        USE_EXPANDABLE_SEGMENTS = False # Disabling this right now as it seems to cause vLLM refit issues with Ampere
+        USE_EXPANDABLE_SEGMENTS = False  # Disabling this right now as it seems to cause vLLM refit issues with Ampere
         if USE_EXPANDABLE_SEGMENTS:
             return None, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, None
         else:
