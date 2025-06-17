@@ -321,7 +321,7 @@ class NLLLoss(LossFunction):
 
         # Gather the logprobs for the actual next tokens
         if vocab_parallel_group is not None:
-            curr_logprobs = from_parallel_logits_to_logprobs(
+            token_logprobs = from_parallel_logits_to_logprobs(
                 next_token_logits,
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
