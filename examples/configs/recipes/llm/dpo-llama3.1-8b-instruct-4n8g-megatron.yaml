@@ -24,7 +24,6 @@ checkpointing:
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
-  training_backend: "megatron"
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 256

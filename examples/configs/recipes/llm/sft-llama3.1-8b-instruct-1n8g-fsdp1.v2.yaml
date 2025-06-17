@@ -15,7 +15,6 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
 policy:
-  training_backend: "hf"
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:
     name: meta-llama/Llama-3.1-8B-Instruct
