@@ -108,6 +108,7 @@ from nemo_rl.models.megatron.refit_utils import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import get_gpu_info
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 
 def setup_megatron_model(
@@ -315,7 +316,11 @@ def destroy_parallel_state():
         pass
 
 
-@ray.remote
+@ray.remote(
+    runtime_env={
+        **get_nsight_config_if_pattern_matches("megatron_policy_worker"),
+    }
+)
 class MegatronPolicyWorker:
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
