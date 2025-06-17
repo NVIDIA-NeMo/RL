@@ -62,21 +62,21 @@ What you can expect:
 
 Clone **NeMo RL**.
 ```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
 cd nemo-rl
 ```
 
 <!--
 # TODO: Replace the above instructions once we have a real mcore example
 ```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
 cd nemo-rl
 
-# If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules 
+# If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules
 # by running:
 # git submodule update --init --recursive
 
-# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure 
+# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
 # submodules are automatically updated after switching branches or pulling updates by configuring git with:
 # git config submodule.recurse true
 
@@ -209,7 +209,7 @@ sbatch \
 We also support multi-turn generation and training (tool use, games, etc.).
 Reference example for training to play a Sliding Puzzle Game:
 ```sh
-uv run python examples/run_grpo_sliding_puzzle.py 
+uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
 ## Supervised Fine-Tuning (SFT)
@@ -373,7 +373,7 @@ If you use NeMo RL in your research, please cite it using the following BibTeX e
 ```bibtex
 @misc{nemo-rl,
 title = {NeMo RL: A Scalable and Efficient Post-Training Library},
-howpublished = {\url{https://github.com/NVIDIA/NeMo-RL}},
+howpublished = {\url{https://github.com/NVIDIA-NeMo/RL}},
 year = {2025},
 note = {GitHub repository},
 }
@@ -381,8 +381,8 @@ note = {GitHub repository},
 
 ## Contributing
 
-We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA/NeMo-RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
+We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
 
 ## Licenses
 
-NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA/NeMo-RL/blob/main/LICENSE).
+NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/RL/blob/main/LICENSE).
