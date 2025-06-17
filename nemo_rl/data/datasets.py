@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Union
 
+import jsonlines
 import torch
 from datasets import Dataset
+from transformers import AutoTokenizer
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -26,6 +30,81 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+@dataclass
+class JsonlinesDataset:
+    jsonl_path: str
+    seed: int
+    tokenizer: AutoTokenizer
+    max_seq_length: int
+    filter_long_samples: bool = False
+
+    def __post_init__(self):
+        self.data = self._load_data()
+
+        idx_to_ignore = set()
+        if self.filter_long_samples:
+            for i, item in enumerate(self):
+                if item["length"] > self.max_seq_length:
+                    idx_to_ignore.add(i)
+            print(f"found {len(idx_to_ignore)} long samples to ignore on dataset init")
+
+        self.data = [item for i, item in enumerate(self.data) if i not in idx_to_ignore]
+
+    def _load_data(self):
+        with jsonlines.open(self.jsonl_path, "r") as reader:
+            data = [line for line in reader]
+        return data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> DatumSpec:
+        data = self.data[idx]
+        # support single turn for now
+        assert len(data["messages"]) == 1
+        single_message = data["messages"][0]
+
+        message_log = []
+
+        # this will also contain system prompt
+        user_message = {"role": "user"}
+
+        for m in single_message:
+            if m["role"] == "user":
+                # need to be deepcopy to avoid overwriting the original metadata
+                extra_env_info = deepcopy(m["metadata"])
+
+        message = self.tokenizer.apply_chat_template(
+            single_message,
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        user_message["token_ids"] = self.tokenizer.apply_chat_template(
+            single_message,
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )[0]
+        user_message["content"] = message
+        message_log.append(user_message)
+
+        length = sum(len(m["token_ids"]) for m in message_log)
+
+        output = {
+            "message_log": message_log,
+            "length": length,
+            "extra_env_info": extra_env_info,
+            "loss_multiplier": 1.0,
+            "idx": idx,
+            "task_name": data["task_name"],
+            "dataset": data["dataset"],
+        }
+
+        return output
 
 
 # TODO @sahilj handle too-long prompts and masking them out throughout the whole process and renormalizing on loss
@@ -126,6 +205,7 @@ def rl_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
 
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
+    dataset_names = [datum.get("dataset", None) for datum in data_batch]
 
     output = BatchedDataDict(
         message_log=message_log,
@@ -136,6 +216,7 @@ def rl_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
+        dataset_names=dataset_names,
     )
     return output
 

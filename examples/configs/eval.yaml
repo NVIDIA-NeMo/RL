@@ -1,8 +1,7 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@1" # only pass@1 is supported now
-  num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
+  num_repeats: 1
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation
@@ -18,25 +17,54 @@ generation:
     precision: "bfloat16"
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.9
-    max_model_len: 2048
+    max_model_len: 4096
+
+data:
+  train:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: ...
+
+    # checks if it's too long on init
+    filter_long_samples: false
+    drop_last: True
+  
+  max_input_seq_length: ${generation.vllm_cfg.max_model_len} # upper bound, real truncation occurs at vllm.max_model_len
 
 tokenizer:
   name: ${generation.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  chat_template: "default"
 
-data:
-  max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
-  prompt_file: null
-  system_prompt_file: null
-  dataset_name: "HuggingFaceH4/aime_2024"
-  dataset_key: "train"
-  problem_key: "problem"
-  solution_key: "answer"
+save_dir: eval_results
 
 env:
   math:
+    enable: true
     num_workers: 8
+  llm_judge_async: # Configuration for the LlmJudgeAsyncEnvironment
+    enable: false
+    num_workers: 2 # Number of parallel judge workers
+    model_name: "Qwen/Qwen2.5-32B-Instruct" # Judge model
+    tensor_parallel_size: 4 # TP size for the judge model
+    gpu_memory_utilization: 0.85 # For judge model
+    max_model_len: 16384 # Max sequence length for the judge model
+    temperature: 0.0 # Judge temperature (usually lower for more deterministic judging)
+    max_tokens: 512  # Max tokens for the judge's evaluation
+    stop: null # Stop strings for the judge's evaluation
+    max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
 
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+
+# don't change this, hack so we can use the train validate function
+master_config:
+  logger:
+    num_val_samples_to_print: 2
+  grpo:
+    max_rollout_turns: 1
+    # not really used
+    max_val_samples: 10000000000000000000000
+    val_batch_size: 1
+    # not really used
+  policy:
+    max_total_sequence_length: ${generation.vllm_cfg.max_model_len}
