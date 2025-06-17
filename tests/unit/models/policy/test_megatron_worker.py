@@ -21,7 +21,7 @@ import torch
 pytestmark = pytest.mark.modelconfig
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, NLLLoss, DPOLossFn
+from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -1147,14 +1147,16 @@ def test_megatron_dpo_training():
     # Create reference policy logprobs (simulating a reference model)
     reference_policy_logprobs = torch.randn(batch_size * 2, seq_len)
 
-    data = BatchedDataDict({
-        "input_ids": input_ids,
-        "input_lengths": input_lengths,
-        "attention_mask": attention_mask,
-        "token_mask": token_mask,
-        "sample_mask": sample_mask,
-        "reference_policy_logprobs": reference_policy_logprobs,
-    })
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
 
     # Create cluster and policy
     cluster = RayVirtualCluster(
@@ -1176,13 +1178,15 @@ def test_megatron_dpo_training():
     )
 
     # Create DPO loss function
-    dpo_loss_fn = DPOLossFn({
-        "reference_policy_kl_penalty": 0.1,
-        "preference_loss_weight": 1.0,
-        "sft_loss_weight": 0.5,
-        "preference_average_log_probs": False,
-        "sft_average_log_probs": False,
-    })
+    dpo_loss_fn = DPOLossFn(
+        {
+            "reference_policy_kl_penalty": 0.1,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.5,
+            "preference_average_log_probs": False,
+            "sft_average_log_probs": False,
+        }
+    )
 
     try:
         # Prepare for training
@@ -1192,18 +1196,24 @@ def test_megatron_dpo_training():
         losses = []
         for step in range(3):
             results = policy.train(data, dpo_loss_fn)
-            
+
             # Verify results contain expected metrics
             assert "loss" in results, "Training results should contain 'loss'"
-            assert "sft_loss" in results["all_mb_metrics"], "Results should contain SFT loss"
-            assert "preference_loss" in results["all_mb_metrics"], "Results should contain preference loss"
-            assert "accuracy" in results["all_mb_metrics"], "Results should contain accuracy"
-            
+            assert "sft_loss" in results["all_mb_metrics"], (
+                "Results should contain SFT loss"
+            )
+            assert "preference_loss" in results["all_mb_metrics"], (
+                "Results should contain preference loss"
+            )
+            assert "accuracy" in results["all_mb_metrics"], (
+                "Results should contain accuracy"
+            )
+
             loss_tensor = results["loss"]
             assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
             assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
             losses.append(loss_tensor[-1].item())
-            
+
             print(f"DPO training step {step}, loss: {results['loss']}")
 
         # Verify loss changed between iterations
@@ -1230,14 +1240,16 @@ def test_megatron_sft_training():
     sample_mask = torch.ones(batch_size)
     labels = torch.randint(0, vocab_size, (batch_size, seq_len))
 
-    data = BatchedDataDict({
-        "input_ids": input_ids,
-        "input_lengths": input_lengths,
-        "attention_mask": attention_mask,
-        "token_mask": token_mask,
-        "sample_mask": sample_mask,
-        "labels": labels,
-    })
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "labels": labels,
+        }
+    )
 
     # Create cluster and policy
     cluster = RayVirtualCluster(
@@ -1269,17 +1281,21 @@ def test_megatron_sft_training():
         losses = []
         for step in range(3):
             results = policy.train(data, sft_loss_fn)
-            
+
             # Verify results contain expected metrics
             assert "loss" in results, "Training results should contain 'loss'"
-            assert "num_unmasked_tokens" in results["all_mb_metrics"], "Results should contain token count"
-            assert "num_valid_samples" in results["all_mb_metrics"], "Results should contain sample count"
-            
+            assert "num_unmasked_tokens" in results["all_mb_metrics"], (
+                "Results should contain token count"
+            )
+            assert "num_valid_samples" in results["all_mb_metrics"], (
+                "Results should contain sample count"
+            )
+
             loss_tensor = results["loss"]
             assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
             assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
             losses.append(loss_tensor[-1].item())
-            
+
             print(f"SFT training step {step}, loss: {results['loss']}")
 
         # Verify loss changed between iterations
