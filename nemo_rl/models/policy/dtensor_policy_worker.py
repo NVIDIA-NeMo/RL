@@ -130,6 +130,7 @@ class DTensorPolicyWorker:
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
+        **kwargs: Any,
     ):
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call

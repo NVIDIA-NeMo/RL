@@ -51,11 +51,12 @@ What you can expect:
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, and SP for efficient training.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
+- ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
+- ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
-- 🔜 **Megatron Inference** - Support Megatron Inference for day-0 support for new megatron models.
+- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
 
