@@ -567,6 +567,12 @@ class VllmGenerationWorker:
         input_lengths_batch = data["input_lengths"]
         batch_size = input_ids_batch.shape[0]
 
+        # Ensure generate_async only receives single samples (batch_size = 1)
+        assert batch_size == 1, (
+            f"generate_async is restricted to handle only single samples, "
+            f"but received batch_size={batch_size}. Please handle batching outside this method."
+        )
+
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
@@ -1432,35 +1438,24 @@ class VllmGeneration(GenerationInterface):
         finished_workers = 0
         total_workers = len(future_bundle)
 
-        # print(f"Setting up async coordination for {total_workers} workers")
-
         async def consume_worker_generator(worker_idx, worker_gen):
             """Consume a single worker generator and put sample results in the queue."""
             nonlocal finished_workers
             worker_name = f"Worker-{worker_idx}"
             try:
-                # print(f"{worker_name}: Starting to consume generator")
                 sample_count = 0
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
                     sample_count += 1
-                    # print(
-                    #     f"{worker_name}: Got sample {sample_count}, global_idx={sample_result[0]}"
-                    # )
                     await result_queue.put(("sample", sample_result))
-                # print(f"{worker_name}: Finished processing {sample_count} samples")
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging
-                # print(f"Error in {worker_name}: {e}")
                 import traceback
 
                 traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
                 finished_workers += 1
-                # print(
-                #     f"{worker_name}: Done (finished_workers: {finished_workers}/{total_workers})"
-                # )
                 await result_queue.put(("worker_done", None))
 
         # Start tasks for all worker generators
@@ -1474,9 +1469,6 @@ class VllmGeneration(GenerationInterface):
 
         # Yield sample results as they become available from any worker
         sample_count = 0
-        # print(
-        #     f"Starting result collection loop, expecting all {total_workers} workers to finish"
-        # )
 
         while finished_workers < total_workers:
             try:
@@ -1496,23 +1488,16 @@ class VllmGeneration(GenerationInterface):
 
             if msg_type == "sample":
                 sample_count += 1
-                # print(f"Yielding sample {sample_count} with global_idx={item[0]}")
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
-                # print(f"Got error from worker: {item}")
                 # Cancel all remaining tasks and propagate error
                 for task in worker_tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise item
-            # elif msg_type == "worker_done":
-            #     print(
-            #         f"Worker finished, finished_workers: {finished_workers}/{total_workers}"
-            #     )
 
-        # print(f"All workers finished. Total samples yielded: {sample_count}")
         # Wait for all tasks to complete
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 

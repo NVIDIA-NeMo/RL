@@ -541,7 +541,7 @@ async def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async)
     print("\nRunning async rollout with async generation engine (VLLM)...")
     vllm_generation.prepare_for_generation()
 
-    final_batch, rollout_metrics = await run_async_multi_turn_rollout(
+    final_batch, rollout_metrics = run_async_multi_turn_rollout(
         policy_generation=vllm_generation,
         input_batch=initial_batch,
         tokenizer=rollout_tokenizer,
@@ -666,7 +666,7 @@ async def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
 
     print("\nRunning multi-step calculator rollout (VLLM async)...")
     vllm_generation.prepare_for_generation()
-    final_batch, rollout_metrics = await run_async_multi_turn_rollout(
+    final_batch, rollout_metrics = run_async_multi_turn_rollout(
         policy_generation=vllm_generation,
         input_batch=initial_batch,
         tokenizer=rollout_tokenizer,
