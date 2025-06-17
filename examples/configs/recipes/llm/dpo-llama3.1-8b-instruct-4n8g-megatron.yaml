@@ -40,7 +40,7 @@ policy:
   dynamic_batching:
     enabled: False
 
-  make_sequence_length_divisible_by: 1 #${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   max_grad_norm: 1.0
 
   optimizer: null
