@@ -1128,8 +1128,6 @@ def test_megatron_checkpoint_save_kill_and_restore(num_gpus, tp, pp):
             cluster2.shutdown()
 
 
-## TODO: refactor to use training_setup? ## use parameterize to swap out
-## clipped pg loss fn with dpo and sft loss fns?
 @pytest.mark.timeout(300)
 def test_megatron_dpo_training():
     """Test DPO training with Megatron backend."""
