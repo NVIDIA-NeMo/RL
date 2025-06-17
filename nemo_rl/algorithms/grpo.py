@@ -465,7 +465,7 @@ def refit_policy_generation(
 # ===============================================================================
 
 
-async def grpo_train(
+def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
@@ -504,7 +504,7 @@ async def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        val_metrics, validation_timings = await validate(
+        val_metrics, validation_timings = validate(
             policy_generation,
             val_dataloader,
             tokenizer,
@@ -556,7 +556,7 @@ async def grpo_train(
                     (
                         repeated_batch,
                         rollout_metrics,
-                    ) = await run_async_multi_turn_rollout(
+                    ) = run_async_multi_turn_rollout(
                         policy_generation=policy_generation,
                         input_batch=repeated_batch,
                         tokenizer=tokenizer,
@@ -682,7 +682,7 @@ async def grpo_train(
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
-                val_metrics, validation_timings = await validate(
+                val_metrics, validation_timings = validate(
                     policy_generation,
                     val_dataloader,
                     tokenizer,
@@ -796,7 +796,7 @@ async def grpo_train(
             break
 
 
-async def validate(
+def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer,
@@ -828,7 +828,7 @@ async def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = await run_async_multi_turn_rollout(
+                val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,

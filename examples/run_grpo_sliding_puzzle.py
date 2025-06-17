@@ -189,7 +189,7 @@ def setup_puzzle_data(
     return training_dataset, validation_dataset, task_to_env, val_task_to_env
 
 
-async def main():
+def main():
     """Main entry point."""
     # Parse arguments
     args, overrides = parse_args()
@@ -257,7 +257,7 @@ async def main():
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    await grpo_train(
+    grpo_train(
         policy,
         policy_generation,
         dataloader,
@@ -274,6 +274,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())
+    main()
