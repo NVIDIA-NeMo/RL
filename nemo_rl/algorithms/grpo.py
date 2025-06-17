@@ -290,38 +290,44 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     refit_buffer_size_gb: int,  # GB
+    timer: Timer,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights."""
+
     policy.offload_before_refit()
-    policy_generation.prepare_for_generation(tags=["weights"])
-    # Streaming update weights to save memory
-    state_dict_info: list[tuple[str, int]] = policy.prepare_weights_for_ipc()
-    # group keys to save time
-    available_bytes = refit_buffer_size_gb * (1024**3)
-    split_keys: list[list[str]] = []
-    keys: list[str] = []
-    for key, size_in_bytes in state_dict_info:
-        if size_in_bytes > available_bytes:
-            if keys:
-                split_keys.append(keys)
-                keys = []
-            available_bytes = refit_buffer_size_gb * (1024**3)
 
-        keys.append(key)
-        available_bytes -= size_in_bytes
+    with timer.time("prepare_for_generation/reshard"):
+        policy_generation.prepare_for_generation(tags=["weights"])
+        # Streaming update weights to save memory
+        state_dict_info: list[tuple[str, int]] = policy.prepare_weights_for_ipc()
+        # group keys to save time
+        available_bytes = refit_buffer_size_gb * (1024**3)
+        split_keys: list[list[str]] = []
+        keys: list[str] = []
+        for key, size_in_bytes in state_dict_info:
+            if size_in_bytes > available_bytes:
+                if keys:
+                    split_keys.append(keys)
+                    keys = []
+                available_bytes = refit_buffer_size_gb * (1024**3)
 
-    if len(keys) > 0:
-        split_keys.append(keys)
-    # do update
-    for keys in split_keys:
-        ipc_handles = policy.get_weights_ipc_handles(keys)
-        if not policy_generation.update_weights(ipc_handles):
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                "This often indicates an issue with cuda-ipc or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
+            keys.append(key)
+            available_bytes -= size_in_bytes
+
+        if len(keys) > 0:
+            split_keys.append(keys)
+        # do update
+        for keys in split_keys:
+            with timer.time("prepare_for_generation/reshard/get_ipc_handles"):
+                ipc_handles = policy.get_weights_ipc_handles(keys)
+            with timer.time("prepare_for_generation/reshard/update_weights"):
+                if not policy_generation.update_weights(ipc_handles):
+                    error_message = (
+                        "❌ Error: Updating weights for the generation policy failed during refit.\n"
+                        "This often indicates an issue with cuda-ipc or "
+                        "a problem within the generation backend (e.g., vLLM worker).\n"
+                    )
+                    raise RuntimeError(error_message)
     policy.offload_after_refit()
     policy_generation.prepare_for_generation(tags=["kv_cache"])
 
@@ -366,7 +372,7 @@ def grpo_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, refit_buffer_size_gb)
+            refit_policy_generation(policy, policy_generation, refit_buffer_size_gb, timer=timer)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -413,6 +419,7 @@ def grpo_train(
                         policy,
                         policy_generation,
                         refit_buffer_size_gb,
+                        timer=timer,
                     )
                     POLICY_GENERATION_STALE = False
                 else:
@@ -529,6 +536,7 @@ def grpo_train(
                         policy,
                         policy_generation,
                         refit_buffer_size_gb,
+                        timer=timer,
                     )
                     POLICY_GENERATION_STALE = False
                 else:
