@@ -409,6 +409,15 @@ class MegatronPolicyWorker:
             pretrained_path, "iter_0000000/run_config.yaml"
         )
 
+        assert not (
+            self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+                "overlap_param_gather"
+            ]
+            and self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
+        ), (
+            "Using overlap param gather together with distributed optimizer has known convergence issues. Please disable overlap param gather."
+        )
+
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
