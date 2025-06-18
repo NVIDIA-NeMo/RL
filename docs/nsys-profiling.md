@@ -50,13 +50,26 @@ NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="*policy*" uv run examp
 ```
 
 ### Profile Multiple Worker Types
+
 ```bash
 NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv run examples/run_grpo_math.py grpo.max_num_steps=5
 ```
 
 ### Profile Workers with Exact Names
+
 ```bash
 NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run examples/run_grpo_math.py grpo.max_num_steps=5
+```
+
+### Profile Megatron Workers
+
+:::{important}
+To profile a Megatron worker, you should set `LD_LIBRARY_PATH` as follows, otherwise you will get errors when loading `libtransformer_engine.so`.
+:::
+
+```bash
+LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/x86_64-linux-gnu" \
+NRL_NSYS_PROFILE_STEP_RANGE=3:5 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run --config examples/configs/grpo_math_1B_megatron.yaml examples/run_grpo_math.py grpo.max_num_steps=5
 ```
 
 ## Profile Output
