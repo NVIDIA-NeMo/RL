@@ -111,7 +111,8 @@ def get_cpu_state_dict(
 
 @ray.remote(
     runtime_env={
-        "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        # TODO: This option causes a crash on Ampere. It's okay to enable on Hopper.
+        # "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         **get_nsight_config_if_pattern_matches("dtensor_policy_worker"),
     }
 )
