@@ -29,6 +29,7 @@ dependencies = [
     "hydra-core",
     "debugpy>=1.8.0",
     "jsonlines",
+    "reasoning-gym>=0.1.22",
 ]
 
 [tool.setuptools]

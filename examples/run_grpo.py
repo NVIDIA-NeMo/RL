@@ -27,9 +27,10 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
 from nemo_rl.environments.math_environment import MathEnvironment
-from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
+from nemo_rl.environments.reasoning_gym_environment import ReasoningGymEnvironment
 from nemo_rl.models.generation.interfaces import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -88,7 +89,7 @@ class JsonlinesDataset:
 
         # this will also contain system prompt
         user_message = {"role": "user"}
-
+        extra_env_info = {}
         for m in single_message:
             # it's actually taking only the last user message's metadata
             if m["role"] == "user":
@@ -156,7 +157,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
             }
         ).remote(env_configs["math"])
         task_to_env["math"] = math_env
-    
+
     if "ifeval" in env_configs and env_configs["ifeval"]["enable"]:
         ifeval_env = IFEvalEnvironment.options(
             runtime_env={
@@ -177,7 +178,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
             },
         ).remote(env_configs["llm_judge_async"])
         task_to_env["llm_judge"] = llm_judge_async_env
-
+    if "reasoning_gym" in env_configs and env_configs["reasoning_gym"]["enable"]:
+        reasoning_gym_env = ReasoningGymEnvironment.options(
+            runtime_env={
+                "py_executable": ReasoningGymEnvironment.DEFAULT_PY_EXECUTABLE,
+                "env_vars": dict(os.environ),
+            },
+        ).remote(env_configs["reasoning_gym"])
+        task_to_env["reasoning_gym"] = reasoning_gym_env
     return train_ds, val_ds, task_to_env, task_to_env
 
 
@@ -239,7 +247,6 @@ def main():
         grpo_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
-
     grpo_train(
         policy,
         policy_generation,

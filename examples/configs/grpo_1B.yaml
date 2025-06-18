@@ -146,6 +146,9 @@ env:
   ifeval:
     num_workers: 8
     enable: false
+  reasoning_gym:
+    enable: true
+    num_workers: 8
 
 logger:
   log_dir: "logs"  # Base directory for all logs
