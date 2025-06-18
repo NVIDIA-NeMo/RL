@@ -27,8 +27,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 
 @dataclass

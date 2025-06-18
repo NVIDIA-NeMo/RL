@@ -89,6 +89,7 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -108,7 +109,6 @@ from nemo_rl.models.megatron.refit_utils import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import get_gpu_info
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 
 def setup_megatron_model(
