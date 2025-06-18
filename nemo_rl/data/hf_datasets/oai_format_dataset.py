@@ -20,6 +20,21 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class OpenAIFormatDataset:
+    """
+    This class is used to load an SFT dataset in the OpenAI format.
+    The dataset should be in the following format:
+    {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of France?"},
+            {"role": "assistant", "content": "The capital of France is Paris."}
+        ]
+    }
+    system_key or system_prompt is optional. If provided, it will be added to the beginning of the dataset.
+    chat_key should be the key of the messages list. Multi-turn conversations are supported.
+    However, the last message should be the assistant's response.
+    """
+
     def __init__(
         self,
         train_ds_path: str,
@@ -47,7 +62,8 @@ class OpenAIFormatDataset:
         )
 
     def add_messages_key(
-        self, example: dict[str, Any],
+        self,
+        example: dict[str, Any],
     ) -> dict[str, list[dict[str, Any]]]:
         messages = [message for message in example[self.chat_key]]
         if self.system_key in example:
