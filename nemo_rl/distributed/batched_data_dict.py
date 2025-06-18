@@ -542,6 +542,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             mb.truncate_tensors(dim=sequence_dim, truncated_len=seqlen)
             yield mb
 
+    def get_microbatch_iterator_dynamic_shapes_len(self) -> int:
+        """Get the length of the microbatch iterator with dynamic shapes."""
+        return len(self.micro_batch_indices[0])
+
     def make_microbatch_iterator(
         self, microbatch_size: int
     ) -> Iterator["SlicedDataDict"]:

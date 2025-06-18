@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 from pathlib import Path
-from typing import Any, Optional, Tuple, TypedDict, cast
+from typing import Any, Optional, Tuple, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -67,7 +67,7 @@ from nemo_rl.utils.timer import Timer
 # ===============================================================================
 # Configuration
 # ===============================================================================
-TokenizerType = PreTrainedTokenizerBase
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
 class GRPOConfig(TypedDict):

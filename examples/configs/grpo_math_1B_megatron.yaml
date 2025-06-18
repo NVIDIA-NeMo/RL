@@ -54,7 +54,7 @@ policy:
     enabled: False
 
   sequence_packing:
-    enabled: true
+    enabled: False # coming soon
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_ffd"
@@ -79,12 +79,6 @@ policy:
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-
-    sequence_packing:
-      enabled: false #coming soon
-      train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-      logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-      algorithm: "modified_ffd"
 
     optimizer:
       optimizer: "adam"

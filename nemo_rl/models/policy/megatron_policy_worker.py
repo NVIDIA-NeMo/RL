@@ -16,9 +16,9 @@ import os
 import time
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterable, Optional
+from typing import Any, Iterator, Optional, TypeVar
 
 import ray
 import torch
@@ -83,7 +83,7 @@ from nemo.tron.utils.train_utils import (
 )
 from ray.util.queue import Queue
 from torch.distributed import get_process_group_ranks
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -107,7 +107,13 @@ from nemo_rl.models.megatron.refit_utils import (
     get_tp_dim,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import (
+    LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
+)
 from nemo_rl.models.policy.utils import get_gpu_info
+
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
 def setup_megatron_model(
@@ -330,13 +336,14 @@ class MegatronPolicyWorker:
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: AutoTokenizer,
+        tokenizer: TokenizerType,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
-        worker_sharding_annotations: NamedSharding = None,
-        pre_init_communication_queue: Queue = None,
+        *,
+        worker_sharding_annotations: NamedSharding,
+        pre_init_communication_queue: Queue,
         megatron_checkpoint_home: Optional[str] = None,
         **kwargs: Any,
     ):
@@ -661,10 +668,10 @@ class MegatronPolicyWorker:
             op=torch.distributed.ReduceOp.SUM,
             group=parallel_state.get_data_parallel_group(),
         )
-        num_global_batches = total_dataset_size.item() // gbs
+        num_global_batches = int(total_dataset_size.item()) // gbs
 
         if eval_mode:
-            ctx = torch.no_grad()
+            ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
         else:
             ctx = nullcontext()
@@ -674,7 +681,7 @@ class MegatronPolicyWorker:
         with ctx:
             # dim 1 is always assumed to be the sequence dim, sanity check this here
             sequence_dim = 1
-            seq_dim_size = data.get("input_ids").shape[sequence_dim]
+            seq_dim_size = data["input_ids"].shape[sequence_dim]
             for k, v in data.items():
                 if torch.is_tensor(v) and len(v.shape) > 1:
                     assert v.shape[sequence_dim] == seq_dim_size, (
@@ -811,7 +818,7 @@ class MegatronPolicyWorker:
                         group=get_pipeline_model_parallel_group(),
                     )
                 else:
-                    loss_metrics = [None]
+                    loss_metrics = [None]  # type: ignore
                     torch.distributed.broadcast_object_list(
                         loss_metrics,
                         src=get_pipeline_model_parallel_last_rank(),
@@ -849,8 +856,8 @@ class MegatronPolicyWorker:
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     def get_logprobs(
-        self, data: BatchedDataDict[Any] = None, micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[Any]:
+        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
         Uses the configured logprob_batch_size to do microbatching.
@@ -874,7 +881,7 @@ class MegatronPolicyWorker:
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
-        input_seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        input_seq_dim_size = data["input_ids"].shape[sequence_dim]
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == input_seq_dim_size, (
@@ -888,7 +895,9 @@ class MegatronPolicyWorker:
         pp_grp = get_pipeline_model_parallel_group()
         pp_size = get_pipeline_model_parallel_world_size()
 
-        def forward_step_fn(data_iterator: Iterable, model: GPTModel):
+        def forward_step_fn(
+            data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
+        ):
             data_dict = next(data_iterator).to("cuda")
             input_ids = data_dict["input_ids"]
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
@@ -961,7 +970,7 @@ class MegatronPolicyWorker:
             )
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict(logprobs=logprobs).to("cpu")
+        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
     @contextmanager
     def use_reference_model(self):
@@ -1006,8 +1015,8 @@ class MegatronPolicyWorker:
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     def get_reference_policy_logprobs(
-        self, data: BatchedDataDict[Any] = None, micro_batch_size: Optional[int] = None
-    ) -> BatchedDataDict[Any]:
+        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         """Get the logprobs from thereference policy for a batch of data.
 
         If micro_batch_size is provided, it will be used instead of the configured
@@ -1019,14 +1028,16 @@ class MegatronPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
-            reference_logprobs = self.get_logprobs(data, micro_batch_size)
+            reference_logprobs = self.get_logprobs(
+                data=data, micro_batch_size=micro_batch_size
+            )
 
-        return_data = BatchedDataDict()
+        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using huggingface framework generation.
 
@@ -1063,7 +1074,7 @@ class MegatronPolicyWorker:
             fp32_residual_connection=model_cfg.fp32_residual_connection,
             params_dtype=model_cfg.params_dtype,
             padded_vocab_size=self.final_padded_vocab_size,  # Use the potentially updated value
-            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],
+            inference_max_seq_length=self.cfg["generation"]["max_new_tokens"],  # type: ignore
             inference_max_requests=self.cfg["generation_batch_size"],
         )
 
@@ -1095,16 +1106,16 @@ class MegatronPolicyWorker:
         out = run_mcore_engine(
             engine=inference_engine,
             # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data.get("input_ids"),
-            prompt_lengths_tensor=data.get("input_lengths"),
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]
-            - data.get("input_ids").size(1),
+            prompt_tokens_tensor=data["input_ids"],
+            prompt_lengths_tensor=data["input_lengths"],
+            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
+            - data["input_ids"].size(1),
         )
         # print(out)
 
-        input_lengths = data.get("input_lengths")
+        input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
-        batch_size = data.get("input_ids").size(0)
+        batch_size = data["input_ids"].size(0)
         max_seq_len = max([len(tokens) for tokens in out["tokens"]])
 
         # Create padded tensors for tokens and logprobs
@@ -1112,27 +1123,27 @@ class MegatronPolicyWorker:
             (batch_size, max_seq_len),
             self.tokenizer.pad_token_id,
             dtype=torch.long,
-            device=data.get("input_ids").device,
+            device=data["input_ids"].device,
         )
 
         logprobs_padded = torch.zeros(
             (batch_size, max_seq_len),
             dtype=torch.float,
-            device=data.get("input_ids").device,
+            device=data["input_ids"].device,
         )
 
         # Fill in the padded tensors with actual values
         for i in range(batch_size):
             seq_len = len(out["tokens"][i])
             output_ids_padded[i, :seq_len] = torch.tensor(
-                out["tokens"][i], dtype=torch.long, device=data.get("input_ids").device
+                out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
             )
 
             logprob_len = len(out["logprobs"][i])
             logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
                 out["logprobs"][i],
                 dtype=torch.float,
-                device=data.get("input_ids").device,
+                device=data["input_ids"].device,
             )
 
         out_dict = {
@@ -1245,7 +1256,7 @@ class MegatronPolicyWorker:
         torch.distributed.all_gather_object(
             pp_gathered_param_infos, param_info, group=pp_group
         )
-        pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]
+        pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
 
         all_param_infos = pp_gathered_param_infos
 
@@ -1275,7 +1286,7 @@ class MegatronPolicyWorker:
         return param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
-    def get_weights_ipc_handles(self, keys: list[str] = None) -> dict[str, Any]:
+    def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
         Args:

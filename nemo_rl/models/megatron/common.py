@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from functools import partial
-from typing import Iterable
+from typing import Any, Iterator
 
 import torch
 import torch.distributed as dist
@@ -25,13 +25,14 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo.tron.state import GlobalState
 
 from nemo_rl.algorithms.loss_functions import LossFunction
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def forward_step_arbitrary_loss(
     state: GlobalState,
     global_valid_seqs: torch.Tensor,
     global_valid_toks: torch.Tensor,
-    data_iterator: Iterable,
+    data_iterator: Iterator[BatchedDataDict[Any]],
     model: GPTModel,
     loss_fn: LossFunction,
 ):

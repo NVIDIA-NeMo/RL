@@ -99,6 +99,15 @@ def verify_right_padding(
     return True, None
 
 
+class ColocationConfig(TypedDict):
+    class ResourcesConfig(TypedDict):
+        gpus_per_node: int
+        num_nodes: int
+
+    enabled: bool
+    resources: NotRequired[ResourcesConfig]
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -111,6 +120,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int]
     stop_strings: NotRequired[list[str]]
     pad_token_id: NotRequired[int]
+    colocated: NotRequired[ColocationConfig]
 
 
 class GenerationDatumSpec(TypedDict):

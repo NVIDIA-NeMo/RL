@@ -14,6 +14,7 @@
 
 import re
 from collections import defaultdict
+from typing import Any
 
 import einops
 import numpy as np
@@ -208,7 +209,7 @@ class MegatronToHFConverter:
         torch.distributed.all_gather_object(
             pp_gathered_global_keys, global_keys, group=pp_group
         )
-        pp_gathered_global_keys = list({k for l in pp_gathered_global_keys for k in l})
+        pp_gathered_global_keys = list({k for l in pp_gathered_global_keys for k in l})  # type: ignore
 
         global_keys = pp_gathered_global_keys
         global_keys_map = {k: None for k in global_keys}
@@ -343,12 +344,12 @@ class MegatronToHFConverter:
         """
         # Most of the keys will be able to converted together (main)
         # For the keys that can't be converted together (exception), we need to handle them separately
-        main_state_dict_keys = []
-        exception_mappings_state_dict_keys_list = []
-        exception_transforms_state_dict_keys_list = []
+        main_state_dict_keys: list[str] = []
+        exception_mappings_state_dict_keys_list: list[list[str]] = []
+        exception_transforms_state_dict_keys_list: list[list[str]] = []
 
-        main_mappings = []
-        exception_mappings = []
+        main_mappings: list[tuple[str, Any]] = []
+        exception_mappings: list[tuple[str, Any]] = []
         for key, val in self.export_mapping.items():
             self._group(
                 state_dict,
