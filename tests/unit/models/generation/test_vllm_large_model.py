@@ -161,10 +161,13 @@ async def test_vllm_large_model(
 
         print("Running async generation...")
         collected_indexed_outputs = []
-        async for original_idx, single_item_output in async_policy.generate_async(
-            test_input_data
-        ):
-            collected_indexed_outputs.append((original_idx, single_item_output))
+        # generate_async is restricted to handle only single samples
+        input_generator = test_input_data.make_microbatch_iterator(microbatch_size=1)
+        for single_item_input in input_generator:
+            async for original_idx, single_item_output in async_policy.generate_async(
+                single_item_input
+            ):
+                collected_indexed_outputs.append((original_idx, single_item_output))
 
         # Sort by original_idx to ensure order matches generation_input_data
         collected_indexed_outputs.sort(key=lambda x: x[0])
