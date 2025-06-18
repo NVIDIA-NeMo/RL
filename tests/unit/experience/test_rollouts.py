@@ -529,8 +529,7 @@ def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
     not torch.cuda.is_available() or torch.cuda.device_count() < 1,
     reason="VLLM test requires at least 1 GPU",
 )
-@pytest.mark.asyncio
-async def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
+def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration using async generation and async rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
         multi_step_setup_vllm_async
@@ -655,8 +654,7 @@ def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
     not torch.cuda.is_available() or torch.cuda.device_count() < 1,
     reason="VLLM test requires at least 1 GPU",
 )
-@pytest.mark.asyncio
-async def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
+def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration (async)."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
         multi_step_setup_vllm_async
