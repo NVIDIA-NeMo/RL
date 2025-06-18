@@ -46,6 +46,7 @@ docker.md
 testing.md
 documentation.md
 debugging.md
+guides/use-custom-vllm.md
 apidocs/index.rst
 ```
 
