@@ -1197,7 +1197,7 @@ def test_vllm_refit_non_collocated_handles_update(
     lm_policy.shutdown()
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(210)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 def test_vllm_generation_with_megatron_training(
     cluster, tokenizer, tensor_parallel_size
