@@ -48,11 +48,15 @@ def sample_data(request):
         val_data[system_key] = "You are a helpful assistant."
 
     # Create temporary files for train and validation data
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as train_file:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as train_file:
         json.dump(train_data, train_file)
         train_path = train_file.name
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as val_file:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False
+    ) as val_file:
         json.dump(val_data, val_file)
         val_path = val_file.name
 
@@ -73,7 +77,10 @@ def test_dataset_initialization(sample_data):
 def test_custom_keys(sample_data):
     train_path, val_path = sample_data
     dataset = OpenAIFormatDataset(
-        train_path, val_path, chat_key="conversations", system_prompt="You are a helpful assistant."
+        train_path,
+        val_path,
+        chat_key="conversations",
+        system_prompt="You are a helpful assistant.",
     )
 
     assert dataset.chat_key == "conversations"
@@ -83,7 +90,9 @@ def test_custom_keys(sample_data):
 @pytest.mark.parametrize("sample_data", [("messages", "system_key")], indirect=True)
 def test_message_formatting(sample_data):
     train_path, val_path = sample_data
-    dataset = OpenAIFormatDataset(train_path, val_path, chat_key="messages", system_key="system_key")
+    dataset = OpenAIFormatDataset(
+        train_path, val_path, chat_key="messages", system_key="system_key"
+    )
 
     first_example = dataset.formatted_ds["train"][0]
 
@@ -105,4 +114,6 @@ def test_message_formatting(sample_data):
         add_special_tokens=False,
     )
 
-    assert combined_message == "".join(message["content"] for message in first_example["messages"])
+    assert combined_message == "".join(
+        message["content"] for message in first_example["messages"]
+    )
