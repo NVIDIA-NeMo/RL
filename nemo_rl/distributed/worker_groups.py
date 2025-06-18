@@ -91,25 +91,32 @@ class MultiWorkerFuture:
         has_generator = False
         for idx, fut in enumerate(self.futures):
             if isinstance(fut, ObjectRefGenerator):
+                # ray.get cannot be called directly on the generator object – it must be iterated to obtain the individual ObjectRef instances first.
                 for generated_ref in fut:
                     object_refs.append(generated_ref)
                     has_generator = True
             else:
                 object_refs.append(fut)
 
+        # Retrieve the concrete results.
         all_results = ray.get(object_refs)
 
+        # If expanded generator was present we are in streaming mode.
+        # Every ObjectRef now corresponds to a unique, ordered chunk of data
         if has_generator:
             return all_results
 
         if self.return_from_workers is not None:
             if self.called_workers is not None:
+                # Create a mapping from global worker indices to local indices in all_results
                 worker_to_result_idx = {
                     worker: idx for idx, worker in enumerate(self.called_workers)
                 }
+                # # Filter return_from_workers to only include workers that were actually called
                 valid_return_workers = [
                     w for w in self.return_from_workers if w in worker_to_result_idx
                 ]
+                # Map global worker indices to local result indices and get results
                 return [
                     all_results[worker_to_result_idx[worker]]
                     for worker in valid_return_workers

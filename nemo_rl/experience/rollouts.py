@@ -135,36 +135,34 @@ async def generate_responses_async(
         and hasattr(policy_generation, "generate_async")
     )
 
-    if use_async_generation:
-        # Use async generation with per-sample streaming
-        collected_indexed_outputs: list[
-            tuple[int, BatchedDataDict[GenerationOutputSpec]]
-        ] = []
-        async for original_idx, single_item_output in policy_generation.generate_async(
-            generation_input_data, greedy=greedy
-        ):
-            collected_indexed_outputs.append((original_idx, single_item_output))
+    assert use_async_generation, (
+        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+    )
 
-        # Sort by original_idx to ensure order matches generation_input_data
-        collected_indexed_outputs.sort(key=lambda x: x[0])
+    # Use async generation with per-sample streaming
+    collected_indexed_outputs: list[
+        tuple[int, BatchedDataDict[GenerationOutputSpec]]
+    ] = []
+    async for original_idx, single_item_output in policy_generation.generate_async(
+        generation_input_data, greedy=greedy
+    ):
+        collected_indexed_outputs.append((original_idx, single_item_output))
 
-        # Extract in correct order
-        ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
+    # Sort by original_idx to ensure order matches generation_input_data
+    collected_indexed_outputs.sort(key=lambda x: x[0])
 
-        assert ordered_batched_data_dicts, (
-            "Generation returned no outputs for a non-empty batch."
-        )
+    # Extract in correct order
+    ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
 
-        pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
-        generation_outputs = BatchedDataDict.from_batches(
-            ordered_batched_data_dicts,
-            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
-        )
-    else:
-        # Use synchronous generation
-        generation_outputs = policy_generation.generate(
-            generation_input_data, greedy=greedy
-        )
+    assert ordered_batched_data_dicts, (
+        "Generation returned no outputs for a non-empty batch."
+    )
+
+    pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    generation_outputs = BatchedDataDict.from_batches(
+        ordered_batched_data_dicts,
+        pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+    )
 
     # Extract everything we need from the generation outputs
     output_ids = generation_outputs["output_ids"]
@@ -388,10 +386,6 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
-
-        # Update current_batch with the assistant messages from active_batch
-        for i, global_idx in enumerate(active_indices.tolist()):
-            current_batch["message_log"][global_idx] = active_batch["message_log"][i]
 
         # Record token usage - assistant
         for i, global_idx in enumerate(active_indices.tolist()):
@@ -617,7 +611,6 @@ async def run_sample_multi_turn_rollout(
     turn_gen_tokens = []
 
     for turn in range(max_rollout_turns):
-        # print(f"Turn {turn} of {max_rollout_turns} at time {time.time()}")
         if terminated or truncated:
             break
 
@@ -662,42 +655,36 @@ async def run_sample_multi_turn_rollout(
         # Get environment feedback
         try:
             env_output = calculate_rewards(sample_batch, task_to_env)
-
             # Update total reward
             total_reward += env_output.rewards[0].item()
-
             # Check termination
             terminated = env_output.terminateds[0].item()
+            env_obs_content = env_output.observations[0]["content"]
+            # Tokenize environment response
+            tokenized_obs = tokenizer(
+                env_obs_content, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0]
 
-            # Add environment observation to message log if present
-            if env_output.observations[0] is not None:
-                env_obs_content = env_output.observations[0]["content"]
+            # Check for sequence length overflow
+            if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
+                # Truncate environment observation
+                max_env_tokens = max_seq_len - input_lengths - gen_token_count
+                if max_env_tokens > 0:
+                    tokenized_obs = tokenized_obs[:max_env_tokens]
+                else:
+                    tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
+                truncated = True
 
-                # Tokenize environment response
-                tokenized_obs = tokenizer(
-                    env_obs_content, return_tensors="pt", add_special_tokens=False
-                )["input_ids"][0]
+            env_message = {
+                "role": env_output.observations[0]["role"],
+                "content": env_obs_content,
+                "token_ids": tokenized_obs,
+            }
+            current_message_log.append(env_message)
 
-                # Check for sequence length overflow
-                if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
-                    # Truncate environment observation
-                    max_env_tokens = max_seq_len - input_lengths - gen_token_count
-                    if max_env_tokens > 0:
-                        tokenized_obs = tokenized_obs[:max_env_tokens]
-                    else:
-                        tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
-                    truncated = True
-
-                env_message = {
-                    "role": env_output.observations[0]["role"],
-                    "content": env_obs_content,
-                    "token_ids": tokenized_obs,
-                }
-                current_message_log.append(env_message)
-
-                # Update token counts
-                env_token_count += len(tokenized_obs)
-                token_count += len(tokenized_obs)
+            # Update token counts
+            env_token_count += len(tokenized_obs)
+            token_count += len(tokenized_obs)
 
             # Update sample state for next turn
             if not terminated and not truncated:
