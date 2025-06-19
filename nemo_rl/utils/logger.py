@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import ray
 import requests
@@ -67,6 +67,7 @@ class LoggerConfig(TypedDict):
     tensorboard: TensorboardConfig
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
+    num_val_samples_to_print: NotRequired[int]
 
 
 class LoggerInterface(ABC):
@@ -350,6 +351,7 @@ class RayGpuMonitorLogger:
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
+        self.start_time: float = 0.0
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""

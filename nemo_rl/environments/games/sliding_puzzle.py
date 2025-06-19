@@ -14,7 +14,7 @@
 
 import copy
 import random
-from typing import Any, Optional, TypedDict
+from typing import Any, Mapping, Optional, TypedDict
 
 import ray
 import torch
@@ -40,7 +40,7 @@ class SlidingPuzzleMetadata(TypedDict):
 
 class SlidingPuzzleGameLogic:
     @staticmethod
-    def generate(config: dict[str, Any]) -> dict[str, Any]:
+    def generate(config: Mapping[str, Any]) -> dict[str, Any]:
         """Generate a new Sliding Puzzle."""
         size = config.get("size", 4)  # Default to 4x4 (15-puzzle)
         shuffle_moves = config.get(

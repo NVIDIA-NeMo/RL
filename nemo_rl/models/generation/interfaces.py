@@ -99,11 +99,12 @@ def verify_right_padding(
     return True, None
 
 
-class ColocationConfig(TypedDict):
-    class ResourcesConfig(TypedDict):
-        gpus_per_node: int
-        num_nodes: int
+class ResourcesConfig(TypedDict):
+    gpus_per_node: int
+    num_nodes: int
 
+
+class ColocationConfig(TypedDict):
     enabled: bool
     resources: NotRequired[ResourcesConfig]
 
@@ -121,6 +122,7 @@ class GenerationConfig(TypedDict):
     stop_strings: NotRequired[list[str]]
     pad_token_id: NotRequired[int]
     colocated: NotRequired[ColocationConfig]
+    num_prompts_per_step: NotRequired[int]
 
 
 class GenerationDatumSpec(TypedDict):
@@ -153,7 +155,7 @@ class GenerationDatumSpec(TypedDict):
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
-    stop_strings: Optional[list[str]] = None
+    stop_strings: Optional[list[str]]
     __extra__: Any
 
 

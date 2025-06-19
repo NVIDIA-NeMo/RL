@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from typing import NamedTuple, Optional
+from typing import Mapping, NamedTuple, Optional
 
 from torch import Tensor
 
@@ -37,7 +37,7 @@ class EnvironmentReturn(NamedTuple):
     """
 
     observations: list[dict[str, str]]
-    metadata: list[Optional[dict]]
+    metadata: list[Mapping | None]
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
     terminateds: Tensor
