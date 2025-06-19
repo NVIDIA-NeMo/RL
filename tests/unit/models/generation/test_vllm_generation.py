@@ -189,7 +189,7 @@ def get_basic_megatron_test_config(
             "distributed_data_parallel_config": {
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
-                "overlap_param_gather": True,
+                "overlap_param_gather": False,
                 "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
