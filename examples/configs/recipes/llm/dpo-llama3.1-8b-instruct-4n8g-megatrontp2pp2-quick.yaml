@@ -1,6 +1,6 @@
 dpo:
   max_num_epochs: 1
-  max_num_steps: 150
+  max_num_steps: 20
   val_period: 50
   val_batches: 16
   val_global_batch_size: 32
@@ -49,7 +49,7 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
+    pipeline_model_parallel_size: 2
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
