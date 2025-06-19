@@ -113,6 +113,7 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
+  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
     name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1

@@ -87,7 +87,9 @@ class VllmInternalWorkerExtension:
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size
         )
-        self.model_update_group = PyNcclCommunicator(pg, device=self.device)
+        self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+            pg, device=self.device
+        )
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
@@ -107,7 +109,7 @@ class VllmInternalWorkerExtension:
             colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype, numel)}
             non-colocated inference: not implemented yet
         """
-        self.state_dict_info = state_dict_info
+        self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
         """Update weights from global IPC handles.

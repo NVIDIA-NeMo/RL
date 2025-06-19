@@ -65,6 +65,7 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    enforce_eager: NotRequired[bool]
 
 
 class VllmConfig(GenerationConfig):
@@ -828,9 +829,7 @@ class VllmGenerationWorker:
         if self.cfg.get("stop_strings", None):
             stop_strings.update(self.cfg["stop_strings"])
 
-        stop_strings: list[str] | None = (
-            list(stop_strings) if len(stop_strings) > 0 else None
-        )
+        stop_strings = list(stop_strings) if len(stop_strings) > 0 else None
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1

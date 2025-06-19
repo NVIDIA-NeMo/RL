@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
@@ -29,7 +29,6 @@ from nemo_rl.algorithms.loss_functions import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -44,7 +43,7 @@ class DPOSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: float
+    val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -101,10 +100,10 @@ def setup(
     StatefulDataLoader,
     StatefulDataLoader,
     DPOLossFn,
-    MasterConfig,
     Logger,
-    TaskDataSpec,
+    CheckpointManager,
     DPOSaveState,
+    MasterConfig,
 ]:
     """Main entry point for running DPO algorithm.
 
@@ -142,8 +141,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    dpo_save_state: Optional[DPOSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    dpo_save_state: Optional[DPOSaveState] = cast(
+        Optional[DPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
 
     # ==========================
@@ -361,8 +360,8 @@ def dpo_train(
     master_config,
     logger,
     checkpointer,
-    dpo_save_state,
-):
+    dpo_save_state: DPOSaveState,
+) -> None:
     # Run dpo training
     timer = Timer()
 
@@ -385,7 +384,7 @@ def dpo_train(
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...")
-        val_metrics, validation_timings = validate(
+        validation_result = validate(
             policy,
             val_dataloader,
             tokenizer,
@@ -396,6 +395,10 @@ def dpo_train(
             val_batch_size=dpo_config["val_global_batch_size"],
             val_mbs=dpo_config["val_micro_batch_size"],
         )
+        if validation_result is not None:
+            val_metrics, validation_timings = validation_result
+        else:
+            val_metrics, validation_timings = None, None
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
@@ -436,7 +439,7 @@ def dpo_train(
 
                 # Run validation if it's a validation step
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
-                    val_metrics, validation_timings = validate(
+                    validation_result = validate(
                         policy,
                         val_dataloader,
                         tokenizer,
@@ -447,6 +450,10 @@ def dpo_train(
                         val_batch_size=dpo_config["val_global_batch_size"],
                         val_mbs=dpo_config["val_micro_batch_size"],
                     )
+                    if validation_result is not None:
+                        val_metrics, validation_timings = validation_result
+                    else:
+                        val_metrics, validation_timings = None, None
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
