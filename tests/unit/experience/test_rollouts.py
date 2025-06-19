@@ -29,7 +29,10 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.experience.rollouts import run_multi_turn_rollout
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -68,9 +71,9 @@ def rollout_cluster():
         # Use 1 GPU for simplicity
         cluster_instance = RayVirtualCluster(
             name=cluster_name,
-            bundle_ct_per_node_list=[1],
+            bundle_ct_per_node_list=[2],
             use_gpus=True,
-            num_gpus_per_node=1,
+            num_gpus_per_node=2,
             max_colocated_worker_groups=2,  # Allow policy and env
         )
         yield cluster_instance
@@ -104,31 +107,40 @@ def multi_step_calculator_environment(rollout_cluster):
 @pytest.fixture(scope="function")
 def initial_multi_step_calculator_batch(rollout_tokenizer):
     print("Creating initial multi-step calculator test batch...")
-    batch_size = 1  # Simpler to debug with one sample
-    problem = "(5 + 3) * 2"  # Example problem
-    expected_answer = 16.0
+
+    problems = [
+        {"problem": "(5 + 3) * 2", "answer": 16.0},
+        {"problem": "(1 * 9) + 2", "answer": 11.0},
+    ]
+    batch_size = len(problems)
     max_steps = 5  # Allow a few steps
-    tool_instructions = (
-        "You have a calculator tool. To use it, respond with:\n"
-        "'[operand1, operand2, operation_name]<call: calculator>'\n"
-        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
-        "Example: [5, 3, sum]<call: calculator>\n"
-        "You will receive the result of your calculation as <result>...</result>\n"
-        "Use this result to make the next calculation if needed.\n"
-        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
-        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
-        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
-        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
-        "------\n"
-        f"Solve: {problem}"
-    )
+
     batch_message_logs = []
     batch_extra_env_info = []
     batch_loss_multipliers = []
     batch_indices = []
     batch_task_names = []
 
-    for i in range(batch_size):
+    for i, p_info in enumerate(problems):
+        problem_text = p_info["problem"]
+        expected_answer = p_info["answer"]
+
+        # tool_instructions = tool_instructions_template.format(problem=problem_text)
+        tool_instructions = (
+            "You have a calculator tool. To use it, respond with:\n"
+            "'[operand1, operand2, operation_name]<call: calculator>'\n"
+            "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
+            "Example: [5, 3, sum]<call: calculator>\n"
+            "You will receive the result of your calculation as <result>...</result>\n"
+            "Use this result to make the next calculation if needed.\n"
+            "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
+            "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
+            "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
+            "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
+            "------\n"
+            f"Solve: {problem_text}"
+        )
+
         # Apply chat template to the initial prompt
         initial_prompt_content = rollout_tokenizer.apply_chat_template(
             [{"role": "user", "content": tool_instructions}],
@@ -148,7 +160,7 @@ def initial_multi_step_calculator_batch(rollout_tokenizer):
             }
         ]
         metadata = MultiStepCalcMetadata(
-            problem=problem,
+            problem=problem_text,
             expected_final_answer=expected_answer,
             max_steps=max_steps,
             current_step=0,
@@ -282,17 +294,17 @@ def multi_step_setup_hf(
 
 
 @pytest.fixture(scope="function")
-def multi_step_setup_vllm(
+def multi_step_setup_vllm_sync(
     rollout_cluster,
     rollout_tokenizer,
     multi_step_calculator_environment,
     initial_multi_step_calculator_batch,
 ):
-    """Sets up components for multi-step calculator tests using VllmGeneration."""
+    """Sets up components for multi-step calculator tests using VllmGeneration with sync engine."""
     vllm_generation = None
     task_to_env, _ = multi_step_calculator_environment
     is_eval = True
-    print("Creating VllmGeneration for Multi-Step Calculator Test...")
+    print("Creating VllmGeneration with sync engine for Multi-Step Calculator Test...")
     try:
         vllm_config = deepcopy(base_vllm_test_config)
         vllm_config["tokenizer_name"] = rollout_tokenizer.name_or_path
@@ -311,7 +323,7 @@ def multi_step_setup_vllm(
             rollout_cluster,
         )
     finally:
-        print("Cleaning up VllmGeneration (Multi-Step Calc Test)...")
+        print("Cleaning up VllmGeneration (sync engine, Multi-Step Calc Test)...")
         if vllm_generation:
             vllm_generation.shutdown()
         # Force garbage collection to help release resources
@@ -319,7 +331,49 @@ def multi_step_setup_vllm(
 
         gc.collect()
         torch.cuda.empty_cache()
-        print("VllmGeneration cleanup finished (Multi-Step Calc Test).")
+        print("VllmGeneration cleanup finished (sync engine, Multi-Step Calc Test).")
+
+
+@pytest.fixture(scope="function")
+def multi_step_setup_vllm_async(
+    rollout_cluster,
+    rollout_tokenizer,
+    multi_step_calculator_environment,
+    initial_multi_step_calculator_batch,
+):
+    """Sets up components for multi-step calculator tests using VllmGeneration with async engine."""
+    vllm_generation = None
+    task_to_env, _ = multi_step_calculator_environment
+    is_eval = True
+    print("Creating VllmGeneration with async engine for Multi-Step Calculator Test...")
+    try:
+        vllm_config = deepcopy(base_vllm_test_config)
+        vllm_config["vllm_cfg"]["async_engine"] = True
+        vllm_config["tokenizer_name"] = rollout_tokenizer.name_or_path
+        if "gpt2" in rollout_tokenizer.name_or_path.lower():
+            vllm_config["model_name"] = "gpt2"
+        vllm_config = configure_generation_config(
+            vllm_config, rollout_tokenizer, is_eval=is_eval
+        )
+        vllm_generation = VllmGeneration(rollout_cluster, vllm_config)
+        vllm_generation.finish_generation()
+        yield (
+            vllm_generation,
+            rollout_tokenizer,
+            task_to_env,
+            initial_multi_step_calculator_batch,
+            rollout_cluster,
+        )
+    finally:
+        print("Cleaning up VllmGeneration (async engine, Multi-Step Calc Test)...")
+        if vllm_generation:
+            vllm_generation.shutdown()
+        # Force garbage collection to help release resources
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("VllmGeneration cleanup finished (async engine, Multi-Step Calc Test).")
 
 
 def test_run_multi_step_calculator_hf(multi_step_setup_hf):
@@ -391,16 +445,17 @@ def test_run_multi_step_calculator_hf(multi_step_setup_hf):
     not torch.cuda.is_available() or torch.cuda.device_count() < 1,
     reason="VLLM test requires at least 1 GPU",
 )
-def test_run_multi_step_calculator_vllm(multi_step_setup_vllm):
-    """Tests multi-step calculator rollout with VllmGeneration."""
+def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
+    """Tests multi-step calculator rollout with VllmGeneration using sync generation and sync rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
-        multi_step_setup_vllm
+        multi_step_setup_vllm_sync
     )
     max_rollout_turns = initial_batch["extra_env_info"][0]["max_steps"] + 1
     max_seq_len = 1024
 
-    print("\nRunning multi-step calculator rollout (VLLM)...")
+    print("\nRunning sync rollout with sync generation engine (VLLM)...")
     vllm_generation.prepare_for_generation()
+
     final_batch, rollout_metrics = run_multi_turn_rollout(
         policy_generation=vllm_generation,
         input_batch=initial_batch,
@@ -409,8 +464,9 @@ def test_run_multi_step_calculator_vllm(multi_step_setup_vllm):
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
     )
+
     vllm_generation.finish_generation()
-    print("Multi-step calculator rollout complete (VLLM).")
+    print("Sync rollout with sync generation engine complete (VLLM).")
 
     # --- Assertions ---
     assert isinstance(final_batch, BatchedDataDict)
@@ -418,53 +474,156 @@ def test_run_multi_step_calculator_vllm(multi_step_setup_vllm):
     assert "total_reward" in final_batch
     assert len(final_batch["message_log"]) == len(initial_batch["message_log"])
 
-    sample_log = final_batch["message_log"][0]
-    expected_final_answer = initial_batch["extra_env_info"][0]["expected_final_answer"]
-    print("\nSample Interaction Log (Multi-Step Calculator - VLLM):")
-    tool_call_count = 0
-    final_answer_msg = None
-    for i, msg in enumerate(sample_log):
-        print(f"  {i}: Role={msg['role']}, Content='{msg['content']}'")
-        if msg["role"] == "assistant":
-            if msg["content"].strip().endswith("<call: calculator>"):
-                tool_call_count += 1
-            else:
-                final_answer_msg = msg["content"].strip()
+    for i in range(len(final_batch["message_log"])):
+        sample_log = final_batch["message_log"][i]
+        expected_final_answer = initial_batch["extra_env_info"][i][
+            "expected_final_answer"
+        ]
+        problem_text = initial_batch["extra_env_info"][i]["problem"]
 
-    assert tool_call_count >= 1, "Expected at least one tool call"
-    assert final_answer_msg is not None, (
-        "Expected a final answer message from assistant"
-    )
+        print(f"\n--- Verifying Sync Sample {i} (Problem: {problem_text}) ---")
+        print(f"Expected Answer: {expected_final_answer}")
 
-    final_answer_logic = _MultiStepCalculatorLogic()
-    extracted_final_answer = final_answer_logic._is_final_answer(final_answer_msg)
-    assert extracted_final_answer is not None, (
-        f"Could not parse final answer from: {final_answer_msg}"
-    )
-    assert abs(extracted_final_answer - expected_final_answer) < 1e-6, (
-        f"Final answer incorrect. Expected {expected_final_answer}, Got {extracted_final_answer}"
-    )
+        tool_call_count = 0
+        final_answer_msg = None
+        for msg_idx, msg in enumerate(sample_log):
+            print(f"  {msg_idx}: Role={msg['role']}, Content='{msg['content']}'")
+            if msg["role"] == "assistant":
+                if msg["content"].strip().endswith("<call: calculator>"):
+                    tool_call_count += 1
+                else:
+                    final_answer_msg = msg["content"].strip()
 
-    assert torch.all(final_batch["total_reward"] == 1.0), (
-        f"Expected total reward 1.0, got {final_batch['total_reward']}"
-    )
+        assert tool_call_count >= 1, f"Sync Sample {i}: Expected at least one tool call"
+        print(
+            f"✓ Sample {i}: Successfully made {tool_call_count} tool call(s) using sync rollout"
+        )
 
-    print("\nMulti-Step Calculator VLLM Test assertions passed.")
+        # Always require a valid final answer
+        assert final_answer_msg is not None and final_answer_msg.strip(), (
+            f"Sync Sample {i}: Expected a final answer message from assistant"
+        )
+
+        # Always require the final answer to be parseable and correct
+        final_answer_logic = _MultiStepCalculatorLogic()
+        extracted_final_answer = final_answer_logic._is_final_answer(final_answer_msg)
+        assert extracted_final_answer is not None, (
+            f"Sync Sample {i}: Could not parse final answer from: {final_answer_msg}"
+        )
+        assert abs(extracted_final_answer - expected_final_answer) < 1e-6, (
+            f"Sync Sample {i}: Final answer incorrect. Expected {expected_final_answer}, Got {extracted_final_answer}"
+        )
+
+        # Check total reward (should be 1.0 if correct)
+        assert final_batch["total_reward"][i] == 1.0, (
+            f"Sync Sample {i}: Expected total reward 1.0 for correct answer, "
+            f"got {final_batch['total_reward'][i]}"
+        )
+        print(f"✓ Sample {i}: Correct answer {extracted_final_answer}")
+        print(f"--- Sync Sample {i}: Rollout verification PASSED ---")
+
+    print("\nSync Multi-Step Calculator VLLM Test assertions passed for all samples.")
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 1,
     reason="VLLM test requires at least 1 GPU",
 )
-def test_max_seqlen_respected(multi_step_setup_vllm):
-    """Tests multi-step calculator rollout with VllmGeneration."""
+def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
+    """Tests multi-step calculator rollout with VllmGeneration using async generation and async rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
-        multi_step_setup_vllm
+        multi_step_setup_vllm_async
+    )
+    max_rollout_turns = initial_batch["extra_env_info"][0]["max_steps"] + 1
+    max_seq_len = 1024
+
+    print("\nRunning async rollout with async generation engine (VLLM)...")
+    vllm_generation.prepare_for_generation()
+
+    final_batch, rollout_metrics = run_async_multi_turn_rollout(
+        policy_generation=vllm_generation,
+        input_batch=initial_batch,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+    )
+
+    vllm_generation.finish_generation()
+    print("Async rollout with async generation engine complete (VLLM).")
+
+    # --- Assertions ---
+    assert isinstance(final_batch, BatchedDataDict)
+    assert "message_log" in final_batch
+    assert "total_reward" in final_batch
+    assert len(final_batch["message_log"]) == len(initial_batch["message_log"])
+
+    for i in range(len(final_batch["message_log"])):
+        sample_log = final_batch["message_log"][i]
+        expected_final_answer = initial_batch["extra_env_info"][i][
+            "expected_final_answer"
+        ]
+        problem_text = initial_batch["extra_env_info"][i]["problem"]
+
+        print(f"\n--- Verifying Async Sample {i} (Problem: {problem_text}) ---")
+        print(f"Expected Answer: {expected_final_answer}")
+
+        tool_call_count = 0
+        final_answer_msg = None
+        for msg_idx, msg in enumerate(sample_log):
+            print(f"  {msg_idx}: Role={msg['role']}, Content='{msg['content']}'")
+            if msg["role"] == "assistant":
+                if msg["content"].strip().endswith("<call: calculator>"):
+                    tool_call_count += 1
+                else:
+                    final_answer_msg = msg["content"].strip()
+
+        assert tool_call_count >= 1, (
+            f"Async Sample {i}: Expected at least one tool call"
+        )
+        print(
+            f"✓ Sample {i}: Successfully made {tool_call_count} tool call(s) using async rollout"
+        )
+
+        # Always require a valid final answer
+        assert final_answer_msg is not None and final_answer_msg.strip(), (
+            f"Async Sample {i}: Expected a final answer message from assistant"
+        )
+
+        # Always require the final answer to be parseable and correct
+        final_answer_logic = _MultiStepCalculatorLogic()
+        extracted_final_answer = final_answer_logic._is_final_answer(final_answer_msg)
+        assert extracted_final_answer is not None, (
+            f"Async Sample {i}: Could not parse final answer from: {final_answer_msg}"
+        )
+        assert abs(extracted_final_answer - expected_final_answer) < 1e-6, (
+            f"Async Sample {i}: Final answer incorrect. Expected {expected_final_answer}, Got {extracted_final_answer}"
+        )
+
+        # Check total reward (should be 1.0 if correct)
+        assert final_batch["total_reward"][i] == 1.0, (
+            f"Async Sample {i}: Expected total reward 1.0 for correct answer, "
+            f"got {final_batch['total_reward'][i]}"
+        )
+        print(f"✓ Sample {i}: Correct answer {extracted_final_answer}")
+        print(f"--- Async Sample {i}: Rollout verification PASSED ---")
+
+    print("\nAsync Multi-Step Calculator VLLM Test assertions passed for all samples.")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
+    reason="VLLM test requires at least 1 GPU",
+)
+def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
+    """Tests multi-step calculator rollout with VllmGeneration (sync)."""
+    vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
+        multi_step_setup_vllm_sync
     )
     max_rollout_turns = initial_batch["extra_env_info"][0]["max_steps"] + 1
     max_seq_len = 290
 
-    print("\nRunning multi-step calculator rollout (VLLM)...")
+    print("\nRunning multi-step calculator rollout (VLLM sync)...")
     vllm_generation.prepare_for_generation()
     final_batch, rollout_metrics = run_multi_turn_rollout(
         policy_generation=vllm_generation,
@@ -475,7 +634,46 @@ def test_max_seqlen_respected(multi_step_setup_vllm):
         max_rollout_turns=max_rollout_turns,
     )
     vllm_generation.finish_generation()
-    print("Multi-step calculator rollout complete (VLLM).")
+    print("Multi-step calculator rollout complete (VLLM sync).")
+
+    # --- Assertions ---
+    assert isinstance(final_batch, BatchedDataDict)
+    assert "message_log" in final_batch
+    assert "total_reward" in final_batch
+    assert len(final_batch["message_log"]) == len(initial_batch["message_log"])
+    flattened_message_log, _ = batched_message_log_to_flat_message(
+        final_batch["message_log"]
+    )
+    # Check that the sequence length is respected by flattening the message log and checking the length
+    assert len(flattened_message_log["token_ids"][0]) == max_seq_len, (
+        f"Sequence length {len(flattened_message_log['token_ids'][0])} is not equal to max_seq_len {max_seq_len}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
+    reason="VLLM test requires at least 1 GPU",
+)
+def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
+    """Tests multi-step calculator rollout with VllmGeneration (async)."""
+    vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
+        multi_step_setup_vllm_async
+    )
+    max_rollout_turns = initial_batch["extra_env_info"][0]["max_steps"] + 1
+    max_seq_len = 290
+
+    print("\nRunning multi-step calculator rollout (VLLM async)...")
+    vllm_generation.prepare_for_generation()
+    final_batch, rollout_metrics = run_async_multi_turn_rollout(
+        policy_generation=vllm_generation,
+        input_batch=initial_batch,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+    )
+    vllm_generation.finish_generation()
+    print("Multi-step calculator rollout complete (VLLM async).")
 
     # --- Assertions ---
     assert isinstance(final_batch, BatchedDataDict)

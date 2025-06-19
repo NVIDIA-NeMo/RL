@@ -160,9 +160,28 @@ async def test_vllm_large_model(
         async_policy = VllmGeneration(two_node_cluster, vllm_config)
 
         print("Running async generation...")
-        outputs = async_policy.generate_async(test_input_data)
+        collected_indexed_outputs = []
+        # generate_async is restricted to handle only single samples
+        input_generator = test_input_data.make_microbatch_iterator(microbatch_size=1)
+        for single_item_input in input_generator:
+            async for original_idx, single_item_output in async_policy.generate_async(
+                single_item_input
+            ):
+                collected_indexed_outputs.append((original_idx, single_item_output))
+
+        # Sort by original_idx to ensure order matches generation_input_data
+        collected_indexed_outputs.sort(key=lambda x: x[0])
+
+        # Extract in correct order
+        outputs = [item for _, item in collected_indexed_outputs]
+        pad_token_id = async_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+        outputs = BatchedDataDict.from_batches(
+            outputs,
+            pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+        )
 
         # Validate outputs format
+
         assert "output_ids" in outputs, "output_ids not found in generation output"
         assert "logprobs" in outputs, "logprobs not found in generation output"
         assert "generation_lengths" in outputs, (
