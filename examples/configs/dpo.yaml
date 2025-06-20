@@ -88,7 +88,7 @@ policy:
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
-    enabled: true
+    enabled: false
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2
