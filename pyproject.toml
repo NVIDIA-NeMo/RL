@@ -22,6 +22,7 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "setuptools",
     "torch==2.7.0",
+    "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     "transformers>=4.51.0",
