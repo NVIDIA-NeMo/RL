@@ -616,7 +616,9 @@ def get_grad_norm(
 
 
 def get_logprobs_from_vocab_parallel_logits(
-    vocab_parallel_logits: DTensor, input_ids: torch.Tensor
+    vocab_parallel_logits: DTensor,
+    input_ids: torch.Tensor | DTensor,
+    seq_index: torch.Tensor | None = None,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -632,8 +634,21 @@ def get_logprobs_from_vocab_parallel_logits(
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
     """
-    tp_mesh = vocab_parallel_logits.device_mesh
-    tp_rank: int = tp_mesh.get_local_rank()
+    device_mesh = vocab_parallel_logits.device_mesh
+    if seq_index is not None:
+        assert "cp" in device_mesh.mesh_dim_names, (
+            "seq_index must be provided for cp sharded logits"
+        )
+
+    cp_size = 1
+    tp_size = 1
+    if "tp" in device_mesh.mesh_dim_names:
+        tp_mesh = device_mesh["tp"]
+        tp_rank = tp_mesh.get_local_rank()
+
+    if "cp" in device_mesh.mesh_dim_names:
+        cp_mesh = device_mesh["cp"]
+        cp_size = cp_mesh.size()
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
 
