@@ -102,10 +102,11 @@ nemo-tron = { workspace = true }
 # The NeMo Run source to be used by nemo-tron
 nemo_run = { git = "https://github.com/NVIDIA/NeMo-Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 torch = [
-  { index = "pytorch-cu126" },
+  { index = "pytorch-cu126", marker = "platform_machine != 'aarch64'"},
+  { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
 ]
 torchvision = [
-  { index = "pytorch-cu126" },
+  { index = "pytorch-cu126", marker = "platform_machine != 'aarch64'"},
 ]
 
 [tool.uv.workspace]
