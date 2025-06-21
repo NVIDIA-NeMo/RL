@@ -108,6 +108,7 @@ logger:
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl
