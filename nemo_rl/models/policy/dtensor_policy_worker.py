@@ -145,6 +145,7 @@ class DTensorPolicyWorker:
         model_name = self.cfg["model_name"]
 
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
+        self.torch_compile = self.cfg["dtensor_cfg"]["torch_compile"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         if self.cfg["precision"] == "float32":
@@ -221,6 +222,9 @@ class DTensorPolicyWorker:
             ],
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
+
+        if self.torch_compile:
+            self.model = torch.compile(model)
 
         if self.cpu_offload:
             self.model = self.move_buffer_to_device(self.model, "cpu")
@@ -894,6 +898,9 @@ class DTensorPolicyWorker:
                 full_tensor = tensor.full_tensor()
             else:
                 full_tensor = tensor
+            #torch.compile wraps the model as "_orig_mod", so remove the prefix here
+            if self.torch_compile and key.startswith("_orig_mod."):
+                key = key.removeprefix("_orig_mod.")
             # Convert parameters to the configured dtype
             converted_params[key] = full_tensor.to(self.dtype, non_blocking=True)
 
