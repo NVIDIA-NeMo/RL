@@ -108,6 +108,9 @@ torch = [
 torchvision = [
   { index = "pytorch-cu126", marker = "platform_machine != 'aarch64'"},
 ]
+triton = [
+  { index = "pytorch-cu126" },
+]
 
 [tool.uv.workspace]
 members = [
