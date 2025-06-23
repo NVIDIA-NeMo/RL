@@ -56,7 +56,7 @@ class MultiWorkerFuture:
         Returns:
             List of results, deduplicated by tied workers if respect_tied_workers is True
         """
-        from ray._raylet import ObjectRef, ObjectRefGenerator
+        from ray import ObjectRef, ObjectRefGenerator
 
         # Flatten futures into a list of ObjectRefs
         object_refs: list[ObjectRef] = []
