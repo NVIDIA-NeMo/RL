@@ -8,8 +8,8 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class MMLUDataset:
-    def __init__(self, prompt_file: str, system_prompt_file: Optional[str] = None):
-        ds = load_dataset('csv', data_files=f"https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv", split='train')
+    def __init__(self, prompt_file: Optional[str] = None, system_prompt_file: Optional[str] = None):
+        ds = load_dataset('csv', data_files="https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv", split='train')
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
 
         self.task_spec = TaskDataSpec(
