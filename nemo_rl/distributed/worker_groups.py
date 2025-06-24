@@ -598,9 +598,12 @@ class RayWorkerGroup:
 
         Args:
             method_name: Name of the method to call on each worker
-            *args, **kwargs: List of arguments/keyword arguments to pass to workers/groups
+            *args: List of arguments to pass to workers/groups
+                   e.g. [[arg1_for_worker_1, arg1_for_worker_2], [arg2_for_worker_1, arg2_for_worker_2]]
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
-            common_kwargs: Additional keyword arguments to pass to all workers
+            common_kwargs: Keyword arguments to pass to all workers
+            **kwargs: Keyword arguments to pass to workers/groups
+                      e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
 
         Returns:
             list[ray.ObjectRef]: A list of ray futures
@@ -733,14 +736,18 @@ class RayWorkerGroup:
 
         Args:
             method_name: Name of the method to call on each worker
-            *args, **kwargs: List of arguments/keyword arguments to pass to workers/groups
+            *args: List of arguments to pass to workers/groups
+                   e.g. [[arg1_for_worker_1, arg1_for_worker_2], [arg2_for_worker_1, arg2_for_worker_2]]
             in_sharded_axes: List of axes that are sharded
             replicate_on_axes: List of axes that are to be replicated
             output_is_replicated: List of axes along which the output is replicated (and we should just return the first result).
                                   We also just return from rank 0 of free axes.
             make_dummy_calls_to_free_axes: Whether to make dummy calls (with None) to workers that
                                            aren't rank 0 on 'free axes' (axes not in in_sharded_axes or replicate_on_axes).
-            common_kwargs: Additional keyword arguments to pass to all workers
+            common_kwargs: Keyword arguments to pass to all workers
+            **kwargs: Keyword arguments to pass to workers/groups
+                      e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
+
         Returns:
             MultiWorkerFuture: Object containing futures and their associated worker information
         """
@@ -802,9 +809,9 @@ class RayWorkerGroup:
                 return_from_workers.append(worker_idx)
 
             if should_receive_data:
+                # Find the appropriate data slice for this worker
                 worker_args = args
                 worker_kwargs = kwargs
-                # Find the appropriate data slice for this worker
                 for axis in in_sharded_axes:
                     if axis in worker_coords:
                         # Select the appropriate slice for this axis
