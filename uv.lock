@@ -43,8 +43,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "safetensors" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/97/33/47bbd507e3a851d33d19ce7b2141c5ea3689bfae91ba168044d7db24b0e9/accelerate-1.7.0.tar.gz", hash = "sha256:e8a2a5503d6237b9eee73cc8d36cf543f9c2d8dd2c6713450b322f5e6d53a610", size = 376026, upload-time = "2025-05-15T10:00:52.117Z" }
 wheels = [
@@ -540,8 +539,7 @@ version = "0.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "transformers" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/af/cb/1de205e8018cb21a4dc995324652115cf209357de5aaed8d6af101d26b42/compressed_tensors-0.9.4.tar.gz", hash = "sha256:34779417ffa31a207adb0cc4fd2a86cb75e239e504fb2068e494092f4b5703b7", size = 111223, upload-time = "2025-04-24T19:19:07.826Z" }
@@ -1766,8 +1764,7 @@ dependencies = [
     { name = "packaging" },
     { name = "pytorch-lightning" },
     { name = "pyyaml" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "torchmetrics" },
     { name = "tqdm" },
     { name = "typing-extensions" },
@@ -2024,8 +2021,7 @@ dependencies = [
     { name = "sentencepiece" },
     { name = "tensorstore" },
     { name = "tiktoken" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "wandb" },
     { name = "wrapt" },
     { name = "zarr" },
@@ -2045,8 +2041,7 @@ requires-dist = [
     { name = "sentencepiece" },
     { name = "tensorstore", specifier = "!=0.1.46,!=0.1.72" },
     { name = "tiktoken" },
-    { name = "torch", marker = "platform_machine != 'aarch64'", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "torch", marker = "platform_machine == 'aarch64'", url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" },
+    { name = "torch", index = "https://download.pytorch.org/whl/cu126" },
     { name = "wandb" },
     { name = "wrapt" },
     { name = "zarr" },
@@ -2318,8 +2313,7 @@ dependencies = [
     { name = "setuptools" },
     { name = "tensorboard" },
     { name = "tiktoken" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "torchdata" },
     { name = "transformers" },
     { name = "triton" },
@@ -2343,8 +2337,7 @@ build = [
     { name = "packaging" },
     { name = "pybind11" },
     { name = "setuptools" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 dev = [
     { name = "mypy" },
@@ -2390,8 +2383,7 @@ requires-dist = [
     { name = "setuptools" },
     { name = "tensorboard" },
     { name = "tiktoken" },
-    { name = "torch", marker = "platform_machine != 'aarch64'", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "torch", marker = "platform_machine == 'aarch64'", url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" },
+    { name = "torch", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.3.0" },
     { name = "transformers", specifier = ">=4.51.0" },
@@ -2408,8 +2400,7 @@ build = [
     { name = "packaging" },
     { name = "pybind11" },
     { name = "setuptools" },
-    { name = "torch", marker = "platform_machine != 'aarch64'", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "torch", marker = "platform_machine == 'aarch64'", url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" },
+    { name = "torch", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu126" },
 ]
 dev = [
     { name = "mypy" },
@@ -2784,8 +2775,7 @@ torch = [
     { name = "pulp", marker = "sys_platform != 'darwin'" },
     { name = "regex", marker = "sys_platform != 'darwin'" },
     { name = "safetensors", marker = "sys_platform != 'darwin'" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64' and sys_platform != 'darwin'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64' and sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
     { name = "torchprofile", marker = "sys_platform != 'darwin'" },
     { name = "torchvision", marker = "sys_platform != 'darwin'" },
 ]
@@ -3090,8 +3080,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "referencing" },
     { name = "requests" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
@@ -3819,8 +3808,7 @@ dependencies = [
     { name = "lightning-utilities" },
     { name = "packaging" },
     { name = "pyyaml" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "torchmetrics" },
     { name = "tqdm" },
     { name = "typing-extensions" },
@@ -4692,19 +4680,11 @@ wheels = [
 name = "torch"
 version = "2.7.0+cu126"
 source = { registry = "https://download.pytorch.org/whl/cu126" }
-resolution-markers = [
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-]
 dependencies = [
-    { name = "filelock", marker = "platform_machine != 'aarch64'" },
-    { name = "fsspec", marker = "platform_machine != 'aarch64'" },
-    { name = "jinja2", marker = "platform_machine != 'aarch64'" },
-    { name = "networkx", marker = "platform_machine != 'aarch64'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
     { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cuda-cupti-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cuda-nvrtc-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -4719,10 +4699,10 @@ dependencies = [
     { name = "nvidia-nccl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nvtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "setuptools", marker = "platform_machine != 'aarch64'" },
-    { name = "sympy", marker = "platform_machine != 'aarch64'" },
+    { name = "setuptools" },
+    { name = "sympy" },
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine != 'aarch64'" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/cu126/torch-2.7.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4933a51bfb906f34b44c23c6ea28fdfef5bf14a3c79a43d5d798285e29eba295" },
@@ -4734,67 +4714,11 @@ wheels = [
 ]
 
 [[package]]
-name = "torch"
-version = "2.7.0+cu128"
-source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }
-resolution-markers = [
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-]
-dependencies = [
-    { name = "filelock", marker = "platform_machine == 'aarch64'" },
-    { name = "fsspec", marker = "platform_machine == 'aarch64'" },
-    { name = "jinja2", marker = "platform_machine == 'aarch64'" },
-    { name = "networkx", marker = "platform_machine == 'aarch64'" },
-    { name = "setuptools", marker = "platform_machine == 'aarch64'" },
-    { name = "sympy", marker = "platform_machine == 'aarch64'" },
-    { name = "triton", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine == 'aarch64'" },
-]
-wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6bba7dca5d9a729f1e8e9befb98055498e551efaf5ed034824c168b560afc1ac" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.3.14" },
-    { name = "nvidia-cuda-cupti-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.57" },
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.61" },
-    { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.57" },
-    { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==9.7.1.26" },
-    { name = "nvidia-cufft-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==11.3.3.41" },
-    { name = "nvidia-cufile-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==1.13.0.11" },
-    { name = "nvidia-curand-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==10.3.9.55" },
-    { name = "nvidia-cusolver-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==11.7.2.55" },
-    { name = "nvidia-cusparse-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.5.7.53" },
-    { name = "nvidia-cusparselt-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.3" },
-    { name = "nvidia-nccl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==2.26.2" },
-    { name = "nvidia-nvjitlink-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.61" },
-    { name = "nvidia-nvtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==12.8.55" },
-    { name = "opt-einsum", marker = "extra == 'opt-einsum'", specifier = ">=3.3" },
-    { name = "optree", marker = "extra == 'optree'", specifier = ">=0.13.0" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'" },
-    { name = "sympy", specifier = ">=1.13.3" },
-    { name = "triton", marker = "sys_platform == 'linux'", specifier = "==3.3.0" },
-    { name = "typing-extensions", specifier = ">=4.10.0" },
-]
-provides-extras = ["optree", "opt-einsum"]
-
-[[package]]
 name = "torchaudio"
 version = "2.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/b9/66dd7c4e16e8e6dcc52b4702ba7bbace589972b3597627d39d9dc3aa5fdd/torchaudio-2.7.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:65b4fc9b7f28367f918b02ae4db4290457bc4fdd160f22b7d684e93ab8dcb956", size = 1846733, upload-time = "2025-04-23T14:47:01.068Z" },
@@ -4817,8 +4741,7 @@ version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "urllib3" },
 ]
 wheels = [
@@ -4833,8 +4756,7 @@ dependencies = [
     { name = "lightning-utilities" },
     { name = "numpy" },
     { name = "packaging" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b7/ec/f5a4f94c77a1b4c0a37e5c5c8b666a33bc074130258a6b655346bec560c2/torchmetrics-1.7.2.tar.gz", hash = "sha256:ba401cd01aeaa268e809c0e4f42ef8f95669bf9b485e1d93d54dc765e012338a", size = 566185, upload-time = "2025-05-28T20:26:29.543Z" }
 wheels = [
@@ -4847,8 +4769,7 @@ version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", marker = "sys_platform != 'darwin'" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64' and sys_platform != 'darwin'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64' and sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
     { name = "torchvision", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6f/36/574c0c46e818533b78b3c09505211162918188325ab4165ef11a3f295755/torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b", size = 4557, upload-time = "2021-06-22T04:58:03.592Z" }
@@ -4863,8 +4784,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/ea/887d1d61cf4431a46280972de665f350af1898ce5006cd046326e5d0a2f2/torchvision-0.22.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:31c3165418fe21c3d81fe3459e51077c2f948801b8933ed18169f54652796a0f", size = 1947826, upload-time = "2025-04-23T14:41:59.188Z" },
@@ -4948,8 +4868,7 @@ name = "transformer-engine-torch"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1b/8f/d8b39a34cebb91528f118591e622d9ba1d9e52e4ea40cca1252ec335d07c/transformer_engine_torch-2.3.0.tar.gz", hash = "sha256:2b0adb75d7a5bf590cc5452276db6badb0963de99e6c50c7fde6a3a8a7c504e9", size = 165832, upload-time = "2025-05-15T23:10:38.909Z" }
 
@@ -5205,8 +5124,7 @@ dependencies = [
     { name = "six" },
     { name = "tiktoken" },
     { name = "tokenizers" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -5409,7 +5327,7 @@ version = "0.0.30"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
+    { name = "torch", marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bf/f7/dd2269cce89fd1221947dd7cc3a60707ffe721ef55c1803ac3b1a1f7ae5c/xformers-0.0.30.tar.gz", hash = "sha256:a12bf3eb39e294cdbe8a7253ac9b665f41bac61d6d98df174e34ef7bdb6f2fc4", size = 10214139, upload-time = "2025-04-28T20:51:02.045Z" }
 wheels = [
@@ -5425,8 +5343,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "sentencepiece" },
     { name = "tiktoken" },
-    { name = "torch", version = "2.7.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "platform_machine != 'aarch64'" },
-    { name = "torch", version = "2.7.0+cu128", source = { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
+    { name = "torch" },
     { name = "transformers" },
     { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
