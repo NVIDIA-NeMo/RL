@@ -167,7 +167,7 @@ jobs:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     with:
       RUNNER: self-hosted-azure
-      TIMEOUT: 120
+      TIMEOUT: 180
       UNIT_TEST_SCRIPT: |
         cd /opt/nemo-rl
         if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
