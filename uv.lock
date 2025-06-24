@@ -2301,6 +2301,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
+    { name = "nvtx" },
     { name = "omegaconf" },
     { name = "plotly" },
     { name = "ray", extra = ["default"] },
@@ -2369,6 +2370,7 @@ requires-dist = [
     { name = "nemo-tron", marker = "extra == 'mcore'", editable = "3rdparty/NeMo-workspace" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
+    { name = "nvtx" },
     { name = "omegaconf" },
     { name = "plotly" },
     { name = "ray", extras = ["default"], specifier = "==2.46.0" },
@@ -2816,6 +2818,20 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/74/996dbc314da8ed670cd5e040d0b4b5be79ff1fc3db3fe25e63134deebe9a/nvidia_sphinx_theme-0.0.8-py3-none-any.whl", hash = "sha256:18f117aa154a3a156251a75647279c541464f3e75f7df2ae283e720cc7d0bc2c", size = 140678, upload-time = "2025-03-24T21:56:25.621Z" },
+]
+
+[[package]]
+name = "nvtx"
+version = "0.2.12"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/05/160dc24b6cd1e21e5b00d55a46abac5802ed7c15c675e6ce25febad2b0d7/nvtx-0.2.12.tar.gz", hash = "sha256:b871fae9b80b004e624b5755291799794287016fa6a0c8fd0fb3255393ae3bc8", size = 110848, upload-time = "2025-05-26T10:32:33.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/e4/944e63039a0d652c843ecffb42700e2b4f596b745ac9ac6ebed937f1bce5/nvtx-0.2.12-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9ea22a86eca22fd52e3c2905654182da1fcebea6f0107e87d7dc4ec6871604ca", size = 539647, upload-time = "2025-05-25T08:52:12.911Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/7b/6e25716c92039a3ecc2f6f4e1380b5492b0d23af78ea862cb84e8ffe0d7b/nvtx-0.2.12-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9a279d880c27ec8c72632a0685456c170e7b12da2839c861ee461c121692aea6", size = 543614, upload-time = "2025-05-25T08:44:44.678Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/96/eb1078d7509b72e3e4b6dd7ff12a698951e81dcc5f20a3ad7f35d7455700/nvtx-0.2.12-cp312-cp312-win_amd64.whl", hash = "sha256:2f93e07add2544a85c202b3c710945b54b3abb6660a6a7e447395cb024938b35", size = 98894, upload-time = "2025-05-25T08:42:59.068Z" },
+    { url = "https://files.pythonhosted.org/packages/55/78/88563935649f9202735ac5686fc451d3fa9f34e6592787ba224244c3570a/nvtx-0.2.12-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:871e54f95929a6c7c39b85d4111bf6af8ab43325bbc36c97a179270443896ef7", size = 520074, upload-time = "2025-05-25T08:52:50.144Z" },
+    { url = "https://files.pythonhosted.org/packages/86/0c/62b1f76c84a8bed267421d11114953b5da631daeb0ec7894a91252f79b5d/nvtx-0.2.12-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2b82ad84ac8d5408851947d1d2cef3e8e627627cc2290e5150c8af0dda1e3f63", size = 524516, upload-time = "2025-05-25T08:45:06.598Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/41/e74ec826e1585ad6d31f41de96f6faae8ffc712a45c2b880baca4ae87a64/nvtx-0.2.12-cp313-cp313-win_amd64.whl", hash = "sha256:a37e063c3c745a4c6b561993a2dae2f67fcc26f2a2c2653f24eeae5810a2180d", size = 97070, upload-time = "2025-05-25T08:43:41.323Z" },
 ]
 
 [[package]]

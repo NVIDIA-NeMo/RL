@@ -542,3 +542,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         user calls worker_group.shutdown().
         """
         self.worker_group.shutdown()
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
+        ray.get(futures)

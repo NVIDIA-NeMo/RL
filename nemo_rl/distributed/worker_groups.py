@@ -27,6 +27,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 
@@ -168,7 +169,8 @@ class RayWorkerBuilder:
             module = importlib.import_module(module_name)
             worker_class = getattr(module, class_name)
             worker_kwargs = dict(self.init_kwargs)
-            options: dict[str, Any] = deepcopy(extra_options)
+            default_options = getattr(worker_class, "_default_options", {})
+            options = recursive_merge_options(default_options, extra_options)
 
             # Use the worker's configuration interface if available
             if hasattr(worker_class, "configure_worker"):

@@ -579,8 +579,8 @@ class DPOLossFn(LossFunction):
             next_token_logits,
             data,
             global_valid_seqs,
-            vocab_parallel_rank,
-            vocab_parallel_group,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
         )
 
         dpo_loss = (

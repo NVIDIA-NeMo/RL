@@ -36,6 +36,7 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 
@@ -412,6 +413,7 @@ def dpo_train(
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
             )
+            maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
@@ -497,7 +499,7 @@ def dpo_train(
             }
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
-                if k in {"lr", "global_valid_seqs", "global_valid_toks"}:
+                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                     metrics[k] = np.mean(v).item()
                 else:
                     metrics[k] = np.sum(v).item()

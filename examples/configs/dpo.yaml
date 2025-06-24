@@ -86,6 +86,58 @@ policy:
         total_iters: 10000000000
     - milestones: [20]
     
+  ## ignored since enabled=false, but needed for testing purposes
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6 #4.0e-5
+      min_lr: 5.0e-6 #4.0e-5
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "linear"
+      lr_decay_iters: 1000000000
+      lr_warmup_iters: 2
+      lr_warmup_init: 0.00000001
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      average_in_collective: true
+      data_parallel_sharding_strategy: "optim_grads_params"
+    
 data:
   dataset_name: "HelpSteer3"
   max_input_seq_length: ${policy.max_total_sequence_length}

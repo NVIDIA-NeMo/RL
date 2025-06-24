@@ -46,6 +46,7 @@ docker.md
 testing.md
 documentation.md
 debugging.md
+nsys-profiling.md
 apidocs/index.rst
 ```
 
