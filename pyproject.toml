@@ -22,6 +22,7 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "setuptools",
     "torch==2.7.0",
+    "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     "transformers>=4.51.0",
@@ -101,12 +102,27 @@ megatron-core = { workspace = true }
 nemo-tron = { workspace = true }
 # The NeMo Run source to be used by nemo-tron
 nemo_run = { git = "https://github.com/NVIDIA/NeMo-Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+# torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
+torch = [
+  { index = "pytorch-cu128" },
+]
+torchvision = [
+  { index = "pytorch-cu128" },
+]
+triton = [
+  { index = "pytorch-cu128" },
+]
 
 [tool.uv.workspace]
 members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/NeMo-workspace",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv]
 # Currently, TE must be built with no build-isolation b/c it requires torch
