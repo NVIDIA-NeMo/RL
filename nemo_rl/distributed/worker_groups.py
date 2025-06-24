@@ -300,27 +300,6 @@ class RayWorkerBuilder:
         worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = isolated_initializer
         return worker
 
-    def get_all_worker_results(
-        self,
-        future_bundle: MultiWorkerFuture,
-        return_generators_as_proxies: bool = False,
-    ) -> list[Any]:
-        """Get results from all workers, optionally filtering to get just one result per tied worker group.
-
-        Args:
-            future_bundle: MultiWorkerFuture containing futures and worker information.
-                          When future_bundle.respect_tied_workers is True, only results from
-                          the leaders of tied worker groups are returned.
-            return_generators_as_proxies: If True, and a future in the bundle is an ObjectRefGenerator,
-                                          return the ObjectRefGenerator itself instead of consuming it.
-
-        Returns:
-            List of results, deduplicated as specified in the future_bundle
-        """
-        return future_bundle.get_results(
-            self, return_generators_as_proxies=return_generators_as_proxies
-        )
-
 
 class RayWorkerGroup:
     """Manages a group of distributed Ray worker/actor processes that execute tasks in parallel.

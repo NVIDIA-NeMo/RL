@@ -1457,15 +1457,14 @@ class VllmGeneration(GenerationInterface):
             nonlocal finished_workers
             worker_name = f"Worker-{worker_idx}"
             try:
-                sample_count = 0
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
-                    sample_count += 1
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging
                 import traceback
 
+                print(f"Exception in worker {worker_name}")
                 traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
@@ -1478,30 +1477,34 @@ class VllmGeneration(GenerationInterface):
             for i, proxy in enumerate(future_bundle)
         ]
 
-        if not worker_tasks:
-            return
-
         # Yield sample results as they become available from any worker
-        sample_count = 0
+        timeout_seconds = float(
+            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
+        )  # Default 10 minutes
 
         while finished_workers < total_workers:
             try:
                 msg_type, item = await asyncio.wait_for(
-                    result_queue.get(), timeout=120.0
+                    result_queue.get(), timeout=timeout_seconds
                 )
             except asyncio.TimeoutError:
                 print(
-                    f"Timeout waiting for results. finished_workers: {finished_workers}/{total_workers}"
+                    f"Timeout waiting for results after {timeout_seconds}s. finished_workers: {finished_workers}/{total_workers}"
+                )
+                print(
+                    f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
                 )
                 # Cancel all remaining tasks
                 for task in worker_tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
-                raise RuntimeError("Timeout waiting for worker results")
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
+                )
 
             if msg_type == "sample":
-                sample_count += 1
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
@@ -1511,9 +1514,15 @@ class VllmGeneration(GenerationInterface):
                         task.cancel()
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise item
+            elif msg_type == "worker_done":
+                # Worker finished, just continue the loop
+                pass
+            else:
+                raise RuntimeError(f"Unexpected message type: {msg_type}")
 
-        # Wait for all tasks to complete
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
+        # Verify all tasks are actually done
+        for i, task in enumerate(worker_tasks):
+            assert task.done(), f"Worker task {i} should be done but isn't"
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""

@@ -409,7 +409,7 @@ def run_multi_turn_rollout(
             # TODO @sahilj: handle if we want these subsequent messages to have a chat template
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0]
+            ).input_ids[0]
 
             # check if new message overflows max_seq_len
             if (
@@ -503,7 +503,7 @@ async def async_generate_response_for_sample_turn(
     tokenizer: TokenizerType,
     max_seq_len: int,
     greedy: bool = False,
-) -> tuple[list[dict], torch.Tensor, dict[str, float]]:
+) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
     Args:
@@ -515,7 +515,7 @@ async def async_generate_response_for_sample_turn(
         greedy: Whether to use greedy decoding
 
     Returns:
-        Tuple of (updated_message_log, generated_tokens, generation_metrics)
+        Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
     """
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 
@@ -653,49 +653,44 @@ async def run_sample_multi_turn_rollout(
         )
 
         # Get environment feedback
-        try:
-            env_output = calculate_rewards(sample_batch, task_to_env)
-            # Update total reward
-            total_reward += env_output.rewards[0].item()
-            # Check termination
-            terminated = env_output.terminateds[0].item()
-            env_obs_content = env_output.observations[0]["content"]
-            # Tokenize environment response
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0]
+        env_output = calculate_rewards(sample_batch, task_to_env)
+        # Update total reward
+        total_reward += env_output.rewards[0].item()
+        # Check termination
+        terminated = env_output.terminateds[0].item()
+        env_obs_content = env_output.observations[0]["content"]
+        # Tokenize environment response
+        tokenized_obs = tokenizer(
+            env_obs_content, return_tensors="pt", add_special_tokens=False
+        ).input_ids[0]
 
-            # Check for sequence length overflow
-            if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
-                # Truncate environment observation
-                max_env_tokens = max_seq_len - input_lengths - gen_token_count
-                if max_env_tokens > 0:
-                    tokenized_obs = tokenized_obs[:max_env_tokens]
-                else:
-                    tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
-                truncated = True
+        # Check for sequence length overflow
+        if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
+            # Truncate environment observation
+            max_env_tokens = max_seq_len - input_lengths - gen_token_count
+            if max_env_tokens > 0:
+                tokenized_obs = tokenized_obs[:max_env_tokens]
+            else:
+                tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
+            truncated = True
 
-            env_message = {
-                "role": env_output.observations[0]["role"],
-                "content": env_obs_content,
-                "token_ids": tokenized_obs,
-            }
-            current_message_log.append(env_message)
+        env_message = {
+            "role": env_output.observations[0]["role"],
+            "content": env_obs_content,
+            "token_ids": tokenized_obs,
+        }
+        current_message_log.append(env_message)
 
-            # Update token counts
-            env_token_count += len(tokenized_obs)
-            token_count += len(tokenized_obs)
+        # Update token counts
+        env_token_count += len(tokenized_obs)
+        token_count += len(tokenized_obs)
 
-            # Update sample state for next turn
-            if not terminated and not truncated:
-                if env_output.next_stop_strings[0] is not None:
-                    current_stop_strings = env_output.next_stop_strings[0]
-                if env_output.metadata[0] is not None:
-                    current_extra_env_info = env_output.metadata[0]
-
-        except Exception as e:
-            print(f"Error in environment interaction for sample {sample_idx}: {e}")
-            break
+        # Update sample state for next turn
+        if not terminated and not truncated:
+            if env_output.next_stop_strings[0] is not None:
+                current_stop_strings = env_output.next_stop_strings[0]
+            if env_output.metadata[0] is not None:
+                current_extra_env_info = env_output.metadata[0]
 
     # Check if max turns reached
     if turn_count >= max_rollout_turns:
@@ -788,8 +783,7 @@ def run_async_multi_turn_rollout(
                 )
                 return result
             except Exception as e:
-                assert False, f"Error in sample {i} rollout: {e}"
-                return None
+                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
 
         # Create tasks for all samples and run them concurrently
         sample_tasks = [
@@ -798,7 +792,7 @@ def run_async_multi_turn_rollout(
         ]
 
         # Execute all sample rollouts concurrently
-        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=True)
+        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
 
         # Process results
         final_sample_states = []
