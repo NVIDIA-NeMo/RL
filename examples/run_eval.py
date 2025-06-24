@@ -29,6 +29,7 @@ from examples.run_grpo_math import math_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.eval_datasets import (
+    aime2024,
     gpqa,
     math,
     mmlu,
@@ -146,6 +147,12 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    elif dataset_name == "aime2024":
+        base_dataset = aime2024.AIME2024Dataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+        data_processor_fn = math_data_processor
     elif dataset_name == "gpqa":
         base_dataset = gpqa.GPQADataset(
             prompt_file=data_config["prompt_file"],
@@ -200,7 +207,7 @@ def main():
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "mmlu_eval.yaml"
+            os.path.dirname(__file__), "configs", "evals", "eval.yaml"
         )
 
     config = OmegaConf.load(args.config)
