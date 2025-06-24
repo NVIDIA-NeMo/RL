@@ -15,13 +15,12 @@ import importlib
 import os
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Optional, Union
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from nemo_rl.distributed.batched_data_dict import SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
@@ -590,25 +589,53 @@ class RayWorkerGroup:
     def run_all_workers_multiple_data(
         self,
         method_name: str,
-        data: list[Any],
+        *args,
         run_rank_0_only_axes: list[str] | None = None,
         common_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with different data.
 
         Args:
             method_name: Name of the method to call on each worker
-            data: List of data to pass to workers/groups
+            *args, **kwargs: List of arguments/keyword arguments to pass to workers/groups
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
             common_kwargs: Additional keyword arguments to pass to all workers
 
         Returns:
             list[ray.ObjectRef]: A list of ray futures
         """
+        # Check at least one arg or kwarg is provided
+        assert len(args) > 0 or len(kwargs) > 0, (
+            "At least one args (positional arguments) or kwargs (keyword arguments) must be provided in run_all_workers_multiple_data. "
+            "Otherwise, please use run_all_workers_single_data."
+        )
+
+        # Check all args and kwargs have the same length
+        args_count = [len(arg) for arg in args]
+        assert all(count == args_count[0] for count in args_count), (
+            "All args must have the same length"
+        )
+        args_count = args_count[0] if len(args_count) > 0 else 0
+
+        kwargs_count = [len(value) for value in kwargs.values()]
+        assert all(count == kwargs_count[0] for count in kwargs_count), (
+            "All kwargs must have the same length"
+        )
+        kwargs_count = kwargs_count[0] if len(kwargs_count) > 0 else 0
+
+        if args_count > 0 and kwargs_count > 0:
+            assert args_count == kwargs_count, (
+                "The number of args and kwargs must be the same in run_all_workers_multiple_data. "
+                f"args length = {args_count}, kwargs length = {kwargs_count}"
+            )
+        data_count = max(args_count, kwargs_count)
+
+        # Check the data length is equal to the number of workers
         if run_rank_0_only_axes is None:
-            assert len(data) == len(self.workers), (
+            assert data_count == len(self.workers), (
                 "data length should be equal to the number of workers: "
-                f"data length = {len(data)}, number of workers = {len(self.workers)}"
+                f"data length = {data_count}, number of workers = {len(self.workers)}"
             )
 
         futures = []
@@ -633,12 +660,16 @@ class RayWorkerGroup:
 
             if should_run:
                 method = getattr(worker, method_name)
-                futures.append(method.remote(data=data[data_idx], **common_kwargs))
+                worker_args = [arg[data_idx] for arg in args]
+                worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
+                futures.append(
+                    method.remote(*worker_args, **worker_kwargs, **common_kwargs)
+                )
                 data_idx += 1
 
-        assert data_idx == len(data), (
+        assert data_idx == data_count, (
             "data length should be equal to the number of workers started: "
-            f"data length = {len(data)}, number of workers started = {data_idx}"
+            f"data length = {data_count}, number of workers started = {data_idx}"
         )
 
         return futures
@@ -686,12 +717,13 @@ class RayWorkerGroup:
     def run_all_workers_sharded_data(
         self,
         method_name: str,
-        data: Iterable[SlicedDataDict],  # arbitrary nested iterables of SlicedDataDicts
+        *args,
         in_sharded_axes: list[str] | None = None,
         replicate_on_axes: list[str] | None = None,
         output_is_replicated: list[str] | None = None,
         make_dummy_calls_to_free_axes: bool = False,
         common_kwargs: Optional[dict[str, Any]] = None,
+        **kwargs,
     ) -> MultiWorkerFuture:
         """Run a method on all workers in parallel with sharded data.
 
@@ -701,7 +733,7 @@ class RayWorkerGroup:
 
         Args:
             method_name: Name of the method to call on each worker
-            data: Iterable of SlicedDataDicts to pass to workers/groups
+            *args, **kwargs: List of arguments/keyword arguments to pass to workers/groups
             in_sharded_axes: List of axes that are sharded
             replicate_on_axes: List of axes that are to be replicated
             output_is_replicated: List of axes along which the output is replicated (and we should just return the first result).
@@ -770,16 +802,21 @@ class RayWorkerGroup:
                 return_from_workers.append(worker_idx)
 
             if should_receive_data:
+                worker_args = args
+                worker_kwargs = kwargs
                 # Find the appropriate data slice for this worker
-                worker_data = data
                 for axis in in_sharded_axes:
                     if axis in worker_coords:
                         # Select the appropriate slice for this axis
-                        worker_data = worker_data[worker_coords[axis]]
+                        worker_args = [arg[worker_coords[axis]] for arg in worker_args]
+                        worker_kwargs = {
+                            key: value[worker_coords[axis]]
+                            for key, value in worker_kwargs.items()
+                        }
 
                 # Call the method on the worker with its data slice
                 future = getattr(worker, method_name).remote(
-                    data=worker_data, **common_kwargs
+                    *worker_args, **worker_kwargs, **common_kwargs
                 )
                 futures.append(future)
                 called_workers.append(worker_idx)
@@ -787,8 +824,10 @@ class RayWorkerGroup:
                 # If this worker doesn't need data:
                 if make_dummy_calls_to_free_axes:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
+                    worker_args = [None] * len(args)
+                    worker_kwargs = {key: None for key in kwargs.keys()}
                     future = getattr(worker, method_name).remote(
-                        data=None, **common_kwargs
+                        *worker_args, **worker_kwargs, **common_kwargs
                     )
                     futures.append(future)
                     called_workers.append(worker_idx)
