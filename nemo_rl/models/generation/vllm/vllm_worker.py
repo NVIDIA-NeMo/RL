@@ -295,6 +295,16 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
+        if use_fp8:
+            fp8_block_quant_cfg = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128]
+            }
+            vllm_kwargs["quantization"] = "fp8"
+            vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,

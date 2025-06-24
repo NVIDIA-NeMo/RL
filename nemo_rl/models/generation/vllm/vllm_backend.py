@@ -96,6 +96,7 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+
         try:
             is_tensor_packed = local_device_ipc_handles[0]
             if is_tensor_packed:
