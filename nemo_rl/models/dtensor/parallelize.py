@@ -640,16 +640,11 @@ def get_logprobs_from_vocab_parallel_logits(
             "seq_index must be provided for cp sharded logits"
         )
 
-    cp_size = 1
     tp_size = 1
 
     tp_group = device_mesh.get_group("tp")
     tp_rank = tp_group.rank()
     tp_size = tp_group.size()
-
-    if "cp" in device_mesh.mesh_dim_names:
-        cp_group = device_mesh.get_group("cp")
-        cp_size = cp_group.size()
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
