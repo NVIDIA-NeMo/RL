@@ -150,10 +150,6 @@ class VllmGenerationWorker:
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
 
-        # Need to give each DP group its own vllm cache to address:
-        # https://github.com/vllm-project/vllm/issues/18851
-        env_vars["VLLM_CACHE_ROOT"] = f"~/.cache/vllm_{seed}"
-
         return resources, env_vars, init_kwargs
 
     def __init__(
@@ -178,6 +174,7 @@ class VllmGenerationWorker:
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -325,8 +322,7 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
-        use_fp8 = True
-        if use_fp8:
+        if self.cfg["vllm_cfg"]["precision"] == 'fp8':
             fp8_block_quant_cfg = {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
@@ -335,6 +331,11 @@ class VllmGenerationWorker:
             }
             vllm_kwargs["quantization"] = "fp8"
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
+            if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
+                from nemo_rl.models.generation import fp8
+                fp8.USE_POW2_SCALE = False
+            # overriden by quant config, just to stop vllm from complaining
+            self.precision = "bfloat16" 
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -344,7 +345,7 @@ class VllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            dtype=self.cfg["vllm_cfg"]["precision"],
+            dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
