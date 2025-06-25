@@ -118,6 +118,21 @@ def session_data(request, init_ray_cluster):
     ############################################################
     # 1. Gather all the unit test data #
     ############################################################
+
+    # Check if _unit_test_data exists, if not, create it
+    if not hasattr(request.config, "_unit_test_data"):
+        print(
+            "Warning: _unit_test_data not found in session_data fixture, creating minimal data"
+        )
+        request.config._unit_test_data = UnitTestData(
+            exit_status="was not set",
+            git_commit="unknown",
+            start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            metrics={},
+            gpu_types=[],
+            coverage="[n/a] run with --cov=nemo_rl",
+        )
+
     unit_test_data: UnitTestData = request.config._unit_test_data
     yield unit_test_data
 
