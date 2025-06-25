@@ -60,7 +60,7 @@ class MultiWorkerFuture:
         Returns:
             List of results, deduplicated by tied workers if respect_tied_workers is True
         """
-        from ray._raylet import ObjectRef, ObjectRefGenerator
+        from ray import ObjectRef, ObjectRefGenerator
 
         if return_generators_as_proxies:
             # Directly return the futures, which are expected to be ObjectRefGenerators (or other proxies).

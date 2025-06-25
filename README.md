@@ -62,19 +62,12 @@ What you can expect:
 
 Clone **NeMo RL**.
 ```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
-cd nemo-rl
-```
-
-<!--
-# TODO: Replace the above instructions once we have a real mcore example
-```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
 cd nemo-rl
 
 # If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules 
-# by running:
-# git submodule update --init --recursive
+# by running (This is not necessary if you are using the pure Pytorch/DTensor path):
+git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure 
 # submodules are automatically updated after switching branches or pulling updates by configuring git with:
@@ -97,7 +90,6 @@ sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt-get update
 sudo apt-get install cudnn-cuda-12
 ```
--->
 
 Install `uv`.
 ```sh
