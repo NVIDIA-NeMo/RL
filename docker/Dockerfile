@@ -71,9 +71,8 @@ VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools  # setuptools for flash-attn
 uv sync --link-mode symlink --locked --no-install-project
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install ninja  # to speed up flash-attn build
-uv sync --link-mode symlink --locked --extra fattn --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
