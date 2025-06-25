@@ -1307,7 +1307,11 @@ class VllmGeneration(GenerationInterface):
 
         # Prepare rank
         total_workers = len(self.worker_group.workers)
-        workers_per_group = len(self.worker_group.tied_workers_groups[0])
+        if self.dp_size == 0:
+            raise RuntimeError(
+                "Data parallel size is zero, cannot initialize collective."
+            )
+        workers_per_group = total_workers // self.dp_size
         rank_prefix_list = list(range(0, total_workers, workers_per_group))
 
         # Send world_size and rank for init collective to all workers

@@ -44,9 +44,6 @@ class MultiWorkerFuture:
     ) -> list[Any]:
         """Get results from the futures, optionally respecting tied workers.
 
-        When respect_tied_workers is True, this method deduplicates results by returning
-        only one result per tied worker group.
-
         The method uses worker_group.worker_to_tied_group_index to identify which tied
         worker group each worker belongs to, then selects only the first result from each group.
 
@@ -58,7 +55,7 @@ class MultiWorkerFuture:
                                           return the ObjectRefGenerator itself instead of consuming it.
 
         Returns:
-            List of results, deduplicated by tied workers if respect_tied_workers is True
+            List of results
         """
         from ray import ObjectRef, ObjectRefGenerator
 
@@ -814,8 +811,6 @@ class RayWorkerGroup:
 
         Args:
             future_bundle: MultiWorkerFuture containing futures and worker information.
-                          When future_bundle.respect_tied_workers is True, only results from
-                          the leaders of tied worker groups are returned.
             return_generators_as_proxies: If True, and a future in the bundle is an ObjectRefGenerator,
                                           return the ObjectRefGenerator itself instead of consuming it.
 
