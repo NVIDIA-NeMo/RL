@@ -339,12 +339,8 @@ class RayWorkerGroup:
         self._worker_metadata: list[dict[str, Any]] = []
         self.cluster = cluster
         self.name_prefix = name_prefix
-        self.tied_workers_groups: list[list[int]] = []
-        # Maps worker indices to their corresponding tied group index
-        # For example, if worker with index 3 belongs to tied worker group 1,
-        # then worker_to_tied_group_index[3] = 1
-        self.worker_to_tied_group_index: dict[int, int] = {}
         self.sharding_annotations = sharding_annotations
+        self.dp_leader_worker_indices: list[int] = []
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -401,6 +397,15 @@ class RayWorkerGroup:
         self._create_workers_from_bundle_indices(
             remote_worker_builder, bundle_indices_list
         )
+
+    def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
+        """Returns the index of the primary worker for a given data parallel shard."""
+        if not 0 <= dp_shard_idx < len(self.dp_leader_worker_indices):
+            raise IndexError(
+                f"Data parallel shard index {dp_shard_idx} is out of range. "
+                f"Valid range is [0, {len(self.dp_leader_worker_indices) - 1}]"
+            )
+        return self.dp_leader_worker_indices[dp_shard_idx]
 
     def _create_workers_from_bundle_indices(
         self,
@@ -476,6 +481,7 @@ class RayWorkerGroup:
                 worker_bundle_indices = None
                 if local_rank == 0:
                     worker_bundle_indices = (pg_idx, local_bundle_indices)
+                    self.dp_leader_worker_indices.append(global_rank)
 
                 # Create a descriptive name based on group structure
                 name = (
@@ -519,6 +525,7 @@ class RayWorkerGroup:
                         "global_rank": global_rank,
                         "name": name,
                         "bundle_indices": worker_bundle_indices,
+                        "dp_shard_idx": group_idx,
                     }
                 )
                 current_group.append(worker_idx)
@@ -545,19 +552,9 @@ class RayWorkerGroup:
                     "global_rank": info["global_rank"],
                     "name": info["name"],
                     "bundle_indices": info["bundle_indices"],
-                    "tied_group_idx": info["group_idx"],
+                    "dp_shard_idx": info["group_idx"],
                 }
             )
-
-            self.worker_to_tied_group_index[idx] = info["group_idx"]
-
-        # Reconstruct tied worker groups
-        for group_idx, (_, local_bundle_indices) in enumerate(bundle_indices_list):
-            current_group = []
-            for idx, info in enumerate(worker_info):
-                if info["group_idx"] == group_idx:
-                    current_group.append(idx)
-            self.tied_workers_groups.append(current_group)
 
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:
@@ -568,52 +565,30 @@ class RayWorkerGroup:
         return self._worker_metadata
 
     @property
-    def group_count(self) -> int:
-        """Number of tied worker groups."""
-        return len(self.tied_workers_groups)
+    def dp_size(self) -> int:
+        """Number of data parallel shards."""
+        return len(self.dp_leader_worker_indices)
 
-    def run_single_group_single_data(
+    def run_single_worker_single_data(
         self,
         method_name: str,
-        group_idx: int,
+        worker_idx: int,
         *args,
-        run_rank_0_only_axes: list[str] | None = None,
         **kwargs,
-    ) -> list[ray.ObjectRef]:
-        """Run a method on a single tied worker group with the same data.
+    ) -> ray.ObjectRef:
+        """Run a method on a single, specific worker.
 
         Args:
-            method_name: Name of the method to call on each worker
-            group_idx: Index of the tied worker group to run on
-            *args, **kwargs: Arguments to pass to the method
-            run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
+            method_name: Name of the method to call on the worker.
+            worker_idx: The index of the worker to run the method on.
+            *args, **kwargs: Arguments to pass to the method.
 
         Returns:
-            list[ray.ObjectRef]: A list of ray futures
+            ray.ObjectRef: A Ray future for the result.
         """
-        futures = []
-
-        if run_rank_0_only_axes is None:
-            run_rank_0_only_axes = []
-
-        for worker_idx in self.tied_workers_groups[group_idx]:
-            worker = self.workers[worker_idx]
-            worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
-
-            # Determine if this worker should receive data
-            should_run = True
-            for axis in self.sharding_annotations.names:
-                if axis not in worker_coords:
-                    continue
-                if axis in run_rank_0_only_axes and worker_coords[axis] != 0:
-                    should_run = False
-                    break
-
-            if should_run:
-                method = getattr(worker, method_name)
-                futures.append(method.remote(*args, **kwargs))
-
-        return futures
+        worker = self.workers[worker_idx]
+        method = getattr(worker, method_name)
+        return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
         self,

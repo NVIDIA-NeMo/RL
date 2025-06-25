@@ -1159,10 +1159,10 @@ class VllmGeneration(GenerationInterface):
             )
 
         # Number of data parallel groups is the number of tied worker groups
-        self.dp_size = self.worker_group.group_count
+        self.dp_size = self.worker_group.dp_size
 
         # Used to track the round-robin selection of worker groups for generate_async
-        self.current_generate_worker_group_idx = 0
+        self.current_generate_dp_shard_idx = 0
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
@@ -1434,27 +1434,30 @@ class VllmGeneration(GenerationInterface):
         if len(data["input_ids"]) == 0:
             return
 
-        # Run the generate_async method on the selected worker group
-        future_bundle = self.worker_group.run_single_group_single_data(
+        # Determine the leader worker for the current data parallel shard
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+            self.current_generate_dp_shard_idx
+        )
+
+        # Run the generate_async method on the selected leader worker. This returns an ObjectRefGenerator.
+        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
             method_name="generate_async",
-            group_idx=self.current_generate_worker_group_idx,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
         )
 
         # Increment the round-robin worker group index
-        self.current_generate_worker_group_idx += 1
-        self.current_generate_worker_group_idx %= self.worker_group.group_count
+        self.current_generate_dp_shard_idx += 1
+        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
 
-        # Create a queue to collect sample results from all workers as they complete
+        # Create a queue to collect sample results from the worker as they complete
         result_queue = asyncio.Queue()
-        finished_workers = 0
-        total_workers = len(future_bundle)
+        finished = False
 
         async def consume_worker_generator(worker_idx, worker_gen):
             """Consume a single worker generator and put sample results in the queue."""
-            nonlocal finished_workers
+            nonlocal finished
             worker_name = f"Worker-{worker_idx}"
             try:
                 async for sample_result_ref in worker_gen:
@@ -1468,37 +1471,35 @@ class VllmGeneration(GenerationInterface):
                 traceback.print_exc()
                 await result_queue.put(("error", e))
             finally:
-                finished_workers += 1
+                finished = True
                 await result_queue.put(("worker_done", None))
 
-        # Start tasks for all worker generators
-        worker_tasks = [
-            asyncio.create_task(consume_worker_generator(i, proxy))
-            for i, proxy in enumerate(future_bundle)
-        ]
+        # Start the task to consume the worker generator
+        worker_task = asyncio.create_task(
+            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
+        )
 
-        # Yield sample results as they become available from any worker
+        # Yield sample results as they become available from the worker
         timeout_seconds = float(
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
         )  # Default 10 minutes
 
-        while finished_workers < total_workers:
+        while not finished:
             try:
                 msg_type, item = await asyncio.wait_for(
                     result_queue.get(), timeout=timeout_seconds
                 )
             except asyncio.TimeoutError:
                 print(
-                    f"Timeout waiting for results after {timeout_seconds}s. finished_workers: {finished_workers}/{total_workers}"
+                    f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
                 )
                 print(
                     f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
                 )
-                # Cancel all remaining tasks
-                for task in worker_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                # Cancel the task
+                if not worker_task.done():
+                    worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
                 raise RuntimeError(
                     f"Timeout waiting for worker results after {timeout_seconds}s. "
                     f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
@@ -1508,11 +1509,10 @@ class VllmGeneration(GenerationInterface):
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
-                # Cancel all remaining tasks and propagate error
-                for task in worker_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                # Cancel the task and propagate error
+                if not worker_task.done():
+                    worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
                 raise item
             elif msg_type == "worker_done":
                 # Worker finished, just continue the loop
@@ -1520,9 +1520,10 @@ class VllmGeneration(GenerationInterface):
             else:
                 raise RuntimeError(f"Unexpected message type: {msg_type}")
 
-        # Verify all tasks are actually done
-        for i, task in enumerate(worker_tasks):
-            assert task.done(), f"Worker task {i} should be done but isn't"
+        # Verify the task is actually done
+        assert worker_task.done(), (
+            f"Worker task {leader_worker_idx} should be done but isn't"
+        )
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
