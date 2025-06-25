@@ -295,7 +295,7 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
-        if use_fp8:
+        if self.cfg["vllm_cfg"]["precision"] == 'fp8':
             fp8_block_quant_cfg = {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
@@ -304,6 +304,11 @@ class BaseVllmGenerationWorker:
             }
             vllm_kwargs["quantization"] = "fp8"
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
+            if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
+                from nemo_rl.models.generation import fp8
+                fp8.USE_POW2_SCALE = False
+            # overriden by quant config, just to stop vllm from complaining
+            self.precision = "bfloat16" 
 
         llm_kwargs = dict(
             model=self.model_name,

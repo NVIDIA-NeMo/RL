@@ -1,23 +1,99 @@
-
-import functools
-import json
-import os
 from typing import Any, Callable, Optional, Union
 
 import torch
-
-from vllm import _custom_ops as ops
-from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    scaled_dequantize)
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    CUTLASS_BLOCK_FP8_SUPPORTED)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import direct_register_custom_op
+
+USE_POW2_SCALE = False
+
+def kitchen_block_scale(
+    data_hp,
+    weight_block_size,
+):
+    if not len(data_hp.shape) == 2:
+        import pdb; pdb.set_trace()
+    assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
+
+    block_size1 = weight_block_size[1]
+    block_size0 = weight_block_size[0]
+    assert (
+        data_hp.shape[1] % block_size1 == 0
+    ), f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
+    assert (
+        data_hp.shape[0] % block_size0 == 0
+    ), f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
+
+    # FP8
+    max_dtype = torch.finfo(torch.float8_e4m3fn).max
+
+    original_shape = data_hp.shape
+    blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
+
+
+    assert block_size1 == block_size0
+    data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
+
+    # Permute to (BLK_M, BLK_N, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    data_hp = data_hp.permute(0, 2, 1, 3)
+    # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
+    data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
+
+    # Calculate max absolute value per block
+    max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
+    # Calculate descale factor
+    descale = max_abs / max_dtype
+    if USE_POW2_SCALE:
+        # Calculate exponent HW instruction: cvt.rp.satfinite.ue8m0x2.f32
+        exponent = torch.ceil(torch.log2(descale))
+        # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
+        exponent = torch.clamp(exponent, min=-127, max=127) + 127
+        # Convert to uint8 container
+        exponent = exponent.to(torch.uint8)
+        # Calculate descale_fp to apply to data_hp
+        descale_fp = torch.where(
+            # If exponent is 0, descale_fp is 1.0 rather than 2^127
+            exponent == 0,
+            1.0,
+            torch.exp2(127 - exponent.to(torch.float32)),
+        )
+    else:
+        descale_fp = max_dtype / max_abs
+        descale_fp = torch.where(
+            max_abs == 0, 1.0, descale_fp
+        )  # preserve the behavior for 0 amax case
+        descale_fp = torch.where(
+            descale_fp == torch.inf, torch.finfo(data_hp.dtype).max, descale_fp
+        )
+        exponent = torch.reciprocal(descale_fp)
+
+    # Scale and saturate cast the data elements to max of target dtype
+    data_lp = torch.clamp(data_hp * descale_fp, min=-1 * max_dtype, max=max_dtype)
+
+    fp_data = data_lp.to(torch.float8_e4m3fn)
+
+    # (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N) to (M, N)
+    fp_data = (
+        fp_data.reshape(blk_m, blk_n, block_size0, block_size1)
+        .permute(0, 2, 1, 3)
+        .reshape(original_shape)
+    )
+
+    # Convert to target format, but still in original precision container
+    return fp_data, exponent 
+
+def is_fp8_weight(name):
+    fp8_params = [
+        "q_proj.weight", 
+        "k_proj.weight", 
+        "v_proj.weight", 
+        "o_proj.weight", 
+        "down_proj.weight", 
+        "up_proj.weight", 
+        "gate_proj.weight",
+    ]
+    return any([param in name for param in fp8_params])
 
 def process_weights_after_loading(self, layer) -> None:
-
     from vllm.model_executor.parameter import (BlockQuantScaleParameter,
                                     ModelWeightParameter,
                                     PerTensorScaleParameter)
@@ -243,7 +319,6 @@ def per_token_group_quant_fp8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    pow2_scale = True
 
     if column_major_scales:
         _per_token_group_quant_fp8_colmajor[(M, )](
@@ -258,7 +333,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=pow2_scale,
+            pow2_scale=USE_POW2_SCALE,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -274,7 +349,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=pow2_scale,
+            pow2_scale=USE_POW2_SCALE,
             num_warps=num_warps,
             num_stages=num_stages,
         )
