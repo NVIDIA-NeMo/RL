@@ -147,7 +147,7 @@ class ClippedPGLossFn(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
@@ -333,7 +333,7 @@ class NLLLoss(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
@@ -481,7 +481,7 @@ class DPOLossFn(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
