@@ -5,14 +5,16 @@ from typing import Any, Literal, Optional
 
 from datasets import load_dataset
 
+from nemo_rl.data import processors
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class GPQADataset:
-    def __init__(self,
+    def __init__(
+        self,
         variant: Literal["diamond", "main"] = "diamond",
         prompt_file: Optional[str] = None,
-        system_prompt_file: Optional[str]=None,
+        system_prompt_file: Optional[str] = None,
     ):
         ds = load_dataset("Idavidrein/gpqa", f"gpqa_{variant}", split="train")
         self._rng = random.Random()
@@ -22,6 +24,7 @@ class GPQADataset:
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
+        self.processor = processors.multichoice_qa_processor
 
     def _rekey(self, data: dict[str, Any]):
         choices = [
