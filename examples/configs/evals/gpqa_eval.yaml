@@ -10,7 +10,7 @@ generation:
   temperature: 0.0
   top_p: 1.0
   top_k: -1 # -1 means disable
-  num_prompts_per_step: 16 # -1 means pass all prompts at once
+  num_prompts_per_step: -1 # -1 means pass all prompts at once
   model_name: "Qwen/Qwen2.5-7B-Instruct"
   stop_token_ids: null
   stop_strings: null

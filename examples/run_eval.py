@@ -155,6 +155,13 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
         data_processor_fn = math_data_processor
     elif dataset_name == "gpqa":
         base_dataset = gpqa.GPQADataset(
+            variant="main",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    elif dataset_name == "gpqa_diamond":
+        base_dataset = gpqa.GPQADataset(
+            variant="diamond",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
