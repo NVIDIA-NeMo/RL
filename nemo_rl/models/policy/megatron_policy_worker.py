@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, List, Tuple
 
 import ray
 import torch
@@ -510,9 +510,14 @@ class MegatronPolicyWorker:
         self._held_gather_buffer = None
         self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
 
+        # Create a map that maps any local parameter name to a list of global parameter names.
+        # This map is repeatedly used by parameter gatherring phase during refit of every step.
+        self.local_key_to_global_keys = self.get_local_key_to_global_keys(
+            state_dict_info = self.prepare_weights_for_ipc()
+        )
+
     def configure_worker(self, num_gpus: int, bundle_indices: Optional[tuple] = None):
         return None, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, None
-
 
     def is_alive(self):
         return True
@@ -1135,6 +1140,66 @@ class MegatronPolicyWorker:
         device_idx = torch.cuda.current_device()
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
+    
+    @torch.no_grad()
+    def get_local_key_to_global_keys(self, state_dict_info: List[Tuple[Any, int]]):
+        """ Get the local key to global keys mapping.
+        """
+        # Get parallel info
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_world_size = torch.distributed.get_world_size(tp_group)
+
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        pp_world_size = torch.distributed.get_world_size(pp_group)
+
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = torch.distributed.get_world_size(ep_group)
+        
+        # start calculating the global key
+        ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
+        state_dict = self.model.state_dict()
+        final_key_to_global_keys = {}
+
+        import time
+        st = time.time()
+            
+        for param_info, size in state_dict_info:
+            local_key, _, _ = param_info
+
+            # Step 1: create global key from local key
+            # if: for if a parameter is sharded along PP or EP; 
+            # else: not sharded (like embedding)
+            if local_key in state_dict:
+                global_key = get_global_key_from_local_key(local_key, self.model.config)
+            else:
+                global_key = None
+            
+            # Step 2: gather global keys from ranks in PP group
+            pp_gathered_objs = [None] * pp_world_size
+            torch.distributed.all_gather_object(
+                pp_gathered_objs, global_key, group=pp_group
+            )
+
+            # Step 3: gather global keys from ranks in EP group
+            if ep_pattern.search(local_key):
+                ep_gathered_objs = [None] * ep_world_size
+                torch.distributed.all_gather_object(
+                    ep_gathered_objs, pp_gathered_objs, group=ep_group
+                )
+                flat_gathered_objs = [x for y in ep_gathered_objs for x in y]
+            else:
+                flat_gathered_objs = pp_gathered_objs
+            
+            final_key_to_global_keys[local_key] = flat_gathered_objs
+
+        et = time.time()
+        if (
+            parallel_state.get_tensor_model_parallel_rank() == 0 and 
+            parallel_state.get_pipeline_model_parallel_rank() == 0 and 
+            parallel_state.get_expert_model_parallel_rank() == 0
+        ):
+            print("[Rank 0] ", f"Time taken to get local key to global keys: {et - st}")
+        return final_key_to_global_keys
 
     def prepare_weights_for_ipc(self):
         """Prepare Megatron model weights for IPC transfer to vLLM.
@@ -1267,6 +1332,7 @@ class MegatronPolicyWorker:
         gathered_megatron_params = gather_params(
             self.model,
             keys,
+            key_to_global_keys=self.local_key_to_global_keys,
         )
         gathered_hf_params = self.megatron_to_hf_converter.convert(
             gathered_megatron_params, self.model.config
@@ -1277,18 +1343,46 @@ class MegatronPolicyWorker:
         from torch.multiprocessing.reductions import reduce_tensor
 
         # Create IPC handles for each parameter
-        all_handles = []
+        
+        # pack tensors in gathered_hf_params to a big tensor
+        type_to_packed_big_tensor_size = defaultdict(lambda : 0)
+        key_to_type_and_offset_and_size_in_big_tensor = []
         for key, tensor in gathered_hf_params.items():
+            key_to_type_and_offset_and_size_in_big_tensor.append(
+                (
+                    key,
+                    tensor.shape,
+                    tensor.dtype, 
+                    type_to_packed_big_tensor_size[tensor.dtype], 
+                    tensor.numel()
+                )
+            )
+            type_to_packed_big_tensor_size[tensor.dtype] += tensor.numel()
+            
+        type_to_packed_big_tensor_size = {
+            k: torch.empty(v, device=tensor.device, dtype=k, requires_grad=False)
+            for k, v in type_to_packed_big_tensor_size.items()
+        }
+        for i, (key, tensor) in enumerate(gathered_hf_params.items()):
+            k, shape, dtype, offset, size = key_to_type_and_offset_and_size_in_big_tensor[i]
+            assert k == key
+            type_to_packed_big_tensor_size[dtype][offset:offset+size] = tensor.detach().view(-1)
+
+        all_handles = []
+        for dtype, tensor in type_to_packed_big_tensor_size.items():
             handle = reduce_tensor(tensor.detach())
-            all_handles.append((key, handle))
+            all_handles.append((dtype, handle))
 
         # Store references to avoid premature garbage collection
-        self._held_gather_buffer = gathered_hf_params
-        shapes = {}
-        for key, tensor in gathered_hf_params.items():
-            shapes[key] = tensor.shape
 
-        return {device_uuid: all_handles}
+        self._held_gather_buffer = type_to_packed_big_tensor_size
+        # shapes = {}
+        # for key, tensor in gathered_hf_params.items():
+        #     shapes[key] = tensor.shape
+        
+        serielized = (all_handles, key_to_type_and_offset_and_size_in_big_tensor)
+
+        return {device_uuid: serielized}
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

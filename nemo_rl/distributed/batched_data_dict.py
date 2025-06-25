@@ -431,7 +431,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 for shard_idx in range(shards):
                     sharded_micro_indices[shard_idx].append(chunk_sharded_micro_indices[shard_idx])
                     sharded_micro_lengths[shard_idx].append(chunk_sharded_micro_lengths[shard_idx])
-                    sharded_elem_counts_per_gb[shard_idx].append(chunk_sharded_micro_indices[shard_idx][-1][1])
+                    if chunk_sharded_micro_indices[shard_idx] == []:
+                        sharded_elem_counts_per_gb[shard_idx].append(0)
+                    else:
+                        sharded_elem_counts_per_gb[shard_idx].append(chunk_sharded_micro_indices[shard_idx][-1][1])
                     
             # flatten global_indices_per_shard
             batch_sorted_indices = []

@@ -41,22 +41,26 @@ class VllmInternalWorkerExtension:
         try:
             # Get handles for this device
             device_uuid = self.report_device_id()
-            handles = ipc_handles[device_uuid]
+            deserialized = ipc_handles[device_uuid]
             device_id = self.device.index
             weights = []
 
-            # Process each handle to get the tensor
-            for name, handle in handles:
-                func, args = handle
+            all_handles, key_to_type_and_offset_and_size_in_big_tensor = deserialized
+            type_to_packed_big_tensor_size = {}
+            for k, tensor_handle in all_handles:
+                func, args = tensor_handle
                 list_args = list(args)
-                # Update device ID to match the current device
                 list_args[6] = device_id
                 tensor = func(*list_args)
-                weights.append((name, tensor))
+                type_to_packed_big_tensor_size[k] = tensor
+            
+            for key, shape, type, offset, size in key_to_type_and_offset_and_size_in_big_tensor:
+                assert offset+size <= type_to_packed_big_tensor_size[type].numel()
+                tensor = type_to_packed_big_tensor_size[type][offset:offset+size].clone().reshape(shape)
+                weights.append((key, tensor))
 
             # Load weights into the model
             self.model_runner.model.load_weights(weights=weights)
-            torch.cuda.synchronize()
             return True
         except Exception as e:
             print(
