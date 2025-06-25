@@ -16,26 +16,15 @@ import argparse
 import os
 import pprint
 import sys
-from typing import Any, cast
-
-import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from examples.run_grpo_math import math_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.eval_datasets import (
-    aime2024,
-    gpqa,
-    math,
-    mmlu,
-    mmlu_pro,
-)
-from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
+from nemo_rl.data.eval_datasets import load_eval_dataset
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -43,6 +32,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.utils.config import load_config
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -63,129 +53,11 @@ def parse_args():
     return args, overrides
 
 
-def _construct_prompt(prompt: str, question: str, options: dict[str, str]) -> str:
-    """Construct prompt from question and options."""
-    output = prompt
-    output += f"\n\nQuestion: {question}\nOptions:\n"
-    output += "\n".join(
-        [
-            f"{letter}) {option}"
-            for letter, option in options.items()
-            if option is not None
-        ]
-    )
-    return output
-
-
-def multichoice_qa_processor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for multiple-choice problems."""
-    question = datum_dict["question"]
-    answer = str(datum_dict["answer"])
-    options = datum_dict["options"]
-    extra_env_info = {"ground_truth": answer}
-    if "subject" in datum_dict:
-        extra_env_info.update({"subject": datum_dict["subject"]})
-
-    message_log = []
-
-    # system prompt
-    if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(sys, return_tensors="pt")["input_ids"][0]
-        message_log.append(sys_prompt)
-
-    # user prompt
-    if task_data_spec.prompt:
-        problem = _construct_prompt(task_data_spec.prompt, question, options)
-    user_message = {"role": "user", "content": problem}
-    message = tokenizer.apply_chat_template(
-        [user_message],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
-
-    length = sum(len(m["token_ids"]) for m in message_log)
-    output: DatumSpec = {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": extra_env_info,
-        "loss_multiplier": 1.0,
-        "idx": idx,
-    }
-    if "task_name" in datum_dict:
-        output["task_name"] = datum_dict["task_name"]
-    return output
-
-
 def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     print("Setting up data...")
 
     # load dataset
-    dataset_name = data_config["dataset_name"]
-    data_processor_fn = multichoice_qa_processor
-    if dataset_name == "mmlu":
-        base_dataset = mmlu.MMLUDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name == "aime2024":
-        base_dataset = aime2024.AIME2024Dataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-        data_processor_fn = math_data_processor
-    elif dataset_name == "gpqa":
-        base_dataset = gpqa.GPQADataset(
-            variant="main",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name == "gpqa_diamond":
-        base_dataset = gpqa.GPQADataset(
-            variant="diamond",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name == "mmlu_pro":
-        base_dataset = mmlu_pro.MMLUProDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name == "math":
-        base_dataset = math.MathDataset(
-            variant="math_test",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-        data_processor_fn = math_data_processor
-    elif dataset_name == "math500":
-        base_dataset = math.MathDataset(
-            variant="math_500_test",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-        data_processor_fn = math_data_processor
-    else:
-        raise ValueError(f"Unknown dataset {dataset_name}.")
+    base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
     env = MathEnvironment.options(
@@ -200,7 +72,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
         default_task_data_spec=base_dataset.task_spec,
-        task_data_processors=data_processor_fn,
+        task_data_processors=base_dataset.processor,
         max_seq_length=data_config["max_input_seq_length"],
     )
 
@@ -217,7 +89,7 @@ def main():
             os.path.dirname(__file__), "configs", "evals", "eval.yaml"
         )
 
-    config = OmegaConf.load(args.config)
+    config = load_config(args.config)
     print(f"Loaded configuration from: {args.config}")
 
     if overrides:

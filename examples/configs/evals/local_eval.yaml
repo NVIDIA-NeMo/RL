@@ -1,0 +1,14 @@
+# Evaluation Configuration from local files.
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+
+data:
+  prompt_file: "examples/prompts/cot.txt"
+  dataset_name: "local"
+  problem_key: "Question"
+  solution_key: "Answer"
+  split: "train"
+  data_paths: "https:\/\/openaipublic.blob.core.windows.net\/simple-evals\/math_500_test.csv"
+  file_format: "csv"
