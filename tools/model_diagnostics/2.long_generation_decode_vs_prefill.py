@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import torch
 import argparse
+
+import torch
 from vllm import LLM, SamplingParams
 
 
@@ -29,7 +30,6 @@ def calculate_error(a, b):
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", type=str, nargs="?", default="nvidia/Nemotron-H-8B-Base-8K"
@@ -74,7 +74,6 @@ def main():
     outputs = llm.generate(prompts * num_batches, sampling_params)
 
     for i, output in enumerate(outputs):
-
         sequence = output.prompt_token_ids + list(output.outputs[0].token_ids)
         prompt_logprobs = extract_logprobs(output.prompt_logprobs)
         logprobs = extract_logprobs(output.outputs[0].logprobs)
@@ -94,9 +93,7 @@ def main():
         print(
             f"Processed sequence length {len(sequence)} with lp error {lp_error} and max abs error {max_abs_error}"
         )
-        assert (
-            lp_error < 1.05
-        ), f"lp error is higher than expected (1.0636): {lp_error}"
+        assert lp_error < 1.05, f"lp error is higher than expected (1.0636): {lp_error}"
 
     print(f"[{args.model}] ALL GOOD!")
 
