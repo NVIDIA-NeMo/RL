@@ -320,7 +320,7 @@ class FSDP1PolicyWorker:
 
                     input_lengths = mb["input_lengths"]
                     batch_size, seq_len = input_ids.shape
-                    attention_mask = torch.ones(
+                    attention_mask = torch.zeros(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
