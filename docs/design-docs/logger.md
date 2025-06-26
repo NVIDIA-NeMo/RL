@@ -1,8 +1,10 @@
 # Logger
 
-## Requirements:
+The logger is designed to track key training metrics (including distributed metrics with reductions and timing), as well as providing integration with logging backends like WandB and Tensorboard.
 
-* Tracking distributed metrics with specified reductions (mean, max, etc)
+## Requirements
+
+* Tracking distributed metrics with specified reductions (mean, max, etc.)
 * Tracking distributed timing with (usually) 'max' reduction across ranks
 * Logging:
    * WandB
@@ -29,7 +31,7 @@ class LoggerInterface(ABC):
         pass
 ```
 
-A {py:class}`Logger <nemo_rl.utils.logger.Logger>` wrapper class will also implement {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` and will contain a list of loggers it delegates to when writing logs. This will be the main class the user uses in the training loop. Usage example:
+A {py:class}`Logger <nemo_rl.utils.logger.Logger>` wrapper class will also implement {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` and maintain a list of loggers to which it delegates writing logs. This will be the main class the user uses in the training loop. Usage example:
 
 ```python
 # Initialize logger with both wandb and tensorboard enabled
@@ -57,7 +59,7 @@ logger.log_metrics({
 
 ## Validation Pretty Logging
 
-The logger supports pretty-formatted logging of validation samples to help visualize model outputs during training. This feature is controlled by the `num_val_samples_to_print` configuration parameter:
+The logger supports pretty-formatted logging of validation samples to help visualize model outputs during training. This feature is controlled by the `num_val_samples_to_print` configuration parameter.
 
 ```python
 logger:
@@ -68,9 +70,9 @@ logger:
 
 When `num_val_samples_to_print` is set to a value greater than 0, the logger will generate well-formatted text outputs for the specified number of validation samples. This is particularly useful for:
 
-1. Quickly inspecting model generation quality during training
-2. Comparing inputs and outputs side-by-side
-3. Tracking validation sample performance over time
+1. Quickly inspecting model generation quality during training.
+2. Comparing inputs and outputs side-by-side.
+3. Tracking validation sample performance over time.
 
 ### Example Output
 
@@ -80,11 +82,11 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ## GPU Metric Logging
 
-NeMo-RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo-RL directly polls GPU memory and utilization data and logs them to TensorBoard and/or Weights & Biases.
+NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard and/or WandB.
 
-This approach allows us to offer the same GPU metric tracking on all loggers (not just wandb) and simplifies the implementation greatly.
+This approach allows us to offer the same GPU metric tracking on all loggers (not just Wandb) and simplifies the implementation greatly.
 
-This feature is enabled with the `monitor_gpus` configuration parameter and the frequency of collection and flushing to the loggers is controlled by `gpu_collection_interval` and `gpu_flush_interval` (both in seconds), respectively:
+This feature is enabled with the `monitor_gpus` configuration parameter. The frequency of data collection and flushing to the loggers is controlled by the `gpu_collection_interval` and `gpu_flush_interval` parameters, both specified in seconds.
 
 ```python
 logger:
@@ -97,12 +99,12 @@ logger:
 ```
 
 :::{note}
-While monitoring through the remote workers is possible, it requires some delicate implementation details to make sure:
-* sending logs back to driver does not incur a large overhead
-* metrics are easily interpretable since we may be double counting due to colocated workers
-* workers gracefully flush their logs in the event of failure
-* the logging is the same for tensorboard and wandb
-* some workers which spawn other workers correctly report the total usage of the grandchild worker
+While it is feasible to monitor using remote workers, the implementation requires careful attention to details to ensure:
+* Logs sent back to the driver do not introduce significant overhead.
+* Metrics remain clear and interpretable, avoiding issues like double counting caused by colocated workers.
+* Workers can gracefully flush their logs in case of failure.
+* Logging behaves consistently across TensorBoard and Wandb.
+* Workers that spawn other workers accurately report the total resource usage of any grandchild workers.
 
-These reasons lead us to the simple implementation of collecting on the driver
+Due to these complexities, we opted for a simpler approach: collecting metrics exposed by the Ray metrics server from the driver.
 :::

@@ -28,10 +28,8 @@ CONTAINER=${CONTAINER}
 
 export HF_HOME=${HF_HOME:-$(realpath $SCRIPT_DIR/../hf_home)}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$(realpath $SCRIPT_DIR/../hf_datasets_cache)}
-export UV_CACHE_DIR=${UV_CACHE_DIR:-$(realpath $SCRIPT_DIR/../uv_cache)}
 mkdir -p $HF_HOME
 mkdir -p $HF_DATASETS_CACHE
-mkdir -p $UV_CACHE_DIR
 
 # Check if running in GitLab CI
 INTERACTIVE_FLAG=""
@@ -52,12 +50,10 @@ docker run -u root $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864
   -v "$PROJECT_ROOT:$PROJECT_ROOT" \
   -v $HF_HOME:/hf_home \
   -v $HF_DATASETS_CACHE:/hf_datasets_cache \
-  -v $UV_CACHE_DIR:/uv_cache \
   -e WANDB_API_KEY \
   -e HF_TOKEN \
   -e HF_HOME=/hf_home \
   -e HF_DATASETS_CACHE=/hf_datasets_cache \
-  -e UV_CACHE_DIR=/uv_cache \
   -e HOME=/tmp/ \
   -w $SCRIPT_DIR \
   "$CONTAINER" -- \

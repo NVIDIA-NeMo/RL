@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Protocol, Tuple
+import enum
+from typing import Any, Protocol
 
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+class LossType(enum.Enum):
+    TOKEN_LEVEL = "token_level"
+    SEQUENCE_LEVEL = "sequence_level"
 
 
 class LossFunction(Protocol):
@@ -26,9 +32,15 @@ class LossFunction(Protocol):
     model logprobs and other data contained in a BatchedDataDict.
     """
 
+    loss_type: LossType
+
     def __call__(
-        self, next_token_logits: torch.Tensor, data: BatchedDataDict
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute loss and metrics from logprobs and other data.
 
         Args:
@@ -40,6 +52,14 @@ class LossFunction(Protocol):
             data: Dictionary containing all relevant data for loss computation
                   such as rewards, values, actions, advantages, masks, and other
                   algorithm-specific information needed for the particular loss calculation.
+            global_valid_seqs: torch.Tensor
+                this tensor should contain the number of valid sequences in the microbatch.
+                It's used for global normalization for losses/metrics that are computed at the sequence level
+                and needs to be aggregated across all microbatches.
+            global_valid_toks: torch.Tensor
+                This tensor should contain the number of valid tokens in the microbatch.
+                It's used for global normalization for losses/metrics that are computed at the token level
+                and needs to be aggregated across all microbatches.
 
         Returns:
             tuple: (loss, metrics)

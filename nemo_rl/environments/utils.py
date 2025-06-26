@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, List
+from typing import Any
 
 
-def chunk_list_to_workers(to_chunk: List[Any], num_workers: int) -> List[List[Any]]:
+def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[Any]]:
     """Chunk a list into a list of lists, where each sublist is assigned to a worker. Keeps ordering of elements.
 
     If the list is not divisible by the number of workers, the last worker may have fewer elements.

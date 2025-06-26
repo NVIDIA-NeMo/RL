@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Dict, List
+from typing import Any, Optional, cast
 
 import torch
 from datasets import Dataset
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
     FlatMessagesType,
@@ -23,6 +24,9 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+Tensor = torch.Tensor
+TokenizerType = PreTrainedTokenizerBase
 
 
 def message_log_to_flat_messages(
@@ -58,13 +62,13 @@ def message_log_to_flat_messages(
     tensor([1, 2, 3, 4, 5, 6, 7])
     ```
     """
-    result = {}
+    result: dict[str, list[Any]] = {}
 
     if len(message_log) == 0:
-        return result
+        return cast(FlatMessagesType, result)
 
     # Get all unique keys across all messages
-    all_keys = set()
+    all_keys: set[str] = set()
     for msg in message_log:
         all_keys.update(msg.keys())
 
@@ -79,26 +83,28 @@ def message_log_to_flat_messages(
                 result[key].append(msg[key])
 
     # Concatenate tensors for each key
+    concat: FlatMessagesType = {}
     for key in result:
-        if result[key] and isinstance(result[key][0], torch.Tensor):
+        if result[key] and isinstance(result[key][0], Tensor):
             try:
-                result[key] = torch.cat(result[key])
+                concat[key] = torch.cat(result[key])
             except RuntimeError as e:
                 if "same number of dimensions" in str(e):
                     raise RuntimeError(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-
-    return result
+    output: FlatMessagesType = {**result, **concat}
+    return output
 
 
 def get_keys_from_message_log(
-    message_log: LLMMessageLogType, keys: List[str]
+    message_log: LLMMessageLogType, keys: list[str]
 ) -> LLMMessageLogType:
     """Return a new LLMMessageLogType containing only the specified keys from each message.
 
     Args:
+        message_log: Original message log to extract keys from
         keys: List of keys to keep in each message
 
     Returns:
@@ -108,44 +114,48 @@ def get_keys_from_message_log(
 
 
 def add_loss_mask_to_message_log(
-    message_log: LLMMessageLogType,
-    roles_to_train_on: List[str] = ["assistant"],
+    batch_message_log: list[LLMMessageLogType],
+    roles_to_train_on: list[str] = ["assistant"],
     only_unmask_final: bool = False,
 ) -> None:
     """Add token-level loss masks to each message in a message log.
 
     Args:
         message_log (LLMMessageLogType): List of message dictionaries containing token IDs and metadata
-        roles_to_train_on (List[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
+        roles_to_train_on (list[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
         only_unmask_final (bool): If True, only unmask the final message in the log. Default: False
     """
     for i, role in enumerate(roles_to_train_on):
         roles_to_train_on[i] = role.lower()
 
-    for message in message_log:
-        for i, sentence in enumerate(message):
+    for message_log in batch_message_log:
+        for i, message in enumerate(message_log):
             if only_unmask_final:
-                if i == len(message) - 1:
-                    sentence["token_loss_mask"] = torch.ones_like(sentence["token_ids"])
+                if i == len(message_log) - 1:
+                    message["token_loss_mask"] = torch.ones_like(
+                        cast(Tensor, message["token_ids"])
+                    )
                 else:
-                    sentence["token_loss_mask"] = torch.zeros_like(
-                        sentence["token_ids"]
+                    message["token_loss_mask"] = torch.zeros_like(
+                        cast(Tensor, message["token_ids"])
                     )
             else:
-                if sentence["role"] in roles_to_train_on:
-                    sentence["token_loss_mask"] = torch.ones_like(sentence["token_ids"])
+                if message["role"] in roles_to_train_on:
+                    message["token_loss_mask"] = torch.ones_like(
+                        cast(Tensor, message["token_ids"])
+                    )
                 else:
-                    sentence["token_loss_mask"] = torch.zeros_like(
-                        sentence["token_ids"]
+                    message["token_loss_mask"] = torch.zeros_like(
+                        cast(Tensor, message["token_ids"])
                     )
 
 
 def _pad_tensor(
-    tensor: torch.Tensor,
+    tensor: Tensor,
     max_len: int,
     pad_side: str,
     pad_value: int = 0,
-) -> torch.Tensor:
+) -> Tensor:
     """Pad a tensor to the specified length.
 
     Args:
@@ -172,7 +182,7 @@ def _pad_tensor(
     )
 
 
-def _validate_tensor_consistency(tensors: List[torch.Tensor]) -> None:
+def _validate_tensor_consistency(tensors: list[Tensor]) -> None:
     """Validate that all tensors have consistent dtypes and devices.
 
     Args:
@@ -196,10 +206,10 @@ def _validate_tensor_consistency(tensors: List[torch.Tensor]) -> None:
 
 
 def batched_message_log_to_flat_message(
-    message_log_batch: List[LLMMessageLogType],
-    pad_value_dict: Dict[str, int] = None,
+    message_log_batch: list[LLMMessageLogType],
+    pad_value_dict: Optional[dict[str, int]] = None,
     make_sequence_length_divisible_by: int = 1,
-) -> tuple[BatchedDataDict[FlatMessagesType], torch.Tensor]:
+) -> tuple[BatchedDataDict[FlatMessagesType], Tensor]:
     """Process and pad a batch of message logs for model input.
 
     For each message log in the batch:
@@ -268,7 +278,7 @@ def batched_message_log_to_flat_message(
     tensor_keys = []
     for seq in sequenced_lists:
         for key, value in seq.items():
-            if isinstance(value, torch.Tensor):
+            if isinstance(value, Tensor):
                 tensor_keys.append(key)
                 max_len = max(max_len, value.size(0))
 
@@ -279,7 +289,7 @@ def batched_message_log_to_flat_message(
 
     # Handle non-tensor case
     if not tensor_keys:
-        result = BatchedDataDict(
+        result: BatchedDataDict[FlatMessagesType] = BatchedDataDict(
             {
                 k: [seq[k][0] if k in seq else None for seq in sequenced_lists]
                 for k in all_keys
@@ -294,7 +304,7 @@ def batched_message_log_to_flat_message(
         # Use maximum here since there may be keys that aren't populated for all messages yet.
         # For example, logprobs don't get populated for non-generated tokens until post-processing.
         seq_len = max(
-            (v.size(0) for v in seq.values() if isinstance(v, torch.Tensor)), default=0
+            (v.size(0) for v in seq.values() if isinstance(v, Tensor)), default=0
         )
         input_lengths.append(seq_len)
     input_lengths_tensor = torch.tensor(input_lengths, dtype=torch.int32)
@@ -303,18 +313,19 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-        if not values or not isinstance(values[0], torch.Tensor):
+        if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
 
         # Filter out None values and validate consistency
-        tensors = [t for t in values if t is not None]
+        values: list[Tensor | None] = cast(list[Tensor | None], values)
+        tensors = cast(list[Tensor], [t for t in values if t is not None])
         _validate_tensor_consistency(tensors)
 
         # Create zero tensors for None values
-        values = [
+        filled_values: list[Tensor] = [
             (
-                torch.zeros(0, dtype=tensors[0].dtype, device=tensors[0].device)
+                torch.zeros(0, dtype=tensors[0].dtype, device=tensors[0].device)  # type: ignore
                 if v is None
                 else v
             )
@@ -323,13 +334,13 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in values]
+        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
 
 
-def message_log_shape(message_log: LLMMessageLogType) -> List[Dict[str, List[int]]]:
+def message_log_shape(message_log: LLMMessageLogType) -> list[dict[str, torch.Size]]:
     """Get the shape of the tensors in the message log.
 
     This utility function examines each message in the message log and reports
@@ -345,15 +356,15 @@ def message_log_shape(message_log: LLMMessageLogType) -> List[Dict[str, List[int
     for message in message_log:
         shape = {}
         for k in message.keys():
-            if isinstance(message[k], torch.Tensor):
-                shape[k] = message[k].shape
+            if isinstance(message[k], Tensor):
+                shape[k] = message[k].shape  # type: ignore # we know it's a tensor
             elif isinstance(message[k], list):
-                shape[k] = [message_log_shape(v) for v in message[k]]
+                shape[k] = [message_log_shape(v) for v in message[k]]  # type: ignore
         shapes.append(shape)
     return shapes
 
 
-def get_first_index_that_differs(str1, str2):
+def get_first_index_that_differs(str1: str, str2: str) -> int:
     """Get the first index that differs between two strings."""
     for i, (c1, c2) in enumerate(zip(str1, str2)):
         if c1 != c2:
@@ -363,10 +374,11 @@ def get_first_index_that_differs(str1, str2):
 
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
-    tokenizer,
+    tokenizer: TokenizerType,
     task_data_spec: TaskDataSpec,
     add_bos_token: bool = True,
     add_eos_token: bool = True,
+    add_generation_prompt: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -374,23 +386,39 @@ def get_formatted_message_log(
         message_log: List of message dicts with 'role' and 'content' keys
         tokenizer: Tokenizer for converting text to token IDs
         task_data_spec: Task spec for this dataset.
+        add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
+        add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
+        add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
 
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
-    new_message_log = []
+    new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
+    message_log_strs: list[dict[str, str]] = cast(
+        list[dict[str, str]], message_log
+    )  # we just use the str:str parts here
 
-    for i, message in enumerate(message_log):
-        formatted_message = tokenizer.apply_chat_template(
-            message_log[: i + 1],
-            add_generation_prompt=False,
+    if task_data_spec.prompt:
+        message_log_strs = [
+            {
+                "role": "user",
+                "content": task_data_spec.prompt.format(message_log_strs[0]["content"]),
+            }
+        ] + message_log_strs[1:]
+
+    for i, message in enumerate(message_log_strs):
+        # If enabled, add_generation_prompt is only used on user messages to include
+        # the assistant's generation prompt as part of the user message.
+        formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
+            message_log_strs[: i + 1],
+            add_generation_prompt=add_generation_prompt and message["role"] == "user",
             tokenize=False,
             add_special_tokens=False,
         )
 
         ## get the length of the previous message, excluding the eos token (if present)
-        prev_message_len_no_eos = get_first_index_that_differs(
+        prev_message_len_no_eos: int = get_first_index_that_differs(
             prev_formatted_message,
             formatted_message,
         )
@@ -407,7 +435,7 @@ def get_formatted_message_log(
                 elif not message_chunk.startswith(tokenizer.bos_token):
                     message_chunk = tokenizer.bos_token + message_chunk
 
-        if i == len(message_log) - 1:
+        if i == len(message_log_strs) - 1:
             message_chunk = message_chunk.rstrip("\n")
             if add_eos_token:
                 if tokenizer.eos_token is None:
@@ -425,7 +453,7 @@ def get_formatted_message_log(
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
             # which causes `_validate_tensor_consistency` to fail. To fix this, we convert the
             # empty tensor to int64.
-            new_message["token_ids"] = new_message["token_ids"].to(torch.int64)
+            new_message["token_ids"] = new_message["token_ids"].to(torch.int64)  # type: ignore
 
         new_message["content"] = message_chunk
         new_message_log.append(new_message)
@@ -437,7 +465,7 @@ def get_formatted_message_log(
 
 def remap_dataset_keys(
     dataset: Dataset,
-    mapping_dict: Dict[str, str],
+    mapping_dict: dict[str, str],
 ) -> Dataset:
     """Remap dataset keys as per mapping.
 

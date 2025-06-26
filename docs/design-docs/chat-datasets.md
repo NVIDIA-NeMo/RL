@@ -1,8 +1,10 @@
 # Data Format
 
-## HuggingFace Chat Datasets
+This guide outlines the required data format for Hugging Face chat datasets and demonstrates how to use chat templates with Hugging Face tokenizers to add special tokens or task-specific information.
 
-HuggingFace chat datasets are expected to have the following structure: Each example in the dataset should be a dictionary with a `messages` key. `messages` should be a list of dictionaries, each with a `role` and `content` key. `role` is typically one of `system`, `user`, and `assistant`. For example:
+## Hugging Face Chat Datasets
+
+Hugging Face chat datasets are expected to have the following structure: Each example in the dataset should be a dictionary with a `messages` key. The `messages` should be a list of dictionaries, each with a `role` and `content` key. The `role` typically has one of the following values: `system`, `user`, and `assistant`. For example:
 
 ```json
 {
@@ -23,9 +25,9 @@ HuggingFace chat datasets are expected to have the following structure: Each exa
 }
 ```
 
-### Chat Templates
+## Chat Templates
 
-Formatting the data in this way allows us to take advantage of HuggingFace tokenizers' `apply_chat_template` functionality to combine the messages. Chat templates can be used to add special tokens or task-specific information to each example in the dataset. Refer to the [HuggingFace apply_chat_template documentation](https://huggingface.co/docs/transformers/main/en/chat_templating#applychattemplate) for details.
+Formatting the data in this way allows us to take advantage of the Hugging Face tokenizers' `apply_chat_template` functionality to combine the messages. Chat templates can be used to add special tokens or task-specific information to each example in the dataset. Refer to the [HuggingFace apply_chat_template documentation](https://huggingface.co/docs/transformers/main/en/chat_templating#applychattemplate) for details.
 
 By default, `apply_chat_template` attempts to apply the `chat_template` associated with the tokenizer. However, in some cases, users might want to specify their own chat template. Also, note that many tokenizers do not have associated `chat_template`s, in which case an explicit chat template is required. Users can specify an explicit chat template string using Jinja format and can pass that string to `apply_chat_template`. 
 The following is an example using a simple template which prepends a role header to each turn:
@@ -58,4 +60,4 @@ assert output == expected_output
 :hide:
 ```
 
-For more details on creating chat templates, refer to the [HuggingFace documentation](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template).
+For more details on creating chat templates, refer to the [Hugging Face documentation](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template).

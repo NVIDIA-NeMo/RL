@@ -1,4 +1,4 @@
-# Direct Preference Optimization in NeMo-RL
+# Direct Preference Optimization in NeMo RL
 
 [Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290) is an RL-free alignment algorithm that operates on preference data. Given a prompt and a pair of chosen and rejected responses, DPO aims
 to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the
@@ -16,7 +16,7 @@ If not specified, `config` will default to [examples/configs/dpo.yaml](../../exa
 
 ## Configuration
 
-NeMo-RL allows users to configure DPO experiments using `yaml` config files. An example DPO configuration file can be found [here](../../examples/configs/dpo.yaml).
+NeMo RL allows users to configure DPO experiments using `yaml` config files. An example DPO configuration file can be found [here](../../examples/configs/dpo.yaml).
 
 To override a value in the config, either update the value in the `yaml` file directly, or pass the override via the command line. For example:
 
@@ -32,7 +32,7 @@ uv run examples/run_dpo.py \
 
 ## Datasets
 
-Each class representing a NeMo-RL DPO dataset is expected to have the following attributes:
+Each class representing a NeMo RL DPO dataset is expected to have the following attributes:
 1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
@@ -158,7 +158,7 @@ First train example rejected response: 5
 
 ## DPO-Specific Parameters
 
-The DPO implementation in NeMo-RL supports several key parameters that can be adjusted:
+The DPO implementation in NeMo RL supports several key parameters that can be adjusted:
 
 - `dpo.reference_policy_kl_penalty`: Controls the strength of the KL penalty term
 - `dpo.preference_loss_weight`: Weight for the preference loss
@@ -167,3 +167,7 @@ The DPO implementation in NeMo-RL supports several key parameters that can be ad
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
+
+## Evaluate the Trained Model
+
+Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.

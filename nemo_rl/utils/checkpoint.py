@@ -22,11 +22,13 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Optional, TypedDict, Union
 
 import numpy as np
 import torch
 import yaml
+
+PathLike = Union[str, "os.PathLike[Any]"]
 
 
 class CheckpointingConfig(TypedDict):
@@ -34,16 +36,17 @@ class CheckpointingConfig(TypedDict):
 
     Attributes:
     enabled (bool): Whether checkpointing is enabled.
-    checkpoint_dir (os.PathLike): Directory where checkpoints will be saved.
+    checkpoint_dir (PathLike): Directory where checkpoints will be saved.
     metric_name (str): Name of the metric to use for determining best checkpoints.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
     """
 
     enabled: bool
-    checkpoint_dir: os.PathLike
+    checkpoint_dir: PathLike
     metric_name: str
     higher_is_better: bool
+    save_period: int
     keep_top_k: Optional[int]
 
 
@@ -82,9 +85,9 @@ class CheckpointManager:
     def init_tmp_checkpoint(
         self,
         step: int,
-        training_info: Dict[str, Any],
-        run_config: Optional[Dict[str, Any]] = None,
-    ) -> os.PathLike:
+        training_info: dict[str, Any],
+        run_config: Optional[dict[str, Any]] = None,
+    ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
         Creates a temporary directory for a new checkpoint and saves training info
@@ -95,11 +98,11 @@ class CheckpointManager:
 
         Args:
             step (int): The training step number.
-            training_info (Dict[str, Any]): Dictionary containing training metrics and info.
-            run_config (Optional[Dict[str, Any]]): Optional configuration for the training run.
+            training_info (dict[str, Any]): Dictionary containing training metrics and info.
+            run_config (Optional[dict[str, Any]]): Optional configuration for the training run.
 
         Returns:
-            os.PathLike: Path to the temporary checkpoint directory.
+            PathLike: Path to the temporary checkpoint directory.
         """
         # create new step_{step} directory
         save_dir = self.checkpoint_dir / f"tmp_step_{step}"
@@ -120,7 +123,7 @@ class CheckpointManager:
 
         return Path(os.path.abspath(save_dir))
 
-    def finalize_checkpoint(self, checkpoint_path: os.PathLike) -> None:
+    def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Complete a checkpoint by moving it from temporary to permanent location.
 
         If a checkpoint at the target location already exists (i.e when resuming training),
@@ -128,7 +131,7 @@ class CheckpointManager:
         Also triggers cleanup of old checkpoints based on the keep_top_k setting.
 
         Args:
-            checkpoint_path (os.PathLike): Path to the temporary checkpoint directory.
+            checkpoint_path (PathLike): Path to the temporary checkpoint directory.
         """
         # rename tmp_step_{step} to step_{step}
         checkpoint_path = Path(checkpoint_path)
@@ -213,13 +216,13 @@ class CheckpointManager:
         )
         return str(checkpoint_history[0][1])
 
-    def get_latest_checkpoint_path(self) -> str:
+    def get_latest_checkpoint_path(self) -> Optional[str]:
         """Get the path to the latest checkpoint.
 
         Returns the path to the checkpoint with the highest step number.
 
         Returns:
-            str: Path to the latest checkpoint, or None if no checkpoints exist.
+            Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
         step_dirs = glob.glob(str(self.checkpoint_dir / "step_*"))
@@ -229,16 +232,16 @@ class CheckpointManager:
         return str(step_dirs[-1])
 
     def load_training_info(
-        self, checkpoint_path: Optional[os.PathLike] = None
-    ) -> Dict[str, Any]:
+        self, checkpoint_path: Optional[PathLike] = None
+    ) -> Optional[dict[str, Any]]:
         """Load the training info from a checkpoint.
 
         Args:
-            checkpoint_path (Optional[os.PathLike]): Path to the checkpoint. If None,
+            checkpoint_path (Optional[PathLike]): Path to the checkpoint. If None,
                 returns None.
 
         Returns:
-            Dict[str, Any]: Dictionary containing the training info, or None if
+            Optional[dict[str, Any]]: Dictionary containing the training info, or None if
                 checkpoint_path is None.
         """
         if checkpoint_path is None:
@@ -249,17 +252,17 @@ class CheckpointManager:
 
 def _load_checkpoint_history(
     checkpoint_dir: Path,
-) -> List[Tuple[int, os.PathLike, Dict[str, Any]]]:
+) -> list[tuple[int, PathLike, dict[str, Any]]]:
     """Load the history of checkpoints and their metrics.
 
     Args:
         checkpoint_dir (Path): Directory containing the checkpoints.
 
     Returns:
-        List[Tuple[int, os.PathLike, Dict[str, Any]]]: List of tuples containing
+        list[tuple[int, PathLike, dict[str, Any]]]: List of tuples containing
             (step_number, checkpoint_path, info) for each checkpoint.
     """
-    checkpoint_history: List[Tuple[int, os.PathLike, Dict[str, Any]]] = []
+    checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
 
     # Find all step directories
     step_dirs = glob.glob(str(checkpoint_dir / "step_*"))
@@ -268,7 +271,7 @@ def _load_checkpoint_history(
         info_file = Path(step_dir) / "training_info.json"
         if info_file.exists():
             with open(info_file) as f:
-                info = json.load(f)
+                info: dict[str, Any] = json.load(f)
                 step = int(Path(step_dir).name.split("_")[1])
                 checkpoint_history.append((step, step_dir, info))
 

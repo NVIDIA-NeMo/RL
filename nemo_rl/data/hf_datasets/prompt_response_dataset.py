@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
@@ -43,7 +45,9 @@ class PromptResponseDataset:
             "json_dataset",
         )
 
-    def add_messages_key(self, example):
+    def add_messages_key(
+        self, example: dict[str, Any]
+    ) -> dict[str, list[dict[str, Any]]]:
         return {
             "messages": [
                 {"role": "user", "content": example[self.input_key]},

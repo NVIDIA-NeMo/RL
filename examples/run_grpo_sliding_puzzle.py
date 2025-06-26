@@ -17,7 +17,7 @@ import itertools
 import os
 import pprint
 import random
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Iterator
 
 from omegaconf import OmegaConf
 from torch.utils.data import IterableDataset
@@ -33,9 +33,11 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
-from nemo_rl.models.generation.interfaces import configure_generation_config
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
+
+OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args():
@@ -58,7 +60,7 @@ def generate_puzzle_datum(
 ) -> DatumSpec:
     """Generates a single sliding puzzle datum (prompt and metadata)."""
 
-    def generate_random_config(max_config: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_random_config(max_config: dict[str, Any]) -> dict[str, Any]:
         """Generate a random config for the sliding puzzle game."""
         shuffle_moves = random.randint(1, max_config.get("shuffle_moves"))
         if shuffle_moves % 2 == 0:
@@ -148,12 +150,12 @@ class IterablePuzzleDataset(IterableDataset):
 
 def setup_puzzle_data(
     tokenizer: AutoTokenizer,
-    env_cfg: Dict[str, Any],
+    env_cfg: dict[str, Any],
     task_name: str,
     length: int,
     val_length: int,
     add_system_prompt: bool,
-) -> Tuple[IterableDataset, IterableDataset | None, Dict, Dict]:
+) -> tuple[IterableDataset, IterableDataset | None, dict, dict]:
     """Sets up the iterable data generator and env map for the sliding puzzle task."""
     print("Setting up Sliding Puzzle iterable data and environment...")
     env_config = env_cfg[task_name]

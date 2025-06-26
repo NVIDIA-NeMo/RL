@@ -41,10 +41,10 @@ class ModelState(Stateful):
         model: The PyTorch model to track.
     """
 
-    def __init__(self, model):
+    def __init__(self, model: torch.nn.Module):
         self.model = model
 
-    def state_dict(self):
+    def state_dict(self) -> dict[str, Any]:
         """Get the model's state dictionary.
 
         Returns:
@@ -59,7 +59,7 @@ class ModelState(Stateful):
         )
         return model_state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load the state dictionary into the model.
 
         Args:
@@ -84,12 +84,17 @@ class OptimizerState(Stateful):
         scheduler: Optional learning rate scheduler.
     """
 
-    def __init__(self, model, optimizer, scheduler=None):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any] = None,
+    ):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-    def state_dict(self):
+    def state_dict(self) -> dict[str, Any]:
         """Get the optimizer and scheduler state dictionaries.
 
         Returns:
@@ -112,7 +117,7 @@ class OptimizerState(Stateful):
 
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load the state dictionaries into the optimizer and scheduler.
 
         Args:
@@ -126,12 +131,12 @@ class OptimizerState(Stateful):
         )
 
         ## load the scheduler state if it exists
-        if "sched" in state_dict:
+        if "sched" in state_dict and self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["sched"])
 
 
 def save_checkpoint(
-    model,
+    model: torch.nn.Module,
     weights_path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
@@ -168,7 +173,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model,
+    model: torch.nn.Module,
     weights_path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
@@ -203,7 +208,7 @@ def convert_dcp_to_hf(
     model_name_or_path: str,
     tokenizer_name_or_path: str,
     overwrite: bool = False,
-):
+) -> str:
     """Convert a Torch DCP checkpoint to a Hugging Face checkpoint.
 
     This is not an optimized utility. If checkpoint is too large, consider saving DCP during training
@@ -243,7 +248,7 @@ def convert_dcp_to_hf(
     config.save_pretrained(hf_ckpt_path)
 
     # TODO: After the following PR gets merged:
-    # https://github.com/NVIDIA/nemo-rl/pull/148/files
+    # https://github.com/NVIDIA/NeMo-RL/pull/148/files
     # tokenizer should be copied from policy/tokenizer/* instead of relying on the model name
     # We can expose a arg at the top level --tokenizer_path to plumb that through.
     # This is more stable than relying on the current NeMo-RL get_tokenizer() which can

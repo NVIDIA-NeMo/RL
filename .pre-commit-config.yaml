@@ -17,3 +17,21 @@ repos:
     - id: ruff
       args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: no-underscore-md
+        name: "Disallow '_' in Markdown filenames"
+        language: system
+        entry: |
+          bash -c '
+            # Report the offending files
+            echo "[pre-commit] ERROR: Found Markdown files with underscores:" >&2
+            for file in "$@"; do
+              echo "  - $file (use hyphens instead)" >&2
+            done
+            exit 1
+          '
+        files: '.*\/[^\/]*_[^\/]*\.md$'
+        exclude: '^\.github/'
+        types: [file]

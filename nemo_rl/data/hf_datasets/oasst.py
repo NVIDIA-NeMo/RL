@@ -25,7 +25,7 @@ from nemo_rl.data.interfaces import TaskDataSpec
 SYSTEM_PROMPT = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n"
 
 
-def parse_conversations(tree_obj, first=False):
+def parse_conversations(tree_obj, first: bool = False):
     """Recusive function that returns all the sub converstaions in a list starting from node tree_obj.
 
     Args:
@@ -86,7 +86,11 @@ def get_data_records(objs):
     return output
 
 
-def download_and_process_oasst(output_directory=".", seed=42, split_ratio=0.95):
+def download_and_process_oasst(
+    output_directory: str = ".",
+    seed: int = 42,
+    split_ratio: float = 0.95,
+) -> dict[str, list]:
     os.makedirs(output_directory, exist_ok=True)
     filename = f"{output_directory}/2023-04-12_oasst_all.trees.jsonl.gz"
 
@@ -119,7 +123,7 @@ def download_and_process_oasst(output_directory=".", seed=42, split_ratio=0.95):
 
 
 class OasstDataset:
-    def __init__(self, output_dir: str = "."):
+    def __init__(self, output_dir: str = ".") -> None:
         self.formatted_ds = download_and_process_oasst(output_dir)
         self.task_spec = TaskDataSpec(
             task_name="OASST",

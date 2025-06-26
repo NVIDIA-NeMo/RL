@@ -24,13 +24,15 @@ policy:
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     # Setting top_p/top_k to 0.999/10000 to strip out Qwen's special/illegal tokens
-    # https://github.com/NVIDIA/nemo-rl/issues/237
+    # https://github.com/NVIDIA/NeMo-RL/issues/237
     top_p: 0.999
     top_k: 10000
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
+      async_engine: false
       tensor_parallel_size: 1
+      pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
@@ -50,7 +52,7 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
   tensorboard_enabled: false
-  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-sliding_puzzle"

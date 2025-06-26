@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
+from typing import Any
 
 import torch
 
@@ -63,14 +63,14 @@ class DistributedLogprob(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: Any,
         vocab_parallel_logits: torch.Tensor,
         target: torch.Tensor,
         vocab_start_index: int,
         vocab_end_index: int,
         group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
-    ):
+    ) -> torch.Tensor:
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target - vocab_start_index
@@ -99,8 +99,10 @@ class DistributedLogprob(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, None, None, None, None, None, None]:
+        ctx: Any,
+        *grad_outputs: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+        grad_output = grad_outputs[0]
         softmax, target_mask, masked_target = ctx.saved_tensors
         partition_vocab_size = softmax.size(-1)
 
@@ -144,7 +146,7 @@ def from_parallel_logits_to_logprobs(
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
     target = target.roll(shifts=-1, dims=-1)
-    probs = DistributedLogprob.apply(
+    probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
         vocab_parallel_logits,
         target,
         vocab_start_index,

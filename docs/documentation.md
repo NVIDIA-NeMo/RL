@@ -1,15 +1,16 @@
 # Documentation Development
 
 - [Documentation Development](#documentation-development)
-  - [Building](#building)
+  - [Build the Documentation](#build-the-documentation)
   - [Live Building](#live-building)
-  - [Running Tests in Python Docstrings](#running-tests-in-python-docstrings)
-  - [Writing Tests in Python Docstrings](#writing-tests-in-python-docstrings)
+  - [Run Tests in Python Docstrings](#run-tests-in-python-docstrings)
+  - [Write Tests in Python Docstrings](#write-tests-in-python-docstrings)
+  - [Documentation Version](#documentation-version)
 
 
-## Building
+## Build the Documentation
 
-The following sections describe how to set up and build the NeMo-RL documentation.
+The following sections describe how to set up and build the NeMo RL documentation.
 
 Switch to the documentation source folder and generate HTML output.
 
@@ -23,9 +24,9 @@ uv run --group docs sphinx-build . _build/html
 
 ## Live Building
 
-When writing documentation it can be helpful to serve the documentation and have it update live while you edit.
+When writing documentation, it can be helpful to serve the documentation and have it update live while you edit.
 
-To do so run:
+To do so, run:
 
 ```sh
 cd docs/
@@ -35,16 +36,16 @@ uv run --group docs sphinx-autobuild . _build/html --port 12345 --host 0.0.0.0
 Open a web browser and go to `http://${HOST_WHERE_SPHINX_COMMAND_RUN}:12345` to view the output.
 
 
-## Running Tests in Python Docstrings
+## Run Tests in Python Docstrings
 
-We also run tests in our python docstrings. You can run them with:
+We also run tests in our Python docstrings. You can run them with:
 
 ```sh
 cd docs/
 uv run --group docs sphinx-build -b doctest . _build/doctest
 ```
 
-## Writing Tests in Python Docstrings
+## Write Tests in Python Docstrings
 
 Any code in triple backtick blocks with the `{doctest}` directive will be tested. The format follows Python's doctest module syntax, where `>>>` indicates Python input and the following line shows the expected output. Here's an example:
 
@@ -71,4 +72,11 @@ def add(x: int, y: int) -> int:
     return x + y
 ```
 
+## Documentation Version
+
+The three files below control the version switcher. Before you attempt to publish a new version of the documentation, update these files to match the latest version numbers.
+
+* docs/versions1.json
+* docs/project.json
+* docs/conf.py
 

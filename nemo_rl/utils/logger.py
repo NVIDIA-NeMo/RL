@@ -21,12 +21,13 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, TypedDict
 
 import ray
 import requests
 import torch
 import wandb
+from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from rich.box import ROUNDED
@@ -72,7 +73,7 @@ class LoggerInterface(ABC):
     @abstractmethod
     def log_metrics(
         self,
-        metrics: Dict[str, Any],
+        metrics: dict[str, Any],
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
@@ -81,7 +82,7 @@ class LoggerInterface(ABC):
         pass
 
     @abstractmethod
-    def log_hyperparams(self, params: Dict[str, Any]) -> None:
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log dictionary of hyperparameters."""
         pass
 
@@ -95,7 +96,7 @@ class TensorboardLogger(LoggerInterface):
 
     def log_metrics(
         self,
-        metrics: Dict[str, Any],
+        metrics: dict[str, Any],
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,  # ignored in TensorBoard
@@ -113,7 +114,7 @@ class TensorboardLogger(LoggerInterface):
                 name = f"{prefix}/{name}"
             self.writer.add_scalar(name, value, step)
 
-    def log_hyperparams(self, params: Dict[str, Any]) -> None:
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
 
         Args:
@@ -121,6 +122,15 @@ class TensorboardLogger(LoggerInterface):
         """
         # Flatten the params because add_hparams does not support nested dicts
         self.writer.add_hparams(flatten_dict(params), {})
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to Tensorboard.
+
+        Args:
+            plot_data: Dictionary of plot data
+            step: Global step value
+        """
+        self.writer.add_figure(name, figure, step)
 
 
 class WandbLogger(LoggerInterface):
@@ -147,7 +157,7 @@ class WandbLogger(LoggerInterface):
 
     def log_metrics(
         self,
-        metrics: Dict[str, Any],
+        metrics: dict[str, Any],
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
@@ -174,7 +184,7 @@ class WandbLogger(LoggerInterface):
         else:
             self.run.log(metrics, step=step)
 
-    def log_hyperparams(self, params: Dict[str, Any]) -> None:
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to wandb.
 
         Args:
@@ -182,10 +192,19 @@ class WandbLogger(LoggerInterface):
         """
         self.run.config.update(params)
 
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to wandb.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+        """
+        self.run.log({name: figure}, step=step)
+
 
 class GpuMetricSnapshot(TypedDict):
     step: int
-    metrics: Dict[str, Any]
+    metrics: dict[str, Any]
 
 
 class RayGpuMonitorLogger:
@@ -217,10 +236,10 @@ class RayGpuMonitorLogger:
         ] = []  # Store metrics with timestamps
         self.last_flush_time = time.time()
         self.is_running = False
-        self.collection_thread = None
+        self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
 
-    def start(self):
+    def start(self) -> None:
         """Start the GPU monitoring thread."""
         if not ray.is_initialized():
             raise ValueError(
@@ -241,7 +260,7 @@ class RayGpuMonitorLogger:
             f"GPU monitoring started with collection interval={self.collection_interval}s, flush interval={self.flush_interval}s"
         )
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop the GPU monitoring thread."""
         self.is_running = False
         if self.collection_thread:
@@ -251,7 +270,7 @@ class RayGpuMonitorLogger:
         self.flush()
         print("GPU monitoring stopped")
 
-    def _collection_loop(self):
+    def _collection_loop(self) -> None:
         """Main collection loop that runs in a separate thread."""
         while self.is_running:
             try:
@@ -284,8 +303,8 @@ class RayGpuMonitorLogger:
                 )
                 time.sleep(self.collection_interval)  # Continue despite errors
 
-    def _parse_gpu_metric(self, sample: Sample, node_idx: int) -> Dict[str, Any]:
-        """Parse a GPU metric sample into a standardized format.
+    def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
+        """Parse a metric sample into a standardized format.
 
         Args:
             sample: Prometheus metric sample
@@ -294,31 +313,31 @@ class RayGpuMonitorLogger:
         Returns:
             Dictionary with metric name and value
         """
-        # Expected labels for GPU metrics
-        expected_labels = ["GpuIndex"]
-        for label in expected_labels:
-            if label not in sample.labels:
-                # This is probably a CPU node
-                return {}
-
         metric_name = sample.name
-        # Rename known metrics to match wandb naming convention
+        labels = sample.labels
+        value = sample.value
+
         if metric_name == "ray_node_gpus_utilization":
-            metric_name = "gpu"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.util"
         elif metric_name == "ray_node_gram_used":
-            metric_name = "memory"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
+            # NOTE: It appears their docs say bytes, but it appears to be MB
+            value /= 1024
+        elif metric_name == "ray_node_mem_used":
+            metric_name = f"node.{node_idx}.mem_gb"
+            value /= 1024 * 1024 * 1024
+        elif metric_name == "ray_node_mem_total":
+            metric_name = f"node.{node_idx}.mem_total_gb"
+            value /= 1024 * 1024 * 1024
         else:
             # Skip unexpected metrics
             return {}
 
-        labels = sample.labels
-        index = labels["GpuIndex"]
-        value = sample.value
-
-        metric_name = f"node.{node_idx}.gpu.{index}.{metric_name}"
         return {metric_name: value}
 
-    def _parse_gpu_sku(self, sample: Sample, node_idx: int) -> Dict[str, str]:
+    def _parse_gpu_sku(self, sample: Sample, node_idx: int) -> dict[str, str]:
         """Parse a GPU metric sample into a standardized format.
 
         Args:
@@ -352,7 +371,7 @@ class RayGpuMonitorLogger:
         metric_name = f"node.{node_idx}.gpu.{index}.type"
         return {metric_name: value}
 
-    def _collect_gpu_sku(self) -> Dict[str, str]:
+    def _collect_gpu_sku(self) -> dict[str, str]:
         """Collect GPU SKU from all Ray nodes.
 
         Note: This is an internal API and users are not expected to call this.
@@ -365,7 +384,7 @@ class RayGpuMonitorLogger:
         #       be the same
         return self._collect(sku=True)
 
-    def _collect_metrics(self) -> Dict[str, Any]:
+    def _collect_metrics(self) -> dict[str, Any]:
         """Collect GPU metrics from all Ray nodes.
 
         Returns:
@@ -373,7 +392,7 @@ class RayGpuMonitorLogger:
         """
         return self._collect(metrics=True)
 
-    def _collect(self, metrics: bool = False, sku: bool = False) -> Dict[str, Any]:
+    def _collect(self, metrics: bool = False, sku: bool = False) -> dict[str, Any]:
         """Collect GPU metrics from all Ray nodes.
 
         Returns:
@@ -382,7 +401,7 @@ class RayGpuMonitorLogger:
         assert metrics ^ sku, (
             f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
         )
-        parser_fn = self._parse_gpu_metric if metrics else self._parse_gpu_sku
+        parser_fn = self._parse_metric if metrics else self._parse_gpu_sku
 
         if not ray.is_initialized():
             print("Ray is not initialized. Cannot collect GPU metrics.")
@@ -407,10 +426,10 @@ class RayGpuMonitorLogger:
             # Process each node's metrics
             collected_metrics = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                gpu_metrics = self._fetch_and_parse_metrics(
+                metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
                 )
-                collected_metrics.update(gpu_metrics)
+                collected_metrics.update(metrics)
 
             return collected_metrics
 
@@ -418,7 +437,9 @@ class RayGpuMonitorLogger:
             print(f"Error collecting GPU metrics: {e}")
             return {}
 
-    def _fetch_and_parse_metrics(self, node_idx, metric_address, parser_fn):
+    def _fetch_and_parse_metrics(
+        self, node_idx: int, metric_address: str, parser_fn: Callable
+    ):
         """Fetch metrics from a node and parse GPU metrics.
 
         Args:
@@ -441,13 +462,6 @@ class RayGpuMonitorLogger:
 
             # Parse the Prometheus format
             for family in text_string_to_metric_families(metrics_text):
-                # Skip non-GPU metrics
-                if family.name not in (
-                    "ray_node_gram_used",
-                    "ray_node_gpus_utilization",
-                ):
-                    continue
-
                 for sample in family.samples:
                     metrics = parser_fn(sample, node_idx)
                     gpu_metrics.update(metrics)
@@ -458,7 +472,7 @@ class RayGpuMonitorLogger:
             print(f"Error fetching metrics from {metric_address}: {e}")
             return {}
 
-    def flush(self):
+    def flush(self) -> None:
         """Flush collected metrics to the parent logger."""
         with self.lock:
             if not self.metrics_buffer:
@@ -501,7 +515,7 @@ class Logger(LoggerInterface):
                 - gpu_collection_interval
                 - gpu_flush_interval
         """
-        self.loggers = []
+        self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
 
         self.base_log_dir = cfg["log_dir"]
@@ -545,7 +559,7 @@ class Logger(LoggerInterface):
 
     def log_metrics(
         self,
-        metrics: Dict[str, Any],
+        metrics: dict[str, Any],
         step: int,
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
@@ -562,7 +576,7 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_metrics(metrics, step, prefix, step_metric)
 
-    def log_hyperparams(self, params: Dict[str, Any]) -> None:
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
 
         Args:
@@ -572,7 +586,7 @@ class Logger(LoggerInterface):
             logger.log_hyperparams(params)
 
     def log_batched_dict_as_jsonl(
-        self, to_log: BatchedDataDict | Dict[str, Any], filename: str
+        self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
     ) -> None:
         """Log a list of dictionaries to a JSONL file.
 
@@ -597,13 +611,105 @@ class Logger(LoggerInterface):
 
         print(f"Logged data to {filepath}")
 
-    def __del__(self):
+    def log_plot_token_mult_prob_error(
+        self, data: dict[str, Any], step: int, name: str
+    ) -> None:
+        """Log a plot of log probability errors in samples.
+
+        This function logs & plots the per-token log-probabilities and errors over the sequence
+        for the sample with the highest multiplicative probability error in the batch.
+
+        Args:
+            log_data: Dictionary of log probability samples
+            step: Global step value
+            name: Name of the plot
+        """
+        # find the sample with the highest log probability error
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        generation_logprobs = data["generation_logprobs"][:, 1:]
+        prev_logprobs = data["prev_logprobs"][:, 1:]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+
+        sample_idx = torch.argmax(mult_prob_error)
+        sample_error = mult_prob_error[sample_idx]
+
+        # plot the sample with the highest log probability error
+        # offset by 1 token for next token prediction
+        generation_start_idx, generation_end_idx = (
+            data["prompt_lengths"][sample_idx] - 1,
+            data["full_lengths"][sample_idx] - 1,
+        )
+
+        generation_logprob = generation_logprobs[
+            sample_idx, generation_start_idx:generation_end_idx
+        ]
+        prev_logprob = (
+            prev_logprobs[sample_idx, generation_start_idx:generation_end_idx]
+            * mask[sample_idx, generation_start_idx:generation_end_idx]
+        )
+        diff_i = diff[sample_idx, generation_start_idx:generation_end_idx]
+
+        # Find max absolute error token
+        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error = diff_i[max_abs_error_idx].item()
+
+        # Find max relative error token (ratio of probabilities)
+        gen_prob = torch.exp(generation_logprob)
+        prev_prob = torch.exp(prev_logprob)
+        relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
+        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error = relative_error[max_rel_error_idx].item()
+
+        fig = plt.figure()
+        step_idx = torch.arange(generation_start_idx, generation_end_idx)
+
+        plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
+        plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")
+        plt.plot(
+            step_idx,
+            diff_i,
+            label=f"abs diff (token_mult_prob_error={sample_error:.2f})",
+        )
+
+        # Highlight max errors with points
+        plt.plot(
+            step_idx[max_abs_error_idx],
+            diff_i[max_abs_error_idx],
+            "ro",
+            markersize=8,
+            label=f"Max abs error: {max_abs_error:.4f}",
+        )
+        plt.plot(
+            step_idx[max_rel_error_idx],
+            diff_i[max_rel_error_idx],
+            "bo",
+            markersize=8,
+            label=f"Max rel error (prob): {max_rel_error:.4f}",
+        )
+
+        plt.xlabel("Token Position (starting from prompt end)")
+        plt.ylabel("Log Probability/Difference")
+        plt.legend()
+        plt.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, name)
+
+        plt.close(fig)
+
+    def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
         if self.gpu_monitor:
             self.gpu_monitor.stop()
 
 
-def flatten_dict(d: Dict[str, Any], sep: str = ".") -> Dict[str, Any]:
+def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
     """Flatten a nested dictionary.
 
     Handles nested dictionaries and lists by creating keys with separators.
@@ -629,9 +735,9 @@ def flatten_dict(d: Dict[str, Any], sep: str = ".") -> Dict[str, Any]:
         {'a.0.b': 1, 'a.1.c': 2}
         ```
     """
-    result = {}
+    result: dict[str, Any] = {}
 
-    def _flatten(d, parent_key=""):
+    def _flatten(d: Mapping[str, Any], parent_key: str = "") -> None:
         for key, value in d.items():
             new_key = f"{parent_key}{sep}{key}" if parent_key else key
 
@@ -690,8 +796,8 @@ def configure_rich_logging(
 
 
 def print_message_log_samples(
-    message_logs: List[LLMMessageLogType],
-    rewards: List[float],
+    message_logs: list[LLMMessageLogType],
+    rewards: list[float],
     num_samples: int = 5,
     step: int = 0,
 ) -> None:
@@ -707,10 +813,19 @@ def print_message_log_samples(
     configure_rich_logging(level="INFO")
 
     if not message_logs or not rewards:
+        print("⚠️  No message logs or rewards to display")
         return
 
     if num_samples <= 0:
         return
+
+    if not message_logs:
+        print("⚠️ No valid message logs to display")
+        return
+
+    assert len(message_logs) == len(rewards), (
+        "Message logs and rewards must have the same length"
+    )
 
     # Sample up to num_samples (or all if less)
     num_to_show = min(num_samples, len(message_logs))
@@ -747,7 +862,7 @@ def print_message_log_samples(
     discrete_lines.append("[bold bright_white]Discrete Reward Levels:[/]")
 
     # Get emoji for each reward level
-    def get_reward_emoji(reward):
+    def get_reward_emoji(reward: float) -> str:
         if reward >= 0.7:
             return "🔥"  # Excellent
         elif reward >= 0.3:
@@ -810,7 +925,7 @@ def print_message_log_samples(
     console.print("\n[bold bright_white]Sample Conversations[/]")
 
     # Helper function to safely render content that might have problematic markups
-    def safe_render(content, role_color):
+    def safe_render(content: str, role_color: str) -> str:
         # Fix common problematic patterns that might break Rich markup
         # Replace any standalone [/ without matching closing bracket
         content = content.replace("[/", "\\[/")
@@ -820,31 +935,31 @@ def print_message_log_samples(
         content = re.sub(r"\[(?![a-z_]+\s|/[a-z_]+\])", "\\[", content)
         return f"[{role_color}]{content}[/]"
 
+    # Extract messages from a message log
+    def extract_messages(message_log):
+        def format_message(role, content):
+            role = role.upper()
+            if role == "SYSTEM":
+                return f"[bold #8A2BE2]{role}:[/] {safe_render(content, '#8A2BE2')}"
+            elif role == "USER":
+                return f"[bold #4682B4]{role}:[/] {safe_render(content, '#4682B4')}"
+            elif role == "ASSISTANT":
+                return f"[bold #2E8B57]{role}:[/] {safe_render(content, '#2E8B57')}"
+            else:
+                return f"[bold]{role}:[/] {safe_render(content, 'bright_white')}"
+
+        messages = []
+        for msg in message_log:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                messages.append(format_message(msg["role"], msg["content"]))
+        return messages
+
     for i, idx in enumerate(indices):
         message_log = message_logs[idx]
         reward = rewards[idx]
 
-        # Format each message in the conversation
-        message_parts = []
-        for msg in message_log:
-            role = msg.get("role", "unknown").upper()
-            content = msg.get("content", "")
-
-            # Choose color based on role - using muted, elegant colors
-            if role == "SYSTEM":
-                message_parts.append(
-                    f"[bold #8A2BE2]{role}:[/] {safe_render(content, '#8A2BE2')}"
-                )
-            elif role == "USER":
-                message_parts.append(
-                    f"[bold #4682B4]{role}:[/] {safe_render(content, '#4682B4')}"
-                )
-            elif role == "ASSISTANT":
-                message_parts.append(
-                    f"[bold #2E8B57]{role}:[/] {safe_render(content, '#2E8B57')}"
-                )
-            else:
-                message_parts.append(f"[bold]{role}:[/] {content}")
+        # Extract messages from the sample
+        message_parts = extract_messages(message_log)
 
         # Get reward emoji
         emoji = get_reward_emoji(reward)
@@ -863,6 +978,10 @@ def print_message_log_samples(
 
         content = "\n\n".join(message_parts)
 
+        # If we have no content to display, show a placeholder
+        if not content.strip():
+            content = "[italic]No message content to display[/]"
+
         panel = Panel(
             content,
             title=f"[bold]{emoji} Sample {i + 1} | Reward: {reward:.4f}",
@@ -876,7 +995,7 @@ def print_message_log_samples(
     console.rule("[bold bright_white on purple4]End of Samples")
 
 
-def get_next_experiment_dir(base_log_dir):
+def get_next_experiment_dir(base_log_dir: str) -> str:
     """Create a new experiment directory with an incremented ID.
 
     Args:

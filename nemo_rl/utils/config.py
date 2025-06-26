@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, cast
 
 from hydra._internal.config_loader_impl import ConfigLoaderImpl
 from hydra.core.override_parser.overrides_parser import OverridesParser
@@ -46,6 +46,9 @@ def load_config_with_inheritance(
     base_dir = Path(base_dir)
 
     config = OmegaConf.load(config_path)
+    assert isinstance(config, DictConfig), (
+        "Config must be a Dictionary Config (List Config not supported)"
+    )
 
     # Handle inheritance
     if "defaults" in config:
@@ -60,10 +63,10 @@ def load_config_with_inheritance(
         for default in defaults:
             parent_path = resolve_path(base_dir, default)
             parent_config = load_config_with_inheritance(parent_path, base_dir)
-            base_config = OmegaConf.merge(base_config, parent_config)
+            base_config = cast(DictConfig, OmegaConf.merge(base_config, parent_config))
 
         # Merge with current config
-        config = OmegaConf.merge(base_config, config)
+        config = cast(DictConfig, OmegaConf.merge(base_config, config))
 
     return config
 

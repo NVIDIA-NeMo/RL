@@ -110,11 +110,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
       - name: Check lint
         run: |
-          pip install pre-commit
+          pip install pre-commit==3.6.0
           pre-commit install
           pre-commit run --all-files --show-diff-on-failure --color=always
+
+  mypy-check:
+    name: Mypy check
+    needs: [pre-flight]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Check mypy
+        run: |
+          pip install uv
+          uv run --group test mypy nemo_rl examples
 
   sphinx-build:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
@@ -124,6 +138,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
       - name: build docs
         run: |
           pip install uv
@@ -133,12 +149,13 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
-    uses: NVIDIA/NeMo-FW-CI-templates/.github/workflows/_build_container.yml@v0.22.7
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.30.0
     with:
       build-ref: ${{ github.sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
+      target: hermetic
       build-args: |
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}
@@ -150,11 +167,11 @@ jobs:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     with:
       RUNNER: self-hosted-azure
-      TIMEOUT: 75
+      TIMEOUT: 180
       UNIT_TEST_SCRIPT: |
         cd /opt/nemo-rl
         if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh
+          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term --cov-report=json
         else
           echo Skipping unit tests for docs-only level
         fi
@@ -171,8 +188,10 @@ jobs:
           time uv run --no-sync bash ./tests/functional/sft.sh
           time uv run --no-sync bash ./tests/functional/grpo.sh
           time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
+          time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
           time uv run --no-sync bash ./tests/functional/dpo.sh
           time uv run --no-sync bash ./tests/functional/eval.sh
+          time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
         else
           echo Skipping functional tests for level ${{ needs.pre-flight.outputs.test_level }}
         fi
@@ -207,20 +226,23 @@ jobs:
     if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download coverage artifact
         uses: actions/download-artifact@v4
         with:
           name: unit-test-coverage-report
           path: .
 
-      # Disabled until we make the repo public
-      # - name: Upload to Codecov
-      #   uses: codecov/codecov-action@v4
-      #   with:
-      #     token: ${{ secrets.CODECOV_TOKEN }}
-      #     file: ./coverage.json
-      #     flags: unit-tests
-      #     verbose: true
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.json
+          flags: unit-tests
+          verbose: true
+          override_branch: ${{ github.event_name == 'merge_group' && 'main' || '' }}
 
   CI_QA_Gate:
     name: CI quality check
@@ -244,7 +266,8 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success'
+                  needs.tests.result == 'success' &&
+                  (needs.mypy-check.result == 'success' || true)
                 )
               )
             }}

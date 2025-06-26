@@ -13,12 +13,14 @@
 # limitations under the License.
 
 
+from typing import Any
+
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def format_squad(data):
+def format_squad(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     return {
         "messages": [
             {
@@ -38,7 +40,7 @@ def format_squad(data):
 
 
 class SquadDataset:
-    def __init__(self):
+    def __init__(self) -> None:
         original_ds = load_dataset("rajpurkar/squad")
         self.formatted_ds = original_ds.map(format_squad)
         self.task_spec = TaskDataSpec(

@@ -15,10 +15,14 @@ import logging
 import os
 import sys
 import time
-from typing import List, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
-from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.placement_group import (
+    PlacementGroup,
+    placement_group,
+    remove_placement_group,
+)
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logging.basicConfig(level=logging.INFO)
@@ -38,16 +42,21 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 class PY_EXECUTABLES:
     SYSTEM = sys.executable
 
-    # TODO: Debug why run-to-run variance is so high with these options
     # Use NeMo-RL direct dependencies.
     BASE = "uv run --locked"
 
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
 
+    # Megatron-core (and nemo dependencies)
+    # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
+    # but the submodules are not downloaded yet. This results in errors where it appears Megatron/Nemo
+    # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
+    MCORE = "uv run --reinstall --extra mcore"
+
 
 @ray.remote
-def _get_node_ip_and_free_port():
+def _get_node_ip_and_free_port() -> tuple[str, int]:
     import socket
 
     # Get the IP address of the current node
@@ -60,27 +69,28 @@ def _get_node_ip_and_free_port():
     return node_ip, port
 
 
-def init_ray(log_dir: Optional[str] = None):
-    """Initialize Ray and connect to an existing Ray cluster or fall back and start a local one. Should be called before any ray API is called.
+def init_ray(log_dir: Optional[str] = None) -> None:
+    """Initialise Ray.
 
-    This function:
-    1. Gathers common environment variables needed for distributed training
-    2. Sets up the working directory and Python executable
-    3. Connects to an existing Ray cluster
+    Try to attach to an existing local cluster.
+    If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
+    Otherwise, we will detach and start a fresh local cluster.
     """
-    if "UV_CACHE_DIR" not in os.environ:
-        logging.warning("UV_CACHE_DIR is not set, using default cache dir")
-
     # Set up runtime environment
+    env_vars = dict(os.environ)
+    env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
     runtime_env = {
-        "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        "working_dir": git_root,
-        "py_executable": PY_EXECUTABLES.SYSTEM,
+        "env_vars": env_vars,  # Pass thru all user environment variables
     }
 
-    # Initialize Ray connection
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
+    # sort cvd to ensure consistent tag
+    cvd = ",".join(sorted(cvd.split(",")))
+    cvd_tag_prefix = "nrl_tag_"
+    cvd_tag = f"{cvd_tag_prefix}{cvd.replace(',', '_')}"
+
+    # Try to attach to an existing cluster
     try:
-        # Try to connect to an existing cluster first.
         ray.init(
             address="auto",
             log_to_driver=True,
@@ -88,16 +98,61 @@ def init_ray(log_dir: Optional[str] = None):
             runtime_env=runtime_env,
             _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         )
-        logger.info(f"Connected to existing Ray cluster: {ray.cluster_resources()}")
+
+        cluster_res = ray.cluster_resources()
+
+        # Check reusability for NeMo-RL managed local clusters
+        if any(k.startswith(cvd_tag_prefix) for k in cluster_res):
+            # Reuse if the driver's cvd_tag matches a tag in the cluster.
+            # This is for reusing a previously self-started local cluster.
+            if cvd_tag in cluster_res:
+                logger.info(
+                    f"Connected to existing Ray cluster (driver CVD_TAG '{cvd_tag}' matched): {cluster_res}"
+                )
+                return
+
+            # If neither reuse condition is met, but we connected to *something*
+            logger.info(
+                f"Existing Ray cluster found ({cluster_res}) but it does not meet reuse criteria. "
+                f"Driver's cvd_tag: '{[k for k in cluster_res if k.startswith(cvd_tag_prefix)][0]}'. Expected cvd_tag: '{cvd_tag}'. "
+                "Starting a new local cluster..."
+            )
+            ray.shutdown()
+
+            # Clear driver-side package cache so working_dir is re-uploaded
+            import importlib
+
+            import ray._private.runtime_env.packaging as _pkg
+
+            importlib.reload(_pkg)
+
+        # Always reuse if it's an externally managed cluster.
+        else:
+            logger.info(f"Connected to existing Ray cluster: {cluster_res}")
+            return
+
     except ConnectionError:
-        # If no existing cluster, start a new one with local resources
-        ray.init(
-            log_to_driver=True,
-            include_dashboard=False,
-            runtime_env=runtime_env,
-            _temp_dir=os.path.abspath(log_dir) if log_dir else None,
-        )
-        logger.info(f"Started local cluster with: {ray.cluster_resources()}")
+        logger.debug("No existing Ray cluster found, will start a new one.")
+        # If ConnectionError, proceed to start a new local cluster without further action here.
+        # Clear driver-side package cache so working_dir is re-uploaded
+        ray.shutdown()
+        pass
+
+    # Start a brand-new local cluster
+    # Reuse `runtime_env` but drop `working_dir` to avoid packaging the whole repo (prevents ray OSError: Failed to download runtime_env file package issue)
+    local_runtime_env = dict(runtime_env)
+    local_runtime_env.pop("working_dir", None)
+
+    ray.init(
+        log_to_driver=True,
+        include_dashboard=True,
+        runtime_env=local_runtime_env,
+        _temp_dir=os.path.abspath(log_dir) if log_dir else None,
+        resources={cvd_tag: 1},
+    )
+    logger.info(
+        f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"
+    )
 
 
 class ResourceInsufficientError(Exception):
@@ -119,12 +174,12 @@ class RayVirtualCluster:
 
     def __init__(
         self,
-        bundle_ct_per_node_list: List[int],
+        bundle_ct_per_node_list: list[int],
         use_gpus: bool = True,
         max_colocated_worker_groups: int = 1,
         num_gpus_per_node: int = 8,
         name: str = "",
-        placement_group_strategy: str = "STRICT_PACK",
+        placement_group_strategy: str = "SPREAD",
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -139,7 +194,7 @@ class RayVirtualCluster:
         """
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
-        self._node_placement_groups = None
+        self._node_placement_groups: Optional[list[PlacementGroup]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
@@ -149,15 +204,39 @@ class RayVirtualCluster:
             )
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
+        self.placement_group_strategy = placement_group_strategy
+
+    def _init_placement_groups(
+        self, strategy: str | None = None, use_unified_pg: bool | None = None
+    ) -> list[PlacementGroup]:
+        """Creates placement groups based on whether cross-node model parallelism is needed.
+
+        Args:
+            strategy: Ray placement group strategy (defaults to self.placement_group_strategy)
+            use_unified_pg: If True, create a single unified placement group.
+                          If False, create per-node placement groups.
+
+        Returns:
+            List of placement groups
+        """
+        if self._node_placement_groups is not None:
+            return self._node_placement_groups
+
+        if strategy is None:
+            strategy = self.placement_group_strategy
+
+        # Add retry logic that was previously in __init__
         max_retries = int(os.environ.get("NRL_VIRTUAL_CLUSTER_MAX_RETRIES", 6))
         assert max_retries > 0, (
             f"NRL_VIRTUAL_CLUSTER_MAX_RETRIES={max_retries} must be an integer greater than 0"
         )
+
         for i in range(max_retries):
             try:
-                self._init_placement_groups(placement_group_strategy)
-                # Reaching here means we were successful
-                break
+                self._node_placement_groups = self._create_placement_groups_internal(
+                    strategy, use_unified_pg
+                )
+                return self._node_placement_groups
             except ResourceInsufficientError as e:
                 print(e)
                 print(
@@ -170,18 +249,10 @@ class RayVirtualCluster:
                 f"Maximum number of retries reached ({max_retries}). Cluster resources may be insufficient or cluster itself is highly unstable. Please check your cluster configuration and your cluster logs."
             )
 
-    def _init_placement_groups(self, strategy: str):
-        """Creates placement groups for each node in the cluster. Has empty groups for nodes that don't have any bundles.
-
-        Args:
-            strategy: Ray placement group strategy
-
-        Returns:
-            List of placement groups, one per node
-        """
-        if self._node_placement_groups is not None:
-            return self._node_placement_groups
-
+    def _create_placement_groups_internal(
+        self, strategy: str, use_unified_pg: bool = False
+    ) -> list[PlacementGroup]:
+        """Internal method to create placement groups without retry logic."""
         # Check available resources in the Ray cluster
         cluster_resources = ray.cluster_resources()
         total_available_gpus = int(cluster_resources.get("GPU", 0))
@@ -210,58 +281,72 @@ class RayVirtualCluster:
         # num_gpus_per_bundle == 1 indicates that there is 1 GPU per process
         num_gpus_per_bundle = 1 if self.use_gpus else 0
 
-        resources = [
-            [
-                {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                for _ in range(bundle_count)
-            ]
-            for bundle_count in self._bundle_ct_per_node_list
-        ]
+        placement_groups = []
+        if use_unified_pg:
+            # Create a single unified placement group for cross-node model parallelism
+            all_bundles = []
+            for bundle_count in self._bundle_ct_per_node_list:
+                for _ in range(bundle_count):
+                    all_bundles.append(
+                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+                    )
 
-        self._node_placement_groups = [
-            placement_group(
-                bundles=bundles, strategy=strategy, name=f"{self.name}-node-{i}"
-            )
-            for i, bundles in enumerate(resources)
-        ]
+            placement_groups = [
+                placement_group(
+                    bundles=all_bundles, strategy=strategy, name=f"{self.name}-unified"
+                )
+            ]
+        else:
+            # Create per-node placement groups to respect bundle_ct_per_node_list
+            for node_idx, bundle_count in enumerate(self._bundle_ct_per_node_list):
+                if bundle_count > 0:
+                    node_bundles = [
+                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+                        for _ in range(bundle_count)
+                    ]
+                    pg = placement_group(
+                        bundles=node_bundles,
+                        strategy="PACK",  # Use PACK to keep bundles together
+                        name=f"{self.name}-node{node_idx}",
+                    )
+                    placement_groups.append(pg)
 
         # Add timeout to prevent hanging indefinitely
         try:
             ray.get(
-                [pg.ready() for pg in self._node_placement_groups], timeout=180
+                [pg.ready() for pg in placement_groups], timeout=180
             )  # 3-minute timeout
         except (TimeoutError, ray.exceptions.GetTimeoutError):
             # Clean up any created placement groups
-            for pg in self._node_placement_groups:
+            for pg in placement_groups:
                 try:
                     remove_placement_group(pg)
                 except Exception:
                     pass
-            self._node_placement_groups = None
             raise TimeoutError(
                 "Timed out waiting for placement groups to be ready. The cluster may not have enough resources "
                 "to satisfy the requested configuration, or the resources may be busy with other tasks."
             )
 
-        return self._node_placement_groups
+        return placement_groups
 
-    def get_placement_groups(self):
-        """Returns a list of placement groups that have at least one bundle, filtering out empty nodes.
+    def get_placement_groups(self) -> list[PlacementGroup]:
+        # Initialize placement groups if not already created
+        if self._node_placement_groups is None:
+            self._init_placement_groups()
 
-        This represents the "virtual cluster" - only nodes that are actually being used.
-
-        Returns:
-            List of placement groups that have at least one bundle
-        """
+        assert self._node_placement_groups is not None, (
+            "Placement groups must be initialized before calling get_placement_groups"
+        )
         return [pg for pg in self._node_placement_groups if pg.bundle_specs]
 
-    def world_size(self):
+    def world_size(self) -> int:
         return self._world_size
 
-    def node_count(self):
-        return len(self.get_placement_groups())
+    def node_count(self) -> int:
+        return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
 
-    def get_master_address_and_port(self):
+    def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
 
         Returns:
@@ -271,7 +356,8 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # Find first non-empty placement group
+        # Use the first bundle of the first placement group
+        # This works for both unified PG and per-node PGs
         pg = self.get_placement_groups()[0]
         if pg.bundle_specs:
             # Launch port finder on the first bundle of this placement group
@@ -288,7 +374,7 @@ class RayVirtualCluster:
 
         raise RuntimeError("No valid placement groups found to get master address")
 
-    def shutdown(self):
+    def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
 
         This includes removing all placement groups and resetting the internal state.
@@ -309,7 +395,9 @@ class RayVirtualCluster:
 
         return True
 
-    def _create_visualization_grid(self, worker_groups=None, is_global_view=False):
+    def _create_visualization_grid(
+        self, worker_groups: Optional[Any] = None, is_global_view: bool = False
+    ) -> dict[str, Any]:
         """Create a visualization grid for the cluster with optional worker groups.
 
         Args:
@@ -368,7 +456,7 @@ class RayVirtualCluster:
 
             # Initialize worker cells arrays (one per worker group)
             for i in range(len(worker_groups)):
-                node_row["worker_cells"].append([])
+                node_row["worker_cells"].append([])  # type: ignore
 
             # Process each GPU position in the row
             for gpu_idx in range(max_gpus_per_node):
@@ -386,10 +474,10 @@ class RayVirtualCluster:
                     worker_cells = [" " * cell_width] * len(worker_groups)
 
                 # Add cells to the row
-                node_row["gpu_cells"].append(gpu_cell)
+                node_row["gpu_cells"].append(gpu_cell)  # type: ignore
                 for i, cell in enumerate(worker_cells):
-                    if i < len(node_row["worker_cells"]):
-                        node_row["worker_cells"][i].append(cell)
+                    if i < len(node_row["worker_cells"]):  # type: ignore
+                        node_row["worker_cells"][i].append(cell)  # type: ignore
 
             # Add the completed row to the grid
             grid_data["rows"].append(node_row)
@@ -397,8 +485,13 @@ class RayVirtualCluster:
         return grid_data
 
     def _get_worker_cells(
-        self, node_idx, gpu_idx, worker_groups, cell_width, is_global_view
-    ):
+        self,
+        node_idx: int,
+        gpu_idx: int,
+        worker_groups: list[Any],
+        cell_width: int,
+        is_global_view: bool,
+    ) -> list[str]:
         """Get the worker cell content for each worker group at a specific GPU location.
 
         Args:
@@ -435,7 +528,7 @@ class RayVirtualCluster:
 
         return worker_cells
 
-    def _print_visualization(self, grid_data):
+    def _print_visualization(self, grid_data: dict[str, Any]) -> None:
         """Print the visualization based on the grid data.
 
         Args:
@@ -495,7 +588,7 @@ class RayVirtualCluster:
         # Print legend
         self._print_legend(grid_data)
 
-    def _print_legend(self, grid_data):
+    def _print_legend(self, grid_data: dict[str, Any]) -> None:
         """Print the legend for the visualization."""
         if grid_data["is_global_view"]:
             # Legend for global view
@@ -516,7 +609,7 @@ class RayVirtualCluster:
 
         print("#.#: Node.GPU identifier")
 
-    def print_cluster_grid(self, worker_group=None):
+    def print_cluster_grid(self, worker_group: Optional[Any] = None) -> None:
         """Prints a compact grid visualization of the virtual cluster, similar to JAX's visualize_array_sharding.
 
         If a worker_group is provided, it will also show worker assignments on each device.
@@ -527,7 +620,9 @@ class RayVirtualCluster:
         grid_data = self._create_visualization_grid(worker_group, is_global_view=False)
         self._print_visualization(grid_data)
 
-    def print_all_worker_groups(self, worker_groups=None):
+    def print_all_worker_groups(
+        self, worker_groups: Optional[list[Any]] = None
+    ) -> None:
         """Prints a visualization showing all worker groups in the cluster.
 
         This provides a global view of all workers across all worker groups.
@@ -539,7 +634,7 @@ class RayVirtualCluster:
         grid_data = self._create_visualization_grid(worker_groups, is_global_view=True)
         self._print_visualization(grid_data)
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Shutsdown the virtual cluster when the object is deleted or is garbage collected.
 
         This is an extra safety net in case the user forgets to call shutdown and the pointer to

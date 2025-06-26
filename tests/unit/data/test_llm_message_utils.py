@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
 
 import pytest
 import torch
@@ -61,7 +60,7 @@ def multiple_messages_log() -> LLMMessageLogType:
 
 
 @pytest.fixture
-def uneven_message_logs() -> List[LLMMessageLogType]:
+def uneven_message_logs() -> list[LLMMessageLogType]:
     """Fixture for message logs of different lengths."""
     return [
         [  # First sequence (shorter)
@@ -80,7 +79,7 @@ def uneven_message_logs() -> List[LLMMessageLogType]:
 
 
 @pytest.fixture
-def raw_chat_message_log() -> List[LLMMessageLogType]:
+def raw_chat_message_log() -> list[LLMMessageLogType]:
     """Fixture for chat message logs."""
     return [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -90,7 +89,7 @@ def raw_chat_message_log() -> List[LLMMessageLogType]:
 
 
 @pytest.fixture
-def tokenized_non_chat_message_log() -> List[LLMMessageLogType]:
+def tokenized_non_chat_message_log() -> list[LLMMessageLogType]:
     return [
         [
             {
@@ -104,7 +103,7 @@ def tokenized_non_chat_message_log() -> List[LLMMessageLogType]:
 
 
 @pytest.fixture
-def tokenized_chat_message_log() -> List[LLMMessageLogType]:
+def tokenized_chat_message_log() -> list[LLMMessageLogType]:
     return [
         [
             {
@@ -278,7 +277,7 @@ def test_get_keys_from_messages() -> None:
 
 @pytest.mark.parametrize("make_sequence_length_divisible_by", [1, 8])
 def test_batch_pad_message_log_divisible_by(
-    uneven_message_logs: List[LLMMessageLogType], make_sequence_length_divisible_by: int
+    uneven_message_logs: list[LLMMessageLogType], make_sequence_length_divisible_by: int
 ) -> None:
     """Test batch_pad_message_log padding to a multiple."""
     result, input_lengths = batched_message_log_to_flat_message(
@@ -293,7 +292,7 @@ def test_batch_pad_message_log_divisible_by(
 
 
 def test_batch_pad_message_log_basic(
-    uneven_message_logs: List[LLMMessageLogType],
+    uneven_message_logs: list[LLMMessageLogType],
 ) -> None:
     """Test batch_pad_message_log with right padding."""
     result, input_lengths = batched_message_log_to_flat_message(uneven_message_logs)
@@ -311,10 +310,10 @@ def test_batch_pad_message_log_basic(
 
 
 def test_batch_pad_message_log_custom_pad_value(
-    uneven_message_logs: List[LLMMessageLogType],
+    uneven_message_logs: list[LLMMessageLogType],
 ) -> None:
     """Test batch_pad_message_log with custom padding values."""
-    pad_value_dict: Dict[str, int] = {"input_ids": -100}
+    pad_value_dict: dict[str, int] = {"input_ids": -100}
     result, input_lengths = batched_message_log_to_flat_message(
         uneven_message_logs, pad_value_dict=pad_value_dict
     )
@@ -373,6 +372,52 @@ def test_get_formatted_message_log_llama(
     assert actual_text == expected_text
 
 
+def test_get_formatted_message_log_add_generation_prompt_llama(
+    raw_chat_message_log: LLMMessageLogType,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+    ## get expected result
+    formatted_system_message = tokenizer.apply_chat_template(
+        [raw_chat_message_log[0]],
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+    formatted_user_message = tokenizer.apply_chat_template(
+        [raw_chat_message_log[1]],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    formatted_assistant_message = (
+        raw_chat_message_log[2]["content"] + tokenizer.eos_token
+    )
+
+    ## text should be equivalent to if we apply chat template
+    ## to each turn separately and manually remove the bot string
+    ## from the intermediate turns
+    bot_str = "<|begin_of_text|>"
+    expected_text = [
+        formatted_system_message,
+        formatted_user_message[len(bot_str) :],
+        formatted_assistant_message,
+    ]
+
+    task_data_spec = TaskDataSpec(
+        task_name="test",
+    )
+    result = get_formatted_message_log(
+        raw_chat_message_log,
+        tokenizer,
+        task_data_spec,
+        add_generation_prompt=True,
+    )
+    actual_text = [m["content"] for m in result]
+
+    assert actual_text == expected_text
+
+
 def test_get_formatted_message_log_qwen(
     raw_chat_message_log: LLMMessageLogType,
 ) -> None:
@@ -403,6 +448,52 @@ def test_get_formatted_message_log_qwen(
         task_name="test",
     )
     result = get_formatted_message_log(raw_chat_message_log, tokenizer, task_data_spec)
+    actual_text = [m["content"] for m in result]
+
+    assert actual_text == expected_text
+
+
+def test_get_formatted_message_log_add_generation_prompt_qwen(
+    raw_chat_message_log: LLMMessageLogType,
+) -> None:
+    ## test using a tokenizer that does not have a bos token
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-32B-Instruct")
+    assert tokenizer.bos_token is None
+
+    ## get expected result
+    ## result is equivalent to if we apply chat template to the full message log,
+    ## remove the trailing newline, and then partition by the delimiter
+    ## Separately handle the last message because of the generation prompt
+    expected_text_string = tokenizer.apply_chat_template(
+        [raw_chat_message_log[:2]],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )[0]
+
+    delimiter = "<|im_end|>\n"
+    split_text = expected_text_string.split(delimiter, 1)
+    expected_text = []
+    for i in range(len(split_text)):
+        if i == len(split_text) - 1:
+            expected_text.append(split_text[i])
+        else:
+            expected_text.append(split_text[i] + delimiter)
+
+    formatted_assistant_message = (
+        raw_chat_message_log[2]["content"] + tokenizer.eos_token
+    )
+    expected_text.append(formatted_assistant_message)
+
+    task_data_spec = TaskDataSpec(
+        task_name="test",
+    )
+    result = get_formatted_message_log(
+        raw_chat_message_log,
+        tokenizer,
+        task_data_spec,
+        add_generation_prompt=True,
+    )
     actual_text = [m["content"] for m in result]
 
     assert actual_text == expected_text
@@ -442,7 +533,7 @@ def test_formatted_message_log_empty_message():
 
 
 def test_add_loss_mask_to_chat_message_log(
-    tokenized_chat_message_log: LLMMessageLogType,
+    tokenized_chat_message_log: list[LLMMessageLogType],
 ):
     add_loss_mask_to_message_log(
         tokenized_chat_message_log, roles_to_train_on=["assistant"]

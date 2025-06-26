@@ -13,7 +13,7 @@
 # limitations under the License.
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import Callable, Generator, Optional, Sequence, Union
 
 import numpy as np
 
@@ -57,7 +57,7 @@ class Timer:
     """
 
     # Define valid reduction types and their corresponding NumPy functions
-    _REDUCTION_FUNCTIONS = {
+    _REDUCTION_FUNCTIONS: dict[str, Callable[[Sequence[float]], float]] = {
         "mean": np.mean,
         "median": np.median,
         "min": np.min,
@@ -67,13 +67,13 @@ class Timer:
         "count": len,
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Dictionary mapping labels to lists of elapsed times
         # We store a list of times for each label rather than a single value
         # to support multiple timing runs with the same label (e.g., in loops)
         # This allows calculating reductions like mean, min, max, and std dev
-        self._timers: Dict[str, List[float]] = {}
-        self._start_times: Dict[str, float] = {}
+        self._timers: dict[str, list[float]] = {}
+        self._start_times: dict[str, float] = {}
 
     def start(self, label: str) -> None:
         """Start timing for the given label."""
@@ -106,7 +106,7 @@ class Timer:
         return elapsed
 
     @contextmanager
-    def time(self, label: str):
+    def time(self, label: str) -> Generator[None, None, None]:
         """Context manager for timing a block of code.
 
         Args:
@@ -121,7 +121,7 @@ class Timer:
         finally:
             self.stop(label)
 
-    def get_elapsed(self, label: str) -> List[float]:
+    def get_elapsed(self, label: str) -> list[float]:
         """Get all elapsed time measurements for a specific label.
 
         Args:
@@ -193,8 +193,8 @@ class Timer:
         return reduction_func(self._timers[label])
 
     def get_timing_metrics(
-        self, reduction_op: Union[str, Dict[str, str]] = "mean"
-    ) -> Dict[str, List[float]]:
+        self, reduction_op: Union[str, dict[str, str]] = "mean"
+    ) -> dict[str, float | list[float]]:
         """Get all timing measurements with optional reduction.
 
         Args:
@@ -214,7 +214,7 @@ class Timer:
         if isinstance(reduction_op, str):
             reduction_op = {label: reduction_op for label in self._timers}
 
-        results = {}
+        results: dict[str, float | list[float]] = {}
         for label, op in reduction_op.items():
             if label not in self._timers:
                 continue

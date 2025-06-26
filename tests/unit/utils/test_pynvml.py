@@ -56,6 +56,6 @@ def test_get_device_uuid(mock_pynvml, mock_convert_id):
     uuid = get_device_uuid(0)
 
     # Verify
-    assert uuid == b"GPU-12345"
+    assert uuid == "GPU-12345"
     mock_convert_id.assert_called_once_with(0)
     mock_pynvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(1)

@@ -15,7 +15,6 @@ import argparse
 import json
 import statistics
 import sys
-from typing import Dict, Tuple
 
 from rich.console import Console
 from rich.table import Table
@@ -37,7 +36,7 @@ def mean(value):
     return statistics.mean(float(v) for v in value.values())
 
 
-def evaluate_check(data: Dict, check: str) -> Tuple[bool, str, object]:
+def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
     """Evaluate a check against the data.
 
     Returns:

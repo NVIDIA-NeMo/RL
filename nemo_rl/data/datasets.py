@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 from datasets import Dataset
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
+    DPODatumSpec,
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
@@ -26,6 +28,8 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+TokenizerType = PreTrainedTokenizerBase
 
 
 # TODO @sahilj handle too-long prompts and masking them out throughout the whole process and renormalizing on loss
@@ -46,13 +50,13 @@ class AllTaskProcessedDataset:
     def __init__(
         self,
         dataset: Union[Dataset, Any],
-        tokenizer,
+        tokenizer: TokenizerType,
         default_task_data_spec: TaskDataSpec,
         task_data_processors: Union[
-            Dict[str, Tuple[TaskDataSpec, TaskDataProcessFnCallable]],
+            dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]],
             TaskDataProcessFnCallable,
         ],
-        max_seq_length=None,
+        max_seq_length: Optional[int] = None,
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -68,10 +72,12 @@ class AllTaskProcessedDataset:
             ) in task_data_processors.items():
                 task_data_spec.copy_defaults(self.default_task_data_spec)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.dataset)
 
-    def encode_single(self, text: Union[str, List[str]]) -> Tuple[List[int], int]:
+    def encode_single(
+        self, text: Union[str, list[str]]
+    ) -> tuple[list[int] | torch.Tensor, int]:
         """Takes either a single string or a list of strings that represent multiple turns for the same conversation.
 
         Returns a single (concatenated) list of tokenized ids and the length of the tokenized ids.
@@ -108,7 +114,7 @@ class AllTaskProcessedDataset:
         return datum_spec
 
 
-def rl_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
+def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     """Collate function for RL training."""
     message_log = [datum_spec["message_log"] for datum_spec in data_batch]
     length = torch.tensor([datum_spec["length"] for datum_spec in data_batch])
@@ -127,7 +133,7 @@ def rl_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
-    output = BatchedDataDict(
+    output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,
         loss_multiplier=loss_multiplier,
@@ -140,7 +146,7 @@ def rl_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
     return output
 
 
-def eval_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
+def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     """Collate function for evaluation.
 
     Takes a list of data samples and combines them into a single batched dictionary
@@ -183,7 +189,7 @@ def eval_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
     extra_env_info = [datum_spec["extra_env_info"] for datum_spec in data_batch]
     idx = [datum_spec["idx"] for datum_spec in data_batch]
 
-    output = BatchedDataDict(
+    output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         extra_env_info=extra_env_info,
         idx=idx,
@@ -192,8 +198,10 @@ def eval_collate_fn(data_batch: List[DatumSpec]) -> BatchedDataDict:
 
 
 def dpo_collate_fn(
-    data_batch: List[DatumSpec], tokenizer, make_sequence_length_divisible_by: int
-) -> BatchedDataDict:
+    data_batch: list[DPODatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+) -> BatchedDataDict[Any]:
     """Collate function for DPO training.
 
     This function separates the chosen and rejected responses to create
@@ -214,15 +222,15 @@ def dpo_collate_fn(
         loss_multiplier.extend([datum_spec["loss_multiplier"]] * 2)
         idx.extend([datum_spec["idx"]] * 2)
         task_names.extend([datum_spec.get("task_name", None)] * 2)
-    length = torch.tensor(length)
-    loss_multiplier = torch.tensor(loss_multiplier)
+    length_batch: torch.Tensor = torch.tensor(length)
+    loss_multiplier_batch: torch.Tensor = torch.tensor(loss_multiplier)
 
-    batch_max_length = torch.ones_like(length) * length.max()
+    batch_max_length = torch.ones_like(length_batch) * length_batch.max()
 
-    batch = BatchedDataDict(
+    batch: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
-        length=length,
-        loss_multiplier=loss_multiplier,
+        length=length_batch,
+        loss_multiplier=loss_multiplier_batch,
         task_name=task_names,
         idx=idx,
         batch_max_length=batch_max_length,
@@ -240,12 +248,12 @@ def dpo_collate_fn(
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
 
-    train_data: BatchedDataDict = BatchedDataDict(
+    train_data: BatchedDataDict[Any] = BatchedDataDict(
         {
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "token_mask": cat_and_padded["token_loss_mask"],
-            "sample_mask": loss_multiplier,
+            "sample_mask": loss_multiplier_batch,
         }
     )
 

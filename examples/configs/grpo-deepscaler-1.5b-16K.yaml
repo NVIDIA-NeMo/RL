@@ -1,0 +1,14 @@
+# GRPO Algorithm Configuration
+defaults: "grpo-deepscaler-1.5b-8K.yaml"
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+  ratio_clip_max: 0.28
+
+
+policy:
+  max_total_sequence_length: 16384
+
+
+  dynamic_batching:
+    enabled: False

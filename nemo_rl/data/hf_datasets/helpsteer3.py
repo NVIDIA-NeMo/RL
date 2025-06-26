@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any
+
 from absl import logging
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def format_helpsteer3(data):
+def format_helpsteer3(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
     response_1 = data["response1"]
     response_2 = data["response2"]
     overall_preference = data["overall_preference"]
@@ -47,7 +49,7 @@ def format_helpsteer3(data):
 class HelpSteer3Dataset:
     """HelpSteer3 preference dataset for DPO training."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         ds = load_dataset("nvidia/HelpSteer3", "preference")
         self.formatted_ds = ds.map(format_helpsteer3)
 

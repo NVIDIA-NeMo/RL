@@ -16,7 +16,7 @@ import argparse
 import os
 import pprint
 import warnings
-from typing import Any, Dict
+from typing import Any
 
 from omegaconf import OmegaConf
 
@@ -49,7 +49,7 @@ def parse_args():
 # Data Processing
 # =======================================================
 def dpo_preprocessor(
-    datum_dict: Dict[str, Any],
+    datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer,
     max_seq_length: int,

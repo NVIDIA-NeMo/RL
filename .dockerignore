@@ -1,0 +1,35 @@
+# Adding to .gitignore helps reduce the size of your working_dir
+
+.git
+*.out
+*.log
+*.tar
+*.tar.gz
+.venv
+venv
+venvs
+__pycache__/
+_build/
+build/
+apidocs/
+dist/
+*.egg-info/
+*.vscode/
+release_run*
+ckpts/
+
+# Test
+coverage.json
+.coverage*
+test_assets/
+
+# Cache
+uv_cache/
+hf_home/
+hf_datasets_cache/
+*logs/
+datasets/
+wandb/
+checkpoints/
+results/
+code_snapshots/

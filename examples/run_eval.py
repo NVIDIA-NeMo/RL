@@ -29,10 +29,13 @@ from nemo_rl.data import MathDataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import remap_dataset_keys
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    get_actor_python_env,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
-from nemo_rl.models.generation.interfaces import configure_generation_config
+from nemo_rl.models.generation import configure_generation_config
 
 
 def parse_args():
@@ -73,7 +76,11 @@ def setup_data(tokenizer: AutoTokenizer, data_config: MathDataConfig, env_config
     )
 
     math_env = MathEnvironment.options(
-        runtime_env={"py_executable": MathEnvironment.DEFAULT_PY_EXECUTABLE}
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.math_environment.MathEnvironment"
+            )
+        }
     ).remote(env_configs["math"])
 
     dataset = AllTaskProcessedDataset(

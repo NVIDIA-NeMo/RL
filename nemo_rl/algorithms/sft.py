@@ -14,7 +14,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Optional, Tuple, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 import torch
@@ -34,11 +34,12 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
-from nemo_rl.models.interfaces import PolicyInterface
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.models.policy.interfaces import PolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 
@@ -87,8 +88,8 @@ def setup(
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: AllTaskProcessedDataset,
-) -> Tuple[
-    HfPolicy,
+) -> tuple[
+    Policy,
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
@@ -182,7 +183,7 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    policy = HfPolicy(
+    policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
@@ -385,6 +386,8 @@ def sft_train(
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
             )
+            maybe_gpu_profile_step(policy, total_steps + 1)
+            val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 # Prepare batch and generate responses
@@ -416,8 +419,17 @@ def sft_train(
                 print("▶ Taking a training step...")
                 train_results = policy.train(train_data, loss_fn)
 
+                is_last_step = total_steps + 1 >= master_config["sft"][
+                    "max_num_steps"
+                ] or (
+                    current_epoch + 1 == max_num_epochs
+                    and current_step + 1 == len(train_dataloader)
+                )
+
                 # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                if is_last_step or (
+                    val_period > 0 and (total_steps + 1) % val_period == 0
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
@@ -441,10 +453,9 @@ def sft_train(
                 sft_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if (
-                    master_config["checkpointing"]["enabled"]
-                    and (total_steps + 1)
-                    % master_config["checkpointing"]["save_period"]
+                if master_config["checkpointing"]["enabled"] and (
+                    is_last_step
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 ):  # +1 because step is 0-indexed
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
@@ -481,10 +492,10 @@ def sft_train(
             }
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
-                if k == "num_valid_samples":
-                    metrics[k] = np.sum(v).item()
-                else:
+                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                     metrics[k] = np.mean(v).item()
+                else:
+                    metrics[k] = np.sum(v).item()
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")

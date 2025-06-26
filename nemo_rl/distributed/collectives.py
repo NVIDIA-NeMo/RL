@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, TypeVar
 
 import torch
+
+T = TypeVar("T")
 
 
 def rebalance_nd_tensor(
     tensor: torch.Tensor, group: Optional[torch.distributed.ProcessGroup] = None
-):
+) -> torch.Tensor:
     """Takes tensors with variable leading sizes (at dim=0) and stacks them into a single tensor.
 
     This function handles the case where different GPUs have tensors with different batch sizes
@@ -48,10 +50,11 @@ def rebalance_nd_tensor(
 
     B = batch_num_per_rank.sum()
     other_dims = tensor.shape[1:]
+    dims = (B, *other_dims)
 
     indices = batch_num_per_rank.cumsum(dim=0)
     output_tensor = torch.zeros(
-        B, *other_dims, dtype=tensor.dtype, device=torch.cuda.current_device()
+        *dims, dtype=tensor.dtype, device=torch.cuda.current_device()
     )
 
     # tensor_split is a view we can copy into
@@ -63,8 +66,8 @@ def rebalance_nd_tensor(
 
 
 def gather_jagged_object_lists(
-    local_objects: list, group: Optional[torch.distributed.ProcessGroup] = None
-):
+    local_objects: list[T], group: Optional[torch.distributed.ProcessGroup] = None
+) -> list[T]:
     """Gathers jagged lists of picklable objects from all ranks and flattens them into a single list.
 
     This function handles the case where different GPUs have lists of different lengths
@@ -89,7 +92,7 @@ def gather_jagged_object_lists(
     """
     # Gather all lists across ranks
     world_size = torch.distributed.get_world_size(group=group)
-    gathered_lists = [None] * world_size
+    gathered_lists: list[list[T]] = [None] * world_size  # type: ignore
     torch.distributed.all_gather_object(gathered_lists, local_objects, group=group)
 
     # Flatten into single list while preserving order

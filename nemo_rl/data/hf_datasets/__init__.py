@@ -16,6 +16,7 @@ from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.hf_datasets.dpo import DPODataset
 from nemo_rl.data.hf_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.hf_datasets.oasst import OasstDataset
+from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.hf_datasets.prompt_response_dataset import (
     PromptResponseDataset,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "DPODataset",
     "HelpSteer3Dataset",
     "OasstDataset",
+    "OpenMathInstruct2Dataset",
     "PromptResponseDataset",
     "SquadDataset",
     "COMMON_CHAT_TEMPLATES",

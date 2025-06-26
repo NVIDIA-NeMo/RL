@@ -14,7 +14,7 @@
 import pytest
 import torch
 
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict, DynamicBatchingArgs
 
 
 def test_shard_by_batch_size_basic():
@@ -202,3 +202,37 @@ def test_shard_by_batch_size_matches_example():
     # Element 1: [A B C D] (second elements from each chunk)
     assert sharded[0]["data"] == ["A", "B", "C", "D"]
     assert sharded[1]["data"] == ["A", "B", "C", "D"]
+
+
+def test_shard_by_batch_size_dynamic():
+    # create a data dict with variable sequence lengths per datum
+    batch = BatchedDataDict(
+        {
+            "data": torch.ones([8, 128]),
+            "sequence_lengths": torch.tensor(
+                (2, 8, 4, 16, 28, 32, 2, 32), dtype=torch.int
+            ),
+        }
+    )
+    dynamic_batching_args: DynamicBatchingArgs = {
+        "input_key": "data",
+        "input_lengths_key": "sequence_lengths",
+        "sequence_length_round": 4,
+        "max_tokens_per_microbatch": 32,
+    }
+
+    shards, _ = batch.shard_by_batch_size(
+        shards=2, dynamic_batching_args=dynamic_batching_args
+    )
+    # Expected Output: 3 microbatches per shard, of sizes 2, 1, 1
+    for shard in shards:
+        shard.micro_batch_indices == [[[0, 2], [2, 3], [3, 4]]]
+
+    # test creating dynamic micro_batch iterators
+    for shard in shards:
+        mb_iterator = shard.make_microbatch_iterator_with_dynamic_shapes()
+        # check each microbatch has a valid dynamic sequence length
+        for mb in mb_iterator:
+            batch_size, seqlen = mb["data"].shape
+            assert seqlen % 4 == 0
+            assert seqlen <= 32

@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Optional, Tuple, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 import torch
@@ -31,11 +31,12 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
-from nemo_rl.models.interfaces import PolicyInterface
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.models.policy.interfaces import PolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 
@@ -70,7 +71,7 @@ class DPOConfig(TypedDict):
     preference_average_log_probs: bool
     sft_average_log_probs: bool
     ## TODO(@ashors) support other loss functions
-    ## https://github.com/NVIDIA/nemo-rl/issues/193
+    ## https://github.com/NVIDIA/NeMo-RL/issues/193
     # preference_loss: str
     # gt_reward_scale: float
     preference_loss_weight: float
@@ -94,8 +95,8 @@ def setup(
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: AllTaskProcessedDataset,
-) -> Tuple[
-    HfPolicy,
+) -> tuple[
+    Policy,
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
@@ -202,7 +203,7 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    policy = HfPolicy(
+    policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
@@ -235,16 +236,22 @@ def setup(
     )
 
 
-def add_ref_logprobs_to_data(dataloader, policy, master_config):
+def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
     dataloader_iter = iter(dataloader)
     while True:
         try:
             batch = next(dataloader_iter)
 
+            micro_batch_size = (
+                master_config["dpo"]["val_micro_batch_size"] * 2
+                if is_val
+                else master_config["policy"]["train_micro_batch_size"] * 2
+            )
+
             ## append ref policy logprobs to batch
             logprobs = policy.get_reference_policy_logprobs(
                 batch,
-                micro_batch_size=master_config["policy"]["train_micro_batch_size"] * 2,
+                micro_batch_size=micro_batch_size,
             )["reference_logprobs"]
             ## want logprobs for batch to correspond to the log probabilities of the next tokens
             ## so we roll the logprobs to the left by one
@@ -283,7 +290,7 @@ def validate(
         val_metrics = defaultdict(lambda: 0.0)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(
-            add_ref_logprobs_to_data(val_dataloader, policy, master_config)
+            add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
             ## just run model fwd
             val_results = policy.train(
@@ -302,7 +309,10 @@ def validate(
 
             else:
                 for k, v in val_results["all_mb_metrics"].items():
-                    val_metrics[k] += np.mean(v).item()
+                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
+                        val_metrics[k] += np.mean(v).item()
+                    else:
+                        val_metrics[k] += np.sum(v).item()
                 num_valid_batches += 1
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
@@ -403,6 +413,8 @@ def dpo_train(
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
             )
+            maybe_gpu_profile_step(policy, total_steps + 1)
+            val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 print("▶ Taking a training step...")
@@ -416,8 +428,17 @@ def dpo_train(
                     mbs=master_config["policy"]["train_micro_batch_size"] * 2,
                 )
 
+                is_last_step = total_steps + 1 >= master_config["dpo"][
+                    "max_num_steps"
+                ] or (
+                    current_epoch + 1 == max_num_epochs
+                    and current_step + 1 == len(train_dataloader)
+                )
+
                 # Run validation if it's a validation step
-                if val_period > 0 and (total_steps + 1) % val_period == 0:
+                if is_last_step or (
+                    val_period > 0 and (total_steps + 1) % val_period == 0
+                ):
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
@@ -440,10 +461,9 @@ def dpo_train(
                 dpo_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if (
-                    master_config["checkpointing"]["enabled"]
-                    and (total_steps + 1)
-                    % master_config["checkpointing"]["save_period"]
+                if master_config["checkpointing"]["enabled"] and (
+                    is_last_step
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 ):  # +1 because step is 0-indexed
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
@@ -479,10 +499,10 @@ def dpo_train(
             }
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
-                if k == "num_valid_samples":
-                    metrics[k] = np.sum(v).item()
-                else:
+                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                     metrics[k] = np.mean(v).item()
+                else:
+                    metrics[k] = np.sum(v).item()
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")

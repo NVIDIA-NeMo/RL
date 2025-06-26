@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import os
-from typing import Tuple, TypedDict
+from typing import TypedDict
 
 import ray
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import MathDataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, eval_collate_fn
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
@@ -33,7 +34,14 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 # ===============================================================================
 
 
+class EvalConfig(TypedDict):
+    metric: str
+    num_tests_per_prompt: int
+    seed: int
+
+
 class MasterConfig(TypedDict):
+    eval: EvalConfig
     generate: GenerationConfig
     data: MathDataConfig
     env: MathEnvConfig
@@ -49,7 +57,7 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     dataset: AllTaskProcessedDataset,
-) -> Tuple[
+) -> tuple[
     VllmGeneration,
     DataLoader,
     MasterConfig,
@@ -66,8 +74,24 @@ def setup(
         VLLM model, data loader, and config.
     """
     # Extract individual configs for easier access
+    eval_config = master_config["eval"]
     generation_config = master_config["generation"]
     cluster_config = master_config["cluster"]
+
+    # Set seed for reproducibility
+    set_seed(eval_config["seed"])
+
+    # Check settings
+    metric = eval_config["metric"]
+    num_tests_per_prompt = eval_config["num_tests_per_prompt"]
+    temperature = generation_config["temperature"]
+    top_k = generation_config["top_k"]
+    # TODO @yukih: support pass@k and cons@k
+    assert metric in ["pass@1"], f"Invalid metric: {metric}"
+    if num_tests_per_prompt > 1:
+        assert temperature > 0 and top_k != 1, (
+            "temperature > 0 and top_k != 1 are required for multiple samples"
+        )
 
     # ==========================
     #           Data
@@ -137,15 +161,29 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         env: Environment that scores responses.
         master_config: Configuration settings.
     """
+    # Extract for easier access
+    generation_config = master_config["generation"]
+    eval_config = master_config["eval"]
+    metric = eval_config["metric"]
+    num_tests_per_prompt = eval_config["num_tests_per_prompt"]
+
     # Run evaluation loop
     score, count = 0.0, 0
     for batch in dataloader:
+        # update stats
+        count += batch.size * num_tests_per_prompt
+
+        # measure multiple samples
+        if num_tests_per_prompt > 1:
+            batch = batch.repeat_interleave(num_tests_per_prompt)
+
         # get input prompt from message_log
         prompts = []
         for message_log in batch["message_log"]:
             content = [message["content"] for message in message_log]
             content = "\n".join(content)
             prompts.append(content)
+
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
         outputs = vllm_generation.generate_text(inputs)["texts"]
@@ -166,8 +204,11 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         ]
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
 
-        score += env_return.rewards.sum().item()
-        count += len(env_return.rewards)
+        # update stats
+        if metric == "pass@1":
+            score += env_return.rewards.sum().item()
+        else:
+            raise ValueError(f"Invalid metric: {metric}")
 
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
@@ -175,10 +216,16 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
 
     # Print results
     dataset_name = os.path.basename(master_config["data"]["dataset_name"])
-    model_name = os.path.basename(master_config["generation"]["model_name"])
+    model_name = os.path.basename(generation_config["model_name"])
+    max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
+    temperature = generation_config["temperature"]
+    top_p = generation_config["top_p"]
+    top_k = generation_config["top_k"]
     average_score = score / count
 
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
-    print(f"score={average_score:.2f} ({score}/{count})")
+    print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
+    print(f"{metric=} {num_tests_per_prompt=}\n")
+    print(f"score={average_score:.4f} ({score}/{count})")
     print("=" * 60 + "\n")

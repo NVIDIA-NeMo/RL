@@ -19,9 +19,7 @@ from nemo_rl.algorithms.loss_functions import (
     DPOLossFn,
     NLLLoss,
 )
-from nemo_rl.algorithms.utils import (
-    masked_mean,
-)
+from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -54,7 +52,8 @@ def test_nll_loss():
         .to(torch.int64)
         .to("cuda"),
         "token_mask": torch.tensor([[0, 0, 1, 1]]).to("cuda"),
-        "sample_mask": torch.tensor([[1]]).to("cuda"),
+        "sample_mask": torch.tensor([1]).to("cuda"),
+        "num_valid_tokens_in_batch": torch.tensor([2]),
     }
 
     ### assume we predict the correct token with high probability
@@ -70,11 +69,17 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    loss, metrics_dict = loss_fn(next_token_logits, data)
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        ),
+    )
     torch.testing.assert_close(loss.cpu(), torch.tensor(0.0))
     # Check the metrics dictionary contains the expected values
     assert metrics_dict["num_unmasked_tokens"] == 2
-    assert metrics_dict["total_tokens"] == 3
 
     ## now assume we predict the incorrect token with high probability
     next_token_logits = (
@@ -89,12 +94,18 @@ def test_nll_loss():
         .unsqueeze(0)
         .to("cuda")
     )
-    loss, metrics_dict = loss_fn(next_token_logits, data)
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        ),
+    )
     ## loss per token is 999, and we have two unmasked tokens
     ## NLLLoss averages the loss over unmasked tokens
     torch.testing.assert_close(loss.cpu(), torch.tensor(999.0))
     assert metrics_dict["num_unmasked_tokens"] == 2
-    assert metrics_dict["total_tokens"] == 3
 
 
 def test_dpo_loss():
@@ -121,6 +132,10 @@ def test_dpo_loss():
     loss, metrics_dict = loss_fn(
         next_token_logits,
         data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
     )
 
     ## chosen and rejected errors are the same, so difference between them is 0
@@ -147,7 +162,14 @@ def test_dpo_loss():
     )
     expected_preference_loss = -torch.nn.functional.logsigmoid(torch.tensor(0.0))
     assert torch.isclose(
-        loss_fn_with_sft(next_token_logits, data)[0].cpu(),
+        loss_fn_with_sft(
+            next_token_logits,
+            data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )[0].cpu(),
         0.5 * expected_sft_loss + expected_preference_loss,
     )
 
@@ -218,8 +240,18 @@ def test_dpo_loss_varying_sequence_lengths():
     )
 
     # Compute loss
-    loss, metrics = dpo_loss_fn_no_avg(next_token_logits, data)
-    loss_avg, metrics_avg = dpo_loss_fn_avg(next_token_logits, data)
+    loss, metrics = dpo_loss_fn_no_avg(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(sample_mask),
+        global_valid_toks=torch.sum(sample_mask.unsqueeze(-1) * token_mask),
+    )
+    loss_avg, metrics_avg = dpo_loss_fn_avg(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(sample_mask),
+        global_valid_toks=torch.sum(sample_mask.unsqueeze(-1) * token_mask),
+    )
 
     num_unmasked_tokens = token_mask[:, 1:][::2].sum().item()
     logprobs = torch.nn.functional.log_softmax(next_token_logits[:, 1:], dim=-1)
@@ -268,7 +300,14 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute NLL loss
     nll_loss_fn = NLLLoss()
-    nll_loss, nll_metrics = nll_loss_fn(next_token_logits[::2], sft_data)
+    nll_loss, nll_metrics = nll_loss_fn(
+        next_token_logits[::2],
+        sft_data,
+        global_valid_seqs=None,
+        global_valid_toks=torch.sum(
+            sft_data["sample_mask"].unsqueeze(-1) * torch.sum(sft_data["token_mask"])
+        ),
+    )
 
     # Compute DPO loss with preference_loss_weight=0
     dpo_loss_fn = DPOLossFn(
@@ -280,15 +319,27 @@ def test_dpo_sft_matches_nll_loss():
             "sft_average_log_probs": False,
         }
     )
-    dpo_loss, dpo_metrics = dpo_loss_fn(next_token_logits, dpo_data)
+    dpo_loss, dpo_metrics = dpo_loss_fn(
+        next_token_logits,
+        dpo_data,
+        global_valid_seqs=torch.sum(dpo_data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            dpo_data["sample_mask"].unsqueeze(-1) * dpo_data["token_mask"]
+        ),
+    )
 
     # Verify losses match
     ## since DPO SFT loss just sums across tokens in a batch and then averages over the batch,
     ## we need to re-normalize by multiplying by the batch size and dividing by the total number
     ## of unmasked chosen tokens
-    torch.testing.assert_close(
-        dpo_loss / torch.sum(dpo_data["token_mask"][::2]) * batch_size, nll_loss
+    scaled_dpo_loss = (
+        dpo_loss
+        * (torch.sum(sft_data["sample_mask"]))
+        / torch.sum(
+            sft_data["sample_mask"].unsqueeze(-1) * torch.sum(sft_data["token_mask"])
+        )
     )
+    torch.testing.assert_close(scaled_dpo_loss, nll_loss)
 
 
 def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="cuda"):
@@ -375,10 +426,12 @@ def test_clipped_pg_loss_ppo_clipping():
     cfg = {
         "ratio_clip_min": ratio_clip,
         "ratio_clip_max": ratio_clip,
+        "ratio_clip_c": None,
         "reference_policy_kl_penalty": 0.0,  # Disable KL
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)
 
@@ -436,7 +489,12 @@ def test_clipped_pg_loss_ppo_clipping():
         curr_lp_masked, input_ids, seq_len, vocab_size, device
     )
 
-    actual_loss, _ = loss_fn(dummy_logits, data)
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
@@ -454,8 +512,10 @@ def test_clipped_pg_loss_reinforce_mode():
         "reference_policy_kl_penalty": 0.0,
         "ratio_clip_min": 0.0,  # Placeholder, ignored
         "ratio_clip_max": 0.0,  # Placeholder, ignored
+        "ratio_clip_c": None,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)
 
@@ -482,7 +542,14 @@ def test_clipped_pg_loss_reinforce_mode():
         curr_lp_masked, input_ids, seq_len, vocab_size, device
     )
 
-    actual_loss, _ = loss_fn(dummy_logits, data)
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
@@ -501,9 +568,11 @@ def test_clipped_pg_loss_kl_penalty():
         "reference_policy_kl_penalty": kl_beta,
         "ratio_clip_min": 0.2,
         "ratio_clip_max": 0.2,
+        "ratio_clip_c": None,
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)
 
@@ -541,7 +610,14 @@ def test_clipped_pg_loss_kl_penalty():
         curr_lp_masked, input_ids, seq_len, vocab_size, device
     )
 
-    actual_loss, _ = loss_fn(dummy_logits, data)
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
@@ -572,16 +648,25 @@ def test_clipped_pg_loss_masking():
     cfg = {
         "ratio_clip_min": 0.2,
         "ratio_clip_max": 0.2,
+        "ratio_clip_c": None,
         "reference_policy_kl_penalty": 0.1,
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
 
     # --- Test 1: Token Mask ---
     # Default mask: [[0, 1, 1, 1], [0, 1, 1, 1]] -> 3 tokens per sample
-    loss_default, _ = loss_fn(dummy_logits, data)
+    loss_default, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
 
     # Modify token_mask for batch item 0 to mask one more token (pos 1)
     data_mod_token = data.copy()
@@ -590,7 +675,14 @@ def test_clipped_pg_loss_masking():
         0  # New mask: [[0, 0, 1, 1], [0, 1, 1, 1]] -> 2 tokens sample 0, 3 tokens sample 1
     )
 
-    loss_token_masked, _ = loss_fn(dummy_logits, data_mod_token)
+    loss_token_masked, _ = loss_fn(
+        dummy_logits,
+        data_mod_token,
+        global_valid_seqs=torch.sum(data_mod_token["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data_mod_token["sample_mask"].unsqueeze(-1) * data_mod_token["token_mask"]
+        ),
+    )
     # Loss should change if a potentially contributing token is masked
     assert not torch.isclose(loss_default, loss_token_masked, atol=1e-4), (
         "Token mask did not change loss as expected"
@@ -602,7 +694,14 @@ def test_clipped_pg_loss_masking():
         [1, 0], dtype=torch.int64, device=device
     )  # Ignore item 1
 
-    loss_sample_masked, _ = loss_fn(dummy_logits, data_mod_sample)
+    loss_sample_masked, _ = loss_fn(
+        dummy_logits,
+        data_mod_sample,
+        global_valid_seqs=torch.sum(data_mod_sample["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data_mod_sample["sample_mask"].unsqueeze(-1) * data_mod_sample["token_mask"]
+        ),
+    )
 
     # Manually create data dict for only batch 0
     data_only_b0_dict = {}
@@ -617,7 +716,14 @@ def test_clipped_pg_loss_masking():
     data_only_b0 = BatchedDataDict(data_only_b0_dict)
 
     logits_only_b0 = dummy_logits[0:1]
-    loss_only_b0, _ = loss_fn(logits_only_b0, data_only_b0)
+    loss_only_b0, _ = loss_fn(
+        logits_only_b0,
+        data_only_b0,
+        global_valid_seqs=torch.sum(data_only_b0["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data_only_b0["sample_mask"].unsqueeze(-1) * data_only_b0["token_mask"]
+        ),
+    )
 
     torch.testing.assert_close(loss_sample_masked, loss_only_b0)
 
@@ -635,17 +741,26 @@ def test_clipped_pg_loss_zero_mask():
     cfg = {
         "ratio_clip_min": 0.2,
         "ratio_clip_max": 0.2,
+        "ratio_clip_c": None,
         "reference_policy_kl_penalty": 0.1,
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)  # Use original loss fn
 
     # Set token mask to all zeros
     data["token_mask"] = torch.zeros_like(data["token_mask"])
 
-    loss, _ = loss_fn(dummy_logits, data)
+    loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
 
     # Loss should be exactly zero
     torch.testing.assert_close(loss, torch.tensor(0.0, device=device))
@@ -665,10 +780,12 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     cfg = {
         "ratio_clip_min": ratio_clip,
         "ratio_clip_max": ratio_clip,
+        "ratio_clip_c": None,
         "reference_policy_kl_penalty": kl_beta,
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": True,
         "use_importance_sampling_correction": True,
+        "token_level_loss": True,
     }
     loss_fn = ClippedPGLossFn(cfg)
 
@@ -791,7 +908,12 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
         curr_lp_masked, input_ids, seq_len, vocab_size, device
     )
 
-    actual_loss, _ = loss_fn(dummy_logits, data)
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
     torch.testing.assert_close(actual_loss, expected_total_loss, atol=1e-4, rtol=1e-3)
 
 
@@ -815,3 +937,173 @@ def test_masked_mean_all_zeros():
     mask = torch.zeros_like(values)
     result = masked_mean(values, mask, dim=1)
     torch.testing.assert_allclose(result, torch.tensor([0.0, 0.0]))
+
+
+def test_clipped_pg_loss_dual_clip():
+    """
+    Tests dual clipping in PPO loss function.
+
+    Dual clipping prevents excessive policy updates when dealing with:
+    1. Strongly negative advantages
+    2. Very large probability ratios (when curr_logprobs >> prev_logprobs)
+
+    This test verifies that when advantages are negative, ratio_clip_c serves as an upper
+    bound on the loss.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    ratio_clip = 0.2
+    ratio_clip_c = 3.0
+    cfg = {
+        "ratio_clip_min": ratio_clip,
+        "ratio_clip_max": ratio_clip,
+        "ratio_clip_c": ratio_clip_c,
+        "reference_policy_kl_penalty": 0.0,  # Disable KL
+        "disable_ppo_ratio": False,
+        "use_on_policy_kl_approximation": False,
+        "use_importance_sampling_correction": False,
+        "token_level_loss": True,
+    }
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Create test data with a mix of advantages: positive, slightly negative, strongly negative
+    adv_masked = torch.tensor([[1.0, -1.0, -4.0]], device=device)
+
+    # Set up target logprobs to test various probability ratios
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -3.0]], device=device)
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.69741]], device=device
+    )  # approx log(0.5)-1, log(1)-1, log(10)-3
+
+    ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # approx [0.5, 1.0, 1.5]
+    assert torch.allclose(
+        ratios, torch.tensor([[0.5, 1.0, 10.0]], device=device), rtol=1e-3
+    )
+
+    # Fill full tensors (only need first dim for B=1)
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # --- Hand Calculation ---
+    # Actor Loss Calculation
+    ratios_clamped = torch.clamp(
+        ratios, 1.0 - ratio_clip, 1.0 + ratio_clip
+    )  # [0.8, 1.0, 1.2]
+    assert torch.allclose(
+        ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
+    )
+
+    # Standard PPO clipping
+    loss1 = -adv_masked * ratios  # -[1*0.5, -1*1.0, -4*10.] = [-0.5, 1.0, 40.]
+    assert torch.allclose(
+        loss1, torch.tensor([[-0.5, 1.0, 40.0]], device=device), rtol=1e-3
+    )
+
+    loss2 = -adv_masked * ratios_clamped  # -[1*0.8, -1*1.0, -4*1.2] = [-0.8, 1.0, 4.8]
+    assert torch.allclose(
+        loss2, torch.tensor([[-0.8, 1.0, 4.8]], device=device), rtol=1e-3
+    )
+
+    max_loss = torch.maximum(loss1, loss2)  # [-0.5, 1.0, 40.]
+    assert torch.allclose(
+        max_loss, torch.tensor([[-0.5, 1.0, 40.0]], device=device), rtol=1e-3
+    )
+
+    # Dual clipping
+    loss3 = -adv_masked * ratio_clip_c  # -[1*3.0, -1*3.0, -4*3.0] = [-3.0, 3.0, 12.0]
+    assert torch.allclose(
+        loss3, torch.tensor([[-3.0, 3.0, 12.0]], device=device), rtol=1e-3
+    )
+    min_loss = torch.minimum(max_loss, loss3)  # [-3.0, 1.0, 12.0]
+    assert torch.allclose(
+        min_loss, torch.tensor([[-3.0, 1.0, 12.0]], device=device), rtol=1e-3
+    )
+
+    # For negative advantages, dual clipping reduces the loss from 40.0 to 12.0
+    clip_loss = torch.where(adv_masked < 0, min_loss, max_loss)  # [-0.5, 1.0, 12.0]
+    assert torch.allclose(
+        clip_loss, torch.tensor([[-0.5, 1.0, 12.0]], device=device), rtol=1e-3
+    ), f"clip_loss is {clip_loss}, expected [[-0.5, 1.0, 12.0]]"
+
+    expected_loss = torch.mean(clip_loss)  # (-0.5 + 1.0 + 12.0) / 3 = 12.5 / 3 = 4.1667
+    assert torch.allclose(expected_loss, torch.tensor(4.1667, device=device), rtol=1e-3)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, seq_len, vocab_size, device
+    )
+
+    actual_loss, _ = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    torch.testing.assert_close(actual_loss, expected_loss)
+
+
+def test_clipped_pg_loss_entropy():
+    """Tests approximate entropy calculation in ClippedPGLossFn."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = {
+        "ratio_clip_min": 0.2,
+        "ratio_clip_max": 0.2,
+        "ratio_clip_c": None,
+        "reference_policy_kl_penalty": 0.0,  # Disable KL for simplicity
+        "disable_ppo_ratio": False,
+        "use_on_policy_kl_approximation": False,
+        "use_importance_sampling_correction": False,  # This flag does not affect entropy calculation
+        "token_level_loss": True,
+    }
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Log probs for 3 tokens (default token_mask is [0, 1, 1, 1], so 3 unmasked after slicing)
+    # curr_lp_masked: log probabilities from the current policy (model output)
+    # gen_lp_masked: log probabilities from the generation policy (from data)
+    curr_lp_masked = torch.tensor([[-0.5, -1.0, -1.5]], device=device)
+    gen_lp_masked = torch.tensor([[-0.6, -1.1, -1.6]], device=device)
+
+    # prev_lp_masked is needed for actor loss but not directly for this entropy formula
+    prev_lp_masked = torch.tensor([[-0.4, -0.9, -1.4]], device=device)
+
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+    data["generation_logprobs"][0, 1:] = gen_lp_masked
+    # _create_exact_logits needs input_ids
+    data["input_ids"] = torch.randint(0, vocab_size, (1, seq_len), device=device)
+
+    # seq_entropy_approx = -masked_mean(torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs, mask)
+    # curr_lp_masked represents curr_logprobs for the hand calculation.
+    # gen_lp_masked represents generation_logprobs.
+    importance_weight_factor = torch.exp(curr_lp_masked - gen_lp_masked)
+    entropy_terms = importance_weight_factor * curr_lp_masked
+    expected_entropy = -torch.mean(
+        entropy_terms
+    )  # torch.mean because default mask applies to these 3 terms
+
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, data["input_ids"], seq_len, vocab_size, device
+    )
+    _, metrics = loss_fn(
+        dummy_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    torch.testing.assert_close(
+        torch.tensor(metrics["approx_entropy"], device=device),
+        expected_entropy,
+        rtol=1e-3,
+        atol=1e-5,
+    )

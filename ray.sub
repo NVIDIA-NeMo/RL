@@ -8,6 +8,20 @@
 #SBATCH --dependency=singleton
 #SBATCH --gres=gpu:8
 
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -eoux pipefail
 
@@ -39,11 +53,21 @@ DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-54257}
 ########################################################
+# Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
+RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+########################################################
 
-# Defaults to placing uv cache inside the SLURM_SUBMIT_DIR
-# This directory is mounted into the container at /home/ray/.cache/uv so it is shared between the head and worker nodes
-UV_CACHE_DIR="${UV_CACHE_DIR:-$SLURM_SUBMIT_DIR/uv_cache}"
-mkdir -p $UV_CACHE_DIR
+# Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
+unset UV_CACHE_DIR
+
+if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
+  mkdir -p "$UV_CACHE_DIR_OVERRIDE"
+  if [[ -n $MOUNTS ]]; then
+    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+  else
+    MOUNTS="$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+  fi
+fi
 
 # Create logs directory
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
@@ -53,7 +77,7 @@ mkdir -p $LOG_DIR
 COMMON_SRUN_ARGS=""
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
-COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS,$UV_CACHE_DIR:/home/ray/.cache/uv"
+COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # TODO: delete these (just for debugging)
@@ -61,8 +85,10 @@ COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 COMMON_SRUN_ARGS+=" --gres=gpu:8"
 
-# Number of GPUs per node
-gpus_per_node=8
+# Number of GPUs per worker node
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+# Number of CPUs per worker node
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 
 num_retries=3
 
@@ -83,7 +109,7 @@ head_node_ip=${ip_addresses_array[0]}
 ip_head=$head_node_ip:$PORT
 
 # First we start the head of the ray cluster on one of the physical nodes
-# Set GPU/CPU resources to 0 to avoid scheduling on the head node
+# Give the head node actual resources to make it schedulable
 
 head_cmd=$(cat <<EOF
 # Touch a file to indicate that the head node has started
@@ -113,11 +139,44 @@ monitor-sidecar() {
 }
 monitor-sidecar &
 
+# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
+log-sync-sidecar() {
+  set +x
+  if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
+    return
+  fi
+  mkdir -p $LOG_DIR/ray
+  while true; do
+    sleep $RAY_LOG_SYNC_FREQUENCY
+    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in /tmp/ray/session_[0-9]*/; do
+        if [[ -d "\$session_dir/logs" ]]; then
+          session_name=\$(basename "\$session_dir")
+          mkdir -p "$LOG_DIR/ray/\$session_name"
+          if command -v rsync > /dev/null 2>&1; then
+            rsync -ahP "\$session_dir/logs/" "$LOG_DIR/ray/\$session_name/logs/" 2>/dev/null || true
+          else
+            cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$session_name/"
+          fi
+        fi
+      done
+    fi
+    if [[ -f "$LOG_DIR/ENDED" ]]; then
+      echo "Log sync sidecar terminating..."
+      break
+    fi
+  done
+}
+log-sync-sidecar &
+
+# Patch nsight.py before starting Ray head
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
     --disable-usage-stats \
-    --num-cpus=0 \
-    --num-gpus=0 \
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
@@ -146,14 +205,15 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 
-NUM_ACTORS=$((gpus_per_node * SLURM_JOB_NUM_NODES))
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Start Ray worker nodes
-# We want 1 Ray worker node per physical node
+# We want 1 Ray worker node per physical node (excluding the head node)
 # Worker nodes are started with ray start but without the --head flag
-for ((i = 0; i < SLURM_JOB_NUM_NODES; i++)); do
+# Start from node 1 since node 0 is running the head
+for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
@@ -180,10 +240,13 @@ monitor-sidecar() {
 }
 monitor-sidecar &
 
+# Patch nsight.py before starting Ray worker
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
           --disable-usage-stats \
-          --resources="{\"worker_units\": $gpus_per_node}" \
+          --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
@@ -208,10 +271,7 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-  if [[ $i -eq 0 ]]; then
-    OVERLAP_HEAD_AND_WORKER_ARG="--overlap"
-  fi
-  srun $COMMON_SRUN_ARGS ${OVERLAP_HEAD_AND_WORKER_ARG:-} --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$((16 * gpus_per_node)) -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
   sleep 3
 done
 
@@ -254,21 +314,30 @@ echo "All workers connected!"
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID --json | jq -r '.jobs[].current_working_directory')
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --gpus=0 --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
-# No args launches on the head node
+# No args launches on the head node (node 0)
+# Args 1-N launch on worker nodes (nodes 1 through N-1)
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  srun --no-container-mount-home --gpus=0 -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  srun --no-container-mount-home --gres=gpu:8 -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
 else
+  # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
+  # and use nodes_array[1] through nodes_array[N-1]
+  if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
+    echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
+    exit 1
+  fi
   nodes_array=($nodes)
   srun --no-container-mount-home --gres=gpu:8 -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh"
+  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
+  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
+  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
   sleep infinity
 fi

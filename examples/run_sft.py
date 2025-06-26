@@ -16,7 +16,7 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any, Dict
+from typing import Any
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -49,13 +49,14 @@ def parse_args():
 # Data Processing
 # =======================================================
 def sft_preprocessor(
-    datum_dict: Dict[str, Any],
+    datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer,
     max_seq_length: int,
     idx: int,
     add_bos: bool = True,
     add_eos: bool = True,
+    add_generation_prompt: bool = False,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
     message_log = get_formatted_message_log(
@@ -64,6 +65,7 @@ def sft_preprocessor(
         task_data_spec,
         add_bos_token=add_bos,
         add_eos_token=add_eos,
+        add_generation_prompt=add_generation_prompt,
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)
@@ -101,6 +103,12 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             data_config["input_key"],
             data_config["output_key"],
         )
+    elif data_cls == "openmathinstruct2":
+        data = hf_datasets.OpenMathInstruct2Dataset(
+            split=data_config["split"],
+            output_key=data_config["output_key"],
+            prompt_file=data_config["prompt_file"],
+        )
     else:
         raise ValueError(f"Unknown dataset class: {data_cls}")
     print(
@@ -119,6 +127,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             sft_preprocessor,
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
+            add_generation_prompt=data_config["add_generation_prompt"],
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -131,6 +140,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             sft_preprocessor,
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
+            add_generation_prompt=data_config["add_generation_prompt"],
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )

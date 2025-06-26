@@ -19,7 +19,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 # Move to the project root
 cd $SCRIPT_DIR/..
 find_files_with_missing_copyright() {
-find ./nemo_rl/ ./docs/*.py ./examples/ ./tests/ ./tools/ -type f -name '*.py' | while read path; do
+find ./nemo_rl/ ./docs/*.py ./examples/ ./tests/ ./tools/ ./3rdparty/*/*.py -type f -name '*.py' | while read path; do
     echo -en $path"\t"
     head -2 $path | grep -iv 'coding=' | head -1
 done \

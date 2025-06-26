@@ -1,0 +1,14 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+
+[build-system]
+requires = [
+    "setuptools",
+    "pybind11",
+]
+
+[project]
+name = "megatron-core"
+dynamic = ["dependencies", "version"]
+description = "Megatron Core - a library for efficient and scalable training of transformer based models"
+authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]

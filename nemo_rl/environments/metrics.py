@@ -14,7 +14,9 @@
 import torch
 
 
-def calculate_pass_rate_per_prompt(prompts, is_correct):
+def calculate_pass_rate_per_prompt(
+    prompts: torch.Tensor, is_correct: torch.Tensor
+) -> float:
     """Function to compute fraction of prompts that have at least one correct answer (reward > 0).
 
     prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device

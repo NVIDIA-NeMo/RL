@@ -13,40 +13,53 @@
 # limitations under the License.
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, TypedDict, Union
+from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
 
 import torch
+from transformers import PreTrainedTokenizerBase
 
 # OpenAI-API-like message log, but every messsage may contain associated tensors (i.e. tokenized strings and logprobs) in addition to the original "content" string
-LLMMessageLogType = List[Dict[str, Union[str, torch.Tensor]]]
+LLMMessageLogType = list[dict[str, Union[str, torch.Tensor]]]
 
 # Flattened message log where all tensors and data are concatenated together for a conversation
 # Converts a conversation from list-of-turns format to key-value format with concatenated tensors
-FlatMessagesType = Dict[str, Union[List[str], torch.Tensor]]
+FlatMessagesType = dict[str, Union[list[str], torch.Tensor]]
+
+PathLike = Union[str, "os.PathLike[Any]"]
+TokenizerType = PreTrainedTokenizerBase
 
 
 class DatumSpec(TypedDict):
     message_log: LLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
-    extra_env_info: Dict[str, Any]
+    extra_env_info: dict[str, Any]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
-    task_name: Optional[str] = "default"
-    stop_strings: Optional[List[str]] = None  # Optional stop strings for generation
-    __extra__: Any  # This allows additional fields of any type
+    task_name: NotRequired[str] = "default"
+    stop_strings: NotRequired[list[str]] = None  # Optional stop strings for generation
+    __extra__: NotRequired[Any]  # This allows additional fields of any type
+
+
+class DPODatumSpec(TypedDict):
+    message_log_chosen: LLMMessageLogType
+    message_log_rejected: LLMMessageLogType
+    length_chosen: int
+    length_rejected: int
+    loss_multiplier: float
+    idx: int
 
 
 @dataclass
 class TaskDataSpec:
     task_name: Optional[str] = None
     # prompt
-    prompt_file: Optional[os.PathLike] = None
+    prompt_file: Optional[PathLike] = None
 
-    system_prompt_file: Optional[Union[str, os.PathLike]] = None
+    system_prompt_file: Optional[PathLike] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         def load_prompt_file(
-            prompt_file: Optional[os.PathLike],
+            prompt_file: Optional[PathLike],
         ) -> Optional[str]:
             """Load prompt from file if it exists, otherwise return as is."""
             if prompt_file is None:
@@ -61,7 +74,7 @@ class TaskDataSpec:
         self.system_prompt = load_prompt_file(self.system_prompt_file)
         self.prompt = load_prompt_file(self.prompt_file)
 
-    def copy_defaults(self, from_spec: "TaskDataSpec"):
+    def copy_defaults(self, from_spec: "TaskDataSpec") -> None:
         """Apply default values from another Task instance for any None attributes."""
         default_attrs = {
             "system_prompt": from_spec.system_prompt,
@@ -78,9 +91,9 @@ class TaskDataProcessFnCallable(Protocol):
 
     def __call__(
         self,
-        datum_dict: Dict[str, Any],
+        datum_dict: dict[str, Any],
         task_data_spec: TaskDataSpec,
-        tokenizer,
+        tokenizer: TokenizerType,
         max_seq_length: int,
         idx: int,
     ) -> DatumSpec:

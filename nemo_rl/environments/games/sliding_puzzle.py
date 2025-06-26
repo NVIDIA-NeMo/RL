@@ -14,14 +14,13 @@
 
 import copy
 import random
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -34,14 +33,14 @@ class SlidingPuzzleConfig(TypedDict):
 
 
 class SlidingPuzzleMetadata(TypedDict):
-    game_state: Dict[str, Any]  # Stores the dict returned by SlidingPuzzleGame methods
+    game_state: dict[str, Any]  # Stores the dict returned by SlidingPuzzleGame methods
     num_moves: int
     max_moves: int
 
 
 class SlidingPuzzleGameLogic:
     @staticmethod
-    def generate(config: Dict[str, Any]) -> Dict[str, Any]:
+    def generate(config: dict[str, Any]) -> dict[str, Any]:
         """Generate a new Sliding Puzzle."""
         size = config.get("size", 4)  # Default to 4x4 (15-puzzle)
         shuffle_moves = config.get(
@@ -92,7 +91,7 @@ class SlidingPuzzleGameLogic:
         }
 
     @staticmethod
-    def init(game_state: Dict[str, Any]) -> str:
+    def init(game_state: dict[str, Any]) -> str:
         """Initialize Sliding Puzzle game and return welcome message."""
         size = game_state["size"]
 
@@ -106,8 +105,8 @@ class SlidingPuzzleGameLogic:
 
     @staticmethod
     def step(
-        action: str, game_state: Dict[str, Any]
-    ) -> Tuple[str, float, bool, Dict[str, Any]]:
+        action: str, game_state: dict[str, Any]
+    ) -> tuple[str, float, bool, dict[str, Any]]:
         """Process an action in the Sliding Puzzle game."""
         size = game_state["size"]
         grid = game_state["grid"]
@@ -201,7 +200,7 @@ class SlidingPuzzleGameLogic:
         return response, reward, is_terminated, new_state
 
     @staticmethod
-    def render(game_state: Dict[str, Any]) -> str:
+    def render(game_state: dict[str, Any]) -> str:
         """Render the current Sliding Puzzle game state."""
         grid = game_state["grid"]
         size = game_state["size"]
@@ -267,11 +266,11 @@ class SlidingPuzzleRunner:
         self,
         message_log: LLMMessageLogType,
         metadata: SlidingPuzzleMetadata,
-    ) -> Tuple[
-        Dict[str, str],
+    ) -> tuple[
+        dict[str, str],
         float,
         bool,
-        Optional[List[str]],
+        Optional[list[str]],
         Optional[SlidingPuzzleMetadata],
     ]:
         """Processes a single turn for the sliding puzzle task."""
@@ -341,7 +340,6 @@ class SlidingPuzzleRunner:
 
 @ray.remote
 class SlidingPuzzleEnv(EnvironmentInterface):
-    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
     """Sliding Puzzle environment (Ray Actor)."""
 
     def __init__(self, cfg: Optional[SlidingPuzzleConfig] = None):
@@ -351,8 +349,8 @@ class SlidingPuzzleEnv(EnvironmentInterface):
 
     def step(
         self,
-        message_log_batch: List[LLMMessageLogType],
-        metadata_batch: List[SlidingPuzzleMetadata],
+        message_log_batch: list[LLMMessageLogType],
+        metadata_batch: list[SlidingPuzzleMetadata],
     ) -> EnvironmentReturn:
         """Processes a batch of sliding puzzle interactions."""
         # Since logic is synchronous, process sequentially (can parallelize if logic becomes heavy)
@@ -391,7 +389,7 @@ class SlidingPuzzleEnv(EnvironmentInterface):
 
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict
-    ) -> Tuple[BatchedDataDict, dict]:
+    ) -> tuple[BatchedDataDict, dict]:
         # Calculate success rate based on final reward == 1.0
         final_rewards = batch.get(
             "total_reward", torch.tensor([0.0] * len(batch["idx"]))

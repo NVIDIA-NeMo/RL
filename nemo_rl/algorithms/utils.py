@@ -14,10 +14,11 @@
 import random
 import warnings
 from functools import wraps
+from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.data import hf_datasets
 from nemo_rl.models.policy import TokenizerConfig
@@ -25,7 +26,7 @@ from nemo_rl.models.policy import TokenizerConfig
 
 def calculate_kl_penalty_joschu2020(
     logprobs_policy: torch.Tensor, logprobs_reference: torch.Tensor
-):
+) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two log_probs.
 
     From Schulman 2020, always positive.
@@ -42,7 +43,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
@@ -55,15 +56,17 @@ def calculate_baseline_and_std_per_prompt(
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
 
     Returns:
-    tensor (b,) of baselines on the same device as 'rewards'
+    tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
-    reward_device = rewards.get_device()
-    if reward_device == -1:
+    device_ordinal = rewards.get_device()
+    if device_ordinal == -1:
         reward_device = torch.device("cpu")
+    else:
+        reward_device = torch.device(reward_device)
 
     for i in range(len(unique_prompts)):
         is_matching_prompt = (prompts == unique_prompts[i]).all(1)
@@ -107,9 +110,9 @@ def calculate_baseline_and_std_per_prompt(
     return baseline, std
 
 
-def surpress_user_warnings(f):
+def surpress_user_warnings(f):  # type: ignore
     @wraps(f)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args, **kwargs):  # type: ignore
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             output = f(*args, **kwargs)
@@ -118,14 +121,22 @@ def surpress_user_warnings(f):
     return wrapper
 
 
-# need to surpress the masked tensor warnings from pytorch
-@surpress_user_warnings
-def masked_mean(values, mask, dim=None):
-    """Masks values with mask, and computes the mean of the values using the masked values."""
-    return (values * mask).sum(dim=dim) / (mask.sum(dim=dim) + 1e-8)
+def masked_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    dim: Optional[int] = None,
+    global_normalization_factor: Optional[torch.Tensor | float] = None,
+):
+    """Computes the mean of a microbatch, using a global statistic as the normalization factor."""
+    normalization_factor = (
+        torch.sum(mask, dim=dim)
+        if global_normalization_factor is None
+        else global_normalization_factor
+    )
+    return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     """Sets the seed for python, numpy, and pytorch."""
     random.seed(seed)
     np.random.seed(seed)
@@ -133,7 +144,7 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig) -> AutoTokenizer:
+def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -151,7 +162,7 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> AutoTokenizer:
                     If not specified, the tokenizer's default template will be used.
 
     Returns:
-        AutoTokenizer: The configured tokenizer instance
+        PreTrainedTokenizerBase: The configured tokenizer instance
 
     Examples:
         ```{doctest}
@@ -189,7 +200,9 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> AutoTokenizer:
         >>> assert formatted == " START: You are a helpful AI assistant. END. START: Hello! END."
         ```
     """
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_config["name"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_config["name"], trust_remote_code=True
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if "chat_template" in tokenizer_config:
