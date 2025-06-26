@@ -29,7 +29,6 @@ def kitchen_block_scale(
     original_shape = data_hp.shape
     blk_m, blk_n = data_hp.shape[0] // block_size0, data_hp.shape[1] // block_size1
 
-
     assert block_size1 == block_size0
     data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
 
@@ -56,6 +55,7 @@ def kitchen_block_scale(
             1.0,
             torch.exp2(127 - exponent.to(torch.float32)),
         )
+        descale_fp_inv = torch.reciprocal(descale_fp)
     else:
         descale_fp = max_dtype / max_abs
         descale_fp = torch.where(
@@ -64,7 +64,7 @@ def kitchen_block_scale(
         descale_fp = torch.where(
             descale_fp == torch.inf, torch.finfo(data_hp.dtype).max, descale_fp
         )
-        exponent = torch.reciprocal(descale_fp)
+        descale_fp_inv = torch.reciprocal(descale_fp)
 
     # Scale and saturate cast the data elements to max of target dtype
     data_lp = torch.clamp(data_hp * descale_fp, min=-1 * max_dtype, max=max_dtype)
@@ -79,7 +79,7 @@ def kitchen_block_scale(
     )
 
     # Convert to target format, but still in original precision container
-    return fp_data, exponent 
+    return fp_data, descale_fp_inv 
 
 def is_fp8_weight(name):
     fp8_params = [

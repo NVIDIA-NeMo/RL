@@ -306,7 +306,9 @@ class BaseVllmGenerationWorker:
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
             if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
                 from nemo_rl.models.generation import fp8
-                fp8.USE_POW2_SCALE = False
+                fp8.USE_POW2_SCALE = True
+                print("Using POW2 Scaling!")
+                
             # overriden by quant config, just to stop vllm from complaining
             self.precision = "bfloat16" 
 
