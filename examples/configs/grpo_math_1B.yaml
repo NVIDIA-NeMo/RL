@@ -101,7 +101,7 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
+      async_engine: false
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
