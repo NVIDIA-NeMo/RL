@@ -1100,6 +1100,12 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        if self.cfg["vllm_cfg"]["pipeline_parallel_size"] > 1:
+            assert self.cfg["vllm_cfg"]["async_engine"], (
+                "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
+                "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
+            )
+
         # Ensure all required VllmConfig fields are present
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
