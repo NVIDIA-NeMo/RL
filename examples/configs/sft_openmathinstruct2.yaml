@@ -37,6 +37,9 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  dynamic_batching:
+    enabled: false
+
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
