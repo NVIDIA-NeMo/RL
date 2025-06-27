@@ -467,7 +467,7 @@ def dpo_train(
                         ):
                             warnings.warn(
                                 f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Defaulting to saving most recent k checkpoints."
+                                "Saving most recent k checkpoints instead."
                             )
                             master_config["checkpointing"]["metric_name"] = None
 
