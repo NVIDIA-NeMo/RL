@@ -134,7 +134,7 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
-      overlap_param_gather: false
+      overlap_param_gather: true
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
     
