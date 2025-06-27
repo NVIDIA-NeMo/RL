@@ -21,6 +21,7 @@ import glob
 import json
 import os
 import shutil
+import warnings
 from pathlib import Path
 from typing import Any, Optional, TypedDict, Union
 
@@ -173,22 +174,34 @@ class CheckpointManager:
             if checkpoint_history
             else None
         )
-        # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-        if self.higher_is_better:
-            # For higher_is_better=True: higher metric values first, then higher step numbers
-            checkpoint_history.sort(
-                key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
-            )
+
+        if self.metric_name is None:
+            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
-            # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-            checkpoint_history.sort(key=lambda x: (x[2][self.metric_name], -x[0]))
+            try:
+                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+                if self.higher_is_better:
+                    # For higher_is_better=True: higher metric values first, then higher step numbers
+                    checkpoint_history.sort(
+                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
+                    )
+                else:
+                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                    checkpoint_history.sort(
+                        key=lambda x: (x[2][self.metric_name], -x[0])
+                    )
+            except KeyError:
+                warnings.warn(
+                    f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
+                )
+                checkpoint_history.sort(key=lambda x: x[0], reverse=True)
 
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
             if exclude_latest and checkpoint[0] == latest_step:
                 continue
             print(
-                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}, metric: {checkpoint[2][self.metric_name]}"
+                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}"
             )
             shutil.rmtree(checkpoint[1])
 
@@ -206,8 +219,8 @@ class CheckpointManager:
             return None
         # sort by metric value
         if self.metric_name not in checkpoint_history[0][2]:
-            print(
-                f"WARNING:Metric {self.metric_name} not found in checkpoint history. Returning last"
+            warnings.warn(
+                f"Metric {self.metric_name} not found in checkpoint history. Returning last"
             )
             return self.get_latest_checkpoint_path()
 
