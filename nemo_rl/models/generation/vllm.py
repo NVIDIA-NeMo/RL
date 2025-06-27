@@ -378,6 +378,19 @@ class VllmGenerationWorker:
             ),
         )
 
+    async def init_collective_async(
+        self, data: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                data,
+                ip,
+                port,
+                world_size,
+            ),
+        )
+
     def llm(self):
         return self.llm
 
