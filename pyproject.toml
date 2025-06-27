@@ -23,7 +23,7 @@ dependencies = [
     "setuptools",
     "torch==2.7.0",
     "triton",
-    "flash-attn",
+    "flash-attn ; sys_platform == 'linux' and python_version == '3.12' and platform_machine != 'arm64' and platform_machine != 'aarch64'",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     "transformers>=4.51.0",

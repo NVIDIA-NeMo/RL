@@ -1017,30 +1017,7 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.8.0.post2"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.13' and platform_machine == 'arm64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
-]
-dependencies = [
-    { name = "einops", marker = "(python_full_version >= '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64') or platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform != 'linux'" },
-    { name = "torch", marker = "(python_full_version >= '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64') or platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform != 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/32/5c/c7610beeb2fc0e70d0c09a93490bb2d07fb6c8fa1f80ef9617b0cd556d76/flash_attn-2.8.0.post2.tar.gz", hash = "sha256:b51d7015eb78f7ab2c332ec7c36681d7e97834f010b52eb4db1f118351982f58", size = 7857730, upload-time = "2025-06-15T01:39:32.219Z" }
-
-[[package]]
-name = "flash-attn"
-version = "2.8.0.post2"
 source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
-resolution-markers = [
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'",
-]
 dependencies = [
     { name = "einops", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
     { name = "torch", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
@@ -2332,8 +2309,7 @@ dependencies = [
     { name = "colored" },
     { name = "datasets" },
     { name = "debugpy" },
-    { name = "flash-attn", version = "2.8.0.post2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64') or platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform != 'linux'" },
-    { name = "flash-attn", version = "2.8.0.post2", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }, marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
+    { name = "flash-attn", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2403,7 +2379,6 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "(python_full_version != '3.12.*' and platform_machine != 'aarch64' and platform_machine != 'arm64') or platform_machine == 'aarch64' or platform_machine == 'arm64' or sys_platform != 'linux'" },
     { name = "flash-attn", marker = "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "hydra-core" },
     { name = "math-verify" },
