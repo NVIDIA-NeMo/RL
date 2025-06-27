@@ -22,7 +22,7 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
-    elif "qwen" in hf_model_name.lower():
+    elif "qwen2" in hf_model_name.lower():
         from nemo.tron.converter.qwen import HFQwen2Importer
 
         print(f"Importing model {hf_model_name} to {output_path}...")
@@ -30,7 +30,19 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
-    elif "deepseek" in hf_model_name.lower() or "Moonlight-16B-A3B" in hf_model_name or hf_model_name in ("ByteDance-Seed/academic-ds-9B",):
+    elif "qwen3" in hf_model_name.lower():
+        from nemo.tron.converter.qwen import HFQwen3Importer
+
+        print(f"Importing model {hf_model_name} to {output_path}...")
+        importer = HFQwen3Importer(
+            hf_model_name,
+            output_path=output_path,
+        )
+    elif (
+        "deepseek" in hf_model_name.lower()
+        or "Moonlight-16B-A3B" in hf_model_name
+        or hf_model_name in ("ByteDance-Seed/academic-ds-9B",)
+    ):
         from nemo.tron.converter.deepseek import HFDeepSeekImporter
 
         print(f"Importing model {hf_model_name} to {output_path}...")

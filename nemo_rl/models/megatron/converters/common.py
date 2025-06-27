@@ -29,9 +29,10 @@ from nemo.lightning.io.state import (
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.integrations.accelerate import init_empty_weights
 
+import nemo_rl.models.megatron.converters.deepseek as deepseek_converter
 import nemo_rl.models.megatron.converters.llama as llama_converter
 import nemo_rl.models.megatron.converters.qwen2 as qwen2_converter
-import nemo_rl.models.megatron.converters.deepseek as deepseek_converter
+import nemo_rl.models.megatron.converters.qwen3 as qwen3_converter
 
 _GROUP_TO_RANKS_CACHE = {}
 
@@ -114,6 +115,7 @@ def get_global_layer_num(s, cfg):
 
 def get_global_expert_num(s, cfg):
     """Assumes experts have 'experts.' in their name. Expert num succeeds '.weight'.
+
     Assumes expert model parallel size is set.
     In the state dict, the expert number is the local expert number (expert local).
     This function converts the local expert number to the global expert number.
@@ -244,7 +246,10 @@ def update_transforms_for_nemorl(export_transforms):
     # In place update
     for transform in export_transforms:
         if transform.transform.__name__ == "split_fc1":
-            if "experts" in transform.source_key and "shared_experts" not in transform.source_key:
+            if (
+                "experts" in transform.source_key
+                and "shared_experts" not in transform.source_key
+            ):
                 transform.transform = split_fc1_etp
             else:
                 transform.transform = split_fc1_tp
@@ -291,9 +296,15 @@ class MegatronToHFConverter:
         global_keys = ep_gathered_global_keys
         global_keys_map = {k: None for k in global_keys}
 
-        if "qwen" in hf_model_name.lower():
+        if "qwen2" in hf_model_name.lower():
             self.export_mapping = qwen2_converter.get_export_mapping(megatron_model)
             self.export_transforms = qwen2_converter.get_export_transforms(config)
+            self.get_source_fn = lambda source_state_dict, _: _ModelState(
+                source_state_dict
+            )
+        elif "qwen3" in hf_model_name.lower():
+            self.export_mapping = qwen3_converter.get_export_mapping(config)
+            self.export_transforms = qwen3_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )

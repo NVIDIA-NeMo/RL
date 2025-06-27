@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, List, Tuple, TypeVar
+from typing import Any, Iterator, List, Optional, Tuple, TypeVar
 
 import ray
 import torch
@@ -102,8 +102,8 @@ from nemo_rl.models.megatron.common import (
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.converters.common import (
-    get_all_rank_ids_in_group,
     MegatronToHFConverter,
+    get_all_rank_ids_in_group,
 )
 from nemo_rl.models.megatron.refit_utils import (
     gather_params,
@@ -464,12 +464,22 @@ class MegatronPolicyWorker:
         assert model_cfg.context_parallel_size == 1, (
             "Context parallel is not supported right now"
         )
+
+        ## moe-related
         model_cfg.expert_tensor_parallel_size = self.cfg["megatron_cfg"][
             "expert_tensor_parallel_size"
         ]
         model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
             "expert_model_parallel_size"
         ]
+        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
+            "moe_router_load_balancing_type"
+        ]
+        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
+            "moe_router_bias_update_rate"
+        ]
+        model_cfg.moe_router_dtype = "fp64"
+
         model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
         model_cfg.bf16 = self.dtype == torch.bfloat16
         model_cfg.fp16 = self.dtype == torch.float16
@@ -478,13 +488,7 @@ class MegatronPolicyWorker:
         ]  # FP32 for amp
         model_cfg.pipeline_dtype = dtype_map[self.cfg["megatron_cfg"]["pipeline_dtype"]]
         model_cfg.parallel_output = True
-        model_cfg.moe_router_dtype = "fp64"
-        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
-            "moe_router_load_balancing_type"
-        ]
-        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
-            "moe_router_bias_update_rate"
-        ]
+
         model_cfg.disable_bf16_reduced_precision_matmul = True
         if self.cfg["megatron_cfg"]["activation_checkpointing"]:
             model_cfg.activations_checkpoint_granularity = "full"
@@ -1260,11 +1264,15 @@ class MegatronPolicyWorker:
             # else: not sharded (like embedding)
             pp_gathered_objs = [None]
             if local_key in state_dict and owner_pp_local_rank_id == pp_local_rank_id:
-                pp_gathered_objs[0] = get_global_key_from_local_key(local_key, self.model.config)
-            
+                pp_gathered_objs[0] = get_global_key_from_local_key(
+                    local_key, self.model.config
+                )
+
             # Step 2: gather global keys from ranks in PP group
             src_global_rank = pp_global_ranks[owner_pp_local_rank_id]
-            torch.distributed.broadcast_object_list(pp_gathered_objs, src=src_global_rank, group=pp_group)
+            torch.distributed.broadcast_object_list(
+                pp_gathered_objs, src=src_global_rank, group=pp_group
+            )
 
             # Step 3: gather global keys from ranks in EP group
             if ep_pattern.search(local_key):
@@ -1275,8 +1283,10 @@ class MegatronPolicyWorker:
                 flat_gathered_objs = [x for y in ep_gathered_objs for x in y]
             else:
                 flat_gathered_objs = pp_gathered_objs
-            
-            final_key_to_global_keys[(local_key, owner_pp_local_rank_id)] = flat_gathered_objs
+
+            final_key_to_global_keys[(local_key, owner_pp_local_rank_id)] = (
+                flat_gathered_objs
+            )
 
         et = time.time()
         if (
