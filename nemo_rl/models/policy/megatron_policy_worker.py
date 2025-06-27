@@ -421,15 +421,6 @@ class MegatronPolicyWorker:
             pretrained_path, "iter_0000000/run_config.yaml"
         )
 
-        assert not (
-            self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
-                "overlap_param_gather"
-            ]
-            and self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
-        ), (
-            "Using overlap param gather together with distributed optimizer has known convergence issues. Please disable overlap param gather."
-        )
-
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -645,6 +636,13 @@ class MegatronPolicyWorker:
         self._held_gather_buffer = None
         self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
 
+        self.should_disable_forward_pre_hook = (
+            self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
+            and self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+                "overlap_param_gather"
+            ]
+        )
+
     def configure_worker(self, num_gpus: int, bundle_indices: Optional[tuple] = None):
         USE_EXPANDABLE_SEGMENTS = False  # Disabling this right now as it seems to cause vLLM refit issues with Ampere
         if USE_EXPANDABLE_SEGMENTS:
@@ -661,6 +659,14 @@ class MegatronPolicyWorker:
     def get_gpu_info(self):
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
+
+    def enable_forward_pre_hook(self):
+        assert isinstance(self.model, DistributedDataParallel)
+        self.model.enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync=True):
+        assert isinstance(self.model, DistributedDataParallel)
+        self.model.disable_forward_pre_hook(param_sync=param_sync)
 
     def train(
         self,
@@ -1001,6 +1007,10 @@ class MegatronPolicyWorker:
         On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references
         On exit: Restores original references and re-flips cuda/cpu
         """
+        ## disable overlap param gather when swapping weights
+        if self.should_disable_forward_pre_hook:
+            self.disable_forward_pre_hook()
+
         with torch.no_grad():
             try:
                 # Save original references
@@ -1034,6 +1044,10 @@ class MegatronPolicyWorker:
 
                 gc.collect()
                 torch.cuda.empty_cache()
+
+                ## re-enable overlap param gather after weight swap
+                if self.should_disable_forward_pre_hook:
+                    self.enable_forward_pre_hook()
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
     def get_reference_policy_logprobs(
