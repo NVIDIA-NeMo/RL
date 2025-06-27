@@ -32,4 +32,4 @@ To enable DTensor (FSDP2) training:
 
 ## Configuration Examples
 
-For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](../../examples/configs/recipes/llm/) folder. This directory contains ready-to-use configurations for various supported combinations.
+For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes/llm) folder. This directory contains ready-to-use configurations for various supported combinations.
