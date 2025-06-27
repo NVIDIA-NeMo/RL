@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
-import io
 import logging
 from typing import Dict, List, Optional, Tuple, TypedDict
 
@@ -21,6 +19,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.environments.code.livecodebench import compute_score, prepare_tests
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -28,117 +27,79 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
-from nemo_rl.environments.utils import chunk_list_to_workers
+from nemo_rl.environments.utils import chunk_list_to_workers, extract_code
 
 
-class IFEvalEnvConfig(TypedDict):
+class CodeEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
+    timeout: int = 10  # Timeout for the code execution
 
 
-@contextlib.contextmanager
-def _mute_output():
-    devnull_out, devnull_err = io.StringIO(), io.StringIO()
-    with (
-        contextlib.redirect_stdout(devnull_out),
-        contextlib.redirect_stderr(devnull_err),
-    ):
-        yield
-
-
-class IFEvalEnvironmentMetadata(TypedDict):
-    instruction_id_list: list
-    instruction_kwargs: list
+class CodeEnvironmentMetadata(TypedDict):
+    unittests: Optional[List[Dict[str, str]]]
+    fn_name: Optional[str]
 
 
 @ray.remote
-class IFEvalVerifyWorker:
-    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.IFEVAL
+class CodeVerifyWorker:
+    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
-    def __init__(self):
-        from nemo_rl.environments.instruction_following.instructions_registry import (
-            INSTRUCTION_DICT,
+    def __init__(self, verbose: bool = False):
+        logging.getLogger("code_verify").setLevel(
+            logging.INFO if verbose else logging.WARNING
         )
-
-        self.INSTRUCTION_DICT = INSTRUCTION_DICT
-        logging.getLogger("ifeval_verify").setLevel(logging.CRITICAL)
-
-    def instruction_following_rewards(self, prompt, response, args):
-        """Tests response to see if instrutions are followed."""
-        try:
-            task_args = args
-            instruction_list = task_args["instruction_id_list"]
-            is_following_list = []
-
-            for index, instruction_id in enumerate(instruction_list):
-                try:
-                    instruction_cls = self.INSTRUCTION_DICT[instruction_id]
-                    instruction = instruction_cls(instruction_id)
-
-                    kwargs = (
-                        task_args["instruction_kwargs"][index]
-                        if task_args["instruction_kwargs"][index] is not None
-                        else {}
-                    )
-                    instruction.build_description(**kwargs)
-                    instruction_args = instruction.get_instruction_args()
-                    if instruction_args and "prompt" in instruction_args:
-                        instruction.build_description(prompt=prompt)
-
-                    if response.strip() and instruction.check_following(response):
-                        is_following_list.append(True)
-                    else:
-                        is_following_list.append(False)
-                except Exception as e:
-                    print(f"Error in instruction_following_rewards: {e}, task: {args}")
-
-            low, high = 0, 1
-            correctness = sum(is_following_list) / len(is_following_list)
-            score = low + (high - low) * correctness
-            return score, True
-        except Exception as e:
-            print(f"Error in instruction_following_rewards: {e}")
-            return 0, False
+        self.verify_func = compute_score
 
     def verify(
         self,
         pred_responses: List[str],
-        prompts: List[str],
-        metadata: List[IFEvalEnvironmentMetadata],
+        metadata: List[CodeEnvironmentMetadata],
+        timeout: int,
     ) -> List[float]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
             pred_responses: List[str]. The predicted responses from the LLM.
-            prompts: List[str]. The prompts that were used to generate the responses.
-            metadata: List[IFEvalEnvironmentMetadata]. The metadata for the prompts.
+            metadata: List[CodeEnvironmentMetadata]. The metadata containing unit tests.
+            timeout: int. Timeout for code execution.
 
         Returns:
             List[float]. The rewards for each predicted response.
         """
         results = []
-        for response, prompt, metadata in zip(pred_responses, prompts, metadata):
+        for response, metadata_item in zip(pred_responses, metadata):
             try:
-                ret_score, _ = self.instruction_following_rewards(
-                    prompt, response, metadata
+                # No more output muting - let errors and debug info show!
+                final_response = response.split("</think>")[
+                    -1
+                ].strip()  # exclude <think> </think> tags
+                code_str = extract_code(final_response)
+
+                ret_score, execution_metadata = self.verify_func(
+                    code_str, metadata_item, timeout
                 )
 
-                results.append(float(ret_score))
-            except Exception:
-                results.append(0.0)
+            except Exception as e:
+                ret_score = 0.0
+
+            results.append(float(ret_score))
         return results
 
 
 @ray.remote
-class IFEvalEnvironment(EnvironmentInterface):
-    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.IFEVAL
+class CodeEnvironment(EnvironmentInterface):
+    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
-    def __init__(self, cfg: IFEvalEnvConfig):
+    def __init__(self, cfg: CodeEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
         self.workers = [
-            IFEvalVerifyWorker.options(
-                runtime_env={"py_executable": IFEvalVerifyWorker.DEFAULT_PY_EXECUTABLE}
+            CodeVerifyWorker.options(
+                runtime_env={
+                    "py_executable": CodeVerifyWorker.DEFAULT_PY_EXECUTABLE,
+                    "env_vars": {"OMP_NUM_THREADS": "1"},
+                }
             ).remote()
             for _ in range(self.num_workers)
         ]
@@ -151,13 +112,13 @@ class IFEvalEnvironment(EnvironmentInterface):
     def step(
         self,
         message_log_batch: List[List[Dict[str, str]]],
-        metadata: List[IFEvalEnvironmentMetadata],
+        metadata: List[CodeEnvironmentMetadata],
     ) -> EnvironmentReturn:
-        """Runs a step in the math environment.
+        """Runs a step in the code environment.
 
         Args:
             message_log: List[List[Dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
-            metadata: List[IFEvalEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness.
+            metadata: List[CodeEnvironmentMetadata]. The grader will use the 'unittests' and 'fn_name' keys to evaluate correctness.
 
         Returns:
             EnvironmentReturn: A tuple containing:
@@ -170,27 +131,26 @@ class IFEvalEnvironment(EnvironmentInterface):
         # Extract the assistant's responses from the message history
         # Each message list should have at least one assistant response
         assistant_response_batch = []
-        prompts = []
         for conversation in message_log_batch:
             assistant_responses = [
                 interaction["content"]
                 for interaction in conversation
                 if interaction["role"] == "assistant"
             ]
-            assistant_response_batch.append(assistant_responses[-1])
-            prompts.append(conversation[0]["content"])
+            assistant_response_batch.append("".join(assistant_responses))
+
+        unittests = [prepare_tests(m) for m in metadata]
 
         chunked_assistant_response_batch = chunk_list_to_workers(
             assistant_response_batch, self.num_workers
         )
-        chunked_prompts = chunk_list_to_workers(prompts, self.num_workers)
-        chunked_metadata = chunk_list_to_workers(metadata, self.num_workers)
+        chunked_unittests = chunk_list_to_workers(unittests, self.num_workers)
 
         # Process each chunk in parallel
         futures = [
-            self.workers[i].verify.remote(response, prompt, metadata)
-            for i, (response, prompt, metadata) in enumerate(
-                zip(chunked_assistant_response_batch, chunked_prompts, chunked_metadata)
+            self.workers[i].verify.remote(chunk, unittests_chunk, self.cfg["timeout"])
+            for i, (chunk, unittests_chunk) in enumerate(
+                zip(chunked_assistant_response_batch, chunked_unittests)
             )
         ]
 

@@ -97,3 +97,11 @@ def extract_answer_from_box(string):
             return None
 
     return None
+
+
+def extract_code(text: str) -> str:
+    outputlines = text.split("\n")
+    indexlines = [i for i, line in enumerate(outputlines) if "```" in line]
+    if len(indexlines) < 2:
+        return ""
+    return "\n".join(outputlines[indexlines[-2] + 1 : indexlines[-1]])
