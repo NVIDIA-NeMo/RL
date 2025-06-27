@@ -379,13 +379,13 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     )
 
 
-async def _generate_async(vllm_policy, tokenizer, test_input_data):
+async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):
     collected_indexed_outputs = []
     # generate_async is restricted to handle only single samples
     input_generator = test_input_data.make_microbatch_iterator(microbatch_size=1)
     for single_item_input in input_generator:
         async for original_idx, single_item_output in vllm_policy.generate_async(
-            single_item_input
+            single_item_input, greedy=greedy
         ):
             collected_indexed_outputs.append((original_idx, single_item_output))
 
@@ -691,7 +691,7 @@ async def test_vllm_generation_with_hf_training(
         print("Using vLLM policy for fast generation...")
         if async_engine:
             generation_results = await _generate_async(
-                vllm_policy, tokenizer, test_input_data
+                vllm_policy, tokenizer, test_input_data, greedy=True
             )
         else:
             generation_results = vllm_policy.generate(test_input_data, greedy=True)
@@ -1174,11 +1174,14 @@ def test_vllm_non_divisible_batch_handling(policy):
     )
 
 
-def test_vllm_refit_non_collocated_handles_update(
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_engine", [True, False])
+async def test_vllm_refit_non_collocated_update_weights(
     policy_cluster_separate,
     generation_cluster_separate,
     tokenizer,
     test_input_data,
+    async_engine,
 ):
     if (
         policy_cluster_separate.num_gpus_per_node < 1
@@ -1197,6 +1200,7 @@ def test_vllm_refit_non_collocated_handles_update(
     # Create VllmGeneration policy on its own cluster
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = 1
     vllm_config["colocated"]["enabled"] = False
     vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
@@ -1213,7 +1217,12 @@ def test_vllm_refit_non_collocated_handles_update(
     )
 
     # test generate
-    outputs = vllm_generation.generate(test_input_data, greedy=True)
+    if async_engine:
+        outputs = await _generate_async(
+            vllm_generation, tokenizer, test_input_data, greedy=True
+        )
+    else:
+        outputs = vllm_generation.generate(test_input_data, greedy=True)
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
     assert generated_texts == [
