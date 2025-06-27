@@ -62,7 +62,7 @@ def chunk_list_to_workers(to_chunk: List[Any], num_workers: int) -> List[List[An
 
 
 def extract_answer_from_box(string):
-    """Extract Answer String from \\boxed expression."""
+    r"""Extract Answer String from \\boxed expression."""
     idx = string.rfind("\\boxed")
     if idx < 0:
         idx = string.rfind("\\fbox")
