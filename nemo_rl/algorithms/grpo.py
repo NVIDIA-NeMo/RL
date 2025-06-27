@@ -82,7 +82,6 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
-    checkpoint_dir: str
 
 
 class GRPOSaveState(TypedDict):
