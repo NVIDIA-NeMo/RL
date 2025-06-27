@@ -1100,6 +1100,12 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        if self.cfg["vllm_cfg"]["pipeline_parallel_size"] > 1:
+            assert self.cfg["vllm_cfg"]["async_engine"], (
+                "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
+                "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
+            )
+
         # Ensure all required VllmConfig fields are present
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
@@ -1381,12 +1387,11 @@ class VllmGeneration(GenerationInterface):
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
 
-        # Get total batch size
-        batch_size = len(data["prompts"])
-
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+            dp_size, allow_uneven_shards=True
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
             sharded_data,
