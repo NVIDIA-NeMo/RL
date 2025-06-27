@@ -196,6 +196,8 @@ class CheckpointManager:
                 )
                 checkpoint_history.sort(key=lambda x: x[0], reverse=True)
 
+                self.metric_name = None
+
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
             if exclude_latest and checkpoint[0] == latest_step:
