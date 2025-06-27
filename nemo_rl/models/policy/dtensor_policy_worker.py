@@ -142,8 +142,13 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Disable NCCL SHM : https://github.com/NVIDIA-NeMo/RL/issues/564
-        os.environ["NCCL_SHM_DISABLE"] = "1"
+        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        if (
+            config["generation"] is not None
+            and not config["generation"]["colocated"]["enabled"]
+        ):
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
@@ -259,6 +264,10 @@ class DTensorPolicyWorker:
                 broadcast_from_rank0=True,
             ),
         )
+
+        # Manually broadcast buffers
+        for _, buf in self.model.named_buffers():
+            torch.distributed.broadcast(buf, src=0, group=self.dp_mesh.get_group())
 
         if self.cpu_offload:
             self.model = self.move_buffer_to_device(self.model, "cpu")
