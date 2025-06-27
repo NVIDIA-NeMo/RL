@@ -67,6 +67,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
+        ep_size = 1
 
         worker_builder_cls: str
         training_backend = None
@@ -91,6 +92,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
+            self.cp_size = config["megatron_cfg"]["context_parallel_size"]
+            ep_size = config["megatron_cfg"]["expert_model_parallel_size"]
             training_backend = "megatron"
         else:
             training_backend = "hf"

@@ -427,6 +427,7 @@ def refit_policy_generation(
         grouped_param_keys = policy.prepare_weights_for_ipc(
             _refit_buffer_size_gb=_refit_buffer_size_gb
         )
+        print(f"[Refit] Number of splits: {len(grouped_param_keys)}")
         # do update
         for keys in grouped_param_keys:
             ipc_handles = policy.get_weights_ipc_handles(keys)
@@ -459,7 +460,6 @@ def refit_policy_generation(
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
-
 
 # ===============================================================================
 # Training & Validation
