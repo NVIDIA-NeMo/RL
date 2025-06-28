@@ -330,10 +330,14 @@ class VllmGenerationWorker:
                 "weight_block_size": [128, 128]
             }
 
-            if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
-                from nemo_rl.models.generation import fp8
-                fp8.USE_POW2_SCALE = True
-                print("Using POW2 Scaling!")
+            from nemo_rl.models.generation import fp8
+            if self.cfg["vllm_cfg"].get("pow2_weight_scaling_factors", False):
+                fp8.USE_WEIGHT_POW2_SCALE = True
+                print("Using USE_WEIGHT_POW2_SCALE Scaling!")
+
+            if self.cfg["vllm_cfg"].get("pow2_activation_scaling_factors", False):
+                fp8.USE_ACTIVATION_POW2_SCALE = True
+                print("Using USE_ACTIVATION_POW2_SCALE Scaling!")
 
             vllm_kwargs["quantization"] = "fp8"
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
