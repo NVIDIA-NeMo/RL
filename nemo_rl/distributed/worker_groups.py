@@ -896,10 +896,3 @@ class RayWorkerGroup:
         self._worker_metadata = []
 
         return success
-
-    def print_worker_layout(self) -> None:
-        """Prints a visual representation of the worker layout across the virtual cluster.
-
-        This shows which workers are assigned to which nodes and GPUs.
-        """
-        self.cluster.print_cluster_grid(self)

@@ -359,6 +359,19 @@ class VllmGenerationWorker:
             ),
         )
 
+    async def init_collective_async(
+        self, data: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                data,
+                ip,
+                port,
+                world_size,
+            ),
+        )
+
     def llm(self):
         return self.llm
 
@@ -979,7 +992,7 @@ class VllmGenerationWorker:
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_collective cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
             result_or_coro = self.llm.collective_rpc(
@@ -1000,9 +1013,69 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    async def update_weights_from_collective_async(self, data: dict[str, Any]) -> bool:
+        """Async version of update_weights_from_collective."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
+                )
+
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_from_collective", args=(data,)
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
+            )
+
         self.llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    async def reset_prefix_cache_async(self):
+        """Async version of reset_prefix_cache."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
+            )
+
+        await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1100,6 +1173,12 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        if self.cfg["vllm_cfg"]["pipeline_parallel_size"] > 1:
+            assert self.cfg["vllm_cfg"]["async_engine"], (
+                "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
+                "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
+            )
+
         # Ensure all required VllmConfig fields are present
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
@@ -1305,6 +1384,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "init_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_collective"
+        )
+
         # Prepare rank
         total_workers = len(self.worker_group.workers)
         if self.dp_size == 0:
@@ -1316,7 +1402,7 @@ class VllmGeneration(GenerationInterface):
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
-            "init_collective",
+            method_name,
             data=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"ip": ip, "port": port, "world_size": world_size},
@@ -1381,12 +1467,11 @@ class VllmGeneration(GenerationInterface):
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
 
-        # Get total batch size
-        batch_size = len(data["prompts"])
-
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+            dp_size, allow_uneven_shards=True
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
             sharded_data,
@@ -1558,11 +1643,15 @@ class VllmGeneration(GenerationInterface):
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
-            if not self.cfg["colocated"]["enabled"]:
-                method_name = "reset_prefix_cache"
-            else:
+            if self.cfg["colocated"]["enabled"]:
                 method_name = (
                     "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+                )
+            else:
+                method_name = (
+                    "reset_prefix_cache_async"
+                    if self.cfg["vllm_cfg"]["async_engine"]
+                    else "reset_prefix_cache"
                 )
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
@@ -1636,9 +1725,16 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "update_weights_from_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_collective"
+        )
+
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(
-            "update_weights_from_collective",
+            method_name,
             data=info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
