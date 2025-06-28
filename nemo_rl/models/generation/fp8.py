@@ -1,18 +1,40 @@
 from typing import Any, Callable, Optional, Union
 
-import torch
+import torch, os
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from transformers import PretrainedConfig
 
 USE_WEIGHT_POW2_SCALE = False
 USE_ACTIVATION_POW2_SCALE = False
+FIRST_LAST_LAYERS_IN_BF16 = False
+NUM_LAYERS = None
+
+def get_first_last_layer_param_names(model_name):
+    def get_layer_params(layer_num):
+        return [
+            f'model.layers.{layer_num}.self_attn.q_proj',
+            f'model.layers.{layer_num}.self_attn.k_proj',
+            f'model.layers.{layer_num}.self_attn.v_proj',
+            f'model.layers.{layer_num}.mlp.up_proj',
+            f'model.layers.{layer_num}.mlp.down_proj',
+            f'model.layers.{layer_num}.mlp.gate_proj',
+        ]
+
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model_name, token=os.getenv('HF_TOKEN', None))
+    
+    global NUM_LAYERS
+    NUM_LAYERS = config_dict['num_hidden_layers']
+    layers = [0, NUM_LAYERS-1]
+
+    return [param for l in layers for param in get_layer_params(l)]
+
 
 def kitchen_block_scale(
     data_hp,
     weight_block_size,
 ):
-    if not len(data_hp.shape) == 2:
-        import pdb; pdb.set_trace()
     assert len(data_hp.shape) == 2, "Only 2d input tensor is supported"
 
     block_size1 = weight_block_size[1]
@@ -42,6 +64,7 @@ def kitchen_block_scale(
     max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
     # Calculate descale factor
     descale = max_abs / max_dtype
+
     if USE_WEIGHT_POW2_SCALE:
         # Calculate exponent HW instruction: cvt.rp.satfinite.ue8m0x2.f32
         exponent = torch.ceil(torch.log2(descale))
@@ -92,6 +115,9 @@ def is_fp8_weight(name):
         "up_proj.weight", 
         "gate_proj.weight",
     ]
+    if FIRST_LAST_LAYERS_IN_BF16:
+        if '0' in name or str(NUM_LAYERS-1) in name:
+            return False
     return any([param in name for param in fp8_params])
 
 def process_weights_after_loading(self, layer) -> None:
