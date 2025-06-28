@@ -2427,7 +2427,7 @@ test = [
 [[package]]
 name = "nemo-run"
 version = "0.5.0rc0.dev0"
-source = { git = "https://github.com/NVIDIA/NeMo-Run?rev=414f0077c648fde2c71bb1186e97ccbf96d6844c#414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+source = { git = "https://github.com/NVIDIA-NeMo/Run?rev=414f0077c648fde2c71bb1186e97ccbf96d6844c#414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 dependencies = [
     { name = "catalogue" },
     { name = "cryptography" },
@@ -2473,7 +2473,7 @@ requires-dist = [
     { name = "ijson" },
     { name = "lightning" },
     { name = "matplotlib" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA/NeMo-Run?rev=414f0077c648fde2c71bb1186e97ccbf96d6844c" },
+    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run?rev=414f0077c648fde2c71bb1186e97ccbf96d6844c" },
     { name = "onnx" },
     { name = "scikit-learn" },
     { name = "webdataset" },
