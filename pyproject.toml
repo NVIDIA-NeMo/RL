@@ -42,7 +42,8 @@ dependencies = [
     "debugpy",
     "nvtx",
     "matplotlib",
-    "plotly"
+    "plotly",
+    "mlflow",
 ]
 
 [project.optional-dependencies]
