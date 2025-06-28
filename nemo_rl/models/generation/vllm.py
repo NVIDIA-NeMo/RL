@@ -323,6 +323,7 @@ class VllmGenerationWorker:
             load_format = "auto"
 
         if self.cfg["vllm_cfg"]["precision"] == 'fp8':
+            from nemo_rl.models.generation import fp8
             fp8_block_quant_cfg = {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
@@ -338,6 +339,17 @@ class VllmGenerationWorker:
             if self.cfg["vllm_cfg"].get("pow2_activation_scaling_factors", False):
                 fp8.USE_ACTIVATION_POW2_SCALE = True
                 print("Using USE_ACTIVATION_POW2_SCALE Scaling!")
+
+            if self.cfg["vllm_cfg"].get("first_layer_layers_in_bf16", True):
+                print("Using FIRST_LAST_LAYERS_IN_BF16!")
+                fp8.FIRST_LAST_LAYERS_IN_BF16 = True
+                fp8_block_quant_cfg['ignored_layers'] = fp8.get_first_last_layer_param_names(
+                    self.model_name
+                )
+
+            if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
+                fp8.USE_POW2_SCALE = True
+                print("Using POW2 Scaling!")
 
             vllm_kwargs["quantization"] = "fp8"
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
