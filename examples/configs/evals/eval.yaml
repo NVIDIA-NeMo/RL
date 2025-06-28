@@ -30,10 +30,7 @@ data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
   prompt_file: null
   system_prompt_file: null
-  dataset_name: "HuggingFaceH4/aime_2024"
-  dataset_key: "train"
-  problem_key: "problem"
-  solution_key: "answer"
+  dataset_name: "aime2024"
 
 env:
   math:
