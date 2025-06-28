@@ -16,10 +16,12 @@
   - [DPO](#dpo)
     - [DPO Single Node](#dpo-single-node)
     - [DPO Multi-node](#dpo-multi-node)
+  - [Supported Training Backends](#training-backends)
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
+  - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
   - [Contributing](#contributing)
   - [Licenses](#licenses)
@@ -151,6 +153,18 @@ uv run python examples/run_grpo_math.py \
   logger.wandb.name="grpo-llama1b_math" \
   logger.num_val_samples_to_print=10
 ```
+
+The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+
+To train using this config on a single GPU:
+
+```sh
+# Run a GRPO math example on 1 GPU using the Megatron backend
+uv run python examples/run_grpo_math.py \
+  --config examples/configs/grpo_math_1B_megatron.yaml
+```
+
+For additional details on supported backends and how to configure the training backend to suit your setup, refer to the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ### GRPO Multi-node
 
@@ -310,6 +324,15 @@ sbatch \
     ray.sub
 ```
 
+## Training Backends
+
+NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
+
+- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
+- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
+
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
+
 ## Evaluation
 
 We provide evaluation tools to assess model capabilities.
@@ -359,6 +382,25 @@ Refer to `examples/configs/eval.yaml` for a full list of parameters that can be 
 ## Set Up Clusters
 
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Cluster Start](docs/cluster.md) documentation.
+
+## Tips and Tricks
+- If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
+  
+  ```sh
+  ModuleNotFoundError: No module named 'megatron'
+  ```
+  
+  If you see this error, there is likely an issue with your virtual environments. To fix this, first intialize the submodules:
+
+  ```sh
+  git submodule update --init --recursive
+  ```
+
+  and then force a rebuild of the virutal environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
+
+  ```sh
+  NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
+  ```
 
 ## Citation
 
