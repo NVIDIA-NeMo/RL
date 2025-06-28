@@ -38,7 +38,7 @@ from nemo_rl.models.generation.vllm_worker import BaseVllmGenerationWorker
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
 )
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
-    async def init_collective_async(
+    async def init_collective(
         self, data: int, ip: str, port: int, world_size: int
     ) -> None:
         await self.llm.collective_rpc(
@@ -51,7 +51,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
-    async def generate_async(
+    async def generate(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
@@ -304,7 +304,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             print(f"Error during vLLM shutdown: {e}")
             return False
 
-    async def report_device_id_async(self) -> list[str]:
+    async def report_device_id(self) -> list[str]:
         """Async version of report_device_id."""
         assert self.llm is not None, (
             "Attempting to report device id with either an uninitialized vLLM or non-model-owner"
@@ -324,7 +324,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
-    async def update_weights_from_ipc_handles_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
         """Async version of update_weights_from_ipc_handles.
 
         Args:
@@ -367,7 +367,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_collective(self, data: dict[str, Any]) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -403,7 +403,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
+    async def reset_prefix_cache(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
@@ -418,7 +418,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def sleep_async(self):
+    async def sleep(self):
         """Async version of sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -436,7 +436,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def wake_up_async(self, **kwargs):
+    async def wake_up(self, **kwargs):
         """Async version of wake_up."""
         assert self.llm is not None, (
             "Attempting to wake up with either an uninitialized vLLM or non-model-owner"

@@ -271,11 +271,7 @@ class VllmGeneration(GenerationInterface):
     def _report_device_id(self) -> list[list[str]]:
         """Report the device ID of vllm workers."""
         # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "report_device_id_async"
-            if self.cfg["vllm_cfg"]["async_engine"]
-            else "report_device_id"
-        )
+        method_name = "report_device_id"
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
@@ -292,11 +288,7 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group is not initialized")
 
         # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "init_collective_async"
-            if self.cfg["vllm_cfg"]["async_engine"]
-            else "init_collective"
-        )
+        method_name = "init_collective"
 
         # Prepare rank
         total_workers = len(self.worker_group.workers)
@@ -437,7 +429,7 @@ class VllmGeneration(GenerationInterface):
 
         # Run the generate_async method on the selected leader worker. This returns an ObjectRefGenerator.
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name="generate_async",
+            method_name="generate",
             worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
@@ -529,9 +521,7 @@ class VllmGeneration(GenerationInterface):
 
         try:
             # Choose the appropriate method based on async_engine setting
-            method_name = (
-                "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
-            )
+            method_name = "wake_up"
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
@@ -551,15 +541,9 @@ class VllmGeneration(GenerationInterface):
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
             if self.cfg["colocated"]["enabled"]:
-                method_name = (
-                    "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
-                )
+                method_name = "sleep"
             else:
-                method_name = (
-                    "reset_prefix_cache_async"
-                    if self.cfg["vllm_cfg"]["async_engine"]
-                    else "reset_prefix_cache"
-                )
+                method_name = "reset_prefix_cache"
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
@@ -596,11 +580,7 @@ class VllmGeneration(GenerationInterface):
             return False
 
         # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "update_weights_from_ipc_handles_async"
-            if self.cfg["vllm_cfg"]["async_engine"]
-            else "update_weights_from_ipc_handles"
-        )
+        method_name = "update_weights_from_ipc_handles"
 
         # Only send the ipc handles required by the current worker
         ipc_handles_list = []
@@ -633,11 +613,7 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group is not initialized")
 
         # Choose the appropriate method based on async_engine setting
-        method_name = (
-            "update_weights_from_collective_async"
-            if self.cfg["vllm_cfg"]["async_engine"]
-            else "update_weights_from_collective"
-        )
+        method_name = "update_weights_from_collective"
 
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(
