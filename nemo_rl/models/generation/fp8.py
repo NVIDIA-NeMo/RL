@@ -4,7 +4,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
-USE_POW2_SCALE = False
+USE_WEIGHT_POW2_SCALE = False
+USE_ACTIVATION_POW2_SCALE = False
 
 def kitchen_block_scale(
     data_hp,
@@ -41,7 +42,7 @@ def kitchen_block_scale(
     max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
     # Calculate descale factor
     descale = max_abs / max_dtype
-    if USE_POW2_SCALE:
+    if USE_WEIGHT_POW2_SCALE:
         # Calculate exponent HW instruction: cvt.rp.satfinite.ue8m0x2.f32
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
@@ -333,7 +334,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=USE_POW2_SCALE,
+            pow2_scale=USE_ACTIVATION_POW2_SCALE,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -349,7 +350,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=USE_POW2_SCALE,
+            pow2_scale=USE_ACTIVATION_POW2_SCALE,
             num_warps=num_warps,
             num_stages=num_stages,
         )
