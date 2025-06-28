@@ -74,10 +74,7 @@ class VllmConfig(GenerationConfig):
     vllm_kwargs: NotRequired[dict[str, Any]]
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
-class VllmGenerationWorker:
+class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -348,30 +345,6 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
-    def init_collective(self, data: int, ip: str, port: int, world_size: int) -> None:
-        self.llm.collective_rpc(
-            "init_collective",
-            args=(
-                data,
-                ip,
-                port,
-                world_size,
-            ),
-        )
-
-    async def init_collective_async(
-        self, data: int, ip: str, port: int, world_size: int
-    ) -> None:
-        await self.llm.collective_rpc(
-            "init_collective",
-            args=(
-                data,
-                ip,
-                port,
-                world_size,
-            ),
-        )
-
     def llm(self):
         return self.llm
 
@@ -417,6 +390,30 @@ class VllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+        )
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)
+class VllmGenerationWorker:
+    def init_collective(self, data: int, ip: str, port: int, world_size: int) -> None:
+        self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                data,
+                ip,
+                port,
+                world_size,
+            ),
         )
 
     def generate(
@@ -556,6 +553,244 @@ class VllmGenerationWorker:
         )
 
         return return_data
+
+    def generate_text(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate text responses using vLLM generation.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Returns:
+            BatchedDataDict containing:
+                - texts: List of generated text responses
+        """
+        # Extract stop_strings if provided, else use default from config
+        batch_stop_strings: list[list[str] | None] = data.get(
+            "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
+        )
+
+        # This function requires all generations have the same stop strings, so we collect all here
+        stop_strings: set[str] = set()
+        for sample_stop_strings in batch_stop_strings:
+            if sample_stop_strings:
+                stop_strings.update(sample_stop_strings)
+
+        # Add default stop strings from config
+        if self.cfg.get("stop_strings", None):
+            stop_strings.update(self.cfg["stop_strings"])
+
+        stop_strings: list[str] | None = (
+            list(stop_strings) if len(stop_strings) > 0 else None
+        )
+
+        # Read generation parameters from config
+        top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+        sampling_params = self.SamplingParams(
+            temperature=self.cfg["temperature"] if not greedy else 0,
+            top_p=self.cfg["top_p"],
+            top_k=top_k if not greedy else 1,
+            max_tokens=self.cfg["max_new_tokens"],
+            stop_token_ids=self.cfg["stop_token_ids"],
+            stop=stop_strings,
+            include_stop_str_in_output=True,  # returning stop strings like hf
+        )
+
+        # Generate outputs
+        assert self.llm is not None, (
+            "Attempting to generate with either an uninitialized vLLM or non-model-owner"
+        )
+        outputs = self.llm.generate(data["prompts"], sampling_params)
+        texts = [output.outputs[0].text for output in outputs]
+
+        # Convert to BatchedDataDict
+        return_data: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict(
+            {"texts": texts}
+        )
+        return return_data
+
+    def shutdown(self) -> bool:
+        """Clean up vLLM resources."""
+        try:
+            if self.llm is not None:
+                is_async_engine = self.cfg.get("vllm_cfg", {}).get(
+                    "async_engine", False
+                )
+
+                if is_async_engine:
+                    try:
+                        self.llm.shutdown()
+                    except Exception as e_stop:
+                        print(f"Error calling shutdown_background_loop: {e_stop}")
+                # Explicitly delete the engine. This may trigger its __del__ method.
+                del self.llm
+
+            self.llm = None
+            self.tokenizer = None
+
+            # Force garbage collection
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            return True
+        except Exception as e:
+            print(f"Error during vLLM shutdown: {e}")
+            return False
+
+    def report_device_id(self) -> list[str]:
+        """Report device ID from the vLLM worker."""
+        assert self.llm is not None, (
+            "Attempting to report device id with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "report_device_id cannot be used with async_engine=True. Use report_device_id_async instead."
+            )
+
+        list_of_worker_results = self.llm.collective_rpc(
+            "report_device_id", args=tuple()
+        )
+        return cast(list[str], list_of_worker_results)
+
+    def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
+        """Update weights from IPC handles by delegating to the vLLM Worker implementation.
+
+        Args:
+            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+
+        Returns:
+            bool: True if weights were successfully updated, False otherwise.
+        """
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_ipc_handles", args=(data,)
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def update_weights_from_collective(self, data: dict[str, Any]) -> bool:
+        """Update the model weights from collective communication."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_collective", args=(data,)
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def reset_prefix_cache(self):
+        """Reset the prefix cache of vLLM engine."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
+            )
+
+        self.llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def sleep(self):
+        """Put the vLLM engine to sleep."""
+        assert self.llm is not None, (
+            "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "sleep cannot be used with async_engine=True. Use sleep_async instead."
+            )
+
+        # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
+        self.llm.llm_engine.reset_prefix_cache()
+        self.llm.sleep(level=1)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def wake_up(self, **kwargs):
+        """Wake up the vLLM engine."""
+        assert self.llm is not None, (
+            "Attempting to wake up with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "wake_up cannot be used with async_engine=True. Use wake_up_async instead."
+            )
+
+        tags = kwargs.get("tags")
+
+        wake_up_args = {}
+        if tags is not None:
+            wake_up_args["tags"] = tags
+
+        self.llm.wake_up(**wake_up_args)
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)
+class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    async def init_collective_async(
+        self, data: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                data,
+                ip,
+                port,
+                world_size,
+            ),
+        )
 
     async def generate_async(
         self,
@@ -782,63 +1017,6 @@ class VllmGenerationWorker:
                 await asyncio.gather(*sample_tasks, return_exceptions=True)
                 raise e
 
-    def generate_text(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate text responses using vLLM generation.
-
-        Args:
-            data: BatchedDataDict containing prompts with text strings
-            greedy: Whether to use greedy decoding instead of sampling
-
-        Returns:
-            BatchedDataDict containing:
-                - texts: List of generated text responses
-        """
-        # Extract stop_strings if provided, else use default from config
-        batch_stop_strings: list[list[str] | None] = data.get(
-            "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
-        )
-
-        # This function requires all generations have the same stop strings, so we collect all here
-        stop_strings: set[str] = set()
-        for sample_stop_strings in batch_stop_strings:
-            if sample_stop_strings:
-                stop_strings.update(sample_stop_strings)
-
-        # Add default stop strings from config
-        if self.cfg.get("stop_strings", None):
-            stop_strings.update(self.cfg["stop_strings"])
-
-        stop_strings: list[str] | None = (
-            list(stop_strings) if len(stop_strings) > 0 else None
-        )
-
-        # Read generation parameters from config
-        top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
-        sampling_params = self.SamplingParams(
-            temperature=self.cfg["temperature"] if not greedy else 0,
-            top_p=self.cfg["top_p"],
-            top_k=top_k if not greedy else 1,
-            max_tokens=self.cfg["max_new_tokens"],
-            stop_token_ids=self.cfg["stop_token_ids"],
-            stop=stop_strings,
-            include_stop_str_in_output=True,  # returning stop strings like hf
-        )
-
-        # Generate outputs
-        assert self.llm is not None, (
-            "Attempting to generate with either an uninitialized vLLM or non-model-owner"
-        )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
-        texts = [output.outputs[0].text for output in outputs]
-
-        # Convert to BatchedDataDict
-        return_data: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict(
-            {"texts": texts}
-        )
-        return return_data
-
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
@@ -867,22 +1045,6 @@ class VllmGenerationWorker:
             print(f"Error during vLLM shutdown: {e}")
             return False
 
-    def report_device_id(self) -> list[str]:
-        """Report device ID from the vLLM worker."""
-        assert self.llm is not None, (
-            "Attempting to report device id with either an uninitialized vLLM or non-model-owner"
-        )
-
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "report_device_id cannot be used with async_engine=True. Use report_device_id_async instead."
-            )
-
-        list_of_worker_results = self.llm.collective_rpc(
-            "report_device_id", args=tuple()
-        )
-        return cast(list[str], list_of_worker_results)
-
     async def report_device_id_async(self) -> list[str]:
         """Async version of report_device_id."""
         assert self.llm is not None, (
@@ -902,43 +1064,6 @@ class VllmGenerationWorker:
             list_of_worker_results = result_or_coro
 
         return cast(list[str], list_of_worker_results)
-
-    def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
-        """Update weights from IPC handles by delegating to the vLLM Worker implementation.
-
-        Args:
-            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
-        try:
-            assert self.llm is not None, (
-                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
-            )
-
-            if self.cfg["vllm_cfg"]["async_engine"]:
-                raise RuntimeError(
-                    "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
-                )
-
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(data,)
-            )
-            worker_result = result_or_coro[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
-                )
-                return False
-            return True
-        except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
 
     async def update_weights_from_ipc_handles_async(self, data: dict[str, Any]) -> bool:
         """Async version of update_weights_from_ipc_handles.
@@ -969,36 +1094,6 @@ class VllmGenerationWorker:
                 worker_results = result_or_coro
 
             worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
-                )
-                return False
-            return True
-        except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def update_weights_from_collective(self, data: dict[str, Any]) -> bool:
-        """Update the model weights from collective communication."""
-        try:
-            assert self.llm is not None, (
-                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
-            )
-
-            if self.cfg["vllm_cfg"]["async_engine"]:
-                raise RuntimeError(
-                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
-                )
-
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(data,)
-            )
-            worker_result = result_or_coro[0]
 
             if not worker_result:
                 print(
@@ -1049,21 +1144,6 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    def reset_prefix_cache(self):
-        """Reset the prefix cache of vLLM engine."""
-        assert self.llm is not None, (
-            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
-        )
-
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
-            )
-
-        self.llm.llm_engine.reset_prefix_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (
@@ -1076,24 +1156,6 @@ class VllmGenerationWorker:
             )
 
         await self.llm.reset_prefix_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def sleep(self):
-        """Put the vLLM engine to sleep."""
-        assert self.llm is not None, (
-            "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
-        )
-
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "sleep cannot be used with async_engine=True. Use sleep_async instead."
-            )
-
-        # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        self.llm.llm_engine.reset_prefix_cache()
-        self.llm.sleep(level=1)
-
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1115,25 +1177,6 @@ class VllmGenerationWorker:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def wake_up(self, **kwargs):
-        """Wake up the vLLM engine."""
-        assert self.llm is not None, (
-            "Attempting to wake up with either an uninitialized vLLM or non-model-owner"
-        )
-
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "wake_up cannot be used with async_engine=True. Use wake_up_async instead."
-            )
-
-        tags = kwargs.get("tags")
-
-        wake_up_args = {}
-        if tags is not None:
-            wake_up_args["tags"] = tags
-
-        self.llm.wake_up(**wake_up_args)
-
     async def wake_up_async(self, **kwargs):
         """Async version of wake_up."""
         assert self.llm is not None, (
@@ -1152,14 +1195,6 @@ class VllmGenerationWorker:
             wake_up_args["tags"] = tags
 
         await self.llm.wake_up(**wake_up_args)
-
-    def start_gpu_profiling(self) -> None:
-        """Start GPU profiling."""
-        torch.cuda.profiler.start()
-
-    def stop_gpu_profiling(self) -> None:
-        """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
 
 
 class VllmGeneration(GenerationInterface):
@@ -1211,9 +1246,11 @@ class VllmGeneration(GenerationInterface):
         cluster._init_placement_groups(use_unified_pg=needs_cross_node_parallelism)
 
         # Create worker builder for VllmGenerationWorker
-        worker_builder = RayWorkerBuilder(
-            "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
-        )
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_cls = "nemo_rl.models.generation.vllm.VllmAsyncGenerationWorker"
+        else:
+            worker_cls = "nemo_rl.models.generation.vllm.VllmGenerationWorker"
+        worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
