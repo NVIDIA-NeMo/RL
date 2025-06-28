@@ -304,7 +304,6 @@ class BaseVllmGenerationWorker:
                 "weight_block_size": [128, 128]
             }
 
-            from nemo_rl.models.generation import fp8
             if self.cfg["vllm_cfg"].get("pow2_weight_scaling_factors", False):
                 fp8.USE_WEIGHT_POW2_SCALE = True
                 print("Using USE_WEIGHT_POW2_SCALE Scaling!")
@@ -320,17 +319,14 @@ class BaseVllmGenerationWorker:
                     self.model_name
                 )
 
-            if self.cfg["vllm_cfg"].get("use_pow2_scaling_factors", False):
-                fp8.USE_POW2_SCALE = True
-                print("Using POW2 Scaling!")
+            if self.cfg["vllm_cfg"].get("use_deep_gemm", False):
+                os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+                print("Using DEEP GEMM!")
 
             vllm_kwargs["quantization"] = "fp8"
             vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
             # overriden by quant config, just to stop vllm from complaining
             self.precision = "bfloat16" 
-            if self.cfg["vllm_cfg"].get("use_deep_gemm", False):
-                os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-                print("Using DEEP GEMM!")
 
         llm_kwargs = dict(
             model=self.model_name,
