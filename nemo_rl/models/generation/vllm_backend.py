@@ -72,49 +72,24 @@ class VllmInternalWorkerExtension:
                 tensor = func(*list_args)
                 weights.append((name, tensor))
 
-            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-            vllm_config = self.model_runner.vllm_config
-            if hasattr(vllm_config, "quant_config") and \
-                isinstance(vllm_config.quant_config, Fp8Config):
-                quant_config = vllm_config.quant_config
-                assert quant_config.weight_block_size is not None, \
-                    "Only block scaling is currently supported in NeMo-RL!"
+            from nemo_rl.models.generation.fp8 import cast_weights_to_fp8, is_fp8_model
+            if is_fp8_model(self.model_runner.vllm_config):
+                quant_config = self.model_runner.vllm_config.quant_config
+                weights = cast_weights_to_fp8(weights, quant_config)
+                for name, param in self.model_runner.model.named_parameters():
+                    if hasattr(param, "subclass_type"):
+                        param.orig_type = param.__class__
+                        param.__class__ = param.subclass_type
 
-                from nemo_rl.models.generation.fp8 import (
-                    is_fp8_weight,
-                    kitchen_block_scale,
-                )
+                for name, weight in weights:
+                    self.model_runner.model.load_weights([[name, weight]])
 
-                weights_quantized = []
-                for k, v in weights:
-                    if not is_fp8_weight(k):
-                        weights_quantized.append((k,v))
-                        continue
-                    
-                    # from nemo_rl.models.generation import fp8
-                    # print(f"POW2 {fp8.USE_POW2_SCALE}") 
+                for name, param in self.model_runner.model.named_parameters():
+                    if hasattr(param, "subclass_type"):
+                        param.__class__ = param.orig_type
+            else:
+                self.model_runner.model.load_weights(weights)
 
-                    param_lp, param_scale = kitchen_block_scale(
-                        v.to(torch.float), 
-                        weight_block_size=quant_config.weight_block_size
-                    )
-                    param_scale = torch.squeeze(param_scale)
-                    weights_quantized.append([k, param_lp])
-                    weights_quantized.append([k + "_scale_inv", param_scale])
-
-                weights = weights_quantized
-
-            for name, param in self.model_runner.model.named_parameters():
-                if hasattr(param, "subclass_type"):
-                    param.orig_type = param.__class__
-                    param.__class__ = param.subclass_type
-
-            for name, weight in weights:
-                self.model_runner.model.load_weights([[name, weight]])
-
-            for name, param in self.model_runner.model.named_parameters():
-                if hasattr(param, "subclass_type"):
-                    param.__class__ = param.orig_type
 
             torch.cuda.synchronize()
             return True
