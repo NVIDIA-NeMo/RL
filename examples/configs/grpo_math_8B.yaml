@@ -58,6 +58,7 @@ policy:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
 
 cluster:
   gpus_per_node: 8
