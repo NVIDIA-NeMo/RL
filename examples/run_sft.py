@@ -31,6 +31,8 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
+OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+
 
 def parse_args():
     """Parse command line arguments."""

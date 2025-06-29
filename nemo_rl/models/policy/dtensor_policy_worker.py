@@ -35,6 +35,7 @@ from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.dtensor.parallelize import (
@@ -44,7 +45,11 @@ from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
     to_local_if_dtensor,
 )
-from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.huggingface.common import (
+    ModelFlag,
+    get_flash_attention_kwargs,
+    pack_sequences,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -157,17 +162,26 @@ class DTensorPolicyWorker:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
         print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        if self.enable_seq_packing:
+            print(
+                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
+            )
+            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="cpu",  # load weights onto CPU initially
             # Always load the model in float32 to keep master weights in float32.
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             # https://github.com/NVIDIA/NeMo-RL/issues/279 will fix the issue of CPU OOM for larger models.
-            torch_dtype=torch.float32,
+            torch_dtype=self.dtype,
             trust_remote_code=True,
             **sliding_window_overwrite(
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
+            attn_implementation="flash_attention_2"
+            if self.enable_seq_packing
+            else None,
         )
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
@@ -455,30 +469,45 @@ class DTensorPolicyWorker:
                 # so its safe to not check for the case where the last data slice is smaller than mbs
                 if self.cfg["dynamic_batching"]["enabled"]:
                     mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
+                elif self.enable_seq_packing:
+                    mb_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
                 else:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
 
                 for mb in mb_iterator:
-                    input_ids = mb.get("input_ids").cuda()
-                    input_lengths = mb.get("input_lengths")
-                    batch_size, seq_len = input_ids.shape
-
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
-                    )
-                    for i, length in enumerate(input_lengths):
-                        # For right-padded sequence, set 1s at the beginning of the sequence
-                        attention_mask[i, :length] = 1
-
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        attention_mask_input_all_ones = torch.ones(
-                            (batch_size, seq_len),
-                            dtype=torch.long,
-                            device=input_ids.device,
-                        )
-                        position_ids = torch.arange(
-                            seq_len, device=input_ids.device
-                        ).repeat(batch_size, 1)
+                        if self.enable_seq_packing:
+                            input_ids = mb.get("input_ids").cuda()
+                            input_ids, position_ids, _ = pack_sequences(
+                                input_ids=input_ids,
+                                input_lengths=mb["input_lengths"],
+                                packed_sequence_size=[
+                                    len(mb["input_lengths"])
+                                ],  # flash attention 2 expects flattened input
+                                padding_value=self.tokenizer.eos_token_id,
+                                return_attention_mask=False,
+                            )
+                            seq_len = input_ids.shape[1]
+                            attention_mask = None
+                            flash_attn_kwargs = get_flash_attention_kwargs(
+                                input_lengths=mb["input_lengths"],
+                            )
+
+                        else:
+                            input_ids = mb.get("input_ids").cuda()
+                            batch_size, seq_len = input_ids.shape
+
+                            attention_mask = torch.ones(
+                                (batch_size, seq_len),
+                                dtype=torch.long,
+                                device=input_ids.device,
+                            )
+                            position_ids = torch.arange(
+                                seq_len, device=input_ids.device
+                            ).repeat(batch_size, 1)
+                            flash_attn_kwargs = {}
 
                     context_parallel_ctx = None
                     if self.cp_size > 1:
@@ -503,9 +532,10 @@ class DTensorPolicyWorker:
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
                             outputs = self.model(
                                 input_ids=input_ids,
-                                attention_mask=attention_mask_input_all_ones,
+                                attention_mask=attention_mask,
                                 position_ids=position_ids,
                                 use_cache=False,
+                                flash_attn_kwargs=flash_attn_kwargs,
                             )
 
                         # Get logprobs
@@ -557,8 +587,20 @@ class DTensorPolicyWorker:
                             )
                             logits = logits_dtensor.full_tensor()[:, sorted_indices]
 
-                        loss, loss_metrics = loss_fn(
-                            logits, mb, global_valid_seqs, global_valid_toks
+                        if self.enable_seq_packing:
+                            loss_fn_ = SequencePackingLossWrapper(
+                                loss_fn=loss_fn,
+                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                            )
+                        else:
+                            loss_fn_ = loss_fn
+
+                        loss, loss_metrics = loss_fn_(
+                            logits,
+                            mb,
+                            global_valid_seqs,
+                            global_valid_toks,
                         )
 
                         ## scale by the number of global batches so we get the correct
