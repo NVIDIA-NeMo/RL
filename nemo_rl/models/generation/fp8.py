@@ -16,6 +16,7 @@ def get_first_last_layer_param_names(model_name):
             f'model.layers.{layer_num}.self_attn.q_proj',
             f'model.layers.{layer_num}.self_attn.k_proj',
             f'model.layers.{layer_num}.self_attn.v_proj',
+            f'model.layers.{layer_num}.self_attn.o_proj',
             f'model.layers.{layer_num}.mlp.up_proj',
             f'model.layers.{layer_num}.mlp.down_proj',
             f'model.layers.{layer_num}.mlp.gate_proj',
@@ -105,6 +106,18 @@ def kitchen_block_scale(
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp_inv 
 
+
+def is_fp8_model(vllm_config):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    if hasattr(vllm_config, "quant_config") and \
+        isinstance(vllm_config.quant_config, Fp8Config):
+        assert vllm_config.quant_config.weight_block_size is not None, \
+            "Only block scaling is currently supported in NeMo-RL!"
+        return True
+
+    return False
+
 def is_fp8_weight(name):
     fp8_params = [
         "q_proj.weight", 
@@ -119,6 +132,24 @@ def is_fp8_weight(name):
         if '0' in name or str(NUM_LAYERS-1) in name:
             return False
     return any([param in name for param in fp8_params])
+
+
+def cast_weights_to_fp8(weights, quant_config):
+    weights_quantized = []
+    for k, v in weights:
+        if not is_fp8_weight(k):
+            weights_quantized.append((k,v))
+            continue
+        
+        param_lp, param_scale = kitchen_block_scale(
+            v.to(torch.float), 
+            weight_block_size=quant_config.weight_block_size
+        )
+        param_scale = torch.squeeze(param_scale)
+        weights_quantized.append([k, param_lp])
+        weights_quantized.append([k + "_scale_inv", param_scale])
+
+    return weights_quantized
 
 def process_weights_after_loading(self, layer) -> None:
     from vllm.model_executor.parameter import (BlockQuantScaleParameter,
