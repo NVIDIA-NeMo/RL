@@ -42,7 +42,7 @@ We will use the `run_eval.py` script to run an evaluation using a model directly
 Note that the evaluation script only supports the Hugging Face format model. If you haven't converted your DCP format model, you should back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
 
 ```sh
-# Run evaluation script with default config (examples/configs/eval.yaml)
+# Run evaluation script with default config (examples/configs/evals/eval.yaml)
 uv run python examples/run_eval.py
 
 # Run evaluation script with converted model
