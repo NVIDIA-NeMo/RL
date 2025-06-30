@@ -55,6 +55,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
+from transformers import PretrainedConfig
 
 
 class VllmSpecificArgs(TypedDict):
@@ -131,6 +132,10 @@ class VllmGenerationWorker:
                 seed = node_idx * 1024 + bundle_id
 
             init_kwargs["seed"] = seed
+            # Need to give each DP group its own vllm cache to address:
+            # https://github.com/vllm-project/vllm/issues/18851
+            env_vars["VLLM_CACHE_ROOT"] = f"~/.cache/vllm_{seed}"
+
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -173,6 +178,7 @@ class VllmGenerationWorker:
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -320,6 +326,40 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        if self.cfg["vllm_cfg"]["precision"] == 'fp8':
+            from nemo_rl.models.generation import fp8
+            fp8_block_quant_cfg = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128]
+            }
+
+            if self.cfg["vllm_cfg"].get("pow2_weight_scaling_factors", False):
+                fp8.USE_WEIGHT_POW2_SCALE = True
+                print("Using USE_WEIGHT_POW2_SCALE Scaling!")
+
+            if self.cfg["vllm_cfg"].get("pow2_activation_scaling_factors", False):
+                fp8.USE_ACTIVATION_POW2_SCALE = True
+                print("Using USE_ACTIVATION_POW2_SCALE Scaling!")
+
+            if self.cfg["vllm_cfg"].get("first_layer_layers_in_bf16", True):
+                print("Using FIRST_LAST_LAYERS_IN_BF16!")
+                fp8.FIRST_LAST_LAYERS_IN_BF16 = True
+                fp8_block_quant_cfg['ignored_layers'] = fp8.get_first_last_layer_param_names(
+                    self.model_name
+                )
+
+            if self.cfg["vllm_cfg"].get("use_deep_gemm", False):
+                os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+                print("Using DEEP GEMM!")
+
+            vllm_kwargs["quantization"] = "fp8"
+            vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
+            # overriden by quant config, just to stop vllm from complaining
+            self.precision = "bfloat16" 
+
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -328,10 +368,8 @@ class VllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            dtype=self.cfg["vllm_cfg"]["precision"],
+            dtype=self.precision,
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
-            enforce_eager=True,
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
@@ -340,13 +378,31 @@ class VllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            from vllm.engine.arg_utils import AsyncEngineArgs
-            from vllm.v1.engine.async_llm import AsyncLLM
+        from unittest.mock import patch
+        from nemo_rl.models.generation.fp8 import (
+            process_weights_after_loading,
+            per_token_group_quant_fp8,
+            _per_token_group_quant_fp8, 
+            _per_token_group_quant_fp8_colmajor,
+        )
 
-            self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
-        else:
-            self.llm = vllm.LLM(**llm_kwargs)
+        func1 = 'vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading'
+        func2 = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
+        func3 = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
+        func4 = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'
+
+        with patch(func1, process_weights_after_loading), \
+            patch(func2, per_token_group_quant_fp8), \
+            patch(func3, _per_token_group_quant_fp8), \
+            patch(func4, _per_token_group_quant_fp8_colmajor):
+            
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.v1.engine.async_llm import AsyncLLM
+
+                self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+            else:
+                self.llm = vllm.LLM(**llm_kwargs)
 
     def init_collective(self, data: int, ip: str, port: int, world_size: int) -> None:
         self.llm.collective_rpc(

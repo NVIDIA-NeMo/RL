@@ -55,6 +55,7 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+
         try:
             # Get handles for this device
             device_uuid = self.report_device_id()
@@ -71,8 +72,25 @@ class VllmInternalWorkerExtension:
                 tensor = func(*list_args)
                 weights.append((name, tensor))
 
-            # Load weights into the model
-            self.model_runner.model.load_weights(weights=weights)
+            from nemo_rl.models.generation.fp8 import cast_weights_to_fp8, is_fp8_model
+            if is_fp8_model(self.model_runner.vllm_config):
+                quant_config = self.model_runner.vllm_config.quant_config
+                weights = cast_weights_to_fp8(weights, quant_config)
+                for name, param in self.model_runner.model.named_parameters():
+                    if hasattr(param, "subclass_type"):
+                        param.orig_type = param.__class__
+                        param.__class__ = param.subclass_type
+
+                for name, weight in weights:
+                    self.model_runner.model.load_weights([[name, weight]])
+
+                for name, param in self.model_runner.model.named_parameters():
+                    if hasattr(param, "subclass_type"):
+                        param.__class__ = param.orig_type
+            else:
+                self.model_runner.model.load_weights(weights)
+
+
             torch.cuda.synchronize()
             return True
         except Exception as e:
