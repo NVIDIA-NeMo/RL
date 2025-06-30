@@ -582,6 +582,12 @@ class RayWorkerGroup:
         Returns:
             ray.ObjectRef: A Ray future for the result.
         """
+        assert len(args) == 0, (
+            "run_single_worker_single_data will fail with args under certain circumstances. "
+            "Please use kwargs instead. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
+        )
+
         worker = self.workers[worker_idx]
         method = getattr(worker, method_name)
         return method.remote(*args, **kwargs)
@@ -608,6 +614,12 @@ class RayWorkerGroup:
         Returns:
             list[ray.ObjectRef]: A list of ray futures
         """
+        assert len(args) == 0, (
+            "run_all_workers_multiple_data will fail with args under certain circumstances. "
+            "Please use kwargs instead. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
+        )
+
         # Check at least one arg or kwarg is provided
         assert len(args) > 0 or len(kwargs) > 0, (
             "At least one args (positional arguments) or kwargs (keyword arguments) must be provided in run_all_workers_multiple_data. "
@@ -694,6 +706,12 @@ class RayWorkerGroup:
         Returns:
             list[ray.ObjectRef]: A list of ray futures
         """
+        assert len(args) == 0, (
+            "run_all_workers_single_data will fail with args under certain circumstances. "
+            "Please use kwargs instead. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
+        )
+
         futures = []
 
         if run_rank_0_only_axes is None:
@@ -751,6 +769,12 @@ class RayWorkerGroup:
         Returns:
             MultiWorkerFuture: Object containing futures and their associated worker information
         """
+        assert len(args) == 0, (
+            "run_all_workers_sharded_data will fail with args under certain circumstances. "
+            "Please use kwargs instead. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
+        )
+
         if self.sharding_annotations is None:
             raise ValueError(
                 "Sharding annotations must be provided to use sharded data distribution"

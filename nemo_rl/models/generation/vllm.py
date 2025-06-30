@@ -1017,7 +1017,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1030,7 +1030,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=(data,)
+                "update_weights_from_collective", args=(info,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
