@@ -5,6 +5,7 @@
   - [📣 News](#-news)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
+  - [Supported Training Backends](#training-backends)
   - [GRPO](#grpo)
     - [GRPO Single Node](#grpo-single-node)
     - [GRPO Multi-node](#grpo-multi-node)
@@ -16,7 +17,6 @@
   - [DPO](#dpo)
     - [DPO Single Node](#dpo-single-node)
     - [DPO Multi-node](#dpo-multi-node)
-  - [Supported Training Backends](#training-backends)
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
@@ -121,6 +121,15 @@ uv venv
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+
+## Training Backends
+
+NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
+
+- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
+- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
+
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ## GRPO
 
@@ -323,15 +332,6 @@ sbatch \
     --gres=gpu:8 \
     ray.sub
 ```
-
-## Training Backends
-
-NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
-
-- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
-- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
-
-The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ## Evaluation
 
