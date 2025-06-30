@@ -156,12 +156,14 @@ class CheckpointManager:
         self.remove_old_checkpoints()
 
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
-        """Remove checkpoints that are not in the top-k or latest based on the metric.
+        """Remove checkpoints that are not in the top-k or latest based on the (optional) metric.
 
         If keep_top_k is set, this method removes all checkpoints except the top-k
-        best ones based on the specified metric. The best checkpoints are determined
-        by the metric value and the higher_is_better setting. When multiple checkpoints
-        have the same metric value, more recent checkpoints (higher step numbers) are preferred.
+        best ones. The "best" checkpoints are determined by:
+        - If a metric is provided: the given metric value and the higher_is_better setting.
+          When multiple checkpoints have the same metric value, more recent checkpoints
+          (higher step numbers) are preferred.
+        - If no metric is provided: the step number. The most recent k checkpoints are kept.
 
         Args:
             exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
