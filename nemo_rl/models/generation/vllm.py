@@ -348,11 +348,13 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
-    def init_collective(self, data: int, ip: str, port: int, world_size: int) -> None:
+    def init_collective(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
         self.llm.collective_rpc(
             "init_collective",
             args=(
-                data,
+                rank_prefix,
                 ip,
                 port,
                 world_size,
@@ -360,12 +362,12 @@ class VllmGenerationWorker:
         )
 
     async def init_collective_async(
-        self, data: int, ip: str, port: int, world_size: int
+        self, rank_prefix: int, ip: str, port: int, world_size: int
     ) -> None:
         await self.llm.collective_rpc(
             "init_collective",
             args=(
-                data,
+                rank_prefix,
                 ip,
                 port,
                 world_size,
@@ -903,11 +905,11 @@ class VllmGenerationWorker:
 
         return cast(list[str], list_of_worker_results)
 
-    def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
-            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -923,7 +925,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(data,)
+                "update_weights_from_ipc_handles", args=(ipc_handles,)
             )
             worker_result = result_or_coro[0]
 
@@ -940,11 +942,13 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_ipc_handles_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_ipc_handles_async(
+        self, ipc_handles: dict[str, Any]
+    ) -> bool:
         """Async version of update_weights_from_ipc_handles.
 
         Args:
-            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -960,7 +964,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(data,)
+                "update_weights_from_ipc_handles", args=(ipc_handles,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -983,7 +987,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    def update_weights_from_collective(self, data: dict[str, Any]) -> bool:
+    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -996,7 +1000,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(data,)
+                "update_weights_from_collective", args=(info,)
             )
             worker_result = result_or_coro[0]
 
@@ -1013,7 +1017,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1026,7 +1030,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=(data,)
+                "update_weights_from_collective", args=(info,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1403,7 +1407,7 @@ class VllmGeneration(GenerationInterface):
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
             method_name,
-            data=rank_prefix_list,
+            rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"ip": ip, "port": port, "world_size": world_size},
         )
@@ -1429,7 +1433,7 @@ class VllmGeneration(GenerationInterface):
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1474,7 +1478,7 @@ class VllmGeneration(GenerationInterface):
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1708,7 +1712,7 @@ class VllmGeneration(GenerationInterface):
             # Directly pass ipc_handles to the method
             futures = self.worker_group.run_all_workers_multiple_data(
                 method_name,
-                ipc_handles_list,
+                ipc_handles=ipc_handles_list,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             # Wait for all futures to complete
@@ -1735,7 +1739,7 @@ class VllmGeneration(GenerationInterface):
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
-            data=info,
+            info=info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
