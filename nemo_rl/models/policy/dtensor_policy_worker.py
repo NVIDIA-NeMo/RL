@@ -267,7 +267,7 @@ class DTensorPolicyWorker:
 
         # Manually broadcast buffers
         for _, buf in self.model.named_buffers():
-            torch.distributed.broadcast(buf, src=0, group=self.dp_mesh.get_group())
+            torch.distributed.broadcast(buf, src=0)
 
         if self.cpu_offload:
             self.model = self.move_buffer_to_device(self.model, "cpu")
