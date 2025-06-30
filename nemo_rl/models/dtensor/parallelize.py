@@ -361,6 +361,76 @@ def get_hf_tp_plan(model):
     return hf_tp_plan
 
 
+def _parallelize_nm5_h(
+    model,
+    dp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    sequence_parallel: bool = False,
+    activation_checkpointing: bool = False,
+    cpu_offload: bool = False,
+    custom_parallel_plan: Optional[Union[dict, str]] = None,
+) -> torch.nn.Module:
+    """Parallelize a NemotronHForCausalLM model across data and tensor parallel dimensions."""
+    assert not sequence_parallel, (
+        "Sequence parallelism is not supported for NemotronHForCausalLM"
+    )
+    assert custom_parallel_plan is None, (
+        "Custom parallel plan is not supported for NemotronHForCausalLM"
+    )
+
+    model_tp_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    mlp_tp_plan = {
+        "mixer.up_proj": ColwiseParallel(),
+        "mixer.down_proj": RowwiseParallel(),
+    }
+
+    layers: torch.nn.ModuleList = model.backbone.layers
+    parallelize_module(model, tp_mesh, model_tp_plan)
+
+    for layer in model.backbone.layers:
+        if layer.block_type == "mlp":
+            parallelize_module(layer, tp_mesh, mlp_tp_plan)
+
+    if activation_checkpointing:
+        for i in range(len(layers)):
+            if layers[i].block_type == "mlp":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+        if layers[i].block_type == "mamba":
+            layers[i] = checkpoint_wrapper(layers[i])
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    offload_policy = (
+        CPUOffloadPolicy(pin_memory=False)
+        if cpu_offload
+        else torch.distributed.fsdp.OffloadPolicy
+    )
+
+    for layer in layers:
+        fully_shard(
+            layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+        )
+
+    # do not reshard after forward for root model
+    # because its parameters will be used in backward immediately
+    return fully_shard(
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
+
+
 def _parallelize_model(
     model: Union[
         Qwen2ForCausalLM,
@@ -398,7 +468,20 @@ def _parallelize_model(
         ValueError: If the model type is not supported for parallelization.
     """
     model_cls = type(model)
-    if model_cls == Gemma3ForConditionalGeneration:
+    if model_cls.__name__ == "NemotronHForCausalLM":
+        # need to do something special for nm5, since it's harder to shard the mamba layers
+        # nm5 is not importable, so we check the __name__ attribute
+        return _parallelize_nm5_h(
+            model,
+            dp_mesh,
+            tp_mesh,
+            param_dtype,
+            sequence_parallel,
+            activation_checkpointing,
+            cpu_offload,
+            custom_parallel_plan,
+        )
+    elif model_cls == Gemma3ForConditionalGeneration:
         layers: torch.nn.ModuleList = model.language_model.model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
