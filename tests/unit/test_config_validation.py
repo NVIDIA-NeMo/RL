@@ -15,7 +15,7 @@
 import glob
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, get_type_hints
+from typing import Any, Dict, List, Optional, Set, Type, get_type_hints
 
 import pytest
 from omegaconf import OmegaConf
@@ -50,6 +50,60 @@ def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:
     return required_keys, optional_keys
 
 
+def validate_nested_config_section(
+    config_dict: Dict[str, Any], config_class: Type, section_path: str
+) -> List[str]:
+    """Recursively validate a config section and its nested TypedDict fields."""
+    errors = []
+    type_hints = get_type_hints(config_class, include_extras=True)
+
+    for key, annotation in type_hints.items():
+        current_path = f"{section_path}.{key}" if section_path else key
+
+        # Check if the field is marked as NotRequired
+        is_optional = hasattr(annotation, "__origin__") and (
+            annotation.__origin__ is NotRequired
+        )
+
+        # If the key is not in the config and it's required, add an error
+        if key not in config_dict:
+            if not is_optional:
+                errors.append(f"Missing required key in {section_path}: {key}")
+            continue
+
+        # Get the value from the config
+        value = config_dict[key]
+
+        # If the annotation is a TypedDict (nested config), validate it recursively
+        if hasattr(annotation, "__annotations__") and isinstance(value, dict):
+            # This is a nested TypedDict, validate it recursively
+            nested_errors = validate_nested_config_section(
+                value, annotation, current_path
+            )
+            errors.extend(nested_errors)
+        elif hasattr(annotation, "__origin__") and annotation.__origin__ is Optional:
+            # Handle Optional[TypedDict] case
+            if (
+                value is not None
+                and hasattr(annotation.__args__[0], "__annotations__")
+                and isinstance(value, dict)
+            ):
+                nested_errors = validate_nested_config_section(
+                    value, annotation.__args__[0], current_path
+                )
+                errors.extend(nested_errors)
+
+    # Check for extra keys (keys in config that are not in the TypedDict)
+    required_keys, optional_keys = get_keys_from_typeddict(config_class)
+    all_valid_keys = required_keys | optional_keys
+
+    for key in config_dict.keys():
+        if key not in all_valid_keys:
+            errors.append(f"Extra key in {section_path}: {key}")
+
+    return errors
+
+
 def validate_config_section(
     config_dict: Dict[str, Any], config_class: dict, section_name: str
 ) -> List[str]:
@@ -66,15 +120,11 @@ def validate_config_section(
         errors.append(f"Section {section_name} must be a dictionary")
         return errors
 
-    # Check for missing required keys
-    for required_key in required_keys:
-        if required_key not in section_config:
-            errors.append(f"Missing required key in {section_name}: {required_key}")
-
-    # Check for extra keys
-    for key in section_config.keys():
-        if key not in required_keys and key not in optional_keys:
-            errors.append(f"Extra key in {section_name}: {key}")
+    # Use the new recursive validation function
+    nested_errors = validate_nested_config_section(
+        section_config, config_class, section_name
+    )
+    errors.extend(nested_errors)
 
     return errors
 

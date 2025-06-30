@@ -19,12 +19,12 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class DTensorConfig(TypedDict):
     enabled: bool
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
-    tensor_parallel_size: int
-    context_parallel_size: int
-    custom_parallel_plan: str
+    cpu_offload: NotRequired[bool]
+    sequence_parallel: NotRequired[bool]
+    activation_checkpointing: NotRequired[bool]
+    tensor_parallel_size: NotRequired[int]
+    context_parallel_size: NotRequired[int]
+    custom_parallel_plan: NotRequired[str]
 
 
 class SequencePackingConfig(TypedDict):
@@ -93,7 +93,7 @@ class MegatronConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: str
+    chat_template: NotRequired[str]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -118,9 +118,9 @@ class DynamicBatchingConfig(TypedDict):
     enabled: bool
 
     ## required if enabled is true
-    train_mb_tokens: Optional[int]
-    logprob_mb_tokens: Optional[int]
-    sequence_length_round: Optional[int]
+    train_mb_tokens: NotRequired[int]
+    logprob_mb_tokens: NotRequired[int]
+    sequence_length_round: NotRequired[int]
 
 
 class PolicyConfig(TypedDict):
