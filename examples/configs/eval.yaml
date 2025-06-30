@@ -1,8 +1,9 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@1" # only pass@1 is supported now
+  metric: "pass@k"
   num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
+  pass_k_value: 1
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation
