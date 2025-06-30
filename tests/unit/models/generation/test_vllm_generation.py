@@ -56,6 +56,7 @@ basic_vllm_test_config: VllmConfig = {
         "async_engine": False,  # Default to False for synchronous tests
         "skip_tokenizer_init": False,
         "load_format": "auto",
+        "enforce_eager": "False",
     },
     "colocated": {
         "enabled": True,

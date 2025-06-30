@@ -241,6 +241,7 @@ base_vllm_test_config: VllmConfig = {
         "disable_log_stats": True,
         "disable_log_requests": True,
         "gpu_memory_utilization": 0.6,
+        "enforce_eager": "False",
     },
     "colocated": {
         "enabled": True,
