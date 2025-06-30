@@ -316,6 +316,10 @@ class VllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        if not self.cfg["colocated"]["enabled"]:
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"

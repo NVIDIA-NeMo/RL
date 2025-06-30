@@ -148,6 +148,7 @@ class DTensorPolicyWorker:
             and not config["generation"]["colocated"]["enabled"]
         ):
             os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
