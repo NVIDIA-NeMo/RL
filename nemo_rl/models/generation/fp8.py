@@ -129,7 +129,7 @@ def is_fp8_weight(name):
         "gate_proj.weight",
     ]
     if FIRST_LAST_LAYERS_IN_BF16:
-        if '0' in name or str(NUM_LAYERS-1) in name:
+        if 'layers.0' in name or f'layers.{str(NUM_LAYERS-1)}' in name:
             return False
     return any([param in name for param in fp8_params])
 
