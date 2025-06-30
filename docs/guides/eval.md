@@ -9,11 +9,11 @@ To prepare for evaluation, first ensure your model is in the correct format, whi
 ### Convert DCP to HF (Optional)
 If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the Hugging Face format before running evaluation.
 
-Use the `examples/convert_dcp_to_hf.py` script. You'll need the path to the training configuration file (`config.yaml`), the DCP checkpoint directory, and specify an output path for the HF format model.
+Use the `examples/converters/convert_dcp_to_hf.py` script. You'll need the path to the training configuration file (`config.yaml`), the DCP checkpoint directory, and specify an output path for the HF format model.
 
 ```sh
 # Example for a GRPO checkpoint at step 170
-uv run python examples/convert_dcp_to_hf.py \
+uv run python examples/converters/convert_dcp_to_hf.py \
     --config results/grpo/step_170/config.yaml \
     --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
     --hf-ckpt-path results/grpo/hf
