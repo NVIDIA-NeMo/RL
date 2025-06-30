@@ -319,6 +319,7 @@ def training_setup(request, two_gpu_virtual_cluster):
         (TEST_ASSETS.TINY_NEMOTRON5_H_MODEL_PATH, 1, 1, True, False, True),
         (TEST_ASSETS.TINY_NEMOTRON5_H_MODEL_PATH, 1, 1, False, True, True),
         (TEST_ASSETS.TINY_NEMOTRON5_H_MODEL_PATH, 1, 1, True, True, True),
+        # nemotron5_h doesn't support cp
     ],
     indirect=True,
 )
