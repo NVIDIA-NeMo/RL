@@ -16,7 +16,7 @@ uv run examples/run_grpo_math.py --config=examples/configs/grpo-deepscaler-1.5b-
 At the end of each stage, you need to specify the Hugging Face checkpoint to continue training with. To get this checkpoint, we convert a model checkpoint to a Hugging Face checkpoint with the following command:
 
 ```sh
-uv run examples/convert_dcp_to_hf.py --config=results/grpo-deepscaler-1.5b-8K/step_240/config.yaml --dcp-ckpt-path=results/grpo-deepscaler-1.5b-8K/step_240/policy/weights --hf-ckpt-path=results/grpo-deepscaler-1.5b-8K/step_240/hf
+uv run examples/converters/convert_dcp_to_hf.py --config=results/grpo-deepscaler-1.5b-8K/step_240/config.yaml --dcp-ckpt-path=results/grpo-deepscaler-1.5b-8K/step_240/policy/weights --hf-ckpt-path=results/grpo-deepscaler-1.5b-8K/step_240/hf
 ```
 
 When running the next command, we use the Hugging Face checkpoint as the initial checkpoint. We train with an 8K context window for 240 steps, a 16K context window for 290 steps, and a 24K context window for 50 steps. We run all experiments on a single 8XH100 80GB node or on a single 8XA100 80GB node.
@@ -33,7 +33,9 @@ Throughout training, the checkpoints of the model will be saved to the `results`
 
 ```sh
 uv run examples/run_eval.py \
-    generation.model_name=results/grpo-deepscaler-1.5b-8K/step_240/hf
+    generation.model_name=results/grpo-deepscaler-1.5b-8K/step_240/hf \
+    data.prompt_file=examples/prompts/cot.txt \
+    generation.vllm_cfg.max_model_len=32768
 ```
 
 Use `generation.model_name` to specify the path to the Hugging Face checkpoint. In addition, we use AIME24 as the validation dataset and calculate pass@1 on it throughout training.
