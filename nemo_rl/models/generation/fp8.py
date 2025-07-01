@@ -1,58 +1,56 @@
-from typing import Any, Callable, Optional, Union
 
 import torch, os
+from accelerate import init_empty_weights
+from dataclasses import dataclass, field
+from transformers import AutoConfig, AutoModel, PretrainedConfig
+from typing import Any, Callable, Optional, Union
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.model_executor.layers.linear import LinearBase
-from transformers import PretrainedConfig
 
-from transformers import AutoConfig, AutoModel
-from accelerate import init_empty_weights
+@dataclass()
+class FP8Config:
+    use_weight_pow2_scale: bool = False
+    use_activation_pow2_scale: bool = False
+    num_first_last_layers_in_bf16: int = 0
+    _seen_params: set = field(default_factory=lambda: set())
+    _fp8_param_names: set = field(default_factory=lambda: set())
 
-USE_WEIGHT_POW2_SCALE = False
-USE_ACTIVATION_POW2_SCALE = False
-NUM_FIRST_LAST_LAYERS_IN_BF16 = None
-NUM_LAYERS = None
-PARAM_NAMES = None
+    fp8_block_quant_cfg = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    }
 
-def get_params_in_first_last_n_layers(model_name, num_layers):
-    try:
-        config = AutoConfig.from_pretrained(model_name)
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [name for name, _ in model.named_parameters()]
+# Global FP8 config that can be accessed by patched vLLM functions
+fp8_config: FP8Config = None
 
-        global NUM_LAYERS, PARAM_NAMES, NUM_FIRST_LAST_LAYERS_IN_BF16
-        NUM_LAYERS = config.num_hidden_layers
-        NUM_FIRST_LAST_LAYERS_IN_BF16 = num_layers
-        PARAM_NAMES = param_names
 
-    except OSError as e:
-        raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
+def init_fp8(vllm_cfg, model_name):
+    global fp8_config
+    fp8_config = FP8Config(
+        use_weight_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False),
+        use_activation_pow2_scale = vllm_cfg.get("pow2_activation_scaling_factors", False),
+        num_first_last_layers_in_bf16 = vllm_cfg.get("num_first_last_layers_in_bf16", 0),
+    )
 
-    layers = [*range(num_layers), *range(NUM_LAYERS - num_layers, NUM_LAYERS)]
-    layer_templates = []
-    for i in layers:
-        # Prefixes used by huggingface model transformer layers.
-        # We'll use these to match against the parameter names to determine 
-        # which layer the parameter is in.
-        layer_templates.extend([
-            f"transformer.h.{i}.",
-            f"layers.{i}.",
-            f"layer.{i}.",
-        ])
+    if vllm_cfg.get("use_deep_gemm", False):
+        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+    print(f"FP8 enabled and initialized to {fp8_config}")
 
-    prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
-    if len(prefixes) == 0:
-        raise ValueError(f"Could not identify layers {layers} for model '{model_name}'.")
 
-    params = []
-    for name in param_names:
-        if any(p in name for p in prefixes) and 'bias' not in name and 'layernorm' not in name:
-            # Convert the param name into vllm's module name
-            # Vllm wraps the model with an extra 'model'
-            params.append(f"model.{name}".removesuffix('.weight'))
-    return params
+def get_vllm_kwargs(model_name):
+    fp8_block_quant_cfg = dict(fp8_config.fp8_block_quant_cfg)
+    if fp8_config.num_first_last_layers_in_bf16 > 0:
+        fp8_block_quant_cfg['ignored_layers'] = _get_params_in_first_last_n_layers(
+            model_name
+        )
+    vllm_kwargs = {
+        "quantization" : "fp8",
+        "hf_overrides" : {"quantization_config": fp8_block_quant_cfg},
+    }
+    return vllm_kwargs
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -65,8 +63,47 @@ def is_fp8_model(vllm_config):
 
     return False
 
+def _get_params_in_first_last_n_layers(model_name):
+    num_first_last_layers_in_bf16 = fp8_config.num_first_last_layers_in_bf16
+    assert fp8_config.num_first_last_layers_in_bf16 > 0
 
-def get_modules_for_params(model, name: str):
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [name for name, _ in model.named_parameters()]
+    except OSError as e:
+        raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
+
+    layers = [
+        *range(num_first_last_layers_in_bf16), 
+        *range(config.num_hidden_layers - num_first_last_layers_in_bf16, config.num_hidden_layers)
+    ]
+
+    layer_templates = []
+    for i in layers:
+        # Prefixes used by huggingface model transformer layers.
+        # We'll use these to match against the parameter names to determine 
+        # which layer the parameter is in.
+        layer_templates.extend([
+            f"transformer.h.{i}.",
+            f"layers.{i}.",
+            f"layer.{i}.",
+        ])
+    prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
+    if len(prefixes) == 0:
+        raise ValueError(f"Could not identify layers {layers} for model '{model_name}'.")
+
+    params = []
+    for name in param_names:
+        if any(p in name for p in prefixes) and 'bias' not in name and 'layernorm' not in name:
+            # Convert the param name into vllm's module name
+            # Vllm wraps the model with an extra 'model'
+            params.append(f"model.{name}".removesuffix('.weight'))
+    return params
+
+
+def _get_module_from_param_name(model, name: str):
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split('.')
@@ -95,22 +132,22 @@ def get_modules_for_params(model, name: str):
     return current_module
 
 
-def is_fp8_weight(name, model):
-    if not name.endswith('weight'):
-        return False
-
-    module = get_modules_for_params(model, name)
-    if not isinstance(module, LinearBase):
-        return False
-
-    return module.weight.dtype == torch.float8_e4m3fn
+def _is_fp8_weight(name, model):
+    if name not in fp8_config._seen_params:
+        fp8_config._seen_params.add(name)
+        # Filter out bias params
+        if name.endswith('weight'):
+            module = _get_module_from_param_name(model, name)
+            # We currently only quantize linear layers
+            if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
+                fp8_config._fp8_param_names.add(name)
+    return name in fp8_config._fp8_param_names
 
 
 def cast_weights_to_fp8(weights, quant_config, model):
     weights_quantized = []
     for k, v in weights:
-        is_fp8 = is_fp8_weight(k, model)
-        if not is_fp8:
+        if not _is_fp8_weight(k, model):
             weights_quantized.append((k,v))
             continue
         
@@ -159,7 +196,7 @@ def kitchen_block_scale(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
-    if USE_WEIGHT_POW2_SCALE:
+    if fp8_config.use_weight_pow2_scale:
         # Calculate exponent HW instruction: cvt.rp.satfinite.ue8m0x2.f32
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
@@ -440,7 +477,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=USE_ACTIVATION_POW2_SCALE,
+            pow2_scale=fp8_config.use_activation_pow2_scale,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -456,7 +493,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
-            pow2_scale=USE_ACTIVATION_POW2_SCALE,
+            pow2_scale=fp8_config.use_activation_pow2_scale,
             num_warps=num_warps,
             num_stages=num_stages,
         )

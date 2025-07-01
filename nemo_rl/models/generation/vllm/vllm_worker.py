@@ -297,34 +297,9 @@ class BaseVllmGenerationWorker:
 
         if self.cfg["vllm_cfg"]["precision"] == 'fp8':
             from nemo_rl.models.generation import fp8
-            fp8_block_quant_cfg = {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128]
-            }
-
-            if self.cfg["vllm_cfg"].get("pow2_weight_scaling_factors", False):
-                fp8.USE_WEIGHT_POW2_SCALE = True
-                print("Using USE_WEIGHT_POW2_SCALE Scaling!")
-
-            if self.cfg["vllm_cfg"].get("pow2_activation_scaling_factors", False):
-                fp8.USE_ACTIVATION_POW2_SCALE = True
-                print("Using USE_ACTIVATION_POW2_SCALE Scaling!")
-
-            if self.cfg["vllm_cfg"].get("first_layer_layers_in_bf16", True):
-                print("Using FIRST_LAST_LAYERS_IN_BF16!")
-                fp8_block_quant_cfg['ignored_layers'] = fp8.get_params_in_first_last_n_layers(
-                    self.model_name, 1
-                )
-
-            if self.cfg["vllm_cfg"].get("use_deep_gemm", False):
-                os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-                print("Using DEEP GEMM!")
-
-            vllm_kwargs["quantization"] = "fp8"
-            vllm_kwargs["hf_overrides"] = {"quantization_config": fp8_block_quant_cfg}
-            # overriden by quant config, just to stop vllm from complaining
+            fp8.init_fp8(self.cfg["vllm_cfg"], self.model_name)
+            vllm_kwargs.update(fp8.get_vllm_kwargs(self.model_name))
+            # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16" 
 
         llm_kwargs = dict(
