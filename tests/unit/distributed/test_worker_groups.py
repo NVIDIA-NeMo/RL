@@ -328,6 +328,48 @@ def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     worker_group.shutdown(force=True)
 
 
+def test_run_single_worker_single_data(worker_group_1d_sharding):
+    worker_group = worker_group_1d_sharding
+    assert len(worker_group.workers) == 2
+    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+
+    data_for_worker0 = SlicedDataDict({"id": 0, "val": "w0_val"})
+    data_for_worker1 = SlicedDataDict({"id": 1, "val": "w1_val"})
+
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        future_0 = worker_group.run_single_worker_single_data(
+            "record_call", 0, data_for_worker0
+        )
+        future_1 = worker_group.run_single_worker_single_data(
+            "record_call", 1, data_for_worker1
+        )
+        ray.get([future_0, future_1])
+
+    # pass through kwargs
+    future_0 = worker_group.run_single_worker_single_data(
+        "record_call", 0, data=data_for_worker0
+    )
+    future_1 = worker_group.run_single_worker_single_data(
+        "record_call", 1, data=data_for_worker1
+    )
+    results = ray.get([future_0, future_1])
+    assert len(results) == 2
+
+    # Check worker 0
+    d, args, _, count = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    assert count == 1
+    assert d == data_for_worker0
+    assert args == ()
+
+    # Check worker 1
+    d, args, _, count = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    assert count == 1
+    assert d == data_for_worker1
+    assert args == ()
+
+
 def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     worker_group = worker_group_1d_sharding
     assert len(worker_group.workers) == 2
@@ -339,17 +381,26 @@ def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     test_arg1 = "arg_single"
     test_kwarg1 = "kwarg_single_val"
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_single_data(
+            "record_call", test_data, test_arg1
+        )
+        ray.get(futures)
+
+    # pass through kwargs
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, test_arg1, kwarg1=test_kwarg1
+        "record_call", data=test_data, kwarg1=test_kwarg1
     )
     results = ray.get(futures)
     assert len(results) == 2  # Should run on all 2 workers
 
-    for i, worker in enumerate(worker_group.workers):
+    for worker in worker_group.workers:
         data, args, kwargs, count = ray.get(worker.get_recorded_data.remote())
         assert count == 1
         assert data == test_data
-        assert args == (test_arg1,)
+        assert args == ()
         assert kwargs == {"kwarg1": test_kwarg1}
 
 
@@ -359,7 +410,7 @@ def test_run_all_workers_single_data_2d_sharding_no_filter(worker_group_2d_shard
     ray.get([w.reset_call_records.remote() for w in worker_group.workers])
 
     test_data = SlicedDataDict({"key": "value_2d_no_filter"})
-    futures = worker_group.run_all_workers_single_data("record_call", test_data)
+    futures = worker_group.run_all_workers_single_data("record_call", data=test_data)
     results = ray.get(futures)
     assert len(results) == 4  # Runs on all 4 workers
 
@@ -377,7 +428,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_tp(worker_group_2d_shard
     test_data = SlicedDataDict({"key": "value_2d_filter_tp"})
     # Only run on tp rank 0 for each dp rank
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, run_rank_0_only_axes=["tp"]
+        "record_call", data=test_data, run_rank_0_only_axes=["tp"]
     )
     results = ray.get(futures)
     assert len(results) == 2  # Runs on 2 workers (dp0-tp0, dp1-tp0)
@@ -403,7 +454,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sh
     test_data = SlicedDataDict({"key": "value_2d_filter_dp_tp"})
     # Only run on dp rank 0 AND tp rank 0
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, run_rank_0_only_axes=["dp", "tp"]
+        "record_call", data=test_data, run_rank_0_only_axes=["dp", "tp"]
     )
     results = ray.get(futures)
     assert len(results) == 1  # Runs on 1 worker (dp0-tp0)
@@ -430,8 +481,17 @@ def test_run_all_workers_multiple_data_1d_sharding(worker_group_1d_sharding):
     multi_data = [data_for_worker0, data_for_worker1]
     common_arg = "common_arg_multi"
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_multiple_data(
+            "record_call", multi_data, common_kwargs={"common": common_arg}
+        )
+        ray.get(futures)
+
+    # pass through kwargs
     futures = worker_group.run_all_workers_multiple_data(
-        "record_call", multi_data, common_kwargs={"common": common_arg}
+        "record_call", data=multi_data, common_kwargs={"common": common_arg}
     )
     results = ray.get(futures)
     assert len(results) == 2
@@ -462,10 +522,11 @@ def test_run_all_workers_multiple_data_fewer_data_than_workers(
     data_for_worker1 = SlicedDataDict({"id": 1})
     multi_data = [data_for_worker0, data_for_worker1]  # Only 2 data items
 
-    with pytest.raises(
-        AssertionError, match="data length should be equal to the number of workers: "
-    ):
-        futures = worker_group.run_all_workers_multiple_data("record_call", multi_data)
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_multiple_data(
+            "record_call", data=multi_data
+        )
+        ray.get(futures)
 
 
 def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
@@ -479,6 +540,15 @@ def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
         SlicedDataDict({"shard": 1, "val": "val1"}),
     ]
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        future_bundle = worker_group.run_all_workers_sharded_data(
+            "record_call", sharded_data_input, in_sharded_axes=["data"]
+        )
+        worker_group.get_all_worker_results(future_bundle)
+
+    # pass through kwargs
     future_bundle = worker_group.run_all_workers_sharded_data(
         "record_call", data=sharded_data_input, in_sharded_axes=["data"]
     )

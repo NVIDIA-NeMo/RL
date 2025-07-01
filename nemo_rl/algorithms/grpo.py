@@ -191,6 +191,7 @@ def setup(
         batch_size=grpo_config["num_prompts_per_step"],
         shuffle=False,
         collate_fn=rl_collate_fn,
+        drop_last=True,
     )
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
