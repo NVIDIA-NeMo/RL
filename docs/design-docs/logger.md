@@ -21,7 +21,7 @@ class LoggerInterface(ABC):
     """Abstract base class for logger backends."""
 
     @abstractmethod
-    def log_metrics(self, metrics: Dict[str, Any], step: int, prefix: Optional[str]: "") -> None:
+    def log_metrics(self, metrics: dict[str, Any], step: int, prefix: Optional[str]: "") -> None:
         """Log a dictionary of metrics."""
         pass
 
