@@ -128,6 +128,7 @@ jobs:
       - name: Check mypy
         run: |
           pip install uv
+          uv pip install setuptools
           uv run --group test mypy nemo_rl examples
 
   sphinx-build:
@@ -143,6 +144,7 @@ jobs:
       - name: build docs
         run: |
           pip install uv
+          uv pip install setuptools
           cd docs/
           uv run --group docs sphinx-build --fail-on-warning --builder html . _build/html
 
