@@ -352,6 +352,14 @@ class MegatronPolicyWorker:
         megatron_checkpoint_home: Optional[str] = None,
         **kwargs: Any,
     ):
+        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        if (
+            config["generation"] is not None
+            and not config["generation"]["colocated"]["enabled"]
+        ):
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         self.cfg = config
         dtype_map = {
             "float32": torch.float32,
@@ -379,7 +387,8 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        if get_rank_safe() == 0:
+        self.rank = get_rank_safe()
+        if self.rank == 0:
             if pt_checkpoint_exists:
                 print(
                     f"Checkpoint already exists at {pretrained_path}. Skipping import."
@@ -649,6 +658,23 @@ class MegatronPolicyWorker:
             return None, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, None
         else:
             return None, None, None
+
+    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        # keep the same behavior as vllm
+        # see https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/env_override.py#L25
+        if not os.path.exists("/dev/nvidia-caps-imex-channels"):
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+        if self.rank == 0:
+            pg = StatelessProcessGroup.create(
+                host=ip, port=port, rank=0, world_size=world_size
+            )
+            device = torch.cuda.current_device()
+            self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self):
         return True
