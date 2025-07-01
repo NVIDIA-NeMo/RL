@@ -341,9 +341,8 @@ class VllmGenerationWorker:
 
             if self.cfg["vllm_cfg"].get("first_layer_layers_in_bf16", True):
                 print("Using FIRST_LAST_LAYERS_IN_BF16!")
-                fp8.FIRST_LAST_LAYERS_IN_BF16 = True
-                fp8_block_quant_cfg['ignored_layers'] = fp8.get_first_last_layer_param_names(
-                    self.model_name
+                fp8_block_quant_cfg['ignored_layers'] = fp8.get_params_in_first_last_n_layers(
+                    self.model_name, 1
                 )
 
             if self.cfg["vllm_cfg"].get("use_deep_gemm", False):
@@ -357,6 +356,7 @@ class VllmGenerationWorker:
 
 
         llm_kwargs = dict(
+            enforce_eager=True,
             model=self.model_name,
             load_format=load_format,
             skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
