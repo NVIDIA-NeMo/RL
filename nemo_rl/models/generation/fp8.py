@@ -7,15 +7,13 @@ from typing import Any, Callable, Optional, Union
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from unittest.mock import patch
 
-@dataclass()
+@dataclass(frozen=True)
 class FP8Config:
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
     num_first_last_layers_in_bf16: int = 0
-    _seen_params: set = field(default_factory=lambda: set())
-    _fp8_param_names: set = field(default_factory=lambda: set())
-
     fp8_block_quant_cfg = {
         "activation_scheme": "dynamic",
         "fmt": "e4m3",
@@ -23,21 +21,52 @@ class FP8Config:
         "weight_block_size": [128, 128]
     }
 
+@dataclass()
+class FP8State:
+    # A cache of fp8 parameter names, we can check this cache to see if a 
+    # param name corresponds to a fp8 weight
+    seen_params: set = field(default_factory=lambda: set())
+    fp8_param_names: set = field(default_factory=lambda: set())
+    vllm_patches: list = field(default_factory=lambda: [])
+
 # Global FP8 config that can be accessed by patched vLLM functions
 fp8_config: FP8Config = None
+# Global FP8 state that holds runtime fp8 objects
+fp8_state: FP8Config = None
 
 
 def init_fp8(vllm_cfg, model_name):
-    global fp8_config
+    global fp8_config, fp8_state
     fp8_config = FP8Config(
         use_weight_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale = vllm_cfg.get("pow2_activation_scaling_factors", False),
         num_first_last_layers_in_bf16 = vllm_cfg.get("num_first_last_layers_in_bf16", 0),
     )
+    fp8_state = FP8State()
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
     print(f"FP8 enabled and initialized to {fp8_config}")
+
+    # This patch is used to support torch.compile with vllm parameter subclasses, such as
+    # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
+    # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
+    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in 
+    # which this patch can be removed. 
+    func1_path = 'vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading'
+    patcher1 = patch(func1_path, process_weights_after_loading)
+    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher 
+    # SNR compared to plain fp32 scaling factors. This feature is still under active research. 
+    func2_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
+    func3_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
+    func4_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'    
+    patcher2 = patch(func2_path, per_token_group_quant_fp8)
+    patcher3 = patch(func3_path, _per_token_group_quant_fp8)
+    patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
+    # Save the patches and activate them
+    fp8_state.vllm_patches = [patcher1, patcher2, patcher3, patcher4]
+    for p in fp8_state.vllm_patches:
+        p.start()
 
 
 def get_vllm_kwargs(model_name):
@@ -108,7 +137,6 @@ def _get_module_from_param_name(model, name: str):
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split('.')
     module_path = path_parts[:-1]
-
     # Replace with the fused model name
     packed_modules_mapping = model.packed_modules_mapping
     reversed_mapping = {
@@ -133,33 +161,44 @@ def _get_module_from_param_name(model, name: str):
 
 
 def _is_fp8_weight(name, model):
-    if name not in fp8_config._seen_params:
-        fp8_config._seen_params.add(name)
+    if name not in fp8_state.seen_params:
+        fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith('weight'):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
-                fp8_config._fp8_param_names.add(name)
-    return name in fp8_config._fp8_param_names
+                fp8_state.fp8_param_names.add(name)
+    return name in fp8_state.fp8_param_names
 
-
-def cast_weights_to_fp8(weights, quant_config, model):
+def load_weights(weights, model_runner):
     weights_quantized = []
+    model = model_runner.model
+
     for k, v in weights:
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k,v))
             continue
-        
+        # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = kitchen_block_scale(
             v.to(torch.float), 
-            weight_block_size=quant_config.weight_block_size
+            weight_block_size=FP8Config.fp8_block_quant_cfg['weight_block_size']
         )
         param_scale = torch.squeeze(param_scale)
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
-
-    return weights_quantized
+    # Monkey patch the param class to their subclass, as certain models
+    # will check the param type to call the proper weightloader
+    for name, param in model.named_parameters():
+        if hasattr(param, "subclass_type"):
+            param.orig_type = param.__class__
+            param.__class__ = param.subclass_type
+    # Finally load the weights into vllm
+    model.load_weights(weights_quantized)
+    # Undo the type change above to the original type
+    for name, param in model.named_parameters():
+        if hasattr(param, "subclass_type"):
+            param.__class__ = param.orig_type
 
 
 def kitchen_block_scale(
