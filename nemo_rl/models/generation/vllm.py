@@ -55,6 +55,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
+from transformers import PretrainedConfig
 
 
 class VllmSpecificArgs(TypedDict):
@@ -131,6 +132,10 @@ class VllmGenerationWorker:
                 seed = node_idx * 1024 + bundle_id
 
             init_kwargs["seed"] = seed
+            # Need to give each DP group its own vllm cache to address:
+            # https://github.com/vllm-project/vllm/issues/18851
+            env_vars["VLLM_CACHE_ROOT"] = f"~/.cache/vllm_{seed}"
+
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -173,6 +178,7 @@ class VllmGenerationWorker:
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -320,6 +326,13 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        if self.cfg["vllm_cfg"]["precision"] == 'fp8':
+            from nemo_rl.models.generation import fp8
+            fp8.init_fp8(self.cfg["vllm_cfg"], self.model_name)
+            vllm_kwargs.update(fp8.get_vllm_kwargs(self.model_name))
+            # overriden by quant config, however vllm complains if this not passed
+            self.precision = "bfloat16" 
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -328,10 +341,8 @@ class VllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            dtype=self.cfg["vllm_cfg"]["precision"],
+            dtype=self.precision,
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
-            enforce_eager=True,
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
