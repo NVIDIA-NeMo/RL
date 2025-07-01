@@ -3,33 +3,126 @@ from typing import Any, Callable, Optional, Union
 import torch, os
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.model_executor.layers.linear import LinearBase
 from transformers import PretrainedConfig
+
+from transformers import AutoConfig, AutoModel
+from accelerate import init_empty_weights
 
 USE_WEIGHT_POW2_SCALE = False
 USE_ACTIVATION_POW2_SCALE = False
-FIRST_LAST_LAYERS_IN_BF16 = False
+NUM_FIRST_LAST_LAYERS_IN_BF16 = None
 NUM_LAYERS = None
+PARAM_NAMES = None
 
-def get_first_last_layer_param_names(model_name):
-    def get_layer_params(layer_num):
-        return [
-            f'model.layers.{layer_num}.self_attn.q_proj',
-            f'model.layers.{layer_num}.self_attn.k_proj',
-            f'model.layers.{layer_num}.self_attn.v_proj',
-            f'model.layers.{layer_num}.self_attn.o_proj',
-            f'model.layers.{layer_num}.mlp.up_proj',
-            f'model.layers.{layer_num}.mlp.down_proj',
-            f'model.layers.{layer_num}.mlp.gate_proj',
-        ]
+def get_params_in_first_last_n_layers(model_name, num_layers):
+    try:
+        config = AutoConfig.from_pretrained(model_name)
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [name for name, _ in model.named_parameters()]
 
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model_name, token=os.getenv('HF_TOKEN', None))
-    
-    global NUM_LAYERS
-    NUM_LAYERS = config_dict['num_hidden_layers']
-    layers = [0, NUM_LAYERS-1]
+        global NUM_LAYERS, PARAM_NAMES, NUM_FIRST_LAST_LAYERS_IN_BF16
+        NUM_LAYERS = config.num_hidden_layers
+        NUM_FIRST_LAST_LAYERS_IN_BF16 = num_layers
+        PARAM_NAMES = param_names
 
-    return [param for l in layers for param in get_layer_params(l)]
+    except OSError as e:
+        raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
+
+    layers = [*range(num_layers), *range(NUM_LAYERS - num_layers, NUM_LAYERS)]
+    layer_templates = []
+    for i in layers:
+        # Prefixes used by huggingface model transformer layers.
+        # We'll use these to match against the parameter names to determine 
+        # which layer the parameter is in.
+        layer_templates.extend([
+            f"transformer.h.{i}.",
+            f"layers.{i}.",
+            f"layer.{i}.",
+        ])
+
+    prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
+    if len(prefixes) == 0:
+        raise ValueError(f"Could not identify layers {layers} for model '{model_name}'.")
+
+    params = []
+    for name in param_names:
+        if any(p in name for p in prefixes) and 'bias' not in name and 'layernorm' not in name:
+            # Convert the param name into vllm's module name
+            # Vllm wraps the model with an extra 'model'
+            params.append(f"model.{name}".removesuffix('.weight'))
+    return params
+
+def is_fp8_model(vllm_config):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    if hasattr(vllm_config, "quant_config") and \
+        isinstance(vllm_config.quant_config, Fp8Config):
+        assert vllm_config.quant_config.weight_block_size is not None, \
+            "Only block scaling is currently supported in NeMo-RL!"
+        return True
+
+    return False
+
+
+def get_modules_for_params(model, name: str):
+    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
+    # The module path is all but the last part (the parameter's own name)
+    path_parts = name.split('.')
+    module_path = path_parts[:-1]
+
+    # Replace with the fused model name
+    packed_modules_mapping = model.packed_modules_mapping
+    reversed_mapping = {
+        original_name: fused_name
+        for fused_name, original_names_list in packed_modules_mapping.items()
+        for original_name in original_names_list
+    }
+    if module_path[-1] in reversed_mapping.keys():
+        module_path[-1] = reversed_mapping[module_path[-1]]
+
+    current_module = model
+    try:
+        # Traverse the model hierarchy
+        for part in module_path:
+            if isinstance(current_module, torch.nn.ModuleList):
+                current_module = current_module[int(part)]
+            else:
+                current_module = getattr(current_module, part)
+    except (AttributeError, IndexError, ValueError) as e:
+        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    return current_module
+
+
+def is_fp8_weight(name, model):
+    if not name.endswith('weight'):
+        return False
+
+    module = get_modules_for_params(model, name)
+    if not isinstance(module, LinearBase):
+        return False
+
+    return module.weight.dtype == torch.float8_e4m3fn
+
+
+def cast_weights_to_fp8(weights, quant_config, model):
+    weights_quantized = []
+    for k, v in weights:
+        is_fp8 = is_fp8_weight(k, model)
+        if not is_fp8:
+            weights_quantized.append((k,v))
+            continue
+        
+        param_lp, param_scale = kitchen_block_scale(
+            v.to(torch.float), 
+            weight_block_size=quant_config.weight_block_size
+        )
+        param_scale = torch.squeeze(param_scale)
+        weights_quantized.append([k, param_lp])
+        weights_quantized.append([k + "_scale_inv", param_scale])
+
+    return weights_quantized
 
 
 def kitchen_block_scale(
@@ -106,50 +199,6 @@ def kitchen_block_scale(
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp_inv 
 
-
-def is_fp8_model(vllm_config):
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
-    if hasattr(vllm_config, "quant_config") and \
-        isinstance(vllm_config.quant_config, Fp8Config):
-        assert vllm_config.quant_config.weight_block_size is not None, \
-            "Only block scaling is currently supported in NeMo-RL!"
-        return True
-
-    return False
-
-def is_fp8_weight(name):
-    fp8_params = [
-        "q_proj.weight", 
-        "k_proj.weight", 
-        "v_proj.weight", 
-        "o_proj.weight", 
-        "down_proj.weight", 
-        "up_proj.weight", 
-        "gate_proj.weight",
-    ]
-    if FIRST_LAST_LAYERS_IN_BF16:
-        if 'layers.0' in name or f'layers.{str(NUM_LAYERS-1)}' in name:
-            return False
-    return any([param in name for param in fp8_params])
-
-
-def cast_weights_to_fp8(weights, quant_config):
-    weights_quantized = []
-    for k, v in weights:
-        if not is_fp8_weight(k):
-            weights_quantized.append((k,v))
-            continue
-        
-        param_lp, param_scale = kitchen_block_scale(
-            v.to(torch.float), 
-            weight_block_size=quant_config.weight_block_size
-        )
-        param_scale = torch.squeeze(param_scale)
-        weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
-
-    return weights_quantized
 
 def process_weights_after_loading(self, layer) -> None:
     from vllm.model_executor.parameter import (BlockQuantScaleParameter,
