@@ -603,12 +603,12 @@ class DTensorPolicyWorker:
                                     logits.device_mesh.ndim == 1
                                     and logits.device_mesh.mesh_dim_names[0] == "tp"
                                 ), "logits must be tp sharded"
-                                local_logits = logits.to_local()
+
                                 # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
-                                logits = DTensor.from_local(
-                                    local_logits,
+                                logits = logits.redistribute(
                                     device_mesh=self.device_mesh["cp", "tp"],
                                     placements=[Shard(sequence_dim), Shard(-1)],
+                                    async_op=True,
                                 )
                             else:
                                 logits = DTensor.from_local(
