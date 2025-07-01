@@ -75,7 +75,7 @@ class VllmInternalWorkerExtension:
             from nemo_rl.models.generation.fp8 import cast_weights_to_fp8, is_fp8_model
             if is_fp8_model(self.model_runner.vllm_config):
                 quant_config = self.model_runner.vllm_config.quant_config
-                weights = cast_weights_to_fp8(weights, quant_config)
+                weights = cast_weights_to_fp8(weights, quant_config, self.model_runner.model)
                 for name, param in self.model_runner.model.named_parameters():
                     if hasattr(param, "subclass_type"):
                         param.orig_type = param.__class__
