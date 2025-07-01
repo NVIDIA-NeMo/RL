@@ -605,10 +605,10 @@ class DTensorPolicyWorker:
                                 ), "logits must be tp sharded"
 
                                 # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
-                                logits = logits.redistribute(
-                                    device_mesh=self.device_mesh["cp", "tp"],
+                                logits = DTensor.from_local(
+                                    logits.to_local(),
+                                    device_mesh=self.device_mesh[("cp", "tp")],
                                     placements=[Shard(sequence_dim), Shard(-1)],
-                                    async_op=True,
                                 )
                             else:
                                 logits = DTensor.from_local(
