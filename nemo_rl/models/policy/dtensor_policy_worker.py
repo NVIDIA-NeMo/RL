@@ -463,13 +463,6 @@ class DTensorPolicyWorker:
                     input_lengths = mb.get("input_lengths")
                     batch_size, seq_len = input_ids.shape
 
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
-                    )
-                    for i, length in enumerate(input_lengths):
-                        # For right-padded sequence, set 1s at the beginning of the sequence
-                        attention_mask[i, :length] = 1
-
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         attention_mask_input_all_ones = torch.ones(
                             (batch_size, seq_len),
