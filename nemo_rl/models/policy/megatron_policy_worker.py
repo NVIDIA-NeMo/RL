@@ -1345,7 +1345,7 @@ class MegatronPolicyWorker:
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
             "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
-        ) # an arbitrary threshold
+        )  # an arbitrary threshold
         if len(gathered_hf_params) >= int(tensor_number_threshold):
             pack_tensor_for_ipc = True
         else:
@@ -1356,14 +1356,14 @@ class MegatronPolicyWorker:
             # First calculate total size needed for each dtype
             type_to_total_size = defaultdict(lambda: 0)
             tensor_metadata = dict()
-            
+
             for key, tensor in gathered_hf_params.items():
                 tensor_metadata[key] = (
-                    tensor.shape,                       # shape of the tensor
-                    tensor.dtype,                       # dtype of the tensor
-                    type_to_total_size[tensor.dtype],   # offset of the tensor 
-                                                        # in packed buffer
-                    tensor.numel()                      # size of the tensor
+                    tensor.shape,  # shape of the tensor
+                    tensor.dtype,  # dtype of the tensor
+                    type_to_total_size[tensor.dtype],  # offset of the tensor
+                    # in packed buffer
+                    tensor.numel(),  # size of the tensor
                 )
                 type_to_total_size[tensor.dtype] += tensor.numel()
 
@@ -1373,7 +1373,7 @@ class MegatronPolicyWorker:
                     total_size,
                     device=next(iter(gathered_hf_params.values())).device,
                     dtype=dtype,
-                    requires_grad=False
+                    requires_grad=False,
                 )
                 for dtype, total_size in type_to_total_size.items()
             }
@@ -1382,7 +1382,7 @@ class MegatronPolicyWorker:
             for key, tensor in gathered_hf_params.items():
                 metadata = tensor_metadata[key]
                 _, dtype, offset, size = metadata
-                packed_tensors[dtype][offset:offset + size].copy_(
+                packed_tensors[dtype][offset : offset + size].copy_(
                     tensor.detach().view(-1)
                 )
 

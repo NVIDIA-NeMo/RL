@@ -78,10 +78,12 @@ class VllmInternalWorkerExtension:
                     tensor = func(*list_args)
                     dtype_to_packed_tensor[dtype] = tensor
 
-                # Unpack tensor to weights. Here we only return a view of the tensor to avoid 
+                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
                 # using extra memory.
                 for key, (shape, dtype, offset, size) in tensor_metadata.items():
-                    tensor = dtype_to_packed_tensor[dtype][offset:offset+size].view(*shape)
+                    tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
+                        *shape
+                    )
                     weights.append((key, tensor))
             else:
                 # Process each handle to get the tensor
