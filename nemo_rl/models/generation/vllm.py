@@ -348,31 +348,13 @@ class VllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        from unittest.mock import patch
-        from nemo_rl.models.generation.fp8 import (
-            process_weights_after_loading,
-            per_token_group_quant_fp8,
-            _per_token_group_quant_fp8, 
-            _per_token_group_quant_fp8_colmajor,
-        )
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.v1.engine.async_llm import AsyncLLM
 
-        func1 = 'vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading'
-        func2 = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
-        func3 = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
-        func4 = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'
-
-        with patch(func1, process_weights_after_loading), \
-            patch(func2, per_token_group_quant_fp8), \
-            patch(func3, _per_token_group_quant_fp8), \
-            patch(func4, _per_token_group_quant_fp8_colmajor):
-            
-            if self.cfg["vllm_cfg"]["async_engine"]:
-                from vllm.engine.arg_utils import AsyncEngineArgs
-                from vllm.v1.engine.async_llm import AsyncLLM
-
-                self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
-            else:
-                self.llm = vllm.LLM(**llm_kwargs)
+            self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+        else:
+            self.llm = vllm.LLM(**llm_kwargs)
 
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
