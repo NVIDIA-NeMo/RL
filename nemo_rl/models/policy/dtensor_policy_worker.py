@@ -271,7 +271,7 @@ class DTensorPolicyWorker:
             torch.distributed.broadcast(buf, src=0)
 
         if self.cpu_offload:
-            self.model = self.move_buffer_to_device(self.model, "cpu")
+            self.model = self.move_to_device(self.model, "cpu")
 
         # used for streaming update inference engine weights
         self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
