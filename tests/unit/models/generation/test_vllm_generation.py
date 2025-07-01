@@ -380,20 +380,16 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
 
 
 async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):
-    collected_indexed_outputs = []
+    import asyncio
+
     # generate_async is restricted to handle only single samples
     input_generator = test_input_data.make_microbatch_iterator(microbatch_size=1)
-    for single_item_input in input_generator:
-        async for original_idx, single_item_output in vllm_policy.generate_async(
-            single_item_input, greedy=greedy
-        ):
-            collected_indexed_outputs.append((original_idx, single_item_output))
-
-    # Sort by original_idx to ensure order matches generation_input_data
-    collected_indexed_outputs.sort(key=lambda x: x[0])
+    tasks = [
+        vllm_policy.generate_async(data, greedy=greedy) for data in input_generator
+    ]
+    outputs = await asyncio.gather(*tasks, return_exceptions=False)
 
     # Extract in correct order
-    outputs = [item for _, item in collected_indexed_outputs]
     pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
     outputs = BatchedDataDict.from_batches(
         outputs,

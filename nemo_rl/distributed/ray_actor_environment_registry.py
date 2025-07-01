@@ -15,7 +15,8 @@
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.VllmGenerationWorker": PY_EXECUTABLES.VLLM,
+    "nemo_rl.models.generation.vllm_worker.VllmGenerationWorker": PY_EXECUTABLES.VLLM,
+    "nemo_rl.models.generation.vllm_worker_async.VllmAsyncGenerationWorker": PY_EXECUTABLES.VLLM,
     # Temporary workaround for the coupled implementation of DTensorPolicyWorker and vLLM.
     # This will be reverted to PY_EXECUTABLES.BASE once https://github.com/NVIDIA/NeMo-RL/issues/501 is resolved.
     "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.VLLM,

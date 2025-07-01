@@ -135,9 +135,11 @@ async def test_vllm_large_model(
     pipeline_parallel_size,
 ):
     """Test vLLM policy async generation capabilities with large model across 2 nodes."""
-    # Check if we have enough nodes
+    import asyncio
+
     import ray
 
+    # Check if we have enough nodes
     nodes = ray.nodes()
     alive_nodes = [node for node in nodes if node["Alive"]]
     if len(alive_nodes) < 2:
@@ -160,20 +162,12 @@ async def test_vllm_large_model(
         async_policy = VllmGeneration(two_node_cluster, vllm_config)
 
         print("Running async generation...")
-        collected_indexed_outputs = []
         # generate_async is restricted to handle only single samples
         input_generator = test_input_data.make_microbatch_iterator(microbatch_size=1)
-        for single_item_input in input_generator:
-            async for original_idx, single_item_output in async_policy.generate_async(
-                single_item_input
-            ):
-                collected_indexed_outputs.append((original_idx, single_item_output))
-
-        # Sort by original_idx to ensure order matches generation_input_data
-        collected_indexed_outputs.sort(key=lambda x: x[0])
+        tasks = [async_policy.generate_async(data) for data in input_generator]
+        outputs = await asyncio.gather(*tasks, return_exceptions=False)
 
         # Extract in correct order
-        outputs = [item for _, item in collected_indexed_outputs]
         pad_token_id = async_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
         outputs = BatchedDataDict.from_batches(
             outputs,

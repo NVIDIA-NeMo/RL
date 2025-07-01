@@ -40,7 +40,6 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
-    GenerationOutputSpec,
 )
 
 TokenizerType = PreTrainedTokenizerBase
@@ -140,27 +139,23 @@ async def generate_responses_async(
     )
 
     # Use async generation with per-sample streaming
-    collected_indexed_outputs: list[
-        tuple[int, BatchedDataDict[GenerationOutputSpec]]
-    ] = []
-    async for original_idx, single_item_output in policy_generation.generate_async(
-        generation_input_data, greedy=greedy
-    ):
-        collected_indexed_outputs.append((original_idx, single_item_output))
-
-    # Sort by original_idx to ensure order matches generation_input_data
-    collected_indexed_outputs.sort(key=lambda x: x[0])
-
-    # Extract in correct order
-    ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
-
-    assert ordered_batched_data_dicts, (
-        "Generation returned no outputs for a non-empty batch."
+    # generate_async is restricted to handle only single samples
+    split_generation_input_data = generation_input_data.make_microbatch_iterator(
+        microbatch_size=1
     )
+    generation_tasks = [
+        policy_generation.generate_async(data, greedy=greedy)
+        for data in split_generation_input_data
+    ]
+    generation_outputs = await asyncio.gather(
+        *generation_tasks, return_exceptions=False
+    )
+
+    assert generation_outputs, "Generation returned no outputs for a non-empty batch."
 
     pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
     generation_outputs = BatchedDataDict.from_batches(
-        ordered_batched_data_dicts,
+        generation_outputs,
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
     )
 

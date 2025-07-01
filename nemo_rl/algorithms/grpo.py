@@ -243,6 +243,10 @@ def setup(
             "Please use vLLM backend for generation."
         )
 
+        assert policy_config["dtensor_cfg"]["enabled"], (
+            "Non-colocated inference is only supported for dtensor policy worker. "
+        )
+
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = cluster_config["num_nodes"]
