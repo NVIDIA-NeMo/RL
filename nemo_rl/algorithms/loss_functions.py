@@ -97,6 +97,7 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
         self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
         self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
+        self.use_correct_grad_kl = cfg.get("use_correct_grad_kl", False)
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
@@ -177,21 +178,38 @@ class ClippedPGLossFn(LossFunction):
                 )
             else:
                 kl_importance_weights = torch.ones_like(curr_logprobs)
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl_penalty_joschu2020(
-                    logprobs_policy=curr_logprobs,
-                    logprobs_reference=reference_policy_logprobs,
-                )
+
+            kl_fprop = calculate_kl_penalty_joschu2020(
+                logprobs_policy=curr_logprobs,
+                logprobs_reference=reference_policy_logprobs,
             )
+            kl_bprop = kl_fprop
+
+            if self.use_correct_grad_kl:
+                with torch.no_grad():
+                    p_t = (curr_logprobs.detach() - reference_policy_logprobs) * mask
+                    p_t = p_t.flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+
+                kl_bprop = p_t * curr_logprobs
+                kl_fprop = kl_fprop.detach()
+
+            kl = kl_importance_weights * self.reference_policy_kl_penalty * kl_bprop
+
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
                     kl, mask, global_normalization_factor=global_valid_toks
                 )
+                kl_fprop = masked_mean(
+                    kl_fprop, mask, global_normalization_factor=global_valid_toks
+                )
             else:
                 kl = masked_mean(
                     masked_mean(kl, token_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+                kl_fprop = masked_mean(
+                    masked_mean(kl_fprop, token_mask, dim=-1),
                     sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 )
@@ -290,6 +308,7 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio": probs_ratio,
                 "probs_ratio_clamped": probs_ratio_clamped,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                "kl_fprop": kl_fprop.item(),
                 "token_mult_prob_error": mult_prob_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
