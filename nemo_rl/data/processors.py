@@ -11,7 +11,6 @@ TokenizerType = PreTrainedTokenizerBase
 
 
 # Example of a generic math data processor
-# TaskDataProcessFnCallable
 def math_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,

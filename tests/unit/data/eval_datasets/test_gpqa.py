@@ -36,5 +36,7 @@ def test_gpqa_dataset():
             add_special_tokens=False,
         )
 
-        assert default_templated == f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{example["question"]}<|im_end|>\n"
-
+        assert (
+            default_templated
+            == f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{example['question']}<|im_end|>\n"
+        )

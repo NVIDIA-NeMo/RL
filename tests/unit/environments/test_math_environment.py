@@ -93,15 +93,24 @@ def basic_multichoice_test_data():
     return {
         "message_log_batch": [
             [
-                {"role": "user", "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD"},
+                {
+                    "role": "user",
+                    "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
+                },
                 {"role": "assistant", "content": "\nAnswer: C"},
             ],
             [
-                {"role": "user", "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD"},
+                {
+                    "role": "user",
+                    "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
+                },
                 {"role": "assistant", "content": "\nAnswer: B"},
             ],
             [
-                {"role": "user", "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD"},
+                {
+                    "role": "user",
+                    "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
+                },
                 {"role": "assistant", "content": "\nAnswer: D"},
             ],
         ],
@@ -197,7 +206,8 @@ def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data
     """Test basic functionality of MathEnvironment step with multichoice verifier."""
     result = ray.get(
         multichoice_env.step.remote(
-            basic_multichoice_test_data["message_log_batch"], basic_multichoice_test_data["metadata"]
+            basic_multichoice_test_data["message_log_batch"],
+            basic_multichoice_test_data["metadata"],
         )
     )
 
@@ -211,7 +221,9 @@ def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data
     assert all(
         obs["content"] == "Environment: correct" for obs in result.observations[:2]
     ), "The first two responses should be correct"
-    assert result.observations[2]["content"] == "Environment: incorrect", "The third response should be incorrect"
+    assert result.observations[2]["content"] == "Environment: incorrect", (
+        "The third response should be incorrect"
+    )
 
     # Check metadata
     assert len(result.metadata) == 3, "Should return metadata for all 3 messages"
@@ -221,7 +233,9 @@ def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data
 
     # Check rewards and done flags
     assert result.rewards.shape == (3,), "Rewards should be a tensor of shape (3,)"
-    assert all(result.rewards[:2] == 1.0), "The first two rewards should be 1.0 for correct answers"
+    assert all(result.rewards[:2] == 1.0), (
+        "The first two rewards should be 1.0 for correct answers"
+    )
     assert result.rewards[2] == 0.0, "The thrid  reward should be 0.0 for wrong answer"
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"

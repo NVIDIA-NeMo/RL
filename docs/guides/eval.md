@@ -54,7 +54,7 @@ uv run python examples/run_eval.py --config path/to/custom_config.yaml
 # Run evaluation script on one of the supported benchmarks (e.g., GPQA)
 uv run python examples/run_eval.py --config examples/configs/evals/gpqa_eval.yaml
 
-# Run evaluation script with a local dataset
+# Run evaluation script with a local dataset that is prefetched as a csv file.
 uv run python examples/run_eval.py --config examples/configs/evals/local_eval.yaml
 
 # Override specific config values via command line

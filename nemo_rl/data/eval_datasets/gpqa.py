@@ -20,7 +20,7 @@ class GPQADataset:
         self._rng = random.Random()
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
-            task_name=f'GPQA_{variant}',
+            task_name=f"GPQA_{variant}",
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
@@ -38,12 +38,12 @@ class GPQADataset:
         correct_index = choices.index(data["Correct Answer"])
         correct_answer = "ABCD"[correct_index]
         return {
-            'question': data['Question'],
-            'options': dict(
+            "question": data["Question"],
+            "options": dict(
                 A=choices[0],
                 B=choices[1],
                 C=choices[2],
                 D=choices[3],
             ),
-            'answer': correct_answer,
+            "answer": correct_answer,
         }

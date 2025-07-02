@@ -102,7 +102,6 @@ class HFVerifyWorker:
 
 @ray.remote
 class MultichoiceVerifyWorker:
-
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
     ) -> list[float]:
@@ -120,10 +119,14 @@ class MultichoiceVerifyWorker:
             response = answer_parsing.normalize_response(response)
             extracted_answer = None
             for answer_regex in answer_parsing.MULTILINGUAL_ANSWER_REGEXES:
-                regex = answer_parsing.MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(answer_regex)
+                regex = answer_parsing.MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(
+                    answer_regex
+                )
                 match = re.search(regex, response)
                 if match:
-                    extracted_answer = answer_parsing.normalize_extracted_answer(match.group(1))
+                    extracted_answer = answer_parsing.normalize_extracted_answer(
+                        match.group(1)
+                    )
                     break
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
@@ -139,7 +142,11 @@ class MathEnvironment(EnvironmentInterface):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        worker_cls = MultichoiceVerifyWorker if cfg.get("verifier_type", "math") == "multichoice" else HFVerifyWorker
+        worker_cls = (
+            MultichoiceVerifyWorker
+            if cfg.get("verifier_type", "math") == "multichoice"
+            else HFVerifyWorker
+        )
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}

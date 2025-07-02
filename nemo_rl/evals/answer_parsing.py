@@ -1,6 +1,5 @@
 """Contains utility functions for answer parsing."""
 
-
 MULTILINGUAL_ANSWER_PATTERN_TEMPLATE = (
     "(?i){}[ \t]*([A-D]|[أ-د]|[অ]|[ব]|[ড]|[ঢ]|[Ａ]|[Ｂ]|[Ｃ]|[Ｄ])"
 )
@@ -73,10 +72,7 @@ def normalize_extracted_answer(extracted_answer: str) -> str:
 
 
 def normalize_response(response: str) -> str:
-    """
-    Normalize the response by removing markdown and LaTeX formatting that may prevent a match.
-    """
-
+    """Normalize the response by removing markdown and LaTeX formatting that may prevent a match."""
     return (
         response.replace("**", "")
         .replace("$\\boxed{", "")
