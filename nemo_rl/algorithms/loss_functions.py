@@ -600,3 +600,76 @@ class DPOLossFn(LossFunction):
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
         }
+
+
+class SequencePackingLossWrapper:
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid padding."""
+        unpadded_cu_seqlens = self.cu_seqlens_q
+        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
+        if self.cu_seqlens_q_padded is not None:
+            padded_cu_seqlens = self.cu_seqlens_q_padded
+            padded_seq_lengths = (
+                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
+            )
+        else:
+            padded_cu_seqlens = unpadded_cu_seqlens
+            padded_seq_lengths = unpadded_seq_lengths
+        seq_starts = padded_cu_seqlens[:-1]
+        seq_ends = padded_cu_seqlens[1:]
+
+        loss_accum = 0
+        metrics_accum = {}
+        for seq_idx in range(len(seq_starts)):
+            seq_start = seq_starts[seq_idx].item()
+            seq_end = seq_ends[seq_idx].item()
+
+            # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
+            seq_data = data.slice(seq_idx, seq_idx + 1)
+            unpadded_seq_data = {}
+            for k, v in seq_data.items():
+                # print(f"k: {k}, v: {v.shape}")
+                if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:
+                    unpadded_seq_data[k] = v[:, : unpadded_seq_lengths[seq_idx]]
+                else:
+                    unpadded_seq_data[k] = v
+
+            # get next_token_logits
+            next_token_logits_slice = next_token_logits[
+                :, seq_start : seq_start + unpadded_seq_lengths[seq_idx], :
+            ]
+            # print(f"seq_start: {seq_start}, seq_end: {seq_end}, next_token_logits: {next_token_logits_slice.shape}")
+
+            loss, metrics = self.loss_fn(
+                next_token_logits_slice,
+                unpadded_seq_data,
+                global_valid_seqs,
+                global_valid_toks,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+            )
+            loss_accum += loss
+            for k, v in metrics.items():
+                if k not in metrics_accum:
+                    metrics_accum[k] = 0
+                metrics_accum[k] += v
+
+        return loss_accum, metrics_accum
