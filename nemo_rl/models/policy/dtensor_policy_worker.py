@@ -144,7 +144,8 @@ class DTensorPolicyWorker:
     ):
         # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
         if (
-            config["generation"] is not None
+            "generation" in config
+            and config["generation"] is not None
             and not config["generation"]["colocated"]["enabled"]
         ):
             os.environ["NCCL_SHM_DISABLE"] = "1"
