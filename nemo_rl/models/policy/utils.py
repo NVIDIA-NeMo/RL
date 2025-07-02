@@ -19,6 +19,8 @@ from typing import Any
 import torch
 from transformers import AutoConfig
 
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
 
 def import_class_from_path(name: str) -> Any:
     """Import a class from a string path (e.g. 'torch.optim.AdamW').
@@ -127,3 +129,27 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         )
 
     return overwrite_dict
+
+
+def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
+    """Get runtime environment configuration for DTensorPolicyWorker.
+
+    Conditionally enables expandable_segments on Hopper GPUs only,
+    as it causes crashes on Ampere GPUs.
+    """
+    runtime_env = {
+        **get_nsight_config_if_pattern_matches(policy_worker_name),
+    }
+
+    # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+    try:
+        compute_capability = torch.cuda.get_device_properties(0).major
+        if compute_capability >= 9:  # Hopper+
+            runtime_env["env_vars"] = {
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+    except Exception:
+        # If we can't detect GPU capability, don't enable expandable_segments for safety
+        pass
+
+    return runtime_env
