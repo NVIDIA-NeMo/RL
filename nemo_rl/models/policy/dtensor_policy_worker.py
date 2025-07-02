@@ -21,7 +21,12 @@ from typing import Any, Generator, Iterable, List, Optional, Set, Union, cast
 
 import ray
 import torch
+from accelerate import init_empty_weights
 from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
+)
 from torch.distributed.fsdp import (
     FSDPModule,
 )
@@ -30,7 +35,7 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
@@ -137,6 +142,15 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        if (
+            "generation" in config
+            and config["generation"] is not None
+            and not config["generation"]["colocated"]["enabled"]
+        ):
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
@@ -156,19 +170,38 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-        self.model = AutoModelForCausalLM.from_pretrained(
+        model_config = AutoConfig.from_pretrained(
             model_name,
-            device_map="cpu",  # load weights onto CPU initially
             # Always load the model in float32 to keep master weights in float32.
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            # https://github.com/NVIDIA-NeMo/RL/issues/279 will fix the issue of CPU OOM for larger models.
             torch_dtype=torch.float32,
             trust_remote_code=True,
             **sliding_window_overwrite(
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
         )
+
+        full_state_dict = None
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="cpu",  # load weights onto CPU initially
+                trust_remote_code=True,
+                config=model_config,
+            )
+            full_state_dict = model.state_dict()
+            del model
+
+        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+        # All ranks initialize model on meta device, so FSDP can shard it.
+        # The actual weights will be broadcast from rank 0.
+
+        with init_empty_weights():
+            self.model = AutoModelForCausalLM.from_config(
+                model_config,
+            )
+
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
         self.skip_tie_check = os.environ.get(
@@ -222,8 +255,24 @@ class DTensorPolicyWorker:
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
 
+        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
+        # This will broadcast the state dict from rank 0 to all other ranks
+        # and load it into the FSDP model.
+        set_model_state_dict(
+            self.model,
+            model_state_dict=full_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+            ),
+        )
+
+        # Manually broadcast buffers
+        for _, buf in self.model.named_buffers():
+            torch.distributed.broadcast(buf, src=0)
+
         if self.cpu_offload:
-            self.model = self.move_buffer_to_device(self.model, "cpu")
+            self.model = self.move_to_device(self.model, "cpu")
 
         # used for streaming update inference engine weights
         self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
