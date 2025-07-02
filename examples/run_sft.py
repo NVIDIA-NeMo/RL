@@ -109,6 +109,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             output_key=data_config["output_key"],
             prompt_file=data_config["prompt_file"],
         )
+    elif data_cls == "openai_format":
+        data = hf_datasets.OpenAIFormatDataset(
+            data_config["train_data_path"],
+            data_config["val_data_path"],
+            data_config["chat_key"],
+            data_config["system_key"],
+            data_config["system_prompt"],
+        )
     else:
         raise ValueError(f"Unknown dataset class: {data_cls}")
     print(
