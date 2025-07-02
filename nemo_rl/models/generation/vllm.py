@@ -330,7 +330,7 @@ class VllmGenerationWorker:
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
             dtype=self.cfg["vllm_cfg"]["precision"],
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
+            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA-NeMo/RL/issues/186)
             enforce_eager=True,
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,

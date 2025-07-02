@@ -162,7 +162,7 @@ class DTensorPolicyWorker:
             device_map="cpu",  # load weights onto CPU initially
             # Always load the model in float32 to keep master weights in float32.
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            # https://github.com/NVIDIA/NeMo-RL/issues/279 will fix the issue of CPU OOM for larger models.
+            # https://github.com/NVIDIA-NeMo/RL/issues/279 will fix the issue of CPU OOM for larger models.
             torch_dtype=torch.float32,
             trust_remote_code=True,
             **sliding_window_overwrite(
@@ -381,7 +381,7 @@ class DTensorPolicyWorker:
             and not self.skip_tie_check
         ):
             raise ValueError(
-                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA/NeMo-RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
+                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA-NeMo/RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
             )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
