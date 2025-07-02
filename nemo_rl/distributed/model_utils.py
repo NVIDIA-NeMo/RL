@@ -149,15 +149,15 @@ def from_parallel_logits_to_logprobs(
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
-    cp_mesh = None
-    cp_placements = None
-    target_shape = torch.Size(target.shape)
-    sorted_indices = None
+    cp_size = 1
 
-    if seq_index is not None:
-        assert isinstance(target, DTensor), (
-            "target must be a DTensor if seq_index is provided"
-        )
+    if isinstance(target, DTensor) and "cp" in target.device_mesh.mesh_dim_names:
+        cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
+        cp_size = target.device_mesh.shape[cp_dim_index]
+
+    if cp_size > 1:
+        assert seq_index is not None, "seq_index must be provided for cp sharded logits"
+        target_shape = torch.Size(target.shape)
         cp_mesh = target.device_mesh
         cp_placements = target.placements
         _, sorted_indices = torch.sort(seq_index)
@@ -180,7 +180,7 @@ def from_parallel_logits_to_logprobs(
         inference_only,
     ).contiguous()
 
-    if seq_index is not None:
+    if cp_size > 1:
         # probs is sharded on the sequence dimension.
         # Get full sequence tensor, vocab dim has been reduced already.
         probs_dtensor = DTensor.from_local(probs, cp_mesh, cp_placements)
