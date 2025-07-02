@@ -14,6 +14,7 @@
 import contextlib
 import io
 import logging
+import re
 from typing import Any, Optional, TypedDict
 
 import ray
@@ -32,11 +33,13 @@ from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
 from nemo_rl.environments.utils import chunk_list_to_workers
+from nemo_rl.evals import answer_parsing
 
 
 class MathEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[list[str]]  # Default stop strings for this env
+    verifier_type: Optional[str]
 
 
 @contextlib.contextmanager
@@ -97,6 +100,39 @@ class HFVerifyWorker:
         return results
 
 
+@ray.remote
+class MultichoiceVerifyWorker:
+    def verify(
+        self, pred_responses: list[str], ground_truths: list[str]
+    ) -> list[float]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            list[float]. The rewards for each predicted response.
+        """
+        results = []
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            response = answer_parsing.normalize_response(response)
+            extracted_answer = None
+            for answer_regex in answer_parsing.MULTILINGUAL_ANSWER_REGEXES:
+                regex = answer_parsing.MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(
+                    answer_regex
+                )
+                match = re.search(regex, response)
+                if match:
+                    extracted_answer = answer_parsing.normalize_extracted_answer(
+                        match.group(1)
+                    )
+                    break
+            score = 1.0 if extracted_answer == ground_truth else 0.0
+            results.append(score)
+        return results
+
+
 class MathEnvironmentMetadata(TypedDict):
     ground_truth: str
 
@@ -106,8 +142,13 @@ class MathEnvironment(EnvironmentInterface):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
+        worker_cls = (
+            MultichoiceVerifyWorker
+            if cfg.get("verifier_type", "math") == "multichoice"
+            else HFVerifyWorker
+        )
         self.workers = [
-            HFVerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
+            worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
             ).remote()
             for _ in range(self.num_workers)
