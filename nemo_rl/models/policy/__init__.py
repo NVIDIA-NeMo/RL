@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -140,7 +140,7 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    max_grad_norm: Optional[Union[float, int]]
+    max_grad_norm: NotRequired[Union[float, int]]
     fsdp_offload_enabled: bool
     activation_checkpointing_enabled: bool
     refit_buffer_size_gb: NotRequired[float]

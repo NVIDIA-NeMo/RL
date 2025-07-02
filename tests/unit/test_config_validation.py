@@ -15,7 +15,7 @@
 import glob
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Type, get_type_hints
+from typing import Any, Dict, List, Optional, Set, Type, Union, get_type_hints
 
 import pytest
 from omegaconf import OmegaConf
@@ -40,10 +40,18 @@ def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:
 
     for key, annotation in type_hints.items():
         # Check if the field is marked as NotRequired
-        if hasattr(annotation, "__origin__") and (
-            annotation.__origin__ is NotRequired or annotation.__origin__ is Optional
-        ):
+        if hasattr(annotation, "__origin__") and (annotation.__origin__ is NotRequired):
             optional_keys.add(key)
+
+        ## check for Optional fields
+        elif (
+            hasattr(annotation, "__origin__")
+            and annotation.__origin__ is Union
+            and type(None) in annotation.__args__
+        ):
+            raise ValueError(
+                f"Please use the NotRequired annotation instead of Optional for key {key}"
+            )
         else:
             required_keys.add(key)
 
@@ -137,10 +145,7 @@ def test_all_config_files_have_required_keys():
     configs_dir = Path("examples/configs")
 
     # Get all YAML config files
-    config_files = glob.glob(str(configs_dir / "*.yaml"))
-    config_files.extend(
-        glob.glob(str(configs_dir / "recipes/**/*.yaml"), recursive=True)
-    )
+    config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 
     assert len(config_files) > 0, "No config files found"
 
