@@ -114,13 +114,31 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(
-    runtime_env={
-        # TODO: This option causes a crash on Ampere. It's okay to enable on Hopper.
-        # "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+def _get_runtime_env_for_dtensor_policy_worker():
+    """Get runtime environment configuration for DTensorPolicyWorker.
+
+    Conditionally enables expandable_segments on Hopper GPUs only,
+    as it causes crashes on Ampere GPUs.
+    """
+    runtime_env = {
         **get_nsight_config_if_pattern_matches("dtensor_policy_worker"),
     }
-)
+
+    # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+    try:
+        compute_capability = torch.cuda.get_device_properties(0).major
+        if compute_capability >= 9:  # Hopper+
+            runtime_env["env_vars"] = {
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+    except Exception:
+        # If we can't detect GPU capability, don't enable expandable_segments for safety
+        pass
+
+    return runtime_env
+
+
+@ray.remote(runtime_env=_get_runtime_env_for_dtensor_policy_worker())
 class DTensorPolicyWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
