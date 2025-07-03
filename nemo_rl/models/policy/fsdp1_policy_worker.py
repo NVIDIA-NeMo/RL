@@ -900,9 +900,9 @@ class FSDP1PolicyWorker:
         for key, p in converted_params.items():
             handle = reduce_tensor(p.detach())
             all_handles.append((key, handle))
-        
+
         # (pack_tensor_for_ipc: bool, handles: list)
-        serialized = (False, all_handles) 
+        serialized = (False, all_handles)
 
         return {device_uuid: serialized}
 
