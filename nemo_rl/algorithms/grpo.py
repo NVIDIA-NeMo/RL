@@ -360,6 +360,12 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
+    # prepare refit info
+    # state_dict_info: {tensor_name: (shape, dtype)}
+    state_dict_info = policy.prepare_refit_info()
+    if not colocated_inference:
+        policy_generation.prepare_refit_info(state_dict_info)
+
     loss_fn = ClippedPGLossFn(loss_config)
 
     print("\n" + "=" * 60)
@@ -435,13 +441,9 @@ def refit_policy_generation(
             if not update_success:
                 break
     else:
-        # prepare info for update weights
-        state_dict_info = policy.prepare_info_for_collective()
         # update weights through nccl
         futures_train = policy.broadcast_weights_for_collective()
-        futures_inference = policy_generation.update_weights_from_collective(
-            state_dict_info
-        )
+        futures_inference = policy_generation.update_weights_from_collective()
         # wait for all futures to complete
         ray.get(futures_train)
         results = ray.get(futures_inference)

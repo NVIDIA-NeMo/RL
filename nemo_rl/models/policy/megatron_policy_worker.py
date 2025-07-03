@@ -346,12 +346,12 @@ class MegatronPolicyWorker:
         megatron_checkpoint_home: Optional[str] = None,
         **kwargs: Any,
     ):
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
         # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
-        if (
-            "generation" in config
-            and config["generation"] is not None
-            and not config["generation"]["colocated"]["enabled"]
-        ):
+        if not self.is_generation_colocated:
             os.environ["NCCL_SHM_DISABLE"] = "1"
             os.environ["NCCL_P2P_DISABLE"] = "1"
 
@@ -1236,6 +1236,25 @@ class MegatronPolicyWorker:
         return get_device_uuid(device_idx)
 
     @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        # Get parameter info for refit
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.param_info = get_param_info(self.model, self.dtype)
+
+        if self.is_generation_colocated:
+            return
+
+        # Collect converted state dict for collective communication
+        state_dict_info = {}
+        for key, _ in self.param_info:
+            gathered_megatron_params = gather_params(self.model, [key])
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            for name, tensor in gathered_hf_params.items():
+                state_dict_info[name] = (tensor.shape, tensor.dtype)
+        return state_dict_info
+
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1243,13 +1262,6 @@ class MegatronPolicyWorker:
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        # Ensure model is in evaluation mode
-        self.model.eval()
-
-        # Get parameter info for refit
-        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        param_info = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1259,7 +1271,7 @@ class MegatronPolicyWorker:
         ## Use 80% of the free memory for safety
         total_available_bytes *= 0.8
 
-        return param_info, total_available_bytes
+        return self.param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
@@ -1293,32 +1305,6 @@ class MegatronPolicyWorker:
             shapes[key] = tensor.shape
 
         return {device_uuid: all_handles}
-
-    @torch.no_grad()
-    def prepare_info_for_collective(self) -> dict[str, Any]:
-        """Prepare the info for collective communication.
-
-        Returns:
-            dict: A dictionary containing the info for collective communication.
-        """
-        # Ensure model is in evaluation mode
-        self.model.eval()
-
-        # Get parameter info for refit
-        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        self.param_info = get_param_info(self.model, self.dtype)
-
-        # Collect info for collective communication
-        state_dict_info = {}
-        for key, _ in self.param_info:
-            gathered_megatron_params = gather_params(self.model, [key])
-            gathered_hf_params = self.megatron_to_hf_converter.convert(
-                gathered_megatron_params, self.model.config
-            )
-            for name, tensor in gathered_hf_params.items():
-                state_dict_info[name] = (tensor.shape, tensor.dtype)
-
-        return state_dict_info
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:

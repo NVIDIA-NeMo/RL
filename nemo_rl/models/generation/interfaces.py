@@ -228,6 +228,10 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        raise NotImplementedError
+
     def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
