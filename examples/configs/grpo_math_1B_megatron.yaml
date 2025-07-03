@@ -83,8 +83,8 @@ policy:
     sequence_parallel: false
     freeze_moe_router: true
     moe_router_dtype: "fp64"
-    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence
-    moe_router_bias_update_rate: 0.0 # by default, disable bias updates
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
 
     optimizer:
       optimizer: "adam"
