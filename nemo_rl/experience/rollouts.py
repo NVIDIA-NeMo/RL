@@ -405,12 +405,18 @@ def run_multi_turn_rollout(
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
         for i, global_idx in enumerate(active_indices.tolist()):
             env_obs_content = env_output.observations[i]["content"]
-            # Tokenize the raw content from the environment
-            # TODO @sahilj: handle if we want these subsequent messages to have a chat template
-            tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
-
+            # Tokenize the raw content from the environment into chat format if needed
+            env_role = env_output.observations[i]["role"].lower()
+            if env_role in {"user", "assistant", "system"}:
+                formatted_obs = tokenizer.apply_chat_template(
+                    [{"role": env_role, "content": env_obs_content}],
+                    tokenize=False,
+                    add_special_tokens=False,
+                    add_generation_prompt=False,
+                ).strip()
+                tokenized_obs = tokenizer(formatted_obs, return_tensors="pt", add_special_tokens=False).input_ids[0]
+            else:
+                tokenized_obs = tokenizer(env_obs_content, return_tensors="pt", add_special_tokens=False).input_ids[0]
             # check if new message overflows max_seq_len
             if (
                 len(tokenized_obs) + len(generated_ids[i]) + active_input_lengths[i]
@@ -660,9 +666,17 @@ async def run_sample_multi_turn_rollout(
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
         # Tokenize environment response
-        tokenized_obs = tokenizer(
-            env_obs_content, return_tensors="pt", add_special_tokens=False
-        ).input_ids[0]
+        env_role = env_output.observations[0]["role"].lower()
+        if env_role in {"user", "assistant", "system"}:
+            formatted_obs = tokenizer.apply_chat_template(
+                [{"role": env_role, "content": env_obs_content}],
+                tokenize=False,
+                add_special_tokens=False,
+                add_generation_prompt=False,
+            ).strip()
+            tokenized_obs = tokenizer(formatted_obs, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        else:
+            tokenized_obs = tokenizer(env_obs_content, return_tensors="pt", add_special_tokens=False).input_ids[0]
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
