@@ -32,10 +32,18 @@ EOF
 
 # Install uv and python
 ARG UV_VERSION=0.7.2
-ARG PYTHON_VERSION=3.12
-ENV PATH="/root/.local/bin:$PATH"
+ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
+ENV UV_LINK_MODE=copy
+ENV PATH="/root/.local/bin:/opt/nemo_rl_venv/bin:$PATH"
+
+WORKDIR /opt/nemo-rl
+COPY .python-version pyproject.toml ./
+
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install $(cat .python-version) && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} && \
+    grep "ray\[default\]" pyproject.toml | sed 's/.*"\(.*\)".*/\1/' > ray-constraint.txt && \
+    uv pip install -r ray-constraint.txt
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -45,10 +53,8 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 FROM base AS hermetic
 
-WORKDIR /opt/nemo-rl
-
 # First copy only the dependency files
-COPY pyproject.toml uv.lock ./
+COPY uv.lock ./
 COPY --link 3rdparty/ ./3rdparty/
 
 # Variables to control the build of TE. If there are issues with parallelization, consider
@@ -56,12 +62,8 @@ COPY --link 3rdparty/ ./3rdparty/
 ARG MAX_JOBS=4
 ARG NVTE_BUILD_THREADS_PER_JOB=1
 
-ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
-ENV UV_LINK_MODE=copy
-
 # Create and activate virtual environment
 RUN <<"EOF" bash -exu
-uv venv ${UV_PROJECT_ENVIRONMENT}
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -74,9 +76,6 @@ uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 EOF
-
-ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
-ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 WORKDIR /opt/nemo-rl
 
