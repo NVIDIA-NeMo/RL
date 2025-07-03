@@ -61,6 +61,13 @@ def create_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
         },
         "dtensor_cfg": {
             "enabled": True,

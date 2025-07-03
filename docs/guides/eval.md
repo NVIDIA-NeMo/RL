@@ -25,7 +25,7 @@ Once the conversion is complete, you can override the `generation.model_name` to
 ### Prepare the Evaluation Configuration
 **Override with Custom Settings**
 
-To run the evaluation, you can use the [default configuration file](../../examples/configs/eval.yaml). Alternatively, you can specify a custom one or override some settings via the command line.
+To run the evaluation, you can use the [default configuration file](../../examples/configs/evals/eval.yaml). Alternatively, you can specify a custom one or override some settings via the command line.
 
 The default configuration employs greedy sampling to evaluate Qwen2.5-Math-1.5B-Instruct on AIME-2024.
 
@@ -42,7 +42,7 @@ We will use the `run_eval.py` script to run an evaluation using a model directly
 Note that the evaluation script only supports the Hugging Face format model. If you haven't converted your DCP format model, you should back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
 
 ```sh
-# Run evaluation script with default config (examples/configs/eval.yaml)
+# Run evaluation script with default config (examples/configs/evals/eval.yaml)
 uv run python examples/run_eval.py
 
 # Run evaluation script with converted model
@@ -51,16 +51,22 @@ uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
 # Run evaluation script with custom config file
 uv run python examples/run_eval.py --config path/to/custom_config.yaml
 
+# Run evaluation script on one of the supported benchmarks (e.g., GPQA)
+uv run python examples/run_eval.py --config examples/configs/evals/gpqa_eval.yaml
+
+# Run evaluation script with a local dataset that is prefetched as a csv file.
+uv run python examples/run_eval.py --config examples/configs/evals/local_eval.yaml
+
 # Override specific config values via command line
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
 #          Pass@1 accuracy averaged over 16 samples for each problem
 uv run python examples/run_eval.py \
+    --config examples/configs/evals/math_eval.yaml \
     generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
     generation.temperature=0.6 \
     generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=HuggingFaceH4/MATH-500 \
-    data.dataset_key=test \
+    generation.vllm_cfg.max_model_len=32768 \ 
+    data.dataset_name="math500" \
     eval.num_tests_per_prompt=16 \
     cluster.gpus_per_node=8
 ```
@@ -80,3 +86,12 @@ metric='pass@1' num_tests_per_prompt=1
 score=0.1000 (3.0/30)
 ============================================================
 ```
+
+## List of currently supported benchmarks
+
+- [AIME-2024](../../nemo_rl/data/eval_datasets/aime2024.py)
+- [GPQA and GPQA-diamond](../../nemo_rl/data/eval_datasets/gpqa.py)
+- [MATH and MATH-500](../../nemo_rl/data/eval_datasets/math.py)
+- [MMLU](../../nemo_rl/data/eval_datasets/mmlu.py)
+- [MMLU-Pro](../../nemo_rl/data/eval_datasets/mmlu_pro.py)
+

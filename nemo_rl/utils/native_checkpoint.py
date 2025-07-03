@@ -248,7 +248,7 @@ def convert_dcp_to_hf(
     config.save_pretrained(hf_ckpt_path)
 
     # TODO: After the following PR gets merged:
-    # https://github.com/NVIDIA/NeMo-RL/pull/148/files
+    # https://github.com/NVIDIA-NeMo/RL/pull/148/files
     # tokenizer should be copied from policy/tokenizer/* instead of relying on the model name
     # We can expose a arg at the top level --tokenizer_path to plumb that through.
     # This is more stable than relying on the current NeMo-RL get_tokenizer() which can

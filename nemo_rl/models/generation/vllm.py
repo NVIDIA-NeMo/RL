@@ -316,6 +316,10 @@ class VllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        if not self.cfg["colocated"]["enabled"]:
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -330,7 +334,7 @@ class VllmGenerationWorker:
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
             dtype=self.cfg["vllm_cfg"]["precision"],
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
+            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA-NeMo/RL/issues/186)
             enforce_eager=True,
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
