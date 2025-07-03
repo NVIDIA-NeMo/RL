@@ -13,15 +13,15 @@
 # limitations under the License.
 
 from .common import (
-    get_global_layer_num,
-    get_local_layer_num,
     get_global_expert_num,
+    get_global_layer_num,
     get_local_expert_num,
+    get_local_layer_num,
 )
 
 __all__ = [
-    "get_local_layer_num",
+    "get_global_expert_num",
     "get_global_layer_num",
     "get_local_expert_num",
-    "get_global_expert_num",
+    "get_local_layer_num",
 ]
