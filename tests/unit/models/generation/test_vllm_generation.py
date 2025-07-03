@@ -56,6 +56,7 @@ basic_vllm_test_config: VllmConfig = {
         "async_engine": False,  # Default to False for synchronous tests
         "skip_tokenizer_init": False,
         "load_format": "auto",
+        "enforce_eager": "False",
     },
     "colocated": {
         "enabled": True,
@@ -475,7 +476,7 @@ async def test_vllm_policy_generation_async(
 
 
 @pytest.mark.skip(
-    reason="Skipping for now, will be fixed in https://github.com/NVIDIA/NeMo-RL/issues/408"
+    reason="Skipping for now, will be fixed in https://github.com/NVIDIA-NeMo/RL/issues/408"
 )
 def test_vllm_worker_seed_behavior(cluster, tokenizer):
     """

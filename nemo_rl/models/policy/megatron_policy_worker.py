@@ -89,7 +89,6 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -112,7 +111,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_gpu_info
+from nemo_rl.models.policy.utils import get_gpu_info, get_runtime_env_for_policy_worker
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -322,11 +321,7 @@ def destroy_parallel_state():
         pass
 
 
-@ray.remote(
-    runtime_env={
-        **get_nsight_config_if_pattern_matches("megatron_policy_worker"),
-    }
-)
+@ray.remote(runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"))
 class MegatronPolicyWorker:
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
