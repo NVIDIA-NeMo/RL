@@ -22,6 +22,7 @@ generation:
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 2048
+    enforce_eager: False
   colocated:
     # true: generation shares training GPUs
     # false: uses dedicated generation resources
