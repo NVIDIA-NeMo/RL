@@ -466,6 +466,9 @@ class MegatronPolicyWorker:
                 "a lambda and couldn't be serialized). This is based on this check "
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
+        # Use fused rope kernel from Transformer Engine, enabled by default
+        model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"].get(
+            "apply_rope_fusion", True)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
