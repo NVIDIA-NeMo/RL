@@ -82,7 +82,6 @@ from nemo.tron.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from ray.util.queue import Queue
-from torch.distributed import get_process_group_ranks
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
@@ -100,13 +99,8 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.megatron.converters.common import (
-    MegatronToHFConverter,
-)
-from nemo_rl.models.megatron.refit_utils import (
-    gather_params,
-    get_tp_dim,
-)
+from nemo_rl.models.megatron.converters.common import MegatronToHFConverter
+from nemo_rl.models.megatron.refit_utils import gather_params, get_param_info
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -354,7 +348,8 @@ class MegatronPolicyWorker:
     ):
         # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
         if (
-            config["generation"] is not None
+            "generation" in config
+            and config["generation"] is not None
             and not config["generation"]["colocated"]["enabled"]
         ):
             os.environ["NCCL_SHM_DISABLE"] = "1"
@@ -1240,6 +1235,7 @@ class MegatronPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    @torch.no_grad()
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1248,94 +1244,12 @@ class MegatronPolicyWorker:
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
         # Ensure model is in evaluation mode
         self.model.eval()
 
-        # Get parallel info
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        tp_world_size = torch.distributed.get_world_size(tp_group)
-        tp_group_rank_ids = get_process_group_ranks(tp_group)
-
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-        pp_group_rank_ids = get_process_group_ranks(pp_group)
-
-        # Collect parameter info
-        param_info = []
-
-        # Dictionary of modules we can quickly look up to check if a module has TP
-        named_modules_dict = dict(self.model.named_modules())
-
-        # Process each parameter in the model
-        # state_dict includes parameters and persistent buffers
-        for name, param in self.model.state_dict().items():
-            # Skip _extra_state entries (these are metadata, not actual weights)
-            if "_extra_state" in name:
-                continue
-
-            shape = list(param.shape)
-            tp_dim = get_tp_dim(self.model, name, named_modules_dict)
-            if tp_dim is not None:
-                tp_rank_ids = tuple(sorted(tp_group_rank_ids))
-                shape[tp_dim] *= len(tp_rank_ids)
-            else:
-                tp_rank_ids = (torch.distributed.get_rank(),)
-
-            pp_rank_ids = tuple(sorted(pp_group_rank_ids))
-
-            # Calculate size for this parameter
-            prec_to_bytes = {
-                torch.bfloat16: 2,
-                torch.float16: 2,
-                torch.float32: 4,
-            }
-            scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-            size_in_bytes = (
-                param.element_size()
-                * param.numel()
-                * len(tp_rank_ids)
-                * len(pp_rank_ids)
-                * scale
-            )
-            param_info.append(
-                (
-                    (
-                        name,
-                        tuple(shape),
-                        param.dtype,
-                    ),
-                    size_in_bytes,
-                )
-            )
-        # Gather parameter info from all pipeline parallel ranks to ensure complete coverage
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-
-        # Gather all parameter info from all PP ranks
-        pp_gathered_param_infos = [None] * pp_world_size
-        torch.distributed.all_gather_object(
-            pp_gathered_param_infos, param_info, group=pp_group
-        )
-        pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
-
-        all_param_infos = pp_gathered_param_infos
-
-        # Merge all parameter infos, keeping only unique parameter names
-        merged_param_info = []
-        seen_params = set()
-
-        for name, size in all_param_infos:
-            if name not in seen_params:
-                merged_param_info.append((name, size))
-                seen_params.add(name)
-
-        # Update param_info with the merged information
-        param_info = merged_param_info
-
-        print(f"Prepared {len(param_info)} tensors for IPC transfer")
-        no_grad.__exit__(None, None, None)
+        # Get parameter info for refit
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        param_info = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1348,6 +1262,7 @@ class MegatronPolicyWorker:
         return param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
+    @torch.no_grad()
     def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
@@ -1356,10 +1271,7 @@ class MegatronPolicyWorker:
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
-        gathered_megatron_params = gather_params(
-            self.model,
-            keys,
-        )
+        gathered_megatron_params = gather_params(self.model, keys)
         gathered_hf_params = self.megatron_to_hf_converter.convert(
             gathered_megatron_params, self.model.config
         )
@@ -1392,87 +1304,9 @@ class MegatronPolicyWorker:
         # Ensure model is in evaluation mode
         self.model.eval()
 
-        # Get parallel info
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        tp_world_size = torch.distributed.get_world_size(tp_group)
-        tp_group_rank_ids = get_process_group_ranks(tp_group)
-
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-        pp_group_rank_ids = get_process_group_ranks(pp_group)
-
-        # Collect parameter info
-        param_info = []
-
-        # Dictionary of modules we can quickly look up to check if a module has TP
-        named_modules_dict = dict(self.model.named_modules())
-
-        # Process each parameter in the model
-        # state_dict includes parameters and persistent buffers
-        for name, param in self.model.state_dict().items():
-            # Skip _extra_state entries (these are metadata, not actual weights)
-            if "_extra_state" in name:
-                continue
-
-            shape = list(param.shape)
-            tp_dim = get_tp_dim(self.model, name, named_modules_dict)
-            if tp_dim is not None:
-                tp_rank_ids = tuple(sorted(tp_group_rank_ids))
-                shape[tp_dim] *= len(tp_rank_ids)
-            else:
-                tp_rank_ids = (torch.distributed.get_rank(),)
-
-            pp_rank_ids = tuple(sorted(pp_group_rank_ids))
-
-            # Calculate size for this parameter
-            prec_to_bytes = {
-                torch.bfloat16: 2,
-                torch.float16: 2,
-                torch.float32: 4,
-            }
-            scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-            size_in_bytes = (
-                param.element_size()
-                * param.numel()
-                * len(tp_rank_ids)
-                * len(pp_rank_ids)
-                * scale
-            )
-            param_info.append(
-                (
-                    (
-                        name,
-                        tuple(shape),
-                        param.dtype,
-                    ),
-                    size_in_bytes,
-                )
-            )
-        # Gather parameter info from all pipeline parallel ranks to ensure complete coverage
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-
-        # Gather all parameter info from all PP ranks
-        pp_gathered_param_infos = [None] * pp_world_size
-        torch.distributed.all_gather_object(
-            pp_gathered_param_infos, param_info, group=pp_group
-        )
-        pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
-
-        all_param_infos = pp_gathered_param_infos
-
-        # Merge all parameter infos, keeping only unique parameter names
-        merged_param_info = []
-        seen_params = set()
-
-        for name, size in all_param_infos:
-            if name not in seen_params:
-                merged_param_info.append((name, size))
-                seen_params.add(name)
-
-        # Update param_info with the merged information
-        self.param_info = merged_param_info
-        print(f"Prepared {len(param_info)} tensors for IPC transfer")
+        # Get parameter info for refit
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.param_info = get_param_info(self.model, self.dtype)
 
         # Collect info for collective communication
         state_dict_info = {}
