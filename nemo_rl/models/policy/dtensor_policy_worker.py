@@ -41,7 +41,6 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -57,6 +56,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     get_gpu_info,
+    get_runtime_env_for_policy_worker,
     import_class_from_path,
     sliding_window_overwrite,
 )
@@ -114,13 +114,7 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(
-    runtime_env={
-        # TODO: This option causes a crash on Ampere. It's okay to enable on Hopper.
-        # "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
-        **get_nsight_config_if_pattern_matches("dtensor_policy_worker"),
-    }
-)
+@ray.remote(runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker"))
 class DTensorPolicyWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
