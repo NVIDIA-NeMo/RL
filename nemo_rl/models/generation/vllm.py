@@ -42,7 +42,11 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.worker_groups import (
+    RayWorkerBuilder,
+    RayWorkerGroup,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -70,7 +74,9 @@ class VllmConfig(GenerationConfig):
     vllm_kwargs: NotRequired[dict[str, Any]]
 
 
-@ray.remote
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -310,6 +316,10 @@ class VllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        if not self.cfg["colocated"]["enabled"]:
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -324,7 +334,7 @@ class VllmGenerationWorker:
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
             dtype=self.cfg["vllm_cfg"]["precision"],
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
+            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA-NeMo/RL/issues/186)
             enforce_eager=True,
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
@@ -341,6 +351,32 @@ class VllmGenerationWorker:
             self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
         else:
             self.llm = vllm.LLM(**llm_kwargs)
+
+    def init_collective(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
+        self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                rank_prefix,
+                ip,
+                port,
+                world_size,
+            ),
+        )
+
+    async def init_collective_async(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                rank_prefix,
+                ip,
+                port,
+                world_size,
+            ),
+        )
 
     def llm(self):
         return self.llm
@@ -507,6 +543,7 @@ class VllmGenerationWorker:
             assert response_length <= self.llm.llm_engine.model_config.max_model_len, (
                 f"response_length={response_length} > max_model_len={self.llm.llm_engine.model_config.max_model_len}, which should not happen. Please check this behavior in isolation by running `uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py {self.llm.llm_engine.model_config.model}` and raise this issue with the vllm team."
             )
+
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
@@ -527,20 +564,18 @@ class VllmGenerationWorker:
         return return_data
 
     async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> AsyncGenerator[BatchedDataDict[GenerationOutputSpec], None]:
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
-            data: BatchedDataDict containing input_ids and input_lengths tensors
+            data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
 
         Yields:
-            BatchedDataDict conforming to GenerationOutputSpec for each completed sequence:
-                - output_ids: input + generated token IDs with proper padding for the single sequence
-                - logprobs: Log probabilities for tokens for the single sequence
-                - generation_lengths: Lengths of each response for the single sequence
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence for the single sequence
+            Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
@@ -557,36 +592,32 @@ class VllmGenerationWorker:
         input_lengths_batch = data["input_lengths"]
         batch_size = input_ids_batch.shape[0]
 
+        # Ensure generate_async only receives single samples (batch_size = 1)
+        assert batch_size == 1, (
+            f"generate_async is restricted to handle only single samples, "
+            f"but received batch_size={batch_size}. Please handle batching outside this method."
+        )
+
         batch_specific_stop_strings_list = data.get(
             "stop_strings", [[] for _ in range(batch_size)]
         )
 
-        request_id_to_context = {}
-        task_futures = []
-
-        # Helper coroutine to consume the vLLM's async generator for a single request
-        async def get_single_request_output(vllm_request_async_gen):
-            # The vLLM AsyncLLMEngine.generate() is an async generator.
-            final_request_output = None
-            async for req_output in vllm_request_async_gen:
-                final_request_output = req_output
-            return final_request_output
-
-        for i in range(batch_size):
-            # Prepare prompt token IDs for this specific sample
-            current_input_actual_length = input_lengths_batch[i].item()
+        # Create tasks for each sample in the batch
+        async def process_single_sample(sample_idx):
+            """Process a single sample and return the result."""
+            current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt_token_ids_list = (
-                input_ids_batch[i, :current_input_actual_length].tolist()
+                input_ids_batch[sample_idx, :current_input_actual_length].tolist()
                 if current_input_actual_length > 0
                 else []
             )
             prompt = {"prompt_token_ids": prompt_token_ids_list}
 
             per_sample_stop_strings = None
-            if batch_specific_stop_strings_list and i < len(
+            if batch_specific_stop_strings_list and sample_idx < len(
                 batch_specific_stop_strings_list
             ):
-                per_sample_stop_strings = batch_specific_stop_strings_list[i]
+                per_sample_stop_strings = batch_specific_stop_strings_list[sample_idx]
 
             final_stop_strings_for_sample = self._merge_stop_strings(
                 [per_sample_stop_strings] if per_sample_stop_strings else None
@@ -597,6 +628,43 @@ class VllmGenerationWorker:
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
+            # Handle case where no tokens can be generated due to length constraints
+            if allowed_new_tokens == 0:
+                # Access the input data directly from the function parameters
+                input_ids_single_row = input_ids_batch[sample_idx]
+
+                # Create output tensors with just the input (no generated tokens)
+                output_ids_single_item_batched = input_ids_single_row[
+                    :current_input_actual_length
+                ].unsqueeze(0)
+
+                logprobs_single_item = torch.zeros(
+                    (1, current_input_actual_length),
+                    dtype=torch.float32,
+                    device=input_ids_single_row.device,
+                )
+
+                generation_lengths_tensor = torch.tensor(
+                    [0], dtype=torch.long, device=input_ids_single_row.device
+                )
+
+                unpadded_sequence_lengths_tensor = torch.tensor(
+                    [current_input_actual_length],
+                    dtype=torch.long,
+                    device=input_ids_single_row.device,
+                )
+
+                result_batch = BatchedDataDict[GenerationOutputSpec](
+                    {
+                        "output_ids": output_ids_single_item_batched,
+                        "logprobs": logprobs_single_item,
+                        "generation_lengths": generation_lengths_tensor,
+                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    }
+                )
+
+                return (sample_idx, result_batch)
+
             sampling_params_for_request = self._build_sampling_params(
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
@@ -605,49 +673,28 @@ class VllmGenerationWorker:
 
             request_id = str(uuid.uuid4())
 
-            # self.llm.generate() returns an async generator for a single request
+            # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
                 prompt=prompt,
                 sampling_params=sampling_params_for_request,
                 request_id=request_id,
             )
-            # Create a task for the helper coroutine that consumes this generator
-            task = asyncio.create_task(
-                get_single_request_output(vllm_request_generator)
-            )
 
-            context_for_this_task = {
-                "original_input_ids_row": input_ids_batch[i],
-                "original_input_length_scalar": current_input_actual_length,
-            }
-            request_id_to_context[request_id] = context_for_this_task
-            task_futures.append(task)
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
 
-        # Wait for all tasks to finish in the original request order to preserve deterministic
-        # alignment between inputs and outputs.
-        finished_task_results = await asyncio.gather(
-            *task_futures, return_exceptions=True
-        )
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
 
-        for i, task_result in enumerate(finished_task_results):
-            if isinstance(task_result, Exception):
-                print(f"Error in a generation task (index {i}): {task_result}")
-                continue
-
-            vllm_output_single = task_result
-            request_id_from_output = vllm_output_single.request_id
-            context = request_id_to_context[request_id_from_output]
-            original_input_ids_single_row = context["original_input_ids_row"]
-            original_input_actual_length = context["original_input_length_scalar"]
-
-            # Process the single vLLM output
-            generation_details = vllm_output_single.outputs[0]
+            # Process the output
+            generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
 
-            final_output_tensor_len = (
-                original_input_actual_length + num_generated_tokens
-            )
+            original_input_ids_single_row = input_ids_batch[sample_idx]
+            final_output_tensor_len = current_input_actual_length + num_generated_tokens
 
             # Create output_ids tensor for this single item
             output_ids_single_item = torch.full(
@@ -657,12 +704,12 @@ class VllmGenerationWorker:
                 device=original_input_ids_single_row.device,
             )
             # Copy original input (up to its actual length)
-            output_ids_single_item[:original_input_actual_length] = (
-                original_input_ids_single_row[:original_input_actual_length]
+            output_ids_single_item[:current_input_actual_length] = (
+                original_input_ids_single_row[:current_input_actual_length]
             )
             # Add generated tokens after the actual input
             output_ids_single_item[
-                original_input_actual_length : original_input_actual_length
+                current_input_actual_length : current_input_actual_length
                 + num_generated_tokens
             ] = torch.tensor(
                 generated_token_ids,
@@ -690,7 +737,7 @@ class VllmGenerationWorker:
                                 token_id_at_idx
                             ].logprob
                             position_in_output_tensor = (
-                                original_input_actual_length + idx
+                                current_input_actual_length + idx
                             )
                             if position_in_output_tensor < final_output_tensor_len:
                                 logprobs_single_item[0, position_in_output_tensor] = (
@@ -705,14 +752,14 @@ class VllmGenerationWorker:
             )
 
             # Unpadded sequence lengths (actual_input + actual_generated)
-            unpadded_total_length = original_input_actual_length + num_generated_tokens
+            unpadded_total_length = current_input_actual_length + num_generated_tokens
             unpadded_sequence_lengths_tensor = torch.tensor(
                 [unpadded_total_length],
                 dtype=torch.long,
                 device=original_input_ids_single_row.device,
             )
 
-            yielded_batch = BatchedDataDict[GenerationOutputSpec](
+            result_batch = BatchedDataDict[GenerationOutputSpec](
                 {
                     "output_ids": output_ids_single_item_batched,
                     "logprobs": logprobs_single_item,
@@ -720,7 +767,26 @@ class VllmGenerationWorker:
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 }
             )
-            yield yielded_batch
+
+            return (sample_idx, result_batch)
+
+        # Create tasks for all samples and yield results as they complete
+        sample_tasks = [
+            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        for completed_task in asyncio.as_completed(sample_tasks):
+            try:
+                result = await completed_task
+                yield result
+            except Exception as e:
+                # Cancel remaining tasks
+                for task in sample_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*sample_tasks, return_exceptions=True)
+                raise e
 
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -925,6 +991,102 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+        """Update the model weights from collective communication."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_collective", args=(info,)
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
+        """Async version of update_weights_from_collective."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
+                )
+
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_from_collective", args=(info,)
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def reset_prefix_cache(self):
+        """Reset the prefix cache of vLLM engine."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
+            )
+
+        self.llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    async def reset_prefix_cache_async(self):
+        """Async version of reset_prefix_cache."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
+            )
+
+        await self.llm.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def sleep(self):
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
@@ -999,6 +1161,14 @@ class VllmGenerationWorker:
 
         await self.llm.wake_up(**wake_up_args)
 
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()
+
 
 class VllmGeneration(GenerationInterface):
     def __init__(
@@ -1011,6 +1181,12 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        if self.cfg["vllm_cfg"]["pipeline_parallel_size"] > 1:
+            assert self.cfg["vllm_cfg"]["async_engine"], (
+                "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
+                "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
+            )
+
         # Ensure all required VllmConfig fields are present
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
@@ -1070,7 +1246,10 @@ class VllmGeneration(GenerationInterface):
             )
 
         # Number of data parallel groups is the number of tied worker groups
-        self.dp_size = self.worker_group.group_count
+        self.dp_size = self.worker_group.dp_size
+
+        # Used to track the round-robin selection of worker groups for generate_async
+        self.current_generate_dp_shard_idx = 0
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
@@ -1206,6 +1385,40 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def init_collective(
+        self, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "init_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_collective"
+        )
+
+        # Prepare rank
+        total_workers = len(self.worker_group.workers)
+        if self.dp_size == 0:
+            raise RuntimeError(
+                "Data parallel size is zero, cannot initialize collective."
+            )
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+
+        # Send world_size and rank for init collective to all workers
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+        )
+
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1224,7 +1437,7 @@ class VllmGeneration(GenerationInterface):
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1262,15 +1475,14 @@ class VllmGeneration(GenerationInterface):
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
 
-        # Get total batch size
-        batch_size = len(data["prompts"])
-
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+            dp_size, allow_uneven_shards=True
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1295,9 +1507,14 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
-    def generate_async(
+    async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> BatchedDataDict[GenerationOutputSpec]:
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate responses asynchronously, yielding individual samples as they complete.
+
+        This method provides per-sample streaming across all workers, yielding each
+        sample result as soon as it's ready, regardless of which worker processed it.
+        """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
                 "generate_async can only be used when async_engine is enabled in VllmConfig."
@@ -1310,46 +1527,107 @@ class VllmGeneration(GenerationInterface):
             "input_ids and input_lengths are required in data for vLLM generation"
         )
 
-        # Shard the data across the tied worker groups
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
-            dp_size, allow_uneven_shards=True
+        # Handle empty input case
+        if len(data["input_ids"]) == 0:
+            return
+
+        # Determine the leader worker for the current data parallel shard
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+            self.current_generate_dp_shard_idx
         )
 
-        future_bundle = self.worker_group.run_all_workers_sharded_data(
-            "generate_async",
-            sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=None,  # just run on tp rank 0
-            output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
+        # Run the generate_async method on the selected leader worker. This returns an ObjectRefGenerator.
+        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+            method_name="generate_async",
+            worker_idx=leader_worker_idx,
+            data=data,
+            greedy=greedy,
         )
 
-        # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
-        results = self.worker_group.get_all_worker_results(future_bundle)
+        # Increment the round-robin worker group index
+        self.current_generate_dp_shard_idx += 1
+        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
 
-        # Combine results from all tied worker groups
-        combined = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+        # Create a queue to collect sample results from the worker as they complete
+        result_queue = asyncio.Queue()
+        finished = False
+
+        async def consume_worker_generator(worker_idx, worker_gen):
+            """Consume a single worker generator and put sample results in the queue."""
+            nonlocal finished
+            worker_name = f"Worker-{worker_idx}"
+            try:
+                async for sample_result_ref in worker_gen:
+                    sample_result = await sample_result_ref
+                    await result_queue.put(("sample", sample_result))
+            except Exception as e:
+                # Log the error before putting it in the queue for better debugging
+                import traceback
+
+                print(f"Exception in worker {worker_name}")
+                traceback.print_exc()
+                await result_queue.put(("error", e))
+            finally:
+                finished = True
+                await result_queue.put(("worker_done", None))
+
+        # Start the task to consume the worker generator
+        worker_task = asyncio.create_task(
+            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
         )
 
-        # Verify the output has all required fields
-        required_keys = [
-            "output_ids",
-            "generation_lengths",
-            "unpadded_sequence_lengths",
-            "logprobs",
-        ]
-        missing_keys = [key for key in required_keys if key not in combined]
-        if missing_keys:
-            raise ValueError(
-                f"Missing required keys for GenerationOutputSpec: {missing_keys}"
-            )
+        # Yield sample results as they become available from the worker
+        timeout_seconds = float(
+            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
+        )  # Default 10 minutes
 
-        return combined
+        while not finished:
+            try:
+                msg_type, item = await asyncio.wait_for(
+                    result_queue.get(), timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
+                )
+                print(
+                    f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
+                )
+                # Cancel the task
+                if not worker_task.done():
+                    worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
+                )
+
+            if msg_type == "sample":
+                # Yield individual sample result immediately
+                yield item
+            elif msg_type == "error":
+                # Cancel the task and propagate error
+                if not worker_task.done():
+                    worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
+                raise item
+            elif msg_type == "worker_done":
+                # Worker finished, just continue the loop
+                pass
+            else:
+                raise RuntimeError(f"Unexpected message type: {msg_type}")
+
+        # Verify the task is actually done
+        assert worker_task.done(), (
+            f"Worker task {leader_worker_idx} should be done but isn't"
+        )
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Wake workers up."""
+        """Wake workers up for colocated inference."""
+        # non-colocated no need to wake up
+        if not self.cfg["colocated"]["enabled"]:
+            return True
+
         try:
             # Choose the appropriate method based on async_engine setting
             method_name = (
@@ -1369,12 +1647,20 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers."""
+        """Sleep workers and reset prefix cache."""
         try:
-            # Choose the appropriate method based on async_engine setting
-            method_name = (
-                "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
-            )
+            # Choose the appropriate method based on setting
+            # non-colocated only needs reset prefix cache, no need to sleep.
+            if self.cfg["colocated"]["enabled"]:
+                method_name = (
+                    "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+                )
+            else:
+                method_name = (
+                    "reset_prefix_cache_async"
+                    if self.cfg["vllm_cfg"]["async_engine"]
+                    else "reset_prefix_cache"
+                )
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
@@ -1430,15 +1716,49 @@ class VllmGeneration(GenerationInterface):
             # Directly pass ipc_handles to the method
             futures = self.worker_group.run_all_workers_multiple_data(
                 method_name,
-                data=ipc_handles_list,
+                ipc_handles=ipc_handles_list,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             # Wait for all futures to complete
             results = ray.get(futures)
             return all(result for result in results if result is not None)
         except Exception as e:
-            print(f"Error updating weights: {e}")
+            print(f"Error during update weights: {e}")
             return False
+
+    def update_weights_from_collective(
+        self, info: dict[str, Any]
+    ) -> list[ray.ObjectRef]:
+        """Update weights of the policy using collective communication."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "update_weights_from_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_collective"
+        )
+
+        # Use run_all_workers_single_data to send data to all workers
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            info=info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
+        ray.get(futures)
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.

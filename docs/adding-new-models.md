@@ -12,7 +12,7 @@ $$\text{KL} = E_{x \sim \pi}[\pi(x) - \pi_{\text{ref}}(x)]$$
 
 When summed/integrated, replacing the $x \sim \pi$ with $x \sim \pi_{\text{wrong}}$ leads to an error of:
 
-$$\sum_{x} \left( \pi(x) - \pi_{\text{ref}}(x) \right) \left( \pi_{\text{wrong}}(x) - \pi(x) \right)$$  
+$$\sum_{x} \left( \pi(x) - \pi_{\text{ref}}(x) \right) \left( \pi_{\text{wrong}}(x) - \pi(x) \right)$$
 
 So, to verify correctness, we calculate:
 
@@ -65,28 +65,28 @@ When investigating discrepancies beyond the acceptable threshold, focus on these
 
 When validating Hugging Face-based models, perform the following checks:
 
-- **Compare log probabilities**  
+- **Compare log probabilities**
   Ensure the generation log probabilities from inference backends like **vLLM** match those computed by Hugging Face. This comparison helps diagnose potential mismatches.
 
-- **Test parallelism**  
+- **Test parallelism**
   Verify consistency with other parallelism settings.
 
-- **Variance**  
+- **Variance**
   Repeat tests multiple times (e.g., 10 runs) to confirm that behavior is deterministic or within acceptable variance.
 
-- **Check sequence lengths**  
-  Perform inference on sequence lengths of 100, 1,000, and 10,000 tokens.  
+- **Check sequence lengths**
+  Perform inference on sequence lengths of 100, 1,000, and 10,000 tokens.
   Ensure the model behaves consistently at each length.
 
-- **Use real and dummy data**  
-  - **Real data:** Tokenize and generate from actual text samples.  
+- **Use real and dummy data**
+  - **Real data:** Tokenize and generate from actual text samples.
   - **Dummy data:** Simple numeric sequences to test basic generation.
 
-- **Vary sampling parameters**  
-  Test both greedy and sampling generation modes.  
+- **Vary sampling parameters**
+  Test both greedy and sampling generation modes.
   Adjust temperature and top-p to confirm output consistency across backends.
 
-- **Test different batch sizes**  
+- **Test different batch sizes**
   Try with batch sizes of 1, 8, and 32 to ensure consistent behavior across different batch configurations.
 
 ---
@@ -95,11 +95,11 @@ When validating Hugging Face-based models, perform the following checks:
 
 ### Additional Validation
 
-- **Compare Megatron outputs**  
+- **Compare Megatron outputs**
   Ensure the Megatron forward pass aligns with Hugging Face and the generation log probabilities from inference backends like **vLLM**.
 
-- **Parallel settings**  
-  Match the same parallelism configurations used for the HuggingFace-based tests.  
+- **Parallel settings**
+  Match the same parallelism configurations used for the HuggingFace-based tests.
   Confirm outputs remain consistent across repeated runs.
 
 ---
@@ -128,7 +128,7 @@ By following these validation steps and ensuring your model's outputs remain con
 We also maintain a set of standalone scripts that can be used to diagnose issues related to correctness that
 we have encountered before.
 
-## [1.max_model_len_respected.py](https://github.com/NVIDIA/NeMo-RL/blob/main/tools/model_diagnostics/1.max_model_len_respected.py)
+## [1.max_model_len_respected.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/1.max_model_len_respected.py)
 
 Test if a new model respects the `max_model_len` passed to vllm:
 
@@ -139,5 +139,16 @@ uv run --extra vllm tools/model_diagnostics/1.max_model_len_respected.py Qwen/Qw
 # Prompt tokens: 8
 # Generated tokens: 12
 # Total tokens: 20
+# [Qwen/Qwen2.5-1.5B] ALL GOOD!
+```
+
+## [2.long_generation_decode_vs_prefill](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/2.long_generation_decode_vs_prefill.py)
+
+Test that vLLM yields near-identical token log-probabilities when comparing decoding with a single prefill pass across multiple prompts.
+
+```sh
+# Run that is expected to pass
+uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.py Qwen/Qwen2.5-1.5B
+# ...
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```

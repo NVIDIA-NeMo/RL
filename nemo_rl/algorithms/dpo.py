@@ -32,10 +32,11 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
 from nemo_rl.models.policy.interfaces import PolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 
@@ -70,7 +71,7 @@ class DPOConfig(TypedDict):
     preference_average_log_probs: bool
     sft_average_log_probs: bool
     ## TODO(@ashors) support other loss functions
-    ## https://github.com/NVIDIA/NeMo-RL/issues/193
+    ## https://github.com/NVIDIA-NeMo/RL/issues/193
     # preference_loss: str
     # gt_reward_scale: float
     preference_loss_weight: float
@@ -95,7 +96,7 @@ def setup(
     train_dataset: AllTaskProcessedDataset,
     val_dataset: AllTaskProcessedDataset,
 ) -> tuple[
-    HfPolicy,
+    Policy,
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
@@ -202,7 +203,7 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    policy = HfPolicy(
+    policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
@@ -308,7 +309,7 @@ def validate(
 
             else:
                 for k, v in val_results["all_mb_metrics"].items():
-                    if k in {"lr", "global_valid_seqs", "global_valid_toks"}:
+                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                         val_metrics[k] += np.mean(v).item()
                     else:
                         val_metrics[k] += np.sum(v).item()
@@ -412,6 +413,7 @@ def dpo_train(
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
             )
+            maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
@@ -497,7 +499,7 @@ def dpo_train(
             }
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
-                if k in {"lr", "global_valid_seqs", "global_valid_toks"}:
+                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                     metrics[k] = np.mean(v).item()
                 else:
                     metrics[k] = np.sum(v).item()

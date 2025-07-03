@@ -5,6 +5,7 @@
   - [📣 News](#-news)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
+  - [Supported Training Backends](#training-backends)
   - [GRPO](#grpo)
     - [GRPO Single Node](#grpo-single-node)
     - [GRPO Multi-node](#grpo-multi-node)
@@ -20,6 +21,7 @@
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
+  - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
   - [Contributing](#contributing)
   - [Licenses](#licenses)
@@ -36,6 +38,8 @@ What you can expect:
 
 ## 📣 News
 * [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
+* [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
 
 ## Features
 
@@ -51,31 +55,25 @@ What you can expect:
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, and SP for efficient training.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
+- ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
+- ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
-- 🔜 **Megatron Inference** - Support Megatron Inference for day-0 support for new megatron models.
+- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
 
 Clone **NeMo RL**.
 ```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
-cd nemo-rl
-```
-
-<!--
-# TODO: Replace the above instructions once we have a real mcore example
-```sh
-git clone git@github.com:NVIDIA/NeMo-RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
 cd nemo-rl
 
 # If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules 
-# by running:
-# git submodule update --init --recursive
+# by running (This is not necessary if you are using the pure Pytorch/DTensor path):
+git submodule update --init --recursive
 
-# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure 
+# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
 # submodules are automatically updated after switching branches or pulling updates by configuring git with:
 # git config submodule.recurse true
 
@@ -96,7 +94,6 @@ sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt-get update
 sudo apt-get install cudnn-cuda-12
 ```
--->
 
 Install `uv`.
 ```sh
@@ -124,6 +121,15 @@ uv venv
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+
+## Training Backends
+
+NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
+
+- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
+- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
+
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ## GRPO
 
@@ -156,6 +162,18 @@ uv run python examples/run_grpo_math.py \
   logger.wandb.name="grpo-llama1b_math" \
   logger.num_val_samples_to_print=10
 ```
+
+The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+
+To train using this config on a single GPU:
+
+```sh
+# Run a GRPO math example on 1 GPU using the Megatron backend
+uv run python examples/run_grpo_math.py \
+  --config examples/configs/grpo_math_1B_megatron.yaml
+```
+
+For additional details on supported backends and how to configure the training backend to suit your setup, refer to the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ### GRPO Multi-node
 
@@ -208,7 +226,7 @@ sbatch \
 We also support multi-turn generation and training (tool use, games, etc.).
 Reference example for training to play a Sliding Puzzle Game:
 ```sh
-uv run python examples/run_grpo_sliding_puzzle.py 
+uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
 ## Supervised Fine-Tuning (SFT)
@@ -359,11 +377,30 @@ uv run python examples/run_eval.py \
 ```
 > **Note:** Evaluation results may vary slightly due to various factors, such as sampling parameters, random seed, inference engine version, and inference engine settings.
 
-Refer to `examples/configs/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
+Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
 
 ## Set Up Clusters
 
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Cluster Start](docs/cluster.md) documentation.
+
+## Tips and Tricks
+- If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
+  
+  ```sh
+  ModuleNotFoundError: No module named 'megatron'
+  ```
+  
+  If you see this error, there is likely an issue with your virtual environments. To fix this, first intialize the submodules:
+
+  ```sh
+  git submodule update --init --recursive
+  ```
+
+  and then force a rebuild of the virutal environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
+
+  ```sh
+  NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
+  ```
 
 ## Citation
 
@@ -372,7 +409,7 @@ If you use NeMo RL in your research, please cite it using the following BibTeX e
 ```bibtex
 @misc{nemo-rl,
 title = {NeMo RL: A Scalable and Efficient Post-Training Library},
-howpublished = {\url{https://github.com/NVIDIA/NeMo-RL}},
+howpublished = {\url{https://github.com/NVIDIA-NeMo/RL}},
 year = {2025},
 note = {GitHub repository},
 }
@@ -380,8 +417,8 @@ note = {GitHub repository},
 
 ## Contributing
 
-We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA/NeMo-RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
+We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
 
 ## Licenses
 
-NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA/NeMo-RL/blob/main/LICENSE).
+NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/RL/blob/main/LICENSE).

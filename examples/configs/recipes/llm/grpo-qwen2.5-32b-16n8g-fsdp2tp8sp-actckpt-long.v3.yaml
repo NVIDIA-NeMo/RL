@@ -42,6 +42,7 @@ policy:
     sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 8
+    context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
     enabled: True
@@ -89,6 +90,11 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: 16384
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
 data:
   max_input_seq_length: 16384
   prompt_file: examples/prompts/cot.txt

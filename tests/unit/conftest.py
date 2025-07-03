@@ -70,7 +70,10 @@ class UnitTestData(TypedDict):
 ###################################
 
 
-def pytest_sessionstart(session):
+@pytest.fixture(scope="session", autouse=True)
+def _unit_test_data(request):
+    """Initializes the unit test data storage at the beginning of the session."""
+    session = request.session
     # Delete the unit results file at the start of a new test session
     if os.path.exists(UNIT_RESULTS_FILE):
         try:
@@ -93,7 +96,7 @@ def pytest_sessionstart(session):
     except Exception as e:
         git_commit = f"Error getting git commit: {str(e)}"
 
-    session.config._unit_test_data = UnitTestData(
+    unit_test_data = UnitTestData(
         exit_status="was not set",
         git_commit=git_commit,
         start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -101,10 +104,12 @@ def pytest_sessionstart(session):
         gpu_types=[],
         coverage="[n/a] run with --cov=nemo_rl",
     )
+    session.config._unit_test_data = unit_test_data
+    return unit_test_data
 
 
 @pytest.fixture(scope="session", autouse=True)
-def session_data(request, init_ray_cluster):
+def session_data(request, init_ray_cluster, _unit_test_data):
     """Session-level fixture to store and save metrics data.
 
     This fixture tracks both metrics from tests and metadata about the test environment.
@@ -118,7 +123,7 @@ def session_data(request, init_ray_cluster):
     ############################################################
     # 1. Gather all the unit test data #
     ############################################################
-    unit_test_data: UnitTestData = request.config._unit_test_data
+    unit_test_data: UnitTestData = _unit_test_data
     yield unit_test_data
 
     ############################################################

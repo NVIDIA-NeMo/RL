@@ -46,6 +46,7 @@ docker.md
 testing.md
 documentation.md
 debugging.md
+nsys-profiling.md
 apidocs/index.rst
 ```
 
@@ -62,4 +63,5 @@ design-docs/generation.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
+design-docs/training-backends.md
 ```

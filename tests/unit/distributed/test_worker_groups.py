@@ -107,6 +107,33 @@ class MyTestActor:
 MY_TEST_ACTOR_FQN = f"{MyTestActor.__module__}.MyTestActor"
 
 
+@ray.remote(
+    num_gpus=1,
+    runtime_env={"nsight": {"t": "cuda,cudnn,cublas", "cuda-memory-usage": "true"}},
+)
+class NsightDummyActor:
+    def __init__(self):
+        self.initialized = True
+        # Store environment info that we can check later
+        self.env_vars = dict(os.environ)
+
+    def get_status(self):
+        return "ready"
+
+    def get_env_var(self, var_name):
+        return self.env_vars.get(var_name)
+
+    def check_nsight_config(self):
+        """Check if nsight profiling environment is properly configured."""
+        # Check if we're running under nsys (which would be the case if nsight was applied)
+        # The nsight configuration should result in the process being run with nsys profiler
+        return {
+            "has_nsight_env": "NSYS_RECIPE_ENABLED" in self.env_vars,
+            "nsys_recipe": self.env_vars.get("NSYS_RECIPE_ENABLED", ""),
+            "all_env_keys": list(self.env_vars.keys()),
+        }
+
+
 @pytest.fixture
 def register_test_actor(request):
     # Default to PY_EXECUTABLES.SYSTEM if no param is given
@@ -301,6 +328,48 @@ def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     worker_group.shutdown(force=True)
 
 
+def test_run_single_worker_single_data(worker_group_1d_sharding):
+    worker_group = worker_group_1d_sharding
+    assert len(worker_group.workers) == 2
+    ray.get([w.reset_call_records.remote() for w in worker_group.workers])
+
+    data_for_worker0 = SlicedDataDict({"id": 0, "val": "w0_val"})
+    data_for_worker1 = SlicedDataDict({"id": 1, "val": "w1_val"})
+
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        future_0 = worker_group.run_single_worker_single_data(
+            "record_call", 0, data_for_worker0
+        )
+        future_1 = worker_group.run_single_worker_single_data(
+            "record_call", 1, data_for_worker1
+        )
+        ray.get([future_0, future_1])
+
+    # pass through kwargs
+    future_0 = worker_group.run_single_worker_single_data(
+        "record_call", 0, data=data_for_worker0
+    )
+    future_1 = worker_group.run_single_worker_single_data(
+        "record_call", 1, data=data_for_worker1
+    )
+    results = ray.get([future_0, future_1])
+    assert len(results) == 2
+
+    # Check worker 0
+    d, args, _, count = ray.get(worker_group.workers[0].get_recorded_data.remote())
+    assert count == 1
+    assert d == data_for_worker0
+    assert args == ()
+
+    # Check worker 1
+    d, args, _, count = ray.get(worker_group.workers[1].get_recorded_data.remote())
+    assert count == 1
+    assert d == data_for_worker1
+    assert args == ()
+
+
 def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     worker_group = worker_group_1d_sharding
     assert len(worker_group.workers) == 2
@@ -312,17 +381,26 @@ def test_run_all_workers_single_data_1d_sharding(worker_group_1d_sharding):
     test_arg1 = "arg_single"
     test_kwarg1 = "kwarg_single_val"
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_single_data(
+            "record_call", test_data, test_arg1
+        )
+        ray.get(futures)
+
+    # pass through kwargs
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, test_arg1, kwarg1=test_kwarg1
+        "record_call", data=test_data, kwarg1=test_kwarg1
     )
     results = ray.get(futures)
     assert len(results) == 2  # Should run on all 2 workers
 
-    for i, worker in enumerate(worker_group.workers):
+    for worker in worker_group.workers:
         data, args, kwargs, count = ray.get(worker.get_recorded_data.remote())
         assert count == 1
         assert data == test_data
-        assert args == (test_arg1,)
+        assert args == ()
         assert kwargs == {"kwarg1": test_kwarg1}
 
 
@@ -332,7 +410,7 @@ def test_run_all_workers_single_data_2d_sharding_no_filter(worker_group_2d_shard
     ray.get([w.reset_call_records.remote() for w in worker_group.workers])
 
     test_data = SlicedDataDict({"key": "value_2d_no_filter"})
-    futures = worker_group.run_all_workers_single_data("record_call", test_data)
+    futures = worker_group.run_all_workers_single_data("record_call", data=test_data)
     results = ray.get(futures)
     assert len(results) == 4  # Runs on all 4 workers
 
@@ -350,7 +428,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_tp(worker_group_2d_shard
     test_data = SlicedDataDict({"key": "value_2d_filter_tp"})
     # Only run on tp rank 0 for each dp rank
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, run_rank_0_only_axes=["tp"]
+        "record_call", data=test_data, run_rank_0_only_axes=["tp"]
     )
     results = ray.get(futures)
     assert len(results) == 2  # Runs on 2 workers (dp0-tp0, dp1-tp0)
@@ -376,7 +454,7 @@ def test_run_all_workers_single_data_2d_sharding_filter_dp_tp(worker_group_2d_sh
     test_data = SlicedDataDict({"key": "value_2d_filter_dp_tp"})
     # Only run on dp rank 0 AND tp rank 0
     futures = worker_group.run_all_workers_single_data(
-        "record_call", test_data, run_rank_0_only_axes=["dp", "tp"]
+        "record_call", data=test_data, run_rank_0_only_axes=["dp", "tp"]
     )
     results = ray.get(futures)
     assert len(results) == 1  # Runs on 1 worker (dp0-tp0)
@@ -403,8 +481,17 @@ def test_run_all_workers_multiple_data_1d_sharding(worker_group_1d_sharding):
     multi_data = [data_for_worker0, data_for_worker1]
     common_arg = "common_arg_multi"
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_multiple_data(
+            "record_call", multi_data, common_kwargs={"common": common_arg}
+        )
+        ray.get(futures)
+
+    # pass through kwargs
     futures = worker_group.run_all_workers_multiple_data(
-        "record_call", multi_data, common_kwargs={"common": common_arg}
+        "record_call", data=multi_data, common_kwargs={"common": common_arg}
     )
     results = ray.get(futures)
     assert len(results) == 2
@@ -435,10 +522,11 @@ def test_run_all_workers_multiple_data_fewer_data_than_workers(
     data_for_worker1 = SlicedDataDict({"id": 1})
     multi_data = [data_for_worker0, data_for_worker1]  # Only 2 data items
 
-    with pytest.raises(
-        AssertionError, match="data length should be equal to the number of workers: "
-    ):
-        futures = worker_group.run_all_workers_multiple_data("record_call", multi_data)
+    with pytest.raises(AssertionError):
+        futures = worker_group.run_all_workers_multiple_data(
+            "record_call", data=multi_data
+        )
+        ray.get(futures)
 
 
 def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
@@ -452,6 +540,15 @@ def test_run_all_workers_sharded_data_1d(worker_group_1d_sharding):
         SlicedDataDict({"shard": 1, "val": "val1"}),
     ]
 
+    # pass through args
+    # due to https://github.com/NVIDIA-NeMo/RL/issues/582, args are not supported.
+    with pytest.raises(AssertionError):
+        future_bundle = worker_group.run_all_workers_sharded_data(
+            "record_call", sharded_data_input, in_sharded_axes=["data"]
+        )
+        worker_group.get_all_worker_results(future_bundle)
+
+    # pass through kwargs
     future_bundle = worker_group.run_all_workers_sharded_data(
         "record_call", data=sharded_data_input, in_sharded_axes=["data"]
     )
@@ -660,3 +757,223 @@ def test_run_all_workers_sharded_data_2d_output_replicated(worker_group_2d_shard
     # Assuming MultiWorkerFuture.get_results returns in order of return_from_workers
     assert "my_rank: 0" in results[0]  # from worker 0
     assert "my_rank: 2" in results[1]  # from worker 2
+
+
+def test_nsight_configuration_forwarding(register_test_actor, virtual_cluster):
+    """Test that nsight configuration in @ray.remote decorator is properly forwarded through RayWorkerGroup."""
+
+    # Check if nsys is installed, skip test if not available
+    import shutil
+
+    if shutil.which("nsys") is None:
+        pytest.skip("nsys (NVIDIA Nsight Systems) is not installed")
+
+    # Register the NsightDummyActor for use in the test
+    nsight_actor_fqn = f"{NsightDummyActor.__module__}.NsightDummyActor"
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(nsight_actor_fqn)
+    ACTOR_ENVIRONMENT_REGISTRY[nsight_actor_fqn] = PY_EXECUTABLES.SYSTEM
+
+    try:
+        # Create a RayWorkerBuilder with the nsight-configured actor
+        builder = RayWorkerBuilder(nsight_actor_fqn)
+
+        # Verify the worker has the expected default options from the @ray.remote decorator
+        # We can check this directly by ensuring the actor class has the nsight config
+        assert hasattr(NsightDummyActor, "_default_options")
+        options = getattr(NsightDummyActor, "_default_options", {})
+
+        # Verify the nsight configuration is in the runtime_env
+        assert "runtime_env" in options
+        assert (
+            "_nsight" in options["runtime_env"]
+        )  # Ray stores it with underscore prefix
+        assert options["runtime_env"]["_nsight"]["t"] == "cuda,cudnn,cublas"
+        assert options["runtime_env"]["_nsight"]["cuda-memory-usage"] == "true"
+        assert options.get("num_gpus") == 1
+
+        # Create worker group - nsight should be applied successfully
+        worker_group = RayWorkerGroup(
+            cluster=virtual_cluster, remote_worker_builder=builder, workers_per_node=1
+        )
+
+        assert len(worker_group.workers) == 1
+        worker = worker_group.workers[0]
+
+        # Verify the actor can be created and responds
+        status = ray.get(worker.get_status.remote())
+        assert status == "ready"
+
+        # Check if nsight configuration was applied
+        nsight_info = ray.get(worker.check_nsight_config.remote())
+
+        # The exact environment variables set by nsight profiling may vary,
+        # but we can verify that the worker was created successfully
+        # and the runtime_env with nsight was processed
+        assert isinstance(nsight_info, dict)
+        assert "all_env_keys" in nsight_info
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        # Clean up registry
+        if nsight_actor_fqn in ACTOR_ENVIRONMENT_REGISTRY:
+            if original_registry_value is None:
+                del ACTOR_ENVIRONMENT_REGISTRY[nsight_actor_fqn]
+            else:
+                ACTOR_ENVIRONMENT_REGISTRY[nsight_actor_fqn] = original_registry_value
+
+
+def test_get_nsight_config_if_pattern_matches():
+    """Test the get_nsight_config_if_pattern_matches utility function."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
+
+    # Test 1: No environment variable set
+    with (
+        patch("nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS", ""),
+        patch("nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", ""),
+    ):
+        result = get_nsight_config_if_pattern_matches("test_worker")
+        assert result == {}
+
+    # Test 2: Environment variable set but no pattern matches
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*critic*,*inference*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert result == {}
+
+    # Test 3: Pattern matches with wildcard
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*,*critic*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert "nsight" in result
+        assert result["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
+        assert result["nsight"]["stop-on-exit"] == "true"
+
+    # Test 4: Exact name match
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "exact-worker,another-worker",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "3:8"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("exact-worker")
+        assert "nsight" in result
+        assert result["nsight"]["o"] == "'exact-worker_3:8_%p'"
+
+    # Test 5: Multiple patterns, first one matches
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*vllm*,*policy*,*critic*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "2:10"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("vllm_inference_worker")
+        assert "nsight" in result
+        assert result["nsight"]["o"] == "'vllm_inference_worker_2:10_%p'"
+
+    # Test 6: CSV parsing with whitespace
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "  *train*  ,  exact-name  ,  *test*  ",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "5:15"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("training_worker")
+        assert "nsight" in result
+
+        result = get_nsight_config_if_pattern_matches("exact-name")
+        assert "nsight" in result
+
+        result = get_nsight_config_if_pattern_matches("some_test_worker")
+        assert "nsight" in result
+
+        result = get_nsight_config_if_pattern_matches("no_match")
+        assert result == {}
+
+    # Test 7: Empty patterns in CSV
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*,,*critic*,",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:3"
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("policy_worker")
+        assert "nsight" in result
+
+        result = get_nsight_config_if_pattern_matches("critic_worker")
+        assert "nsight" in result
+
+        result = get_nsight_config_if_pattern_matches("other_worker")
+        assert result == {}
+
+
+def test_get_nsight_config_output_format():
+    """Test that the nsight config output can be directly unpacked into runtime_env."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
+
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS", "*test*"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:5"
+        ),
+    ):
+        # Test the unpacking behavior
+        base_runtime_env = {
+            "env_vars": {"SOME_VAR": "value"},
+            "py_executable": "python",
+        }
+
+        nsight_config = get_nsight_config_if_pattern_matches("test_worker")
+
+        # This should work without errors
+        combined_runtime_env = {**base_runtime_env, **nsight_config}
+
+        assert "env_vars" in combined_runtime_env
+        assert "py_executable" in combined_runtime_env
+        assert "nsight" in combined_runtime_env
+        assert combined_runtime_env["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+
+        # Test with no match
+        no_match_config = get_nsight_config_if_pattern_matches("no_match_worker")
+        combined_runtime_env_no_match = {**base_runtime_env, **no_match_config}
+
+        assert "env_vars" in combined_runtime_env_no_match
+        assert "py_executable" in combined_runtime_env_no_match
+        assert "nsight" not in combined_runtime_env_no_match

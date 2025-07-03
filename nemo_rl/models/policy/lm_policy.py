@@ -17,6 +17,7 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import ray
+from ray.util.queue import Queue as RayQueue
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -43,13 +44,13 @@ from nemo_rl.models.policy.interfaces import (
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
-class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
+class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __init__(
         self,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
         tokenizer: PreTrainedTokenizerBase,
-        name_prefix: str = "hf_policy",
+        name_prefix: str = "lm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         init_optimizer: bool = True,
         weights_path: Optional[PathLike] = None,
@@ -62,27 +63,57 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
             optimizer_path = os.path.abspath(optimizer_path)
 
         node_bundle_indices = None
+        self.cp_size = 1
         tp_size = 1
+        pp_size = 1
+        cp_size = 1
 
         worker_builder_cls: str
-        if config["dtensor_cfg"]["enabled"]:
+        training_backend = None
+        if not config.get("megatron_cfg", {}).get(
+            "enabled", False
+        ):  # Huggingface backend
+            if config["dtensor_cfg"]["enabled"]:
+                worker_builder_cls = (
+                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+                )
+                tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+                cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            else:
+                worker_builder_cls = (
+                    "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
+                )
+            training_backend = "hf"
+        elif config["megatron_cfg"]["enabled"]:  # Megatron backend
             worker_builder_cls = (
-                "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+                "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
             )
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
+            pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
+            cp_size = config["megatron_cfg"]["context_parallel_size"]
+            training_backend = "megatron"
         else:
+            training_backend = "hf"
             worker_builder_cls = (
                 "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
             )
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
+                pp_size,  # PP
                 -1,  # DP
+                cp_size,  # CP
                 tp_size,  # TP
             ),
-            names=["data_parallel", "tensor_parallel"],
+            names=[
+                "pipeline_parallel",
+                "data_parallel",
+                "context_parallel",
+                "tensor_parallel",
+            ],
         )
 
+        pre_init_queue = RayQueue()
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
             config,
@@ -91,6 +122,8 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
+            worker_sharding_annotations=self.sharding_annotations,
+            pre_init_communication_queue=pre_init_queue,
         )
 
         self.worker_group = RayWorkerGroup(
@@ -102,8 +135,11 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         if config["dynamic_batching"]["enabled"]:
-            assert config["dtensor_cfg"]["enabled"], (
-                "Dynamic batch is only supported for DTensor policy."
+            assert config["dtensor_cfg"]["enabled"] or training_backend == "megatron", (
+                "Dynamic batch is only supported for DTensor or Megatron policy."
+            )
+            assert pp_size == 1, (
+                "Dynamic batching is only supported for single pipeline parallel stage"
             )
             self.use_dynamic_batches = True
             self.dynamic_batching_args: DynamicBatchingArgs = {
@@ -119,6 +155,16 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+    def init_collective(
+        self, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_collective", ip=ip, port=port, world_size=world_size
+        )
+        # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
+
     def get_logprobs(
         self, data: BatchedDataDict[GenerationDatumSpec]
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -130,29 +176,41 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
+
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
             )
 
+        sharded_data_2d = []
+        shard_idx = 0
+        # Convert to 2d dim array
+        for _ in range(dp_size):
+            cp_data = []
+            for _ in range(cp_size):
+                cp_data.append(sharded_data[shard_idx])
+                shard_idx += 1
+            sharded_data_2d.append(cp_data)
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_logprobs",
-            sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel"],
-            output_is_replicated=["tensor_parallel"],
+            data=sharded_data_2d,
+            in_sharded_axes=["data_parallel", "context_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
         )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
@@ -175,6 +233,7 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         Returns: Identical to get_logprobs.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
         if self.use_dynamic_batches:
@@ -182,22 +241,32 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
+                cp_size * dp_size,
                 batch_size=None,
             )
 
+        sharded_data_2d = []
+        shard_idx = 0
+        # Convert to 2d dim array
+        for _ in range(dp_size):
+            cp_data = []
+            for _ in range(cp_size):
+                cp_data.append(sharded_data[shard_idx])
+                shard_idx += 1
+            sharded_data_2d.append(cp_data)
+
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_reference_policy_logprobs",
-            sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel"],
-            output_is_replicated=["tensor_parallel"],
+            data=sharded_data_2d,
+            in_sharded_axes=["data_parallel", "context_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
@@ -244,10 +313,18 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         # Train each shard in parallel
         futures = self.worker_group.run_all_workers_sharded_data(
             "train",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel"],
-            output_is_replicated=["tensor_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
             common_kwargs={
                 "loss_fn": loss_fn,
                 "eval_mode": eval_mode,
@@ -288,10 +365,10 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel"],
-            output_is_replicated=["tensor_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"greedy": greedy},
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
@@ -390,7 +467,7 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         # Collect IPC handles from all workers
         worker_handles: list[dict[str, Any]] = ray.get(
             [
-                worker.get_weights_ipc_handles.remote(keys)
+                worker.get_weights_ipc_handles.remote(keys=keys)
                 for worker in self.worker_group.workers
             ]
         )
@@ -401,6 +478,27 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
             all_handles.update(handle)
 
         return all_handles
+
+    def prepare_info_for_collective(self) -> dict[str, Any]:
+        """Prepare the info for collective communication.
+
+        Returns:
+            dict: A dictionary containing the info for collective communication.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_info_for_collective"
+        )
+        results = ray.get(futures)
+        # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
+    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+        """Broadcast the weights for collective communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "broadcast_weights_for_collective"
+        )
+        # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
@@ -421,9 +519,9 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         """Save a checkpoint of the model."""
         futures = self.worker_group.run_all_workers_single_data(
             "save_checkpoint",
-            weights_path,
-            optimizer_path,
-            tokenizer_path,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            tokenizer_path=tokenizer_path,
         )
         ray.get(futures)
 
@@ -444,3 +542,13 @@ class HfPolicy(ColocatablePolicyInterface, GenerationInterface):
         user calls worker_group.shutdown().
         """
         self.worker_group.shutdown()
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
+        ray.get(futures)

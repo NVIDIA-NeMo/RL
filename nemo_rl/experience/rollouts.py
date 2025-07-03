@@ -15,6 +15,8 @@
 # Generate rollouts for arbitrary environments
 # Supports multi-turn rollouts and many simultaneous environments (E.g. you can train on math, code, multi-turn games and more at once)
 
+import asyncio
+import copy
 from typing import Any
 
 import ray
@@ -38,6 +40,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
+    GenerationOutputSpec,
 )
 
 TokenizerType = PreTrainedTokenizerBase
@@ -52,7 +55,7 @@ def generate_responses(
     include_logprobs: bool = True,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
-    """Generate responses from policy."""
+    """Generate responses from policy using synchronous generation."""
     # Add stop_strings to generation_input_data if present in the batch
     if "stop_strings" in batch:
         generation_input_data["stop_strings"] = batch["stop_strings"]
@@ -60,26 +63,24 @@ def generate_responses(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Generate responses
-    if (
-        "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
-    ):
-        generation_outputs = policy_generation.generate_async(
-            generation_input_data, greedy=greedy
-        )
-    else:
-        generation_outputs = policy_generation.generate(
-            generation_input_data, greedy=greedy
-        )
+    # Always use synchronous generation
+    generation_outputs = policy_generation.generate(
+        generation_input_data, greedy=greedy
+    )
 
-    # Extract generated tokens
-    generated_ids = []
+    # Extract everything we need from the generation outputs
+    output_ids = generation_outputs["output_ids"]
+    generation_lengths = generation_outputs["generation_lengths"]
     unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
-    for output_ids, input_length, total_length in zip(
-        generation_outputs["output_ids"], input_lengths, unpadded_sequence_lengths
-    ):
-        generated_ids.append(output_ids[input_length:total_length])
+
+    # Extract generated parts
+    generated_ids = []
+    for i in range(len(input_lengths)):
+        input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
+        full_output = output_ids[i]
+        generated_part = full_output[input_len:total_length]
+        generated_ids.append(generated_part)
 
     generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
@@ -87,28 +88,122 @@ def generate_responses(
     for i, (text, input_length, total_length) in enumerate(
         zip(generated_texts, input_lengths, unpadded_sequence_lengths)
     ):
-        message = {
+        assistant_message = {
             "role": "assistant",
             "content": text,
-            "token_ids": generation_outputs["output_ids"][i, input_length:total_length],
+            "token_ids": output_ids[i, input_length:total_length],
         }
 
         if include_logprobs and "logprobs" in generation_outputs:
-            message["generation_logprobs"] = generation_outputs["logprobs"][
+            assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
 
-        batch["message_log"][i].append(message)
+        batch["message_log"][i].append(assistant_message)
 
-    metrics = {
-        "mean_generation_length": (
-            torch.sum(unpadded_sequence_lengths) - torch.sum(input_lengths)
-        ).item()
-        / len(unpadded_sequence_lengths),
-        "max_seqlen": torch.max(unpadded_sequence_lengths).item(),
+    # Generation metrics
+    gen_metrics = {
+        "mean_generation_length": generation_lengths.float().mean().item(),
+        "total_generated_tokens": generation_lengths.sum().item(),
     }
 
-    return batch, generated_ids, metrics
+    return batch, generated_ids, gen_metrics
+
+
+async def generate_responses_async(
+    policy_generation: GenerationInterface,
+    generation_input_data: BatchedDataDict[GenerationDatumSpec],
+    batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    input_lengths: torch.Tensor,
+    include_logprobs: bool = True,
+    greedy: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
+    """Async version of generate_responses that properly calls generate_async."""
+    # Add stop_strings to generation_input_data if present in the batch
+    if "stop_strings" in batch:
+        generation_input_data["stop_strings"] = batch["stop_strings"]
+    else:
+        # Ensure the key exists even if it's None, matching GenerationDatumSpec
+        generation_input_data["stop_strings"] = [None] * len(input_lengths)
+
+    # Check if this is vLLM with async_engine enabled
+    use_async_generation = (
+        hasattr(policy_generation, "cfg")
+        and "vllm_cfg" in policy_generation.cfg
+        and policy_generation.cfg["vllm_cfg"]["async_engine"]
+        and hasattr(policy_generation, "generate_async")
+    )
+
+    assert use_async_generation, (
+        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+    )
+
+    # Use async generation with per-sample streaming
+    collected_indexed_outputs: list[
+        tuple[int, BatchedDataDict[GenerationOutputSpec]]
+    ] = []
+    async for original_idx, single_item_output in policy_generation.generate_async(
+        generation_input_data, greedy=greedy
+    ):
+        collected_indexed_outputs.append((original_idx, single_item_output))
+
+    # Sort by original_idx to ensure order matches generation_input_data
+    collected_indexed_outputs.sort(key=lambda x: x[0])
+
+    # Extract in correct order
+    ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
+
+    assert ordered_batched_data_dicts, (
+        "Generation returned no outputs for a non-empty batch."
+    )
+
+    pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    generation_outputs = BatchedDataDict.from_batches(
+        ordered_batched_data_dicts,
+        pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+    )
+
+    # Extract everything we need from the generation outputs
+    output_ids = generation_outputs["output_ids"]
+    generation_lengths = generation_outputs["generation_lengths"]
+    unpadded_sequence_lengths = generation_outputs["unpadded_sequence_lengths"]
+
+    # Extract generated parts
+    generated_ids = []
+    for i in range(len(input_lengths)):
+        input_len = input_lengths[i].item()
+        total_length = unpadded_sequence_lengths[i].item()
+        full_output = output_ids[i]
+        generated_part = full_output[input_len:total_length]
+        generated_ids.append(generated_part)
+
+    generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+    # Append to message log
+    for i, (text, input_length, total_length) in enumerate(
+        zip(generated_texts, input_lengths, unpadded_sequence_lengths)
+    ):
+        assistant_message = {
+            "role": "assistant",
+            "content": text,
+            "token_ids": output_ids[i, input_length:total_length],
+        }
+
+        if include_logprobs and "logprobs" in generation_outputs:
+            assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
+
+        batch["message_log"][i].append(assistant_message)
+
+    # Generation metrics
+    gen_metrics = {
+        "mean_generation_length": generation_lengths.float().mean().item(),
+        "total_generated_tokens": generation_lengths.sum().item(),
+    }
+
+    return batch, generated_ids, gen_metrics
 
 
 def calculate_rewards(
@@ -288,7 +383,7 @@ def run_multi_turn_rollout(
             generation_input_data,
             active_batch,
             tokenizer,
-            active_input_lengths,
+            input_lengths=active_input_lengths,
             greedy=greedy,
         )
 
@@ -314,7 +409,7 @@ def run_multi_turn_rollout(
             # TODO @sahilj: handle if we want these subsequent messages to have a chat template
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0]
+            ).input_ids[0]
 
             # check if new message overflows max_seq_len
             if (
@@ -388,9 +483,383 @@ def run_multi_turn_rollout(
         "truncation_rate": float(sample_truncated.float().mean().item()),
         "max_turns_reached_rate": float(sample_max_turns_reached.float().mean().item()),
         # Token usage metrics
-        "mean_gen_tokens_per_sample": float(sample_token_counts.float().mean().item()),
+        "mean_total_tokens_per_sample": float(
+            sample_token_counts.float().mean().item()
+        ),
+        "mean_gen_tokens_per_sample": float(
+            sample_assistant_token_counts.float().mean().item()
+        ),
         "mean_env_tokens_per_sample": float(
             sample_env_token_counts.float().mean().item()
         ),
     }
     return current_batch, rollout_metrics
+
+
+async def async_generate_response_for_sample_turn(
+    policy_generation: GenerationInterface,
+    sample_message_log: list[dict],
+    sample_stop_strings: list[str] | None,
+    tokenizer: TokenizerType,
+    max_seq_len: int,
+    greedy: bool = False,
+) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Generate a response for a single sample's turn using async generation.
+
+    Args:
+        policy_generation: The generation interface to use
+        sample_message_log: Message log for a single sample
+        sample_stop_strings: Stop strings for this sample
+        tokenizer: Tokenizer to use
+        max_seq_len: Maximum sequence length
+        greedy: Whether to use greedy decoding
+
+    Returns:
+        Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
+    """
+    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
+    # Convert single sample to batch format
+    batch_message_logs = [sample_message_log]
+
+    # Convert to flat format for generation
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        batch_message_logs,
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+
+    # Create generation input
+    generation_input_data = BatchedDataDict[GenerationDatumSpec](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "stop_strings": [sample_stop_strings],
+        }
+    )
+
+    # Create a dummy batch for generate_responses_async
+    dummy_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": batch_message_logs,
+            "stop_strings": [sample_stop_strings],
+        }
+    )
+
+    # Generate response using the async version
+    updated_batch, generated_ids, gen_metrics = await generate_responses_async(
+        policy_generation,
+        generation_input_data,
+        dummy_batch,
+        tokenizer,
+        input_lengths=input_lengths,
+        include_logprobs=True,
+        greedy=greedy,
+    )
+
+    # Extract results for the single sample
+    updated_message_log = updated_batch["message_log"][0]
+    generated_tokens = generated_ids[0] if generated_ids else torch.empty(0)
+
+    return updated_message_log, generated_tokens, input_lengths, gen_metrics
+
+
+async def run_sample_multi_turn_rollout(
+    sample_idx: int,
+    initial_sample_state: dict,
+    policy_generation: GenerationInterface,
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> tuple[dict, dict[str, Any]]:
+    """Run a multi-turn rollout for a single sample.
+
+    This function manages the complete lifecycle of one sample's interaction.
+    Async generation is used internally when available.
+
+    Args:
+        sample_idx: Index of this sample in the original batch
+        initial_sample_state: Initial state containing message_log, extra_env_info, etc.
+        policy_generation: The generation interface
+        tokenizer: Tokenizer to use
+        task_to_env: Environment mapping
+        max_seq_len: Maximum sequence length
+        max_rollout_turns: Maximum number of turns
+        greedy: Whether to use greedy decoding
+
+    Returns:
+        Tuple of (final_sample_state, sample_metrics)
+    """
+    # Initialize sample state
+    current_message_log = copy.deepcopy(initial_sample_state["message_log"])
+    current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
+    current_stop_strings = initial_sample_state.get("stop_strings", None)
+    task_name = initial_sample_state["task_name"]
+
+    # Sample-level metrics
+    total_reward = 0.0
+    turn_count = 0
+    token_count = 0
+    assistant_token_count = 0
+    env_token_count = 0
+    terminated = False
+    truncated = False
+    max_turns_reached = False
+
+    # Track per-turn metrics
+    turn_gen_tokens = []
+
+    for turn in range(max_rollout_turns):
+        if terminated or truncated:
+            break
+
+        turn_count += 1
+
+        # Generate response for this sample using async generation
+        try:
+            (
+                updated_message_log,
+                generated_tokens,
+                input_lengths,
+                gen_metrics,
+            ) = await async_generate_response_for_sample_turn(
+                policy_generation,
+                current_message_log,
+                current_stop_strings,
+                tokenizer,
+                max_seq_len,
+                greedy=greedy,
+            )
+            current_message_log = updated_message_log
+
+            # Update token counts
+            gen_token_count = len(generated_tokens)
+            assistant_token_count += gen_token_count
+            token_count += gen_token_count
+            turn_gen_tokens.append(gen_token_count)
+
+        except Exception as e:
+            print(f"Error generating response for sample {sample_idx}: {e}")
+            break
+
+        # Create single-sample batch for environment interaction
+        sample_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [current_message_log],
+                "extra_env_info": [current_extra_env_info],
+                "task_name": [task_name],
+            }
+        )
+
+        # Get environment feedback
+        env_output = calculate_rewards(sample_batch, task_to_env)
+        # Update total reward
+        total_reward += env_output.rewards[0].item()
+        # Check termination
+        terminated = env_output.terminateds[0].item()
+        env_obs_content = env_output.observations[0]["content"]
+        # Tokenize environment response
+        tokenized_obs = tokenizer(
+            env_obs_content, return_tensors="pt", add_special_tokens=False
+        ).input_ids[0]
+
+        # Check for sequence length overflow
+        if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
+            # Truncate environment observation
+            max_env_tokens = max_seq_len - input_lengths - gen_token_count
+            if max_env_tokens > 0:
+                tokenized_obs = tokenized_obs[:max_env_tokens]
+            else:
+                tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
+            truncated = True
+
+        env_message = {
+            "role": env_output.observations[0]["role"],
+            "content": env_obs_content,
+            "token_ids": tokenized_obs,
+        }
+        current_message_log.append(env_message)
+
+        # Update token counts
+        env_token_count += len(tokenized_obs)
+        token_count += len(tokenized_obs)
+
+        # Update sample state for next turn
+        if not terminated and not truncated:
+            if env_output.next_stop_strings[0] is not None:
+                current_stop_strings = env_output.next_stop_strings[0]
+            if env_output.metadata[0] is not None:
+                current_extra_env_info = env_output.metadata[0]
+
+    # Check if max turns reached
+    if turn_count >= max_rollout_turns:
+        max_turns_reached = True
+
+    # Prepare final sample state
+    final_sample_state = {
+        "message_log": current_message_log,
+        "extra_env_info": current_extra_env_info,
+        "task_name": task_name,
+        "total_reward": torch.tensor(total_reward),
+        "stop_strings": current_stop_strings,
+        "idx": sample_idx,
+    }
+
+    # Sample metrics
+    sample_metrics = {
+        "turn_count": turn_count,
+        "total_tokens": token_count,
+        "assistant_tokens": assistant_token_count,
+        "env_tokens": env_token_count,
+        "terminated": terminated,
+        "truncated": truncated,
+        "max_turns_reached": max_turns_reached,
+        "total_reward": total_reward,
+        "turn_gen_tokens": turn_gen_tokens,
+    }
+
+    return final_sample_state, sample_metrics
+
+
+def run_async_multi_turn_rollout(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
+    """Run multi-turn rollouts with sample-level processing.
+
+    Each sample in the batch proceeds through its interaction independently.
+    Async generation is used internally when available but the function is synchronous.
+
+    Args:
+        policy_generation: The generation interface (policy)
+        input_batch: The starting batch containing initial message logs
+        tokenizer: The tokenizer
+        task_to_env: Dictionary mapping task names to environment instances
+        max_seq_len: Maximum sequence length allowed
+        max_rollout_turns: Maximum number of agent-environment interaction turns
+        greedy: Whether to use greedy decoding
+
+    Returns:
+        Tuple containing:
+            - BatchedDataDict with the full interaction history and accumulated rewards
+            - Dictionary of rollout metrics
+    """
+
+    async def _async_rollout_implementation():
+        """Internal async implementation."""
+        batch_size = len(input_batch["message_log"])
+
+        # Prepare initial states for each sample
+        sample_initial_states = []
+        for i in range(batch_size):
+            sample_state = {
+                "message_log": input_batch["message_log"][i],
+                "extra_env_info": input_batch["extra_env_info"][i],
+                "task_name": input_batch["task_name"][i],
+                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
+                "idx": input_batch.get("idx", list(range(batch_size)))[i],
+            }
+            sample_initial_states.append(sample_state)
+
+        # Run all samples concurrently
+        async def run_single_sample_with_error_handling(i, sample_state):
+            """Wrapper to handle errors for individual sample rollouts."""
+            try:
+                result = await run_sample_multi_turn_rollout(
+                    sample_idx=i,
+                    initial_sample_state=sample_state,
+                    policy_generation=policy_generation,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=max_rollout_turns,
+                    greedy=greedy,
+                )
+                return result
+            except Exception as e:
+                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
+
+        # Create tasks for all samples and run them concurrently
+        sample_tasks = [
+            run_single_sample_with_error_handling(i, sample_state)
+            for i, sample_state in enumerate(sample_initial_states)
+        ]
+
+        # Execute all sample rollouts concurrently
+        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
+
+        # Process results
+        final_sample_states = []
+        all_sample_metrics = []
+
+        for final_state, sample_metrics in sample_results:
+            final_sample_states.append(final_state)
+            all_sample_metrics.append(sample_metrics)
+
+        # Reconstruct batch from sample results
+        batch_size = len(final_sample_states)
+        final_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [state["message_log"] for state in final_sample_states],
+                "extra_env_info": [
+                    state["extra_env_info"] for state in final_sample_states
+                ],
+                "task_name": [state["task_name"] for state in final_sample_states],
+                "total_reward": torch.stack(
+                    [state["total_reward"] for state in final_sample_states]
+                ),
+                "idx": [
+                    state.get("idx", i) for i, state in enumerate(final_sample_states)
+                ],
+            }
+        )
+
+        # Preserve additional fields from the original input_batch
+        for key in input_batch.keys():
+            if key not in final_batch:
+                final_batch[key] = input_batch[key]
+
+        # Aggregate metrics across all samples
+        rollout_metrics = {
+            # Overall metrics
+            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
+            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
+            / batch_size,
+            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+            / batch_size,
+            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
+            / batch_size,
+            "max_turns_reached_rate": sum(
+                m["max_turns_reached"] for m in all_sample_metrics
+            )
+            / batch_size,
+            # Token usage metrics
+            "mean_total_tokens_per_sample": sum(
+                m["total_tokens"] for m in all_sample_metrics
+            )
+            / batch_size,
+            "mean_gen_tokens_per_sample": sum(
+                m["assistant_tokens"] for m in all_sample_metrics
+            )
+            / batch_size,
+            "mean_env_tokens_per_sample": sum(
+                m["env_tokens"] for m in all_sample_metrics
+            )
+            / batch_size,
+            # Reward metrics
+            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
+            / batch_size,
+            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+        }
+
+        return final_batch, rollout_metrics
+
+    return asyncio.run(_async_rollout_implementation())

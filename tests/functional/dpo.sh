@@ -28,6 +28,7 @@ uv run $PROJECT_ROOT/examples/run_dpo.py \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
+    logger.monitor_gpus=true \
     checkpointing.enabled=false \
     $@ \
     2>&1 | tee $RUN_LOG
@@ -35,7 +36,7 @@ uv run $PROJECT_ROOT/examples/run_dpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # TODO: threshold set higher since test is flaky
-# https://github.com/NVIDIA/NeMo-RL/issues/370
+# https://github.com/NVIDIA-NeMo/RL/issues/370
 uv run tests/check_metrics.py $JSON_METRICS \
   'data["train/loss"]["3"] < 0.8'
 

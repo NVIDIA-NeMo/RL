@@ -3,7 +3,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # TODO: this config can crash on OOM
-# https://github.com/NVIDIA/NeMo-RL/issues/263
+# https://github.com/NVIDIA-NeMo/RL/issues/263
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
@@ -39,5 +39,5 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 1.5' \
         'data["train/loss"]["20"] < 0.3' \
-        'max(data["ray/node.0.gpu.0.memory"]) < 35000'
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 35'
 fi 

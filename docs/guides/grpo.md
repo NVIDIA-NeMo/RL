@@ -67,7 +67,7 @@ def my_data_processor(
 ) -> DatumSpec:
 ```
 
-We have an example of this as `math_data_processor` in [run_grpo_math.py](../../examples/run_grpo_math.py)
+We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py)
 
 #### Putting it all together
 

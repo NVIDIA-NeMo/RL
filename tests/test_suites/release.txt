@@ -24,3 +24,4 @@ tests/test_suites/llm/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long.v2.sh
 
 # Long 8b convergence
 tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1.v2.sh
+tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.sh
