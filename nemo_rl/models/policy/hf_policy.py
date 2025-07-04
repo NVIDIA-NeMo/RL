@@ -389,3 +389,42 @@ class HfPolicy(PolicyInterface, GenerationInterface):
         user calls worker_group.shutdown().
         """
         self.worker_group.shutdown()
+
+    def get_entropy(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict:
+        """Get the logprobs of the model for a data dict.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        if self.use_dynamic_batches:
+            self.dynamic_batching_cfg["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                self.dp_size,
+                batch_size=None,
+                dynamic_batching_cfg=self.dynamic_batching_cfg,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(
+                self.dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "get_entropy", sharded_data, only_on="all_tied_workers"
+        )
+        entropy = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures)
+        )
+
+        # dynamic batching sorts the inputs by sequence length to improve load balancing,
+        # so change it back here
+        if self.use_dynamic_batches:
+            entropy.reorder_data(unsorted_data_indices)
+
+        return entropy

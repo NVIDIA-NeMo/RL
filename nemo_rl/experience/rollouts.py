@@ -15,6 +15,7 @@
 # Generate rollouts for arbitrary environments
 # Supports multi-turn rollouts and many simultaneous environments (E.g. you can train on math, code, multi-turn games and more at once)
 
+from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 import ray
@@ -363,21 +364,66 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
 
-    # Calculate aggregate metrics
-    rollout_metrics = {
-        # Overall metrics
-        "total_turns": int(sample_turn_counts.sum().item()),
-        "avg_turns_per_sample": float(sample_turn_counts.float().mean().item()),
-        "max_turns_per_sample": int(sample_turn_counts.max().item()),
-        "natural_termination_rate": float(sample_terminated.float().mean().item()),
-        "truncation_rate": float(sample_truncated.float().mean().item()),
-        "max_turns_reached_rate": float(sample_max_turns_reached.float().mean().item()),
-        # Token usage metrics
-        "mean_gen_tokens_per_sample": float(sample_token_counts.float().mean().item()),
-        "min_gen_tokens_per_sample": float(sample_token_counts.float().min().item()),
-        "max_gen_tokens_per_sample": float(sample_token_counts.float().max().item()),
-        "mean_env_tokens_per_sample": float(
-            sample_env_token_counts.float().mean().item()
-        ),
-    }
+    # Group sample-level data by dataset for per-dataset metrics
+    per_dataset_data = defaultdict(lambda: defaultdict(list))
+
+    for i in range(len(current_batch["dataset_names"])):
+        dataset_name = current_batch["dataset_names"][i]
+        per_dataset_data[dataset_name]["total_rewards"].append(
+            current_batch["total_reward"][i].item()
+        )
+        per_dataset_data[dataset_name]["turn_counts"].append(
+            sample_turn_counts[i].item()
+        )
+        per_dataset_data[dataset_name]["terminated"].append(sample_terminated[i].item())
+        per_dataset_data[dataset_name]["truncated"].append(sample_truncated[i].item())
+        per_dataset_data[dataset_name]["max_turns_reached"].append(
+            sample_max_turns_reached[i].item()
+        )
+        per_dataset_data[dataset_name]["token_counts"].append(
+            sample_token_counts[i].item()
+        )
+        per_dataset_data[dataset_name]["env_token_counts"].append(
+            sample_env_token_counts[i].item()
+        )
+
+    rollout_metrics = {}
+
+    # Compute per-dataset metrics
+    for dataset_name, data in per_dataset_data.items():
+        # Convert lists to tensors for easier computation
+        rewards_tensor = torch.tensor(data["total_rewards"], dtype=torch.float32)
+        turns_tensor = torch.tensor(data["turn_counts"], dtype=torch.int32)
+        terminated_tensor = torch.tensor(data["terminated"], dtype=torch.bool)
+        truncated_tensor = torch.tensor(data["truncated"], dtype=torch.bool)
+        max_turns_tensor = torch.tensor(data["max_turns_reached"], dtype=torch.bool)
+        tokens_tensor = torch.tensor(data["token_counts"], dtype=torch.int32)
+        env_tokens_tensor = torch.tensor(data["env_token_counts"], dtype=torch.int32)
+
+        per_dataset_metric = {
+            # Reward metrics
+            "mean_total_reward": float(rewards_tensor.mean().item()),
+            "max_total_reward": float(rewards_tensor.max().item()),
+            "min_total_reward": float(rewards_tensor.min().item()),
+            # Turn metrics
+            "total_turns": int(turns_tensor.sum().item()),
+            "avg_turns_per_sample": float(turns_tensor.float().mean().item()),
+            "max_turns_per_sample": int(turns_tensor.max().item()),
+            # Termination metrics
+            "natural_termination_rate": float(terminated_tensor.float().mean().item()),
+            "truncation_rate": float(truncated_tensor.float().mean().item()),
+            "max_turns_reached_rate": float(max_turns_tensor.float().mean().item()),
+            # Token usage metrics
+            "mean_gen_tokens_per_sample": float(tokens_tensor.float().mean().item()),
+            "min_gen_tokens_per_sample": float(tokens_tensor.float().min().item()),
+            "max_gen_tokens_per_sample": float(tokens_tensor.float().max().item()),
+            "mean_env_tokens_per_sample": float(
+                env_tokens_tensor.float().mean().item()
+            ),
+            "num_samples": len(data["total_rewards"]),
+        }
+        rollout_metrics.update(
+            {f"{dataset_name}/{k}": v for k, v in per_dataset_metric.items()}
+        )
+
     return current_batch, rollout_metrics

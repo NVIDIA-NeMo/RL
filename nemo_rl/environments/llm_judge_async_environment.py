@@ -103,22 +103,22 @@ Answer yes or no, then give your reasoning.
         from vllm.sampling_params import SamplingParams
 
         self.SamplingParams = SamplingParams
-        # Attempt to use HF_HOME from env, otherwise default to huggingface_hub's default cache
+        # Attempt to use HF_HUB_CACHE from env, otherwise default to huggingface_hub's default cache
         # This ensures the worker tries to use the same cache path as the driver.
-        hf_home_cache_path = os.environ.get("HF_HOME", HUGGINGFACE_HUB_CACHE)
-        if not os.path.isdir(hf_home_cache_path):
+        hf_hub_cache_path = os.environ.get("HF_HUB_CACHE", HUGGINGFACE_HUB_CACHE)
+        if not os.path.isdir(hf_hub_cache_path):
             try:
-                os.makedirs(hf_home_cache_path, exist_ok=True)
+                os.makedirs(hf_hub_cache_path, exist_ok=True)
                 logging.info(
-                    f"Created HF cache directory for worker: {hf_home_cache_path}"
+                    f"Created HF cache directory for worker: {hf_hub_cache_path}"
                 )
             except OSError as e:
                 logging.warning(
-                    f"Worker could not create HF cache directory {hf_home_cache_path}: {e}. "
+                    f"Worker could not create HF cache directory {hf_hub_cache_path}: {e}. "
                     "This might lead to download issues if the default cache is not writable."
                 )
 
-        # It's critical that download_dir is set for vLLM if HF_HOME is being customized,
+        # It's critical that download_dir is set for vLLM if HF_HUB_CACHE is being customized,
         # or if there are any doubts about vLLM picking up the environment variable.
         # Also add ignore_patterns to prevent issues with problematic aux files.
         engine_args = AsyncEngineArgs(
@@ -127,7 +127,7 @@ Answer yes or no, then give your reasoning.
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             disable_log_stats=disable_log_stats,
-            download_dir=hf_home_cache_path,  # Explicitly tell vLLM where to download/look for models
+            download_dir=hf_hub_cache_path,  # Explicitly tell vLLM where to download/look for models
             ignore_patterns=[
                 "*.safetensors.index.json",
                 "*.pt",
@@ -260,6 +260,7 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
         # Pass down critical environment variables (HF cache, etc.) to workers.
         env_vars_to_pass = {}
         for key in [
+            "HF_HUB_CACHE",
             "HF_HOME",
             "TRANSFORMERS_CACHE",
             "WANDB_API_KEY",

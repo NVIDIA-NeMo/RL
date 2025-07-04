@@ -15,16 +15,18 @@
 from typing import Optional, TypedDict
 
 
+class DatasetConfig(TypedDict):
+    shuffle: bool
+    seed: int
+    jsonl_path: str
+    filter_long_samples: bool
+    drop_last: bool
+
+
 class DataConfig(TypedDict):
+    train: DatasetConfig
+    val: Optional[DatasetConfig]
     max_input_seq_length: int
-    prompt_file: str
-    system_prompt_file: Optional[str]
-    dataset_name: str
-    val_dataset_name: Optional[str]
-    add_bos: Optional[bool]
-    add_eos: Optional[bool]
-    input_key: Optional[str]
-    output_key: Optional[str]
 
 
 class MathDataConfig(DataConfig):

@@ -15,13 +15,17 @@ import random
 import warnings
 from collections import defaultdict
 from functools import wraps
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data import hf_datasets
+from nemo_rl.models.dtensor.parallelize import (
+    get_logprobs_from_vocab_parallel_logits,
+    token_level_entropy_from_vocab_parallel_logits,
+)
 from nemo_rl.models.policy import TokenizerConfig
 
 
@@ -231,3 +235,47 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> AutoTokenizer:
         print("No chat template provided, using tokenizer's default")
 
     return tokenizer
+
+
+def compute_token_level_entropy(
+    logits: Union[torch.Tensor, torch.distributed.tensor.DTensor],
+):
+    """Computes token-level entropy from logits and input ids.
+
+    return B x (S-1)
+    """
+    if isinstance(logits, torch.distributed.tensor.DTensor):
+        token_level_entropy = token_level_entropy_from_vocab_parallel_logits(
+            vocab_parallel_logits=logits,
+        )
+    else:
+        next_token_logits_wo_last = logits[:, :-1]  # Remove last position's logits
+        next_token_logprobs = torch.nn.functional.log_softmax(
+            next_token_logits_wo_last, dim=-1
+        )
+        token_level_entropy = -(next_token_logprobs.exp() * next_token_logprobs).sum(-1)
+
+    return token_level_entropy
+
+
+def compute_token_logprobs(
+    logits: Union[torch.Tensor, torch.distributed.tensor.DTensor],
+    input_ids: torch.Tensor,
+):
+    """Computes token-level logprobs from logits and input ids."""
+    if isinstance(logits, torch.distributed.tensor.DTensor):
+        curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+            vocab_parallel_logits=logits,
+            input_ids=input_ids,
+        )
+    else:
+        next_token_logits_wo_last = logits[:, :-1]  # Remove last position's logits
+        next_token_logprobs = torch.nn.functional.log_softmax(
+            next_token_logits_wo_last, dim=-1
+        )
+        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
+        curr_logprobs = next_token_logprobs.gather(
+            dim=-1, index=next_tokens.unsqueeze(-1)
+        ).squeeze(-1)
+
+    return curr_logprobs
