@@ -62,8 +62,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        node_bundle_indices = None
-        self.cp_size = 1
         tp_size = 1
         pp_size = 1
         cp_size = 1
