@@ -79,7 +79,9 @@ policy:
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6
