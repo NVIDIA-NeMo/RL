@@ -437,7 +437,9 @@ def refit_policy_generation(
         # do update
         for keys in grouped_param_keys:
             ipc_handles = policy.get_weights_ipc_handles(keys)
-            update_success = policy_generation.update_weights(ipc_handles)
+            update_success = policy_generation.update_weights_from_ipc_handles(
+                ipc_handles
+            )
             if not update_success:
                 break
     else:
