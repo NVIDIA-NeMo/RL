@@ -1239,14 +1239,14 @@ class MegatronPolicyWorker:
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         # Get parameter info for refit
         # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        self.param_info = get_param_info(self.model, self.dtype)
+        self.refit_param_info = get_param_info(self.model, self.dtype)
 
         if self.is_generation_colocated:
             return
 
         # Collect converted state dict for collective communication
         state_dict_info = {}
-        for key, _ in self.param_info:
+        for key, _ in self.refit_param_info:
             gathered_megatron_params = gather_params(self.model, [key])
             gathered_hf_params = self.megatron_to_hf_converter.convert(
                 gathered_megatron_params, self.model.config
@@ -1271,7 +1271,7 @@ class MegatronPolicyWorker:
         ## Use 80% of the free memory for safety
         total_available_bytes *= 0.8
 
-        return self.param_info, total_available_bytes
+        return self.refit_param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
@@ -1309,7 +1309,7 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
-        for key, _ in self.param_info:
+        for key, _ in self.refit_param_info:
             gathered_megatron_params = gather_params(self.model, [key])
             gathered_hf_params = self.megatron_to_hf_converter.convert(
                 gathered_megatron_params, self.model.config
