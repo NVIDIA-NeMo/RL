@@ -1221,6 +1221,7 @@ class VllmGeneration(GenerationInterface):
             "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
         )
 
+        # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
         env_vars = {}
         if not self.cfg["colocated"]["enabled"]:
