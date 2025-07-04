@@ -105,6 +105,9 @@ pip install uv
 #       This ensures that the version of python used is always what we prescribe.
 uv venv
 
+# Install setuptools (required by flash-attn)
+uv pip install setuptools
+
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
 
