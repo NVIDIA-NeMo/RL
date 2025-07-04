@@ -46,6 +46,11 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        # state_dict_info: {tensor_name: (shape, dtype)}
+        self.state_dict_info = state_dict_info
+
     def update_weights_from_ipc_handles(self, ipc_handles):
         """Update weights from IPC handles.
 
@@ -81,10 +86,15 @@ class VllmInternalWorkerExtension:
             )
             return False
 
-    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
+        assert self.state_dict_info is not None, (
+            "state_dict_info is not prepared. "
+            "Please call prepare_refit_info when initializing the worker."
+        )
+
         try:
-            for name, (shape, dtype) in info.items():
+            for name, (shape, dtype) in self.state_dict_info.items():
                 weight = torch.empty(shape, dtype=dtype, device="cuda")
                 self.model_update_group.broadcast(weight, src=0)
                 self.model_runner.model.load_weights(weights=[(name, weight)])

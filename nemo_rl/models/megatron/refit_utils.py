@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel.layers import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
+from torch.distributed import get_process_group_ranks
 
 from nemo_rl.models.megatron.converters.common import get_global_key_from_local_key
 
@@ -75,10 +76,7 @@ def get_tp_dim(model, param_name, named_modules_dict):
 
 
 @torch.no_grad()
-def gather_params(
-    model,
-    keys,
-):
+def gather_params(model, keys):
     st = time.time()
 
     tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -140,3 +138,86 @@ def gather_params(
     torch.cuda.synchronize()
     print(f"Time taken to gather params: {time.time() - st}")
     return gathered_params
+
+
+@torch.no_grad()
+def get_param_info(model, dtype):
+    # Get parallel info
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    tp_group_rank_ids = get_process_group_ranks(tp_group)
+
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    pp_world_size = torch.distributed.get_world_size(pp_group)
+    pp_group_rank_ids = get_process_group_ranks(pp_group)
+
+    # Collect parameter info
+    param_info = []
+
+    # Dictionary of modules we can quickly look up to check if a module has TP
+    named_modules_dict = dict(model.named_modules())
+
+    # Process each parameter in the model
+    # state_dict includes parameters and persistent buffers
+    for name, param in model.state_dict().items():
+        # Skip _extra_state entries (these are metadata, not actual weights)
+        if "_extra_state" in name:
+            continue
+
+        shape = list(param.shape)
+        tp_dim = get_tp_dim(model, name, named_modules_dict)
+        if tp_dim is not None:
+            tp_rank_ids = tuple(sorted(tp_group_rank_ids))
+            shape[tp_dim] *= len(tp_rank_ids)
+        else:
+            tp_rank_ids = (torch.distributed.get_rank(),)
+
+        pp_rank_ids = tuple(sorted(pp_group_rank_ids))
+
+        # Calculate size for this parameter
+        prec_to_bytes = {
+            torch.bfloat16: 2,
+            torch.float16: 2,
+            torch.float32: 4,
+        }
+        scale = prec_to_bytes[dtype] / prec_to_bytes[param.dtype]
+        size_in_bytes = (
+            param.element_size()
+            * param.numel()
+            * len(tp_rank_ids)
+            * len(pp_rank_ids)
+            * scale
+        )
+        param_info.append(
+            (
+                (
+                    name,
+                    tuple(shape),
+                    param.dtype,
+                ),
+                size_in_bytes,
+            )
+        )
+
+    # Gather all parameter info from all PP ranks
+    pp_gathered_param_infos = [None] * pp_world_size
+    torch.distributed.all_gather_object(
+        pp_gathered_param_infos, param_info, group=pp_group
+    )
+    pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
+
+    all_param_infos = pp_gathered_param_infos
+
+    # Merge all parameter infos, keeping only unique parameter names
+    merged_param_info = []
+    seen_params = set()
+
+    for name, size in all_param_infos:
+        if name not in seen_params:
+            merged_param_info.append((name, size))
+            seen_params.add(name)
+
+    # Update param_info with the merged information
+    param_info = merged_param_info
+    print(f"Prepared {len(param_info)} tensors for refit")
+
+    return param_info
