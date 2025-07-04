@@ -23,10 +23,7 @@ from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss_functions import NLLLoss
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import (
-    RayVirtualCluster,
-    _get_node_ip_and_free_port,
-)
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -1200,12 +1197,14 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
 async def test_vllm_refit_non_collocated_update_weights(
     policy_cluster_separate,
     tokenizer,
     test_input_data,
     async_engine,
     tensor_parallel_size,
+    policy_type,
 ):
     # Skip tensor_parallel_size == 2 until we have resources in CI
     if tensor_parallel_size == 2:
@@ -1223,23 +1222,41 @@ async def test_vllm_refit_non_collocated_update_weights(
             "Test requires at least two GPUs to run policies on separate clusters."
         )
 
-    # Create Policy on its own cluster
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["generation"]["colocated"]["enabled"] = False
-    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+    # Get policy config
+    if policy_type == "dtensor":
+        lm_config = deepcopy(basic_dtensor_test_config)
+    else:
+        assert policy_type == "megatron"
+        lm_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    lm_config["generation"]["colocated"]["enabled"] = False
 
-    # Create VllmGeneration policy on its own cluster
+    # Get vllm config
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
     vllm_config["colocated"]["enabled"] = False
+
+    # Megatron nee
+    if policy_type == "megatron":
+        model_name = "Qwen/Qwen2.5-0.5B"
+        tokenizer = get_tokenizer({"name": model_name})
+
+        lm_config["model_name"] = model_name
+        lm_config["tokenizer"]["name"] = model_name
+
+        vllm_config["model_name"] = model_name
+        vllm_config["tokenizer"]["name"] = model_name
+
+    # Create Policy and VllmGeneration
+    lm_policy = Policy(policy_cluster_separate, lm_config, tokenizer)
     vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
 
     # initialize collective communication for update weights
-    ip, port = ray.get(_get_node_ip_and_free_port.remote())
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=2)
+    ip, port = policy_cluster_separate.get_master_address_and_port()
+    world_size = tensor_parallel_size + 1
+    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
+    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1247,9 +1264,7 @@ async def test_vllm_refit_non_collocated_update_weights(
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
-    refit_policy_generation(
-        lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
-    )
+    refit_policy_generation(lm_policy, vllm_generation, False)
 
     # test generate
     if async_engine:
@@ -1258,12 +1273,29 @@ async def test_vllm_refit_non_collocated_update_weights(
         )
     else:
         outputs = vllm_generation.generate(test_input_data, greedy=True)
+
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    assert generated_texts == [
-        "Hello, my name is Lina. I'm",
-        "The capital of France is Paris. The capital of",
-    ], "Output should be the same as the expected output"
+
+    if policy_type == "dtensor":
+        expected_texts = [
+            "Hello, my name is Lina. I'm",
+            "The capital of France is Paris. The capital of",
+        ]
+    else:
+        if async_engine:
+            expected_texts = [
+                "Hello, my name is John. I am a",
+                "The capital of France is Paris. It is the",
+            ]
+        else:
+            expected_texts = [
+                "Hello, my name is John and I am a",
+                "The capital of France is Paris. It is the",
+            ]
+    assert generated_texts == expected_texts, (
+        "Output should be the same as the expected output"
+    )
 
     # Clean up
     vllm_generation.shutdown()
