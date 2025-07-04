@@ -54,7 +54,7 @@ simple_policy_config = {
         },
     },
     "dtensor_cfg": {
-        "enabled": False,
+        "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
         "activation_checkpointing": False,
