@@ -24,11 +24,19 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
-    elif "qwen" in hf_model_name.lower():
+    elif "qwen2" in hf_model_name.lower():
         from nemo.tron.converter.qwen import HFQwen2Importer
 
         print(f"Importing model {hf_model_name} to {output_path}...")
         importer = HFQwen2Importer(
+            hf_model_name,
+            output_path=output_path,
+        )
+    elif "qwen3" in hf_model_name.lower():
+        from nemo.tron.converter.qwen import HFQwen3Importer
+
+        print(f"Importing model {hf_model_name} to {output_path}...")
+        importer = HFQwen3Importer(
             hf_model_name,
             output_path=output_path,
         )
