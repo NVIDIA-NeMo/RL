@@ -142,12 +142,12 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
         # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
-        if (
-            "generation" in config
-            and config["generation"] is not None
-            and not config["generation"]["colocated"]["enabled"]
-        ):
+        if not self.is_generation_colocated:
             os.environ["NCCL_SHM_DISABLE"] = "1"
             os.environ["NCCL_P2P_DISABLE"] = "1"
 
@@ -877,6 +877,26 @@ class DTensorPolicyWorker:
         return get_device_uuid(device_idx)
 
     @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        state_dict = self.model.state_dict()
+
+        if self.is_generation_colocated:
+            # Collect info for streaming multiple tensors
+            self.refit_param_info = []
+            for name, tensor in self.model.state_dict():
+                # dtensor's numel will return complete tensor instead of only local tensor
+                size_in_bytes = tensor.element_size() * tensor.numel()
+                self.refit_param_info.append((name, size_in_bytes))
+
+        else:
+            # Collect info for collective communication
+            state_dict_info = {}
+            for name, tensor in state_dict.items():
+                state_dict_info[name] = (tensor.shape, self.dtype)
+
+            return state_dict_info
+
+    @torch.no_grad()
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare the weights for IPC.
 
@@ -896,13 +916,6 @@ class DTensorPolicyWorker:
             self.model.state_dict()
         )
 
-        # Collect info for streaming multiple tensors
-        state_dict_info = []
-        for name, tensor in self._held_sharded_state_dict_reference.items():
-            # dtensor's numel will return complete tensor instead of only local tensor
-            size_in_bytes = tensor.element_size() * tensor.numel()
-            state_dict_info.append((name, size_in_bytes))
-
         # Collect current available memory for refit
         ## Get current device index from torch
         device_idx = torch.cuda.current_device()
@@ -911,7 +924,7 @@ class DTensorPolicyWorker:
         ## Use 80% of the free memory for safety
         total_available_bytes *= 0.8
 
-        return state_dict_info, total_available_bytes
+        return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
     def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
@@ -950,24 +963,6 @@ class DTensorPolicyWorker:
             all_handles.append((key, handle))
 
         return {device_uuid: all_handles}
-
-    @torch.no_grad()
-    def prepare_info_for_collective(self) -> dict[str, Any]:
-        """Prepare the info for collective communication.
-
-        Returns:
-            dict: A dictionary containing the info for collective communication.
-        """
-        # Get state_dict
-        self.model = self.move_to_cuda(self.model)
-        state_dict = self.model.state_dict()
-
-        # Collect info for collective communication
-        state_dict_info = {}
-        for name, tensor in state_dict.items():
-            state_dict_info[name] = (tensor.shape, self.dtype)
-
-        return state_dict_info
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:

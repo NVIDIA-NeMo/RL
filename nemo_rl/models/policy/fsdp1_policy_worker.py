@@ -820,6 +820,25 @@ class FSDP1PolicyWorker:
         return get_device_uuid(device_idx)
 
     @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        if not isinstance(self.model, FullyShardedDataParallel):
+            state_dict = self.model.state_dict()
+        else:
+            with FullyShardedDataParallel.state_dict_type(
+                self.model,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            ):
+                state_dict = self.model.state_dict()
+
+        # Collect info for streaming multiple tensors
+        self.refit_param_info = []
+        for name, tensor in state_dict.items():
+            # dtensor's numel will return complete tensor instead of only local tensor
+            size_in_bytes = tensor.element_size() * tensor.numel()
+            self.refit_param_info.append((name, size_in_bytes))
+
+    @torch.no_grad()
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare the weights for IPC.
 
@@ -847,13 +866,6 @@ class FSDP1PolicyWorker:
             ):
                 self._held_sharded_state_dict_reference = self.model.state_dict()
 
-        # Collect info for streaming multiple tensors
-        state_dict_info = []
-        for name, tensor in self._held_sharded_state_dict_reference.items():
-            # dtensor's numel will return complete tensor instead of only local tensor
-            size_in_bytes = tensor.element_size() * tensor.numel()
-            state_dict_info.append((name, size_in_bytes))
-
         # Collect current available memory for refit
         ## Get current device index from torch
         device_idx = torch.cuda.current_device()
@@ -862,7 +874,7 @@ class FSDP1PolicyWorker:
         ## Use 80% of the free memory for safety
         total_available_bytes *= 0.8
 
-        return state_dict_info, total_available_bytes
+        return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
     def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
