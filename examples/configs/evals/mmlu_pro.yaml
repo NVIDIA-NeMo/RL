@@ -1,0 +1,15 @@
+# GPQA evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  vllm_cfg:
+    max_model_len: 3072
+
+data:
+  prompt_file: "examples/prompts/mmlu_pro.txt"
+  dataset_name: "mmlu_pro"
+
+env:
+  math:
+    verifier_type: "english_multichoice"

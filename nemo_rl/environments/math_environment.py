@@ -101,7 +101,7 @@ class HFVerifyWorker:
 
 
 @ray.remote
-class MultichoiceVerifyWorker:
+class MultilingualMultichoiceVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
     ) -> list[float]:
@@ -133,6 +133,35 @@ class MultichoiceVerifyWorker:
         return results
 
 
+@ray.remote
+class EnglishMultichoiceVerifyWorker:
+    def verify(
+        self, pred_responses: list[str], ground_truths: list[str]
+    ) -> list[float]:
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            list[float]. The rewards for each predicted response.
+        """
+        results = []
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            ground_truth = answer_parsing.normalize_response(ground_truth)
+            response = answer_parsing.normalize_response(response)
+            extracted_answer = None
+            match = re.search("(?i)Answer\s*:[ \t]*([A-Z])", response)
+            if match:
+                extracted_answer = answer_parsing.normalize_extracted_answer(
+                    match.group(1)
+                )
+            score = 1.0 if extracted_answer == ground_truth else 0.0
+            results.append(score)
+        return results
+
+
 class MathEnvironmentMetadata(TypedDict):
     ground_truth: str
 
@@ -142,11 +171,11 @@ class MathEnvironment(EnvironmentInterface):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        worker_cls = (
-            MultichoiceVerifyWorker
-            if cfg.get("verifier_type", "math") == "multichoice"
-            else HFVerifyWorker
-        )
+        worker_cls = {
+            "math": HFVerifyWorker,
+            "english_multichoice": EnglishMultichoiceVerifyWorker,
+            "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
+        }[cfg.get("verifier_type", "math")]
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
