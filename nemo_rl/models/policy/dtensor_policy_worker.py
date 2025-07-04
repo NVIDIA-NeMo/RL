@@ -387,7 +387,7 @@ class DTensorPolicyWorker:
         from vllm.distributed.utils import StatelessProcessGroup
 
         # keep the same behavior as vllm
-        # see https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/env_override.py#L25
+        # see https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/env_override.py#L25
         if not os.path.exists("/dev/nvidia-caps-imex-channels"):
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
