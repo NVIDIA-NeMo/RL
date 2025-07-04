@@ -136,6 +136,7 @@ env:
     enable: false
     num_workers: 8
     timeout: 10
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
   llm_judge_async: # Configuration for the LlmJudgeAsyncEnvironment
     enable: false
     num_workers: 2 # Number of parallel judge workers

@@ -34,6 +34,9 @@ class CodeEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
     timeout: int = 10  # Timeout for the code execution
+    reasoning_split_word: Optional[
+        str
+    ]  # Configurable split word for response processing (default: "</think>")
 
 
 class CodeEnvironmentMetadata(TypedDict):
@@ -45,11 +48,13 @@ class CodeEnvironmentMetadata(TypedDict):
 class CodeVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
 
-    def __init__(self, verbose: bool = False):
-        logging.getLogger("code_verify").setLevel(
-            logging.INFO if verbose else logging.WARNING
-        )
+    def __init__(
+        self,
+        reasoning_split_word: Optional[str] = None,  # Configurable split word for response processing
+    ):
+        logging.getLogger("code_verify").setLevel(logging.INFO)
         self.verify_func = compute_score
+        self.reasoning_split_word = reasoning_split_word 
 
     def verify(
         self,
@@ -70,10 +75,11 @@ class CodeVerifyWorker:
         results = []
         for response, metadata_item in zip(pred_responses, metadata):
             try:
-                # No more output muting - let errors and debug info show!
-                final_response = response.split("</think>")[
-                    -1
-                ].strip()  # exclude <think> </think> tags
+                # Only split if reasoning_split_word is provided
+                if self.reasoning_split_word:
+                    final_response = response.split(self.reasoning_split_word)[
+                        -1
+                    ].lstrip()
                 code_str = extract_code(final_response)
 
                 ret_score, execution_metadata = self.verify_func(
@@ -100,7 +106,7 @@ class CodeEnvironment(EnvironmentInterface):
                     "py_executable": CodeVerifyWorker.DEFAULT_PY_EXECUTABLE,
                     "env_vars": {"OMP_NUM_THREADS": "1"},
                 }
-            ).remote()
+            ).remote(reasoning_split_word=cfg.get("reasoning_split_word"))
             for _ in range(self.num_workers)
         ]
 
