@@ -883,7 +883,7 @@ class DTensorPolicyWorker:
         if self.is_generation_colocated:
             # Collect info for streaming multiple tensors
             self.refit_param_info = []
-            for name, tensor in self.model.state_dict():
+            for name, tensor in state_dict.items():
                 # dtensor's numel will return complete tensor instead of only local tensor
                 size_in_bytes = tensor.element_size() * tensor.numel()
                 self.refit_param_info.append((name, size_in_bytes))

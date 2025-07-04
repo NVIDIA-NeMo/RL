@@ -920,6 +920,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     try:
         print(f"Creating HF policy for TP={tensor_parallel_size}...")
         lm_policy = Policy(cluster, hf_config, tokenizer)
+        lm_policy.prepare_refit_info()
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
