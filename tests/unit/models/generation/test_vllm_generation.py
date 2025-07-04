@@ -961,7 +961,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         grouped_param_keys = lm_policy.prepare_weights_for_ipc()
         for keys in grouped_param_keys:
             ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights(ipc_handles)
+            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
             assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
