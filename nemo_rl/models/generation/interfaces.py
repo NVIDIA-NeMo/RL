@@ -232,7 +232,7 @@ class GenerationInterface(ABC):
         """Prepare the info for refit."""
         raise NotImplementedError
 
-    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
