@@ -14,7 +14,7 @@
 
 """MMLU dataset and its variants."""
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from datasets import load_dataset
 
@@ -25,18 +25,41 @@ from nemo_rl.data.interfaces import TaskDataSpec
 class MMLUDataset:
     def __init__(
         self,
+        language: Literal[
+            "AR-XY",
+            "BN-BD",
+            "DE-DE",
+            "EN-US",
+            "ES-LA",
+            "FR-FR",
+            "HI-IN",
+            "ID-ID",
+            "IT-IT",
+            "JA-JP",
+            "KO-KR",
+            "PT-BR",
+            "ZH-CN",
+            "SW-KE",
+            "YO-NG",
+        ] = "EN-US",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
+        if language != "EN-US":
+            data_files = f"https://openaipublic.blob.core.windows.net/simple-evals/mmlu_{language}.csv"
+        else:
+            data_files = (
+                "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+            )
         ds = load_dataset(
             "csv",
-            data_files="https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv",
+            data_files=data_files,
             split="train",
         )
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
 
         self.task_spec = TaskDataSpec(
-            task_name="MMLU",
+            task_name=f"MMLU_{language}",
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
