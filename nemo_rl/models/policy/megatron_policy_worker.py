@@ -942,7 +942,7 @@ class MegatronPolicyWorker:
                     target=input_ids,
                     vocab_start_index=tp_rank * output_tensor.shape[-1],
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                    group=tp_grp,
+                    tp_group=tp_grp,
                     inference_only=True,
                 )
 
