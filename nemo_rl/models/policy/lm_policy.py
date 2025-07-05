@@ -293,7 +293,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Train the policy on a batch of data with a given loss function."""
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+
         # Shard and replicate the batch
+        allow_uneven_shards = False
+        total_batch_size = data.get_total_batch_size()
+        if total_batch_size % batch_size != 0:
+            batch_size = total_batch_size
+            allow_uneven_shards = True
+
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -303,11 +310,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=batch_size,
                 dynamic_batching_args=self.dynamic_batching_args,
+                allow_uneven_shards=allow_uneven_shards,
             )
         else:
             sharded_data = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
+                allow_uneven_shards=allow_uneven_shards,
             )
 
         # Train each shard in parallel
@@ -333,7 +342,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             },
         )
         results = self.worker_group.get_all_worker_results(futures)
-
         # Aggregate the results
         aggregated_results = {
             "loss": results[0]["global_loss"],

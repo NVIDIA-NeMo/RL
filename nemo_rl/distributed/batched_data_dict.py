@@ -171,8 +171,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         return chunked_batch
 
-    def reorder_data(self, reorded_indices: List[int]):
-        """Reorders the data along the batch dimension by the given indices."""
+    def get_total_batch_size(self: Self) -> int:
+        """Get the total batch size of the batch.
+
+        Returns:
+            int: The total batch size.
+        """
         batch_sizes = set()
         for val in self.data.values():
             if isinstance(val, torch.Tensor):
@@ -181,9 +185,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 batch_sizes.add(len(val))
 
         assert len(batch_sizes) == 1, (
-            "Batch sizes are not the same across the rollout batch"
+            "Batch sizes are not the same across all the entries in the batch"
         )
-        total_batch_size = batch_sizes.pop()
+        return batch_sizes.pop()
+
+    def reorder_data(self, reorded_indices: List[int]):
+        """Reorders the data along the batch dimension by the given indices."""
+        total_batch_size = self.get_total_batch_size()
 
         indices = range(total_batch_size)
         reordered = sorted(zip(reorded_indices, indices), key=lambda pair: pair[0])
@@ -265,23 +273,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         >>> # This is incompatible with the batch_size argument
         ```
         """
-        if allow_uneven_shards:
-            assert batch_size is None, (
-                "batch_size must be None if allow_uneven_shards is True"
-            )
-
         # Get the total batch size
-        batch_sizes = set()
-        for val in self.data.values():
-            if isinstance(val, torch.Tensor):
-                batch_sizes.add(val.size(0))
-            else:
-                batch_sizes.add(len(val))
-
-        assert len(batch_sizes) == 1, (
-            "Batch sizes are not the same across the rollout batch"
-        )
-        total_batch_size = batch_sizes.pop()
+        total_batch_size = self.get_total_batch_size()
         if batch_size is None:
             batch_size = total_batch_size
 
