@@ -468,7 +468,6 @@ class MegatronPolicyWorker:
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
 
-
         checkpoint_config = CheckpointConfig(
             save_interval=100,
             save=weights_path,
