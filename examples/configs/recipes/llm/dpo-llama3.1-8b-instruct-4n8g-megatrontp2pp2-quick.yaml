@@ -55,7 +55,9 @@ policy:
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: true
-
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6 #4.0e-5

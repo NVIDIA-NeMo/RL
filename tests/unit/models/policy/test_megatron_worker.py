@@ -79,6 +79,7 @@ def create_megatron_test_config(
             "context_parallel_size": 1,
             "pipeline_dtype": precision,
             "sequence_parallel": sequence_parallel,
+            "apply_rope_fusion": True,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
