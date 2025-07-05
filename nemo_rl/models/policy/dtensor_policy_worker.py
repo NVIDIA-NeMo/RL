@@ -954,7 +954,10 @@ class DTensorPolicyWorker:
             handle = reduce_tensor(p.detach())
             all_handles.append((key, handle))
 
-        return {device_uuid: all_handles}
+        # (pack_tensor_for_ipc: bool, handles: list)
+        serialized = (False, all_handles)
+
+        return {device_uuid: serialized}
 
     @torch.no_grad()
     def prepare_info_for_collective(self) -> dict[str, Any]:
