@@ -160,89 +160,77 @@ jobs:
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}
 
-  tests:
-    name: Tests
+  doc-tests:
+    name: Doc Tests
     needs: [build-container, pre-flight]
     uses: ./.github/workflows/_run_test.yml
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
+    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     with:
       RUNNER: self-hosted-azure
       TIMEOUT: 180
-      UNIT_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term --cov-report=json
-        else
-          echo Skipping unit tests for docs-only level
-        fi
-      DOC_TEST_SCRIPT: |
+      TEST_SCRIPT: |
         cd /opt/nemo-rl/docs
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(docs|L0|L1|L2)$ ]]; then
-          uv run --no-sync sphinx-build -b doctest . _build/doctest
-        else
-          echo Skipping doc tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      FUNCTIONAL_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L1|L2)$ ]]; then
-          time uv run --no-sync bash ./tests/functional/sft.sh
-          time uv run --no-sync bash ./tests/functional/grpo.sh
-          time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
-          time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-          time uv run --no-sync bash ./tests/functional/dpo.sh
-          time uv run --no-sync bash ./tests/functional/eval.sh
-          time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
-        else
-          echo Skipping functional tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      # TODO: enable once we have convergence tests in CI
-      #CONVERGENCE_TEST_SCRIPT: |
-      #  cd /opt/nemo-rl
-      #  if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L2)$  ]]; then
-      #    echo "Running convergence tests"
-      #    # Add your convergence test commands here
-      #    # uv run --no-sync bash ./tests/convergence/test.sh
-      #  else
-      #    echo "Skipping convergence tests for level ${{ needs.pre-flight.outputs.test_level }}"
-      #  fi
-      AFTER_SCRIPT: |
-        cd /opt/nemo-rl
-        cat <<EOF | tee -a $GITHUB_STEP_SUMMARY
-        # Test Summary for level: ${{ needs.pre-flight.outputs.test_level }}
+        uv run --no-sync sphinx-build -b doctest . _build/doctest
 
-        ## Unit test results
-        \`\`\`json
-        $(if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then cat tests/unit/unit_results.json || echo "n/a"; else echo "Not run"; fi)
-        \`\`\`
-
-        ## Test Level: ${{ needs.pre-flight.outputs.test_level }}
-        EOF
+  unit-tests:
+    name: Unit Tests
+    needs: [build-container, pre-flight]
+    uses: ./.github/workflows/_run_test.yml
+    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     secrets:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    with:
+      RUNNER: self-hosted-azure
+      TIMEOUT: 180
+      TEST_SCRIPT: |
+        cd /opt/nemo-rl
+        uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term --cov-report=json --durations=30 --durations-min=0.1
 
-  coverage:
-    name: Upload coverage to Codecov
-    needs: [tests]
-    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  functional-tests:
+    name: Functional Tests
+    needs: [build-container, pre-flight, unit-tests]
+    uses: ./.github/workflows/_run_test.yml
+    if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    with:
+      RUNNER: self-hosted-azure
+      TIMEOUT: 180
+      TEST_SCRIPT: |
+        cd /opt/nemo-rl
+        time uv run --no-sync bash ./tests/functional/sft.sh
+        time uv run --no-sync bash ./tests/functional/grpo.sh
+        time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
+        time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
+        time uv run --no-sync bash ./tests/functional/dpo.sh
+        time uv run --no-sync bash ./tests/functional/eval.sh
+        time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 
-      - name: Download coverage artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: unit-test-coverage-report
-          path: .
+  # coverage:
+  #   name: Upload coverage to Codecov
+  #   needs: [tests]
+  #   if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
 
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.json
-          flags: unit-tests
-          verbose: true
-          override_branch: ${{ github.event_name == 'merge_group' && 'main' || '' }}
+  #     - name: Download coverage artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: unit-test-coverage-report
+  #         path: .
+
+  #     - name: Upload to Codecov
+  #       uses: codecov/codecov-action@v4
+  #       with:
+  #         token: ${{ secrets.CODECOV_TOKEN }}
+  #         file: ./coverage.json
+  #         flags: unit-tests
+  #         verbose: true
+  #         override_branch: ${{ github.event_name == 'merge_group' && 'main' || '' }}
 
   CI_QA_Gate:
     name: CI quality check
@@ -252,7 +240,9 @@ jobs:
       - pre-flight
       - lint-check
       - sphinx-build
-      - tests
+      - doc-tests
+      - unit-tests
+      - functional-tests
     steps:
       - name: main
         env:
@@ -266,7 +256,13 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success' &&
+                  (
+                    (
+                      (needs.doc-tests.result == 'skipped' || needs.doc-tests.result == 'success') &&
+                      (needs.unit-tests.result == 'skipped' || needs.unit-tests.result == 'success') &&
+                      (needs.functional-tests.result == 'skpped' || needs.functional-tests.result == 'success')
+                    )
+                  ) &&
                   (needs.mypy-check.result == 'success' || true)
                 )
               )

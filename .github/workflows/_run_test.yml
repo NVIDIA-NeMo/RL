@@ -25,17 +25,9 @@ on:
         description: Max runtime of test in minutes
         required: false
         default: 10
-      UNIT_TEST_SCRIPT:
+      TEST_SCRIPT:
         type: string
-        description: Unit test script to execute
-        required: true
-      DOC_TEST_SCRIPT:
-        type: string
-        description: Doc test script to execute
-        required: true
-      FUNCTIONAL_TEST_SCRIPT:
-        type: string
-        description: Functional test script to execute
+        description: Test script to execute
         required: true
       AFTER_SCRIPT:
         type: string
@@ -95,29 +87,13 @@ jobs:
             nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }}"
             echo "DOCKER_RUN_CMD=$DOCKER_RUN_CMD" >> $GITHUB_ENV
 
-        - name: Run unit tests
+        - name: Run tests
           run: |
             $DOCKER_RUN_CMD bash -eux -o pipefail -c "
             git config --global --add safe.directory /opt/nemo-rl
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
             umask 000
-            ${{ inputs.UNIT_TEST_SCRIPT }}"
-
-        - name: Run doc tests
-          run: |
-            $DOCKER_RUN_CMD bash -eux -o pipefail -c "
-            git config --global --add safe.directory /opt/nemo-rl
-            # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
-            umask 000
-            ${{ inputs.DOC_TEST_SCRIPT }}"
-
-        - name: Run functional tests
-          run: |
-            $DOCKER_RUN_CMD bash -eux -o pipefail -c "
-            git config --global --add safe.directory /opt/nemo-rl
-            # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
-            umask 000
-            ${{ inputs.FUNCTIONAL_TEST_SCRIPT }}"
+            ${{ inputs.TEST_SCRIPT }}"
 
         - name: Upload coverage report
           uses: actions/upload-artifact@v4
