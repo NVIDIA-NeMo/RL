@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import logging
 import os
 import pprint
 from functools import partial
@@ -89,36 +90,118 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def rm_preprocessor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary for RM training."""
+    messages_chosen = datum_dict["prompt"] + [
+        {"role": "assistant", "content": datum_dict["chosen_response"]}
+    ]
+    messages_rejected = datum_dict["prompt"] + [
+        {"role": "assistant", "content": datum_dict["rejected_response"]}
+    ]
+
+    message_log_chosen = get_formatted_message_log(
+        messages_chosen, tokenizer, task_data_spec
+    )
+    message_log_rejected = get_formatted_message_log(
+        messages_rejected, tokenizer, task_data_spec
+    )
+
+    length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+    length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+    loss_multiplier = 1.0
+    if max(length_chosen, length_rejected) > max_seq_length:
+        # make smaller and mask out
+        logging.warning(
+            f"Truncating chosen and rejected messages to {max_seq_length} tokens"
+        )
+        for message in message_log_chosen:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_chosen))
+            ]
+        for message in message_log_rejected:
+            message["token_ids"] = message["token_ids"][
+                : min(4, max_seq_length // len(message_log_rejected))
+            ]
+        loss_multiplier = 0.0
+
+        length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
+        length_rejected = sum(len(m["token_ids"]) for m in message_log_rejected)
+
+        # safeguard against edge case where there are too many turns to fit within the max length
+        assert max(length_chosen, length_rejected) <= max_seq_length
+
+    output = {
+        "message_log_chosen": message_log_chosen,
+        "length_chosen": length_chosen,
+        "message_log_rejected": message_log_rejected,
+        "length_rejected": length_rejected,
+        "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, model_type: str):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
-    if data_cls == "open_assistant":
-        data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
-    elif data_cls == "squad":
-        data = hf_datasets.SquadDataset()
-    elif data_cls == "prompt_response_dataset":
-        data = hf_datasets.PromptResponseDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["input_key"],
-            data_config["output_key"],
+
+    if model_type == "lm":
+        data_preprocessor = partial(
+            sft_preprocessor,
+            add_bos=data_config["add_bos"],
+            add_eos=data_config["add_eos"],
+            add_generation_prompt=data_config["add_generation_prompt"],
         )
-    elif data_cls == "openmathinstruct2":
-        data = hf_datasets.OpenMathInstruct2Dataset(
-            split=data_config["split"],
-            output_key=data_config["output_key"],
-            prompt_file=data_config["prompt_file"],
-        )
-    elif data_cls == "openai_format":
-        data = hf_datasets.OpenAIFormatDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["chat_key"],
-            data_config["system_key"],
-            data_config["system_prompt"],
-        )
+
+        if data_cls == "open_assistant":
+            data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
+        elif data_cls == "squad":
+            data = hf_datasets.SquadDataset()
+        elif data_cls == "prompt_response_dataset":
+            data = hf_datasets.PromptResponseDataset(
+                data_config["train_data_path"],
+                data_config["val_data_path"],
+                data_config["input_key"],
+                data_config["output_key"],
+            )
+        elif data_cls == "openmathinstruct2":
+            data = hf_datasets.OpenMathInstruct2Dataset(
+                split=data_config["split"],
+                output_key=data_config["output_key"],
+                prompt_file=data_config["prompt_file"],
+            )
+        elif data_cls == "openai_format":
+            data = hf_datasets.OpenAIFormatDataset(
+                data_config["train_data_path"],
+                data_config["val_data_path"],
+                data_config["chat_key"],
+                data_config["system_key"],
+                data_config["system_prompt"],
+            )
+        else:
+            raise ValueError(
+                f"Unknown dataset class: {data_cls} for model_type: {model_type}"
+            )
+    elif model_type == "reward":
+        data_preprocessor = rm_preprocessor
+
+        if data_cls == "HelpSteer3":
+            data = hf_datasets.HelpSteer3Dataset()
+        else:
+            raise ValueError(
+                f"Unknown dataset class: {data_cls} for model_type: {model_type}"
+            )
     else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
+        raise ValueError(f"Unknown model type: {model_type}")
+
     print(
         f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
     )
@@ -131,12 +214,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         train_dataset,
         tokenizer,
         sft_task_spec,
-        partial(
-            sft_preprocessor,
-            add_bos=data_config["add_bos"],
-            add_eos=data_config["add_eos"],
-            add_generation_prompt=data_config["add_generation_prompt"],
-        ),
+        data_preprocessor,
         max_seq_length=data_config["max_input_seq_length"],
     )
 
@@ -144,12 +222,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         val_dataset,
         tokenizer,
         sft_task_spec,
-        partial(
-            sft_preprocessor,
-            add_bos=data_config.get("add_bos", True),
-            add_eos=data_config.get("add_eos", True),
-            add_generation_prompt=data_config["add_generation_prompt"],
-        ),
+        data_preprocessor,
         max_seq_length=data_config["max_input_seq_length"],
     )
 
@@ -178,6 +251,8 @@ def main():
     print("Final config:")
     pprint.pprint(config)
 
+    model_type = "reward" if "reward_model_type" in config["policy"] else "lm"
+
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
     print(f"📊 Using log directory: {config['logger']['log_dir']}")
     if config["checkpointing"]["enabled"]:
@@ -195,7 +270,7 @@ def main():
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    ) = setup_data(tokenizer, config["data"], model_type)
 
     (
         policy,

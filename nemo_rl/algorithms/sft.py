@@ -22,11 +22,17 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss_functions import (
+    LossFunction,
     NLLLoss,
+    PreferenceLoss,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    preference_collate_fn,
+    rl_collate_fn,
+)
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
@@ -80,6 +86,18 @@ class MasterConfig(TypedDict):
     checkpointing: CheckpointingConfig
 
 
+class SFTValMetrics(TypedDict):
+    val_loss: float
+
+
+class RMValMetrics(TypedDict):
+    val_loss: float
+    accuracy: float
+    rewards_chosen_mean: float
+    rewards_rejected_mean: float
+    num_valid_samples: float
+
+
 # =======================================================
 # Setup & Initialization
 # =======================================================
@@ -93,7 +111,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
-    NLLLoss,
+    LossFunction,
     MasterConfig,
     Logger,
     TaskDataSpec,
@@ -104,6 +122,19 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
+    model_type = "reward" if "reward_model_type" in master_config["policy"] else "lm"
+
+    if model_type == "lm":
+        collate_fn = rl_collate_fn
+        loss_fn_class = NLLLoss
+    elif model_type == "reward":
+        collate_fn = preference_collate_fn
+        loss_fn_class = PreferenceLoss
+    else:
+        raise NotImplementedError(
+            f"Model type {model_type} not implemented for SFT training."
+        )
+
     set_seed(master_config["sft"]["seed"])
 
     # Extract individual configs for easier access
@@ -147,7 +178,7 @@ def setup(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
         shuffle=True,
-        collate_fn=rl_collate_fn,
+        collate_fn=collate_fn,
         drop_last=True,
     )
 
@@ -161,7 +192,7 @@ def setup(
         val_dataset,
         batch_size=sft_config["val_global_batch_size"],
         shuffle=False,
-        collate_fn=rl_collate_fn,
+        collate_fn=collate_fn,
         drop_last=True,
     )
 
@@ -196,7 +227,7 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
-    loss_fn = NLLLoss()
+    loss_fn = loss_fn_class()
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -230,6 +261,7 @@ def validate(
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
+    model_type: str,
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -244,7 +276,8 @@ def validate(
         # Show a progress indicator for validation
         # val_total = len(val_dataloader)
 
-        val_metrics = {"val_loss": 0.0}
+        list_of_val_metrics = []
+
         num_valid_batches = 0
 
         policy.prepare_for_training()
@@ -273,13 +306,29 @@ def validate(
             )
 
             ## just run model fwd
-            val_results = policy.train(
-                val_data,
-                loss_fn,
-                eval_mode=True,
-                gbs=val_batch_size,
-                mbs=val_mbs,
-            )
+
+            if model_type == "lm":
+                val_results = policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    gbs=val_batch_size,
+                    mbs=val_mbs,
+                )
+            elif model_type == "reward":
+                val_results = policy.train(
+                    val_data,
+                    loss_fn,
+                    eval_mode=True,
+                    ## NOTE: we double the batch size here because each preference example corresponds to a pair of
+                    ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
+                    gbs=val_batch_size * 2,
+                    mbs=val_mbs * 2,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Model type {model_type} not implemented for SFT training."
+                )
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
@@ -287,19 +336,92 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                val_metrics["val_loss"] += float(val_results["loss"])
+                if model_type == "lm":
+                    list_of_val_metrics.append(
+                        SFTValMetrics(val_loss=float(val_results["loss"]))
+                    )
+                elif model_type == "reward":
+                    list_of_val_metrics.append(
+                        RMValMetrics(
+                            val_loss=sum(val_results["all_mb_metrics"]["loss"]),
+                            accuracy=sum(val_results["all_mb_metrics"]["accuracy"]),
+                            rewards_chosen_mean=sum(
+                                val_results["all_mb_metrics"]["rewards_chosen_mean"]
+                            ),
+                            rewards_rejected_mean=sum(
+                                val_results["all_mb_metrics"]["rewards_rejected_mean"]
+                            ),
+                            num_valid_samples=sum(
+                                val_results["all_mb_metrics"]["num_valid_samples"]
+                            ),
+                        )
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Model type {model_type} not implemented for SFT training."
+                    )
+
                 num_valid_batches += 1
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
         if num_valid_batches > 0:
-            val_metrics["val_loss"] /= num_valid_batches
+            if model_type == "lm":
+                val_metrics = SFTValMetrics(
+                    val_loss=sum([m["val_loss"] for m in list_of_val_metrics])
+                )
+                val_metrics["val_loss"] /= num_valid_batches
+            elif model_type == "reward":
+                sum_num_valid_samples = sum(
+                    [m["num_valid_samples"] for m in list_of_val_metrics]
+                )
+                val_metrics = RMValMetrics(
+                    val_loss=sum(
+                        [
+                            m["val_loss"] * m["num_valid_samples"]
+                            for m in list_of_val_metrics
+                        ]
+                    )
+                    / sum_num_valid_samples,
+                    accuracy=sum(
+                        [
+                            m["accuracy"] * m["num_valid_samples"]
+                            for m in list_of_val_metrics
+                        ]
+                    )
+                    / sum_num_valid_samples,
+                    rewards_chosen_mean=sum(
+                        [
+                            m["rewards_chosen_mean"] * m["num_valid_samples"]
+                            for m in list_of_val_metrics
+                        ]
+                    )
+                    / sum_num_valid_samples,
+                    rewards_rejected_mean=sum(
+                        [
+                            m["rewards_rejected_mean"] * m["num_valid_samples"]
+                            for m in list_of_val_metrics
+                        ]
+                    )
+                    / sum_num_valid_samples,
+                    num_valid_samples=sum_num_valid_samples,
+                )
         else:
             warnings.warn(
                 "No validation metrics were collected."
                 " This is likely because there were no valid samples in the validation set."
             )
+            if model_type == "lm":
+                val_metrics = SFTValMetrics(val_loss=0.0)
+            elif model_type == "reward":
+                val_metrics = RMValMetrics(
+                    val_loss=0.0,
+                    accuracy=0.0,
+                    rewards_chosen_mean=0.0,
+                    rewards_rejected_mean=0.0,
+                    num_valid_samples=0.0,
+                )
 
         # Calculate validation metrics
         policy.prepare_for_training()
@@ -312,6 +434,18 @@ def validate(
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
+
+        if model_type == "reward":
+            print(f"    • Validation accuracy: {val_metrics['accuracy']:.4f}")
+            print(
+                f"    • Validation rewards chosen mean: {val_metrics['rewards_chosen_mean']:.4f}"
+            )
+            print(
+                f"    • Validation rewards rejected mean: {val_metrics['rewards_rejected_mean']:.4f}"
+            )
+            print(
+                f"    • Validation num valid samples: {val_metrics['num_valid_samples']:.0f}"
+            )
 
         # Print timing information
         print("\n  ⏱️  Validation Timing:")
@@ -355,6 +489,8 @@ def sft_train(
     val_at_start = sft_config["val_at_start"]
     max_num_epochs = sft_config["max_num_epochs"]
 
+    model_type = "reward" if "reward_model_type" in master_config["policy"] else "lm"
+
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...")
@@ -369,6 +505,7 @@ def sft_train(
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
+            model_type=model_type,
         )
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -376,15 +513,15 @@ def sft_train(
 
     policy.prepare_for_training()
 
-    while (
-        current_epoch < max_num_epochs
-        and total_steps < master_config["sft"]["max_num_steps"]
+    while current_epoch < max_num_epochs and (
+        master_config["sft"]["max_num_steps"] == -1
+        or total_steps < master_config["sft"]["max_num_steps"]
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'] if master_config['sft']['max_num_steps'] != -1 else len(train_dataloader))} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -417,11 +554,28 @@ def sft_train(
                     )
 
                 print("▶ Taking a training step...")
-                train_results = policy.train(train_data, loss_fn)
 
-                is_last_step = total_steps + 1 >= master_config["sft"][
-                    "max_num_steps"
-                ] or (
+                if model_type == "lm":
+                    train_results = policy.train(train_data, loss_fn)
+                elif model_type == "reward":
+                    train_results = policy.train(
+                        train_data,
+                        loss_fn,
+                        eval_mode=False,
+                        ## NOTE: we double the batch size here because each preference example corresponds to a pair of
+                        ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
+                        gbs=master_config["policy"]["train_global_batch_size"] * 2,
+                        mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"Model type {model_type} not implemented for SFT training."
+                    )
+
+                is_last_step = (
+                    master_config["sft"]["max_num_steps"] != -1
+                    and total_steps + 1 >= master_config["sft"]["max_num_steps"]
+                ) or (
                     current_epoch + 1 == max_num_epochs
                     and current_step + 1 == len(train_dataloader)
                 )
@@ -441,6 +595,7 @@ def sft_train(
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],
+                        model_type=model_type,
                     )
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
@@ -490,6 +645,7 @@ def sft_train(
                 "loss": train_results["loss"].numpy(),
                 "grad_norm": train_results["grad_norm"].numpy(),
             }
+
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
                 if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
@@ -500,6 +656,19 @@ def sft_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+
+            if model_type == "reward":
+                print(f"  • Accuracy: {float(metrics['accuracy']):.4f}")
+                print(
+                    f"  • Rewards chosen mean: {float(metrics['rewards_chosen_mean']):.4f}"
+                )
+                print(
+                    f"  • Rewards rejected mean: {float(metrics['rewards_rejected_mean']):.4f}"
+                )
+                print(
+                    f"  • Num valid samples: {float(metrics['num_valid_samples']):.0f}"
+                )
+
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
@@ -520,7 +689,10 @@ def sft_train(
             current_step += 1
             total_steps += 1
 
-            if total_steps >= master_config["sft"]["max_num_steps"]:
+            if (
+                master_config["sft"]["max_num_steps"] != -1
+                and total_steps >= master_config["sft"]["max_num_steps"]
+            ):
                 return
 
         current_epoch += 1

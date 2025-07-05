@@ -35,7 +35,12 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
@@ -164,6 +169,8 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
+        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -175,15 +182,40 @@ class DTensorPolicyWorker:
             ),  # due to https://github.com/huggingface/transformers/issues/38002
         )
 
+        if "reward_model_type" in self.cfg:
+            if self.cfg["reward_model_type"] == "bradley_terry":
+                model_class = AutoModelForSequenceClassification
+                if model_config.num_labels != 1:
+                    # For Bradley-Terry reward models, the linear head has a single output.
+                    # In the transformers library, the default setting for model_config.num_labels is 2
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
+                    # Since num_labels is used as the out_features for the linear head
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
+                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
+                    # from the model checkpoint and are instead initialized using model_config.initializer_range
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
+                    print(
+                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                        "for the linear head of Bradley-Terry reward models."
+                    )
+                    model_config.num_labels = 1
+            else:
+                raise ValueError(
+                    f"Unknown reward model type: {self.cfg['reward_model_type']}"
+                )
+        else:
+            model_class = AutoModelForCausalLM
+
         full_state_dict = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_class.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
                 config=model_config,
             )
+
             full_state_dict = model.state_dict()
             del model
 
@@ -192,9 +224,19 @@ class DTensorPolicyWorker:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_config(
+            self.model = model_class.from_config(
                 model_config,
             )
+
+        if self.model.config.pad_token_id is None:
+            if isinstance(self.model.config.eos_token_id, int):
+                self.model.config.pad_token_id = self.model.config.eos_token_id
+            elif isinstance(self.model.config.eos_token_id, list):
+                self.model.config.pad_token_id = self.model.config.eos_token_id[0]
+            else:
+                raise ValueError(
+                    f"Unknown eos_token_id type: {type(self.model.config.eos_token_id)}"
+                )
 
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
