@@ -265,17 +265,15 @@ def policy_cluster_separate():
         print(f"Error during policy_cluster_separate shutdown: {e}")
 
 
-@pytest.fixture(scope="function")
-def generation_cluster_separate():
-    """Create a virtual cluster for the VllmGeneration policy, using 1 GPU."""
-    cluster = _create_ray_virtual_cluster_for_test(
-        "vllm-test-generation-cluster-separate"
+def get_generation_cluster_separate(num_gpus_per_node: int = 1) -> RayVirtualCluster:
+    """Create a virtual cluster for the VllmGeneration policy, using num_gpus_per_node GPU."""
+    return RayVirtualCluster(
+        bundle_ct_per_node_list=[num_gpus_per_node],
+        use_gpus=True,
+        max_colocated_worker_groups=1,
+        num_gpus_per_node=num_gpus_per_node,
+        name="vllm-test-generation-cluster-separate",
     )
-    yield cluster
-    try:
-        cluster.shutdown()
-    except Exception as e:
-        print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
 @pytest.fixture(scope="function")
@@ -1178,13 +1176,22 @@ def test_vllm_non_divisible_batch_handling(policy):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 async def test_vllm_refit_non_collocated_update_weights(
     policy_cluster_separate,
-    generation_cluster_separate,
     tokenizer,
     test_input_data,
     async_engine,
+    tensor_parallel_size,
 ):
+    # Skip tensor_parallel_size == 2 until we have resources in CI
+    if tensor_parallel_size == 2:
+        pytest.skip(
+            "Test requires at least three GPUs to run with tensor_parallel_size == 2 on separate clusters."
+        )
+
+    generation_cluster_separate = get_generation_cluster_separate(tensor_parallel_size)
+
     if (
         policy_cluster_separate.num_gpus_per_node < 1
         or generation_cluster_separate.num_gpus_per_node < 1
@@ -1195,7 +1202,6 @@ async def test_vllm_refit_non_collocated_update_weights(
 
     # Create Policy on its own cluster
     hf_config = get_basic_hf_test_config(enable_dtensor=True)
-    hf_config["dtensor_cfg"]["tensor_parallel_size"] = 1
     hf_config["generation"]["colocated"]["enabled"] = False
     lm_policy = Policy(policy_cluster_separate, hf_config, tokenizer)
 
@@ -1203,7 +1209,7 @@ async def test_vllm_refit_non_collocated_update_weights(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
-    vllm_config["vllm_cfg"]["tensor_parallel_size"] = 1
+    vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
     vllm_config["colocated"]["enabled"] = False
     vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
 
@@ -1235,6 +1241,10 @@ async def test_vllm_refit_non_collocated_update_weights(
     # Clean up
     vllm_generation.shutdown()
     lm_policy.shutdown()
+    try:
+        generation_cluster_separate.shutdown()
+    except Exception as e:
+        print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
 @pytest.mark.timeout(210)

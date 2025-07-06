@@ -317,6 +317,7 @@ class RayWorkerGroup:
         name_prefix: str = "",
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
+        env_vars: dict[str, str] = {},
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -391,7 +392,7 @@ class RayWorkerGroup:
 
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
-            remote_worker_builder, bundle_indices_list
+            remote_worker_builder, bundle_indices_list, env_vars=env_vars
         )
 
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
@@ -407,6 +408,7 @@ class RayWorkerGroup:
         self,
         remote_worker_builder: RayWorkerBuilder,
         bundle_indices_list: list[tuple[int, list[int]]],
+        env_vars: dict[str, str] = {},
     ) -> None:
         """Create workers based on explicit bundle indices for tied worker groups.
 
@@ -421,6 +423,10 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
+        # Update env_vars with the current environment variables
+        env_vars.update(dict(os.environ))
+
+        # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
             remote_worker_builder.ray_actor_class_fqn
         )
@@ -459,8 +465,8 @@ class RayWorkerGroup:
 
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
                 # Set up basic distributed environment variables
-                env_vars = dict(os.environ)
-                env_vars.update(
+                worker_env_vars = deepcopy(env_vars)
+                worker_env_vars.update(
                     {
                         "RANK": str(global_rank),
                         "LOCAL_RANK": str(bundle_idx),
@@ -470,7 +476,7 @@ class RayWorkerGroup:
                         "NODE_RANK": str(pg_idx),
                     }
                 )
-                env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+                worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
                 # Only the first worker in each group gets bundle_indices
                 # This ensures only one worker per group is the model owner
@@ -494,7 +500,10 @@ class RayWorkerGroup:
                 )
 
                 # Pass these options to the remote_worker_builder
-                runtime_env = {"env_vars": env_vars, "py_executable": py_executable}
+                runtime_env = {
+                    "env_vars": worker_env_vars,
+                    "py_executable": py_executable,
+                }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
 

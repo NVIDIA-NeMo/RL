@@ -319,10 +319,6 @@ class VllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-        if not self.cfg["colocated"]["enabled"]:
-            os.environ["NCCL_SHM_DISABLE"] = "1"
-            os.environ["NCCL_P2P_DISABLE"] = "1"
-
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -1225,6 +1221,13 @@ class VllmGeneration(GenerationInterface):
             "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
         )
 
+        # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
+        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        env_vars = {}
+        if not self.cfg["colocated"]["enabled"]:
+            env_vars["NCCL_SHM_DISABLE"] = "1"
+            env_vars["NCCL_P2P_DISABLE"] = "1"
+
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
@@ -1236,6 +1239,7 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 bundle_indices_list=node_bundle_indices,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
         else:
             # Use standard worker group creation for non-parallel case
@@ -1245,6 +1249,7 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 workers_per_node=workers_per_node,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
 
         # Number of data parallel groups is the number of tied worker groups
