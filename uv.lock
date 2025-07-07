@@ -20,6 +20,10 @@ members = [
     "nemo-tron",
 ]
 
+[[manifest.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
 [[package]]
 name = "absl-py"
 version = "2.3.0"
@@ -1016,21 +1020,16 @@ wheels = [
 
 [[package]]
 name = "flash-attn"
-version = "2.8.0.post2"
-source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+version = "2.7.4.post1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "einops", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
-    { name = "torch", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", hash = "sha256:fc596b041e6d43cd00886a4715234accd75a8e93813c8ed0ad17b47466693610" },
-]
-
-[package.metadata]
-requires-dist = [
     { name = "einops" },
+    { name = "ninja" },
+    { name = "psutil" },
+    { name = "setuptools" },
     { name = "torch" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/11/34/9bf60e736ed7bbe15055ac2dab48ec67d9dbd088d2b4ae318fd77190ab4e/flash_attn-2.7.4.post1.tar.gz", hash = "sha256:f03485c9a49a4d68d0733acdcad80ab0e72afa025a777fdc2966ceccf9d51765", size = 5986610, upload-time = "2025-01-30T06:39:51.93Z" }
 
 [[package]]
 name = "flask"
@@ -2309,7 +2308,7 @@ dependencies = [
     { name = "colored" },
     { name = "datasets" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "python_full_version < '3.13' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'" },
+    { name = "flash-attn" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2379,7 +2378,7 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'linux'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", specifier = "==2.7.4.post1" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
