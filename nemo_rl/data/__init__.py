@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, TypedDict
+from typing import NotRequired, TypedDict
 
 
 class DataConfig(TypedDict):
     max_input_seq_length: int
-    prompt_file: str
-    system_prompt_file: Optional[str]
+    prompt_file: NotRequired[str]
+    system_prompt_file: NotRequired[str]
     dataset_name: str
-    val_dataset_name: Optional[str]
-    add_bos: Optional[bool]
-    add_eos: Optional[bool]
-    input_key: Optional[str]
-    output_key: Optional[str]
+    val_dataset_name: NotRequired[str]
+    add_bos: NotRequired[bool]
+    add_eos: NotRequired[bool]
+    input_key: NotRequired[str]
+    output_key: NotRequired[str]
+    add_generation_prompt: NotRequired[bool]
+    add_system_prompt: NotRequired[bool]
+    split: NotRequired[str]
 
 
 class MathDataConfig(DataConfig):

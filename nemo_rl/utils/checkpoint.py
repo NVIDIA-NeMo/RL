@@ -22,7 +22,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
@@ -47,7 +47,7 @@ class CheckpointingConfig(TypedDict):
     metric_name: str
     higher_is_better: bool
     save_period: int
-    keep_top_k: Optional[int]
+    keep_top_k: NotRequired[int]
 
 
 class CheckpointManager:
