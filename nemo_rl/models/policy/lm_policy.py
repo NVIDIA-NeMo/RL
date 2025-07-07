@@ -62,14 +62,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        node_bundle_indices = None
-        self.cp_size = 1
+        worker_builder_cls: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
-
-        worker_builder_cls: str
-        training_backend = None
 
         megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
         if megatron_enable:
@@ -79,7 +75,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
-            training_backend = "megatron"
         else:
             assert config["dtensor_cfg"]["enabled"]
             worker_builder_cls = (
@@ -87,7 +82,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
-            training_backend = "hf"
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
