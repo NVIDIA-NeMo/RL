@@ -23,7 +23,10 @@ dependencies = [
     "setuptools",
     "torch==2.7.0",
     "triton",
-    "flash-attn ; sys_platform == 'linux' and python_version == '3.12' and platform_machine != 'arm64' and platform_machine != 'aarch64'",
+    # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
+    # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
+    # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
+    "flash-attn==2.7.4.post1",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     "transformers>=4.51.0",
@@ -115,7 +118,6 @@ torchvision = [
 triton = [
   { index = "pytorch-cu128" },
 ]
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine != 'arm64' and platform_machine != 'aarch64'" }
 
 [tool.uv.workspace]
 members = [
@@ -141,9 +143,9 @@ default-groups = ["dev", "build"]
 link-mode = "copy"
 
 # Needed when building from source
-#[[tool.uv.dependency-metadata]]
-#name = "flash-attn"
-#requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [tool.black]
 line-length = 120
@@ -190,3 +192,4 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
+

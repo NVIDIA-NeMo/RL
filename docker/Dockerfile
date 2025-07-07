@@ -62,8 +62,6 @@ ENV UV_LINK_MODE=copy
 # Create and activate virtual environment
 RUN <<"EOF" bash -exu
 uv venv ${UV_PROJECT_ENVIRONMENT}
-# Install setuptools since uv venv --seed may not install it
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -71,7 +69,7 @@ VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools  # setuptools for flash-attn
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools ninja torch==2.7.0 psutil --torch-backend=cu128  # setuptools, torch for flash-attn, ninja for flash-attn parallel build
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
@@ -99,3 +97,4 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # Copy in source and prefetch all virtual environments
 COPY . /opt/nemo-rl
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+

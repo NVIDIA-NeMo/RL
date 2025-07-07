@@ -95,7 +95,7 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "pip", "install", "setuptools"], env=env, check=True)
+    subprocess.run(["uv", "pip", "install", "setuptools", "ninja"], env=env, check=True)
     subprocess.run(["uv", "sync"], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
@@ -188,3 +188,4 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.util.remove_placement_group(pg)
     # Return mapping from node IP to venv python path
     return paths[0]
+
