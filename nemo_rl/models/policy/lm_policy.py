@@ -76,7 +76,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
         else:
-            assert config["dtensor_cfg"]["enabled"]
+            assert config["dtensor_cfg"]["enabled"], (
+                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+            )
             worker_builder_cls = (
                 "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
             )
