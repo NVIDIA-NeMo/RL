@@ -387,7 +387,7 @@ class DTensorPolicyWorker:
         from vllm.distributed.utils import StatelessProcessGroup
 
         # keep the same behavior as vllm
-        # see https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/env_override.py#L25
+        # see https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/env_override.py#L25
         if not os.path.exists("/dev/nvidia-caps-imex-channels"):
             os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
@@ -574,7 +574,8 @@ class DTensorPolicyWorker:
                                 .full_tensor()
                                 .squeeze(0)
                             )
-                            _, sorted_indices = torch.sort(seq_index_dtensor)
+
+                            mb["seq_index"] = seq_index_dtensor
 
                             for tensor_name in mb:
                                 current_tensor = mb[tensor_name]
@@ -587,18 +588,28 @@ class DTensorPolicyWorker:
                                             current_tensor,
                                             device_mesh=self.cp_mesh,
                                             placements=[Shard(sequence_dim)],
-                                        ).full_tensor()[:, sorted_indices]
+                                        )
                                         break
 
                             if isinstance(logits, DTensor):
-                                logits = logits.full_tensor()
+                                # Must be tp sharded
+                                assert (
+                                    logits.device_mesh.ndim == 1
+                                    and logits.device_mesh.mesh_dim_names[0] == "tp"
+                                ), "logits must be tp sharded"
 
-                            logits_dtensor = DTensor.from_local(
-                                logits,
-                                device_mesh=self.cp_mesh,
-                                placements=[Shard(sequence_dim)],
-                            )
-                            logits = logits_dtensor.full_tensor()[:, sorted_indices]
+                                # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                                logits = DTensor.from_local(
+                                    logits.to_local(),
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
+                            else:
+                                logits = DTensor.from_local(
+                                    logits,
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
 
                         loss, loss_metrics = loss_fn(
                             logits, mb, global_valid_seqs, global_valid_toks

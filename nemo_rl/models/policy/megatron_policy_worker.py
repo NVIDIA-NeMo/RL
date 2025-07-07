@@ -495,6 +495,7 @@ class MegatronPolicyWorker:
                 "a lambda and couldn't be serialized). This is based on this check "
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
+        model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -984,7 +985,7 @@ class MegatronPolicyWorker:
                     target=input_ids,
                     vocab_start_index=tp_rank * output_tensor.shape[-1],
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
-                    group=tp_grp,
+                    tp_group=tp_grp,
                     inference_only=True,
                 )
 
