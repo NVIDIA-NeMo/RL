@@ -1,0 +1,13 @@
+# Example sweep configuration for evaluation experiments
+# This file demonstrates how to sweep over different evaluation parameters
+
+# Optional: Specify the config file to use for all experiments in this sweep
+# If not specified here, must be provided via --config command line argument
+config_path: examples/configs/eval.yaml
+
+generation.model_name: ["Qwen/Qwen2.5-Math-7B"]
+tokenizer.chat_template: ["examples/prompts/quack/qwen2.5-math.jinja"]
+data.prompt_file: ["examples/prompts/quack/math.txt"]
+
+# Different datasets to evaluate on
+data.dataset_name: ["HuggingFaceH4/aime_2024", "HuggingFaceH4/MATH-500"] 
