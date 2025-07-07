@@ -152,6 +152,9 @@ env:
   ifeval:
     num_workers: 8
     enable: false
+  bfcl_multiturn:
+    enable: true
+    num_workers: 1
 
 logger:
   log_dir: "logs"  # Base directory for all logs
