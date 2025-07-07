@@ -70,21 +70,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         worker_builder_cls: str
         training_backend = None
-        if not config.get("megatron_cfg", {}).get(
-            "enabled", False
-        ):  # Huggingface backend
-            if config["dtensor_cfg"]["enabled"]:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-                )
-                tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-                cp_size = config["dtensor_cfg"]["context_parallel_size"]
-            else:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
-                )
-            training_backend = "hf"
-        elif config["megatron_cfg"]["enabled"]:  # Megatron backend
+
+        megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
+        if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
             )
@@ -93,10 +81,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
             training_backend = "megatron"
         else:
-            training_backend = "hf"
+            assert config["dtensor_cfg"]["enabled"]
             worker_builder_cls = (
-                "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
+                "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
             )
+            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            training_backend = "hf"
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -135,9 +126,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         if config["dynamic_batching"]["enabled"]:
-            assert config["dtensor_cfg"]["enabled"] or training_backend == "megatron", (
-                "Dynamic batch is only supported for DTensor or Megatron policy."
-            )
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
             )
