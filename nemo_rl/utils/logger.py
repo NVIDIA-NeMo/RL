@@ -757,6 +757,12 @@ class Logger(LoggerInterface):
             data["full_lengths"][sample_idx] - 1,
         )
 
+        if generation_start_idx >= generation_end_idx:
+            print(
+                f"Skipping token_mult_prob_error plot because generation_start_idx ({generation_start_idx}) >= generation_end_idx ({generation_end_idx})"
+            )
+            return
+
         generation_logprob = generation_logprobs[
             sample_idx, generation_start_idx:generation_end_idx
         ]
