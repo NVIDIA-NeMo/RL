@@ -35,8 +35,6 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.lm_policy import Policy
 
 # Import the test environment definitions
 from tests.unit.test_envs import (
@@ -183,43 +181,6 @@ def initial_multi_step_calculator_batch(rollout_tokenizer):
     return BatchedDataDict(initial_batch_dict)
 
 
-# Keep the base config separate
-base_hf_test_config: PolicyConfig = {
-    "policy_type": "hf",
-    "model_name": MODEL_NAME,
-    "tokenizer_name": None,
-    "model_path": None,
-    "num_workers": 1,
-    "train_global_batch_size": 2,
-    "train_micro_batch_size": 1,
-    "logprob_batch_size": 2,
-    "generation_batch_size": 1,  # Smaller for simpler testing
-    "learning_rate": 5e-6,
-    "precision": "float32",
-    "activation_checkpointing_enabled": False,
-    "fsdp_offload_enabled": False,
-    "generation": {
-        "backend": "hf",
-        "max_new_tokens": 50,  # Increased for tool call format
-        "temperature": 0.01,
-        "top_p": 1.0,
-        "top_k": None,
-        "stop_token_ids": None,
-        "stop_strings": None,
-    },
-    "optimizer": {
-        "name": "torch.optim.AdamW",
-        "kwargs": {
-            "lr": 5e-6,
-            "weight_decay": 0.01,
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
-        },
-    },
-    "dtensor_cfg": {"enabled": False},
-    "dynamic_batching": {"enabled": False},
-}
-
 base_vllm_test_config: VllmConfig = {
     "backend": "vllm",
     "model_name": MODEL_NAME,
@@ -251,47 +212,6 @@ base_vllm_test_config: VllmConfig = {
         },
     },
 }
-
-
-@pytest.fixture(scope="function")
-def multi_step_setup_hf(
-    rollout_cluster,
-    rollout_tokenizer,
-    multi_step_calculator_environment,
-    initial_multi_step_calculator_batch,
-):
-    """Sets up components for multi-step calculator tests using Policy."""
-    policy = None
-    task_to_env, _ = multi_step_calculator_environment
-    print("Creating Policy for Multi-Step Calculator Test...")
-    try:
-        config = deepcopy(base_hf_test_config)
-        config["tokenizer_name"] = rollout_tokenizer.name_or_path
-        if "gpt2" in rollout_tokenizer.name_or_path.lower():
-            config["model_name"] = "gpt2"
-        config["generation"] = configure_generation_config(
-            config["generation"], rollout_tokenizer
-        )
-        config["generation"]["stop_strings"] = None
-        policy = Policy(
-            cluster=rollout_cluster,
-            config=config,
-            tokenizer=rollout_tokenizer,
-            init_reference_model=False,
-            init_optimizer=False,
-        )
-        yield (
-            policy,
-            rollout_tokenizer,
-            task_to_env,
-            initial_multi_step_calculator_batch,
-            rollout_cluster,
-        )
-    finally:
-        print("Cleaning up Policy (Multi-Step Calc Test)...")
-        if policy:
-            policy.shutdown()
-        print("Policy cleanup finished (Multi-Step Calc Test).")
 
 
 @pytest.fixture(scope="function")
@@ -375,71 +295,6 @@ def multi_step_setup_vllm_async(
         gc.collect()
         torch.cuda.empty_cache()
         print("VllmGeneration cleanup finished (async engine, Multi-Step Calc Test).")
-
-
-def test_run_multi_step_calculator_hf(multi_step_setup_hf):
-    """Tests multi-step calculator rollout with Policy."""
-    policy, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
-        multi_step_setup_hf
-    )
-    max_rollout_turns = (
-        initial_batch["extra_env_info"][0]["max_steps"] + 1
-    )  # Allow max steps + final answer
-    max_seq_len = 1024  # Increased for potentially longer interaction
-
-    print("\nRunning multi-step calculator rollout (HF)...")
-    policy.prepare_for_generation()
-    final_batch, rollout_metrics = run_multi_turn_rollout(
-        policy_generation=policy,
-        input_batch=initial_batch,
-        tokenizer=rollout_tokenizer,
-        task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
-        max_rollout_turns=max_rollout_turns,
-    )
-    policy.finish_generation()
-    print("Multi-step calculator rollout complete (HF).")
-
-    # --- Assertions ---
-    assert isinstance(final_batch, BatchedDataDict)
-    assert "message_log" in final_batch
-    assert "total_reward" in final_batch
-    assert len(final_batch["message_log"]) == len(initial_batch["message_log"])
-
-    sample_log = final_batch["message_log"][0]
-    expected_final_answer = initial_batch["extra_env_info"][0]["expected_final_answer"]
-    print("\nSample Interaction Log (Multi-Step Calculator - HF):")
-    tool_call_count = 0
-    final_answer_msg = None
-    for i, msg in enumerate(sample_log):
-        print(f"  {i}: Role={msg['role']}, Content='{msg['content']}'")
-        if msg["role"] == "assistant":
-            if msg["content"].strip().endswith("<call: calculator>"):
-                tool_call_count += 1
-            else:
-                final_answer_msg = msg["content"].strip()
-
-    assert tool_call_count >= 1, "Expected at least one tool call"
-    assert final_answer_msg is not None, (
-        "Expected a final answer message from assistant"
-    )
-
-    # Check final answer correctness (allowing for different final answer formats)
-    final_answer_logic = _MultiStepCalculatorLogic()
-    extracted_final_answer = final_answer_logic._is_final_answer(final_answer_msg)
-    assert extracted_final_answer is not None, (
-        f"Could not parse final answer from: {final_answer_msg}"
-    )
-    assert abs(extracted_final_answer - expected_final_answer) < 1e-6, (
-        f"Final answer incorrect. Expected {expected_final_answer}, Got {extracted_final_answer}"
-    )
-
-    # Check total reward (should be 1.0 if correct)
-    assert torch.all(final_batch["total_reward"] == 1.0), (
-        f"Expected total reward 1.0, got {final_batch['total_reward']}"
-    )
-
-    print("\nMulti-Step Calculator HF Test assertions passed.")
 
 
 @pytest.mark.skipif(

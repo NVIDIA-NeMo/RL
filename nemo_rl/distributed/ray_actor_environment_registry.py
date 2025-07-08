@@ -19,7 +19,6 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # Temporary workaround for the coupled implementation of DTensorPolicyWorker and vLLM.
     # This will be reverted to PY_EXECUTABLES.BASE once https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved.
     "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.VLLM,
-    "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker": PY_EXECUTABLES.BASE,
     "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker": PY_EXECUTABLES.MCORE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,

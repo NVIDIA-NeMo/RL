@@ -68,52 +68,49 @@ basic_vllm_test_config: VllmConfig = {
     "vllm_kwargs": {},
 }
 
-
-def get_basic_hf_test_config(enable_dtensor: bool = False) -> PolicyConfig:
-    # Create HF-specific config with required parameters
-    return {
-        "model_name": basic_vllm_test_config["model_name"],
-        "tokenizer": {
-            "name": basic_vllm_test_config["tokenizer"]["name"],
+basic_dtensor_test_config: PolicyConfig = {
+    "model_name": basic_vllm_test_config["model_name"],
+    "tokenizer": {
+        "name": basic_vllm_test_config["tokenizer"]["name"],
+    },
+    # Required training parameters
+    "train_global_batch_size": 1,
+    "train_micro_batch_size": 1,
+    "learning_rate": 5e-6,
+    "logprob_batch_size": 1,
+    "max_new_tokens": 16,
+    "do_sample": False,
+    "precision": "float32",
+    "fsdp_offload_enabled": False,
+    "activation_checkpointing_enabled": False,
+    "optimizer": {
+        "name": "torch.optim.AdamW",
+        "kwargs": {
+            "lr": 5e-6,
+            "weight_decay": 0.01,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
         },
-        # Required training parameters
-        "train_global_batch_size": 1,
-        "train_micro_batch_size": 1,
-        "learning_rate": 5e-6,
-        "logprob_batch_size": 1,
-        "max_new_tokens": 16,
-        "do_sample": False,
-        "precision": "float32",
-        "fsdp_offload_enabled": False,
-        "activation_checkpointing_enabled": False,
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "kwargs": {
-                "lr": 5e-6,
-                "weight_decay": 0.01,
-                "betas": [0.9, 0.999],
-                "eps": 1e-8,
-            },
-        },
-        "dtensor_cfg": {
-            "enabled": enable_dtensor,
-            "cpu_offload": False,
-            "sequence_parallel": False,
-            "activation_checkpointing": False,
-            "tensor_parallel_size": 1,
-            "context_parallel_size": 1,
-            "custom_parallel_plan": None,
-        },
-        "dynamic_batching": {
-            "enabled": enable_dtensor,  # Dynamic batching is only supported with DTensor
-            "train_mb_tokens": 40,
-            "logprob_mb_tokens": 40,
-            "sequence_length_round": 4,
-        },
-        "max_grad_norm": 1.0,
-        "make_sequence_length_divisible_by": 1,
-        "generation": deepcopy(basic_vllm_test_config),
-    }
+    },
+    "dtensor_cfg": {
+        "enabled": True,
+        "cpu_offload": False,
+        "sequence_parallel": False,
+        "activation_checkpointing": False,
+        "tensor_parallel_size": 1,
+        "context_parallel_size": 1,
+        "custom_parallel_plan": None,
+    },
+    "dynamic_batching": {
+        "enabled": True,
+        "train_mb_tokens": 40,
+        "logprob_mb_tokens": 40,
+        "sequence_length_round": 4,
+    },
+    "max_grad_norm": 1.0,
+    "make_sequence_length_divisible_by": 1,
+    "generation": deepcopy(basic_vllm_test_config),
+}
 
 
 def get_basic_megatron_test_config(
@@ -420,14 +417,14 @@ async def test_vllm_policy_generation_async(
         vllm_config["vllm_cfg"]["async_engine"] = True
         vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
         vllm_config["vllm_cfg"]["pipeline_parallel_size"] = pipeline_parallel_size
-        hf_config = get_basic_hf_test_config(enable_dtensor=True)
+        dtensor_config = basic_dtensor_test_config
         from nemo_rl.models.policy.lm_policy import Policy
 
         async_policy = VllmGeneration(cluster, vllm_config)
         async_policy.finish_generation()
         print("creating hf policy...")
 
-        lm_policy = Policy(cluster, hf_config, tokenizer)
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
         refit_policy_generation(
             lm_policy, async_policy, vllm_config["colocated"]["enabled"]
         )
@@ -522,8 +519,8 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
     from nemo_rl.models.policy.lm_policy import Policy
 
-    hf_config = get_basic_hf_test_config(enable_dtensor=False)
-    lm_policy = Policy(cluster, hf_config, tokenizer)
+    dtensor_config = basic_dtensor_test_config
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
     print("refitting vllm policy...")
     refit_policy_generation(lm_policy, policy, vllm_config["colocated"]["enabled"])
@@ -620,10 +617,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 @pytest.mark.timeout(140)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
-@pytest.mark.parametrize("enable_dtensor", [True, False])
-async def test_vllm_generation_with_hf_training(
-    cluster, tokenizer, enable_dtensor, async_engine
-):
+async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine):
     """1. Use vLLM for generation
     2. Use HF policy for training and logprob computation
 
@@ -637,8 +631,8 @@ async def test_vllm_generation_with_hf_training(
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config = configure_generation_config(vllm_config, tokenizer)
 
-    hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
-    hf_config["train_global_batch_size"] = 4
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["train_global_batch_size"] = 4
 
     vllm_policy = None
     lm_policy = None
@@ -679,8 +673,8 @@ async def test_vllm_generation_with_hf_training(
         vllm_policy = VllmGeneration(cluster, vllm_config)
         vllm_policy.finish_generation()
 
-        print("Creating HF policy...")
-        lm_policy = Policy(cluster, hf_config, tokenizer)
+        print("Creating DTensor policy...")
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("refitting vllm policy...")
         refit_policy_generation(
@@ -922,14 +916,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
-    hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
+    dtensor_config = basic_dtensor_test_config
 
     # Create policies
     vllm_policy = None
     lm_policy = None
     try:
-        print(f"Creating HF policy for TP={tensor_parallel_size}...")
-        lm_policy = Policy(cluster, hf_config, tokenizer)
+        print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
@@ -1031,9 +1025,9 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
 
-    print("Creating HF policy...")
-    hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
-    lm_policy = Policy(cluster, hf_config, tokenizer)
+    print("Creating DTensor policy...")
+    dtensor_config = basic_dtensor_test_config
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
     print("refitting vllm policy...")
     # take it outside statistics to get clean peak memory during refit
@@ -1108,9 +1102,9 @@ def test_vllm_generation_with_stop(
         # set to sleep first if not in eval mode
         vllm_generation.finish_generation()
 
-        print("Creating HF policy...")
-        hf_config = get_basic_hf_test_config(enable_dtensor=enable_dtensor)
-        lm_policy = Policy(cluster, hf_config, tokenizer)
+        print("Creating DTensor policy...")
+        dtensor_config = basic_dtensor_test_config
+        lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("refitting vllm policy...")
         refit_policy_generation(
@@ -1201,9 +1195,9 @@ async def test_vllm_refit_non_collocated_update_weights(
         )
 
     # Create Policy on its own cluster
-    hf_config = get_basic_hf_test_config(enable_dtensor=True)
-    hf_config["generation"]["colocated"]["enabled"] = False
-    lm_policy = Policy(policy_cluster_separate, hf_config, tokenizer)
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["generation"]["colocated"]["enabled"] = False
+    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
     # Create VllmGeneration policy on its own cluster
     vllm_config = deepcopy(basic_vllm_test_config)
