@@ -180,14 +180,6 @@ omit = ["/tmp/*"]
 [tool.coverage.paths]
 source = ["nemo_rl/", "/opt/nemo-rl/nemo_rl/"]
 
-[tool.coverage.report]
-# At the moment there's no way to easily get line coverage across the ray.remote boundary.
-# We disable coverage so we can have an accurate number of non-remote logic.
-# https://github.com/NVIDIA/NeMo-RL/issues/329
-exclude_also = [
-    "@ray.remote",
-]
-
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the
 # Google convention via `convention = "google"`, below.
