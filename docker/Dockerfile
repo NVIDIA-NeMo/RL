@@ -49,7 +49,7 @@ WORKDIR /opt/nemo-rl
 
 # First copy only the dependency files
 COPY pyproject.toml uv.lock ./
-COPY tools/build-flash-attn-in-uv-cache.sh ./tools/
+COPY --link 3rdparty/ ./3rdparty/
 
 # Variables to control the build of TE. If there are issues with parallelization, consider
 # setting these to 1.
@@ -59,15 +59,9 @@ ARG NVTE_BUILD_THREADS_PER_JOB
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Create virtual environment and pre-fetch flash-attn to minimize docker build cache misses
+# Create and activate virtual environment
 RUN <<"EOF" bash -exu
 uv venv ${UV_PROJECT_ENVIRONMENT}
-bash tools/build-flash-attn-in-uv-cache.sh
-EOF
-
-COPY --link 3rdparty/ ./3rdparty/
-
-RUN <<"EOF" bash -exu
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
