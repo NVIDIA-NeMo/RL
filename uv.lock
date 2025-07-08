@@ -2308,7 +2308,6 @@ dependencies = [
     { name = "colored" },
     { name = "datasets" },
     { name = "debugpy" },
-    { name = "flash-attn" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2330,12 +2329,17 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+automodel = [
+    { name = "flash-attn" },
+]
 mcore = [
+    { name = "flash-attn" },
     { name = "megatron-core" },
     { name = "nemo-tron" },
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
 vllm = [
+    { name = "flash-attn" },
     { name = "vllm" },
 ]
 
@@ -2378,7 +2382,9 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "debugpy" },
-    { name = "flash-attn", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2402,7 +2408,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.9.0" },
     { name = "wandb" },
 ]
-provides-extras = ["vllm", "mcore"]
+provides-extras = ["automodel", "vllm", "mcore"]
 
 [package.metadata.requires-dev]
 build = [

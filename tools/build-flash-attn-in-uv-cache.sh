@@ -8,4 +8,8 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # setuptools, torch, psutil (required by flash-attn), ninja (enables parallel flash-attn build)
-uv pip install setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
+uv sync
+uv pip install ninja
+uv sync --extra automodel
+uv sync
+echo "✅ flash-attn successfully added to uv cache"

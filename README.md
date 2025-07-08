@@ -105,8 +105,12 @@ pip install uv
 #       This ensures that the version of python used is always what we prescribe.
 uv venv
 
-# Installs python packages required by library not following PEP 517 (e.g., flash-attn)
-bash tools/preinstall.sh
+# If working outside a container, it can help to build flash-attn and warm the
+# uv cache before your first run. The NeMo RL Dockerfile will warm the uv cache
+# with flash-attn. See https://docs.nvidia.com/nemo/rl/latest/docker.html for
+# instructions if you are looking for the NeMo RL container.
+bash tools/build-flash-attn-in-uv-cache.sh
+# If sucessful, you should see "✅ flash-attn successfully added to uv cache"
 
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
