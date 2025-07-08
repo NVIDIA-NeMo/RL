@@ -1,0 +1,13 @@
+# MMLU evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+
+data:
+  prompt_file: "examples/prompts/mmlu.txt"
+  dataset_name: "mmlu"
+
+env:
+  math:
+    verifier_type: "multichoice"

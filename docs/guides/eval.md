@@ -92,6 +92,6 @@ score=0.1000 (3.0/30)
 - [AIME-2024](../../nemo_rl/data/eval_datasets/aime2024.py)
 - [GPQA and GPQA-diamond](../../nemo_rl/data/eval_datasets/gpqa.py)
 - [MATH and MATH-500](../../nemo_rl/data/eval_datasets/math.py)
-- [MMLU](../../nemo_rl/data/eval_datasets/mmlu.py)
+- [MMLU](../../nemo_rl/data/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages.
 - [MMLU-Pro](../../nemo_rl/data/eval_datasets/mmlu_pro.py)
 
