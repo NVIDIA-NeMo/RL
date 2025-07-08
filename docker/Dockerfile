@@ -49,6 +49,7 @@ WORKDIR /opt/nemo-rl
 
 # First copy only the dependency files
 COPY pyproject.toml uv.lock ./
+COPY tools/preinstall.sh ./tools/
 COPY --link 3rdparty/ ./3rdparty/
 
 # Variables to control the build of TE. If there are issues with parallelization, consider
@@ -69,7 +70,7 @@ uv venv ${UV_PROJECT_ENVIRONMENT}
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install setuptools ninja torch==2.7.0 psutil --torch-backend=cu128  # setuptools, torch for flash-attn, ninja for flash-attn parallel build
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT bash tools/preinstall.sh
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project

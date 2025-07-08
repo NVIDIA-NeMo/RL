@@ -95,7 +95,13 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "pip", "install", "setuptools", "ninja"], env=env, check=True)
+    # When running bare `uv pip` and if the venv_path is out of the project dir (the case for tests)
+    # you need to set VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT to make it work. See discussion https://github.com/astral-sh/uv/issues/14022#issuecomment-2970297963
+    subprocess.run(
+        ["uv", "pip", "install", "setuptools"],
+        env=env | {"VIRTUAL_ENV": venv_path},
+        check=True,
+    )
     subprocess.run(["uv", "sync"], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 

@@ -105,8 +105,8 @@ pip install uv
 #       This ensures that the version of python used is always what we prescribe.
 uv venv
 
-# Install setuptools, torch, psutil (required by flash-attn), ninja (enables parallel flash-attn build)
-uv pip install setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
+# Installs python packages required by library not following PEP 517 (e.g., flash-attn)
+bash tools/preinstall.sh
 
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
@@ -123,7 +123,7 @@ uv pip install setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
 
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
-- `flash-attn` build can take a few minutes to install if running from fresh install (`uv` cache not warmed).
+- On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your `uv`'s cache dir making subsequent installs much quicker.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 ## Training Backends
