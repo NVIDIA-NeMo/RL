@@ -126,8 +126,8 @@ jobs:
       - name: Check lint
         run: |
           uv venv
-          uv run --group dev --with "flash-attn ; sys_platform == 'never'" pre-commit install
-          uv run --group dev --with "flash-attn ; sys_platform == 'never'" pre-commit run --all-files --show-diff-on-failure --color=always
+          uv run --group dev --with "flash-attn==2.7.4.post1 ; sys_platform == 'never'" pre-commit install
+          uv run --group dev --with "flash-attn==2.7.4.post1 ; sys_platform == 'never'" pre-commit run --all-files --show-diff-on-failure --color=always
       - name: Minimize uv cache
         run: uv cache prune --ci
 
@@ -152,7 +152,7 @@ jobs:
       - name: Check mypy
         run: |
           uv venv
-          uv run --group test --with "flash-attn ; sys_platform == 'never'" mypy nemo_rl examples
+          uv run --group test --with "flash-attn==2.7.4.post1 ; sys_platform == 'never'" mypy nemo_rl examples
       - name: Minimize uv cache
         run: uv cache prune --ci
 
