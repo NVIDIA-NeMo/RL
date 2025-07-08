@@ -27,6 +27,7 @@ from typing import Any, Callable, Mapping, Optional, TypedDict
 import ray
 import requests
 import torch
+import wandb
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -36,7 +37,6 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
-import wandb
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
