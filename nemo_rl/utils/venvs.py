@@ -188,4 +188,3 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.util.remove_placement_group(pg)
     # Return mapping from node IP to venv python path
     return paths[0]
-
