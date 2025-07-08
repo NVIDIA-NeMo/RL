@@ -58,6 +58,7 @@ mcore = [
     "transformer-engine[pytorch]==2.3.0",
     "megatron-core",
     "nemo-tron",
+    "vllm==0.9.0",
 ]
 
 [dependency-groups]

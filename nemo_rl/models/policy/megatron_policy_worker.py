@@ -82,7 +82,6 @@ from nemo.tron.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from ray.util.queue import Queue
-from torch.distributed import get_process_group_ranks
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
@@ -99,13 +98,8 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.megatron.converters.common import (
-    MegatronToHFConverter,
-)
-from nemo_rl.models.megatron.refit_utils import (
-    gather_params,
-    get_tp_dim,
-)
+from nemo_rl.models.megatron.converters.common import MegatronToHFConverter
+from nemo_rl.models.megatron.refit_utils import gather_params, get_param_info
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -347,6 +341,15 @@ class MegatronPolicyWorker:
         megatron_checkpoint_home: Optional[str] = None,
         **kwargs: Any,
     ):
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        if not self.is_generation_colocated:
+            os.environ["NCCL_SHM_DISABLE"] = "1"
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+
         self.cfg = config
         dtype_map = {
             "float32": torch.float32,
@@ -374,7 +377,8 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        if get_rank_safe() == 0:
+        self.rank = get_rank_safe()
+        if self.rank == 0:
             if pt_checkpoint_exists:
                 print(
                     f"Checkpoint already exists at {pretrained_path}. Skipping import."
@@ -645,6 +649,23 @@ class MegatronPolicyWorker:
             return None, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, None
         else:
             return None, None, None
+
+    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        # keep the same behavior as vllm
+        # see https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/env_override.py#L25
+        if not os.path.exists("/dev/nvidia-caps-imex-channels"):
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+        if self.rank == 0:
+            pg = StatelessProcessGroup.create(
+                host=ip, port=port, rank=0, world_size=world_size
+            )
+            device = torch.cuda.current_device()
+            self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self):
         return True
@@ -1210,6 +1231,26 @@ class MegatronPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        # Get parameter info for refit
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.refit_param_info = get_param_info(self.model, self.dtype)
+
+        if self.is_generation_colocated:
+            return
+
+        # Collect converted state dict for collective communication
+        state_dict_info = {}
+        for key, _ in self.refit_param_info:
+            gathered_megatron_params = gather_params(self.model, [key])
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            for name, tensor in gathered_hf_params.items():
+                state_dict_info[name] = (tensor.shape, tensor.dtype)
+        return state_dict_info
+
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1217,95 +1258,6 @@ class MegatronPolicyWorker:
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-        # Ensure model is in evaluation mode
-        self.model.eval()
-
-        # Get parallel info
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        tp_world_size = torch.distributed.get_world_size(tp_group)
-        tp_group_rank_ids = get_process_group_ranks(tp_group)
-
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-        pp_group_rank_ids = get_process_group_ranks(pp_group)
-
-        # Collect parameter info
-        param_info = []
-
-        # Dictionary of modules we can quickly look up to check if a module has TP
-        named_modules_dict = dict(self.model.named_modules())
-
-        # Process each parameter in the model
-        # state_dict includes parameters and persistent buffers
-        for name, param in self.model.state_dict().items():
-            # Skip _extra_state entries (these are metadata, not actual weights)
-            if "_extra_state" in name:
-                continue
-
-            shape = list(param.shape)
-            tp_dim = get_tp_dim(self.model, name, named_modules_dict)
-            if tp_dim is not None:
-                tp_rank_ids = tuple(sorted(tp_group_rank_ids))
-                shape[tp_dim] *= len(tp_rank_ids)
-            else:
-                tp_rank_ids = (torch.distributed.get_rank(),)
-
-            pp_rank_ids = tuple(sorted(pp_group_rank_ids))
-
-            # Calculate size for this parameter
-            prec_to_bytes = {
-                torch.bfloat16: 2,
-                torch.float16: 2,
-                torch.float32: 4,
-            }
-            scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
-            size_in_bytes = (
-                param.element_size()
-                * param.numel()
-                * len(tp_rank_ids)
-                * len(pp_rank_ids)
-                * scale
-            )
-            param_info.append(
-                (
-                    (
-                        name,
-                        tuple(shape),
-                        param.dtype,
-                    ),
-                    size_in_bytes,
-                )
-            )
-        # Gather parameter info from all pipeline parallel ranks to ensure complete coverage
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pp_world_size = torch.distributed.get_world_size(pp_group)
-
-        # Gather all parameter info from all PP ranks
-        pp_gathered_param_infos = [None] * pp_world_size
-        torch.distributed.all_gather_object(
-            pp_gathered_param_infos, param_info, group=pp_group
-        )
-        pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
-
-        all_param_infos = pp_gathered_param_infos
-
-        # Merge all parameter infos, keeping only unique parameter names
-        merged_param_info = []
-        seen_params = set()
-
-        for name, size in all_param_infos:
-            if name not in seen_params:
-                merged_param_info.append((name, size))
-                seen_params.add(name)
-
-        # Update param_info with the merged information
-        param_info = merged_param_info
-
-        print(f"Prepared {len(param_info)} tensors for IPC transfer")
-        no_grad.__exit__(None, None, None)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1315,9 +1267,10 @@ class MegatronPolicyWorker:
         ## Use 80% of the free memory for safety
         total_available_bytes *= 0.8
 
-        return param_info, total_available_bytes
+        return self.refit_param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
+    @torch.no_grad()
     def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
@@ -1326,10 +1279,7 @@ class MegatronPolicyWorker:
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
-        gathered_megatron_params = gather_params(
-            self.model,
-            keys,
-        )
+        gathered_megatron_params = gather_params(self.model, keys)
         gathered_hf_params = self.megatron_to_hf_converter.convert(
             gathered_megatron_params, self.model.config
         )
@@ -1401,6 +1351,18 @@ class MegatronPolicyWorker:
             serialized = (False, all_handles)
 
         return {device_uuid: serialized}
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(self) -> None:
+        """Broadcast the weights for collective communication."""
+        for key, _ in self.refit_param_info:
+            gathered_megatron_params = gather_params(self.model, [key])
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            if self.rank == 0:
+                for _, tensor in gathered_hf_params.items():
+                    self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
