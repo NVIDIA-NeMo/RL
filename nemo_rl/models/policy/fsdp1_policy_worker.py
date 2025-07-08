@@ -901,7 +901,10 @@ class FSDP1PolicyWorker:
             handle = reduce_tensor(p.detach())
             all_handles.append((key, handle))
 
-        return {device_uuid: all_handles}
+        # (pack_tensor_for_ipc: bool, handles: list)
+        serialized = (False, all_handles)
+
+        return {device_uuid: serialized}
 
     def prepare_for_lp_inference(self) -> None:
         self.model = self.manual_load_to_gpu(self.model)
