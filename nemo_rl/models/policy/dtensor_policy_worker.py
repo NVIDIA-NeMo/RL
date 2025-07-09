@@ -41,7 +41,6 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.utils.flops_tracker import FLOPTracker
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,

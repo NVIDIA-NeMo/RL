@@ -28,7 +28,7 @@ LLM_VOCAB_SIZE_MAP = {
 # lifted from NeMo/nemo/utils/flops_formulas.py
 @dataclass
 class FLOPSConfig:
-    """Contains the model hparams needed for FLOPS computations"""
+    """Contains the model hparams needed for FLOPS computations."""
 
     gbs: int
     enc_seq_len: Optional[int] = None
@@ -69,8 +69,7 @@ class FLOPSConfig:
 
 
 def gpt3(config: FLOPSConfig):
-    """Model FLOPs for GPT3 family"""
-
+    """Model FLOPs for GPT3 family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["gpt3"]
 
     return (
@@ -80,7 +79,7 @@ def gpt3(config: FLOPSConfig):
 
 
 def llama2(config: FLOPSConfig):
-    """Model FLOPs for llama2 family"""
+    """Model FLOPs for llama2 family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["llama2"]
 
     return (
@@ -100,7 +99,7 @@ def llama2(config: FLOPSConfig):
 
 
 def llama3(config: FLOPSConfig):
-    """Model FLOPs for llama3 family"""
+    """Model FLOPs for llama3 family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["llama3"]
 
     return (
@@ -120,7 +119,7 @@ def llama3(config: FLOPSConfig):
 
 
 def nemotron(config: FLOPSConfig):
-    """Model FLOPs for nemotron family"""
+    """Model FLOPs for nemotron family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["nemotron"]
 
     return (
@@ -140,7 +139,7 @@ def nemotron(config: FLOPSConfig):
 
 
 def mixtral(config: FLOPSConfig):
-    """Model FLOPs for mixtral family"""
+    """Model FLOPs for mixtral family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["mixtral"]
 
     return (
@@ -160,7 +159,7 @@ def mixtral(config: FLOPSConfig):
 
 
 def qwen2(config: FLOPSConfig):
-    """Model FLOPs for Qwen2 family"""
+    """Model FLOPs for Qwen2 family."""
     causal_self_attn = True
     seq_len = config.enc_seq_len
     hidden_size = config.hs
@@ -202,7 +201,7 @@ def qwen2(config: FLOPSConfig):
 
 
 def qwen3(config: FLOPSConfig):
-    """Model FLOPs for Qwen3 family"""
+    """Model FLOPs for Qwen3 family."""
     causal_self_attn = True
     seq_len = config.enc_seq_len
     hidden_size = config.hs
@@ -243,7 +242,7 @@ def qwen3(config: FLOPSConfig):
 
 
 def bert(config: FLOPSConfig):
-    """Model FLOPs for BERT family"""
+    """Model FLOPs for BERT family."""
     vocab_size = LLM_VOCAB_SIZE_MAP["bert"]
 
     return (
@@ -259,6 +258,7 @@ def bert(config: FLOPSConfig):
 
 def transformer(config: FLOPSConfig):
     """Calculate FLOPs for a standard Transformer model.
+
     Note: This does not cover encoder-decoder models.
     """
     # Extract parameters from config
@@ -360,8 +360,7 @@ def transformer(config: FLOPSConfig):
 
 
 def clip_vit_l(config: FLOPSConfig):
-    """Model FLOPs for CLIP ViT"""
-
+    """Model FLOPs for CLIP ViT."""
     if config.img_seq_len is None:
         config.img_seq_len = (config.img_h * config.img_w) / (
             config.patch_dim * config.patch_dim
@@ -372,8 +371,7 @@ def clip_vit_l(config: FLOPSConfig):
 
 
 def neva_projection(config: FLOPSConfig):
-    """Model FLOPs for NeVA Projection"""
-
+    """Model FLOPs for NeVA Projection."""
     if "mlp" in config.projector_type:
         return 6 * config.gbs * config.img_seq_len * config.ffn_hs * (config.inp_s + config.hs)
     elif config.projector_type == "affine":
@@ -386,8 +384,7 @@ def neva_projection(config: FLOPSConfig):
 
 
 def flux(config: FLOPSConfig):
-    """Model FLOPs for FLUX"""
-
+    """Model FLOPs for FLUX."""
     hs = config.hs
     seq_len = config.model_channels + config.inp_s
     base_factor = 6 * config.gbs  # common multiplier for most terms
@@ -433,8 +430,7 @@ def flux(config: FLOPSConfig):
 
 
 def deepseekv3(config: FLOPSConfig):
-    """Model FLOPs for DeepSeek V3"""
-
+    """Model FLOPs for DeepSeek V3."""
     # self-attention flops
     bmm1_flops = (
         0.5 * (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads * (config.enc_seq_len**2)
@@ -488,12 +484,12 @@ def deepseekv3(config: FLOPSConfig):
 
 
 def _mlp_layer_flops(config: FLOPSConfig):
-    """Model FLOPs for MLP layer"""
+    """Model FLOPs for MLP layer."""
     return 6 * config.gbs * config.enc_seq_len * config.hs * config.ffn_hs * (2 if config.gated_linear_unit else 1)
 
 
 def _non_mla_attn_layer_flops(config: FLOPSConfig):
-    """Model FLOPs for attention layer"""
+    """Model FLOPs for attention layer."""
     return (
         6
         * config.gbs
@@ -509,8 +505,7 @@ def _non_mla_attn_layer_flops(config: FLOPSConfig):
 
 
 def _mamba_layer_flops(config: FLOPSConfig):
-    """Model FLOPs for Mamba layer. We ignore part of the flops of scan because the
-    chunk size is not known from model config."""
+    """Model FLOPs for Mamba layer. We ignore part of the flops of scan because the chunk size is not known from model config."""
     assert config.mamba_state_dim is not None
     assert config.mamba_head_dim is not None
 
@@ -533,7 +528,7 @@ def _mamba_layer_flops(config: FLOPSConfig):
 
 
 def _hybrid_model_flops(config: FLOPSConfig):
-    """Model FLOPs for hybrid model"""
+    """Model FLOPs for hybrid model."""
     assert config.is_hybrid_model == True
     assert config.hybrid_override_pattern is not None
 
@@ -554,5 +549,5 @@ def _hybrid_model_flops(config: FLOPSConfig):
 
 
 def nemotronh(config: FLOPSConfig):
-    """Model FLOPs for NemotronH"""
+    """Model FLOPs for NemotronH."""
     return _hybrid_model_flops(config)
