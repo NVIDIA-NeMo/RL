@@ -134,18 +134,6 @@ def setup(
     dpo_save_state: Optional[DPOSaveState] = checkpointer.load_training_info(
         last_checkpoint_path
     )
-    # config validation checks
-    if master_config["checkpointing"]["enabled"]:
-        assert master_config["checkpointing"]["save_period"] > 0
-        assert (
-            master_config["checkpointing"]["save_period"]
-            % master_config["dpo"]["val_period"]
-            == 0
-        ), (
-            f"Checkpointing save period {master_config['checkpointing']['save_period']} "
-            f"must be a multiple of validation period {master_config['dpo']['val_period']}"
-            f", or we won't know what metric to save!"
-        )
 
     # ==========================
     #           Data
@@ -436,9 +424,7 @@ def dpo_train(
                 )
 
                 # Run validation if it's a validation step
-                if is_last_step or (
-                    val_period > 0 and (total_steps + 1) % val_period == 0
-                ):
+                if val_period > 0 and (total_steps + 1) % val_period == 0:
                     val_metrics, validation_timings = validate(
                         policy,
                         val_dataloader,
@@ -469,7 +455,22 @@ def dpo_train(
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     dpo_save_state["total_steps"] = total_steps + 1
                     dpo_save_state["epoch"] = current_epoch
-                    dpo_save_state["val_loss"] = val_metrics["loss"]
+                    if val_metrics is not None:
+                        dpo_save_state["val_loss"] = val_metrics["loss"]
+                    elif "val_loss" in dpo_save_state:
+                        del dpo_save_state["val_loss"]
+
+                    if master_config["checkpointing"]["metric_name"] is not None:
+                        if (
+                            master_config["checkpointing"]["metric_name"]
+                            not in dpo_save_state
+                        ):
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                                "Saving most recent k checkpoints instead."
+                            )
+                            master_config["checkpointing"]["metric_name"] = None
+
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
