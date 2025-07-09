@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Callable
 from dataclasses import asdict
-from nemo_rl.utils.flops_formulas import FLOPSConfig, qwen2, llama2, llama3
+from typing import Callable, Optional
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+
+from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2
 
 
-def convert_config_to_flops_config(model_name: str, config: PretrainedConfig) -> tuple[FLOPSConfig, Callable]:
+def convert_config_to_flops_config(
+    model_name: str, config: PretrainedConfig
+) -> tuple[FLOPSConfig, Callable]:
     """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula."""
     if isinstance(config, Qwen2Config):
         return FLOPSConfig(
@@ -43,8 +46,14 @@ def convert_config_to_flops_config(model_name: str, config: PretrainedConfig) ->
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
+
 class FLOPTracker:
-    def __init__(self, model_name: str, base_config: FLOPSConfig | None = None, flops_formula: Callable[[FLOPSConfig], float] | None = None):
+    def __init__(
+        self,
+        model_name: str,
+        base_config: FLOPSConfig | None = None,
+        flops_formula: Callable[[FLOPSConfig], float] | None = None,
+    ):
         self.model_name = model_name
         self.base_config = base_config
         self.total_flops = 0
@@ -53,13 +62,17 @@ class FLOPTracker:
     @classmethod
     def from_config(cls, model_name: str, config: PretrainedConfig) -> "FLOPTracker":
         flops_config, flops_formula = convert_config_to_flops_config(model_name, config)
-        return cls(model_name=model_name, base_config=flops_config, flops_formula=flops_formula)
+        return cls(
+            model_name=model_name, base_config=flops_config, flops_formula=flops_formula
+        )
 
     def track(self, n_samples: int, padded_seq_len: int):
         if self.flops_formula is None:
             raise ValueError("Flops formula is not set")
 
-        base_config_dict = asdict(self.base_config) if self.base_config is not None else {}
+        base_config_dict = (
+            asdict(self.base_config) if self.base_config is not None else {}
+        )
 
         # Override gbs and enc_seq_len with current values
         config_dict = {
@@ -74,4 +87,3 @@ class FLOPTracker:
 
     def reset(self):
         self.total_flops = 0
-
