@@ -41,7 +41,6 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.flops_tracker import FLOPTracker
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -62,6 +61,7 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     sliding_window_overwrite,
 )
+from nemo_rl.utils.flops_tracker import FLOPTracker
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -722,7 +722,9 @@ class DTensorPolicyWorker:
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
                 "all_mb_metrics": dict(mb_metrics),
-                "total_flops": self.flops_tracker.total_flops if self.flops_tracker else None
+                "total_flops": self.flops_tracker.total_flops
+                if self.flops_tracker
+                else None,
             }
 
             return metrics

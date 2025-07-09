@@ -25,6 +25,7 @@ LLM_VOCAB_SIZE_MAP = {
     "mixtral": 32000,
 }
 
+
 # lifted from NeMo/nemo/utils/flops_formulas.py
 @dataclass
 class FLOPSConfig:
@@ -75,7 +76,9 @@ def gpt3(config: FLOPSConfig):
     return (
         24 * config.gbs * config.enc_seq_len * config.hs * config.hs
         + 4 * config.gbs * config.enc_seq_len * config.enc_seq_len * config.hs
-    ) * (3 * config.layers) + (6 * config.gbs * config.enc_seq_len * config.hs * vocab_size)
+    ) * (3 * config.layers) + (
+        6 * config.gbs * config.enc_seq_len * config.hs * vocab_size
+    )
 
 
 def llama2(config: FLOPSConfig):
@@ -176,7 +179,9 @@ def qwen2(config: FLOPSConfig):
         * hidden_size
         * (
             (2 + 1)  # QKV gemm
-            + (seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1))  # attention
+            + (
+                seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1)
+            )  # attention
             + 1  # attention proj gemm
         )
     )
@@ -199,7 +204,6 @@ def qwen2(config: FLOPSConfig):
     return attention_flops + mlp_flops + vocab_flops
 
 
-
 def qwen3(config: FLOPSConfig):
     """Model FLOPs for Qwen3 family."""
     causal_self_attn = True
@@ -218,7 +222,9 @@ def qwen3(config: FLOPSConfig):
         * hidden_size
         * (
             (config.query_groups / config.attention_heads * 2 + 1)  # QKV gemm
-            + (seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1))  # attention
+            + (
+                seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1)
+            )  # attention
             + 1  # attention proj gemm
         )
     )
@@ -252,7 +258,11 @@ def bert(config: FLOPSConfig):
         * config.enc_seq_len
         * config.hs
         * config.hs
-        * (1 + (config.enc_seq_len / (6 * config.hs)) + (vocab_size / (12 * config.hs * config.layers)))
+        * (
+            1
+            + (config.enc_seq_len / (6 * config.hs))
+            + (vocab_size / (12 * config.hs * config.layers))
+        )
     )
 
 
@@ -274,9 +284,15 @@ def transformer(config: FLOPSConfig):
         raise ValueError("vocab_size is required for transformer FLOPs calculation")
 
     # Handle optional parameters with reasonable defaults
-    query_groups = config.query_groups if config.query_groups is not None else num_attention_heads
-    causal_self_attn = config.causal_self_attn if config.causal_self_attn is not None else False
-    moe_router_topk = config.moe_router_topk if config.moe_router_topk is not None else 0
+    query_groups = (
+        config.query_groups if config.query_groups is not None else num_attention_heads
+    )
+    causal_self_attn = (
+        config.causal_self_attn if config.causal_self_attn is not None else False
+    )
+    moe_router_topk = (
+        config.moe_router_topk if config.moe_router_topk is not None else 0
+    )
     kv_channels = hidden_size // num_attention_heads  # Standard dimension per head
 
     # Calculate query projection size and ratio
@@ -341,8 +357,7 @@ def transformer(config: FLOPSConfig):
                     (
                         (
                             # Routed experts
-                            ffn_hidden_size
-                            * num_experts_routed_to
+                            ffn_hidden_size * num_experts_routed_to
                             # Note: Shared experts are not implemented in this version
                         )
                         * num_moe_layers
@@ -373,7 +388,13 @@ def clip_vit_l(config: FLOPSConfig):
 def neva_projection(config: FLOPSConfig):
     """Model FLOPs for NeVA Projection."""
     if "mlp" in config.projector_type:
-        return 6 * config.gbs * config.img_seq_len * config.ffn_hs * (config.inp_s + config.hs)
+        return (
+            6
+            * config.gbs
+            * config.img_seq_len
+            * config.ffn_hs
+            * (config.inp_s + config.hs)
+        )
     elif config.projector_type == "affine":
         return 6 * config.gbs * config.img_seq_len * config.inp_s * config.hs
     else:
@@ -395,7 +416,10 @@ def flux(config: FLOPSConfig):
         * config.layers[0]
         * (
             10 * hs * hs  # hidden size operations
-            + 2 * hs * (config.model_channels + config.inp_s) * (1 + hs * 7)  # channel and context joint attention
+            + 2
+            * hs
+            * (config.model_channels + config.inp_s)
+            * (1 + hs * 7)  # channel and context joint attention
             + 2 * (config.model_channels + config.inp_s) * hs  # final projection
         )
     )
@@ -433,12 +457,19 @@ def deepseekv3(config: FLOPSConfig):
     """Model FLOPs for DeepSeek V3."""
     # self-attention flops
     bmm1_flops = (
-        0.5 * (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads * (config.enc_seq_len**2)
+        0.5
+        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
+        * config.attention_heads
+        * (config.enc_seq_len**2)
     )
-    bmm2_flops = 0.5 * config.v_head_dim * config.attention_heads * (config.enc_seq_len**2)
+    bmm2_flops = (
+        0.5 * config.v_head_dim * config.attention_heads * (config.enc_seq_len**2)
+    )
     per_input_attention_flops = 6 * (bmm1_flops + bmm2_flops) * config.layers
     if config.mtp_num_layers is not None:
-        per_input_attention_flops += 6 * (bmm1_flops + bmm2_flops) * config.mtp_num_layers
+        per_input_attention_flops += (
+            6 * (bmm1_flops + bmm2_flops) * config.mtp_num_layers
+        )
 
     # linear layer flops
     per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
@@ -448,28 +479,38 @@ def deepseekv3(config: FLOPSConfig):
     per_layer_mla_params += config.hs * config.kv_lora_rank + config.kv_lora_rank * (
         (config.qk_head_dim + config.v_head_dim) * config.attention_heads
     )  # K^C and V^C
-    per_layer_mla_params += config.v_head_dim * config.attention_heads * config.hs  # Proj
+    per_layer_mla_params += (
+        config.v_head_dim * config.attention_heads * config.hs
+    )  # Proj
     mla_params = per_layer_mla_params * config.layers
     if config.mtp_num_layers is not None:
         mla_params += per_layer_mla_params * config.mtp_num_layers
 
     dense_layer_ffn_params = config.hs * config.ffn_hs * 3  # gated linear unit
-    per_shared_expert_params = config.hs * config.moe_shared_expert_intermediate_size * 3
+    per_shared_expert_params = (
+        config.hs * config.moe_shared_expert_intermediate_size * 3
+    )
     per_selected_expert_params = config.hs * config.moe_ffn_hidden_size * 3
     ffn_params = 0
 
     if isinstance(config.moe_layer_freq, int):
-        moe_layer_pattern = [1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)]
+        moe_layer_pattern = [
+            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.layers)
+        ]
     else:
         moe_layer_pattern = config.moe_layer_freq
     for i in moe_layer_pattern:
         if i == 0:
             ffn_params += dense_layer_ffn_params
         else:
-            ffn_params += per_shared_expert_params + (per_selected_expert_params * config.moe_router_topk)
+            ffn_params += per_shared_expert_params + (
+                per_selected_expert_params * config.moe_router_topk
+            )
     if config.mtp_num_layers is not None:
         for i in range(config.mtp_num_layers):
-            ffn_params += per_shared_expert_params + (per_selected_expert_params * config.moe_router_topk)
+            ffn_params += per_shared_expert_params + (
+                per_selected_expert_params * config.moe_router_topk
+            )
     per_input_params = mla_params + ffn_params
     per_input_linear_flops = 6 * per_input_params * config.enc_seq_len
 
@@ -477,15 +518,26 @@ def deepseekv3(config: FLOPSConfig):
     per_input_vocab_flops = 6 * config.vocab_size * config.hs * config.enc_seq_len
     if config.mtp_num_layers is not None:
         for i in range(config.mtp_num_layers):
-            per_input_vocab_flops += 6 * config.vocab_size * config.hs * config.enc_seq_len
+            per_input_vocab_flops += (
+                6 * config.vocab_size * config.hs * config.enc_seq_len
+            )
             per_input_vocab_flops += 6 * config.hs * 2 * config.hs * config.enc_seq_len
 
-    return (per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops) * config.gbs
+    return (
+        per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops
+    ) * config.gbs
 
 
 def _mlp_layer_flops(config: FLOPSConfig):
     """Model FLOPs for MLP layer."""
-    return 6 * config.gbs * config.enc_seq_len * config.hs * config.ffn_hs * (2 if config.gated_linear_unit else 1)
+    return (
+        6
+        * config.gbs
+        * config.enc_seq_len
+        * config.hs
+        * config.ffn_hs
+        * (2 if config.gated_linear_unit else 1)
+    )
 
 
 def _non_mla_attn_layer_flops(config: FLOPSConfig):
@@ -534,11 +586,11 @@ def _hybrid_model_flops(config: FLOPSConfig):
 
     num_attn_layers, num_mamba_layers, num_mlp_layers = 0, 0, 0
     for c in config.hybrid_override_pattern:
-        if c == 'M':
+        if c == "M":
             num_mamba_layers += 1
-        elif c == '-':
+        elif c == "-":
             num_mlp_layers += 1
-        elif c == '*':
+        elif c == "*":
             num_attn_layers += 1
     return (
         num_attn_layers * _non_mla_attn_layer_flops(config)

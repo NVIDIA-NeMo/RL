@@ -510,9 +510,15 @@ def dpo_train(
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
             if "total_flops" in train_results:
-                total_tflops = train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+                total_tflops = (
+                    train_results["total_flops"]
+                    / timing_metrics["policy_training"]
+                    / 1e12
+                )
                 num_gpus = len(train_results["rank_flops"])
-                print(f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops/num_gpus:.2f} TFLOPS per rank)")
+                print(
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_gpus:.2f} TFLOPS per rank)"
+                )
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
