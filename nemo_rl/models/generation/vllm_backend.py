@@ -96,7 +96,6 @@ class VllmInternalWorkerExtension:
 
             # Load weights into the model
             self.model_runner.model.load_weights(weights=weights)
-            torch.cuda.synchronize()
             return True
         except Exception as e:
             print(
