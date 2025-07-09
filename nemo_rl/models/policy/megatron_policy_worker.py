@@ -13,12 +13,13 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, Optional, TypeVar
+from typing import Any, Iterator, List, Optional, Tuple, TypeVar
 
 import ray
 import torch
@@ -101,6 +102,7 @@ from nemo_rl.models.megatron.common import (
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.converters.common import (
     MegatronToHFConverter,
+    get_global_key_from_local_key,
 )
 from nemo_rl.models.megatron.refit_utils import (
     gather_params,
@@ -172,6 +174,16 @@ def setup_megatron_model(
 
     torch.distributed.barrier()
 
+    model_post_init_fns = []
+    if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
+
+        def freeze_moe_router(model_module):
+            for layer in model_module.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router.weight.requires_grad = False
+
+        model_post_init_fns.append(freeze_moe_router)
+
     # Model, optimizer, and learning rate.
     model = get_model_from_config(
         cfg.model_config,
@@ -179,6 +191,7 @@ def setup_megatron_model(
         use_torch_fsdp2=cfg.dist_config.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=cfg.rng_config.data_parallel_random_init,
+        model_post_init_fns=model_post_init_fns,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -191,13 +204,6 @@ def setup_megatron_model(
         optimizer = None
         scheduler = None
 
-    _update_model_config_funcs(
-        model,
-        cfg.model_config,
-        cfg.ddp_config,
-        optimizer,
-        align_grad_reduce=cfg.dist_config.align_grad_reduce,
-    )
     print("Model, optimizer, and learning rate scheduler built")
     torch.distributed.barrier()
 
@@ -443,6 +449,13 @@ class MegatronPolicyWorker:
         assert model_cfg.context_parallel_size == 1, (
             "Context parallel is not supported right now"
         )
+        model_cfg.expert_tensor_parallel_size = self.cfg["megatron_cfg"][
+            "expert_tensor_parallel_size"
+        ]
+        model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
+            "expert_model_parallel_size"
+        ]
+        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
         model_cfg.bf16 = self.dtype == torch.bfloat16
         model_cfg.fp16 = self.dtype == torch.float16
         if model_cfg.fp16:
@@ -455,6 +468,22 @@ class MegatronPolicyWorker:
             model_cfg.params_dtype = torch.float32
         model_cfg.pipeline_dtype = dtype_map[self.cfg["megatron_cfg"]["pipeline_dtype"]]
         model_cfg.parallel_output = True
+        # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
+        # especially when using many experts.
+        model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
+
+        # The below two configs (and "freeze_moe_router") are used to stabilize moe training
+        # by preventing updates to the moe router. We found that this is helpful in reducing
+        # logprob error during training.
+
+        # Set this to "none" to disable load balancing loss.
+        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
+            "moe_router_load_balancing_type"
+        ]
+        # Set this to 0.0 to disable updates to the moe router expert bias
+        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
+            "moe_router_bias_update_rate"
+        ]
         if self.cfg["megatron_cfg"]["activation_checkpointing"]:
             model_cfg.activations_checkpoint_granularity = "full"
             model_cfg.activations_checkpoint_method = "uniform"
@@ -612,6 +641,14 @@ class MegatronPolicyWorker:
 
             self.model = self.move_model(self.model, "cuda")
 
+        _update_model_config_funcs(
+            [self.model],
+            self.megatron_cfg.model_config,
+            self.megatron_cfg.ddp_config,
+            self.optimizer,
+            align_grad_reduce=self.megatron_cfg.dist_config.align_grad_reduce,
+        )
+
         from nemo.tron.tokenizers.tokenizer import build_tokenizer
 
         tokenizer_config = TokenizerConfig(
@@ -632,6 +669,11 @@ class MegatronPolicyWorker:
         self._held_gather_buffer = None
         self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
 
+        # Create a map that maps any local parameter name to a list of global parameter names.
+        # This map is repeatedly used by parameter gatherring phase during refit of every step.
+        self.local_key_to_global_keys = self.get_local_key_to_global_keys(
+            state_dict_info=self.prepare_weights_for_ipc()[0]
+        )
         self.should_disable_forward_pre_hook = (
             self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
             and self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
@@ -951,7 +993,9 @@ class MegatronPolicyWorker:
                 token_logprobs = torch.cat(
                     [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
                 )
-                return torch.tensor(0.0), {"logprobs": token_logprobs}
+                return torch.tensor(0.0, device=token_logprobs.device), {
+                    "logprobs": token_logprobs
+                }
 
             return output_tensor, collection_fn
 
@@ -1210,6 +1254,60 @@ class MegatronPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    @torch.no_grad()
+    def get_local_key_to_global_keys(self, state_dict_info: List[Tuple[Any, int]]):
+        """Get the local key to global keys mapping."""
+        # Get parallel info
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_world_size = torch.distributed.get_world_size(tp_group)
+
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        pp_world_size = torch.distributed.get_world_size(pp_group)
+        pp_global_ranks = torch.distributed.get_process_group_ranks(group=pp_group)
+        pp_local_rank_id = parallel_state.get_pipeline_model_parallel_rank()
+
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = torch.distributed.get_world_size(ep_group)
+
+        # start calculating the global key
+        ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
+        state_dict = self.model.state_dict()
+        final_key_to_global_keys = {}
+
+        for param_info, size in state_dict_info:
+            local_key, owner_pp_local_rank_id, _, _ = param_info
+
+            # Step 1: create global key from local key
+            # if: for if a parameter is sharded along PP or EP;
+            # else: not sharded (like embedding)
+            pp_gathered_objs = [None]
+            if local_key in state_dict and owner_pp_local_rank_id == pp_local_rank_id:
+                pp_gathered_objs[0] = get_global_key_from_local_key(
+                    local_key, self.model.config
+                )
+
+            # Step 2: gather global keys from ranks in PP group
+            src_global_rank = pp_global_ranks[owner_pp_local_rank_id]
+            torch.distributed.broadcast_object_list(
+                pp_gathered_objs, src=src_global_rank, group=pp_group
+            )
+
+            # Step 3: gather global keys from ranks in EP group
+            if ep_pattern.search(local_key):
+                ep_gathered_objs = [None] * ep_world_size
+                torch.distributed.all_gather_object(
+                    ep_gathered_objs, pp_gathered_objs, group=ep_group
+                )
+                flat_gathered_objs = [x for y in ep_gathered_objs for x in y]
+            else:
+                flat_gathered_objs = pp_gathered_objs
+
+            final_key_to_global_keys[(local_key, owner_pp_local_rank_id)] = (
+                flat_gathered_objs
+            )
+
+        return final_key_to_global_keys
+
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1228,9 +1326,18 @@ class MegatronPolicyWorker:
         tp_world_size = torch.distributed.get_world_size(tp_group)
         tp_group_rank_ids = get_process_group_ranks(tp_group)
 
+        etp_group = parallel_state.get_expert_tensor_parallel_group()
+        etp_world_size = torch.distributed.get_world_size(etp_group)
+        etp_group_rank_ids = get_process_group_ranks(etp_group)
+
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         pp_world_size = torch.distributed.get_world_size(pp_group)
         pp_group_rank_ids = get_process_group_ranks(pp_group)
+        pp_local_rank_id = parallel_state.get_pipeline_model_parallel_rank()
+
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = torch.distributed.get_world_size(ep_group)
+        ep_group_rank_ids = get_process_group_ranks(ep_group)
 
         # Collect parameter info
         param_info = []
@@ -1240,20 +1347,33 @@ class MegatronPolicyWorker:
 
         # Process each parameter in the model
         # state_dict includes parameters and persistent buffers
+        ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
         for name, param in self.model.state_dict().items():
             # Skip _extra_state entries (these are metadata, not actual weights)
             if "_extra_state" in name:
                 continue
 
+            use_etp = True if ep_pattern.search(name) else False
+            if use_etp:
+                tensor_mp_rank_ids = etp_group_rank_ids
+            else:
+                tensor_mp_rank_ids = tp_group_rank_ids
+
             shape = list(param.shape)
             tp_dim = get_tp_dim(self.model, name, named_modules_dict)
             if tp_dim is not None:
-                tp_rank_ids = tuple(sorted(tp_group_rank_ids))
+                tp_rank_ids = tuple(sorted(tensor_mp_rank_ids))
                 shape[tp_dim] *= len(tp_rank_ids)
             else:
                 tp_rank_ids = (torch.distributed.get_rank(),)
 
             pp_rank_ids = tuple(sorted(pp_group_rank_ids))
+            ep_rank_ids = tuple(sorted(ep_group_rank_ids))
+
+            if ep_pattern.search(name):
+                ep_rank_ids = tuple(sorted(ep_group_rank_ids))
+            else:
+                ep_rank_ids = (torch.distributed.get_rank(),)
 
             # Calculate size for this parameter
             prec_to_bytes = {
@@ -1265,14 +1385,15 @@ class MegatronPolicyWorker:
             size_in_bytes = (
                 param.element_size()
                 * param.numel()
-                * len(tp_rank_ids)
-                * len(pp_rank_ids)
+                * len(tensor_mp_rank_ids)
+                * len(ep_rank_ids)
                 * scale
             )
             param_info.append(
                 (
                     (
                         name,
+                        pp_local_rank_id,
                         tuple(shape),
                         param.dtype,
                     ),
@@ -1290,7 +1411,16 @@ class MegatronPolicyWorker:
         )
         pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
 
-        all_param_infos = pp_gathered_param_infos
+        # Gather parameter info from all expert parallel ranks to ensure complete coverage
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = torch.distributed.get_world_size(ep_group)
+
+        # Gather all parameter info from all EP ranks
+        ep_gathered_param_infos = [None] * ep_world_size
+        torch.distributed.all_gather_object(
+            ep_gathered_param_infos, pp_gathered_param_infos, group=ep_group
+        )
+        all_param_infos = [x for y in ep_gathered_param_infos for x in y]
 
         # Merge all parameter infos, keeping only unique parameter names
         merged_param_info = []
@@ -1312,8 +1442,9 @@ class MegatronPolicyWorker:
         device_idx = torch.cuda.current_device()
         ## Get device free memory using NVML
         total_available_bytes = get_free_memory_bytes(device_idx)
-        ## Use 80% of the free memory for safety
-        total_available_bytes *= 0.8
+        # TODO: setting to low value (10%) since
+        # more buckets seems to have better perf
+        total_available_bytes *= 0.1
 
         return param_info, total_available_bytes
 
@@ -1326,10 +1457,16 @@ class MegatronPolicyWorker:
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
+        if self._held_gather_buffer is not None:
+            del self._held_gather_buffer
+            self._held_gather_buffer = None
+
         gathered_megatron_params = gather_params(
             self.model,
             keys,
+            key_to_global_keys=self.local_key_to_global_keys,
         )
+
         gathered_hf_params = self.megatron_to_hf_converter.convert(
             gathered_megatron_params, self.model.config
         )
@@ -1493,19 +1630,20 @@ class MegatronPolicyWorker:
         # move all param and grad buffers to the device
         if isinstance(model, DistributedDataParallel):
             # DDP case
-            for buffer_idx in range(len(model.buffers)):
-                if device == "cpu":
-                    model.buffers[buffer_idx].offload_to_cpu(
-                        move_params=move_params, move_grads=move_grads
-                    )
-                elif device == "cuda":
-                    model.buffers[buffer_idx].reload_from_cpu(
-                        move_params=move_params, move_grads=move_grads
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                    )
+            for buffers in [model.buffers, model.expert_parallel_buffers]:
+                for buffer_idx in range(len(buffers)):
+                    if device == "cpu":
+                        buffers[buffer_idx].offload_to_cpu(
+                            move_params=move_params, move_grads=move_grads
+                        )
+                    elif device == "cuda":
+                        buffers[buffer_idx].reload_from_cpu(
+                            move_params=move_params, move_grads=move_grads
+                        )
+                    else:
+                        raise ValueError(
+                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                        )
         elif isinstance(model, custom_FSDP):
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)

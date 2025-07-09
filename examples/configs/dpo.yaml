@@ -92,12 +92,18 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: false
     tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "aux_loss"
+    moe_router_bias_update_rate: 1e-3
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     
