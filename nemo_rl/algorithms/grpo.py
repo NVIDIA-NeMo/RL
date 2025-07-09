@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Optional, Tuple, TypedDict, TypeVar, cast
 
@@ -169,19 +170,6 @@ def setup(
     )
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()
-
-    # config validation checks
-    if master_config["checkpointing"]["enabled"]:
-        assert master_config["checkpointing"]["save_period"] > 0
-        assert (
-            master_config["checkpointing"]["save_period"]
-            % master_config["grpo"]["val_period"]
-            == 0
-        ), (
-            f"Checkpointing save period {master_config['checkpointing']['save_period']} "
-            f"must be a multiple of validation period {master_config['grpo']['val_period']}"
-            f", or we won't know what metric to save!"
-        )
 
     # ==========================
     #           Data
@@ -683,7 +671,7 @@ def grpo_train(
             )
 
             # Run validation if it's a validation step
-            if is_last_step or (val_period > 0 and (step + 1) % val_period == 0):
+            if val_period > 0 and (step + 1) % val_period == 0:
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
                         policy, policy_generation, colocated_inference
@@ -714,8 +702,23 @@ def grpo_train(
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1
-                grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                if val_metrics is not None:
+                    grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                elif "val_reward" in grpo_save_state:
+                    del grpo_save_state["val_reward"]
                 grpo_save_state["consumed_samples"] = consumed_samples
+
+                if master_config["checkpointing"]["metric_name"] is not None:
+                    if (
+                        master_config["checkpointing"]["metric_name"]
+                        not in grpo_save_state
+                    ):
+                        warnings.warn(
+                            f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                            "Saving most recent k checkpoints instead."
+                        )
+                        master_config["checkpointing"]["metric_name"] = None
+
                 with timer.time("checkpointing"):
                     print(f"Saving checkpoint for step {step + 1}...")
                     checkpoint_path = checkpointer.init_tmp_checkpoint(

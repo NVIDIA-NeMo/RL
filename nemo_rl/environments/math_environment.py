@@ -69,7 +69,7 @@ class HFVerifyWorker:
 
     def verify(
         self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
-    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -80,6 +80,7 @@ class HFVerifyWorker:
             Union[list[float], tuple[list[float], list[str | None]]]. 
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
+            extracted_answers is a list of strings or None.
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -104,13 +105,15 @@ class HFVerifyWorker:
                     # Make sure the extracted answer is not None and is a list of two elements
                     assert extracted_answer is not None
                     assert len(extracted_answer) == 2
-                    extracted_answers.append(extracted_answer[1])
-                    print(f"ruit extracted_answer: {extracted_answer[1]}     gold_answer: {extracted_answer[0]}     ground_truth: {ground_truth}")
+                    # The extracted answer is a list of two elements. The first element is the gold answer. 
+                    # The second element is the predicted answer. The predicted answer also includes two 
+                    # elements which are parsed with different ExtractionConfig. (Not sure why there are two elements.)
+                    # We choose the first element as the predicted answer.
+                    extracted_answers.append(extracted_answer[1][0][0])
             except Exception:
                 results.append(0.0)
                 extracted_answers.append(None)
         if return_extracted_answer:
-            print(f"fruit results type: {type(results)} extracted_answers type: {type(extracted_answers)}  ")
             return results, extracted_answers
         else:
             return results
@@ -120,7 +123,7 @@ class HFVerifyWorker:
 class MultilingualMultichoiceVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
-    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -132,6 +135,7 @@ class MultilingualMultichoiceVerifyWorker:
             Union[list[float], tuple[list[float], list[str | None]]]. 
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
+            extracted_answers is a list of strings or None.
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -163,7 +167,7 @@ class MultilingualMultichoiceVerifyWorker:
 class EnglishMultichoiceVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
-    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -175,6 +179,7 @@ class EnglishMultichoiceVerifyWorker:
             Union[list[float], tuple[list[float], list[str | None]]]. 
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
+            extracted_answers is a list of strings or None.
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -300,7 +305,7 @@ class MathEnvironment(EnvironmentInterface):
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
-        extracted_answers = extracted_answers if return_extracted_answer else None
+        extracted_answers = extracted_answers_list if return_extracted_answer else None
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(
