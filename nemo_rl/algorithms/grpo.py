@@ -786,6 +786,10 @@ def grpo_train(
         print(
             f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
         )
+        if "total_flops" in train_results:
+            total_tflops = train_results['total_flops'] / timing_metrics['policy_training'] / 1e12
+            num_gpus = len(train_results['rank_flops'])
+            print(f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops/num_gpus:.2f} TFLOPS per rank)")
 
         print("\n⏱️  Timing:")
         # Display total time first, separately

@@ -406,15 +406,16 @@ def dpo_train(
 
             with timer.time("total_step_time"):
                 print("▶ Taking a training step...")
-                train_results = policy.train(
-                    batch,
-                    loss_fn,
-                    eval_mode=False,
-                    ## NOTE: we double the batch size here because each preference example corresponds to a pair of
-                    ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                    gbs=master_config["policy"]["train_global_batch_size"] * 2,
-                    mbs=master_config["policy"]["train_micro_batch_size"] * 2,
-                )
+                with timer.time("policy_training"):
+                    train_results = policy.train(
+                        batch,
+                        loss_fn,
+                        eval_mode=False,
+                        ## NOTE: we double the batch size here because each preference example corresponds to a pair of
+                        ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
+                        gbs=master_config["policy"]["train_global_batch_size"] * 2,
+                        mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][
                     "max_num_steps"
@@ -508,6 +509,10 @@ def dpo_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            if "total_flops" in train_results:
+                total_tflops = train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+                num_gpus = len(train_results["rank_flops"])
+                print(f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops/num_gpus:.2f} TFLOPS per rank)")
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

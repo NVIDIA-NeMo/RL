@@ -41,6 +41,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -180,6 +181,12 @@ class DTensorPolicyWorker:
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
         )
+
+        try:
+            self.flops_tracker = FLOPTracker.from_config(model_name, model_config)
+        except ValueError as e:
+            self.flops_tracker = None
+            print(f"FLOPS tracker not supported for model {model_name}: {e}")
 
         full_state_dict = None
         if self.rank == 0:
@@ -470,6 +477,9 @@ class DTensorPolicyWorker:
             # Ensure model is in training mode
             self.model.train()
 
+        if self.flops_tracker:
+            self.flops_tracker.reset()
+
         with ctx:
             # Get data from batch and move to device
             data.to("cuda")
@@ -524,6 +534,8 @@ class DTensorPolicyWorker:
                     input_ids = mb.get("input_ids").cuda()
                     input_lengths = mb.get("input_lengths")
                     batch_size, seq_len = input_ids.shape
+                    if self.flops_tracker:
+                        self.flops_tracker.track(batch_size, seq_len)
 
                     attention_mask = torch.zeros(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
@@ -710,6 +722,7 @@ class DTensorPolicyWorker:
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
                 "all_mb_metrics": dict(mb_metrics),
+                "total_flops": self.flops_tracker.total_flops if self.flops_tracker else None
             }
 
             return metrics

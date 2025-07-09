@@ -330,6 +330,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "grad_norm": results[0]["grad_norm"],
         }
 
+        if all("total_flops" in r and r["total_flops"] is not None for r in results):
+            aggregated_results["total_flops"] = sum(r["total_flops"] for r in results)
+            aggregated_results["rank_flops"] = [r["total_flops"] for r in results]
+
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
         for r in results:
