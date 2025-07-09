@@ -29,8 +29,11 @@ from nemo.lightning.io.state import (
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.integrations.accelerate import init_empty_weights
 
+import nemo_rl.models.megatron.converters.deepseek as deepseek_converter
 import nemo_rl.models.megatron.converters.llama as llama_converter
 import nemo_rl.models.megatron.converters.qwen2 as qwen2_converter
+
+_GROUP_TO_RANKS_CACHE = {}
 
 
 def get_local_layer_num(s):
@@ -271,21 +274,28 @@ class MegatronToHFConverter:
         global_keys = ep_gathered_global_keys
         global_keys_map = {k: None for k in global_keys}
 
-        if "qwen" in hf_model_name.lower():
+        if config.model_type == "qwen2":
             self.export_mapping = qwen2_converter.get_export_mapping(megatron_model)
             self.export_transforms = qwen2_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )
-        elif "llama" in hf_model_name.lower():
+        elif config.model_type == "llama":
             self.export_mapping = llama_converter.get_export_mapping()
             self.export_transforms = llama_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )
+        elif config.model_type in ("deepseek_v2", "deepseek_v3"):
+            self.export_mapping = deepseek_converter.get_export_mapping(
+                source=global_keys_map,
+                source_config=megatron_model.config.__dict__,
+            )
+            self.export_transforms = deepseek_converter.get_export_transforms()
+            self.get_source_fn = deepseek_converter.get_source_fn
         else:
             raise ValueError(
-                f"No converter mapping and transforms found for {hf_model_name}"
+                f"No converter mapping and transforms found for {hf_model_name} with model_type {config.model_type}"
             )
 
         self.export_transforms = update_transforms_for_nemorl(self.export_transforms)
