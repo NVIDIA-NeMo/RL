@@ -43,8 +43,9 @@ def math_env():
 
 
 @pytest.fixture(scope="module")
-def multichoice_env():
+def multichoice_env(request):
     """Create a MathEnvironment actor for testing."""
+    verifier_type = request.param
     env = MathEnvironment.options(
         runtime_env={
             "py_executable": get_actor_python_env(
@@ -52,7 +53,7 @@ def multichoice_env():
             ),
             "env_vars": dict(os.environ),
         }
-    ).remote({"num_workers": 2, "verifier_type": "multichoice"})
+    ).remote({"num_workers": 2, "verifier_type": verifier_type})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
@@ -88,8 +89,9 @@ def basic_test_data():
 
 
 @pytest.fixture
-def basic_multichoice_test_data():
+def multichoice_test_data(request):
     """Common test data for basic multichoice problems."""
+    answer_key = request.param
     return {
         "message_log_batch": [
             [
@@ -97,21 +99,21 @@ def basic_multichoice_test_data():
                     "role": "user",
                     "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
                 },
-                {"role": "assistant", "content": "\nAnswer: C"},
+                {"role": "assistant", "content": f"\n{answer_key}: C"},
             ],
             [
                 {
                     "role": "user",
                     "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
                 },
-                {"role": "assistant", "content": "\nAnswer: B"},
+                {"role": "assistant", "content": f"\n{answer_key}: B"},
             ],
             [
                 {
                     "role": "user",
                     "content": "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD",
                 },
-                {"role": "assistant", "content": "\nAnswer: D"},
+                {"role": "assistant", "content": f"\n{answer_key}: D"},
             ],
         ],
         "metadata": [
@@ -202,12 +204,20 @@ def test_math_env_step_basic(math_env, basic_test_data):
     assert all(result.terminateds == 1.0), "All terminated flags should be 1.0"
 
 
-def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data):
+@pytest.mark.parametrize(
+    "multichoice_env, multichoice_test_data",
+    [
+        ("english_multichoice", "Answer"),
+        ("multilingual_multichoice", "答案"),
+    ],
+    indirect=True,
+)
+def test_multichoice_env_step_basic(multichoice_env, multichoice_test_data):
     """Test basic functionality of MathEnvironment step with multichoice verifier."""
     result = ray.get(
         multichoice_env.step.remote(
-            basic_multichoice_test_data["message_log_batch"],
-            basic_multichoice_test_data["metadata"],
+            multichoice_test_data["message_log_batch"],
+            multichoice_test_data["metadata"],
         )
     )
 
@@ -227,7 +237,7 @@ def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data
 
     # Check metadata
     assert len(result.metadata) == 3, "Should return metadata for all 3 messages"
-    assert result.metadata == basic_multichoice_test_data["metadata"], (
+    assert result.metadata == multichoice_test_data["metadata"], (
         "Metadata should be unchanged"
     )
 
@@ -236,7 +246,7 @@ def test_multichoice_env_step_basic(multichoice_env, basic_multichoice_test_data
     assert all(result.rewards[:2] == 1.0), (
         "The first two rewards should be 1.0 for correct answers"
     )
-    assert result.rewards[2] == 0.0, "The thrid  reward should be 0.0 for wrong answer"
+    assert result.rewards[2] == 0.0, "The third reward should be 0.0 for wrong answer"
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"
     )

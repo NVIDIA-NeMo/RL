@@ -59,17 +59,40 @@ class VllmInternalWorkerExtension:
             # Get handles for this device
             device_uuid = self.report_device_id()
             handles = ipc_handles[device_uuid]
+            is_tensor_packed = handles[0]
+            if is_tensor_packed:
+                _, all_handles, tensor_metadata = handles
+            else:
+                _, name_and_handle_list = handles
+
             device_id = self.device.index
             weights = []
 
-            # Process each handle to get the tensor
-            for name, handle in handles:
-                func, args = handle
-                list_args = list(args)
-                # Update device ID to match the current device
-                list_args[6] = device_id
-                tensor = func(*list_args)
-                weights.append((name, tensor))
+            if is_tensor_packed:
+                # Extract packed tensor from IPC handle
+                dtype_to_packed_tensor = {}
+                for dtype, tensor_handle in all_handles:
+                    func, args = tensor_handle
+                    list_args = list(args)
+                    list_args[6] = device_id
+                    tensor = func(*list_args)
+                    dtype_to_packed_tensor[dtype] = tensor
+
+                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
+                # using extra memory.
+                for key, (shape, dtype, offset, size) in tensor_metadata.items():
+                    tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
+                        *shape
+                    )
+                    weights.append((key, tensor))
+            else:
+                # Process each handle to get the tensor
+                for name, handle in name_and_handle_list:
+                    func, args = handle
+                    list_args = list(args)
+                    list_args[6] = device_id
+                    tensor = func(*list_args)
+                    weights.append((name, tensor))
 
             # Load weights into the model
             self.model_runner.model.load_weights(weights=weights)

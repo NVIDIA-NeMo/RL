@@ -230,7 +230,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
-            if generation_config["backend"] in ("hf", "megatron")
+            if generation_config["backend"] == "megatron"
             else 2,
         )
         train_cluster = cluster
@@ -238,8 +238,8 @@ def setup(
         print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
     else:
-        assert generation_config["backend"] not in ("hf", "megatron"), (
-            "Non-colocated inference is not supported for either the HF or Megatron generation backends. "
+        assert generation_config["backend"] != "megatron", (
+            "Non-colocated inference is not supported for Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
 
@@ -315,7 +315,7 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    if backend in ("hf", "megatron"):
+    if backend == "megatron":
         policy_generation = None
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}"
@@ -488,7 +488,7 @@ def grpo_train(
     """Run GRPO training algorithm."""
     timer = Timer()
     NEED_REFIT = True
-    # If policy_generation is None, use the policy as the generation interface (hf framework backend)
+    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
