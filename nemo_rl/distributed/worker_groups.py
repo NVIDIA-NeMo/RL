@@ -318,6 +318,7 @@ class RayWorkerGroup:
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
         env_vars: dict[str, str] = {},
+        use_expandable_segments: Optional[bool] = None,
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -392,7 +393,10 @@ class RayWorkerGroup:
 
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
-            remote_worker_builder, bundle_indices_list, env_vars=env_vars
+            remote_worker_builder,
+            bundle_indices_list,
+            env_vars=env_vars,
+            use_expandable_segments=use_expandable_segments,
         )
 
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
@@ -409,6 +413,7 @@ class RayWorkerGroup:
         remote_worker_builder: RayWorkerBuilder,
         bundle_indices_list: list[tuple[int, list[int]]],
         env_vars: dict[str, str] = {},
+        use_expandable_segments: Optional[bool] = None,
     ) -> None:
         """Create workers based on explicit bundle indices for tied worker groups.
 
@@ -506,6 +511,11 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+
+                if use_expandable_segments is not None:
+                    runtime_env["env_vars"]["PYTORCH_CUDA_ALLOC_CONF"] = (
+                        f"expandable_segments:{use_expandable_segments}"
+                    )
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 

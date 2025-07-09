@@ -120,6 +120,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
+            use_expandable_segments=config["megatron_cfg"].get(
+                "use_expandable_segments", None
+            ),
         )
 
         if config["dynamic_batching"]["enabled"]:
