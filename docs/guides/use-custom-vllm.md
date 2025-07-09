@@ -13,8 +13,19 @@ bash tools/build-custom-vllm.sh https://github.com/terrykong/vllm.git terryk/dem
 ## Update `pyproject.toml` to Use Your Local vLLM
 Edit your [pyproject.toml](https://github.com/NVIDIA-NeMo/RL/blob/main/pyproject.toml) so that the  `vLLM`  dependency points to your local clone instead of PyPI.
 
-**Change the vLLM dependency:**
+**Change the pyproject.toml:**
 ```toml
+# Add setuptools_scm
+[project]
+# ...<OMITTED>
+dependencies = [
+# ...<OMITTED>
+    "setuptools_scm",  # <-- Add
+# ...<OMITTED>
+]
+
+# Change the vLLM dependency:
+
 [project.optional-dependencies]
 vllm = [
     #"vllm==0.9.0",  # <-- BEFORE
@@ -22,12 +33,14 @@ vllm = [
 ]
 
 # ...<OMITTED>
+
 # Add a local source entry:
 [tool.uv.sources]
 # ...<OMITTED>
 vllm = { path = "3rdparty/vllm", editable = true }  # <-- ADD AN ENTRY
 
 # ...<OMITTED>
+
 # Update build isolation packages:
 [tool.uv]
 no-build-isolation-package = ["transformer-engine-torch", "transformer-engine"]          # <-- BEFORE

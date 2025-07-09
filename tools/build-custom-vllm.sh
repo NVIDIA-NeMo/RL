@@ -50,14 +50,18 @@ git checkout "$BRANCH"
 echo "Creating Python environment..."
 uv venv
 
+# Remove all comments from requirements files to prevent use_existing_torch.py from incorrectly removing xformers
+echo "Removing comments from requirements files..."
+find requirements/ -name "*.txt" -type f -exec sed -i 's/#.*$//' {} \; 2>/dev/null || true
+find requirements/ -name "*.txt" -type f -exec sed -i '/^[[:space:]]*$/d' {} \; 2>/dev/null || true
+
 uv run --no-project use_existing_torch.py
 
 # Install dependencies
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.7.0 --torch-backend=auto
-uv pip install xformers  # this probably gets removed erroneously by use_existing_torch.py b/c it has torch in a comment
+uv pip install torch==2.7.0 --torch-backend=cu128
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."
