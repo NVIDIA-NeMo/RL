@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Callable, Any
+from typing import Optional, Callable
 from dataclasses import asdict
 from nemo_rl.utils.flops_formulas import FLOPSConfig, qwen2, llama2, llama3
 
