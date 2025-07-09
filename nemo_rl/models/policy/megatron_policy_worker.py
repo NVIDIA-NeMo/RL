@@ -327,7 +327,9 @@ def destroy_parallel_state():
         pass
 
 
-@ray.remote(runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"))
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
 class MegatronPolicyWorker:
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.

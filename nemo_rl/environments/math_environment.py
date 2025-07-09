@@ -52,7 +52,7 @@ def _mute_output():
         yield
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class HFVerifyWorker:
     def __init__(self) -> None:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
@@ -100,7 +100,7 @@ class HFVerifyWorker:
         return results
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class MultilingualMultichoiceVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
@@ -133,7 +133,7 @@ class MultilingualMultichoiceVerifyWorker:
         return results
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class EnglishMultichoiceVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
@@ -166,7 +166,7 @@ class MathEnvironmentMetadata(TypedDict):
     ground_truth: str
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)
+@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class MathEnvironment(EnvironmentInterface):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
