@@ -27,7 +27,7 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
-    elif hf_config.model_type == "qwen":
+    elif hf_config.model_type == "qwen2":
         from nemo.tron.converter.qwen import HFQwen2Importer
 
         print(f"Importing model {hf_model_name} to {output_path}...")

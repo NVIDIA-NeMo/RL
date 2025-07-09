@@ -274,7 +274,7 @@ class MegatronToHFConverter:
         global_keys = ep_gathered_global_keys
         global_keys_map = {k: None for k in global_keys}
 
-        if config.model_type == "qwen":
+        if config.model_type == "qwen2":
             self.export_mapping = qwen2_converter.get_export_mapping(megatron_model)
             self.export_transforms = qwen2_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
