@@ -1328,6 +1328,7 @@ class VllmGeneration(GenerationInterface):
             "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
         )
 
+        # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         env_vars = {}
