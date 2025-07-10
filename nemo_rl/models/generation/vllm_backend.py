@@ -21,7 +21,8 @@ except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
         "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-        "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+        "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
+        "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
 
 
