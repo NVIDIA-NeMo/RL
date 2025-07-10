@@ -170,7 +170,6 @@ def setup(
                 "make_sequence_length_divisible_by"
             ],
         ),
-        drop_last=True,
     )
 
     # ==========================
