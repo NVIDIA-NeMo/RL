@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -69,8 +69,8 @@ class HFVerifyWorker:
         )
 
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> list[float]:
+        self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
+    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -78,15 +78,19 @@ class HFVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            list[float]. The rewards for each predicted response.
+            Union[list[float], tuple[list[float], list[str | None]]]. 
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
+        extracted_answers: list[str | None] = []
+        
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
                 ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                 with _mute_output():
                     try:
-                        ret_score, _ = self.verify_func(
+                        ret_score, extracted_answer = self.verify_func(
                             [ground_truth_parsable], [response]
                         )
                     # It's possible to emit a TimeoutException and that wouldn't be caught since
@@ -94,28 +98,45 @@ class HFVerifyWorker:
                     # to catch it.
                     except (Exception, TimeoutException):
                         ret_score = 0.0
+                        extracted_answers = None
 
                 results.append(float(ret_score))
+                if return_extracted_answer:
+                    # Make sure the extracted answer is not None and is a list of two elements
+                    assert extracted_answer is not None
+                    assert len(extracted_answer) == 2
+                    extracted_answers.append(extracted_answer[1])
+                    print(f"ruit extracted_answer: {extracted_answer[1]}     gold_answer: {extracted_answer[0]}     ground_truth: {ground_truth}")
             except Exception:
                 results.append(0.0)
-        return results
+                extracted_answers.append(None)
+        if return_extracted_answer:
+            print(f"fruit results type: {type(results)} extracted_answers type: {type(extracted_answers)}  ")
+            return results, extracted_answers
+        else:
+            return results
 
 
 @ray.remote  # pragma: no cover
 class MultilingualMultichoiceVerifyWorker:
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> list[float]:
+        self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
+    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
             pred_responses: list[str]. The predicted responses from the LLM.
             ground_truths: list[str]. The ground truth responses.
+            return_extracted_answer: bool. Whether to return extracted answers along with scores.
 
         Returns:
-            list[float]. The rewards for each predicted response.
+            Union[list[float], tuple[list[float], list[str | None]]]. 
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
+        extracted_answers: list[str | None] = []
+        
         for response, ground_truth in zip(pred_responses, ground_truths):
             response = answer_parsing.normalize_response(response)
             extracted_answer = None
@@ -131,24 +152,34 @@ class MultilingualMultichoiceVerifyWorker:
                     break
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
-        return results
+            extracted_answers.append(extracted_answer)
+        
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 @ray.remote  # pragma: no cover
 class EnglishMultichoiceVerifyWorker:
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> list[float]:
+        self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
+    ) -> Union[list[float], tuple[list[float], list[list[str] | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
             pred_responses: list[str]. The predicted responses from the LLM.
             ground_truths: list[str]. The ground truth responses.
+            return_extracted_answer: bool. Whether to return extracted answers along with scores.
 
         Returns:
-            list[float]. The rewards for each predicted response.
+            Union[list[float], tuple[list[float], list[str | None]]]. 
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
+        extracted_answers: list[str | None] = []
+        
         for response, ground_truth in zip(pred_responses, ground_truths):
             ground_truth = answer_parsing.normalize_response(ground_truth)
             response = answer_parsing.normalize_response(response)
@@ -160,7 +191,13 @@ class EnglishMultichoiceVerifyWorker:
                 )
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
-        return results
+            if return_extracted_answer:
+                extracted_answers.append(extracted_answer)
+        
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 class MathEnvironmentMetadata(TypedDict):
@@ -198,12 +235,14 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         self,
         message_log_batch: list[LLMMessageLogType],
         metadata: list[MathEnvironmentMetadata],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn[MathEnvironmentMetadata]:
         """Runs a step in the math environment.
 
         Args:
             message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
             metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness.
+            return_extracted_answer: bool. Whether to extract and return answers in metadata.
 
         Returns:
             EnvironmentReturn: A tuple containing:
@@ -231,18 +270,28 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
 
-        # # Process each chunk in parallel
+        # Process each chunk in parallel
         futures = [
-            self.workers[i].verify.remote(chunk, ground_truth_chunk)
+            self.workers[i].verify.remote(chunk, ground_truth_chunk, return_extracted_answer)
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
 
-        results = ray.get(futures)
+        worker_results = ray.get(futures)
 
-        # flatten the results
-        results = [item for sublist in results for item in sublist]
+        # Flatten the results and extract both scores and answers
+        results = []
+        extracted_answers_list: list[str | None] = []
+        
+        for worker_result in worker_results:
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                results.extend(worker_scores)
+                extracted_answers_list.extend(worker_answers)
+            else:
+                results.extend(worker_result)
+        
         observations = [
             {
                 "role": "environment",
@@ -252,11 +301,12 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
             }
             for result in results
         ]
+        
 
         # create a tensor of rewards and done flags
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
-
+        extracted_answers = extracted_answers if return_extracted_answer else None
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(
@@ -264,6 +314,7 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
             metadata=metadata,
             next_stop_strings=next_stop_strings,
             rewards=rewards,
+            extracted_answers=extracted_answers,
             terminateds=done,
         )
 
