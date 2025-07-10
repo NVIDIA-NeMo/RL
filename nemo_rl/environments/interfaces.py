@@ -40,6 +40,7 @@ class EnvironmentReturn(NamedTuple):
     metadata: list[Optional[dict]]
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
+    extracted_answers: list[list[str] | None]
     terminateds: Tensor
 
 
