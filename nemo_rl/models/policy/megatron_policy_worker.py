@@ -1254,6 +1254,11 @@ class MegatronPolicyWorker:
         return get_device_uuid(device_idx)
 
     @torch.no_grad()
+    def prepare_refit_info(self) -> None:
+        # Get parameter info for refit
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.refit_param_info = get_param_info(self.model, self.dtype)
+
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1261,13 +1266,6 @@ class MegatronPolicyWorker:
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        # Ensure model is in evaluation mode
-        self.model.eval()
-
-        # Get parameter info for refit
-        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        param_info = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1278,7 +1276,7 @@ class MegatronPolicyWorker:
         # more buckets seems to have better perf
         total_available_bytes *= 0.1
 
-        return param_info, total_available_bytes
+        return self.refit_param_info, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
