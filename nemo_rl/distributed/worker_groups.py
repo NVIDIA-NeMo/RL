@@ -426,7 +426,9 @@ class RayWorkerGroup:
         )
 
         # Update env_vars with the current environment variables
-        env_vars.update(dict(os.environ))
+        for k, v in os.environ.items():
+            if k not in env_vars:
+                env_vars[k] = v
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
