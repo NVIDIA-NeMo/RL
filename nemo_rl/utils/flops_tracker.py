@@ -15,6 +15,7 @@
 from dataclasses import asdict
 from typing import Callable, Optional
 
+import torch
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
@@ -45,6 +46,19 @@ def convert_config_to_flops_config(
         ), llama3 if "llama3" in model_name.lower() else llama2
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
+
+
+THEORETICAL_FLOPS = {("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2}
+
+
+def get_theoretical_flops(device_name: str, model_dtype: torch.dtype) -> float:
+    """Get the theoretical total flops for a device name."""
+    if (device_name, model_dtype) in THEORETICAL_FLOPS:
+        return THEORETICAL_FLOPS[(device_name, model_dtype)]
+    else:
+        raise ValueError(
+            f"Unknown device name: {device_name} and dtype name: {model_dtype}"
+        )
 
 
 class FLOPTracker:
