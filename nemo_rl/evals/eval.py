@@ -39,7 +39,7 @@ class EvalConfig(TypedDict):
     metric: str
     num_tests_per_prompt: int
     seed: int
-    pass_k_value: int
+    k_value: int
 
 
 class MasterConfig(TypedDict):
@@ -85,7 +85,7 @@ def setup(
 
     # Check settings
     metric = eval_config["metric"]
-    pass_k_value = eval_config["pass_k_value"]
+    k_value = eval_config["k_value"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     temperature = generation_config["temperature"]
     top_k = generation_config["top_k"]
@@ -98,11 +98,11 @@ def setup(
             "temperature > 0 and top_k != 1 are required for multiple samples"
         )
 
-    assert pass_k_value >= 1, (
-        "pass_k_value must be greater than or equal to 1 for pass@k metric"
+    assert k_value >= 1, (
+        "k_value must be greater than or equal to 1 for pass@k metric"
     )
-    assert num_tests_per_prompt >= pass_k_value, (
-        "num_tests_per_prompt must be greater than or equal to pass_k_value for pass@k metric"
+    assert num_tests_per_prompt >= k_value, (
+        "num_tests_per_prompt must be greater than or equal to k_value for pass@k metric"
     )
 
     # ==========================
@@ -189,6 +189,20 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
 
     return pass_k_score
 
+def eval_cons_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, extracted_answers: list[list[str]| None]) -> float:
+    """Evaluate cons@k score using an unbiased estimator.
+    
+    Args:
+        rewards: Tensor of shape (batch_size * num_tests_per_prompt)
+        num_tests_per_prompt: int
+        k: int
+        extracted_answers: list[list[str]| None]
+
+    Returns:
+        cons_k_score: float
+    """
+    pass
+    
 
 def run_env_eval(vllm_generation, dataloader, env, master_config):
     """Main entry point for running evaluation using environment.
@@ -206,7 +220,7 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
     eval_config = master_config["eval"]
     metric = eval_config["metric"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
-    pass_k_value = eval_config["pass_k_value"]
+    k_value = eval_config["k_value"]
 
     # Run evaluation loop
     score = 0.0
@@ -240,11 +254,13 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
             get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
             for i in range(len(batch["message_log"]))
         ]
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
+        # Set return_extracted_answer to True to get the extracted answers
+        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"],True))
         rewards = env_return.rewards
+        extracted_answers = env_return.extracted_answers
         # update stats
         if metric == "pass@k":
-            score += eval_pass_k(rewards, num_tests_per_prompt, pass_k_value)
+            score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
@@ -264,6 +280,6 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
     print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
-    print(f"{metric=} {pass_k_value=} {num_tests_per_prompt=}\n")
+    print(f"{metric=} {k_value=} {num_tests_per_prompt=}\n")
     print(f"score={average_score:.4f} ({score}/{len(dataloader.dataset)})")
     print("=" * 60 + "\n")
