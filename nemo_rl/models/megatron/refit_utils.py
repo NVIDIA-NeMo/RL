@@ -164,11 +164,21 @@ def gather_params(model, keys, key_to_global_keys: Dict[str, List[str]]):
 def get_param_info(model, dtype):
     # Get parallel info
     tp_group = parallel_state.get_tensor_model_parallel_group()
+    tp_world_size = torch.distributed.get_world_size(tp_group)
     tp_group_rank_ids = get_process_group_ranks(tp_group)
+
+    etp_group = parallel_state.get_expert_tensor_parallel_group()
+    etp_world_size = torch.distributed.get_world_size(etp_group)
+    etp_group_rank_ids = get_process_group_ranks(etp_group)
 
     pp_group = parallel_state.get_pipeline_model_parallel_group()
     pp_world_size = torch.distributed.get_world_size(pp_group)
     pp_group_rank_ids = get_process_group_ranks(pp_group)
+    pp_local_rank_id = parallel_state.get_pipeline_model_parallel_rank()
+
+    ep_group = parallel_state.get_expert_model_parallel_group()
+    ep_world_size = torch.distributed.get_world_size(ep_group)
+    ep_group_rank_ids = get_process_group_ranks(ep_group)
 
     # Collect parameter info
     param_info = []
@@ -178,20 +188,33 @@ def get_param_info(model, dtype):
 
     # Process each parameter in the model
     # state_dict includes parameters and persistent buffers
+    ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
     for name, param in model.state_dict().items():
         # Skip _extra_state entries (these are metadata, not actual weights)
         if "_extra_state" in name:
             continue
 
+        use_etp = True if ep_pattern.search(name) else False
+        if use_etp:
+            tensor_mp_rank_ids = etp_group_rank_ids
+        else:
+            tensor_mp_rank_ids = tp_group_rank_ids
+
         shape = list(param.shape)
         tp_dim = get_tp_dim(model, name, named_modules_dict)
         if tp_dim is not None:
-            tp_rank_ids = tuple(sorted(tp_group_rank_ids))
+            tp_rank_ids = tuple(sorted(tensor_mp_rank_ids))
             shape[tp_dim] *= len(tp_rank_ids)
         else:
             tp_rank_ids = (torch.distributed.get_rank(),)
 
         pp_rank_ids = tuple(sorted(pp_group_rank_ids))
+        ep_rank_ids = tuple(sorted(ep_group_rank_ids))
+
+        if ep_pattern.search(name):
+            ep_rank_ids = tuple(sorted(ep_group_rank_ids))
+        else:
+            ep_rank_ids = (torch.distributed.get_rank(),)
 
         # Calculate size for this parameter
         prec_to_bytes = {
@@ -203,20 +226,24 @@ def get_param_info(model, dtype):
         size_in_bytes = (
             param.element_size()
             * param.numel()
-            * len(tp_rank_ids)
-            * len(pp_rank_ids)
+            * len(tensor_mp_rank_ids)
+            * len(ep_rank_ids)
             * scale
         )
         param_info.append(
             (
                 (
                     name,
+                    pp_local_rank_id,
                     tuple(shape),
                     param.dtype,
                 ),
                 size_in_bytes,
             )
         )
+    # Gather parameter info from all pipeline parallel ranks to ensure complete coverage
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+    pp_world_size = torch.distributed.get_world_size(pp_group)
 
     # Gather all parameter info from all PP ranks
     pp_gathered_param_infos = [None] * pp_world_size
@@ -225,7 +252,16 @@ def get_param_info(model, dtype):
     )
     pp_gathered_param_infos = [x for y in pp_gathered_param_infos for x in y]  # type: ignore
 
-    all_param_infos = pp_gathered_param_infos
+    # Gather parameter info from all expert parallel ranks to ensure complete coverage
+    ep_group = parallel_state.get_expert_model_parallel_group()
+    ep_world_size = torch.distributed.get_world_size(ep_group)
+
+    # Gather all parameter info from all EP ranks
+    ep_gathered_param_infos = [None] * ep_world_size
+    torch.distributed.all_gather_object(
+        ep_gathered_param_infos, pp_gathered_param_infos, group=ep_group
+    )
+    all_param_infos = [x for y in ep_gathered_param_infos for x in y]
 
     # Merge all parameter infos, keeping only unique parameter names
     merged_param_info = []
@@ -244,7 +280,7 @@ def get_param_info(model, dtype):
 
 
 @torch.no_grad()
-def get_local_key_to_global_keys(self, state_dict_info: List[Tuple[Any, int]]):
+def get_local_key_to_global_keys(model, state_dict_info: List[Tuple[Any, int]]):
     """Get the local key to global keys mapping."""
     # Get parallel info
     tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -260,7 +296,7 @@ def get_local_key_to_global_keys(self, state_dict_info: List[Tuple[Any, int]]):
 
     # start calculating the global key
     ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
-    state_dict = self.model.state_dict()
+    state_dict = model.state_dict()
     final_key_to_global_keys = {}
 
     for param_info, size in state_dict_info:
@@ -271,9 +307,7 @@ def get_local_key_to_global_keys(self, state_dict_info: List[Tuple[Any, int]]):
         # else: not sharded (like embedding)
         pp_gathered_objs = [None]
         if local_key in state_dict and owner_pp_local_rank_id == pp_local_rank_id:
-            pp_gathered_objs[0] = get_global_key_from_local_key(
-                local_key, self.model.config
-            )
+            pp_gathered_objs[0] = get_global_key_from_local_key(local_key, model.config)
 
         # Step 2: gather global keys from ranks in PP group
         src_global_rank = pp_global_ranks[owner_pp_local_rank_id]

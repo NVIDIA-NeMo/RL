@@ -13,13 +13,12 @@
 # limitations under the License.
 import gc
 import os
-import re
 import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Iterator, List, Optional, Tuple, TypeVar
+from typing import Any, Iterator, Optional, TypeVar
 
 import ray
 import torch
@@ -102,8 +101,8 @@ from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.converters.common import MegatronToHFConverter
 from nemo_rl.models.megatron.refit_utils import (
     gather_params,
-    get_param_info,
     get_local_key_to_global_keys,
+    get_param_info,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -668,17 +667,16 @@ class MegatronPolicyWorker:
         self._held_gather_buffer = None
         self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
 
-        # Create a map that maps any local parameter name to a list of global parameter names.
-        # This map is repeatedly used by parameter gatherring phase during refit of every step.
-        self.local_key_to_global_keys = get_local_key_to_global_keys(
-            state_dict_info=self.prepare_weights_for_ipc()[0]
-        )
         self.should_disable_forward_pre_hook = (
             self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
             and self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
                 "overlap_param_gather"
             ]
         )
+
+        # refit stuff, will be initialized in prepare_refit_info
+        self.refit_param_info = None
+        self.local_key_to_global_keys = None
 
     def configure_worker(self, num_gpus: int, bundle_indices: Optional[tuple] = None):
         USE_EXPANDABLE_SEGMENTS = False  # Disabling this right now as it seems to cause vLLM refit issues with Ampere
@@ -1258,6 +1256,12 @@ class MegatronPolicyWorker:
         # Get parameter info for refit
         # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
         self.refit_param_info = get_param_info(self.model, self.dtype)
+
+        # Create a map that maps any local parameter name to a list of global parameter names.
+        # This map is repeatedly used by parameter gatherring phase during refit of every step.
+        self.local_key_to_global_keys = get_local_key_to_global_keys(
+            self.model, state_dict_info=self.refit_param_info
+        )
 
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
