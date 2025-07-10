@@ -41,7 +41,7 @@ basic_vllm_test_config: VllmConfig = {
         "name": model_name,
     },
     "dtype": "bfloat16",
-    "max_new_tokens": 5,
+    "max_new_tokens": 5,  # Small number of tokens for testing
     "temperature": 0.8,
     "top_p": 1.0,
     "top_k": None,
@@ -133,15 +133,6 @@ def get_basic_megatron_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
         "precision": precision,
-        "generation": {
-            "backend": "megatron",
-            "temperature": 1.0,
-            "max_new_tokens": 16,  # Small number of tokens for testing
-            "top_p": 1.0,
-            "top_k": None,
-            "stop_token_ids": None,
-            "stop_strings": None,
-        },
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -202,6 +193,7 @@ def get_basic_megatron_test_config(
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
+        "generation": deepcopy(basic_vllm_test_config),
     }
 
 
