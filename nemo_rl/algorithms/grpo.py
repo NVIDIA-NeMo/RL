@@ -794,6 +794,12 @@ def grpo_train(
             print(
                 f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_gpus:.2f} TFLOPS per rank)"
             )
+            if "theoretical_flops" in train_results:
+                theoretical_flops = train_results["theoretical_flops"]
+                print(
+                    f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_flops:.2f}%"
+                )
+                metrics["train_fp_utilization"] = total_tflops / theoretical_flops
 
         print("\n⏱️  Timing:")
         # Display total time first, separately

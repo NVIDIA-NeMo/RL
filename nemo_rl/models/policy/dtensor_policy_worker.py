@@ -721,6 +721,8 @@ class DTensorPolicyWorker:
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
+                "gpu_name": torch.cuda.get_device_name(),
+                "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
                 "total_flops": self.flops_tracker.total_flops
                 if self.flops_tracker
