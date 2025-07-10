@@ -54,6 +54,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+  shuffle: true
 logger:
   log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   wandb_enabled: true

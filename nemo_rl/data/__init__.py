@@ -25,6 +25,7 @@ class DataConfig(TypedDict):
     add_eos: Optional[bool]
     input_key: Optional[str]
     output_key: Optional[str]
+    shuffle: Optional[bool]
 
 
 class MathDataConfig(DataConfig):
