@@ -29,6 +29,7 @@ guides/dpo.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/eval.md
+guides/deepseek.md
 model-quirks.md
 ```
 
@@ -47,6 +48,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+guides/use-custom-vllm.md
 apidocs/index.rst
 ```
 

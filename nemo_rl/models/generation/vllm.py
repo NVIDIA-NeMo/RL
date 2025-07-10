@@ -76,7 +76,7 @@ class VllmConfig(GenerationConfig):
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.

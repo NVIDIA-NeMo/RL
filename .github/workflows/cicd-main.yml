@@ -210,7 +210,7 @@ jobs:
       UNIT_TEST_SCRIPT: |
         cd /opt/nemo-rl
         if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term --cov-report=json
+          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term-missing --cov-report=json
         else
           echo Skipping unit tests for docs-only level
         fi

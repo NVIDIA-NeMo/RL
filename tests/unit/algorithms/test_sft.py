@@ -115,8 +115,8 @@ def test_exit_on_max_steps(mock_components):
         sft_save_state,
     )
 
-    # Verify we only trained for 12 + 1 steps. The extra 1 step is the final validation step.
-    assert mock_components["policy"].train.call_count == 12 + 1
+    # Verify we only trained for 12 steps.
+    assert mock_components["policy"].train.call_count == 12
 
 
 def test_exit_on_max_epochs(mock_components):
@@ -141,5 +141,5 @@ def test_exit_on_max_epochs(mock_components):
         sft_save_state,
     )
 
-    # Verify we trained for exactly two epochs (20 batches) + 1 validation step
-    assert mock_components["policy"].train.call_count == 20 + 1
+    # Verify we trained for exactly two epochs (20 batches).
+    assert mock_components["policy"].train.call_count == 20
