@@ -86,6 +86,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
+        env_vars = config.get("env_vars", {})
+
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 pp_size,  # PP
@@ -120,9 +122,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
-            use_expandable_segments=config["megatron_cfg"].get(
-                "use_expandable_segments", None
-            ),
+            env_vars=env_vars,
         )
 
         if config["dynamic_batching"]["enabled"]:
