@@ -333,10 +333,10 @@ async def _run_env_eval_impl(
             get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
             for i in range(len(batch["message_log"]))
         ]
-        # Set return_extracted_answer to True to get the extracted answers
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
+
+        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
         rewards = env_return.rewards
-        extracted_answers = env_return.extracted_answers
+        extracted_answers = [m["extracted_answer"] for m in env_return.metadata]
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
