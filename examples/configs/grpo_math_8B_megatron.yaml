@@ -21,7 +21,6 @@ policy:
   precision: "bfloat16"
   fsdp_offload_enabled: false
   activation_checkpointing_enabled: false
-  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
 
   dtensor_cfg:
     enabled: false
@@ -35,7 +34,8 @@ policy:
     empty_unused_memory_level: 0
     converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
+    # On H100, can run with pp=1 for better performance with expandable segments (which is enabled by default)
+    pipeline_model_parallel_size: 2
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
 
@@ -67,7 +67,7 @@ policy:
     stop_strings: null
     vllm_cfg:
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.95
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
 
 cluster:
