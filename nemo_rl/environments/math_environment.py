@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -71,7 +71,8 @@ class HFVerifyWorker:
         self,
         pred_responses: list[str],
         ground_truths: list[str],
-    ) -> tuple[list[float], list[str | None]]:
+        return_extracted_answer: bool = False,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -79,7 +80,9 @@ class HFVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            tuple[list[float], list[str | None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -100,19 +103,23 @@ class HFVerifyWorker:
                         extracted_answer = None
 
                 results.append(float(ret_score))
-                # Make sure the extracted answer is not None and is a list of two elements
-                assert extracted_answer is not None
-                assert len(extracted_answer) == 2
-                # The extracted answer is a list of two elements. The first element is the gold answer.
-                # The second element is the predicted answer. The predicted answer also includes two
-                # elements which are parsed with different ExtractionConfig. (Not sure why there are two elements.)
-                # We choose the first element as the predicted answer.
-                extracted_answers.append(extracted_answer[1][0][0])
+                if return_extracted_answer:
+                    # Make sure the extracted answer is not None and is a list of two elements
+                    assert extracted_answer is not None
+                    assert len(extracted_answer) == 2
+                    # The extracted answer is a list of two elements. The first element is the gold answer.
+                    # The second element is the predicted answer. The predicted answer also includes two
+                    # elements which are parsed with different ExtractionConfig. (Not sure why there are two elements.)
+                    # We choose the first element as the predicted answer.
+                    # TODO @rayentian: check if the two elements both fine to be the extracted answer.
+                    extracted_answers.append(extracted_answer[1][0][0])
             except Exception:
                 results.append(0.0)
                 extracted_answers.append(None)
-
-        return results, extracted_answers
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 @ray.remote  # pragma: no cover
@@ -121,7 +128,8 @@ class MultilingualMultichoiceVerifyWorker:
         self,
         pred_responses: list[str],
         ground_truths: list[str],
-    ) -> tuple[list[float], list[str | None]]:
+        return_extracted_answer: bool = False,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -129,7 +137,9 @@ class MultilingualMultichoiceVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            tuple[list[float], list[str | None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -151,14 +161,20 @@ class MultilingualMultichoiceVerifyWorker:
             results.append(score)
             extracted_answers.append(extracted_answer)
 
-        return results, extracted_answers
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 @ray.remote  # pragma: no cover
 class EnglishMultichoiceVerifyWorker:
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> tuple[list[float], list[str | None]]:
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -166,7 +182,9 @@ class EnglishMultichoiceVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            tuple[list[float], list[str | None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
+            If return_extracted_answer is False, returns only the scores.
+            If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
         extracted_answers: list[str | None] = []
@@ -182,9 +200,13 @@ class EnglishMultichoiceVerifyWorker:
                 )
             score = 1.0 if extracted_answer == ground_truth else 0.0
             results.append(score)
-            extracted_answers.append(extracted_answer)
+            if return_extracted_answer:
+                extracted_answers.append(extracted_answer)
 
-        return results, extracted_answers
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 class MathEnvironmentMetadata(TypedDict):
@@ -218,6 +240,7 @@ class MathEnvironment(EnvironmentInterface):
         self,
         message_log_batch: list[list[dict[str, str]]],
         metadata: list[MathEnvironmentMetadata],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         """Runs a step in the math environment.
 
@@ -253,7 +276,9 @@ class MathEnvironment(EnvironmentInterface):
 
         # Process each chunk in parallel
         futures = [
-            self.workers[i].verify.remote(chunk, ground_truth_chunk)
+            self.workers[i].verify.remote(
+                chunk, ground_truth_chunk, return_extracted_answer
+            )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
@@ -266,9 +291,12 @@ class MathEnvironment(EnvironmentInterface):
         extracted_answers_list: list[str | None] = []
 
         for worker_result in worker_results:
-            worker_scores, worker_answers = worker_result
-            results.extend(worker_scores)
-            extracted_answers_list.extend(worker_answers)
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                results.extend(worker_scores)
+                extracted_answers_list.extend(worker_answers)
+            else:
+                results.extend(worker_result)
 
         observations = [
             {
@@ -284,10 +312,12 @@ class MathEnvironment(EnvironmentInterface):
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
         next_stop_strings = [None] * len(message_log_batch)
-        metadata = [
-            {**m, "extracted_answer": extracted_answers_list[i]}
-            for i, m in enumerate(metadata)
-        ]
+
+        info = (
+            [{"extracted_answer": answer} for answer in extracted_answers_list]
+            if extracted_answers_list
+            else None
+        )
 
         return EnvironmentReturn(
             observations=observations,
@@ -295,6 +325,7 @@ class MathEnvironment(EnvironmentInterface):
             next_stop_strings=next_stop_strings,
             rewards=rewards,
             terminateds=done,
+            info=info,
         )
 
     def global_post_process_and_metrics(
