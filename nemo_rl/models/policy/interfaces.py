@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -109,15 +109,15 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        pass
+
+    @abstractmethod
     def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
         pass
 
     @abstractmethod
     def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
-        pass
-
-    @abstractmethod
-    def prepare_info_for_collective(self) -> dict[str, Any]:
         pass
 
     @abstractmethod

@@ -1011,6 +1011,14 @@ class VllmGenerationWorker:
 
         return cast(list[str], list_of_worker_results)
 
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
+    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+        """Async version of prepare_refit_info."""
+        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
@@ -1093,7 +1101,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1106,7 +1114,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(info,)
+                "update_weights_from_collective", args=tuple()
             )
             worker_result = result_or_coro[0]
 
@@ -1123,7 +1131,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
+    async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1136,7 +1144,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=(info,)
+                "update_weights_from_collective", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1852,7 +1860,26 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "prepare_refit_info_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_refit_info"
+        )
+
+        # Use run_all_workers_single_data to send data to all workers
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            state_dict_info=state_dict_info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+        # Wait for all futures to complete
+        ray.get(futures)
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
 
         For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
@@ -1896,9 +1923,7 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during update weights: {e}")
             return False
 
-    def update_weights_from_collective(
-        self, info: dict[str, Any]
-    ) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1910,10 +1935,9 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
-        # Use run_all_workers_single_data to send data to all workers
+        # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
-            info=info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
