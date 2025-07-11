@@ -990,6 +990,7 @@ class DTensorPolicyWorker:
                 self.model_update_group.broadcast(tensor.data, src=0)
 
     def prepare_for_lp_inference(self) -> None:
+        breakpoint()
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
         else:
@@ -999,6 +1000,7 @@ class DTensorPolicyWorker:
         self.offload_before_refit()
 
     def prepare_for_training(self, *args, **kwargs) -> None:
+        breakpoint()
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
