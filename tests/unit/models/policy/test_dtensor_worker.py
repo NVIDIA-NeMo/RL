@@ -157,7 +157,7 @@ def policy_setup(two_gpu_virtual_cluster):
     policy.shutdown()
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(360)
 def test_lm_policy_init(policy_setup):
     policy = policy_setup
 

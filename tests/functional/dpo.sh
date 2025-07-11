@@ -18,7 +18,8 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run $PROJECT_ROOT/examples/run_dpo.py \
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_dpo.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     dpo.max_num_steps=3 \
