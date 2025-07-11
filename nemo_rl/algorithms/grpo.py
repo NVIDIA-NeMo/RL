@@ -14,7 +14,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Optional, Tuple, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, Optional, Tuple, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -28,6 +28,7 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
+from nemo_rl.algorithms.reward_functions import RewardConfig, process_rewards
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
@@ -84,6 +85,8 @@ class GRPOConfig(TypedDict):
     val_at_start: bool
     max_val_samples: int
     checkpoint_dir: str
+    use_dynamic_sampling: NotRequired[bool]
+    max_num_gen_batches: NotRequired[int]
 
 
 class GRPOSaveState(TypedDict):
@@ -107,6 +110,7 @@ class GRPOLoggerConfig(LoggerConfig):
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
+    reward_fn: RewardConfig
     env: dict[str, Any]
     data: DataConfig
     grpo: GRPOConfig
@@ -510,6 +514,7 @@ def grpo_train(
         logger.log_metrics(val_metrics, step, prefix="validation")
         logger.log_metrics(validation_timings, step, prefix="timing/validation")
 
+    num_gen_batches = 0
     # Run grpo training (single-turn)
     batch: BatchedDataDict[DatumSpec]
     for batch in dataloader:
@@ -547,6 +552,7 @@ def grpo_train(
                 else:
                     policy_generation.prepare_for_generation()
 
+            num_gen_batches += 1
             with timer.time("generation"):
                 # Use async rollouts if vLLM async engine is enabled
                 if _should_use_async_rollouts(master_config):
@@ -593,8 +599,76 @@ def grpo_train(
                         "use_leave_one_out_baseline"
                     ],
                 )
+
+                # Dynamic sampling algorithm (used in DAPO algorithm)
+                # This block implements dynamic sampling by selecting prompt groups with non-zero std.
+                # If sampled prompts are fewer than train_batch_size * num_generations_per_prompt, continue sampling until max_num_gen_batches is reached.
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    std_chunks_per_prompt = std.split(
+                        master_config["grpo"]["num_generations_per_prompt"]
+                    )
+                    keep_prompt_indices = []
+                    selected_std_chunks = []
+                    for chunk_idx, chunk in enumerate(std_chunks_per_prompt):
+                        chunk_length = chunk.shape[0]
+                        if torch.nonzero(chunk).shape[0] == chunk_length:
+                            chunk_prompt_indices = [
+                                chunk_idx * chunk_length + idx
+                                for idx in range(chunk_length)
+                            ]
+                            keep_prompt_indices.extend(chunk_prompt_indices)
+                            selected_std_chunks.append(chunk)
+                    std = torch.cat(selected_std_chunks)
+
+                    generation_sample_buffer_size = len(keep_prompt_indices)
+                    train_prompts_buffer_size = (
+                        master_config["policy"]["train_global_batch_size"]
+                        * master_config["grpo"]["num_generations_per_prompt"]
+                    )
+
+                    # If the generation samples size is smaller than a fixed threshold (train_prompts_buffer_size), keep generating by processing the next batch
+                    if generation_sample_buffer_size < train_prompts_buffer_size:
+                        max_num_gen_batches = master_config["grpo"].get(
+                            "max_num_gen_batches", 0
+                        )
+                        if (
+                            max_num_gen_batches <= 0
+                            or num_gen_batches <= max_num_gen_batches
+                        ):
+                            continue
+                        else:
+                            raise ValueError(
+                                f"Dynamic sampling has reached the maximum allowable number of batches ({max_num_gen_batches}). Consider evaluating the complexity of your data or adjusting the num_prompts_per_step or num_generations_per_prompt parameters to enhance the diversity of the samples."
+                            )
+                    else:
+                        # Select the inputs that have non-zero std
+                        repeated_batch = repeated_batch.select_indices(
+                            keep_prompt_indices
+                        )
+
+                        # Gather the corresponding rewards
+                        rewards = rewards[keep_prompt_indices]
+
+                        # Gather the corresponding baselines(mean)
+                        baseline = baseline[keep_prompt_indices]
+
+                        # Slice the batch, rewards, baselines and std to ensure batch size is train_prompts_buffer_size
+                        repeated_batch = repeated_batch.slice(
+                            0, train_prompts_buffer_size
+                        )
+                        rewards = rewards[:train_prompts_buffer_size]
+                        baseline = baseline[:train_prompts_buffer_size]
+                        std = std[:train_prompts_buffer_size]
+
+                # Process rewards with custom reward function
+                if master_config["reward_fn"]["enabled"]:
+                    rewards = process_rewards(
+                        repeated_batch, rewards, master_config["reward_fn"]
+                    )
+
                 advantages = (rewards - baseline).unsqueeze(-1)
 
+                # Normalize rewards
                 if master_config["grpo"]["normalize_rewards"]:
                     # don't sharpen the ones with no variation
                     zero_std_mask = std > 0

@@ -1,0 +1,79 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from typing import TypedDict, TypeVar
+
+import torch
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+
+class RewardConfig(TypedDict):
+    """Configuration for reward function processing.
+
+    This configuration enables custom reward shaping, currently supporting DAPO-style
+    penalties for responses that exceed the maximum response length threshold.
+    """
+
+    enabled: bool
+    overlong_buffer_length: int
+    overlong_buffer_penalty: float
+    max_response_length: int
+
+
+def process_rewards(
+    batch: BatchedDataDict, rewards: torch.Tensor, cfg: RewardConfig
+) -> torch.Tensor:
+    """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.
+
+    Nonetheless, it can be potentially extended to support any custom reward logic.
+    """
+    if not cfg["enabled"]:
+        return rewards
+
+    # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
+    if (
+        cfg["overlong_buffer_length"] is None
+        or cfg["overlong_buffer_penalty"] is None
+        or cfg["max_response_length"] is None
+    ):
+        raise ValueError(
+            "Reward function is enabled but only DAPO reward shaping is currently supported. Please ensure overlong_buffer_length, overlong_buffer_penalty, and max_response_length are properly configured."
+        )
+
+    # Get the overlong_buffer_length, overlong_buffer_penalty and max_response_length
+    overlong_buffer_length = cfg["overlong_buffer_length"]
+    overlong_buffer_penalty = cfg["overlong_buffer_penalty"]
+    max_response_length = cfg["max_response_length"]
+
+    # Calculate the expected response length
+    expected_response_length = max_response_length - overlong_buffer_length
+
+    assert len(batch["message_log"]) == len(rewards), (
+        "The number of messages in the batch must match the number of rewards"
+    )
+
+    updated_rewards = torch.zeros_like(rewards)
+    for i, message_log in enumerate(batch["message_log"]):
+        # Get the assistant response length (index 1 is the assistant response)
+        message_response_length = message_log[1]["token_ids"].shape[0]
+        # Calculate the exceed length and the corresponding reward penalty
+        exceed_length = message_response_length - expected_response_length
+        overlong_reward = min(
+            -exceed_length / overlong_buffer_length * overlong_buffer_penalty, 0
+        )
+        updated_rewards[i] = rewards[i] + overlong_reward
+
+    return updated_rewards
