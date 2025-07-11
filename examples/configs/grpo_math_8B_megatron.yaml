@@ -38,6 +38,8 @@ policy:
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
     optimizer:
       optimizer: "adam"
@@ -67,7 +69,7 @@ policy:
     stop_strings: null
     vllm_cfg:
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.95
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
 
 cluster:
