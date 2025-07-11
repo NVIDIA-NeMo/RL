@@ -349,10 +349,8 @@ def setup(
         ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    # state_dict_info: {tensor_name: (shape, dtype)}
     state_dict_info = policy.prepare_refit_info()
-    if not colocated_inference:
-        policy_generation.prepare_refit_info(state_dict_info)
+    policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
 

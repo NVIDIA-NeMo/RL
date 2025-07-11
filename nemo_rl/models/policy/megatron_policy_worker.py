@@ -1263,6 +1263,29 @@ class MegatronPolicyWorker:
             self.model, state_dict_info=self.refit_param_info
         )
 
+        # Collect tensor metadata for refit
+        state_dict_info = {}
+        for key, _ in self.refit_param_info:
+            # gather megatron params
+            gathered_megatron_params = gather_params(
+                self.model,
+                [key],
+                key_to_global_keys=self.local_key_to_global_keys,
+            )
+            # convert to hf params
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            # collect tensor metadata
+            for name, tensor in gathered_hf_params.items():
+                state_dict_info[name] = (
+                    tensor.shape,
+                    tensor.dtype,
+                    tensor.numel(),
+                )
+
+        return state_dict_info
+
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1325,14 +1348,9 @@ class MegatronPolicyWorker:
             type_to_total_size = defaultdict(lambda: 0)
             tensor_metadata = dict()
 
+            # Record offset of the tensor
             for key, tensor in gathered_hf_params.items():
-                tensor_metadata[key] = (
-                    tensor.shape,  # shape of the tensor
-                    tensor.dtype,  # dtype of the tensor
-                    type_to_total_size[tensor.dtype],  # offset of the tensor
-                    # in packed buffer
-                    tensor.numel(),  # size of the tensor
-                )
+                tensor_metadata[key] = type_to_total_size[tensor.dtype]
                 type_to_total_size[tensor.dtype] += tensor.numel()
 
             # Allocate consolidated tensors for each dtype
@@ -1348,8 +1366,9 @@ class MegatronPolicyWorker:
 
             # Copy tensors into consolidated buffers
             for key, tensor in gathered_hf_params.items():
-                metadata = tensor_metadata[key]
-                _, dtype, offset, size = metadata
+                offset = tensor_metadata[key]
+                dtype = tensor.dtype
+                size = tensor.numel()
                 packed_tensors[dtype][offset : offset + size].copy_(
                     tensor.detach().view(-1)
                 )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -51,9 +51,19 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        # state_dict_info: {tensor_name: (shape, dtype)}
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Prepare the info for refit.
+
+        DtensorPolicyWorker:
+            colocated inference: state_dict_info is None
+            non-colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
+
+        MegatronPolicyWorker:
+            colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype, numel)}
+            non-colocated inference: not implemented yet
+        """
         self.state_dict_info = state_dict_info
 
     def update_weights_from_ipc_handles(self, ipc_handles):
@@ -90,7 +100,8 @@ class VllmInternalWorkerExtension:
 
                 # Unpack tensor to weights. Here we only return a view of the tensor to avoid
                 # using extra memory.
-                for key, (shape, dtype, offset, size) in tensor_metadata.items():
+                for key, offset in tensor_metadata.items():
+                    shape, dtype, size = self.state_dict_info[key]
                     tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
                         *shape
                     )
