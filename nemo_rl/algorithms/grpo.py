@@ -163,6 +163,8 @@ def setup(
     # ==========================
     #      Checkpointing
     # ==========================
+    # Add policy model name to checkpointing config
+    master_config["checkpointing"]["model_name"] = policy_config["model_name"]
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     grpo_save_state: Optional[GRPOSaveState] = checkpointer.load_training_info(
