@@ -376,6 +376,22 @@ async def _run_env_eval_impl(
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
+        return_extracted_answer, eval_func = metric_configs[metric]
+
+        # run env
+        env_return = ray.get(
+            env.step.remote(to_env, batch["extra_env_info"], return_extracted_answer)
+        )
+
+        # evaluate
+        rewards = env_return.rewards
+        extracted_answers = (
+            [m["extracted_answer"] for m in env_return.info]
+            if return_extracted_answer
+            else None
+        )
+        score += eval_func(rewards, num_tests_per_prompt, k_value, extracted_answers)
+
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()
