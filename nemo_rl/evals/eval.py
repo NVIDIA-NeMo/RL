@@ -104,9 +104,9 @@ def setup(
             "temperature > 0 and top_k != 1 are required for multiple samples"
         )
 
-    assert k_value >= 1, "k_value must be greater than or equal to 1 for pass@k metric"
+    assert k_value >= 1, "k_value must be greater than or equal to 1"
     assert num_tests_per_prompt >= k_value, (
-        "num_tests_per_prompt must be greater than or equal to k_value for pass@k metric"
+        "num_tests_per_prompt must be greater than or equal to k_value "
     )
 
     # ==========================
