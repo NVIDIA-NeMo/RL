@@ -197,16 +197,20 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     return output
 
 
-def dpo_collate_fn(
+def preference_collate_fn(
     data_batch: list[DPODatumSpec],
-    tokenizer: TokenizerType,
-    make_sequence_length_divisible_by: int,
 ) -> BatchedDataDict[Any]:
-    """Collate function for DPO training.
+    """Collate function for preference data training.
 
     This function separates the chosen and rejected responses to create
     two examples per prompt. The chosen and rejected examples are interleaved
     along the batch dimension, resulting in a batch size of 2 * len(data_batch).
+
+    Args:
+        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
+
+    Returns:
+        BatchedDataDict with message_log, length, loss_multiplier, task_name, and idx fields.
     """
     message_log = []
     length = []
@@ -236,6 +240,26 @@ def dpo_collate_fn(
         batch_max_length=batch_max_length,
     )
 
+    return batch
+
+
+def dpo_collate_fn(
+    data_batch: list[DPODatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+) -> BatchedDataDict[Any]:
+    """Collate function for DPO training.
+
+    Args:
+        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
+        tokenizer: Tokenizer for text processing
+        make_sequence_length_divisible_by: Make the sequence length divisible by this value
+
+    Returns:
+        BatchedDataDict with input_ids, input_lengths, token_mask, and sample_mask fields.
+    """
+    batch = preference_collate_fn(data_batch)
+
     ## add loss mask based on role to every message
     add_loss_mask_to_message_log(
         batch["message_log"],
@@ -253,7 +277,7 @@ def dpo_collate_fn(
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "token_mask": cat_and_padded["token_loss_mask"],
-            "sample_mask": loss_multiplier_batch,
+            "sample_mask": batch["loss_multiplier"],
         }
     )
 
