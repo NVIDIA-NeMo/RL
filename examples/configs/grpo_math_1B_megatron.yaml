@@ -40,7 +40,6 @@ policy:
   logprob_batch_size: 8
   max_total_sequence_length: 512
   precision: "bfloat16"
-  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
 
   dtensor_cfg:
     enabled: false
