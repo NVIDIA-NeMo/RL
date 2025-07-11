@@ -418,11 +418,18 @@ async def test_vllm_policy_generation_async(
         dtensor_config = basic_dtensor_test_config
         from nemo_rl.models.policy.lm_policy import Policy
 
+        print("creating vllm policy...")
         async_policy = VllmGeneration(cluster, vllm_config)
         async_policy.finish_generation()
-        print("creating hf policy...")
 
+        print("creating lm policy...")
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+        print("preparing refit info...")
+        state_dict_info = lm_policy.prepare_refit_info()
+        async_policy.prepare_refit_info(state_dict_info)
+
+        print("refitting vllm policy...")
         refit_policy_generation(
             lm_policy, async_policy, vllm_config["colocated"]["enabled"]
         )
@@ -519,6 +526,9 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
     dtensor_config = basic_dtensor_test_config
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    state_dict_info = lm_policy.prepare_refit_info()
+    policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
     refit_policy_generation(lm_policy, policy, vllm_config["colocated"]["enabled"])
@@ -673,6 +683,10 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
 
         print("Creating DTensor policy...")
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+        print("preparing refit info...")
+        state_dict_info = lm_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
         refit_policy_generation(
@@ -922,8 +936,13 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     try:
         print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
+
+        print("preparing refit info...")
+        state_dict_info = lm_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
         text = """Answer the question based on the context below. Keep the answer short and concise. Respond "Unsure about answer" if not sure about the answer. Context: Teplizumab traces its roots to a New Jersey drug company called Ortho Pharmaceutical. There, scientists generated an early version of the antibody, dubbed OKT3. Originally sourced from mice, the molecule was able to bind to the surface of T cells and limit their cell-killing potential. In 1986, it was approved to help prevent organ rejection after kidney transplants, making it the first therapeutic antibody allowed for human use.Question: What was OKT3 originally sourced from?Answer:"""
@@ -962,7 +981,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         grouped_param_keys = lm_policy.prepare_weights_for_ipc()
         for keys in grouped_param_keys:
             ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights(ipc_handles)
+            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
             assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
@@ -1026,6 +1045,10 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
     print("Creating DTensor policy...")
     dtensor_config = basic_dtensor_test_config
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    print("preparing refit info...")
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
     # take it outside statistics to get clean peak memory during refit
@@ -1103,6 +1126,10 @@ def test_vllm_generation_with_stop(
         print("Creating DTensor policy...")
         dtensor_config = basic_dtensor_test_config
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+        print("preparing refit info...")
+        state_dict_info = lm_policy.prepare_refit_info()
+        vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
         refit_policy_generation(
@@ -1211,6 +1238,10 @@ async def test_vllm_refit_non_collocated_update_weights(
     futures_inference = vllm_generation.init_collective(ip, port, world_size=2)
     ray.get(futures_train + futures_inference)
 
+    # prepare refit info
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_generation.prepare_refit_info(state_dict_info)
+
     print("refitting vllm policy...")
     refit_policy_generation(
         lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
@@ -1308,6 +1339,10 @@ def test_vllm_generation_with_megatron_training(
 
         print("Creating Megatron policy...")
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
+
+        print("preparing refit info...")
+        state_dict_info = megatron_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
         refit_policy_generation(
@@ -1428,6 +1463,10 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     print("Creating Megatron policy...")
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
+    print("preparing refit info...")
+    state_dict_info = megatron_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
     print("Refitting vLLM policy with Megatron...")
     # Take it outside statistics to get clean peak memory during refit
     megatron_policy.offload_before_refit()
@@ -1530,6 +1569,10 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         print("Creating vLLM policy...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
         vllm_policy.finish_generation()
+
+        print("preparing refit info...")
+        state_dict_info = megatron_policy.prepare_refit_info()
+        vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
         refit_policy_generation(
