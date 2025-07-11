@@ -15,16 +15,6 @@
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
-# lifted from NeMo/nemo/collections/common/parts/perf_metrics_utils.py
-LLM_VOCAB_SIZE_MAP = {
-    "gpt3": 51200,
-    "llama2": 32000,
-    "llama3": 128256,
-    "nemotron": 256000,
-    "bert": 29000,
-    "mixtral": 32000,
-}
-
 
 # lifted from NeMo/nemo/utils/flops_formulas.py
 @dataclass
@@ -71,20 +61,16 @@ class FLOPSConfig:
 
 def gpt3(config: FLOPSConfig):
     """Model FLOPs for GPT3 family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["gpt3"]
-
     return (
         24 * config.gbs * config.enc_seq_len * config.hs * config.hs
         + 4 * config.gbs * config.enc_seq_len * config.enc_seq_len * config.hs
     ) * (3 * config.layers) + (
-        6 * config.gbs * config.enc_seq_len * config.hs * vocab_size
+        6 * config.gbs * config.enc_seq_len * config.hs * config.vocab_size
     )
 
 
 def llama2(config: FLOPSConfig):
     """Model FLOPs for llama2 family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["llama2"]
-
     return (
         config.gbs
         * config.enc_seq_len
@@ -96,15 +82,13 @@ def llama2(config: FLOPSConfig):
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
             + (12 * config.enc_seq_len / config.hs)
-            + (6 * vocab_size / (config.layers * config.hs))
+            + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
 
 
 def llama3(config: FLOPSConfig):
     """Model FLOPs for llama3 family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["llama3"]
-
     return (
         config.gbs
         * config.enc_seq_len
@@ -116,15 +100,13 @@ def llama3(config: FLOPSConfig):
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
             + (12 * config.enc_seq_len / config.hs)
-            + (6 * vocab_size / (config.layers * config.hs))
+            + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
 
 
 def nemotron(config: FLOPSConfig):
     """Model FLOPs for nemotron family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["nemotron"]
-
     return (
         config.gbs
         * config.enc_seq_len
@@ -136,15 +118,13 @@ def nemotron(config: FLOPSConfig):
             + (12 * config.query_groups / config.attention_heads)
             + (12 * config.ffn_hs / config.hs)
             + (12 * config.enc_seq_len / config.hs)
-            + (6 * vocab_size / (config.layers * config.hs))
+            + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
 
 
 def mixtral(config: FLOPSConfig):
     """Model FLOPs for mixtral family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["mixtral"]
-
     return (
         config.gbs
         * config.enc_seq_len
@@ -156,7 +136,7 @@ def mixtral(config: FLOPSConfig):
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.moe_router_topk * config.ffn_hs / config.hs)
             + (12 * config.enc_seq_len / config.hs)
-            + (6 * vocab_size / (config.layers * config.hs))
+            + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
 
@@ -249,8 +229,6 @@ def qwen3(config: FLOPSConfig):
 
 def bert(config: FLOPSConfig):
     """Model FLOPs for BERT family."""
-    vocab_size = LLM_VOCAB_SIZE_MAP["bert"]
-
     return (
         72
         * config.gbs
@@ -261,7 +239,7 @@ def bert(config: FLOPSConfig):
         * (
             1
             + (config.enc_seq_len / (6 * config.hs))
-            + (vocab_size / (12 * config.hs * config.layers))
+            + (config.vocab_size / (12 * config.hs * config.layers))
         )
     )
 
@@ -372,36 +350,6 @@ def transformer(config: FLOPSConfig):
     )
 
     return total_flops
-
-
-def clip_vit_l(config: FLOPSConfig):
-    """Model FLOPs for CLIP ViT."""
-    if config.img_seq_len is None:
-        config.img_seq_len = (config.img_h * config.img_w) / (
-            config.patch_dim * config.patch_dim
-        ) + config.class_token_len
-    return config.gbs * config.layers * config.hs * config.hs * config.img_seq_len * (
-        24 + (4 * config.img_seq_len / config.hs)
-    ) + (2 * config.gbs * config.hs * config.in_channels * config.img_h * config.img_w)
-
-
-def neva_projection(config: FLOPSConfig):
-    """Model FLOPs for NeVA Projection."""
-    if "mlp" in config.projector_type:
-        return (
-            6
-            * config.gbs
-            * config.img_seq_len
-            * config.ffn_hs
-            * (config.inp_s + config.hs)
-        )
-    elif config.projector_type == "affine":
-        return 6 * config.gbs * config.img_seq_len * config.inp_s * config.hs
-    else:
-        raise ValueError(
-            f"NeVA Projections FLOPs calculator only supports 'mlp', 'mcore_mlp'"
-            f" or 'affine' projector_type but found {config.projector_type}"
-        )
 
 
 def flux(config: FLOPSConfig):

@@ -43,6 +43,7 @@ def convert_config_to_flops_config(
             ffn_hs=config.intermediate_size,
             query_groups=config.num_attention_heads / config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
+            vocab_size=config.vocab_size,
         ), llama3 if "llama3" in model_name.lower() else llama2
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
