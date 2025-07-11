@@ -534,8 +534,10 @@ class DTensorPolicyWorker:
                     input_ids = mb.get("input_ids").cuda()
                     input_lengths = mb.get("input_lengths")
                     batch_size, seq_len = input_ids.shape
+
                     if self.flops_tracker:
-                        self.flops_tracker.track(batch_size, seq_len)
+                        for l in input_lengths.tolist():
+                            self.flops_tracker.track(1, l)
 
                     attention_mask = torch.zeros(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
