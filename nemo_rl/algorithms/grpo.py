@@ -405,6 +405,9 @@ def refit_policy_generation(
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
     """
+    # Jimmy: This a workaround given the mcore policy refit memory use is high.
+    # TODO: implement mcore-> HF inplace weight conversion
+    _refit_buffer_size_gb = 4
     if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])

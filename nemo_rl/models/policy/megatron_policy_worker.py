@@ -341,6 +341,79 @@ class MegatronPolicyWorker:
         else:
             return f"{self.__class__.__qualname__}"
 
+    def _get_model_cfg(self, pretrained_run_config_path):
+        cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config_path)
+        model_cfg = cfg_from_pretrained.model_config
+        cfg_from_pretrained.logger_config = LoggerConfig()
+
+        model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
+            "tensor_model_parallel_size"
+        ]
+        model_cfg.pipeline_model_parallel_size = self.cfg["megatron_cfg"][
+            "pipeline_model_parallel_size"
+        ]
+        model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
+            "num_layers_in_first_pipeline_stage"
+        ]
+        model_cfg.num_layers_in_last_pipeline_stage = self.cfg["megatron_cfg"][
+            "num_layers_in_last_pipeline_stage"
+        ]
+        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
+        model_cfg.context_parallel_size = self.cfg["megatron_cfg"][
+            "context_parallel_size"
+        ]  # not supported right now
+        assert model_cfg.context_parallel_size == 1, (
+            "Context parallel is not supported right now"
+        )
+        model_cfg.expert_tensor_parallel_size = self.cfg["megatron_cfg"][
+            "expert_tensor_parallel_size"
+        ]
+        model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
+            "expert_model_parallel_size"
+        ]
+        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
+        model_cfg.bf16 = self.dtype == torch.bfloat16
+        model_cfg.fp16 = self.dtype == torch.float16
+        if model_cfg.fp16:
+            assert not model_cfg.bf16, "fp16 and bf16 cannot be used together"
+            model_cfg.params_dtype = torch.float16
+        elif model_cfg.bf16:
+            assert not model_cfg.fp16, "fp16 and bf16 cannot be used together"
+            model_cfg.params_dtype = torch.bfloat16
+        else:
+            model_cfg.params_dtype = torch.float32
+        model_cfg.pipeline_dtype = self.dtype_map[self.cfg["megatron_cfg"]["pipeline_dtype"]]
+        model_cfg.parallel_output = True
+        # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
+        # especially when using many experts.
+        model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
+
+        # The below two configs (and "freeze_moe_router") are used to stabilize moe training
+        # by preventing updates to the moe router. We found that this is helpful in reducing
+        # logprob error during training.
+
+        # Set this to "none" to disable load balancing loss.
+        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
+            "moe_router_load_balancing_type"
+        ]
+        # Set this to 0.0 to disable updates to the moe router expert bias
+        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
+            "moe_router_bias_update_rate"
+        ]
+        if self.cfg["megatron_cfg"]["activation_checkpointing"]:
+            model_cfg.activations_checkpoint_granularity = "full"
+            model_cfg.activations_checkpoint_method = "uniform"
+            model_cfg.activations_checkpoint_num_layers = 1
+        if not model_cfg.gated_linear_unit:
+            assert model_cfg.activation_func is not None, (
+                "activation_func must be set if not using gated_linear_unit. This likely "
+                "indicates an issue in configuration conversion (e.g. activation func was "
+                "a lambda and couldn't be serialized). This is based on this check "
+                "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
+            )
+        model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        return model_cfg
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -356,12 +429,12 @@ class MegatronPolicyWorker:
         **kwargs: Any,
     ):
         self.cfg = config
-        dtype_map = {
+        self.dtype_map = {
             "float32": torch.float32,
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
         }
-        self.dtype = dtype_map[self.cfg["precision"]]
+        self.dtype = self.dtype_map[self.cfg["precision"]]
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
@@ -403,7 +476,6 @@ class MegatronPolicyWorker:
                             del os.environ[var]
 
                     import_model_from_hf_name(hf_model_name, pretrained_path)
-
                     # Restore environment
                     for var, val in env_backup.items():
                         os.environ[var] = val
@@ -420,84 +492,13 @@ class MegatronPolicyWorker:
             pre_init_communication_queue.put(True)
         destroy_parallel_state()
 
-        pretrained_run_config = os.path.join(
+        pretrained_run_config_path = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
         )
 
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config)
-        model_cfg = cfg_from_pretrained.model_config
-        cfg_from_pretrained.logger_config = LoggerConfig()
-
-        model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
-            "tensor_model_parallel_size"
-        ]
-        model_cfg.pipeline_model_parallel_size = self.cfg["megatron_cfg"][
-            "pipeline_model_parallel_size"
-        ]
-        model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
-            "num_layers_in_first_pipeline_stage"
-        ]
-        model_cfg.num_layers_in_last_pipeline_stage = self.cfg["megatron_cfg"][
-            "num_layers_in_last_pipeline_stage"
-        ]
-        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
-        model_cfg.context_parallel_size = self.cfg["megatron_cfg"][
-            "context_parallel_size"
-        ]  # not supported right now
-        assert model_cfg.context_parallel_size == 1, (
-            "Context parallel is not supported right now"
-        )
-        model_cfg.expert_tensor_parallel_size = self.cfg["megatron_cfg"][
-            "expert_tensor_parallel_size"
-        ]
-        model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
-            "expert_model_parallel_size"
-        ]
-        model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
-        model_cfg.bf16 = self.dtype == torch.bfloat16
-        model_cfg.fp16 = self.dtype == torch.float16
-        if model_cfg.fp16:
-            assert not model_cfg.bf16, "fp16 and bf16 cannot be used together"
-            model_cfg.params_dtype = torch.float16
-        elif model_cfg.bf16:
-            assert not model_cfg.fp16, "fp16 and bf16 cannot be used together"
-            model_cfg.params_dtype = torch.bfloat16
-        else:
-            model_cfg.params_dtype = torch.float32
-        model_cfg.pipeline_dtype = dtype_map[self.cfg["megatron_cfg"]["pipeline_dtype"]]
-        model_cfg.parallel_output = True
-        # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
-        # especially when using many experts.
-        model_cfg.moe_router_dtype = self.cfg["megatron_cfg"]["moe_router_dtype"]
-
-        # The below two configs (and "freeze_moe_router") are used to stabilize moe training
-        # by preventing updates to the moe router. We found that this is helpful in reducing
-        # logprob error during training.
-
-        # Set this to "none" to disable load balancing loss.
-        model_cfg.moe_router_load_balancing_type = self.cfg["megatron_cfg"][
-            "moe_router_load_balancing_type"
-        ]
-        # Set this to 0.0 to disable updates to the moe router expert bias
-        model_cfg.moe_router_bias_update_rate = self.cfg["megatron_cfg"][
-            "moe_router_bias_update_rate"
-        ]
-        if self.cfg["megatron_cfg"]["activation_checkpointing"]:
-            model_cfg.activations_checkpoint_granularity = "full"
-            model_cfg.activations_checkpoint_method = "uniform"
-            model_cfg.activations_checkpoint_num_layers = 1
-        if not model_cfg.gated_linear_unit:
-            assert model_cfg.activation_func is not None, (
-                "activation_func must be set if not using gated_linear_unit. This likely "
-                "indicates an issue in configuration conversion (e.g. activation func was "
-                "a lambda and couldn't be serialized). This is based on this check "
-                "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
-            )
-        model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -517,7 +518,7 @@ class MegatronPolicyWorker:
             load_rng=False,
         )
         self.megatron_cfg = ConfigContainer(
-            model_config=model_cfg,
+            model_config=self._get_model_cfg(pretrained_run_config_path),
             checkpoint_config=checkpoint_config,
             logger_config=LoggerConfig(logging_level=0),
             train_config=TrainingConfig(
@@ -586,10 +587,13 @@ class MegatronPolicyWorker:
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
             ref_ckpt_context = _init_checkpointing_context(ref_checkpoint_config)
+            ref_model_cfg = self._get_model_cfg(pretrained_run_config_path)
+            if not ref_model_cfg.vocab_size:
+                ref_model_cfg.vocab_size = self.megatron_cfg.tokenizer_config.padded_vocab_size
 
             # Create a separate megatron config for the reference model with the correct checkpoint config
             ref_megatron_cfg = ConfigContainer(
-                model_config=self.megatron_cfg.model_config,
+                model_config=ref_model_cfg,
                 checkpoint_config=ref_checkpoint_config,  # Use the reference checkpoint config
                 logger_config=self.megatron_cfg.logger_config,
                 train_config=self.megatron_cfg.train_config,
@@ -605,8 +609,8 @@ class MegatronPolicyWorker:
             ref_state.cfg = ref_megatron_cfg
 
             reference_model = get_model_from_config(
-                self.megatron_cfg.model_config,
-                self.megatron_cfg.ddp_config,
+                model_config=ref_model_cfg,
+                ddp_config=self.megatron_cfg.ddp_config,
                 use_torch_fsdp2=self.megatron_cfg.dist_config.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
                 data_parallel_random_init=self.megatron_cfg.rng_config.data_parallel_random_init,
@@ -1447,6 +1451,9 @@ class MegatronPolicyWorker:
         # TODO: setting to low value (10%) since
         # more buckets seems to have better perf
         total_available_bytes *= 0.1
+
+        # free any unused memory in preparation for weight refitting
+        torch.cuda.empty_cache()
 
         return param_info, total_available_bytes
 

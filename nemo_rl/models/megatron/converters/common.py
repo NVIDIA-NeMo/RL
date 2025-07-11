@@ -280,7 +280,7 @@ class MegatronToHFConverter:
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )
-        elif config.model_type == "llama":
+        elif config.model_type == "llama" or "nemotron-nas":
             self.export_mapping = llama_converter.get_export_mapping()
             self.export_transforms = llama_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(

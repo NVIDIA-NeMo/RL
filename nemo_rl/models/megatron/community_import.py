@@ -43,6 +43,14 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
+    elif hf_config.model_type in "nemotron-nas":
+        from nemo.tron.converter.llama_nemotron import HFLlamaNemotronImporter
+        
+        print(f" Importing model {hf_model_name} to {output_path}...")
+        importer = HFLlamaNemotronImporter(
+            hf_model_name,
+            output_path=output_path,
+        )
     else:
         raise ValueError(f"Unknown model_type: {hf_config.model_type}")
     importer.apply()
