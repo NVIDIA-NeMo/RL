@@ -138,6 +138,7 @@ def configure_expandable_segments() -> None:
     on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
     """
     compute_capability = torch.cuda.get_device_properties(0).major
+
     if compute_capability >= 9:  # Hopper+
         existing_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
 
@@ -157,6 +158,20 @@ def configure_expandable_segments() -> None:
 
         print(f"Setting PYTORCH_CUDA_ALLOC_CONF to {new_conf}")
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_conf
+
+    else:
+        ## make sure that expandable_segments is not set to True
+        if "expandable_segments" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+            conf_items = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+            for item in conf_items:
+                if item.strip().startswith("expandable_segments"):
+                    key_value = item.split(":")
+                    if len(key_value) == 2 and key_value[1].strip().lower() == "true":
+                        raise RuntimeError(
+                            "expandable_segments is enabled in PYTORCH_CUDA_ALLOC_CONF, "
+                            "but this is not supported on architectures older than Hopper (compute capability < 9). "
+                            "Please set expandable_segments to False."
+                        )
 
 
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
