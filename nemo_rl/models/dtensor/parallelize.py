@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -38,7 +38,10 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import (
+    DistributedLogprob,
+    DistributedTokenLevelEntropy,
+)
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -77,6 +80,80 @@ class RotaryEmbedParallel(SequenceParallel):
     @staticmethod
     def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
         return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
+
+
+def _parallelize_nm5_h(
+    model,
+    dp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    sequence_parallel: bool = False,
+    activation_checkpointing: bool = False,
+    cpu_offload: bool = False,
+    custom_parallel_plan: Optional[Union[dict, str]] = None,
+) -> torch.nn.Module:
+    """Parallelize a NemotronHForCausalLM model across data and tensor parallel dimensions."""
+    assert not sequence_parallel, (
+        "Sequence parallelism is not supported for NemotronHForCausalLM"
+    )
+
+    assert custom_parallel_plan is None, (
+        "Custom parallel plan is not supported for NemotronHForCausalLM"
+    )
+
+    model_tp_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    mlp_tp_plan = {
+        "mixer.up_proj": ColwiseParallel(),
+        "mixer.down_proj": RowwiseParallel(),
+    }
+
+    layers: torch.nn.ModuleList = model.backbone.layers
+
+    parallelize_module(model, tp_mesh, model_tp_plan)
+
+    for layer in model.backbone.layers:
+        if layer.block_type == "mlp":
+            parallelize_module(layer, tp_mesh, mlp_tp_plan)
+
+    if activation_checkpointing:
+        for i in range(len(layers)):
+            if layers[i].block_type == "mlp":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+        if layers[i].block_type == "mamba":
+            layers[i] = checkpoint_wrapper(layers[i])
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    offload_policy = (
+        CPUOffloadPolicy(pin_memory=False)
+        if cpu_offload
+        else torch.distributed.fsdp.OffloadPolicy
+    )
+
+    for layer in layers:
+        fully_shard(
+            layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+        )
+
+    # do not reshard after forward for root model
+
+    # because its parameters will be used in backward immediately
+
+    return fully_shard(
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
 
 
 def _parallelize_gemma3(
@@ -384,6 +461,20 @@ def _parallelize_model(
     )
 
     model_cls = type(model)
+    if model_cls.__name__ == "NemotronHForCausalLM":
+        # need to do something special for nm5, since it's harder to shard the mamba layers
+        # nm5 is not importable, so we check the __name__ attribute
+        return _parallelize_nm5_h(
+            model,
+            dp_mesh,
+            tp_mesh,
+            param_dtype,
+            sequence_parallel,
+            activation_checkpointing,
+            cpu_offload,
+            None,
+        )
+
     if model_cls not in PARALLIZE_FUNCTIONS:
         raise ValueError(f"Model {model_cls} not supported as part of dtensor")
 
@@ -446,6 +537,53 @@ def clip_grad_by_total_norm_(
             g.mul_(clip_coeff)
 
 
+def get_grad_sparsity(
+    named_parameters: Union[
+        List[Tuple[str, Union[torch.Tensor, DTensor]]],
+        Tuple[str, Union[torch.Tensor, DTensor]],
+    ],
+    dp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+) -> float:
+    """NOTE: This function is somewhat incorrect if the grads are not all reduced across the data parallel GPUs.
+        * this is because the zeros might not be all in the same place across DP ranks
+
+    Args:
+        parameters (Union[List[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+            An iterable of Tensors or DTensors, or a single Tensor or DTensor
+            that will have gradient norm calculated.
+        dp_group (torch.distributed.ProcessGroup): Process group for data parallel communication.
+        tp_group (torch.distributed.ProcessGroup): Process group for tensor parallel communication.
+        norm_type (Union[int, float]): Type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        float: Total norm of the gradients (viewed as a single vector)
+    """
+    grad_sparsity_dict = {}
+    grads_dict = {
+        name: to_local_if_dtensor(p.grad.detach())
+        for name, p in sorted(named_parameters)
+        if p.grad is not None
+    }
+
+    total_num_zeros, total_num_elements = 0, 0
+    for name, grad in grads_dict.items():
+        num_zeros = grad.numel() - grad.count_nonzero()
+        num_elements = grad.numel()
+
+        to_reduce = torch.tensor(
+            [num_zeros, num_elements], dtype=torch.float32, device="cuda"
+        )
+        torch.distributed.all_reduce(to_reduce, group=dp_group)
+        torch.distributed.all_reduce(to_reduce, group=tp_group)
+        grad_sparsity_dict[name] = (to_reduce[0] / to_reduce[1]).item()
+        total_num_zeros += to_reduce[0]
+        total_num_elements += to_reduce[1]
+
+    return (total_num_zeros / total_num_elements).item(), grad_sparsity_dict
+
+
 def get_grad_norm(
     parameters: Union[List[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     dp_group: torch.distributed.ProcessGroup,
@@ -479,6 +617,16 @@ def get_grad_norm(
         if p.grad is not None
     ]
 
+    is_finite = [grad.isfinite().all() for grad in grads_for_norm]
+
+    if not all(is_finite):
+        print(
+            "rank",
+            torch.distributed.get_rank(),
+            "grads are not finite",
+            is_finite,
+        )
+
     # Norm parameters.
     norm_type = float(norm_type)
     total_norm = 0.0
@@ -503,6 +651,8 @@ def get_grad_norm(
             grad_norm = torch.norm(grad, norm_type)
             total_norm += grad_norm**norm_type
 
+        print("### rank", torch.distributed.get_rank(), "total_norm", total_norm)
+
         total_norm = total_norm.cuda()
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
@@ -514,6 +664,31 @@ def get_grad_norm(
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
+
+
+def token_level_entropy_from_vocab_parallel_logits(
+    vocab_parallel_logits: DTensor,
+):
+    """Computes token-level entropy from vocabulary-parallel logits.
+
+    Args:
+        vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
+            with shape [batch_size, seq_len, vocab_size/tp_size].
+
+    Returns:
+        torch.Tensor: Token-level entropy tensor with shape [batch_size, seq_len-1].
+            The sequence dimension is reduced by 1 due to the target shifting.
+
+    NOTE: this function assumes the vocab dimension includes all valid tokens(no padding)
+    """
+    tp_mesh = vocab_parallel_logits.device_mesh
+
+    entropy = DistributedTokenLevelEntropy.apply(
+        vocab_parallel_logits.to_local(),
+        tp_mesh.get_group(),
+        not torch.is_grad_enabled(),
+    ).contiguous()
+    return entropy[:, :-1]
 
 
 def get_logprobs_from_vocab_parallel_logits(
@@ -538,11 +713,13 @@ def get_logprobs_from_vocab_parallel_logits(
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
 
-    return from_parallel_logits_to_logprobs(
+    target = input_ids.roll(shifts=-1, dims=-1)
+    probs = DistributedLogprob.apply(
         vocab_parallel_logits.to_local(),
-        input_ids,
+        target,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
         tp_mesh.get_group(),
-        inference_only=not torch.is_grad_enabled(),
-    )
+        not torch.is_grad_enabled(),
+    ).contiguous()
+    return probs[:, :-1]

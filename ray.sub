@@ -26,7 +26,17 @@ DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
 METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 
 # Ports for the head node
-PORT=${PORT:-6379}
+# PORT=${PORT:-6379}
+used_ports=$(netstat -lnt | awk 'NR>2{print $4}' | grep -Eo '[0-9]+$' | sort -n | uniq)
+for port in {54258..65535}; do
+  if ! echo "$used_ports" | grep -q "^$port$"; then
+    echo "Available port: $port"
+    break
+  fi
+done
+
+PORT=$port
+
 RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}

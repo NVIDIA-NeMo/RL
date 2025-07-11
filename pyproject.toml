@@ -2,34 +2,6 @@
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "nemo-rl"
-dynamic = [
-    "version",
-    "readme",
-]
-description = "Nemo-RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
-requires-python = ">=3.10"
-license = {text = "Apache 2.0"}
-dependencies = [
-    "torch==2.6.0",
-    "colored==2.2.3",
-    "ray[default]==2.43.0",
-    "transformers>=4.51.0",
-    "wandb",
-    "numpy",
-    "datasets",
-    "rich",
-    "math-verify",
-    "accelerate>=0.26",
-    "tensorboard",
-    "omegaconf",
-    "torchdata",
-    "nvidia-ml-py",
-    "hydra-core",
-    "debugpy>=1.8.0",
-    "jsonlines",
-]
 
 [tool.setuptools]
 packages = ["nemo_rl"]
@@ -38,9 +10,42 @@ packages = ["nemo_rl"]
 version = {attr = "nemo_rl.__version__"}  # any module attribute compatible with ast.literal_eval
 readme = {file = "README.md", content-type = "text/markdown"}
 
+[project]
+name = "nemo-rl"
+dynamic = [
+    "version",
+    "readme",
+]
+description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
+requires-python = ">=3.12"
+license = {text = "Apache 2.0"}
+dependencies = [
+    "jsonlines",
+    "matplotlib",
+    "plotly",
+    "debugpy",
+    "torch==2.7.0",
+    "colored==2.2.3",
+    "ray[default]==2.46.0",
+    "transformers>=4.51.0",
+    "wandb",
+    "numpy",
+    "datasets>=3.6.0",
+    "rich",
+    "math-verify",
+    "accelerate>=0.26",
+    "tensorboard",
+    "omegaconf",
+    "torchdata",
+    "nvidia-ml-py",
+    "hydra-core",
+    "mamba-ssm",
+    "causal-conv1d",
+]
+
 [project.optional-dependencies]
 vllm = [
-    "vllm==0.8.4",
+    "vllm==0.9.1",
 ]
 
 ifeval = [
@@ -51,11 +56,19 @@ ifeval = [
 ]
 
 [dependency-groups]
+
+# This is a default group so that we install these even with bare `uv sync`
 build = [
-    "torch==2.6.0",
+    # Build requirement for TE
+    "torch==2.7.0",
+    # Build requirement for TE
     "setuptools",
     "packaging",
-    "einops"
+    "einops",
+    # Build requirement for nemo_run
+    "hatchling",
+    # Build requirement for mcore
+    "pybind11",
 ]
 docs = [
     "sphinx",
@@ -68,13 +81,45 @@ docs = [
 dev = [
     "pre-commit==3.6.0",
     "ruff==0.9.9",
+    "mypy",
+    "types-PyYAML",
+    "types-requests",
 ]
 test = [
     "pytest>=7.0.0",
     "pytest-timeout",
     "pytest-cov",
+    "pytest-asyncio",
 ]
 
+[tool.uv.sources]
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
+# Has roger's fix
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+# Need to add this to the environment:
+# export VLLM_COMMIT=a3319f4f04fbea7defe883e516df727711e516cd
+# export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+# uv pip install https://wheels.vllm.ai/a3319f4f04fbea7defe883e516df727711e516cd/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+
+#vllm = { path = "./3rdparty/vllm" }
+#vllm = { index = "vllm-nightly-index" }
+
+#[[tool.uv.index]]
+#name = "vllm-nightly-index"
+#url = "https://wheels.vllm.ai/nightly"
+
+[tool.uv]
+# Currently, TE must be built with no build-isolation b/c it requires torch
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "mamba-ssm", "causal-conv1d"]
+# Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
+# and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
+# avoid including these in the default dependency set, but for now it's required.
+default-groups = ["dev", "build"]
+# Users may use different link-modes depending on their scenario:
+#  --link-mode=hardlink (default on linux; may get warnings about switching to --link-mode copy if uv cache and venv on different file-systems)
+#  --link-mode=copy (slower but more reliable; supresses warning)
+#  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
+link-mode = "copy"
 
 [tool.black]
 line-length = 120
@@ -121,11 +166,3 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
-
-[tool.uv]
-# Users may use different link-modes depending on their scenario:
-#  --link-mode=hardlink (default on linux; may get warnings about switching to --link-mode copy if uv cache and venv on different file-systems)
-#  --link-mode=copy (slower but more reliable; supresses warning)
-#  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
-#
-#link-mode = "symlink"

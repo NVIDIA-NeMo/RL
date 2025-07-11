@@ -1,0 +1,26 @@
+model_name: "Qwen/Qwen2.5-Math-1.5B-Instruct"
+num_tests_per_prompt: 1
+
+max_concurrent_requests: 100
+max_runtime_hours: 3.5
+output_dir: ???
+
+server_cfg:
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  max_model_len: 8192
+
+
+client_cfg:
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: ${server_cfg.max_model_len}
+
+data:
+  shuffle: False
+  seed: 420 # unused if shuffle is False
+  jsonl_path: ???
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

@@ -19,6 +19,8 @@ import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.utils import (
     calculate_kl_penalty_joschu2020,
+    compute_token_level_entropy,
+    compute_token_logprobs,
     masked_mean,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -40,6 +42,7 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     token_level_loss: bool
+    use_generation_logprobs_in_ppo_baseline: bool
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -100,6 +103,7 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
         self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
         self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
+        self.use_kl_fix = cfg.get("use_kl_fix", False)
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
@@ -112,6 +116,7 @@ class ClippedPGLossFn(LossFunction):
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
+        self.use_stable_loss = cfg.get("use_stable_loss", False)
 
     def __call__(
         self,
@@ -141,22 +146,7 @@ class ClippedPGLossFn(LossFunction):
         ).item()
 
         next_token_logits = next_token_logits.to(torch.float32)
-
-        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
-            )
-        else:
-            next_token_logits_wo_last = next_token_logits[
-                :, :-1
-            ]  # Remove last position's logits
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits_wo_last, dim=-1
-            )
-            next_tokens = data.get("input_ids")[:, 1:].cuda()  # Skip first token
-            curr_logprobs = next_token_logprobs.gather(
-                dim=-1, index=next_tokens.unsqueeze(-1)
-            ).squeeze(-1)
+        curr_logprobs = compute_token_logprobs(next_token_logits, data["input_ids"])
 
         # Calculate KL regularization.
         if self.use_on_policy_kl_approximation:
@@ -170,16 +160,37 @@ class ClippedPGLossFn(LossFunction):
         else:
             kl_importance_weights = torch.ones_like(curr_logprobs)
 
-        kl = kl_importance_weights * calculate_kl_penalty_joschu2020(
-            logprobs_policy=curr_logprobs,
-            logprobs_reference=reference_policy_logprobs,
-        )
+        if self.use_kl_fix:
+            with torch.no_grad():
+                p_t = (curr_logprobs.detach() - reference_policy_logprobs) * mask
+                p_t = p_t.flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+
+                kl_for_metric = kl_importance_weights * calculate_kl_penalty_joschu2020(
+                    logprobs_policy=curr_logprobs,
+                    logprobs_reference=reference_policy_logprobs,
+                )
+
+            kl = p_t * curr_logprobs
+        else:
+            kl = kl_importance_weights * calculate_kl_penalty_joschu2020(
+                logprobs_policy=curr_logprobs,
+                logprobs_reference=reference_policy_logprobs,
+            )
+            kl_for_metric = kl
 
         if self.loss_type == LossType.TOKEN_LEVEL:
             kl = masked_mean(kl, mask, global_normalization_factor=global_valid_toks)
+            kl_for_metric = masked_mean(
+                kl_for_metric, mask, global_normalization_factor=global_valid_toks
+            )
         else:
             kl = masked_mean(
                 masked_mean(kl, token_mask, dim=-1),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+            kl_for_metric = masked_mean(
+                masked_mean(kl_for_metric, token_mask, dim=-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
@@ -194,15 +205,21 @@ class ClippedPGLossFn(LossFunction):
             ratios_clamped = ratios.clamp(
                 1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
             )
+
         else:
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
+        if self.use_stable_loss:
+            loss_stable = -(advantages * ratios_clamped.detach() * curr_logprobs)
+            clip_loss = loss_stable
 
-        # Determine which value to use for clipping (max for pessimistic estimate)
-        clip_loss = torch.max(loss1, loss2)
+        else:
+            loss1 = -advantages * ratios
+            loss2 = -advantages * ratios_clamped
+
+            # Determine which value to use for clipping (max for pessimistic estimate)
+            clip_loss = torch.max(loss1, loss2)
 
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
@@ -262,10 +279,24 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
+            ratio_to_compare = (
+                generation_logprobs
+                if self.use_generation_logprobs_in_ppo_baseline
+                else prev_logprobs
+            ).detach()
+            sequence_level_ratios = (
+                ((curr_logprobs.detach() - ratio_to_compare) * mask).sum(-1).exp().sum()
+            )
+
         kl_for_loss = self.reference_policy_kl_penalty * kl
         loss = actor_loss + kl_for_loss
 
         with torch.no_grad():
+            token_level_entropy = masked_mean(
+                compute_token_level_entropy(next_token_logits),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
             probs_ratio = masked_mean(
                 ratios.detach(),
                 mask,
@@ -277,6 +308,29 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             ).item()
 
+            if self.disable_ppo_ratio:
+                clipped_min = 0
+                clipped_max = 0
+            else:
+                advantages_neg = advantages < 0
+                advantages_pos = advantages > 0
+
+                clipped_min_mask = (
+                    (ratios < 1 - self.ratio_clip_min) * advantages_neg * mask
+                )
+                clipped_max_mask = (
+                    (ratios > 1 + self.ratio_clip_max) * advantages_pos * mask
+                )
+
+                clipped_min = clipped_min_mask.sum().item()
+                clipped_max = clipped_max_mask.sum().item()
+
+                clamped_min_ratios, clamped_max_ratios = 0, 0
+                if clipped_min > 0:
+                    clamped_min_ratios = ratios[clipped_min_mask.bool()].sum().item()
+                if clipped_max > 0:
+                    clamped_max_ratios = ratios[clipped_max_mask.bool()].sum().item()
+
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
@@ -285,14 +339,21 @@ class ClippedPGLossFn(LossFunction):
             {
                 "loss": loss.item(),
                 "log_probs_mean": log_probs_mean.item(),
+                "sequence_level_ratios": sequence_level_ratios.item(),
+                "tokens_min_clipped": clipped_min,
+                "tokens_max_clipped": clipped_max,
+                "clamped_min_ratios": clamped_min_ratios,
+                "clamped_max_ratios": clamped_max_ratios,
                 "probs_ratio": probs_ratio,
                 "probs_ratio_clamped": probs_ratio_clamped,
                 "kl_penalty": kl.item(),
+                "kl_penalty_for_metric": kl_for_metric.item(),
                 "kl_penalty_for_loss": kl_for_loss.item(),
                 "token_mult_prob_error": mult_prob_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
-                "approx_entropy": seq_entropy_approx.item(),
+                "seq_approx_entropy": seq_entropy_approx.item(),
+                "token_level_entropy": token_level_entropy.item(),
             },
         )
 

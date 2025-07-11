@@ -17,21 +17,19 @@ import os
 import pprint
 import sys
 
+import jsonlines
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets import load_dataset
-from omegaconf import OmegaConf
-from transformers import AutoTokenizer
+from pathlib import Path
 
-from examples.run_grpo import math_data_processor
+from omegaconf import OmegaConf
+
+from examples.run_grpo import setup_data
+from nemo_rl.algorithms.grpo import validate
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import MathDataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.llm_message_utils import remap_dataset_keys
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.math_environment import MathEnvironment
-from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
+from nemo_rl.evals.eval import MasterConfig, setup
 from nemo_rl.models.generation.interfaces import configure_generation_config
 
 
@@ -49,42 +47,6 @@ def parse_args():
     overrides = OmegaConf.from_dotlist(remaining)
 
     return args, overrides
-
-
-def setup_data(tokenizer: AutoTokenizer, data_config: MathDataConfig, env_configs):
-    print("\n▶ Setting up data...")
-    math_task_spec = TaskDataSpec(
-        task_name="math",
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-
-    # load dataset
-    base_dataset = load_dataset(data_config["dataset_name"])
-    if data_config["dataset_key"] is not None:
-        base_dataset = base_dataset[data_config["dataset_key"]]
-    # remap problem and solution keys
-    remapped_dataset = remap_dataset_keys(
-        base_dataset,
-        mapping_dict={
-            data_config["problem_key"]: "problem",
-            data_config["solution_key"]: "expected_answer",
-        },
-    )
-
-    math_env = MathEnvironment.options(
-        runtime_env={"py_executable": MathEnvironment.DEFAULT_PY_EXECUTABLE}
-    ).remote(env_configs["math"])
-
-    dataset = AllTaskProcessedDataset(
-        dataset=remapped_dataset,
-        tokenizer=tokenizer,
-        default_task_data_spec=math_task_spec,
-        task_data_processors=math_data_processor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
-
-    return dataset, math_env, tokenizer
 
 
 def main():
@@ -119,27 +81,47 @@ def main():
         config["generation"], tokenizer, is_eval=True
     )
 
-    # Setup data
+    # setup data
     (
         dataset,
-        math_env,
-        tokenizer,
+        _,
+        task_to_env,
+        _,
     ) = setup_data(tokenizer, config["data"], config["env"])
 
     # Setup
     (
         vllm_generation,
         dataloader,
-        master_config,
+        _,
     ) = setup(config, tokenizer, dataset)
 
-    # Run evaluation
-    run_env_eval(
+    val_metrics, _, data_for_saving = validate(
         vllm_generation,
         dataloader,
-        math_env,
-        master_config,
+        tokenizer,
+        task_to_env,
+        0,
+        config["master_config"],
+        num_repeats=config["eval"]["num_repeats"],
+        return_data_for_saving=True,
     )
+
+    save_dir = config["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Atomic save using jsonlines
+    base_name = Path(config["data"]["train"]["jsonl_path"]).stem
+    output_file = os.path.join(save_dir, f"{base_name}_sampled.jsonl")
+    temp_file = output_file + ".tmp"
+
+    with jsonlines.open(temp_file, "w") as f:
+        for item in data_for_saving:
+            f.write(item)
+
+    # Atomic rename
+    os.rename(temp_file, output_file)
+    print(f"Saved data to {output_file}")
 
 
 if __name__ == "__main__":

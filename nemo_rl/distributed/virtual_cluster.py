@@ -40,13 +40,13 @@ class PY_EXECUTABLES:
 
     # TODO: Debug why run-to-run variance is so high with these options
     # Use NeMo-RL direct dependencies.
-    BASE = "uv run --locked"
+    BASE = "uv run"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = "uv run --locked --extra vllm"
+    VLLM = "uv run --extra vllm"
 
     # Use NeMo-RL direct dependencies and ifeval dependencies.
-    IFEVAL = "uv run --locked --extra ifeval"
+    IFEVAL = "uv run --extra ifeval"
 
 
 @ray.remote

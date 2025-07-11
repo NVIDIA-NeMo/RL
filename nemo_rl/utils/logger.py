@@ -509,7 +509,14 @@ class Logger(LoggerInterface):
         self.wandb_tables = {}
         self.wandb_tables_df = defaultdict(
             lambda: pd.DataFrame(
-                columns=["step", "prompt", "response", "environment", "reward"]
+                columns=[
+                    "step",
+                    "prompt",
+                    "response",
+                    "environment",
+                    "reward",
+                    "dataset_name",
+                ]
             )
         )
 
@@ -523,7 +530,14 @@ class Logger(LoggerInterface):
             self.loggers.append(self.wandb_logger)
             self.wandb_tables = defaultdict(
                 lambda: wandb.Table(
-                    columns=["step", "prompt", "response", "environment", "reward"]
+                    columns=[
+                        "step",
+                        "prompt",
+                        "response",
+                        "environment",
+                        "reward",
+                        "dataset_name",
+                    ]
                 )
             )
 
@@ -611,7 +625,9 @@ class Logger(LoggerInterface):
 
         print(f"Logged data to {filepath}")
 
-    def log_table_contents(self, step, prompt, response, environment, reward, prefix):
+    def log_table_contents(
+        self, step, prompt, response, environment, reward, dataset_name, prefix
+    ):
         if self.wandb_logger is None:
             return
 
@@ -621,12 +637,12 @@ class Logger(LoggerInterface):
             "response": response,
             "environment": environment,
             "reward": reward,
+            "dataset_name": dataset_name,
         }
 
         self.wandb_tables_df[prefix] = pd.concat(
             [self.wandb_tables_df[prefix], pd.DataFrame([new_row])], ignore_index=True
         )
-
         return wandb.Table(dataframe=self.wandb_tables_df[prefix])
 
     def log_batched_dict_as_table(
@@ -635,24 +651,30 @@ class Logger(LoggerInterface):
         if not isinstance(to_log, BatchedDataDict):
             to_log = BatchedDataDict(to_log)
 
+        unique_datasets = list(set(to_log["dataset_names"]))
+
         if self.wandb_logger is None:
             return
 
-        # Write to JSONL file
-        for _, sample in enumerate(to_log.make_microbatch_iterator(1)):
-            for key, value in sample.items():
-                if isinstance(value, torch.Tensor):
-                    sample[key] = value.tolist()
+        table = None
 
-                content = sample["content"][0]
-                return self.log_table_contents(
-                    step,
-                    content[0],
-                    content[1],
-                    content[2],
-                    sample["rewards"][0],
-                    prefix,
-                )
+        for dataset in unique_datasets:
+            dataset_idx = to_log["dataset_names"].index(dataset)
+
+            content = to_log["content"][dataset_idx]
+            reward = to_log["rewards"][dataset_idx]
+
+            table = self.log_table_contents(
+                step,
+                content[0],
+                content[1],
+                content[2],
+                reward,
+                dataset,
+                prefix,
+            )
+
+        return table
 
     def __del__(self):
         """Clean up resources when the logger is destroyed."""

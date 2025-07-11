@@ -117,6 +117,34 @@ class DistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class DistributedTokenLevelEntropy(torch.autograd.Function):
+    """Custom autograd function for computing entropy in a distributed setting."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        vocab_parallel_logits: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ):
+        # TODO: keep the vocab start and end index
+        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
+        tp_entropy = (log_probs.exp() * log_probs).sum(-1)
+
+        torch.distributed.all_reduce(
+            tp_entropy,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+        return -tp_entropy
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, None, None, None, None, None]:
+        raise NotImplementedError("Backward pass for entropy is not implemented.")
+
+
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,

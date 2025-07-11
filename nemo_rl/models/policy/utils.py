@@ -107,21 +107,20 @@ def sliding_window_overwrite(model_name: str) -> dict:
     Returns:
         dict: Dictionary with overwrite values, or empty dict if no overwrites needed
     """
-    hf_config = AutoConfig.from_pretrained(model_name)
-    overwrite_dict = {}
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return {}
+# Override sliding_window setting to address a HF mismatch relevant to use_sliding_window
+# TODO(@zhiyul): remove this once the bug is fixed https://github.com/huggingface/transformers/issues/38002
+# if (
+# hasattr(hf_config, "use_sliding_window")
+# and hf_config.use_sliding_window == False
+# ):
+# assert hasattr(hf_config, "sliding_window")
+# overwrite_dict = {
+# "sliding_window": None,
+# }
+# print(
+# f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}"
+# )
 
-    # Override sliding_window setting to address a HF mismatch relevant to use_sliding_window
-    # TODO(@zhiyul): remove this once the bug is fixed https://github.com/huggingface/transformers/issues/38002
-    if (
-        hasattr(hf_config, "use_sliding_window")
-        and hf_config.use_sliding_window == False
-    ):
-        assert hasattr(hf_config, "sliding_window")
-        overwrite_dict = {
-            "sliding_window": None,
-        }
-        print(
-            f"use_sliding_window=False in config - overriding sliding_window parameter to None: {overwrite_dict}"
-        )
-
-    return overwrite_dict
+# return overwrite_dict
