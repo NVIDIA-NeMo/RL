@@ -22,11 +22,8 @@ from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
-    Dict,
-    List,
     NotRequired,
     Optional,
-    Tuple,
     TypedDict,
     Union,
     cast,
@@ -1370,7 +1367,7 @@ class VllmGeneration(GenerationInterface):
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
-    ) -> List[Tuple[int, List[int]]]:
+    ) -> list[tuple[int, list[int]]]:
         """Calculate bundle indices for tensor and pipeline parallel workers.
 
         Handles both unified placement groups (for cross-node model parallelism) and
@@ -1393,7 +1390,7 @@ class VllmGeneration(GenerationInterface):
 
             def get_node_bundles(
                 pg: PlacementGroup,
-            ) -> Dict[str, List[int]]:
+            ) -> dict[str, list[int]]:
                 # Retrieve mapping from node ID to bundle indices from a placement group.
                 try:
                     pg_table = ray.util.placement_group_table(pg)
@@ -1403,7 +1400,7 @@ class VllmGeneration(GenerationInterface):
                         "Failed to retrieve bundle/node mapping from placement group"
                     ) from e
 
-                node_bundles: Dict[str, List[int]] = defaultdict(list)
+                node_bundles: dict[str, list[int]] = defaultdict(list)
                 for bundle_idx, node_id in bundle_to_node.items():
                     node_bundles[node_id].append(bundle_idx)
                 for bundles in node_bundles.values():
@@ -1412,7 +1409,7 @@ class VllmGeneration(GenerationInterface):
 
             def allocate_worker_groups(
                 pg: PlacementGroup, tp_size: int, pp_size: int
-            ) -> List[Tuple[int, List[int]]]:
+            ) -> list[tuple[int, list[int]]]:
                 # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
 
                 # Retrieve both bundle mapping and per-node bundles
@@ -1442,12 +1439,12 @@ class VllmGeneration(GenerationInterface):
                 node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
 
                 # Flatten bundles in node order
-                flat: List[int] = []
+                flat: list[int] = []
                 for nid in sorted_nodes:
                     flat.extend(node_bundles[nid])
 
                 # Slice into groups and assign logical index
-                groups: List[Tuple[int, List[int]]] = []
+                groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size

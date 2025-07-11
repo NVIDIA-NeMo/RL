@@ -17,7 +17,7 @@ import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, List, Optional, Set, Union, cast
+from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
@@ -336,8 +336,8 @@ class DTensorPolicyWorker:
     @staticmethod
     def create_context_parallel_ctx(
         cp_mesh: torch.distributed.device_mesh.DeviceMesh,
-        cp_buffers: List[torch.Tensor],
-        cp_seq_dims: List[int],
+        cp_buffers: list[torch.Tensor],
+        cp_seq_dims: list[int],
         cp_no_restore_buffers: Set[torch.Tensor],
         cp_rotate_method: Optional[str] = None,
     ):
@@ -345,8 +345,8 @@ class DTensorPolicyWorker:
 
         Args:
             cp_mesh (DeviceMesh): The device mesh for context parallel.
-            cp_buffers (List[torch.Tensor]): The buffers for context parallel.
-            cp_seq_dims (List[int]): The sequence dimensions for context parallel.
+            cp_buffers (list[torch.Tensor]): The buffers for context parallel.
+            cp_seq_dims (list[int]): The sequence dimensions for context parallel.
             cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
             cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
         """

@@ -14,7 +14,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Optional, Tuple, TypedDict, TypeVar, cast
+from typing import Any, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -128,7 +128,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
-    Tuple[RayVirtualCluster, RayVirtualCluster],
+    tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
@@ -140,7 +140,7 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
     """
     # Extract individual configs for easier access
     policy_config = master_config["policy"]
