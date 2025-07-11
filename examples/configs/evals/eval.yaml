@@ -1,7 +1,7 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@k"
-  num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
+  metric: "cons@k"
+  num_tests_per_prompt: 5 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
   k_value: 1
   save_path: null # Path to save evaluation results and configuration of the evaluation. Set to null to disable saving. Example: "results/eval_output" or "/path/to/evaluation_results"
@@ -9,7 +9,7 @@ eval:
 generation:
   backend: "vllm" # only vllm is supported for evaluation
   max_new_tokens: ${generation.vllm_cfg.max_model_len}
-  temperature: 0.0
+  temperature: 0.7
   top_p: 1.0
   top_k: -1 # -1 means disable
   num_prompts_per_step: -1 # -1 means pass all prompts at once

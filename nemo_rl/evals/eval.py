@@ -15,6 +15,8 @@
 import asyncio
 import json
 import os
+from collections import Counter
+from itertools import combinations
 from typing import TypedDict
 
 import ray
@@ -95,17 +97,14 @@ def setup(
     temperature = generation_config["temperature"]
     top_k = generation_config["top_k"]
 
-    # TODO @yukih: support cons@k
     # Validate metrics
-    assert metric in ["pass@k"], f"Invalid metric: {metric}"
+    assert metric in ["pass@k", "cons@k"], f"Invalid metric: {metric}"
     if num_tests_per_prompt > 1:
         assert temperature > 0 and top_k != 1, (
             "temperature > 0 and top_k != 1 are required for multiple samples"
         )
 
-    assert k_value >= 1, (
-        "k_value must be greater than or equal to 1 for pass@k metric"
-    )
+    assert k_value >= 1, "k_value must be greater than or equal to 1 for pass@k metric"
     assert num_tests_per_prompt >= k_value, (
         "num_tests_per_prompt must be greater than or equal to k_value for pass@k metric"
     )
@@ -194,20 +193,80 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
 
     return pass_k_score
 
-def eval_cons_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, extracted_answers: list[list[str]| None]) -> float:
+
+def eval_cons_k(
+    rewards: torch.Tensor,
+    num_tests_per_prompt: int,
+    k: int,
+    extracted_answers: list[str | None],
+) -> float:
     """Evaluate cons@k score using an unbiased estimator.
-    
+
     Args:
         rewards: Tensor of shape (batch_size * num_tests_per_prompt)
         num_tests_per_prompt: int
         k: int
-        extracted_answers: list[list[str]| None]
+        extracted_answers: list[str| None]
 
     Returns:
         cons_k_score: float
     """
-    pass
-    
+
+    def majority_vote(answers: list[str | None]) -> str | None:
+        """Find the most common answer in the list of answers."""
+        if not answers:
+            return None
+        # To fix@rayentian: How to deal with the case that there are multiple most common answers? Now we just return the first one.
+        return Counter(answers).most_common(1)[0][0]
+
+    def eval_single_cons_k(
+        chunk_rewards: torch.Tensor, chunk_answers: list[str | None], n: int, k: int
+    ) -> float:
+        if chunk_answers is None or n == 0 or k > n:
+            return 0.0
+
+        total_subsets = 0
+        correct_subsets = 0
+        # For each subset of k answers, we vote for the most common answer.
+        # If the most common answer is the same as the gold answer, we consider the subset as correct.
+        for subset_indices in combinations(range(n), k):
+            subset_answers = [chunk_answers[i] for i in subset_indices]
+            majority_answer = majority_vote(subset_answers)
+            reward_idx = chunk_answers.index(majority_answer)
+            reward = chunk_rewards[reward_idx].item()
+            total_subsets += 1
+            if reward == 1.0:
+                correct_subsets += 1
+
+        return correct_subsets / total_subsets
+
+    assert len(extracted_answers) == len(rewards), (
+        "The number of extracted answers must be the same as the number of rewards"
+    )
+    # Split the rewards and extracted answers into groups of num_tests_per_prompt.
+    group_rewards = rewards.split(num_tests_per_prompt)
+    group_extracted_answers = [
+        extracted_answers[i : i + num_tests_per_prompt]
+        for i in range(0, len(extracted_answers), num_tests_per_prompt)
+    ]
+    assert len(group_rewards) == len(group_extracted_answers), (
+        "The number of rewards and extracted answers must be the same"
+    )
+    num_groups = len(group_rewards)
+    cons_k_score = 0.0
+    # For each group of num_tests_per_prompt rewards and extracted answers, we evaluate the cons@k score.
+    for i in range(num_groups):
+        chunk_rewards = group_rewards[i]
+        chunk_answers = group_extracted_answers[i]
+        assert len(chunk_rewards) == len(chunk_answers), (
+            "The number of rewards and extracted answers must be the same"
+        )
+        cons_k_score += eval_single_cons_k(
+            chunk_rewards, chunk_answers, len(chunk_answers), k
+        )
+
+    return cons_k_score
+
 
 def run_env_eval(vllm_generation, dataloader, env, master_config):
     """Main entry point for running evaluation using environment.
@@ -282,7 +341,7 @@ async def _run_env_eval_impl(
             for i in range(len(batch["message_log"]))
         ]
         # Set return_extracted_answer to True to get the extracted answers
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"],True))
+        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
         rewards = env_return.rewards
 
         # Collect data for JSON file
@@ -310,6 +369,10 @@ async def _run_env_eval_impl(
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
+        elif metric == "cons@k":
+            score += eval_cons_k(
+                rewards, num_tests_per_prompt, k_value, extracted_answers
+            )
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
@@ -329,7 +392,7 @@ async def _run_env_eval_impl(
         score,
         len(dataloader.dataset),
         metric,
-        pass_k_value,
+        k_value,
         num_tests_per_prompt,
     )
 
@@ -415,7 +478,7 @@ def _print_results(
     score,
     dataset_size,
     metric,
-    pass_k_value,
+    k_value,
     num_tests_per_prompt,
 ):
     """Print evaluation results."""
