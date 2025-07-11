@@ -21,7 +21,12 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
+from accelerate import init_empty_weights
 from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
+)
 from torch.distributed.fsdp import (
     FSDPModule,
 )
@@ -30,13 +35,12 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -52,6 +56,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     get_gpu_info,
+    get_runtime_env_for_policy_worker,
     import_class_from_path,
     sliding_window_overwrite,
 )
@@ -110,12 +115,8 @@ def get_cpu_state_dict(
 
 
 @ray.remote(
-    runtime_env={
-        # TODO: This option causes a crash on Ampere. It's okay to enable on Hopper.
-        # "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
-        **get_nsight_config_if_pattern_matches("dtensor_policy_worker"),
-    }
-)
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+)  # pragma: no cover
 class DTensorPolicyWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -137,6 +138,15 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        if (
+            "generation" in config
+            and config["generation"] is not None
+            and not config["generation"]["colocated"]["enabled"]
+        ):
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
@@ -156,19 +166,38 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-        self.model = AutoModelForCausalLM.from_pretrained(
+        model_config = AutoConfig.from_pretrained(
             model_name,
-            device_map="cpu",  # load weights onto CPU initially
             # Always load the model in float32 to keep master weights in float32.
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            # https://github.com/NVIDIA/NeMo-RL/issues/279 will fix the issue of CPU OOM for larger models.
             torch_dtype=torch.float32,
             trust_remote_code=True,
             **sliding_window_overwrite(
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
         )
+
+        full_state_dict = None
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="cpu",  # load weights onto CPU initially
+                trust_remote_code=True,
+                config=model_config,
+            )
+            full_state_dict = model.state_dict()
+            del model
+
+        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+        # All ranks initialize model on meta device, so FSDP can shard it.
+        # The actual weights will be broadcast from rank 0.
+
+        with init_empty_weights():
+            self.model = AutoModelForCausalLM.from_config(
+                model_config,
+            )
+
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
         self.skip_tie_check = os.environ.get(
@@ -222,8 +251,24 @@ class DTensorPolicyWorker:
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
 
+        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
+        # This will broadcast the state dict from rank 0 to all other ranks
+        # and load it into the FSDP model.
+        set_model_state_dict(
+            self.model,
+            model_state_dict=full_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+            ),
+        )
+
+        # Manually broadcast buffers
+        for _, buf in self.model.named_buffers():
+            torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
+
         if self.cpu_offload:
-            self.model = self.move_buffer_to_device(self.model, "cpu")
+            self.model = self.move_to_device(self.model, "cpu")
 
         # used for streaming update inference engine weights
         self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
@@ -343,11 +388,6 @@ class DTensorPolicyWorker:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        # keep the same behavior as vllm
-        # see https://github.com/vllm-project/vllm/blob/v0.8.5/vllm/env_override.py#L25
-        if not os.path.exists("/dev/nvidia-caps-imex-channels"):
-            os.environ["NCCL_CUMEM_ENABLE"] = "0"
-
         if self.rank == 0:
             pg = StatelessProcessGroup.create(
                 host=ip, port=port, rank=0, world_size=world_size
@@ -381,7 +421,7 @@ class DTensorPolicyWorker:
             and not self.skip_tie_check
         ):
             raise ValueError(
-                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA/NeMo-RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
+                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA-NeMo/RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
             )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -531,7 +571,8 @@ class DTensorPolicyWorker:
                                 .full_tensor()
                                 .squeeze(0)
                             )
-                            _, sorted_indices = torch.sort(seq_index_dtensor)
+
+                            mb["seq_index"] = seq_index_dtensor
 
                             for tensor_name in mb:
                                 current_tensor = mb[tensor_name]
@@ -544,18 +585,28 @@ class DTensorPolicyWorker:
                                             current_tensor,
                                             device_mesh=self.cp_mesh,
                                             placements=[Shard(sequence_dim)],
-                                        ).full_tensor()[:, sorted_indices]
+                                        )
                                         break
 
                             if isinstance(logits, DTensor):
-                                logits = logits.full_tensor()
+                                # Must be tp sharded
+                                assert (
+                                    logits.device_mesh.ndim == 1
+                                    and logits.device_mesh.mesh_dim_names[0] == "tp"
+                                ), "logits must be tp sharded"
 
-                            logits_dtensor = DTensor.from_local(
-                                logits,
-                                device_mesh=self.cp_mesh,
-                                placements=[Shard(sequence_dim)],
-                            )
-                            logits = logits_dtensor.full_tensor()[:, sorted_indices]
+                                # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                                logits = DTensor.from_local(
+                                    logits.to_local(),
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
+                            else:
+                                logits = DTensor.from_local(
+                                    logits,
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
 
                         loss, loss_metrics = loss_fn(
                             logits, mb, global_valid_seqs, global_valid_toks
@@ -900,7 +951,10 @@ class DTensorPolicyWorker:
             handle = reduce_tensor(p.detach())
             all_handles.append((key, handle))
 
-        return {device_uuid: all_handles}
+        # (pack_tensor_for_ipc: bool, handles: list)
+        serialized = (False, all_handles)
+
+        return {device_uuid: serialized}
 
     @torch.no_grad()
     def prepare_info_for_collective(self) -> dict[str, Any]:

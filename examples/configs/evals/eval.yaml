@@ -1,8 +1,9 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@1" # only pass@1 is supported now
+  metric: "pass@k"
   num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
+  pass_k_value: 1
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation
@@ -21,6 +22,16 @@ generation:
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 2048
+    enforce_eager: False
+  colocated:
+    # true: generation shares training GPUs
+    # false: uses dedicated generation resources
+    enabled: true
+    # only relevant when enabled is false
+    resources:
+      gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+      num_nodes: null # Decides number of nodes to be dedicated to generation
+
 
 tokenizer:
   name: ${generation.model_name} ## specify if you'd like to use a tokenizer different from the model's default
@@ -30,10 +41,7 @@ data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
   prompt_file: null
   system_prompt_file: null
-  dataset_name: "HuggingFaceH4/aime_2024"
-  dataset_key: "train"
-  problem_key: "problem"
-  solution_key: "answer"
+  dataset_name: "aime2024"
 
 env:
   math:

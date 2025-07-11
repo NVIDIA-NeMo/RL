@@ -104,7 +104,7 @@ def create_local_venv(
 
 
 # Ray-based helper to create a virtual environment on each Ray node
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1)  # pragma: no cover
 def _env_builder(
     py_executable: str, venv_name: str, node_idx: int, force_rebuild: bool = False
 ):

@@ -92,7 +92,7 @@ def _parallelize_gemma3(
     Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
     """
     if isinstance(model, Gemma3ForConditionalGeneration):
-        model_prefix = "language_model.model"
+        model_prefix = "language_model"
     else:
         model_prefix = "model"
 
@@ -399,7 +399,7 @@ def _parallelize_model(
     """
     model_cls = type(model)
     if model_cls == Gemma3ForConditionalGeneration:
-        layers: torch.nn.ModuleList = model.language_model.model.layers  # type: ignore
+        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     else:
@@ -616,7 +616,9 @@ def get_grad_norm(
 
 
 def get_logprobs_from_vocab_parallel_logits(
-    vocab_parallel_logits: DTensor, input_ids: torch.Tensor
+    vocab_parallel_logits: DTensor,
+    input_ids: torch.Tensor | DTensor,
+    seq_index: Optional[torch.Tensor] = None,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -632,16 +634,26 @@ def get_logprobs_from_vocab_parallel_logits(
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
     """
-    tp_mesh = vocab_parallel_logits.device_mesh
-    tp_rank: int = tp_mesh.get_local_rank()
+    device_mesh = vocab_parallel_logits.device_mesh
+    if seq_index is not None:
+        assert "cp" in device_mesh.mesh_dim_names, (
+            "seq_index must be provided for cp sharded logits"
+        )
 
-    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
+    tp_size = 1
+
+    tp_group = device_mesh.get_group("tp")
+    tp_rank = tp_group.rank()
+    tp_size = tp_group.size()
+
+    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
     return from_parallel_logits_to_logprobs(
         vocab_parallel_logits.to_local(),
         input_ids,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
-        tp_mesh.get_group(),
+        tp_group,
         inference_only=not torch.is_grad_enabled(),
+        seq_index=seq_index,
     )

@@ -73,7 +73,7 @@ class VllmConfig(GenerationConfig):
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -128,6 +128,9 @@ class VllmGenerationWorker:
                 seed = node_idx * 1024 + bundle_id
 
             init_kwargs["seed"] = seed
+            # Need to give each DP group its own vllm cache to address:
+            # https://github.com/vllm-project/vllm/issues/18851
+            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -327,8 +330,7 @@ class VllmGenerationWorker:
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
             dtype=self.cfg["vllm_cfg"]["precision"],
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA/NeMo-RL/issues/186)
-            enforce_eager=True,
+            enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
@@ -345,11 +347,26 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
-    def init_collective(self, data: int, ip: str, port: int, world_size: int) -> None:
+    def init_collective(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
         self.llm.collective_rpc(
             "init_collective",
             args=(
-                data,
+                rank_prefix,
+                ip,
+                port,
+                world_size,
+            ),
+        )
+
+    async def init_collective_async(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
+        await self.llm.collective_rpc(
+            "init_collective",
+            args=(
+                rank_prefix,
                 ip,
                 port,
                 world_size,
@@ -779,6 +796,12 @@ class VllmGenerationWorker:
             BatchedDataDict containing:
                 - texts: List of generated text responses
         """
+        # Check if async engine is enabled
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
+            )
+
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
             "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
@@ -822,6 +845,107 @@ class VllmGenerationWorker:
             {"texts": texts}
         )
         return return_data
+
+    async def generate_text_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate text responses asynchronously, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing single text response)
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text_async can only be used when async_engine is enabled in vLLM config."
+            )
+
+        # Handle empty input case
+        if len(data["prompts"]) == 0:
+            return
+
+        prompts = data["prompts"]
+        batch_size = len(prompts)
+
+        # Extract stop_strings if provided, else use default from config
+        batch_stop_strings: list[list[str] | None] = data.get(
+            "stop_strings", [self.cfg.get("stop_strings")] * batch_size
+        )
+
+        # Create tasks for each prompt
+        async def process_single_prompt(prompt_idx):
+            """Process a single prompt and return the result."""
+            prompt = prompts[prompt_idx]
+
+            # Get stop strings for this specific prompt
+            per_prompt_stop_strings = None
+            if batch_stop_strings and prompt_idx < len(batch_stop_strings):
+                per_prompt_stop_strings = batch_stop_strings[prompt_idx]
+
+            # Merge stop strings
+            final_stop_strings = self._merge_stop_strings(
+                [per_prompt_stop_strings] if per_prompt_stop_strings else None
+            )
+
+            # Create sampling parameters
+            top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+            sampling_params = self.SamplingParams(
+                temperature=self.cfg["temperature"] if not greedy else 0,
+                top_p=self.cfg["top_p"],
+                top_k=top_k if not greedy else 1,
+                max_tokens=self.cfg["max_new_tokens"],
+                stop_token_ids=self.cfg["stop_token_ids"],
+                stop=final_stop_strings,
+                include_stop_str_in_output=True,  # returning stop strings like hf
+            )
+
+            request_id = str(uuid.uuid4())
+
+            # Generate using vLLM async engine
+            vllm_request_generator = self.llm.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
+
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
+
+            # Extract the generated text
+            generated_text = final_request_output.outputs[0].text
+
+            # Create result in BatchedDataDict format
+            result_batch = BatchedDataDict[GenerationOutputSpec](
+                {"texts": [generated_text]}
+            )
+
+            return (prompt_idx, result_batch)
+
+        # Create tasks for all prompts and yield results as they complete
+        prompt_tasks = [
+            asyncio.create_task(process_single_prompt(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        for completed_task in asyncio.as_completed(prompt_tasks):
+            try:
+                result = await completed_task
+                yield result
+            except Exception as e:
+                # Cancel remaining tasks
+                for task in prompt_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*prompt_tasks, return_exceptions=True)
+                raise e
 
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
@@ -887,11 +1011,11 @@ class VllmGenerationWorker:
 
         return cast(list[str], list_of_worker_results)
 
-    def update_weights_from_ipc_handles(self, data: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
-            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -907,7 +1031,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(data,)
+                "update_weights_from_ipc_handles", args=(ipc_handles,)
             )
             worker_result = result_or_coro[0]
 
@@ -924,11 +1048,13 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_ipc_handles_async(self, data: dict[str, Any]) -> bool:
+    async def update_weights_from_ipc_handles_async(
+        self, ipc_handles: dict[str, Any]
+    ) -> bool:
         """Async version of update_weights_from_ipc_handles.
 
         Args:
-            data (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -944,7 +1070,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(data,)
+                "update_weights_from_ipc_handles", args=(ipc_handles,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -967,7 +1093,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    def update_weights_from_collective(self, data: dict[str, Any]) -> bool:
+    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -976,11 +1102,11 @@ class VllmGenerationWorker:
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_collective cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                    "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(data,)
+                "update_weights_from_collective", args=(info,)
             )
             worker_result = result_or_coro[0]
 
@@ -997,9 +1123,69 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
+        """Async version of update_weights_from_collective."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
+                )
+
+            result_or_coro = await self.llm.collective_rpc(
+                "update_weights_from_collective", args=(info,)
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
+            )
+
         self.llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    async def reset_prefix_cache_async(self):
+        """Async version of reset_prefix_cache."""
+        assert self.llm is not None, (
+            "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
+            )
+
+        await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1139,6 +1325,13 @@ class VllmGeneration(GenerationInterface):
             "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
         )
 
+        # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        env_vars = {}
+        if not self.cfg["colocated"]["enabled"]:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
@@ -1150,6 +1343,7 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 bundle_indices_list=node_bundle_indices,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
         else:
             # Use standard worker group creation for non-parallel case
@@ -1159,6 +1353,7 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 workers_per_node=workers_per_node,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
 
         # Number of data parallel groups is the number of tied worker groups
@@ -1308,6 +1503,13 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "init_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "init_collective"
+        )
+
         # Prepare rank
         total_workers = len(self.worker_group.workers)
         if self.dp_size == 0:
@@ -1319,8 +1521,8 @@ class VllmGeneration(GenerationInterface):
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
-            "init_collective",
-            data=rank_prefix_list,
+            method_name,
+            rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"ip": ip, "port": port, "world_size": world_size},
         )
@@ -1346,7 +1548,7 @@ class VllmGeneration(GenerationInterface):
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1384,15 +1586,20 @@ class VllmGeneration(GenerationInterface):
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
 
-        # Get total batch size
-        batch_size = len(data["prompts"])
+        # Check if async engine is enabled
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
+            )
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = data.shard_by_batch_size(dp_size, batch_size=batch_size)
+        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+            dp_size, allow_uneven_shards=True
+        )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_text",
-            sharded_data,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
@@ -1417,28 +1624,35 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
-    async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    async def _async_generate_base(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        method_name: str,
+        data_validation_fn,
+        greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate responses asynchronously, yielding individual samples as they complete.
+        """Base async generation method that handles common worker management logic.
 
-        This method provides per-sample streaming across all workers, yielding each
-        sample result as soon as it's ready, regardless of which worker processed it.
+        Args:
+            data: Input data for generation
+            method_name: Name of the worker method to call ('generate_async' or 'generate_text_async')
+            data_validation_fn: Function to validate input data
+            greedy: Whether to use greedy decoding
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing generation result)
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
-                "generate_async can only be used when async_engine is enabled in VllmConfig."
+                f"{method_name} can only be used when async_engine is enabled in vLLM config."
             )
 
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
-        assert "input_ids" in data and "input_lengths" in data, (
-            "input_ids and input_lengths are required in data for vLLM generation"
-        )
 
-        # Handle empty input case
-        if len(data["input_ids"]) == 0:
+        # Validate input data and handle empty case
+        if not data_validation_fn(data):
             return
 
         # Determine the leader worker for the current data parallel shard
@@ -1446,9 +1660,9 @@ class VllmGeneration(GenerationInterface):
             self.current_generate_dp_shard_idx
         )
 
-        # Run the generate_async method on the selected leader worker. This returns an ObjectRefGenerator.
+        # Run the async method on the selected leader worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name="generate_async",
+            method_name=method_name,
             worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
@@ -1532,6 +1746,52 @@ class VllmGeneration(GenerationInterface):
             f"Worker task {leader_worker_idx} should be done but isn't"
         )
 
+    async def generate_text_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate text responses asynchronously, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing single text response)
+        """
+
+        def validate_text_data(data):
+            if len(data["prompts"]) == 0:
+                return False  # Return False for empty case to trigger early return
+            return True
+
+        async for result in self._async_generate_base(
+            data, "generate_text_async", validate_text_data, greedy
+        ):
+            yield result
+
+    async def generate_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate responses asynchronously, yielding individual samples as they complete.
+
+        This method provides per-sample streaming across all workers, yielding each
+        sample result as soon as it's ready, regardless of which worker processed it.
+        """
+
+        def validate_generate_data(data):
+            if "input_ids" not in data or "input_lengths" not in data:
+                raise AssertionError(
+                    "input_ids and input_lengths are required in data for vLLM generation"
+                )
+            if len(data["input_ids"]) == 0:
+                return False  # Return False for empty case to trigger early return
+            return True
+
+        async for result in self._async_generate_base(
+            data, "generate_async", validate_generate_data, greedy
+        ):
+            yield result
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
         # non-colocated no need to wake up
@@ -1561,11 +1821,15 @@ class VllmGeneration(GenerationInterface):
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
-            if not self.cfg["colocated"]["enabled"]:
-                method_name = "reset_prefix_cache"
-            else:
+            if self.cfg["colocated"]["enabled"]:
                 method_name = (
                     "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+                )
+            else:
+                method_name = (
+                    "reset_prefix_cache_async"
+                    if self.cfg["vllm_cfg"]["async_engine"]
+                    else "reset_prefix_cache"
                 )
             # Use run_all_workers_single_data for methods that don't need data
             futures = self.worker_group.run_all_workers_single_data(
@@ -1622,7 +1886,7 @@ class VllmGeneration(GenerationInterface):
             # Directly pass ipc_handles to the method
             futures = self.worker_group.run_all_workers_multiple_data(
                 method_name,
-                ipc_handles_list,
+                ipc_handles=ipc_handles_list,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             # Wait for all futures to complete
@@ -1639,10 +1903,17 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "update_weights_from_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_collective"
+        )
+
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(
-            "update_weights_from_collective",
-            data=info,
+            method_name,
+            info=info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 

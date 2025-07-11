@@ -5,6 +5,7 @@
   - [📣 News](#-news)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
+  - [Training Backends](#training-backends)
   - [GRPO](#grpo)
     - [GRPO Single Node](#grpo-single-node)
     - [GRPO Multi-node](#grpo-multi-node)
@@ -20,6 +21,7 @@
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
+  - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
   - [Contributing](#contributing)
   - [Licenses](#licenses)
@@ -71,7 +73,7 @@ cd nemo-rl
 # by running (This is not necessary if you are using the pure Pytorch/DTensor path):
 git submodule update --init --recursive
 
-# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure 
+# Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
 # submodules are automatically updated after switching branches or pulling updates by configuring git with:
 # git config submodule.recurse true
 
@@ -103,6 +105,13 @@ pip install uv
 #       This ensures that the version of python used is always what we prescribe.
 uv venv
 
+# If working outside a container, it can help to build flash-attn and warm the
+# uv cache before your first run. The NeMo RL Dockerfile will warm the uv cache
+# with flash-attn. See https://docs.nvidia.com/nemo/rl/latest/docker.html for
+# instructions if you are looking for the NeMo RL container.
+bash tools/build-flash-attn-in-uv-cache.sh
+# If sucessful, you should see "✅ flash-attn successfully added to uv cache"
+
 # If you cannot install at the system level, you can install for your user with
 # pip install --user uv
 
@@ -118,7 +127,17 @@ uv venv
 
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
+- On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your `uv`'s cache dir making subsequent installs much quicker.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+
+## Training Backends
+
+NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
+
+- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
+- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
+
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ## GRPO
 
@@ -151,6 +170,18 @@ uv run python examples/run_grpo_math.py \
   logger.wandb.name="grpo-llama1b_math" \
   logger.num_val_samples_to_print=10
 ```
+
+The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+
+To train using this config on a single GPU:
+
+```sh
+# Run a GRPO math example on 1 GPU using the Megatron backend
+uv run python examples/run_grpo_math.py \
+  --config examples/configs/grpo_math_1B_megatron.yaml
+```
+
+For additional details on supported backends and how to configure the training backend to suit your setup, refer to the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ### GRPO Multi-node
 
@@ -185,7 +216,7 @@ HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True policy.dynamic_batching.train_mb_tokens=16384 policy.dynamic_batching.logprob_mb_tokens=32768 checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -203,7 +234,7 @@ sbatch \
 We also support multi-turn generation and training (tool use, games, etc.).
 Reference example for training to play a Sliding Puzzle Game:
 ```sh
-uv run python examples/run_grpo_sliding_puzzle.py 
+uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
 ## Supervised Fine-Tuning (SFT)
@@ -354,11 +385,30 @@ uv run python examples/run_eval.py \
 ```
 > **Note:** Evaluation results may vary slightly due to various factors, such as sampling parameters, random seed, inference engine version, and inference engine settings.
 
-Refer to `examples/configs/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
+Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
 
 ## Set Up Clusters
 
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Cluster Start](docs/cluster.md) documentation.
+
+## Tips and Tricks
+- If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
+  
+  ```sh
+  ModuleNotFoundError: No module named 'megatron'
+  ```
+  
+  If you see this error, there is likely an issue with your virtual environments. To fix this, first intialize the submodules:
+
+  ```sh
+  git submodule update --init --recursive
+  ```
+
+  and then force a rebuild of the virutal environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
+
+  ```sh
+  NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
+  ```
 
 ## Citation
 
@@ -367,7 +417,7 @@ If you use NeMo RL in your research, please cite it using the following BibTeX e
 ```bibtex
 @misc{nemo-rl,
 title = {NeMo RL: A Scalable and Efficient Post-Training Library},
-howpublished = {\url{https://github.com/NVIDIA/NeMo-RL}},
+howpublished = {\url{https://github.com/NVIDIA-NeMo/RL}},
 year = {2025},
 note = {GitHub repository},
 }
@@ -375,8 +425,8 @@ note = {GitHub repository},
 
 ## Contributing
 
-We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA/NeMo-RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
+We welcome contributions to NeMo RL\! Please see our [Contributing Guidelines](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md) for more information on how to get involved.
 
 ## Licenses
 
-NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA/NeMo-RL/blob/main/LICENSE).
+NVIDIA NeMo RL is licensed under the [Apache License 2.0](https://github.com/NVIDIA-NeMo/RL/blob/main/LICENSE).

@@ -50,6 +50,7 @@ large_model_vllm_config: VllmConfig = {
         "async_engine": True,
         "skip_tokenizer_init": False,
         "load_format": "auto",
+        "enforce_eager": "False",
     },
     "colocated": {
         "enabled": True,
