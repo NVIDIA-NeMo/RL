@@ -172,6 +172,9 @@ exclude = '''
 addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
+markers = [
+    "mcore: marks tests that require the mcore extra",
+]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]

@@ -35,6 +35,14 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             hf_model_name,
             output_path=output_path,
         )
+    elif hf_config.model_type in ("qwen3", "qwen3_moe"):
+        from nemo.tron.converter.qwen import HFQwen3Importer
+
+        print(f"Importing model {hf_model_name} to {output_path}...")
+        importer = HFQwen3Importer(
+            hf_model_name,
+            output_path=output_path,
+        )
     elif hf_config.model_type in ("deepseek_v2", "deepseek_v3"):
         from nemo.tron.converter.deepseek import HFDeepSeekImporter
 
@@ -44,7 +52,10 @@ def import_model_from_hf_name(hf_model_name: str, output_path: str):
             output_path=output_path,
         )
     else:
-        raise ValueError(f"Unknown model_type: {hf_config.model_type}")
+        raise ValueError(
+            f"Unknown model type: {hf_config.model_type}. Currently, DeepSeek, Qwen and Llama are supported. "
+            "If you'd like to run with a different model, please raise an issue or consider adding your own converter."
+        )
     importer.apply()
     # resetting mcore state
     import megatron.core.rerun_state_machine
@@ -64,11 +75,13 @@ def export_model_from_megatron(
             f"HF checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
         )
 
-    if "llama" in hf_model_name.lower():
+    hf_config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
+
+    if hf_config.model_type == "llama":
         from nemo.tron.converter.llama import HFLlamaExporter
 
         exporter_cls = HFLlamaExporter
-    elif "qwen" in hf_model_name.lower():
+    elif hf_config.model_type == "qwen2":
         from nemo.tron.converter.qwen import HFQwen2Exporter
 
         exporter_cls = HFQwen2Exporter
