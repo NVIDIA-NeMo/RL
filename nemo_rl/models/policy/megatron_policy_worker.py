@@ -113,7 +113,11 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_gpu_info, get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    configure_expandable_segments,
+    get_gpu_info,
+    get_runtime_env_for_policy_worker,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -362,6 +366,9 @@ class MegatronPolicyWorker:
             "float16": torch.float16,
         }
         self.dtype = dtype_map[self.cfg["precision"]]
+
+        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+        configure_expandable_segments()
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
@@ -682,13 +689,6 @@ class MegatronPolicyWorker:
                 "overlap_param_gather"
             ]
         )
-
-    def configure_worker(self, num_gpus: int, bundle_indices: Optional[tuple] = None):
-        USE_EXPANDABLE_SEGMENTS = False  # Disabling this right now as it seems to cause vLLM refit issues with Ampere
-        if USE_EXPANDABLE_SEGMENTS:
-            return None, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}, None
-        else:
-            return None, None, None
 
     def is_alive(self):
         return True

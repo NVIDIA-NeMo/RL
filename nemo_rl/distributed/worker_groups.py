@@ -392,7 +392,9 @@ class RayWorkerGroup:
 
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
-            remote_worker_builder, bundle_indices_list, env_vars=env_vars
+            remote_worker_builder,
+            bundle_indices_list,
+            env_vars=env_vars,
         )
 
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
@@ -424,7 +426,9 @@ class RayWorkerGroup:
         )
 
         # Update env_vars with the current environment variables
-        env_vars.update(dict(os.environ))
+        for k, v in os.environ.items():
+            if k not in env_vars:
+                env_vars[k] = v
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
