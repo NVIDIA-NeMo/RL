@@ -21,6 +21,9 @@ policy:
   dynamic_batching:
     enabled: False
 
+  sequence_packing:
+    enabled: False
+
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:

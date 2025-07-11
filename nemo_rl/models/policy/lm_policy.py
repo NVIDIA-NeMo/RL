@@ -24,6 +24,7 @@ from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
+    SequencePackingArgs,
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -138,6 +139,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             self.use_dynamic_batches = False
 
+        if config["sequence_packing"]["enabled"]:
+            assert (
+                config["megatron_cfg"]["enabled"] or config["dtensor_cfg"]["enabled"]
+            ), "Sequence packing requires Megatron or DTensor policies."
+            self.use_sequence_packing = True
+            self.sequence_packing_args: SequencePackingArgs = {
+                "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
+                "logprob_mb_tokens": config["sequence_packing"].get(
+                    "logprob_mb_tokens", None
+                ),
+                "algorithm": config["sequence_packing"]["algorithm"],
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_pad_multiple": (self.cp_size * 2 * tp_size)
+                if self.cp_size > 1
+                else tp_size,
+            }
+        else:
+            self.use_sequence_packing = False
+
         self.cfg = config
 
     def init_collective(
@@ -174,6 +195,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
                 cp_size * dp_size,
@@ -203,7 +233,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
@@ -229,6 +259,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 cp_size * dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
@@ -262,7 +301,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
@@ -288,6 +327,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=batch_size,
                 dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["train_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+                sequence_packing_args=self.sequence_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(
