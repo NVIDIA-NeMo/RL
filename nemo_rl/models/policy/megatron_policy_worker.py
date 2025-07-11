@@ -113,7 +113,11 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_gpu_info, get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    configure_expandable_segments,
+    get_gpu_info,
+    get_runtime_env_for_policy_worker,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -360,6 +364,9 @@ class MegatronPolicyWorker:
             "float16": torch.float16,
         }
         self.dtype = dtype_map[self.cfg["precision"]]
+
+        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+        configure_expandable_segments()
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path

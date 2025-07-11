@@ -55,6 +55,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_expandable_segments,
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
@@ -144,6 +145,9 @@ class DTensorPolicyWorker:
         ):
             os.environ["NCCL_SHM_DISABLE"] = "1"
             os.environ["NCCL_P2P_DISABLE"] = "1"
+
+        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+        configure_expandable_segments()
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
