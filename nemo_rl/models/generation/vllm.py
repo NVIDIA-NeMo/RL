@@ -1873,11 +1873,14 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Use run_all_workers_single_data to send data to all workers
-        self.worker_group.run_all_workers_single_data(
+        futures = self.worker_group.run_all_workers_single_data(
             method_name,
             state_dict_info=state_dict_info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
+
+        # Wait for all futures to complete
+        ray.get(futures)
 
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
