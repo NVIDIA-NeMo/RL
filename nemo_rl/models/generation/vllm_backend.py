@@ -51,24 +51,21 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
-    def update_weights_from_ipc_handles(self, ipc_handles):
+    def update_weights_from_ipc_handles(self, device_ipc_handles):
         """Update weights from IPC handles.
 
         Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
+            device_ipc_handles (dict): parameter IPC handles for local device.
 
         Returns:
             bool: True if weights were successfully updated.
         """
         try:
-            # Get handles for this device
-            device_uuid = self.report_device_id()
-            handles = ipc_handles[device_uuid]
-            is_tensor_packed = handles[0]
+            is_tensor_packed = device_ipc_handles[0]
             if is_tensor_packed:
-                _, all_handles, tensor_metadata = handles
+                _, all_handles, tensor_metadata = device_ipc_handles
             else:
-                _, name_and_handle_list = handles
+                _, name_and_handle_list = device_ipc_handles
 
             device_id = self.device.index
             weights = []

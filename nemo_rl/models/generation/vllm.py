@@ -347,6 +347,8 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
+        self.vllm_device_ids = self.report_device_id()
+
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
     ) -> None:
@@ -1030,9 +1032,36 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
-            )
+            if self.tensor_parallel_size == 1:
+                # UniProcExecutor
+                assert len(self.vllm_device_ids) == 1
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_ipc_handles",
+                    args=(ipc_handles[self.vllm_device_ids[0]],),
+                )
+            else:
+                """
+                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
+                leading to unnecessary network serialization overhead and potential performance degradation.
+
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_ipc_handles", args=(ipc_handles,)
+                )
+                """
+                ray_worker_outputs = []
+                # MultiProcExecutor
+                for worker, device_id in zip(
+                    self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
+                ):
+                    ray_worker_outputs.append(
+                        worker.execute_method.remote(
+                            "update_weights_from_ipc_handles", ipc_handles[device_id]
+                        )
+                    )
+
+                # Gather the results
+                result_or_coro = ray.get(ray_worker_outputs)
+
             worker_result = result_or_coro[0]
 
             if not worker_result:
