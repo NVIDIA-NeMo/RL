@@ -30,6 +30,7 @@ class SimpleLoss:
         global_valid_toks: torch.Tensor | None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # Just return mean of logprobs as the loss for testing
         loss = next_token_logits.mean()
@@ -53,6 +54,7 @@ class SimpleNLLLoss:
         global_valid_toks: torch.Tensor | None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position

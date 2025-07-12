@@ -63,6 +63,13 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     sequence_length_round: 64
 
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}

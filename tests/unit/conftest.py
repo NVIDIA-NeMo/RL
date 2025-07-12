@@ -301,19 +301,32 @@ def distributed_test_runner():
         # Generate a single random port in the main process
         port = random.randint(10000, 20000)
 
+        # use a queue to report exceptions
+        queue = mp.get_context("spawn").Queue()
+
         # Run the test on multiple processes
         mp.spawn(
             _distributed_test_wrapper,
-            args=(test_fn, world_size, port, backend),
+            args=(test_fn, world_size, port, backend, queue),
             nprocs=world_size,
             join=True,
         )
+
+        # check if any process raised an exception
+        if not queue.empty():
+            msg = queue.get()
+            raise RuntimeError(msg)
 
     return run_distributed_test
 
 
 def _distributed_test_wrapper(
-    rank: int, test_fn: Callable, world_size: int, port: int, backend: str
+    rank: int,
+    test_fn: Callable,
+    world_size: int,
+    port: int,
+    backend: str,
+    queue: mp.Queue,
 ) -> None:
     """Wrapper function that sets up the distributed environment before running the test function.
     Internal use only - use distributed_test_runner fixture instead.
@@ -324,6 +337,7 @@ def _distributed_test_wrapper(
         world_size: Total number of processes
         port: Port to use for distributed communication
         backend: PyTorch distributed backend to use
+        queue: a multiprocessing queue to report exceptions
     """
     try:
         # Setup the distributed environment
@@ -335,8 +349,11 @@ def _distributed_test_wrapper(
         # Clean up
         _cleanup_distributed()
     except Exception as e:
-        print(f"Error in rank {rank}: {e}")
-        _cleanup_distributed()
+        # report exception to the main process
+        import traceback
+
+        queue.put(f"Error in rank {rank}:\n{e}\n{traceback.format_exc()}")
+        # still raise the exception to stop the current process
         raise
 
 

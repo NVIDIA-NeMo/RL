@@ -41,7 +41,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
 from nemo_rl.models.policy.utils import import_class_from_path
 
 
@@ -648,7 +648,7 @@ def get_logprobs_from_vocab_parallel_logits(
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return from_parallel_logits_to_logprobs(
+    return dtensor_from_parallel_logits_to_logprobs(
         vocab_parallel_logits.to_local(),
         input_ids,
         vocab_interval_per_rank * tp_rank,
