@@ -2,7 +2,7 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_rollout_turns: 1
-  max_num_steps: 20
+  max_num_steps: 2
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
@@ -19,7 +19,7 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-qwen2.5-32b-16n8g-fsdp2tp8sp-actckpt-long
+  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
   metric_name: val_reward
   higher_is_better: true
   keep_top_k: 3
@@ -105,18 +105,18 @@ env:
   math:
     num_workers: 8
 logger:
-  log_dir: logs/grpo-qwen2.5-32b-16n8g-fsdp2tp8sp-actckpt-long
+  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-32b-16n8g-fsdp2tp8sp-actckpt-long
+    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 16
+  num_nodes: 32
