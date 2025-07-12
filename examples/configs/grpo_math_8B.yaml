@@ -22,8 +22,7 @@ policy:
     enabled: True
 
   dynamic_batching:
-    train_mb_tokens: 4096
-    logprob_mb_tokens: 8192
+    enabled: True
 
   optimizer:
     name: "torch.optim.AdamW"
