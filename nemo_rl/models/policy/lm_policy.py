@@ -40,6 +40,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
+from nemo_rl.utils.flops_tracker import get_theoretical_flops
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -329,6 +330,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
         }
+
+        if all("total_flops" in r and r["total_flops"] is not None for r in results):
+            aggregated_results["total_flops"] = sum(r["total_flops"] for r in results)
+            aggregated_results["rank_flops"] = [r["total_flops"] for r in results]
+
+            try:
+                aggregated_results["theoretical_flops"] = sum(
+                    get_theoretical_flops(r["gpu_name"], r["model_dtype"])
+                    for r in results
+                )
+            except Exception as e:
+                print(f"Error getting theoretical flops: {e}")
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
