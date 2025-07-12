@@ -122,3 +122,24 @@ class VllmInternalWorkerExtension:
             return False
 
         return True
+
+    def update_weight_update_metadata_for_refit(self, refit_buffer_ipc_handles, weight_update_metadata):
+        """Update the weight update metadata for refit."""
+        self.refit_buffer_ipc_handles = {}
+        for k, tensor_handle in refit_buffer_ipc_handles.items():
+            func, args = tensor_handle
+            list_args = list(args)
+            list_args[6] = self.device.index
+            tensor = func(*list_args)
+            self.refit_buffer_ipc_handles[k] = tensor
+        self.weight_update_metadata = weight_update_metadata
+        return True
+
+    def consume_refit_bucket(self, bucket_id):
+        """Consume the refit bucket."""
+        weights = []
+        for (name, _, shape, param_dtype, offset, numel) in self.weight_update_metadata[bucket_id]:
+            param = self.refit_buffer_ipc_handles[param_dtype][offset:offset+numel]
+            weights.append((name, param))
+        self.model_runner.model.load_weights(weights=weights)
+        return True # todo this is not right for ep all-gather

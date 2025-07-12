@@ -237,3 +237,19 @@ class GenerationInterface(ABC):
     ) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError
+
+    @abstractmethod
+    def update_weight_update_metadata_for_refit(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def consume_refit_bucket(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        pass

@@ -123,3 +123,19 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         pass
+
+    @abstractmethod
+    def prepare_weight_update_metadata(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def fill_refit_bucket(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        pass

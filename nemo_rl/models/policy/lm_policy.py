@@ -542,3 +542,56 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    def prepare_weight_update_metadata(self, _refit_buffer_size_gb: Optional[int] = None):
+        """Prepare weight update metadata for refit."""
+        # step 1: run "prepare_weight_update_metadata" on all workers
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_weight_update_metadata",
+            _refit_buffer_size_gb=_refit_buffer_size_gb,
+        )
+        results =ray.get(futures)
+
+        # step 2: check if there is any worker that needs to update the cache
+        need_to_update_vllm = any(result['need_update_cache'] for result in results)
+        if not hasattr(self, "cached_weight_update_metadata"):
+            self.cached_weight_update_metadata = {}
+        if need_to_update_vllm:
+            for i, result in enumerate(results):
+                if (i not in self.cached_weight_update_metadata) and (not result['need_update_cache']):
+                    raise ValueError("No cached metadta and no need update, this is a bug")
+                if result['need_update_cache']:
+                    self.cached_weight_update_metadata[i] = (
+                        result['num_buckets'],
+                        result['dtype_to_max_bucket_size'],
+                        result['weight_update_metadata_for_all_buckets'],
+                    )
+        
+        # step 3: create ipc handles
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "create_refit_buffers_and_associate_param_with_buffer",
+            args=(),
+        )
+        refit_buffer_ipc_handles = ray.get(futures)
+
+        # step 4: prepare weight metadata
+        if need_to_update_vllm:
+            weight_update_metadata = {}
+            for result in results:
+                if result['need_update_cache']:
+                    weight_update_metadata[result['device_id']] = result['weight_update_metadata_for_all_buckets']
+        else:
+            weight_update_metadata = None
+
+        return (
+            refit_buffer_ipc_handles,
+            weight_update_metadata,
+            need_to_update_vllm,
+        )
+
+    def fill_refit_bucket(self, bucket_id: int):
+        futures = self.worker_group.run_all_workers_single_data(
+            "fill_refit_bucket",
+            bucket_id=bucket_id,
+        )
+        ray.get(futures)

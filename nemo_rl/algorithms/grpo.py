@@ -413,19 +413,48 @@ def refit_policy_generation(
     update_success = False
     if colocated_inference:
         # get model param keys, which is grouped by size
-        grouped_param_keys = policy.prepare_weights_for_ipc(
-            _refit_buffer_size_gb=_refit_buffer_size_gb
-        )
-        total_num_keys = sum(len(k) for k in grouped_param_keys)
-        print(
-            f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
-        )
-        # do update
-        for keys in grouped_param_keys:
-            ipc_handles = policy.get_weights_ipc_handles(keys)
-            update_success = policy_generation.update_weights(ipc_handles)
-            if not update_success:
-                break
+        result = policy.prepare_weight_update_metadata()
+        if result is None:
+            # fallback to old refit algorithm
+        
+            grouped_param_keys = policy.prepare_weights_for_ipc(
+                _refit_buffer_size_gb=_refit_buffer_size_gb
+            )
+            total_num_keys = sum(len(k) for k in grouped_param_keys)
+            print(
+                f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
+            )
+            # do update
+            for keys in grouped_param_keys:
+                ipc_handles = policy.get_weights_ipc_handles(keys)
+                update_success = policy_generation.update_weights(ipc_handles)
+                if not update_success:
+                    break
+        else:
+            (
+                refit_buffer_ipc_handles,
+                weight_update_metadata,
+                need_update_from_last_refit,
+            ) = result
+            num_refit_buckets = weight_update_metadata["num_refit_buckets"]
+            print(
+                f"[Refit] Number of refit buckets: {num_refit_buckets}"
+            )
+            if need_update_from_last_refit:
+                policy_generation.update_weight_update_metadata_for_refit(
+                    refit_buffer_ipc_handles,
+                    weight_update_metadata,
+                )
+            else:
+                policy_generation.update_weight_update_metadata_for_refit(
+                    refit_buffer_ipc_handles,
+                    weight_update_metadata=None,
+                )
+            for bucket_id in range(num_refit_buckets):
+                policy.fill_refit_bucket(bucket_id)
+                update_success = policy_generation.consume_refit_bucket(bucket_id)
+                if not update_success:
+                    break
     else:
         # prepare info for update weights
         state_dict_info = policy.prepare_info_for_collective()
