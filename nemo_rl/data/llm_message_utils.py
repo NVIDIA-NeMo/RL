@@ -13,6 +13,7 @@
 # limitations under the License.
 import warnings
 from typing import Any, Optional, cast
+from nemo_rl.data.interfaces import DatumSpec
 
 import torch
 from datasets import Dataset
@@ -209,6 +210,7 @@ def batched_message_log_to_flat_message(
     message_log_batch: list[LLMMessageLogType],
     pad_value_dict: Optional[dict[str, int]] = None,
     make_sequence_length_divisible_by: int = 1,
+    skip_padding_keys: Optional[list[str]] = [],
 ) -> tuple[BatchedDataDict[FlatMessagesType], Tensor]:
     """Process and pad a batch of message logs for model input.
 
@@ -313,6 +315,7 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
+        # if not a tensor or DNE, then return the list of values
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
@@ -334,8 +337,24 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
-        result[key] = torch.stack(padded)
+
+        # do not pad the vlm_kwargs
+        if key in skip_padding_keys:
+            padded = filled_values
+        else:
+            padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
+
+        # special case for `pixel_values` which is a flattened (N, D) tensor with potentially different Ns for each message
+        # keys_to_concat = ['pixel_values']
+
+        ## TODO: @rohitrango assuming for now that that all images are the same size (so stacking them is fine)
+        ## this will have consequences for data sharding for VLM models (split along the batch dim but from [start_patch:end_patch])
+        keys_to_concat = []
+
+        if key in keys_to_concat:
+            result[key] = torch.cat(padded)
+        else:
+            result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
 
@@ -485,3 +504,30 @@ def remap_dataset_keys(
         lambda x: {v: x[k] for k, v in mapping_dict.items()},
         remove_columns=list(mapping_dict.keys()),
     )
+
+
+def get_vlm_keys_from_datumspec_batch(batch: BatchedDataDict[DatumSpec]) -> list[str]:
+    """Extract VLM keys from a batch of data.
+    
+    Args:
+        batch: A BatchedDataDict containing message logs
+        
+    Returns:
+        list[str]: List of unique VLM keys found across all messages in the batch
+    """
+    if not batch["message_log"]:
+        return []
+        
+    # Create a set to store unique VLM keys
+    vlm_keys = set()
+    
+    # Iterate through all conversations in the batch
+    for conversation in batch["message_log"]:
+        # Iterate through all messages in each conversation
+        for message in conversation:
+            # Get VLM keys from the message if they exist
+            if 'vlm_keys' in message:
+                vlm_keys.update(message['vlm_keys'])
+    
+    # Convert set to list and return
+    return list(vlm_keys)

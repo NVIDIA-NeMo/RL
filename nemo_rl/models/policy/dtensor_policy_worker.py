@@ -21,7 +21,6 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
-from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -35,7 +34,7 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
@@ -64,6 +63,7 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.models.policy.utils import load_hf_model
 
 
 @contextmanager
@@ -79,6 +79,26 @@ def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
             if isinstance(module, FSDPModule):
                 module.reshard()
 
+def get_vlm_keys_from_clippedpgloss_batch(batch: BatchedDataDict[Any]) -> list[str]:
+    """
+    Get VLM keys from a batch of data in the ClippedPGLossDataDict format.
+
+    Note that in this case, the `vlm_keys` key is added to the batch dict before `get_logprobs` or `get_reference_policy_logprobs` functions are called.
+
+    This function is fundamentally different from the `get_vlm_keys_from_datumspec_batch` function, which is used for the `DatumSpec` format, and is 
+    only supposed to be used inside the `get_logprobs` function. Try not to use it elsewhere.
+    """
+    vlm_keys = batch.get("vlm_keys", [])
+    if len(vlm_keys) > 0:
+        if isinstance(vlm_keys[0], dict):
+            vlm_keys = [key for subdict in vlm_keys for key in subdict.keys()]
+            vlm_keys = list(set(vlm_keys))
+        elif isinstance(vlm_keys[0], str):
+            vlm_keys = list(set(vlm_keys))
+        elif isinstance(vlm_keys[0], list):
+            vlm_keys = [key for sublist in vlm_keys for key in sublist]
+            vlm_keys = list(set(vlm_keys))
+    return vlm_keys
 
 @torch.no_grad()
 def get_cpu_state_dict(
@@ -132,6 +152,7 @@ class DTensorPolicyWorker:
         self,
         config: PolicyConfig,
         tokenizer: AutoTokenizer,
+        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -166,37 +187,8 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        model_config = AutoConfig.from_pretrained(
-            model_name,
-            # Always load the model in float32 to keep master weights in float32.
-            # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            torch_dtype=torch.float32,
-            trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
-        )
-
-        full_state_dict = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-            )
-            full_state_dict = model.state_dict()
-            del model
-
-        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
-        # All ranks initialize model on meta device, so FSDP can shard it.
-        # The actual weights will be broadcast from rank 0.
-
-        with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_config(
-                model_config,
-            )
+        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+        self.model, full_state_dict = load_hf_model(model_name, self)
 
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
@@ -205,6 +197,9 @@ class DTensorPolicyWorker:
         ) or ModelFlag.SKIP_DTENSOR_TIED_WEIGHTS_CHECK.matches(model_name)
 
         self.tokenizer = tokenizer
+        self.processor = processor
+        self.is_vlm = processor is not None
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -405,6 +400,28 @@ class DTensorPolicyWorker:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
+    def _extract_vlm_kwargs(self, mb: BatchedDataDict[Any]) -> dict[str, Any]:
+        """Extract VLM (Vision Language Model) specific kwargs from a message batch.
+        
+        This function extracts VLM-specific keys from the message batch while filtering out
+        keys that are already handled by the model input (input_ids, attention_mask).
+        
+        Args:
+            mb: Message batch containing potentially VLM-specific keys
+            
+        Returns:
+            Dictionary of VLM kwargs to pass to the model, empty if not a VLM or no VLM keys
+        """
+        vlm_kwargs = {}
+        if self.is_vlm:
+            # Handle vlm_keys from flattened message data
+            vlm_keys_lists = mb.get("vlm_keys", [[]])[0]
+            if vlm_keys_lists:
+                for key in vlm_keys_lists:
+                    if key in mb:
+                        vlm_kwargs[key] = mb[key]
+        return vlm_kwargs
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -434,7 +451,14 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        # get vlm keys from data
+        vlm_keys = get_vlm_keys_from_clippedpgloss_batch(data)
+
         for k, v in data.items():
+            if k in vlm_keys:
+                continue
+
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
@@ -520,6 +544,9 @@ class DTensorPolicyWorker:
                             seq_len, device=input_ids.device
                         ).repeat(batch_size, 1)
 
+                        # add vlm kwargs to model call
+                        vlm_kwargs = self._extract_vlm_kwargs(mb)
+
                     context_parallel_ctx = None
                     if self.cp_size > 1:
                         seq_index = torch.arange(
@@ -546,6 +573,7 @@ class DTensorPolicyWorker:
                                 attention_mask=attention_mask_input_all_ones,
                                 position_ids=position_ids,
                                 use_cache=False,
+                                **vlm_kwargs,
                             )
 
                         # Get logprobs
@@ -711,7 +739,14 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        # get vlm keys from data
+        vlm_keys = get_vlm_keys_from_clippedpgloss_batch(data)
+
         for k, v in data.items():
+            if k in vlm_keys:
+                continue
+
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
@@ -755,11 +790,14 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
+                    vlm_kwargs = self._extract_vlm_kwargs(lp_batch)
+
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask_input_all_ones,
                         position_ids=position_ids,
                         use_cache=False,
+                        **vlm_kwargs,
                     )
 
                 if isinstance(outputs.logits, DTensor):
@@ -894,9 +932,8 @@ class DTensorPolicyWorker:
 
         # Get state_dict
         self.model = self.move_to_cuda(self.model)
-        self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
-            self.model.state_dict()
-        )
+
+        self._held_sharded_state_dict_reference = self.model.state_dict()
 
         # Collect info for streaming multiple tensors
         state_dict_info = []
@@ -1096,10 +1133,13 @@ class DTensorPolicyWorker:
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
+            # optimizer and scheduler
             optimizer=self.optimizer if optimizer_path else None,
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
+            # tokenizer and processor
             tokenizer=self.tokenizer if tokenizer_path else None,
+            processor=self.processor if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
         )
 

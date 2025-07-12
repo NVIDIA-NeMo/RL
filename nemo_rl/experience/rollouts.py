@@ -17,11 +17,12 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
+from nemo_rl.data.llm_message_utils import get_vlm_keys_from_datumspec_batch
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -52,6 +53,7 @@ def generate_responses(
     batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     input_lengths: torch.Tensor,
+    vlm_kwargs: Optional[dict[str, Any]] = None,
     include_logprobs: bool = True,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
@@ -363,12 +365,14 @@ def run_multi_turn_rollout(
             batched_message_log_to_flat_message(
                 active_batch["message_log"],
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                skip_padding_keys=get_vlm_keys_from_datumspec_batch(active_batch)
             )
         )
 
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
-
+        
+        # Prepare generation input data
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": active_input_ids,
@@ -376,6 +380,42 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        
+        message_log_for_generation = []
+        # Add VLM-specific data if available
+        if 'vlm_keys' in active_flat_messages and any(active_flat_messages['vlm_keys']):
+            # Pass VLM keys for model input
+            generation_input_data['vlm_keys'] = active_flat_messages['vlm_keys']
+            
+            # Add VLM-specific tensors
+            # Handle 3-level nesting: batch -> conversation -> message -> keys
+            vlm_keys = set()
+            for conversation_vlm_keys in active_flat_messages['vlm_keys']:  # Each conversation
+                if conversation_vlm_keys:  # Check if conversation has vlm_keys
+                    for message_vlm_keys in conversation_vlm_keys:  # Each message in conversation
+                        if message_vlm_keys:  # Check if message has vlm_keys
+                            for key in message_vlm_keys:  # Individual keys
+                                vlm_keys.add(key)
+            
+            for key in vlm_keys:
+                if key in active_flat_messages:
+                    generation_input_data[key] = active_flat_messages[key]
+        
+            ## Reconstruct message_log from flat messages for vLLM generation
+            for i in range(len(active_batch["message_log"])):
+                msg = {
+                    'content': active_flat_messages.get('content', [None] * len(active_batch["message_log"]))[i],
+                }
+                
+                # Add images if present
+                if 'images' in active_flat_messages:
+                    images = active_flat_messages['images']
+                    if i < len(images) and images[i] is not None:
+                        msg['images'] = images[i] if isinstance(images[i], list) else [images[i]]
+                
+                message_log_for_generation.append(msg)
+            
+            generation_input_data['message_log'] = message_log_for_generation
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(

@@ -79,7 +79,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
 
-        for k in sorted(batches[0]):
+        for k in sorted(batches[0]):  
             list_of_tensors = [item[k] for item in batches]
 
             if isinstance(list_of_tensors[0], list):
@@ -268,7 +268,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             assert batch_size is None, (
                 "batch_size must be None if allow_uneven_shards is True"
             )
-
         # Get the total batch size
         batch_sizes = set()
         for val in self.data.values():
@@ -512,7 +511,19 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""
+        vlm_keys = self.get('vlm_keys', [])
+        if len(vlm_keys) > 0:
+            # this is a dict of vlm_keys to their tensors, so we need to collect all the keys
+            if isinstance(vlm_keys[0], dict):
+                vlm_keys = [key for subdict in vlm_keys for key in subdict.keys()]
+                vlm_keys = list(set(vlm_keys))
+
         for k, v in self.items():
+            # skip truncation for VLM keys
+            if k in vlm_keys:
+                self.data[k] = v
+                continue
+
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
 

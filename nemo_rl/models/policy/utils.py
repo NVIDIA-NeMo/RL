@@ -15,9 +15,11 @@
 import importlib
 import os
 from typing import Any
+from accelerate import init_empty_weights
 
 import torch
-from transformers import AutoConfig
+from torch import nn
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
@@ -129,6 +131,49 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         )
 
     return overwrite_dict
+
+def load_hf_model(model_name: str, policy_worker) -> nn.Module:
+    """Load a Hugging Face model with optional sliding window support."""
+
+    # determine model class based on model name
+    AutoModelClass = AutoModelForCausalLM
+    vlm_model_names = ["qwen2.5-vl"]   # add more models where AutoModelForCausalLM is not supported
+    if any([x in model_name.lower() for x in vlm_model_names]):
+        AutoModelClass = AutoModelForVision2Seq
+
+    model_config = AutoConfig.from_pretrained(
+        model_name,
+        # Always load the model in float32 to keep master weights in float32.
+        # Keeping the master weights in lower precision has shown to cause issues with convergence.
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+        **sliding_window_overwrite(
+            model_name
+        ),  # due to https://github.com/huggingface/transformers/issues/38002
+    )
+
+    full_state_dict = None
+    if policy_worker.rank == 0:
+        print(f"[Rank {policy_worker.rank}] Loading model {model_name} on CPU...")
+        model = AutoModelClass.from_pretrained(
+            model_name,
+            device_map="cpu",  # load weights onto CPU initially
+            trust_remote_code=True,
+            config=model_config,
+        )
+        full_state_dict = model.state_dict()
+        del model
+
+    print(f"[Rank {policy_worker.rank}] Initializing empty model for FSDP...")
+    # All ranks initialize model on meta device, so FSDP can shard it.
+    # The actual weights will be broadcast from rank 0.
+
+    with init_empty_weights():
+        model = AutoModelClass.from_config(
+            model_config,
+        )
+
+    return model, full_state_dict
 
 
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
