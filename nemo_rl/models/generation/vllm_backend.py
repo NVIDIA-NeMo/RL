@@ -100,8 +100,18 @@ class VllmInternalWorkerExtension:
 
                 # Unpack tensor to weights. Here we only return a view of the tensor to avoid
                 # using extra memory.
-                for key, offset in tensor_metadata.items():
-                    shape, dtype, size = self.state_dict_info[key]
+                for key, metadata in tensor_metadata.items():
+                    # dtype for the 1st and 2nd steps may be different
+                    # e.g. model.layers.4.mlp.gate.e_score_correction_bias
+                    if isinstance(metadata, tuple):
+                        # use dtype of current step
+                        offset, dtype = metadata
+                        shape, _, size = self.state_dict_info[key]
+                        # update record
+                        self.state_dict_info[key] = (shape, dtype, size)
+                    else:
+                        offset = metadata
+                        shape, dtype, size = self.state_dict_info[key]
                     tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
                         *shape
                     )
