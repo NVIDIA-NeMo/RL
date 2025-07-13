@@ -301,6 +301,92 @@ def test_environment_variables_setup(register_test_actor, virtual_cluster):
     worker_group.shutdown(force=True)
 
 
+def test_custom_environment_variables(register_test_actor, virtual_cluster):
+    """Test that custom environment variables passed through env_vars are correctly set in workers."""
+    actor_fqn = register_test_actor
+    builder = RayWorkerBuilder(actor_fqn)
+
+    # Define custom environment variables to pass to workers
+    custom_env_vars = {
+        "CUSTOM_VAR_1": "test_value_1",
+        "CUSTOM_VAR_2": "test_value_2",
+        "NEMO_TEST_ENV": "nemo_test_value",
+        "DUMMY_TEST_VAR": "/custom/test/path",
+    }
+
+    # Create worker group with custom environment variables
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=2,
+        env_vars=custom_env_vars.copy(),
+    )
+
+    assert len(worker_group.workers) == 2
+
+    # Check that all workers have the custom environment variables set
+    for i, worker in enumerate(worker_group.workers):
+        # Check each custom environment variable
+        for var_name, expected_value in custom_env_vars.items():
+            actual_value = ray.get(worker.get_env_var.remote(var_name))
+            assert actual_value == expected_value, (
+                f"Worker {i}: Expected {var_name}={expected_value}, got {actual_value}"
+            )
+
+        # Also verify that the standard distributed environment variables are still set
+        rank, ws, node_rank, local_rank = ray.get(
+            worker.get_rank_world_size_node_rank_local_rank.remote()
+        )
+        assert rank == str(i)
+        assert ws == "2"
+        assert node_rank == "0"
+        assert local_rank == str(i)
+
+    worker_group.shutdown(force=True)
+
+
+def test_custom_environment_variables_override_existing(
+    register_test_actor, virtual_cluster
+):
+    """Test that custom environment variables can override existing environment variables."""
+    actor_fqn = register_test_actor
+    builder = RayWorkerBuilder(actor_fqn)
+
+    # Set an environment variable in the current process
+    os.environ["DUMMY_PYTHONPATH"] = "/original/python/path"
+
+    # Define custom environment variables that override existing ones
+    custom_env_vars = {
+        "DUMMY_PYTHONPATH": "/overridden/python/path",
+        "CUSTOM_OVERRIDE": "overridden_value",
+    }
+
+    # Create worker group with custom environment variables
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=1,
+        env_vars=custom_env_vars,
+    )
+
+    assert len(worker_group.workers) == 1
+    worker = worker_group.workers[0]
+
+    # Check that the custom environment variable overrides the original
+    pythonpath_value = ray.get(worker.get_env_var.remote("DUMMY_PYTHONPATH"))
+    assert pythonpath_value == "/overridden/python/path", (
+        f"Expected DUMMY_PYTHONPATH to be overridden, got {pythonpath_value}"
+    )
+
+    # Check that the new custom variable is set
+    custom_value = ray.get(worker.get_env_var.remote("CUSTOM_OVERRIDE"))
+    assert custom_value == "overridden_value", (
+        f"Expected CUSTOM_OVERRIDE=overridden_value, got {custom_value}"
+    )
+
+    worker_group.shutdown(force=True)
+
+
 def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     builder = RayWorkerBuilder(actor_fqn)
