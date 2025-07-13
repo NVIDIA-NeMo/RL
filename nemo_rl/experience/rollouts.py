@@ -268,7 +268,7 @@ def calculate_rewards(
     for future, result in zip(futures, results):
         indices = future_to_indices[future]
         # Environment step returns: EnvironmentReturn
-        env_observations, metadata, next_stop_strings, task_rewards, terminateds = (
+        env_observations, metadata, next_stop_strings, task_rewards, terminateds, _ = (
             result
         )
         if next_stop_strings is None:
