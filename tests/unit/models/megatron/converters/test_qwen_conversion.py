@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import socket
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 
@@ -20,6 +21,37 @@ import pytest
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM
+
+
+@contextmanager
+def temporary_distributed_context():
+    if "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ:
+        init_method = None
+    else:
+        # Find an available port dynamically
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("localhost", 0))
+            addr, port = s.getsockname()
+
+        init_method = f"tcp://{addr}:{port}"
+
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=1, rank=0
+    )
+
+    from megatron.core import parallel_state
+
+    parallel_state.initialize_model_parallel()
+
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    model_parallel_cuda_manual_seed(42)
+
+    try:
+        yield
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
 
 
 def dummy_qwen3_megatron_moe_config():
@@ -86,46 +118,6 @@ def create_dummy_hf_dense_config():
     hf_config.head_dim = 16
 
     return hf_config
-
-
-@contextmanager
-def setup_distributed_environment(port="6000"):
-    """Set up distributed environment for testing."""
-    # Set up environment variables for distributed training
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["LOCAL_RANK"] = "0"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = port
-
-    # Initialize torch.distributed first
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
-            rank=0,
-            world_size=1,
-        )
-
-    # Initialize megatron parallel
-    import megatron.core.parallel_state as parallel_state
-    import megatron.core.tensor_parallel.random as tensor_parallel_random
-
-    parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        expert_model_parallel_size=1,
-    )
-
-    # Set up CUDA RNG states for model parallel
-    tensor_parallel_random.model_parallel_cuda_manual_seed(42)
-
-    try:
-        yield
-    finally:
-        # Clean up megatron parallel
-        parallel_state.destroy_model_parallel()
-        # Clean up distributed
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def create_model_and_converter(megatron_config, hf_config, model_name):
@@ -208,7 +200,7 @@ def assert_attention_tensors_match(
 @pytest.mark.mcore
 def test_conversion_to_hf_moe():
     """Test conversion of Qwen3 MoE model to HF format."""
-    with setup_distributed_environment("6000"):
+    with temporary_distributed_context():
         mcore_config = dummy_qwen3_megatron_moe_config()
         hf_config = create_dummy_hf_moe_config()
 
@@ -252,7 +244,7 @@ def test_conversion_to_hf_moe():
 @pytest.mark.mcore
 def test_conversion_to_hf_dense():
     """Test conversion of Qwen3 dense model to HF format."""
-    with setup_distributed_environment("6001"):
+    with temporary_distributed_context():
         mcore_config = dummy_qwen3_megatron_dense_config()
         hf_config = create_dummy_hf_dense_config()
 
