@@ -55,16 +55,19 @@ def init_fp8(vllm_cfg, model_name):
     # which this patch can be removed. 
     func1_path = 'vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading'
     patcher1 = patch(func1_path, process_weights_after_loading)
+    fp8_state.vllm_patches.append(patcher1)
     # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher 
     # SNR compared to plain fp32 scaling factors. This feature is still under active research. 
-    func2_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
-    func3_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
-    func4_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'    
-    patcher2 = patch(func2_path, per_token_group_quant_fp8)
-    patcher3 = patch(func3_path, _per_token_group_quant_fp8)
-    patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-    # Save the patches and activate them
-    fp8_state.vllm_patches = [patcher1, patcher2, patcher3, patcher4]
+    if fp8_config.use_weight_pow2_scale or fp8_config.use_activation_pow2_scale:
+        func2_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
+        func3_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
+        func4_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'   
+        patcher2 = patch(func2_path, per_token_group_quant_fp8) 
+        patcher3 = patch(func3_path, _per_token_group_quant_fp8)
+        patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
+        # Save the patches and activate them
+        fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
+        
     for p in fp8_state.vllm_patches:
         p.start()
 
@@ -236,32 +239,33 @@ def kitchen_block_scale(
     descale = max_abs / max_dtype
 
     if fp8_config.use_weight_pow2_scale:
-        # Calculate exponent HW instruction: cvt.rp.satfinite.ue8m0x2.f32
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
         exponent = torch.clamp(exponent, min=-127, max=127) + 127
         # Convert to uint8 container
         exponent = exponent.to(torch.uint8)
         # Calculate descale_fp to apply to data_hp
-        descale_fp = torch.where(
+        scale_fp = torch.where(
             # If exponent is 0, descale_fp is 1.0 rather than 2^127
             exponent == 0,
             1.0,
             torch.exp2(127 - exponent.to(torch.float32)),
         )
-        descale_fp_inv = torch.reciprocal(descale_fp)
+        descale_fp = torch.reciprocal(scale_fp)
     else:
-        descale_fp = max_dtype / max_abs
-        descale_fp = torch.where(
-            max_abs == 0, 1.0, descale_fp
-        )  # preserve the behavior for 0 amax case
-        descale_fp = torch.where(
-            descale_fp == torch.inf, torch.finfo(data_hp.dtype).max, descale_fp
-        )
-        descale_fp_inv = torch.reciprocal(descale_fp)
+        scale_fp = max_dtype / max_abs
+        scale_fp = torch.where(
+            max_abs == 0, 1.0, scale_fp
+        ) 
+        # preserve the behavior for 0 amax case
+        scale_fp = torch.where(
+            max_abs == torch.inf, 1.0, scale_fp
+        ) 
+
+        descale_fp = torch.reciprocal(scale_fp)
 
     # Scale and saturate cast the data elements to max of target dtype
-    data_lp = torch.clamp(data_hp * descale_fp, min=-1 * max_dtype, max=max_dtype)
+    data_lp = torch.clamp(data_hp * scale_fp, min=-1 * max_dtype, max=max_dtype)
 
     fp_data = data_lp.to(torch.float8_e4m3fn)
 
@@ -273,7 +277,7 @@ def kitchen_block_scale(
     )
 
     # Convert to target format, but still in original precision container
-    return fp_data, descale_fp_inv 
+    return fp_data, descale_fp 
 
 
 def process_weights_after_loading(self, layer) -> None:
