@@ -1054,7 +1054,8 @@ class VllmGenerationWorker:
                 ):
                     ray_worker_outputs.append(
                         worker.execute_method.remote(
-                            "update_weights_from_local_ipc_handles", ipc_handles[device_id]
+                            "update_weights_from_local_ipc_handles",
+                            ipc_handles[device_id],
                         )
                     )
 

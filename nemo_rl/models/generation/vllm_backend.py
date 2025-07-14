@@ -50,7 +50,7 @@ class VllmInternalWorkerExtension:
         from nemo_rl.utils.nvml import get_device_uuid
 
         return get_device_uuid(self.device.index)
-    
+
     def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
         """Update weights from global IPC handles.
 
