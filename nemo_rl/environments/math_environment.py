@@ -19,6 +19,7 @@ from typing import Any, Optional, TypedDict, Union
 
 import ray
 import torch
+from math_verify import grader
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
@@ -108,12 +109,13 @@ class HFVerifyWorker:
                     # Make sure the extracted answer is not None and is a list of two elements
                     assert extracted_answer is not None
                     assert len(extracted_answer) == 2
-                    # The extracted answer is a list of two elements. The first element is the gold answer.
-                    # The second element is the predicted answer. The predicted answer also includes two
-                    # elements which are parsed with different ExtractionConfig. (Not sure why there are two elements.)
-                    # We choose the first element as the predicted answer.
-                    # TODO @rayentian: check if the two elements both fine to be the extracted answer.
-                    extracted_answers.append(extracted_answer[1][0][0])
+                    extracted_prediction, extracted_gold = extracted_answer
+                    for pred in extracted_prediction:
+                        if any(grader.verify(gold, pred) for gold in extracted_gold):
+                            extracted_answers.append(pred)
+                            break
+                    else:
+                        extracted_answers.append(None)
             except Exception:
                 results.append(0.0)
                 extracted_answers.append(None)
