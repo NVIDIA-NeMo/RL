@@ -323,12 +323,13 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
-        if self.cfg["vllm_cfg"]["precision"] == 'fp8':
+        if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation import fp8
+
             fp8.init_fp8(self.cfg["vllm_cfg"], self.model_name)
             vllm_kwargs.update(fp8.get_vllm_kwargs(self.model_name))
             # overriden by quant config, however vllm complains if this not passed
-            self.precision = "bfloat16" 
+            self.precision = "bfloat16"
 
         llm_kwargs = dict(
             model=self.model_name,
