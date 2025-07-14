@@ -6,7 +6,7 @@
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-long.v3.sh
 
 # Long 32b run
-tests/test_suites/llm/grpo-qwen2.5-32b-16n8g-fsdp2tp8sp-actckpt-long.v3.sh
+tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long.v3.sh
 
 # Long Gemma3 27b run
 tests/test_suites/llm/grpo-gemma3-27b-it-16n8g-fsdp2tp8sp-actckpt-long.sh

@@ -209,14 +209,14 @@ The required `CONTAINER` can be built by following the instructions in the [Dock
 This section outlines how to run GRPO for Qwen2.5-32B with a 16k sequence length.
 ```sh
 # Run from the root of NeMo RL repo
-NUM_ACTOR_NODES=16
+NUM_ACTOR_NODES=32
 
 # Download Qwen before the job starts to avoid spending time downloading during the training loop
 HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \
-COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True policy.dynamic_batching.train_mb_tokens=16384 policy.dynamic_batching.logprob_mb_tokens=32768 checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
+COMMAND="uv run ./examples/run_grpo_math.py --config examples/configs/grpo_math_8B.yaml policy.model_name='Qwen/Qwen2.5-32B' policy.generation.vllm_cfg.tensor_parallel_size=4 policy.max_total_sequence_length=16384 cluster.num_nodes=${NUM_ACTOR_NODES} policy.dtensor_cfg.enabled=True policy.dtensor_cfg.tensor_parallel_size=8 policy.dtensor_cfg.sequence_parallel=True policy.dtensor_cfg.activation_checkpointing=True checkpointing.checkpoint_dir='results/qwen2.5-32b' logger.wandb_enabled=True logger.wandb.name='qwen2.5-32b'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
