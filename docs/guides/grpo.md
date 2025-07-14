@@ -44,7 +44,7 @@ We define a [DatumSpec](../../nemo_rl/data/interfaces.py) that holds all relevan
 class DatumSpec(TypedDict):
     message_log: LLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
-    extra_env_info: Dict[str, Any] # anything your environment requires goes here, for example the 'answer' of a math problem
+    extra_env_info: dict[str, Any] # anything your environment requires goes here, for example the 'answer' of a math problem
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
     task_name: Optional[str] = "default"
@@ -59,7 +59,7 @@ For each task, you should provide a data processor that reads from your dataset 
 
 ```python
 def my_data_processor(
-    datum_dict: Dict[str, Any], # loaded directly from your dataset (i.e. single line of jsonl data)
+    datum_dict: dict[str, Any], # loaded directly from your dataset (i.e. single line of jsonl data)
     task_data_spec: TaskDataSpec,
     tokenizer,
     max_seq_length: int,

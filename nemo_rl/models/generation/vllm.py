@@ -22,11 +22,8 @@ from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
-    Dict,
-    List,
     NotRequired,
     Optional,
-    Tuple,
     TypedDict,
     Union,
     cast,
@@ -76,7 +73,7 @@ class VllmConfig(GenerationConfig):
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -1329,11 +1326,11 @@ class VllmGeneration(GenerationInterface):
         )
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
-        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         env_vars = {}
         if not self.cfg["colocated"]["enabled"]:
-            env_vars["NCCL_SHM_DISABLE"] = "1"
-            env_vars["NCCL_P2P_DISABLE"] = "1"
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -1370,7 +1367,7 @@ class VllmGeneration(GenerationInterface):
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
-    ) -> List[Tuple[int, List[int]]]:
+    ) -> list[tuple[int, list[int]]]:
         """Calculate bundle indices for tensor and pipeline parallel workers.
 
         Handles both unified placement groups (for cross-node model parallelism) and
@@ -1393,7 +1390,7 @@ class VllmGeneration(GenerationInterface):
 
             def get_node_bundles(
                 pg: PlacementGroup,
-            ) -> Dict[str, List[int]]:
+            ) -> dict[str, list[int]]:
                 # Retrieve mapping from node ID to bundle indices from a placement group.
                 try:
                     pg_table = ray.util.placement_group_table(pg)
@@ -1403,7 +1400,7 @@ class VllmGeneration(GenerationInterface):
                         "Failed to retrieve bundle/node mapping from placement group"
                     ) from e
 
-                node_bundles: Dict[str, List[int]] = defaultdict(list)
+                node_bundles: dict[str, list[int]] = defaultdict(list)
                 for bundle_idx, node_id in bundle_to_node.items():
                     node_bundles[node_id].append(bundle_idx)
                 for bundles in node_bundles.values():
@@ -1412,7 +1409,7 @@ class VllmGeneration(GenerationInterface):
 
             def allocate_worker_groups(
                 pg: PlacementGroup, tp_size: int, pp_size: int
-            ) -> List[Tuple[int, List[int]]]:
+            ) -> list[tuple[int, list[int]]]:
                 # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
 
                 # Retrieve both bundle mapping and per-node bundles
@@ -1442,12 +1439,12 @@ class VllmGeneration(GenerationInterface):
                 node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
 
                 # Flatten bundles in node order
-                flat: List[int] = []
+                flat: list[int] = []
                 for nid in sorted_nodes:
                     flat.extend(node_bundles[nid])
 
                 # Slice into groups and assign logical index
-                groups: List[Tuple[int, List[int]]] = []
+                groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size

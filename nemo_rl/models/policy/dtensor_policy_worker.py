@@ -17,7 +17,7 @@ import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, List, Optional, Set, Union, cast
+from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
@@ -55,6 +55,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_expandable_segments,
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
@@ -114,7 +115,9 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-@ray.remote(runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker"))
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+)  # pragma: no cover
 class DTensorPolicyWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -136,14 +139,17 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        # Disable NCCL SHM if training and generation are not co-located: https://github.com/NVIDIA-NeMo/RL/issues/564
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if (
             "generation" in config
             and config["generation"] is not None
             and not config["generation"]["colocated"]["enabled"]
         ):
-            os.environ["NCCL_SHM_DISABLE"] = "1"
-            os.environ["NCCL_P2P_DISABLE"] = "1"
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
+        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
+        configure_expandable_segments()
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
@@ -334,8 +340,8 @@ class DTensorPolicyWorker:
     @staticmethod
     def create_context_parallel_ctx(
         cp_mesh: torch.distributed.device_mesh.DeviceMesh,
-        cp_buffers: List[torch.Tensor],
-        cp_seq_dims: List[int],
+        cp_buffers: list[torch.Tensor],
+        cp_seq_dims: list[int],
         cp_no_restore_buffers: Set[torch.Tensor],
         cp_rotate_method: Optional[str] = None,
     ):
@@ -343,8 +349,8 @@ class DTensorPolicyWorker:
 
         Args:
             cp_mesh (DeviceMesh): The device mesh for context parallel.
-            cp_buffers (List[torch.Tensor]): The buffers for context parallel.
-            cp_seq_dims (List[int]): The sequence dimensions for context parallel.
+            cp_buffers (list[torch.Tensor]): The buffers for context parallel.
+            cp_seq_dims (list[int]): The sequence dimensions for context parallel.
             cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
             cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
         """
@@ -385,11 +391,6 @@ class DTensorPolicyWorker:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
-
-        # keep the same behavior as vllm
-        # see https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/env_override.py#L25
-        if not os.path.exists("/dev/nvidia-caps-imex-channels"):
-            os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
         if self.rank == 0:
             pg = StatelessProcessGroup.create(

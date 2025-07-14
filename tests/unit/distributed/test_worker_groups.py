@@ -311,7 +311,7 @@ def test_custom_environment_variables(register_test_actor, virtual_cluster):
         "CUSTOM_VAR_1": "test_value_1",
         "CUSTOM_VAR_2": "test_value_2",
         "NEMO_TEST_ENV": "nemo_test_value",
-        "PYTHONPATH": "/custom/python/path",
+        "DUMMY_TEST_VAR": "/custom/test/path",
     }
 
     # Create worker group with custom environment variables
