@@ -13,7 +13,8 @@ from unittest.mock import patch
 class FP8Config:
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
-    num_first_last_layers_in_bf16: int = 0
+    num_first_layers_in_bf16: int = 0
+    num_last_layers_in_bf16: int = 0
     fp8_block_quant_cfg = {
         "activation_scheme": "dynamic",
         "fmt": "e4m3",
@@ -44,7 +45,8 @@ def init_fp8(vllm_cfg, model_name):
         use_activation_pow2_scale=vllm_cfg.get(
             "pow2_activation_scaling_factors", False
         ),
-        num_first_last_layers_in_bf16=vllm_cfg.get("num_first_last_layers_in_bf16", 0),
+        num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
+        num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
     )
     fp8_state = FP8State()
 
@@ -69,7 +71,6 @@ def init_fp8(vllm_cfg, model_name):
         patcher2 = patch(func2_path, per_token_group_quant_fp8)
         patcher3 = patch(func3_path, _per_token_group_quant_fp8)
         patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-        # Save the patches and activate them
         fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
     for p in fp8_state.vllm_patches:
@@ -78,10 +79,30 @@ def init_fp8(vllm_cfg, model_name):
 
 def get_vllm_kwargs(model_name):
     fp8_block_quant_cfg = dict(fp8_config.fp8_block_quant_cfg)
-    if fp8_config.num_first_last_layers_in_bf16 > 0:
-        fp8_block_quant_cfg["ignored_layers"] = _get_params_in_first_last_n_layers(
-            model_name
-        )
+    if fp8_config.num_first_layers_in_bf16 > 0 or fp8_config.num_last_layers_in_bf16 > 0:
+        try:
+            config = AutoConfig.from_pretrained(model_name)
+            with init_empty_weights():
+                model = AutoModel.from_config(config)
+            param_names = [name for name, _ in model.named_parameters()]
+        except OSError as e:
+            raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
+
+        bf16_params = []
+        if fp8_config.num_first_layers_in_bf16 > 0:
+            layers = [l for l in range(fp8_config.num_first_layers_in_bf16)]
+            bf16_params.append(_get_params_in_layers(param_names, layers))
+
+        if fp8_config.num_last_layers_in_bf16 > 0:
+            layers = [l for l in range(
+                config.num_hidden_layers - fp8_config.num_last_layers_in_bf16,
+                config.num_hidden_layers,
+                )
+            ]
+            bf16_params.append(_get_params_in_layers(param_names, layers))       
+
+        fp8_block_quant_cfg["ignored_layers"] = bf16_params
+
     vllm_kwargs = {
         "quantization": "fp8",
         "hf_overrides": {"quantization_config": fp8_block_quant_cfg},
@@ -103,26 +124,7 @@ def is_fp8_model(vllm_config):
     return False
 
 
-def _get_params_in_first_last_n_layers(model_name):
-    num_first_last_layers_in_bf16 = fp8_config.num_first_last_layers_in_bf16
-    assert fp8_config.num_first_last_layers_in_bf16 > 0
-
-    try:
-        config = AutoConfig.from_pretrained(model_name)
-        with init_empty_weights():
-            model = AutoModel.from_config(config)
-        param_names = [name for name, _ in model.named_parameters()]
-    except OSError as e:
-        raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
-
-    layers = [
-        *range(num_first_last_layers_in_bf16),
-        *range(
-            config.num_hidden_layers - num_first_last_layers_in_bf16,
-            config.num_hidden_layers,
-        ),
-    ]
-
+def _get_params_in_layers(param_names, layers):
     layer_templates = []
     for i in layers:
         # Prefixes used by huggingface model transformer layers.
@@ -138,7 +140,7 @@ def _get_params_in_first_last_n_layers(model_name):
     prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
     if len(prefixes) == 0:
         raise ValueError(
-            f"Could not identify layers {layers} for model '{model_name}'."
+            f"Could not identify layers {layers} for model."
         )
 
     params = []
