@@ -963,6 +963,8 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
@@ -1331,8 +1333,9 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
@@ -1353,6 +1356,7 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
