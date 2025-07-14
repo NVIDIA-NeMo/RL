@@ -1,13 +1,13 @@
-
 import torch, os
 from accelerate import init_empty_weights
 from dataclasses import dataclass, field
-from transformers import AutoConfig, AutoModel, PretrainedConfig
-from typing import Any, Callable, Optional, Union
+from transformers import AutoConfig, AutoModel
+from typing import Optional
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from unittest.mock import patch
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -18,16 +18,18 @@ class FP8Config:
         "activation_scheme": "dynamic",
         "fmt": "e4m3",
         "quant_method": "fp8",
-        "weight_block_size": [128, 128]
+        "weight_block_size": [128, 128],
     }
+
 
 @dataclass()
 class FP8State:
-    # A cache of fp8 parameter names, we can check this cache to see if a 
+    # A cache of fp8 parameter names, we can check this cache to see if a
     # param name corresponds to a fp8 weight
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+
 
 # Global FP8 config that can be accessed by patched vLLM functions
 fp8_config: FP8Config = None
@@ -38,9 +40,11 @@ fp8_state: FP8Config = None
 def init_fp8(vllm_cfg, model_name):
     global fp8_config, fp8_state
     fp8_config = FP8Config(
-        use_weight_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False),
-        use_activation_pow2_scale = vllm_cfg.get("pow2_activation_scaling_factors", False),
-        num_first_last_layers_in_bf16 = vllm_cfg.get("num_first_last_layers_in_bf16", 0),
+        use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
+        use_activation_pow2_scale=vllm_cfg.get(
+            "pow2_activation_scaling_factors", False
+        ),
+        num_first_last_layers_in_bf16=vllm_cfg.get("num_first_last_layers_in_bf16", 0),
     )
     fp8_state = FP8State()
 
@@ -51,23 +55,23 @@ def init_fp8(vllm_cfg, model_name):
     # This patch is used to support torch.compile with vllm parameter subclasses, such as
     # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
     # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
-    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in 
-    # which this patch can be removed. 
-    func1_path = 'vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading'
+    # with pytorch 2.8, parameter subclassing with torch.compile will be natively supported, in
+    # which this patch can be removed.
+    func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     patcher1 = patch(func1_path, process_weights_after_loading)
     fp8_state.vllm_patches.append(patcher1)
-    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher 
-    # SNR compared to plain fp32 scaling factors. This feature is still under active research. 
+    # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
+    # SNR compared to plain fp32 scaling factors. This feature is still under active research.
     if fp8_config.use_weight_pow2_scale or fp8_config.use_activation_pow2_scale:
-        func2_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8'
-        func3_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8'
-        func4_path = 'vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor'   
-        patcher2 = patch(func2_path, per_token_group_quant_fp8) 
+        func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
+        func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
+        func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
+        patcher2 = patch(func2_path, per_token_group_quant_fp8)
         patcher3 = patch(func3_path, _per_token_group_quant_fp8)
         patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
         # Save the patches and activate them
         fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
-        
+
     for p in fp8_state.vllm_patches:
         p.start()
 
@@ -75,25 +79,29 @@ def init_fp8(vllm_cfg, model_name):
 def get_vllm_kwargs(model_name):
     fp8_block_quant_cfg = dict(fp8_config.fp8_block_quant_cfg)
     if fp8_config.num_first_last_layers_in_bf16 > 0:
-        fp8_block_quant_cfg['ignored_layers'] = _get_params_in_first_last_n_layers(
+        fp8_block_quant_cfg["ignored_layers"] = _get_params_in_first_last_n_layers(
             model_name
         )
     vllm_kwargs = {
-        "quantization" : "fp8",
-        "hf_overrides" : {"quantization_config": fp8_block_quant_cfg},
+        "quantization": "fp8",
+        "hf_overrides": {"quantization_config": fp8_block_quant_cfg},
     }
     return vllm_kwargs
+
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    if hasattr(vllm_config, "quant_config") and \
-        isinstance(vllm_config.quant_config, Fp8Config):
-        assert vllm_config.quant_config.weight_block_size is not None, \
+    if hasattr(vllm_config, "quant_config") and isinstance(
+        vllm_config.quant_config, Fp8Config
+    ):
+        assert vllm_config.quant_config.weight_block_size is not None, (
             "Only block scaling is currently supported in NeMo-RL!"
+        )
         return True
 
     return False
+
 
 def _get_params_in_first_last_n_layers(model_name):
     num_first_last_layers_in_bf16 = fp8_config.num_first_last_layers_in_bf16
@@ -108,37 +116,48 @@ def _get_params_in_first_last_n_layers(model_name):
         raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
 
     layers = [
-        *range(num_first_last_layers_in_bf16), 
-        *range(config.num_hidden_layers - num_first_last_layers_in_bf16, config.num_hidden_layers)
+        *range(num_first_last_layers_in_bf16),
+        *range(
+            config.num_hidden_layers - num_first_last_layers_in_bf16,
+            config.num_hidden_layers,
+        ),
     ]
 
     layer_templates = []
     for i in layers:
         # Prefixes used by huggingface model transformer layers.
-        # We'll use these to match against the parameter names to determine 
+        # We'll use these to match against the parameter names to determine
         # which layer the parameter is in.
-        layer_templates.extend([
-            f"transformer.h.{i}.",
-            f"layers.{i}.",
-            f"layer.{i}.",
-        ])
+        layer_templates.extend(
+            [
+                f"transformer.h.{i}.",
+                f"layers.{i}.",
+                f"layer.{i}.",
+            ]
+        )
     prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
     if len(prefixes) == 0:
-        raise ValueError(f"Could not identify layers {layers} for model '{model_name}'.")
+        raise ValueError(
+            f"Could not identify layers {layers} for model '{model_name}'."
+        )
 
     params = []
     for name in param_names:
-        if any(p in name for p in prefixes) and 'bias' not in name and 'layernorm' not in name:
+        if (
+            any(p in name for p in prefixes)
+            and "bias" not in name
+            and "layernorm" not in name
+        ):
             # Convert the param name into vllm's module name
             # Vllm wraps the model with an extra 'model'
-            params.append(f"model.{name}".removesuffix('.weight'))
+            params.append(f"model.{name}".removesuffix(".weight"))
     return params
 
 
 def _get_module_from_param_name(model, name: str):
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split('.')
+    path_parts = name.split(".")
     module_path = path_parts[:-1]
     # Replace with the fused model name
     packed_modules_mapping = model.packed_modules_mapping
@@ -167,12 +186,16 @@ def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith('weight'):
+        if name.endswith("weight"):
             module = _get_module_from_param_name(model, name)
             # We currently only quantize linear layers
-            if isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn:
+            if (
+                isinstance(module, LinearBase)
+                and module.weight.dtype == torch.float8_e4m3fn
+            ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
+
 
 def load_weights(weights, model_runner):
     weights_quantized = []
@@ -180,12 +203,12 @@ def load_weights(weights, model_runner):
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
-            weights_quantized.append((k,v))
+            weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = kitchen_block_scale(
-            v.to(torch.float), 
-            weight_block_size=FP8Config.fp8_block_quant_cfg['weight_block_size']
+            v.to(torch.float),
+            weight_block_size=FP8Config.fp8_block_quant_cfg["weight_block_size"],
         )
         param_scale = torch.squeeze(param_scale)
         weights_quantized.append([k, param_lp])
@@ -212,12 +235,12 @@ def kitchen_block_scale(
 
     block_size1 = weight_block_size[1]
     block_size0 = weight_block_size[0]
-    assert (
-        data_hp.shape[1] % block_size1 == 0
-    ), f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
-    assert (
-        data_hp.shape[0] % block_size0 == 0
-    ), f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
+    assert data_hp.shape[1] % block_size1 == 0, (
+        f"data_hp.shape[1] {data_hp.shape[1]}  must be a multiple of block_size1: {block_size1}."
+    )
+    assert data_hp.shape[0] % block_size0 == 0, (
+        f"data_hp.shape[0] {data_hp.shape[0]} must be a multiple of block_size0: {block_size0}."
+    )
 
     # FP8
     max_dtype = torch.finfo(torch.float8_e4m3fn).max
@@ -254,13 +277,9 @@ def kitchen_block_scale(
         descale_fp = torch.reciprocal(scale_fp)
     else:
         scale_fp = max_dtype / max_abs
-        scale_fp = torch.where(
-            max_abs == 0, 1.0, scale_fp
-        ) 
+        scale_fp = torch.where(max_abs == 0, 1.0, scale_fp)
         # preserve the behavior for 0 amax case
-        scale_fp = torch.where(
-            max_abs == torch.inf, 1.0, scale_fp
-        ) 
+        scale_fp = torch.where(max_abs == torch.inf, 1.0, scale_fp)
 
         descale_fp = torch.reciprocal(scale_fp)
 
@@ -277,14 +296,16 @@ def kitchen_block_scale(
     )
 
     # Convert to target format, but still in original precision container
-    return fp_data, descale_fp 
+    return fp_data, descale_fp
 
 
 def process_weights_after_loading(self, layer) -> None:
-    from vllm.model_executor.parameter import (BlockQuantScaleParameter,
-                                    ModelWeightParameter,
-                                    PerTensorScaleParameter)
+    from vllm.model_executor.parameter import (
+        BlockQuantScaleParameter,
+        ModelWeightParameter,
+    )
     from torch.nn import Parameter
+
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
 
@@ -294,8 +315,9 @@ def process_weights_after_loading(self, layer) -> None:
         custom_param_dir = dir(custom_param)
         # Find the attributes that are unique to the custom parameter
         custom_attributes = [
-            attr for attr in custom_param_dir 
-            if attr not in base_param_dir and not attr.startswith('__')
+            attr
+            for attr in custom_param_dir
+            if attr not in base_param_dir and not attr.startswith("__")
         ]
         # Set the custom attributes into the base parameter object
         for attr in custom_attributes:
@@ -309,13 +331,20 @@ def process_weights_after_loading(self, layer) -> None:
     weight = self._maybe_pad_weight(weight)
 
     layer.weight = _create_param_from_subclass_attributes(
-        ModelWeightParameter(data=weight, output_dim=0, input_dim=1,
-            weight_loader=layer.weight.weight_loader)
+        ModelWeightParameter(
+            data=weight,
+            output_dim=0,
+            input_dim=1,
+            weight_loader=layer.weight.weight_loader,
+        )
     )
     layer.weight_scale_inv = _create_param_from_subclass_attributes(
         BlockQuantScaleParameter(
-            data=weight_scale_inv, output_dim=0, input_dim=1,
-            weight_loader=layer.weight_scale_inv.weight_loader)
+            data=weight_scale_inv,
+            output_dim=0,
+            input_dim=1,
+            weight_loader=layer.weight_scale_inv.weight_loader,
+        )
     )
 
 
@@ -338,10 +367,6 @@ def _per_token_group_quant_fp8(
     BLOCK: tl.constexpr,
     pow2_scale: tl.constexpr,
 ):
-    """A Triton-accelerated function to perform per-token-group
-    quantization on a tensor.
-    This function converts the tensor values into float8 values.
-    """
     groups_per_row = y_num_columns // group_size
 
     # Map the program id to the row of X and Y it should compute.
@@ -368,14 +393,14 @@ def _per_token_group_quant_fp8(
 
         # after rounding to exponent, round back to floating
         inv_scale_pow2 = tl.exp2(exponent)
-        
+
         is_nan = inv_scale_pow2 != inv_scale_pow2
         is_inf = (inv_scale_pow2 == 1.0 / 0.0) | (inv_scale_pow2 == -1.0 / 0.0)
-        
+
         # If the value is NaN or infinity, default it to 1.0,
         # otherwise keep its original value.
-        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2) 
-        # finally uninverse        
+        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
+        # finally uninverse
         y_s = 1.0 / inv_scale_pow2
 
     else:
@@ -409,10 +434,6 @@ def _per_token_group_quant_fp8_colmajor(
     BLOCK: tl.constexpr,
     pow2_scale: tl.constexpr,
 ):
-    """A Triton-accelerated function to perform per-token-group
-    quantization on a tensor.
-    This function converts the tensor values into float8 values.
-    """
     groups_per_row = y_num_columns // group_size
 
     # Map the program id to the row of X and Y it should compute.
@@ -447,9 +468,9 @@ def _per_token_group_quant_fp8_colmajor(
         # If the value is NaN or infinity, default it to 1.0,
         # otherwise keep its original value.
         is_nan = inv_scale_pow2 != inv_scale_pow2
-        is_inf = (inv_scale_pow2 == float('inf')) | (inv_scale_pow2 == float('-inf'))
-        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2) 
-        # finally uninverse        
+        is_inf = (inv_scale_pow2 == float("inf")) | (inv_scale_pow2 == float("-inf"))
+        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
+        # finally uninverse
         y_s = 1.0 / inv_scale_pow2
     else:
         y_s = _absmax / fp8_max
@@ -468,23 +489,11 @@ def per_token_group_quant_fp8(
     column_major_scales: bool = False,
     pow2_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Function to perform per-token-group quantization on an input tensor `x`.
-    It converts the tensor values into signed float8 values and returns the
-    quantized tensor along with the scaling factor used for quantization.
-    Args:
-        x: The input tensor with ndim >= 2.
-        group_size: The group size used for quantization.
-        eps: The minimum to avoid dividing zero.
-        dtype: The dype of output tensor. Note that only `torch.float8_e4m3fn`
-        is supported for now.
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
-        scaling factor for quantization.
-    """
     dtype = current_platform.fp8_dtype() if dtype is None else dtype
-    assert (x.shape[-1] % group_size == 0), (
+    assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible "
-        f"by `group_size` {group_size}")
+        f"by `group_size` {group_size}"
+    )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
 
     finfo = torch.finfo(dtype)
@@ -495,11 +504,10 @@ def per_token_group_quant_fp8(
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
-        shape = (x.shape[-1] // group_size, ) + x.shape[:-1]
-        x_s = torch.empty(shape, device=x.device,
-                          dtype=torch.float32).permute(-1, -2)
+        shape = (x.shape[-1] // group_size,) + x.shape[:-1]
+        x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
     else:
-        shape = x.shape[:-1] + (x.shape[-1] // group_size, )
+        shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     BLOCK = triton.next_power_of_2(N)
@@ -508,7 +516,7 @@ def per_token_group_quant_fp8(
     num_stages = 1
 
     if column_major_scales:
-        _per_token_group_quant_fp8_colmajor[(M, )](
+        _per_token_group_quant_fp8_colmajor[(M,)](
             x,
             x_q,
             x_s,
@@ -525,7 +533,7 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
-        _per_token_group_quant_fp8[(M, )](
+        _per_token_group_quant_fp8[(M,)](
             x,
             x_q,
             x_s,

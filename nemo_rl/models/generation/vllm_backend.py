@@ -60,7 +60,6 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
-
         try:
             # Get handles for this device
             device_uuid = self.report_device_id()
@@ -101,13 +100,14 @@ class VllmInternalWorkerExtension:
                     weights.append((name, tensor))
 
             # Load weights into the model
-            from nemo_rl.models.generation import fp8 
+            from nemo_rl.models.generation import fp8
+
             if fp8.is_fp8_model(self.model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
                 fp8.load_weights(weights, self.model_runner)
             else:
                 self.model_runner.model.load_weights(weights=weights)
-                
+
             return True
         except Exception as e:
             print(
