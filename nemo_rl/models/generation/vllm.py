@@ -1098,6 +1098,7 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles_async can only be used with async_engine=True. Use update_weights_from_ipc_handles instead."
                 )
 
+            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_global_ipc_handles", args=(ipc_handles,)
             )
