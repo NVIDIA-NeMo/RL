@@ -79,7 +79,10 @@ def init_fp8(vllm_cfg, model_name):
 
 def get_vllm_kwargs(model_name):
     fp8_block_quant_cfg = dict(fp8_config.fp8_block_quant_cfg)
-    if fp8_config.num_first_layers_in_bf16 > 0 or fp8_config.num_last_layers_in_bf16 > 0:
+    if (
+        fp8_config.num_first_layers_in_bf16 > 0
+        or fp8_config.num_last_layers_in_bf16 > 0
+    ):
         try:
             config = AutoConfig.from_pretrained(model_name)
             with init_empty_weights():
@@ -94,12 +97,14 @@ def get_vllm_kwargs(model_name):
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
         if fp8_config.num_last_layers_in_bf16 > 0:
-            layers = [l for l in range(
-                config.num_hidden_layers - fp8_config.num_last_layers_in_bf16,
-                config.num_hidden_layers,
+            layers = [
+                l
+                for l in range(
+                    config.num_hidden_layers - fp8_config.num_last_layers_in_bf16,
+                    config.num_hidden_layers,
                 )
             ]
-            bf16_params.append(_get_params_in_layers(param_names, layers))       
+            bf16_params.append(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_cfg["ignored_layers"] = bf16_params
 
@@ -139,9 +144,7 @@ def _get_params_in_layers(param_names, layers):
         )
     prefixes = [p for p in layer_templates if any(p in n for n in param_names)]
     if len(prefixes) == 0:
-        raise ValueError(
-            f"Could not identify layers {layers} for model."
-        )
+        raise ValueError(f"Could not identify layers {layers} for model.")
 
     params = []
     for name in param_names:
