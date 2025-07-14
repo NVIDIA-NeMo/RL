@@ -317,6 +317,11 @@ def setup(
         )
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            assert loss_config["use_importance_sampling_correction"] is True, (
+                "Importance sampling must be enabled for vLLM FP8 generation!"
+            )
+
         policy_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
         )
