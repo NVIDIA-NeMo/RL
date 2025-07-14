@@ -334,27 +334,19 @@ async def _run_env_eval_impl(
             for i in range(len(batch["message_log"]))
         ]
 
-        # define metric configs
-        metric_configs = {"pass@k": (False, eval_pass_k), "cons@k": (True, eval_cons_k)}
-        # check metric
-        if metric not in metric_configs:
-            raise ValueError(f"Invalid metric: {metric}")
-
-        return_extracted_answer, eval_func = metric_configs[metric]
-
-        # run env
-        env_return = ray.get(
-            env.step.remote(to_env, batch["extra_env_info"], return_extracted_answer)
-        )
-
-        # evaluate
+        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
         rewards = env_return.rewards
-        extracted_answers = (
-            [m["extracted_answer"] for m in env_return.info]
-            if return_extracted_answer
-            else None
-        )
-        score += eval_func(rewards, num_tests_per_prompt, k_value, extracted_answers)
+
+        # update stats
+        if metric == "pass@k":
+            score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
+        elif metric == "cons@k":
+            extracted_answers = [m["extracted_answer"] for m in env_return.info]
+            score += eval_cons_k(
+                rewards, num_tests_per_prompt, k_value, extracted_answers
+            )
+        else:
+            raise ValueError(f"Invalid metric: {metric}")
 
     # Cleanup before printing results
     ray.get(env.shutdown.remote())

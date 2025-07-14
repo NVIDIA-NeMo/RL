@@ -316,7 +316,7 @@ class MathEnvironment(EnvironmentInterface):
         info = (
             [{"extracted_answer": answer} for answer in extracted_answers_list]
             if extracted_answers_list
-            else None
+            else [None] * len(message_log_batch)
         )
 
         return EnvironmentReturn(

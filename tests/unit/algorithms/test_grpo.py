@@ -41,6 +41,7 @@ class MockEnvironment(EnvironmentInterface):
             [[]] * len(messages),
             self.rewards,
             [True] * len(messages),
+            [None] * len(messages),
         )
 
     def get_calls(self):
@@ -136,7 +137,7 @@ def test_calculate_rewards_single_task(mock_env):
     assert len(terminateds) == 2
     assert len(next_stop_strings) == 2
     assert len(metadata) == 2
-    assert info is None
+    assert len(info) == 2
     assert torch.allclose(rewards, torch.tensor([1.0, 2.0]))
     assert (
         ray.get(mock_env.get_calls.remote()) == 1
@@ -172,7 +173,7 @@ def test_calculate_rewards_multiple_tasks(mock_envs):
     assert len(terminateds) == 4
     assert len(next_stop_strings) == 4
     assert len(metadata) == 4
-    assert info is None
+    assert len(info) == 4
     assert torch.allclose(rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
     assert (
         ray.get(mock_envs["math"].get_calls.remote()) == 1
@@ -200,7 +201,7 @@ def test_calculate_rewards_empty_batch(mock_env):
     assert len(terminateds) == 0
     assert len(next_stop_strings) == 0
     assert len(metadata) == 0
-    assert info is None
+    assert len(info) == 0
     assert (
         ray.get(mock_env.get_calls.remote()) == 0
     )  # Should not call environment for empty batch
