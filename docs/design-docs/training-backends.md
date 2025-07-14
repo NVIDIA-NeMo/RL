@@ -33,3 +33,38 @@ To enable DTensor (FSDP2) training:
 ## Configuration Examples
 
 For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes/llm) folder. This directory contains ready-to-use configurations for various supported combinations.
+
+## Configuration
+
+### Megatron Configuration
+
+#### Checkpoint Directory Configuration
+
+The Megatron backend requires a checkpoint directory for storing converted Hugging Face model weights in Megatron format. This directory must be accessible from all nodes in your distributed training setup.
+
+**Environment Variable Priority (highest to lowest):**
+
+1. **`NRL_MEGATRON_CHECKPOINT_DIR`** - Custom checkpoint directory path
+2. [RECOMMENDED] **`HF_HOME/nemo_rl`** - Uses HuggingFace cache directory if available
+3. **`~/.cache/huggingface/nemo_rl`** - Default fallback location
+
+**Configuration Examples:**
+
+```bash
+# Option 1: Set custom checkpoint directory
+export NRL_MEGATRON_CHECKPOINT_DIR="/shared/nfs/checkpoints/megatron"
+
+# Option 2: Use HuggingFace home directory (recommended for shared setups)
+export HF_HOME="/shared/nfs/huggingface"
+# This will use /shared/nfs/huggingface/nemo_rl
+
+# Option 3: Use default (no environment variables needed)
+# Uses ~/.cache/huggingface/nemo_rl
+```
+
+**Best Practices:**
+
+- **Mount in checkpoint directory**: If you are using docker, make sure the megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
+- **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem)
+- **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage
+- **Sufficient space**: Ensure adequate disk space for converted model checkpoints

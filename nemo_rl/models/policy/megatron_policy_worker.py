@@ -116,6 +116,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_expandable_segments,
     get_gpu_info,
+    get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
 
@@ -356,7 +357,6 @@ class MegatronPolicyWorker:
         *,
         worker_sharding_annotations: NamedSharding,
         pre_init_communication_queue: Queue,
-        megatron_checkpoint_home: Optional[str] = None,
         **kwargs: Any,
     ):
         self.cfg = config
@@ -378,10 +378,7 @@ class MegatronPolicyWorker:
         if os.path.exists(hf_model_name):
             hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
 
-        if megatron_checkpoint_home is not None:
-            pretrained_path = f"{megatron_checkpoint_home}/{hf_model_subdir}"
-        else:
-            pretrained_path = f"/opt/checkpoints/tron/{hf_model_subdir}"
+        pretrained_path = f"{get_megatron_checkpoint_dir()}/{hf_model_subdir}"
         pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
             os.path.join(pretrained_path, "iter_0000000")
         )
@@ -434,6 +431,11 @@ class MegatronPolicyWorker:
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if not os.path.exists(pretrained_run_config):
+            raise FileNotFoundError(
+                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. Please check "
+            )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config)
         model_cfg = cfg_from_pretrained.model_config
