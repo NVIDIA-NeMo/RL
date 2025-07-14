@@ -117,7 +117,7 @@ class DynamicBatchingConfig(TypedDict):
     # training and logprob stages respectively.
     enabled: bool
     train_mb_tokens: int
-    logprob_mb_tokens: int
+    logprob_mb_tokens: NotRequired[int] = None
     sequence_length_round: int
 
 
