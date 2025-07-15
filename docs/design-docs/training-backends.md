@@ -47,10 +47,6 @@ For comprehensive examples of each algorithm and backend, see the [examples/conf
 
 ## Megatron Configuration
 
-### Megatron Configuration
-
-#### Checkpoint Directory Configuration
-
 The Megatron backend requires a checkpoint directory for storing converted Hugging Face model weights in Megatron format. This directory must be accessible from all nodes in your distributed training setup.
 
 ###Environment Variable Priority (Highest to Lowest)###
