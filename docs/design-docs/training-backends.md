@@ -7,6 +7,19 @@ NeMo RL supports multiple training backends to accommodate different model sizes
 - **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
 - **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
 
+## Supported Input Checkpoint Format
+
+At this time, NeMo RL only supports Hugging Face checkpoints as inputs to the training scripts. This applies to both
+the `DTensor` backend and `Megatron` backend.
+
+* `DTensor` uses the Hugging Face checkpoint to initialize the training backend and also configure `vllm` so that the
+  model implementations exactly match. This is crucial for correctness.
+* `Megatron` also uses the Hugging Face checkpoint to configure `vllm`, but it also does a one-time conversion of
+  Hugging Face checkpoint to Megatron checkpoint to initialize the training backend.
+
+If you would like to see direct support for megatron checkpoints, please share your use-case on
+https://github.com/NVIDIA-NeMo/RL/issues/671.
+
 ## Backend Selection
 
 The training backend is automatically determined based on your YAML configuration settings. Here's how to configure each backend.
