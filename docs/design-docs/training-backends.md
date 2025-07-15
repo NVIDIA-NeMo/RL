@@ -53,13 +53,13 @@ For comprehensive examples of each algorithm and backend, see the [examples/conf
 
 The Megatron backend requires a checkpoint directory for storing converted Hugging Face model weights in Megatron format. This directory must be accessible from all nodes in your distributed training setup.
 
-**Environment Variable Priority (highest to lowest):**
+###Environment Variable Priority (Highest to Lowest)###
 
-1. **`NRL_MEGATRON_CHECKPOINT_DIR`** - Custom checkpoint directory path
-2. [RECOMMENDED] **`HF_HOME/nemo_rl`** - Uses HuggingFace cache directory if available
-3. **`~/.cache/huggingface/nemo_rl`** - Default fallback location
+1. **`NRL_MEGATRON_CHECKPOINT_DIR`** - The custom checkpoint directory path.
+2. [RECOMMENDED] **`HF_HOME/nemo_rl`** - Uses the Hugging Face cache directory, if available.
+3. **`~/.cache/huggingface/nemo_rl`** - The default fallback location.
 
-**Configuration Examples:**
+###Configuration Examples###
 
 ```bash
 # Option 1: Set custom checkpoint directory
@@ -73,9 +73,9 @@ export HF_HOME="/shared/nfs/huggingface"
 # Uses ~/.cache/huggingface/nemo_rl
 ```
 
-**Best Practices:**
+###Best Practices###
 
-- **Mount in checkpoint directory**: If you are using docker, make sure the megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
-- **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem)
-- **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage
-- **Sufficient space**: Ensure adequate disk space for converted model checkpoints
+- **Mount in checkpoint directory**: If you are using Docker, make sure the Megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
+- **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem).
+- **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
+- **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.
