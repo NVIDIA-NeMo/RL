@@ -19,16 +19,12 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets import load_dataset
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from examples.run_grpo_math import math_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import MathDataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.llm_message_utils import remap_dataset_keys
+from nemo_rl.data.eval_datasets import load_eval_dataset
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -36,6 +32,9 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.utils.config import load_config
+
+TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args():
@@ -54,28 +53,14 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: MathDataConfig, env_configs):
-    print("\n▶ Setting up data...")
-    math_task_spec = TaskDataSpec(
-        task_name="math",
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
+def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+    print("Setting up data...")
 
     # load dataset
-    base_dataset = load_dataset(data_config["dataset_name"])
-    if data_config["dataset_key"] is not None:
-        base_dataset = base_dataset[data_config["dataset_key"]]
-    # remap problem and solution keys
-    remapped_dataset = remap_dataset_keys(
-        base_dataset,
-        mapping_dict={
-            data_config["problem_key"]: "problem",
-            data_config["solution_key"]: "expected_answer",
-        },
-    )
+    base_dataset = load_eval_dataset(data_config)
+    rekeyed_ds = base_dataset.rekeyed_ds
 
-    math_env = MathEnvironment.options(
+    env = MathEnvironment.options(
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.math_environment.MathEnvironment"
@@ -84,14 +69,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: MathDataConfig, env_config
     ).remote(env_configs["math"])
 
     dataset = AllTaskProcessedDataset(
-        dataset=remapped_dataset,
+        dataset=rekeyed_ds,
         tokenizer=tokenizer,
-        default_task_data_spec=math_task_spec,
-        task_data_processors=math_data_processor,
+        default_task_data_spec=base_dataset.task_spec,
+        task_data_processors=base_dataset.processor,
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    return dataset, math_env, tokenizer
+    return dataset, env, tokenizer
 
 
 def main():
@@ -100,9 +85,11 @@ def main():
     args, overrides = parse_args()
 
     if not args.config:
-        args.config = os.path.join(os.path.dirname(__file__), "configs", "eval.yaml")
+        args.config = os.path.join(
+            os.path.dirname(__file__), "configs", "evals", "eval.yaml"
+        )
 
-    config = OmegaConf.load(args.config)
+    config = load_config(args.config)
     print(f"Loaded configuration from: {args.config}")
 
     if overrides:
@@ -129,7 +116,7 @@ def main():
     # Setup data
     (
         dataset,
-        math_env,
+        env,
         tokenizer,
     ) = setup_data(tokenizer, config["data"], config["env"])
 
@@ -144,7 +131,7 @@ def main():
     run_env_eval(
         vllm_generation,
         dataloader,
-        math_env,
+        env,
         master_config,
     )
 

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 
 @torch.no_grad()
@@ -121,11 +122,12 @@ class DistributedLogprob(torch.autograd.Function):
 
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
-    target: torch.Tensor,
+    target: torch.Tensor | DTensor,
     vocab_start_index: int,
     vocab_end_index: int,
-    group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
+    seq_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits.
 
@@ -136,8 +138,10 @@ def from_parallel_logits_to_logprobs(
             NOTE: Must be the unmodified targets as this function will shift them internally.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
-        group (torch.distributed.ProcessGroup): Process group for distributed communication.
+        tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
+        seq_index (Optional[torch.Tensor]): Sequence index tensor with shape [seq_len].
+            It is only provided for cp sharded logits. It represents how tensor is sharded across the sequence dimension.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -145,13 +149,42 @@ def from_parallel_logits_to_logprobs(
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
-    target = target.roll(shifts=-1, dims=-1)
+    cp_size = 1
+
+    if isinstance(target, DTensor) and "cp" in target.device_mesh.mesh_dim_names:
+        cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
+        cp_size = target.device_mesh.shape[cp_dim_index]
+
+    if cp_size > 1:
+        assert seq_index is not None, "seq_index must be provided for cp sharded logits"
+        target_shape = torch.Size(target.shape)
+        cp_mesh = target.device_mesh
+        cp_placements = target.placements
+        _, sorted_indices = torch.sort(seq_index)
+        # Recover the original order of the target
+        target = target.full_tensor()[:, sorted_indices]
+        target = target.roll(shifts=-1, dims=-1)[:, seq_index]
+
+        # Reshard
+        target = distribute_tensor(target, cp_mesh, cp_placements)
+        target = target.to_local()
+    else:
+        target = target.roll(shifts=-1, dims=-1)
+
     probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
         vocab_parallel_logits,
         target,
         vocab_start_index,
         vocab_end_index,
-        group,
+        tp_group,
         inference_only,
     ).contiguous()
+
+    if cp_size > 1:
+        # probs is sharded on the sequence dimension.
+        # Get full sequence tensor, vocab dim has been reduced already.
+        probs_dtensor = DTensor.from_local(probs, cp_mesh, cp_placements)
+        probs = probs_dtensor.full_tensor()[:, sorted_indices]
+        assert probs.shape == target_shape
+
     return probs[:, :-1]

@@ -36,6 +36,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
+from typing_extensions import NotRequired
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -45,12 +46,12 @@ _rich_logging_configured = False
 
 
 class WandbConfig(TypedDict):
-    project: str
-    name: str
+    project: NotRequired[str]
+    name: NotRequired[str]
 
 
 class TensorboardConfig(TypedDict):
-    log_dir: str
+    log_dir: NotRequired[str]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -756,6 +757,12 @@ class Logger(LoggerInterface):
             data["prompt_lengths"][sample_idx] - 1,
             data["full_lengths"][sample_idx] - 1,
         )
+
+        if generation_start_idx >= generation_end_idx:
+            print(
+                f"Skipping token_mult_prob_error plot because generation_start_idx ({generation_start_idx}) >= generation_end_idx ({generation_end_idx})"
+            )
+            return
 
         generation_logprob = generation_logprobs[
             sample_idx, generation_start_idx:generation_end_idx

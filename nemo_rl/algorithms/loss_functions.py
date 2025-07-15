@@ -122,6 +122,7 @@ class ClippedPGLossFn(LossFunction):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
         reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -146,12 +147,12 @@ class ClippedPGLossFn(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
+                next_token_logits, data["input_ids"], seq_index=seq_index
             )
         else:
             next_token_logits_wo_last = next_token_logits[
@@ -332,7 +333,7 @@ class NLLLoss(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
@@ -480,7 +481,7 @@ class DPOLossFn(LossFunction):
                 data["input_ids"],
                 vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
                 vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
-                group=vocab_parallel_group,
+                tp_group=vocab_parallel_group,
                 inference_only=False,
             )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):

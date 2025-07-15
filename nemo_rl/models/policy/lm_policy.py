@@ -62,41 +62,33 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        node_bundle_indices = None
-        self.cp_size = 1
+        worker_builder_cls: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
 
-        worker_builder_cls: str
-        training_backend = None
-        if not config.get("megatron_cfg", {}).get(
-            "enabled", False
-        ):  # Huggingface backend
-            if config["dtensor_cfg"]["enabled"]:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-                )
-                tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-                cp_size = config["dtensor_cfg"]["context_parallel_size"]
-            else:
-                worker_builder_cls = (
-                    "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
-                )
-            training_backend = "hf"
-        elif config["megatron_cfg"]["enabled"]:  # Megatron backend
+        megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
+        if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
             )
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
-            training_backend = "megatron"
+
+            env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            training_backend = "hf"
-            worker_builder_cls = (
-                "nemo_rl.models.policy.fsdp1_policy_worker.FSDP1PolicyWorker"
+            assert config["dtensor_cfg"]["enabled"], (
+                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
             )
+            worker_builder_cls = (
+                "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+            )
+            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+
+            env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -132,12 +124,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars,
         )
 
         if config["dynamic_batching"]["enabled"]:
-            assert config["dtensor_cfg"]["enabled"] or training_backend == "megatron", (
-                "Dynamic batch is only supported for DTensor or Megatron policy."
-            )
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
             )

@@ -199,6 +199,9 @@ def tracker(request, session_data, ray_gpu_monitor):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if not hasattr(session.config, "_unit_test_data"):
+        return
+
     data = session.config._unit_test_data
     data["exit_status"] = exitstatus
     print(f"\nSaving unit test data to {UNIT_RESULTS_FILE}")

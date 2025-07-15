@@ -40,7 +40,6 @@ policy:
   logprob_batch_size: 8
   max_total_sequence_length: 512
   precision: "bfloat16"
-  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
 
   dtensor_cfg:
     enabled: false
@@ -73,13 +72,21 @@ policy:
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6

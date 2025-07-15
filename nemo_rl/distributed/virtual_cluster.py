@@ -55,7 +55,7 @@ class PY_EXECUTABLES:
     MCORE = "uv run --reinstall --extra mcore"
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:
     import socket
 
