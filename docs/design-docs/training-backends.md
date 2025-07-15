@@ -49,13 +49,13 @@ For comprehensive examples of each algorithm and backend, see the [examples/conf
 
 The Megatron backend requires a checkpoint directory for storing converted Hugging Face model weights in Megatron format. This directory must be accessible from all nodes in your distributed training setup.
 
-###Environment Variable Priority (Highest to Lowest)###
+### Environment Variable Priority (Highest to Lowest) ###
 
 1. **`NRL_MEGATRON_CHECKPOINT_DIR`** - The custom checkpoint directory path.
 2. [RECOMMENDED] **`HF_HOME/nemo_rl`** - Uses the Hugging Face cache directory, if available.
 3. **`~/.cache/huggingface/nemo_rl`** - The default fallback location.
 
-###Configuration Examples###
+### Configuration Examples ###
 
 ```bash
 # Option 1: Set custom checkpoint directory
@@ -69,7 +69,7 @@ export HF_HOME="/shared/nfs/huggingface"
 # Uses ~/.cache/huggingface/nemo_rl
 ```
 
-###Best Practices###
+### Best Practices ###
 
 - **Mount in checkpoint directory**: If you are using Docker, make sure the Megatron checkpoint path is covered by `-v`/`--mount`. Similarly, if you are using SLURM+pyxis, ensure `--container-mounts` includes this path.
 - **Use shared storage**: Ensure the checkpoint directory is accessible from all nodes (e.g., NFS, shared filesystem).
