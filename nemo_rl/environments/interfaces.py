@@ -42,7 +42,7 @@ class EnvironmentReturn(NamedTuple):
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
     terminateds: Tensor
-    info: list[Optional[dict] | None] | list[None]
+    info: list[Optional[dict]]
 
 
 class EnvironmentInterface(abc.ABC):
