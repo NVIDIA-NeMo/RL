@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import glob
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Type, Union, get_type_hints
@@ -142,7 +143,10 @@ def test_all_config_files_have_required_keys():
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
-    configs_dir = Path("/opt/nemo-rl/examples/configs")
+    absolute_path = os.path.abspath(__file__)
+    configs_dir = Path(
+        os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
+    )
 
     # Get all YAML config files
     config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
