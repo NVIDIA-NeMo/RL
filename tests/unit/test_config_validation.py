@@ -142,7 +142,7 @@ def test_all_config_files_have_required_keys():
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
-    configs_dir = Path("examples/configs")
+    configs_dir = Path("/opt/nemo-rl/examples/configs")
 
     # Get all YAML config files
     config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
