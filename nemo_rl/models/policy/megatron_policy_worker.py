@@ -20,6 +20,7 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, List, Optional, Tuple, TypeVar
+import numpy as np
 
 import ray
 import torch
@@ -107,6 +108,8 @@ from nemo_rl.models.megatron.converters.common import (
 from nemo_rl.models.megatron.refit_utils import (
     gather_params,
     get_tp_dim,
+    get_param_info,
+    bucketize_params,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -1770,3 +1773,98 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    @torch.no_grad()
+    def prepare_weight_update_metadata(
+        self, 
+        refit_buffer_size_gb=None, 
+    ):
+        """
+        Prepare the weight update metadata for the model.
+        This function prepares the following information:
+        1. how many buckets are needed. The bucket size is refit_buffer_size_gb or 10% of free memory if refit_buffer_size_gb is not provided.
+        2. the size of ipc buffers for each dtype.
+        3. for each bucket, a list of (key, dtype, offset, size) of tensors in this bucket.
+        """
+
+
+        # set model to no grad mode
+        self.model.eval()
+
+        # Step 1: get parameter info
+        if not hasattr(self, "cached_param_info"):
+            self.cached_param_info = {}
+        param_info, need_update_cache = get_param_info(self.model, self.dtype, self.cached_param_info)
+
+        if need_update_cache:
+            self.cached_param_info = param_info
+
+            # Step 2: bucketizing
+            buckets_of_param_info, num_buckets, dtype_to_max_bucket_size = bucketize_params(param_info, refit_buffer_size_gb)
+
+            # Step 3 and 4: collect weight update metadata for params
+            weight_update_metadata_for_all_buckets = []
+            for bucket in buckets_of_param_info:
+                weight_update_metadata_for_this_bucket = []
+                offset_in_buffer = defaultdict(lambda: 0)
+                for (name, pp_local_rank_id, shape, param_dtype) in bucket:
+                    offset = offset_in_buffer[param_dtype]
+                    numel = np.prod(shape)
+                    offset_in_buffer[param_dtype] += numel
+                    weight_update_metadata_for_this_bucket.append(
+                        (
+                            name,
+                            pp_local_rank_id,
+                            shape,
+                            param_dtype,
+                            offset,
+                            numel,
+                        )
+                    )
+            self.num_buckets = num_buckets
+            self.dtype_to_max_bucket_size = dtype_to_max_bucket_size
+            self.weight_update_metadata_for_all_buckets = weight_update_metadata_for_all_buckets
+
+            return {
+                'device_id': self.report_device_id(),
+                'num_buckets': num_buckets,
+                'dtype_to_max_bucket_size': dtype_to_max_bucket_size,
+                'weight_update_metadata_for_all_buckets': weight_update_metadata_for_all_buckets,
+                'need_update_cache': need_update_cache,
+            }
+        else:
+            return {
+                'device_id': self.report_device_id(),
+                'num_buckets': None,
+                'dtype_to_max_bucket_size': None,
+                'weight_update_metadata_for_all_buckets': None,
+                'need_update_cache': need_update_cache,
+            }
+
+    def create_refit_buffers_and_associate_param_with_buffer(self):
+        """
+        Create refit buffers for the model.
+        """
+        # step 1: create torch tensors for ipc
+        self._held_refit_buffers = {}
+        for key, size in self.dtype_to_max_bucket_size.items():
+            self._held_refit_buffers[key] = torch.empty(size, dtype=key, device=torch.cuda.current_device())
+        
+
+        # step 2: associate each param with a buffer
+        self._key_to_list_of_gather_dest = {}
+        for bucket in self.weight_update_metadata_for_all_buckets:
+            for (name, pp_local_rank_id, shape, param_dtype, offset, numel) in bucket:
+                full_param = self._held_refit_buffers[param_dtype][offset:offset+numel]
+                self._key_to_list_of_gather_dest[name] = full_param
+        
+        # step 3: prepare ipc handles
+        device_uuid = self.report_device_id()
+        from torch.multiprocessing.reductions import reduce_tensor
+        ipc_handles = {k: reduce_tensor(v) for k, v in self._held_refit_buffers.items()}
+        return {device_uuid: ipc_handles}
+
+    def fill_refit_bucket(self, bucket_id):
+        """Fill the refit bucket."""
+        pass
+    
