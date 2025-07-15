@@ -6,7 +6,6 @@
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
 #SBATCH --dependency=singleton
-#SBATCH --gres=gpu:8
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -24,6 +23,26 @@
 
 
 set -eoux pipefail
+
+########################################################
+# Function to detect if SLURM cluster uses GRES
+########################################################
+maybe_gres_arg() {
+  # Check if any nodes in the partition have GRES configured
+  # Assumes a homogeneous allocation (not a heterogeneous job)
+  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8.
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d: -f2) ]]; then
+      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+      exit 1
+    fi
+    echo "--gres=gpu:${GPUS_PER_NODE}"
+    return
+  fi
+  
+  # No GRES support detected
+  echo ""
+}
 
 ########################################################
 # User defined variables
@@ -74,7 +93,18 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
-COMMON_SRUN_ARGS=""
+# Number of GPUs per worker node
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+# Detect GRES support and set GRES_ARG
+GRES_ARG=$(maybe_gres_arg)
+if [[ -n "$GRES_ARG" ]]; then
+  echo "[INFO] GRES support detected. Using: $GRES_ARG"
+else
+  echo "[INFO] No GRES support detected. Running without --gres flag."
+fi
+
+COMMON_SRUN_ARGS="$GRES_ARG"
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
@@ -83,10 +113,6 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # TODO: delete these (just for debugging)
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
-COMMON_SRUN_ARGS+=" --gres=gpu:8"
-
-# Number of GPUs per worker node
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 # Number of CPUs per worker node
 CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 
@@ -323,7 +349,7 @@ else
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  srun --no-container-mount-home --gres=gpu:8 -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
   # and use nodes_array[1] through nodes_array[N-1]
@@ -332,7 +358,7 @@ else
     exit 1
   fi
   nodes_array=($nodes)
-  srun --no-container-mount-home --gres=gpu:8 -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh

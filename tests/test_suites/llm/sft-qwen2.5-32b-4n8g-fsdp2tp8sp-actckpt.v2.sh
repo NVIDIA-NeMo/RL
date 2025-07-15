@@ -3,7 +3,7 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # TODO: this config can crash on OOM
-# https://github.com/NVIDIA/NeMo-RL/issues/263
+# https://github.com/NVIDIA-NeMo/RL/issues/263
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4

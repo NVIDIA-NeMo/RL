@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 from typing import TypedDict
 
@@ -201,6 +202,25 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         env: Environment that scores responses.
         master_config: Configuration settings.
     """
+    # Check if async engine is enabled and run appropriate version
+    if master_config["generation"]["vllm_cfg"]["async_engine"]:
+        asyncio.run(
+            _run_env_eval_impl(
+                vllm_generation, dataloader, env, master_config, use_async=True
+            )
+        )
+    else:
+        asyncio.run(
+            _run_env_eval_impl(
+                vllm_generation, dataloader, env, master_config, use_async=False
+            )
+        )
+
+
+async def _run_env_eval_impl(
+    vllm_generation, dataloader, env, master_config, use_async=False
+):
+    """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
     generation_config = master_config["generation"]
     eval_config = master_config["eval"]
@@ -224,7 +244,7 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
-        outputs = vllm_generation.generate_text(inputs)["texts"]
+        outputs = await _generate_texts(vllm_generation, inputs, use_async)
 
         # append to message_log
         for idx, output in enumerate(outputs):
@@ -253,17 +273,54 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
     vllm_generation.shutdown()
 
     # Print results
+    _print_results(
+        master_config,
+        generation_config,
+        score,
+        len(dataloader.dataset),
+        metric,
+        pass_k_value,
+        num_tests_per_prompt,
+    )
+
+
+async def _generate_texts(vllm_generation, inputs, use_async):
+    """Generate texts using either sync or async method."""
+    if use_async:
+        # Use async generation - collect all results
+        results = []
+        async for idx, result in vllm_generation.generate_text_async(inputs):
+            results.append((idx, result["texts"][0]))
+
+        # Sort by index to maintain order
+        results.sort(key=lambda x: x[0])
+        return [text for _, text in results]
+    else:
+        # Use sync generation
+        return vllm_generation.generate_text(inputs)["texts"]
+
+
+def _print_results(
+    master_config,
+    generation_config,
+    score,
+    dataset_size,
+    metric,
+    pass_k_value,
+    num_tests_per_prompt,
+):
+    """Print evaluation results."""
     dataset_name = os.path.basename(master_config["data"]["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
     max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]
     top_k = generation_config["top_k"]
-    average_score = score / len(dataloader.dataset)
+    average_score = score / dataset_size
 
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
     print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
     print(f"{metric=} {pass_k_value=} {num_tests_per_prompt=}\n")
-    print(f"score={average_score:.4f} ({score}/{len(dataloader.dataset)})")
+    print(f"score={average_score:.4f} ({score}/{dataset_size})")
     print("=" * 60 + "\n")

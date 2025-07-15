@@ -45,7 +45,7 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    # TODO: OOMs if enabled https://github.com/NVIDIA/NeMo-RL/issues/383
+    # TODO: OOMs if enabled https://github.com/NVIDIA-NeMo/RL/issues/383
     enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
@@ -90,6 +90,7 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: 16384
+      enforce_eager: False
     colocated:
       enabled: true
       resources:

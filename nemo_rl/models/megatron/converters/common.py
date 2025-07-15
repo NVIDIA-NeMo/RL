@@ -29,8 +29,12 @@ from nemo.lightning.io.state import (
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.integrations.accelerate import init_empty_weights
 
+import nemo_rl.models.megatron.converters.deepseek as deepseek_converter
 import nemo_rl.models.megatron.converters.llama as llama_converter
 import nemo_rl.models.megatron.converters.qwen2 as qwen2_converter
+import nemo_rl.models.megatron.converters.qwen3 as qwen3_converter
+
+_GROUP_TO_RANKS_CACHE = {}
 
 
 def get_local_layer_num(s):
@@ -42,6 +46,15 @@ def get_local_layer_num(s):
             if segments[i + 1].isdigit():
                 number = int(segments[i + 1])
                 break
+    return number
+
+
+def get_local_expert_num(s):
+    """Assumes experts have 'experts.' in their name. Expert num succeeds '.weight'."""
+    segments = s.split(".")
+    if "experts" not in segments or segments[-1] == "_extra_state":
+        return None
+    number = int(segments[-1].strip("weight"))
     return number
 
 
@@ -79,6 +92,23 @@ def get_global_layer_num(s, cfg):
     return global_offset + local_layer_num
 
 
+def get_global_expert_num(s, cfg):
+    """Assumes experts have 'experts.' in their name. Expert num succeeds '.weight'.
+
+    Assumes expert model parallel size is set.
+    In the state dict, the expert number is the local expert number (expert local).
+    This function converts the local expert number to the global expert number.
+    """
+    local_expert_num = get_local_expert_num(s)
+    global_expert_num = (
+        parallel_state.get_expert_model_parallel_rank()
+        * cfg.num_moe_experts
+        // parallel_state.get_expert_model_parallel_world_size()
+        + local_expert_num
+    )
+    return global_expert_num
+
+
 def get_global_key_from_local_key(local_key, model_cfg):
     local_layer = get_local_layer_num(local_key)
     if local_layer is not None:
@@ -87,6 +117,11 @@ def get_global_key_from_local_key(local_key, model_cfg):
         global_key = re.sub(r"(?<=layers\.)\d+", str(global_layer), local_key, count=1)
     else:
         global_key = local_key
+    local_expert = get_local_expert_num(global_key)
+    if local_expert is not None:
+        global_expert = get_global_expert_num(global_key, model_cfg)
+        # Replace the last occurrence of the digits after "weight" with the global expert number.
+        global_key = re.sub(r"(?<=weight)\d+", str(global_expert), global_key)
     return global_key
 
 
@@ -97,9 +132,22 @@ def split_fc1_tp(ctx: TransformCTX, linear_fc1: torch.Tensor):
     # [ gate_tp1 ] --/ [  up_tp0  ] --/ (split  up)
     # [  up_tp1  ]     [  up_tp1  ]
     megatron_config = ctx.source.config
-    # TODO: handle expert_tensor_parallel_size
     tp = megatron_config.tensor_model_parallel_size
     linear_fc1 = einops.rearrange(linear_fc1, "(t c d) a1 ->  c (t d) a1", c=2, t=tp)
+    mlp_gate_proj_weight = linear_fc1[0]
+    mlp_up_proj_weight = linear_fc1[1]
+    return mlp_gate_proj_weight, mlp_up_proj_weight
+
+
+def split_fc1_etp(ctx: TransformCTX, linear_fc1: torch.Tensor):
+    # gate proj and up proj are mixed right now, and we need to reshape them
+    # [ gate_tp0 ]     [ gate_tp0 ]
+    # [  up_tp0  ] --\ [ gate_tp1 ] --\ (split gate)
+    # [ gate_tp1 ] --/ [  up_tp0  ] --/ (split  up)
+    # [  up_tp1  ]     [  up_tp1  ]
+    megatron_config = ctx.source.config
+    etp = megatron_config.expert_tensor_parallel_size
+    linear_fc1 = einops.rearrange(linear_fc1, "(t c d) a1 ->  c (t d) a1", c=2, t=etp)
     mlp_gate_proj_weight = linear_fc1[0]
     mlp_up_proj_weight = linear_fc1[1]
     return mlp_gate_proj_weight, mlp_up_proj_weight
@@ -177,8 +225,13 @@ def update_transforms_for_nemorl(export_transforms):
     # In place update
     for transform in export_transforms:
         if transform.transform.__name__ == "split_fc1":
-            # Need to modify this transform to take into account the TP size
-            transform.transform = split_fc1_tp
+            if (
+                "experts" in transform.source_key
+                and "shared_experts" not in transform.source_key
+            ):
+                transform.transform = split_fc1_etp
+            else:
+                transform.transform = split_fc1_tp
         elif transform.transform.__name__ == "split_qkv":
             # This transform previously moved qkv weights to cpu
             transform.transform = split_qkv_gpu
@@ -211,24 +264,45 @@ class MegatronToHFConverter:
         )
         pp_gathered_global_keys = list({k for l in pp_gathered_global_keys for k in l})  # type: ignore
 
-        global_keys = pp_gathered_global_keys
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_gathered_global_keys = [None] * ep_world_size
+        torch.distributed.all_gather_object(
+            ep_gathered_global_keys, pp_gathered_global_keys, group=ep_group
+        )
+        ep_gathered_global_keys = list({k for l in ep_gathered_global_keys for k in l})
+
+        global_keys = ep_gathered_global_keys
         global_keys_map = {k: None for k in global_keys}
 
-        if "qwen" in hf_model_name.lower():
+        if config.model_type == "qwen2":
             self.export_mapping = qwen2_converter.get_export_mapping(megatron_model)
             self.export_transforms = qwen2_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )
-        elif "llama" in hf_model_name.lower():
+        elif config.model_type in ("qwen3", "qwen3_moe"):
+            self.export_mapping = qwen3_converter.get_export_mapping(config)
+            self.export_transforms = qwen3_converter.get_export_transforms(config)
+            self.get_source_fn = lambda source_state_dict, _: _ModelState(
+                source_state_dict
+            )
+        elif config.model_type == "llama":
             self.export_mapping = llama_converter.get_export_mapping()
             self.export_transforms = llama_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )
+        elif config.model_type in ("deepseek_v2", "deepseek_v3"):
+            self.export_mapping = deepseek_converter.get_export_mapping(
+                source=global_keys_map,
+                source_config=megatron_model.config.__dict__,
+            )
+            self.export_transforms = deepseek_converter.get_export_transforms()
+            self.get_source_fn = deepseek_converter.get_source_fn
         else:
             raise ValueError(
-                f"No converter mapping and transforms found for {hf_model_name}"
+                f"No converter mapping and transforms found for {hf_model_name} with model_type {config.model_type}"
             )
 
         self.export_transforms = update_transforms_for_nemorl(self.export_transforms)
