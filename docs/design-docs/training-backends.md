@@ -45,7 +45,7 @@ To enable DTensor (FSDP2) training:
 
 For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes/llm) folder. This directory contains ready-to-use configurations for various supported combinations.
 
-## Configuration
+## Megatron Configuration
 
 ### Megatron Configuration
 
