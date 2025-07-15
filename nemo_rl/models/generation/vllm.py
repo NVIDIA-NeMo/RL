@@ -347,6 +347,16 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
+        # will be initialized in post_init
+        # used in update_weights_from_ipc_handles
+        self.vllm_device_ids = None
+
+    def post_init(self):
+        self.vllm_device_ids = self.report_device_id()
+
+    async def post_init_async(self):
+        self.vllm_device_ids = await self.report_device_id_async()
+
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
     ) -> None:
@@ -1030,9 +1040,37 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
-            )
+            if self.tensor_parallel_size == 1:
+                # UniProcExecutor
+                assert len(self.vllm_device_ids) == 1
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_local_ipc_handles",
+                    args=(ipc_handles[self.vllm_device_ids[0]],),
+                )
+            else:
+                """
+                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
+                leading to unnecessary network serialization overhead and potential performance degradation.
+
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_global_ipc_handles", args=(ipc_handles,)
+                )
+                """
+                ray_worker_outputs = []
+                # MultiProcExecutor
+                for worker, device_id in zip(
+                    self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
+                ):
+                    ray_worker_outputs.append(
+                        worker.execute_method.remote(
+                            "update_weights_from_local_ipc_handles",
+                            ipc_handles[device_id],
+                        )
+                    )
+
+                # Gather the results
+                result_or_coro = ray.get(ray_worker_outputs)
+
             worker_result = result_or_coro[0]
 
             if not worker_result:
@@ -1069,8 +1107,9 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles_async can only be used with async_engine=True. Use update_weights_from_ipc_handles instead."
                 )
 
+            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
+                "update_weights_from_global_ipc_handles", args=(ipc_handles,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1356,6 +1395,10 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
+        # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
+        # This is necessary for async engine to work
+        self._post_init()
+
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
 
@@ -1487,6 +1530,19 @@ class VllmGeneration(GenerationInterface):
             "report_device_id_async"
             if self.cfg["vllm_cfg"]["async_engine"]
             else "report_device_id"
+        )
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results
+
+    def _post_init(self):
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
