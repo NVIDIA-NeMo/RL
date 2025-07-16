@@ -857,7 +857,6 @@ class MegatronPolicyWorker:
                     num_zeros_in_grad
                 )
 
-                # Update learning rate.
                 if update_successful:
                     skipped_iter = 0
                 else:
