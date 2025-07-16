@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import os
 from typing import Any
 
 from datasets import Dataset, load_dataset
@@ -36,42 +36,45 @@ def format_math(data: dict[str, str | float | int]) -> dict[str, list[Any] | str
         "task_name": "math",
     }
 
-
-def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
-    """Load and split the DeepScaler dataset into train and test sets."""
-    # Load the original dataset for training
-    train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
-
-    # Load hendrydong/aime24 dataset for validation
-    val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
-
-    # Shuffle the training dataset with the specified seed
-    train_ds = train_ds.shuffle(seed=seed)
-
-    # Format the examples, removing original columns
-    train_formatted = train_ds.map(format_math, remove_columns=train_ds.column_names)
-    val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
-
-    # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
-    val_repeated = []
-    for _ in range(16):
-        val_repeated.extend(val_formatted)
-    val_formatted = val_formatted.from_list(val_repeated)
-
-    return {
-        "train": train_formatted,
-        "validation": val_formatted,
-    }
-
-
 class DeepScalerDataset:
-    def __init__(self, seed: int = 42) -> None:
+    def __init__(self, seed: int = 42, repo_id: str = "agentica-org/DeepScaleR-Preview-Dataset") -> None:
         """Initialize the DeepScaler dataset with train/test split.
 
         Args:
             seed: Random seed for reproducible splitting
         """
-        self.formatted_ds = prepare_deepscaler_dataset(seed=seed)
+        # Check if repo_id is a local directory
+        if os.path.isdir(repo_id):
+            # Load the original dataset for training from local directory
+            train_ds = load_dataset(repo_id, split="train")
+            
+            # Load aime_2024 from the same directory
+            aime_path = os.path.join(os.path.dirname(repo_id), "aime_2024")
+            val_ds = load_dataset(aime_path, split="train")
+        else:
+            # Load the original dataset for training from Hugging Face Hub
+            train_ds = load_dataset(repo_id, split="train")
+            
+            # Load hendrydong/aime24 dataset for validation from Hugging Face Hub
+            val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+
+        # Shuffle the training dataset with the specified seed
+        train_ds = train_ds.shuffle(seed=seed)
+
+        # Format the examples, removing original columns
+        train_formatted = train_ds.map(format_math, remove_columns=train_ds.column_names)
+        val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
+
+        # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
+        val_repeated = []
+        for _ in range(16):
+            val_repeated.extend(val_formatted)
+        val_formatted = val_formatted.from_list(val_repeated)
+
+        self.formatted_ds = {
+            "train": train_formatted,
+            "validation": val_formatted,
+        }
 
         self.task_spec = TaskDataSpec(
             task_name="DeepScaler",
