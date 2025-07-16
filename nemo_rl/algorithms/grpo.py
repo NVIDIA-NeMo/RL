@@ -347,6 +347,10 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
+    # prepare refit info
+    state_dict_info = policy.prepare_refit_info()
+    policy_generation.prepare_refit_info(state_dict_info)
+
     loss_fn = ClippedPGLossFn(loss_config)
 
     print("\n" + "=" * 60)
@@ -422,17 +426,15 @@ def refit_policy_generation(
         # do update
         for keys in grouped_param_keys:
             ipc_handles = policy.get_weights_ipc_handles(keys)
-            update_success = policy_generation.update_weights(ipc_handles)
+            update_success = policy_generation.update_weights_from_ipc_handles(
+                ipc_handles
+            )
             if not update_success:
                 break
     else:
-        # prepare info for update weights
-        state_dict_info = policy.prepare_info_for_collective()
         # update weights through nccl
         futures_train = policy.broadcast_weights_for_collective()
-        futures_inference = policy_generation.update_weights_from_collective(
-            state_dict_info
-        )
+        futures_inference = policy_generation.update_weights_from_collective()
         # wait for all futures to complete
         ray.get(futures_train)
         results = ray.get(futures_inference)

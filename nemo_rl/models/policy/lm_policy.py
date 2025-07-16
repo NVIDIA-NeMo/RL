@@ -405,6 +405,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Placeholder implementation
         pass
 
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare the info for refit.
+
+        Returns:
+            dict: A dictionary containing the info for refit.
+        """
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
+        results = ray.get(futures)
+        # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
     ) -> list[list[str]]:
@@ -468,19 +479,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             all_handles.update(handle)
 
         return all_handles
-
-    def prepare_info_for_collective(self) -> dict[str, Any]:
-        """Prepare the info for collective communication.
-
-        Returns:
-            dict: A dictionary containing the info for collective communication.
-        """
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_info_for_collective"
-        )
-        results = ray.get(futures)
-        # Only get the first worker's info since all workers will have the same result
-        return results[0]
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
