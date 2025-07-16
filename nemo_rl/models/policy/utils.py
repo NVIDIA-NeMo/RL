@@ -185,3 +185,29 @@ def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]
     }
 
     return runtime_env
+
+
+def get_megatron_checkpoint_dir() -> str:
+    """Gets the default megatron checkpoint directory for initial HF -> Mcore conversion.
+
+    Megatron initial checkpoint should be saved to a path available on all nodes. The directory used will take this order of precendence:
+    1. $NRL_MEGATRON_CHECKPOINT_DIR (if set)
+    2. $HF_HOME/nemo_rl (if HF_HOME is set)
+    3. ~/.cache/huggingface/nemo_rl
+
+    HF_HOME is preferred since many users will also have that path mounted and it means one less directory
+    to mount into your runtime environment.
+    """
+    nrl_checkpoint_dir = os.environ.get("NRL_MEGATRON_CHECKPOINT_DIR")
+    if nrl_checkpoint_dir is not None and nrl_checkpoint_dir.strip():
+        checkpoint_dir = nrl_checkpoint_dir
+    else:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is not None and hf_home.strip():
+            checkpoint_dir = os.path.join(hf_home, "nemo_rl")
+        else:
+            checkpoint_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "huggingface", "nemo_rl"
+            )
+    print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
+    return checkpoint_dir
