@@ -92,7 +92,7 @@ def _parallelize_gemma3(
     Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
     """
     if isinstance(model, Gemma3ForConditionalGeneration):
-        model_prefix = "language_model"
+        model_prefix = "model.language_model"
     else:
         model_prefix = "model"
 
@@ -127,7 +127,7 @@ def _parallelize_gemma3(
         ),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
-        f"{model_prefix}.lm_head": PrepareModuleInput(
+        "lm_head": PrepareModuleInput(
             input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
             use_local_output=True,
