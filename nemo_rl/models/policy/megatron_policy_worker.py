@@ -1338,6 +1338,13 @@ class MegatronPolicyWorker:
 
         return refit_param_info_mcore, total_available_bytes
 
+    def get_handle_from_tensor(self, tensor: torch.Tensor) -> tuple[str, Any]:
+        """Get IPC handle from a tensor."""
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        # skip serializing the function for better refit performance
+        return reduce_tensor(tensor.detach())[1:]
+
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
     def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
@@ -1364,7 +1371,6 @@ class MegatronPolicyWorker:
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
-        from torch.multiprocessing.reductions import reduce_tensor
 
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
@@ -1424,7 +1430,7 @@ class MegatronPolicyWorker:
 
             # Create IPC handles for consolidated tensors
             all_handles = [
-                (dtype, reduce_tensor(tensor.detach()))
+                (dtype, self.get_handle_from_tensor(tensor))
                 for dtype, tensor in packed_tensors.items()
             ]
 
@@ -1435,7 +1441,7 @@ class MegatronPolicyWorker:
         else:
             all_handles = []
             for key, tensor in gathered_hf_params.items():
-                handle = reduce_tensor(tensor.detach())
+                handle = self.get_handle_from_tensor(tensor)
                 all_handles.append((key, handle))
             self._held_gather_buffer = gathered_hf_params
             serialized = (False, all_handles)
