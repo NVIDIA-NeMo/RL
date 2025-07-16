@@ -32,6 +32,7 @@ from transformers.integrations.accelerate import init_empty_weights
 import nemo_rl.models.megatron.converters.deepseek as deepseek_converter
 import nemo_rl.models.megatron.converters.llama as llama_converter
 import nemo_rl.models.megatron.converters.qwen2 as qwen2_converter
+import nemo_rl.models.megatron.converters.qwen3 as qwen3_converter
 
 _GROUP_TO_RANKS_CACHE = {}
 
@@ -277,6 +278,12 @@ class MegatronToHFConverter:
         if config.model_type == "qwen2":
             self.export_mapping = qwen2_converter.get_export_mapping(megatron_model)
             self.export_transforms = qwen2_converter.get_export_transforms(config)
+            self.get_source_fn = lambda source_state_dict, _: _ModelState(
+                source_state_dict
+            )
+        elif config.model_type in ("qwen3", "qwen3_moe"):
+            self.export_mapping = qwen3_converter.get_export_mapping(config)
+            self.export_transforms = qwen3_converter.get_export_transforms(config)
             self.get_source_fn = lambda source_state_dict, _: _ModelState(
                 source_state_dict
             )

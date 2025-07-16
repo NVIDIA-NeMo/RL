@@ -15,10 +15,10 @@ shopt -s globstar
 
 OUTPUT_TAR="release_runs-$(git rev-parse --short HEAD).tar.gz"
 
-TB_EVENTS=$(ls code_snapshots/*/tests/test_suites/**/logs/*/tensorboard/events* || true)
+TB_EVENTS=$(ls code_snapshots/*/tests/test_suites/**/logs/*/tensorboard/**/events* || true)
 
 # Check if the glob expanded to any files
-if [ -z "$TB_EVENTS" ]; then
+if [[ -z "$TB_EVENTS" ]]; then
     echo "Error: No tensorboard event files found matching the pattern."
     exit 1
 elif [[ -f $OUTPUT_TAR ]]; then
@@ -35,17 +35,22 @@ trap "echo 'Cleaning up temporary directory $TMP_DIR'; rm -rf $TMP_DIR" EXIT
 # Loop over all the recipe runs and package them into a tarball
 for tbevent in $TB_EVENTS; do
     exp_name=$(basename -- $(cut -d/ -f2 <<<$tbevent) -logs)
-    # Obfuscate the hostname
+    # Redact the hostname
     # events.out.tfevents.1744822578.<host-name>.780899.0
-    obfuscated_event_path=$(basename $tbevent | awk -F. '{print $1"."$2"."$3"."$4".HOSTNAME."$(NF-1)"."$NF}')
+    redacted_event_path=$(basename $tbevent | awk -F. '{print $1"."$2"."$3"."$4".HOSTNAME."$(NF-1)"."$NF}')
     
     # Create subdirectory for experiment if it doesn't exist
     mkdir -p "$TMP_DIR/$exp_name"
+
+    if [[ -f "$TMP_DIR/$exp_name/$redacted_event_path" ]]; then
+        echo "Error: $redacted_event_path already exists. This is unusual since tensorboard usually suffixes event files with a unique number. Please investigate."
+        exit 1
+    fi
     
-    # Copy the event file with obfuscated name to the experiment subdirectory
-    cp "$tbevent" "$TMP_DIR/$exp_name/$obfuscated_event_path"
+    # Copy the event file with redacted hostname to the experiment subdirectory
+    uv run --with tensorboard --no-project tools/copy_tbevent_maybe_redact.py "$tbevent" "$TMP_DIR/$exp_name/$redacted_event_path"
     
-    echo "[$exp_name] Copied $tbevent to $TMP_DIR/$exp_name/$obfuscated_event_path"
+    echo "[$exp_name] Copied $tbevent to $TMP_DIR/$exp_name/$redacted_event_path"
 done
 
 # Create a tarball of all the processed event files
