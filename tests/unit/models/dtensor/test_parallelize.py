@@ -19,18 +19,31 @@ import pytest
 from torch.distributed.tensor.parallel import parallelize_module, ParallelStyle
 from transformers import AutoModelForCausalLM
 
-from nemo_rl.models.dtensor.parallelize import _parallelize_gemma3
+from nemo_rl.models.dtensor.parallelize import (
+    _parallelize_gemma3,
+    _parallelize_llama,
+    _parallelize_qwen,
+)
 
 
 @pytest.mark.parametrize(
-    "model_name, sequence_parallel",
-    product(
-        ["google/gemma-3-1b-it", "google/gemma-3-4b-it"],
-        [True, False],
-    ),
+    "model_name, parallelize_func, sequence_parallel",
+    [
+        (model_name, parallelize_func, sp)
+        for (model_name, parallelize_func), sp in product(
+            [
+                ("google/gemma-3-1b-it", _parallelize_gemma3),
+                ("google/gemma-3-4b-it", _parallelize_gemma3),
+                # ("Qwen/Qwen2.5-1.5B", _parallelize_qwen), # TODO: qwen2 doesn't have q_norm and k_norm, which will cause this test to fail
+                ("Qwen/Qwen3-0.6B", _parallelize_qwen),
+                ("meta-llama/Llama-3.2-1B-Instruct", _parallelize_llama),
+            ],
+            [True, False],
+        )
+    ],
 )
-def test_parallelize_gemma3_plan_keys(model_name, sequence_parallel):
-    """Tests that the keys in the gemma3 parallelization plan are valid by mocking parallel styles."""
+def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
+    """Tests that the keys in the parallelization plans are valid by mocking parallel styles."""
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
     except (OSError, ValueError) as e:
@@ -46,7 +59,8 @@ def test_parallelize_gemma3_plan_keys(model_name, sequence_parallel):
         else:
             raise
 
-    parallel_plan = _parallelize_gemma3(model, sequence_parallel=sequence_parallel)
+    parallel_plan = parallelize_func(model, sequence_parallel=sequence_parallel)
+
     applied_keys = set()
 
     class MockParallelStyle(ParallelStyle):
