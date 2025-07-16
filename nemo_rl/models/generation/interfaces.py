@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 import ray
 import torch
@@ -122,7 +122,6 @@ class GenerationConfig(TypedDict):
     stop_strings: NotRequired[list[str]]
     pad_token_id: NotRequired[int]
     colocated: NotRequired[ColocationConfig]
-    num_prompts_per_step: NotRequired[int]
 
 
 class GenerationDatumSpec(TypedDict):
@@ -155,7 +154,7 @@ class GenerationDatumSpec(TypedDict):
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
-    stop_strings: Optional[list[str]]
+    stop_strings: NotRequired[list[str]]
     __extra__: Any
 
 
