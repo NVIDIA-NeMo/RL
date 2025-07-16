@@ -44,21 +44,7 @@ from nemo_rl.models.dtensor.parallelize import (
 )
 def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
     """Tests that the keys in the parallelization plans are valid by mocking parallel styles."""
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
-    except (OSError, ValueError) as e:
-        error_str = str(e).lower()
-        if (
-            "gated model" in error_str
-            or "requires you to be logged in" in error_str
-            or "not a valid model identifier" in error_str
-        ):
-            pytest.skip(
-                f"Model {model_name} is gated or unavailable, and requires authentication or access."
-            )
-        else:
-            raise
-
+    model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
     parallel_plan = parallelize_func(model, sequence_parallel=sequence_parallel)
 
     applied_keys = set()
