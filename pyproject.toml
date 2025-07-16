@@ -104,7 +104,7 @@ dev = [
     "ruff==0.9.9",
     "types-PyYAML",
     "types-requests",
-    "pyrefly==0.23.1",
+    "pyrefly==0.24.2",
 ]
 test = [
     "pytest>=7.0.0",

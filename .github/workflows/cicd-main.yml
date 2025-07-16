@@ -131,31 +131,6 @@ jobs:
       - name: Minimize uv cache
         run: uv cache prune --ci
 
-  mypy-check:
-    name: Mypy check
-    needs: [pre-flight]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.7.2"
-          enable-cache: true
-          prune-cache: false
-      # Faster than uv python install since it caches python alongside runner
-      - name: "Set up Python"
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: ".python-version"
-      - name: Check mypy
-        run: |
-          uv venv
-          uv run --group test mypy nemo_rl examples
-      - name: Minimize uv cache
-        run: uv cache prune --ci
-
   sphinx-build:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     name: Sphinx build
@@ -308,8 +283,7 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success' &&
-                  (needs.mypy-check.result == 'success' || true)
+                  needs.tests.result == 'success'
                 )
               )
             }}
