@@ -904,7 +904,6 @@ class MegatronPolicyWorker:
                 losses.append(torch.tensor(mb_losses).sum().item())
 
         if not eval_mode:
-            increment = total_dataset_size.item()
             # take one LR step every rollout batch
             self.scheduler.step(increment=1)
 
