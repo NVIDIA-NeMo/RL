@@ -132,7 +132,6 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
-    learning_rate: float
     logprob_batch_size: int
     generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
