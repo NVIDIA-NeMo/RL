@@ -40,6 +40,13 @@ extensions = [
     "sphinx_copybutton",  # For copy button in code blocks
 ]
 
+
+def foo(int: 4):
+    return
+
+
+foo("qwe")
+
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
