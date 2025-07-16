@@ -99,6 +99,11 @@ class VllmInternalWorkerExtension:
             weights = []
 
             if is_tensor_packed:
+                assert self.state_dict_info is not None, (
+                    "state_dict_info is not prepared. "
+                    "Please call prepare_refit_info when initializing the worker."
+                )
+
                 # Extract packed tensor from IPC handle
                 dtype_to_packed_tensor = {}
                 for dtype, tensor_handle in all_handles:
