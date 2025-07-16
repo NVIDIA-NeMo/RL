@@ -22,15 +22,9 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+from nemo_rl.environments.simulated_user.prompt import starting_user_prompt
 
-PROMPT = (
-    "I will play a game with you. I have a list of integers in mind and can NOT tell you. "
-    "Your goal is to guess the count of UNIQUE numbers in my list. The only 2 things you can do is the following: "
-    "You can either ask me 'what is number k?' to get the number at position k in my list, "
-    "or answer 'there are m unique numbers' whenever you feel you want to make a guess."
-    "Please do not say anything else. You cannot ask me to provide the list of integers."
-)
+OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args():
@@ -42,7 +36,7 @@ def parse_args():
 
 def generate_datum(tokenizer: AutoTokenizer, env_cfg: dict, task_name: str, idx: int, add_system_prompt: bool) -> DatumSpec:
     formatted_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": PROMPT}],
+        [{"role": "user", "content": starting_user_prompt}],
         tokenize=False,
         add_system_prompt=add_system_prompt,
         add_generation_prompt=True,
