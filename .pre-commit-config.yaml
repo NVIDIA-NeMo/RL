@@ -35,3 +35,9 @@ repos:
         files: '.*\/[^\/]*_[^\/]*\.md$'
         exclude: '^\.github/'
         types: [file]
+
+  - repo: https://github.com/facebook/pyrefly
+    rev: main
+    hooks:
+      - id: pyrefly-typecheck
+        files: \.py$
