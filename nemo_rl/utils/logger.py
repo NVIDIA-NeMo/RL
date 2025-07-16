@@ -350,7 +350,7 @@ class RayGpuMonitorLogger:
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
-        self.start_time: float = 0.0
+        self.start_time: float = float("-inf")
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""
