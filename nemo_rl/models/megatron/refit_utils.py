@@ -76,7 +76,7 @@ def get_tp_dim(model, param_name, named_modules_dict):
 
 
 @torch.no_grad()
-def gather_params(model, keys, key_to_global_keys: Dict[str, List[str]]):
+def gather_params(model, keys: list[str], key_to_global_keys: dict[str, list[str]]):
     st = time.perf_counter()
 
     tp_group = parallel_state.get_tensor_model_parallel_group()

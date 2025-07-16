@@ -44,7 +44,9 @@ class VllmInternalWorkerExtension:
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size
         )
-        self.model_update_group = PyNcclCommunicator(pg, device=self.device)
+        self.model_update_group = PyNcclCommunicator(
+            pg, device=self.device
+        )  # pyrefly: ignore[implicitly-defined-attribute]  we're not supposed to define the constructor so ignoring typing issue
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
