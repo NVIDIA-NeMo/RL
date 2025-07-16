@@ -16,7 +16,7 @@ from itertools import product
 from unittest.mock import MagicMock
 
 import pytest
-from torch.distributed.tensor.parallel import parallelize_module, ParallelStyle
+from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from transformers import AutoModelForCausalLM
 
 from nemo_rl.models.dtensor.parallelize import (
