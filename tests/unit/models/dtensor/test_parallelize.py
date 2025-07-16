@@ -44,7 +44,7 @@ from nemo_rl.models.dtensor.parallelize import (
 )
 def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
     """Tests that the keys in the parallelization plans are valid by mocking parallel styles."""
-    model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
     parallel_plan = parallelize_func(model, sequence_parallel=sequence_parallel)
 
     applied_keys = set()
