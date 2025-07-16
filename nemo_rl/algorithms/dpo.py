@@ -53,7 +53,6 @@ def _default_dpo_save_state() -> DPOSaveState:
         "step": 0,
         "total_steps": 0,
         "consumed_samples": 0,
-        "val_loss": 0.0,
     }
 
 

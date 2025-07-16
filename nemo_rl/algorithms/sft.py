@@ -57,7 +57,6 @@ def _default_sft_save_state() -> SFTSaveState:
         "step": 0,
         "total_steps": 0,
         "consumed_samples": 0,
-        "val_loss": 0.0,
     }
 
 
