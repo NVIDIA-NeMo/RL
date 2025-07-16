@@ -487,7 +487,10 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_clu
     from torch.distributed.tensor.parallel import ColwiseParallel
     from torch.distributed.tensor.placement_types import Replicate
 
-    custom_parallel_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
+    custom_parallel_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+        "model.embed_tokens": ColwiseParallel(output_layouts=Replicate()),
+    }
     config = create_test_config(
         model_name=TEST_ASSETS.TINY_LLAMA_TIED_MODEL_PATH,
         tp=2,
@@ -510,11 +513,11 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_clu
     state_dict = ray.get(policy.worker_group.workers[0].return_state_dict.remote())
     total_shape = state_dict["lm_head.weight"].shape
     sharded_shape = state_dict["lm_head.weight"].to_local().shape
-    assert total_shape[0] == sharded_shape[0] * 2, (
-        "lm_head.weight should be sharded across 2 GPUs"
+    assert total_shape[0] == sharded_shape[0], (
+        "lm_head.weight should have the same number of rows"
     )
-    assert total_shape[1] == sharded_shape[1], (
-        "lm_head.weight should have the same number of columns"
+    assert total_shape[1] == sharded_shape[1] * 2, (
+        "lm_head.weight should be sharded across 2 GPUs"
     )
 
     # Clean up
