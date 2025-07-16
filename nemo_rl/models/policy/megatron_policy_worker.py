@@ -27,6 +27,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.custom_fsdp import (
     FullyShardedDataParallel as custom_FSDP,
 )
+from megatron.core.transformer.module import Float16Module
 from megatron.core.inference.engines import (
     StaticInferenceEngine,
 )
@@ -179,11 +180,25 @@ def setup_megatron_model(
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
         def freeze_moe_router(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
             for layer in model_module.decoder.layers:
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.weight.requires_grad = False
 
+        # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
+        # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
+        def re_enable_float32_expert_bias(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
+            for layer in model_module.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router._maintain_float32_expert_bias()
+
         model_post_init_fns.append(freeze_moe_router)
+        model_post_init_fns.append(re_enable_float32_expert_bias)
 
     # Model, optimizer, and learning rate.
     model = get_model_from_config(
