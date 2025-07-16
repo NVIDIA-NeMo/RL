@@ -61,7 +61,6 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     sliding_window_overwrite,
 )
-from nemo_rl.utils.flops_tracker import FLOPTracker
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -181,12 +180,6 @@ class DTensorPolicyWorker:
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
         )
-
-        try:
-            self.flops_tracker = FLOPTracker.from_config(model_name, model_config)
-        except ValueError as e:
-            self.flops_tracker = None
-            print(f"FLOPS tracker not supported for model {model_name}: {e}")
 
         full_state_dict = None
         if self.rank == 0:
@@ -477,9 +470,6 @@ class DTensorPolicyWorker:
             # Ensure model is in training mode
             self.model.train()
 
-        if self.flops_tracker:
-            self.flops_tracker.reset()
-
         with ctx:
             # Get data from batch and move to device
             data.to("cuda")
@@ -534,10 +524,6 @@ class DTensorPolicyWorker:
                     input_ids = mb.get("input_ids").cuda()
                     input_lengths = mb.get("input_lengths")
                     batch_size, seq_len = input_ids.shape
-
-                    if self.flops_tracker:
-                        for l in input_lengths.tolist():
-                            self.flops_tracker.track(1, l)
 
                     attention_mask = torch.zeros(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
@@ -726,9 +712,6 @@ class DTensorPolicyWorker:
                 "gpu_name": torch.cuda.get_device_name(),
                 "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
-                "total_flops": self.flops_tracker.total_flops
-                if self.flops_tracker
-                else None,
             }
 
             return metrics

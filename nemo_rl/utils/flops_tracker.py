@@ -16,11 +16,27 @@ from dataclasses import asdict
 from typing import Callable, Optional
 
 import torch
+from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
+from nemo_rl.models.policy.utils import sliding_window_overwrite
 from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2
+
+
+def get_default_hf_config(model_name: str) -> PretrainedConfig:
+    """Get the default Hugging Face config for a model.
+
+    Both the DTensor and MCore paths use the same default config, we initialize the model config
+    here to allow computation of theoretical flops which is agnostic to the backend.
+    """
+    return AutoConfig.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+        **sliding_window_overwrite(model_name),
+    )
 
 
 def convert_config_to_flops_config(
@@ -99,6 +115,11 @@ class FLOPTracker:
         # Compute and accumulate flops
         flops = self.flops_formula(FLOPSConfig(**config_dict))
         self.total_flops += flops
+
+    def track_batch(self, sequence_lengths: list[int]):
+        """Track the flops for a batch of sequences."""
+        for seq_len in sequence_lengths:
+            self.track(n_samples=1, padded_seq_len=seq_len)
 
     def reset(self):
         self.total_flops = 0

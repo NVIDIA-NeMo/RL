@@ -515,9 +515,9 @@ def dpo_train(
                     / timing_metrics["policy_training"]
                     / 1e12
                 )
-                num_gpus = len(train_results["rank_flops"])
+                num_ranks = train_results["num_ranks"]
                 print(
-                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_gpus:.2f} TFLOPS per rank)"
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
                 )
                 if "theoretical_flops" in train_results:
                     theoretical_flops = train_results["theoretical_flops"]
