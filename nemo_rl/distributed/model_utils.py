@@ -103,6 +103,9 @@ class DistributedLogprob(torch.autograd.Function):
         ctx: Any,
         *grad_outputs: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+        grad_output = grad_outputs[0]
+        softmax, target_mask, masked_target = ctx.saved_tensors
+
         if softmax.ndim == 3:
             B, S, V = softmax.shape
 
