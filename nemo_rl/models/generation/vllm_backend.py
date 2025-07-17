@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from collections import defaultdict
 from typing import Any, Optional
 
 import torch
@@ -92,7 +93,7 @@ class VllmInternalWorkerExtension:
         try:
             is_tensor_packed = local_device_ipc_handles[0]
             if is_tensor_packed:
-                _, all_handles, tensor_metadata = local_device_ipc_handles
+                _, all_handles, list_keys = local_device_ipc_handles
             else:
                 _, name_and_handle_list = local_device_ipc_handles
 
@@ -115,23 +116,19 @@ class VllmInternalWorkerExtension:
                     tensor = func(*list_args)
                     dtype_to_packed_tensor[dtype] = tensor
 
-                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
-                # using extra memory.
-                for key, metadata in tensor_metadata.items():
-                    # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                    if isinstance(metadata, tuple):
-                        # use dtype of current step
-                        offset, dtype = metadata
-                        shape, _, size = self.state_dict_info[key]
-                        # update record
-                        self.state_dict_info[key] = (shape, dtype, size)
-                    else:
-                        offset = metadata
-                        shape, dtype, size = self.state_dict_info[key]
-                    tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
-                        *shape
-                    )
-                    weights.append((key, tensor))
+                # Unpack tensor to weights using pre-calculated offsets
+                weights = []
+                dtype_to_offset = defaultdict(lambda: 0)
+                for key in list_keys:
+                    shape, dtype, size = self.state_dict_info[key]
+                    weights.append((key, dtype_to_packed_tensor[dtype][dtype_to_offset[dtype]:dtype_to_offset[dtype]+size].view(*shape)))
+                    dtype_to_offset[dtype] += size
+
+                expected_sizes = {dtype: tensor.numel() for dtype, tensor in dtype_to_packed_tensor.items()}
+                assert dtype_to_offset == expected_sizes, (
+                    f"Packed tensor size mismatch: expected sizes from keys list {expected_sizes} != actual packed tensor sizes {dtype_to_offset}. "
+                    f"This indicates the keys list order doesn't match the order used when packing tensors."
+                )
             else:
                 # Process each handle to get the tensor
                 for name, handle in name_and_handle_list:

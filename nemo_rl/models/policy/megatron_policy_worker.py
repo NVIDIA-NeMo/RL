@@ -1385,28 +1385,9 @@ class MegatronPolicyWorker:
             # Pack tensors in gathered_hf_params into consolidated tensors by dtype
             # First calculate total size needed for each dtype
             type_to_total_size = defaultdict(lambda: 0)
-            tensor_metadata = dict()
 
             # Record offset of the tensor
             for key, tensor in gathered_hf_params.items():
-                # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                if tensor.dtype == self.refit_param_info_hf[key][1]:
-                    tensor_metadata[key] = type_to_total_size[tensor.dtype]
-                else:
-                    assert False, (
-                        f"{key} dtype mismatch: {tensor.dtype} vs {self.refit_param_info_hf[key][1]}"
-                    )
-                    # also send dtype if it changes
-                    tensor_metadata[key] = (
-                        type_to_total_size[tensor.dtype],
-                        tensor.dtype,
-                    )
-                    # update record
-                    self.refit_param_info_hf[key] = (
-                        tensor.shape,
-                        tensor.dtype,
-                        tensor.numel(),
-                    )
                 type_to_total_size[tensor.dtype] += tensor.numel()
 
             # Allocate consolidated tensors for each dtype
@@ -1420,16 +1401,15 @@ class MegatronPolicyWorker:
                 for dtype, total_size in type_to_total_size.items()
             }
 
+            dtype_to_offset = defaultdict(lambda: 0)
             # Copy tensors into consolidated buffers
             for key, tensor in gathered_hf_params.items():
-                offset = tensor_metadata[key]
-                if isinstance(offset, tuple):
-                    offset, _ = offset
                 dtype = tensor.dtype
                 size = tensor.numel()
-                packed_tensors[dtype][offset : offset + size].copy_(
-                    tensor.detach().view(-1)
-                )
+                packed_tensors[dtype][
+                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                ].copy_(tensor.detach().view(-1))
+                dtype_to_offset[dtype] += size
 
             # Create IPC handles for consolidated tensors
             all_handles = [
@@ -1440,7 +1420,11 @@ class MegatronPolicyWorker:
             # Store reference to prevent garbage collection
             self._held_gather_buffer = packed_tensors
 
-            serialized = (pack_tensor_for_ipc, all_handles, tensor_metadata)
+            serialized = (
+                pack_tensor_for_ipc,
+                all_handles,
+                tuple(gathered_hf_params.keys()),
+            )
         else:
             all_handles = []
             for key, tensor in gathered_hf_params.items():
