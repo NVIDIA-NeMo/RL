@@ -143,6 +143,7 @@ class PolicyConfig(TypedDict):
     max_grad_norm: NotRequired[Union[float, int]]
     fsdp_offload_enabled: bool
     activation_checkpointing_enabled: bool
+    drop_last_validation: NotRequired[bool]
     refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig] = None
     scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (

@@ -150,7 +150,7 @@ def setup(
         batch_size=sft_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=rl_collate_fn,
-        drop_last=True,
+        drop_last=policy_config.get("drop_last_validation", False),
     )
 
     # ==========================
