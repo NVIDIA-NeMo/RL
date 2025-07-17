@@ -621,8 +621,10 @@ def get_logprobs_from_vocab_parallel_logits(
     Args:
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
-        input_ids (torch.Tensor): Input token IDs for which to compute log probabilities,
+        input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
             with shape [batch_size, seq_len].
+        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
+            with shape [sequence_length].
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.

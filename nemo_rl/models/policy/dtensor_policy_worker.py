@@ -14,11 +14,11 @@
 
 import contextlib
 import gc
+import itertools
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
-import itertools
 
 import ray
 import torch
@@ -233,6 +233,10 @@ class DTensorPolicyWorker:
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        if cp_size > 1 and self.enable_seq_packing:
+            raise ValueError(
+                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
         dp_size = world_size // tp_size // cp_size
         assert world_size == dp_size * tp_size * cp_size, (
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
@@ -543,20 +547,30 @@ class DTensorPolicyWorker:
                     mb_iterator = (
                         batch.make_microbatch_iterator_for_packable_sequences()
                     )
-                    iterator_len, max_seqlen = batch.get_microbatch_iterator_for_packable_sequences_len()
-                    max_batch_ct = torch.tensor([iterator_len], device='cuda')
-                    torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                    iterator_len, max_seqlen = (
+                        batch.get_microbatch_iterator_for_packable_sequences_len()
+                    )
+                    max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                    torch.distributed.all_reduce(
+                        max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                    )
 
                     # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
                     # We add dummy batches to the end of the iterator to make the batch counts equal.
                     dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                    dummy_iterator = batch.make_microbatch_iterator_for_packable_sequences()
-                    dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                    dummy_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
+                    dummy_iterator = itertools.islice(
+                        itertools.cycle(dummy_iterator), dummy_batch_ct
+                    )
                 else:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
                     iterator_len = batch.size // mbs
 
-                for mb_idx, mb in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+                for mb_idx, mb in enumerate(
+                    itertools.chain(mb_iterator, dummy_iterator)
+                ):
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()
@@ -568,6 +582,9 @@ class DTensorPolicyWorker:
                                 ],  # flash attention 2 expects flattened input
                                 padding_value=self.tokenizer.eos_token_id,
                                 return_attention_mask=False,
+                                min_seq_len=self.cfg["sequence_packing"][
+                                    "train_mb_tokens"
+                                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
                             )
                             seq_len = input_ids.shape[1]
                             attention_mask = None
@@ -819,21 +836,29 @@ class DTensorPolicyWorker:
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
                 mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = data.get_microbatch_iterator_for_packable_sequences_len()
-                max_batch_ct = torch.tensor([iterator_len], device='cuda')
-                torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
 
                 # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
                 # We add dummy batches to the end of the iterator to make the batch counts equal.
                 dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
                 dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
             else:
                 mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
                 iterator_len = data.size // logprob_batch_size
 
             step = 0
-            for batch_idx, lp_batch in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
@@ -843,7 +868,9 @@ class DTensorPolicyWorker:
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
-                        packed_sequence_size=[batch_size],  # flash attention 2 expects flattened input
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
                         padding_value=self.tokenizer.eos_token_id,
                         return_attention_mask=False,
                     )
@@ -863,9 +890,9 @@ class DTensorPolicyWorker:
 
                     # explicitly create position ids for the input, otherwise the sharding
                     # for DTensor will be incorrect
-                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(
-                        batch_size, 1
-                    )
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
@@ -877,35 +904,99 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask_input_all_ones,
-                        position_ids=position_ids,
-                        use_cache=False,
-                        flash_attn_kwargs=flash_attn_kwargs,
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
                     )
 
-                if isinstance(outputs.logits, DTensor):
-                    token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                        outputs.logits.to(torch.float32), input_ids
-                    )
-                else:
-                    # Extract logprobs for each token in the sequence by gathering the logprob
-                    # corresponding to the next token at each position
-                    # Input shapes:
-                    #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
-                    #   token_ids: [batch_size, sequence_length] - actual tokens
-                    # Output shape: [batch_size, sequence_length] - logprob of each token given previous
-                    # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                        )
 
-                    log_probs = torch.nn.functional.log_softmax(
-                        outputs.logits.to(torch.float32), dim=-1
-                    )
-                    next_tokens = input_ids[:, 1:]
-                    log_probs = log_probs[:, :-1]
-                    token_logprobs = log_probs.gather(
-                        dim=-1, index=next_tokens.unsqueeze(-1)
-                    ).squeeze(-1)
+                    logits = outputs.logits
+
+                    if self.cp_size > 1:
+                        seq_index_tensor = (
+                            DTensor.from_local(
+                                seq_index,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(1)],
+                            )
+                            .full_tensor()
+                            .squeeze(0)
+                        )
+
+                        input_ids_dtensor = DTensor.from_local(
+                            input_ids,
+                            device_mesh=self.cp_mesh,
+                            placements=[Shard(sequence_dim)],
+                        )
+
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                            logits.to(torch.float32),
+                            input_ids_dtensor,
+                            seq_index_tensor,
+                        )
+
+                        assert token_logprobs.shape[1] == seq_len - 1
+                    else:
+                        if isinstance(logits, DTensor):
+                            token_logprobs = get_logprobs_from_vocab_parallel_logits(
+                                logits.to(torch.float32), input_ids
+                            )
+                        else:
+                            # Extract logprobs for each token in the sequence by gathering the logprob
+                            # corresponding to the next token at each position
+                            # Input shapes:
+                            #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
+                            #   token_ids: [batch_size, sequence_length] - actual tokens
+                            # Output shape: [batch_size, sequence_length] - logprob of each token given previous
+                            # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
+
+                            log_probs = torch.nn.functional.log_softmax(
+                                outputs.logits.to(torch.float32), dim=-1
+                            )
+                            next_tokens = input_ids[:, 1:]
+                            log_probs = log_probs[:, :-1]
+                            token_logprobs = log_probs.gather(
+                                dim=-1, index=next_tokens.unsqueeze(-1)
+                            ).squeeze(-1)
 
                 token_logprobs = torch.cat(
                     [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
@@ -920,13 +1011,19 @@ class DTensorPolicyWorker:
                     token_logprobs = token_logprobs * attention_mask
                 else:
                     # For packed sequences, unpack logprobs
-                    unpacked_logprobs = torch.zeros((batch_size, seq_dim_size), dtype=token_logprobs.dtype, device=token_logprobs.device)
+                    unpacked_logprobs = torch.zeros(
+                        (batch_size, seq_dim_size),
+                        dtype=token_logprobs.dtype,
+                        device=token_logprobs.device,
+                    )
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q
                     for i in range(batch_size):
                         start = cu_seqlens[i].item() + 1
-                        end = cu_seqlens[i+1].item()
+                        end = cu_seqlens[i + 1].item()
                         seq_len_actual = input_lengths[i].item()
-                        unpacked_logprobs[i, 1: seq_len_actual] = token_logprobs[0, start:end]
+                        unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[
+                            0, start:end
+                        ]
                     token_logprobs = unpacked_logprobs
 
                 all_log_probs.append(token_logprobs)

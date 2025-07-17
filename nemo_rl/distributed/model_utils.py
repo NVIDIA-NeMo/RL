@@ -121,8 +121,8 @@ class DistributedLogprob(torch.autograd.Function):
 
 
 def dtensor_from_parallel_logits_to_logprobs(
-    vocab_parallel_logits: DTensor,
-    target: DTensor,
+    vocab_parallel_logits: torch.Tensor,
+    target: DTensor | torch.Tensor,
     vocab_start_index: int,
     vocab_end_index: int,
     tp_group: torch.distributed.ProcessGroup,
@@ -132,7 +132,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     """Get log probabilities from TP+CP sharded vocab logits.
 
     Args:
-        vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
+        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
         target (DTensor): Target token indices with shape [batch_size, seq_len].
             NOTE: Must be the unmodified targets as this function will shift them internally.
@@ -149,7 +149,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     """
     cp_size = 1
 
-    if "cp" in target.device_mesh.mesh_dim_names:
+    if isinstance(target, DTensor) and "cp" in target.device_mesh.mesh_dim_names:
         cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
         cp_size = target.device_mesh.shape[cp_dim_index]
 
