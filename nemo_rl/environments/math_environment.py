@@ -93,32 +93,33 @@ class HFVerifyWorker:
             try:
                 ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                 with _mute_output():
-                    try:
-                        ret_score, extracted_answer = self.verify_func(
-                            [ground_truth_parsable], [response]
-                        )
-                    # It's possible to emit a TimeoutException and that wouldn't be caught since
-                    # it actually subclasses from BaseException and math-verify itself does not
-                    # to catch it.
-                    except (Exception, TimeoutException):
-                        ret_score = 0.0
-                        extracted_answer = None
+                    ret_score, extracted_answer = self.verify_func(
+                        [ground_truth_parsable], [response]
+                    )
 
                 results.append(float(ret_score))
+
                 if return_extracted_answer:
                     # Make sure the extracted answer is not None and is a list of two elements
                     assert extracted_answer is not None
                     assert len(extracted_answer) == 2
-                    extracted_prediction, extracted_gold = extracted_answer
+                    extracted_gold, extracted_prediction = extracted_answer
+                    # Get the extracted answer with the same logic as in the HFVerifyWorker
                     for pred in extracted_prediction:
                         if any(grader.verify(gold, pred) for gold in extracted_gold):
                             extracted_answers.append(pred)
                             break
                     else:
-                        extracted_answers.append(None)
-            except Exception:
+                        # If no match is found, means all answers are incorrect, just use the first prediction
+                        extracted_answers.append(extracted_prediction[0][0])
+
+            # It's possible to emit a TimeoutException and that wouldn't be caught since
+            # it actually subclasses from BaseException and math-verify itself does not
+            # to catch it.
+            except (Exception, TimeoutException):
                 results.append(0.0)
                 extracted_answers.append(None)
+
         if return_extracted_answer:
             return results, extracted_answers
         else:
