@@ -854,13 +854,8 @@ class MegatronPolicyWorker:
                     num_zeros_in_grad
                 )
 
-                # Update learning rate.
                 if update_successful:
-                    increment = total_dataset_size.item()
-                    self.scheduler.step(increment=increment)
                     skipped_iter = 0
-                    curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
-                    curr_wd = self.scheduler.get_wd()
                 else:
                     skipped_iter = 1
 
@@ -877,6 +872,8 @@ class MegatronPolicyWorker:
                         for k in x.keys():
                             loss_metrics[k] = x[k] / num_global_batches
                         gb_loss_metrics.append(loss_metrics)
+                        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+                        curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
                         loss_metrics["grad_norm"] = grad_norm
@@ -901,6 +898,10 @@ class MegatronPolicyWorker:
 
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
+
+        if not eval_mode:
+            # take one LR step every rollout batch
+            self.scheduler.step(increment=1)
 
         # Aggregate metrics across all microbatches
         mb_metrics = defaultdict(list)

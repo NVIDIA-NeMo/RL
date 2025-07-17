@@ -49,7 +49,7 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: null
-      lr_warmup_iters: 50
+      lr_warmup_iters: 13
       lr_warmup_init: 3.0e-8
 
   generation:
