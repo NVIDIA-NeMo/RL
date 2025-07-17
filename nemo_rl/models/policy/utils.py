@@ -131,25 +131,83 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
-def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
-    """Get runtime environment configuration for DTensorPolicyWorker.
+def configure_expandable_segments() -> None:
+    """Configure expandable_segments on Hopper and newer architectures (compute capability 9.x+).
 
-    Conditionally enables expandable_segments on Hopper GPUs only,
-    as it causes crashes on Ampere GPUs.
+    This helps with memory allocation but causes crashes on Ampere GPUs, so we only enable it
+    on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
+    """
+    compute_capability = torch.cuda.get_device_properties(0).major
+
+    if compute_capability >= 9:  # Hopper+
+        existing_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+
+        # Check if expandable_segments is already configured
+        if "expandable_segments" in existing_conf:
+            print(f"expandable_segments already configured: {existing_conf}")
+            # Already configured, don't override
+            return
+
+        # Add expandable_segments to existing configuration
+        if existing_conf:
+            # Append to existing configuration
+            new_conf = f"{existing_conf},expandable_segments:True"
+        else:
+            # Set new configuration
+            new_conf = "expandable_segments:True"
+
+        print(f"Setting PYTORCH_CUDA_ALLOC_CONF to {new_conf}")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_conf
+
+    else:
+        ## make sure that expandable_segments is not set to True
+        if "expandable_segments" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+            conf_items = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
+            for item in conf_items:
+                if item.strip().startswith("expandable_segments"):
+                    key_value = item.split(":")
+                    if len(key_value) == 2 and key_value[1].strip().lower() == "true":
+                        raise RuntimeError(
+                            "expandable_segments is enabled in PYTORCH_CUDA_ALLOC_CONF, "
+                            "but this is not supported on architectures older than Hopper (compute capability < 9). "
+                            "Please set expandable_segments to False."
+                        )
+
+
+def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
+    """Get runtime environment configuration for policy workers.
+
+    Note: expandable_segments configuration is handled directly in the worker init methods
+    to ensure proper GPU detection after CUDA initialization.
     """
     runtime_env = {
         **get_nsight_config_if_pattern_matches(policy_worker_name),
     }
 
-    # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-    try:
-        compute_capability = torch.cuda.get_device_properties(0).major
-        if compute_capability >= 9:  # Hopper+
-            runtime_env["env_vars"] = {
-                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
-            }
-    except Exception:
-        # If we can't detect GPU capability, don't enable expandable_segments for safety
-        pass
-
     return runtime_env
+
+
+def get_megatron_checkpoint_dir() -> str:
+    """Gets the default megatron checkpoint directory for initial HF -> Mcore conversion.
+
+    Megatron initial checkpoint should be saved to a path available on all nodes. The directory used will take this order of precendence:
+    1. $NRL_MEGATRON_CHECKPOINT_DIR (if set)
+    2. $HF_HOME/nemo_rl (if HF_HOME is set)
+    3. ~/.cache/huggingface/nemo_rl
+
+    HF_HOME is preferred since many users will also have that path mounted and it means one less directory
+    to mount into your runtime environment.
+    """
+    nrl_checkpoint_dir = os.environ.get("NRL_MEGATRON_CHECKPOINT_DIR")
+    if nrl_checkpoint_dir is not None and nrl_checkpoint_dir.strip():
+        checkpoint_dir = nrl_checkpoint_dir
+    else:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is not None and hf_home.strip():
+            checkpoint_dir = os.path.join(hf_home, "nemo_rl")
+        else:
+            checkpoint_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "huggingface", "nemo_rl"
+            )
+    print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
+    return checkpoint_dir

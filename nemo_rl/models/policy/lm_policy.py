@@ -76,6 +76,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
+
+            env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
             assert config["dtensor_cfg"]["enabled"], (
                 "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
@@ -86,6 +88,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
+
+            env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -121,6 +125,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
+            env_vars=env_vars,
         )
 
         if config["dynamic_batching"]["enabled"]:
@@ -473,6 +478,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Placeholder implementation
         pass
 
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare the info for refit.
+
+        Returns:
+            dict: A dictionary containing the info for refit.
+        """
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
+        results = ray.get(futures)
+        # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
     ) -> list[list[str]]:
@@ -536,19 +552,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             all_handles.update(handle)
 
         return all_handles
-
-    def prepare_info_for_collective(self) -> dict[str, Any]:
-        """Prepare the info for collective communication.
-
-        Returns:
-            dict: A dictionary containing the info for collective communication.
-        """
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_info_for_collective"
-        )
-        results = ray.get(futures)
-        # Only get the first worker's info since all workers will have the same result
-        return results[0]
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""

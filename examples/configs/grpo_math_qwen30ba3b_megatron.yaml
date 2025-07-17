@@ -5,12 +5,8 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
 
-checkpointing:
-  enabled: false
-  checkpoint_dir: "results/grpo_8b_megatron"
-
 policy:
-  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  model_name: "Qwen/Qwen3-30B-A3B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512
@@ -31,12 +27,14 @@ policy:
 
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1
     converter_type: "LlamaForCausalLM"
-    tensor_model_parallel_size: 1
-    # On H100, can run with pp=1 for better performance with expandable segments (which is enabled by default)
-    pipeline_model_parallel_size: 2
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 4
     context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: True
     pipeline_dtype: ${policy.precision}
 
     optimizer:
@@ -56,6 +54,9 @@ policy:
       lr_decay_iters: null
       lr_warmup_iters: 50
       lr_warmup_init: 3.0e-8
+    
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
 
   generation:
     backend: "vllm"
@@ -66,10 +67,10 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      tensor_parallel_size: 1
+      tensor_parallel_size: 4
       gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
+  num_nodes: 8

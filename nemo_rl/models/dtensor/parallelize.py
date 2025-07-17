@@ -146,10 +146,6 @@ def _parallelize_llama(
     sequence_parallel: bool = False,
 ):
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
-
     base_model_tp_plan = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
@@ -206,9 +202,6 @@ def _parallelize_qwen(
                     f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
                 )
 
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
     if sequence_parallel:
         base_model_tp_plan = {
             "lm_head": ColwiseParallel(

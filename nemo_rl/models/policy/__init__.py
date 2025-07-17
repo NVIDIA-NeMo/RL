@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
 class DTensorConfig(TypedDict):
     enabled: bool
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
-    tensor_parallel_size: int
-    context_parallel_size: int
-    custom_parallel_plan: str
+    cpu_offload: NotRequired[bool]
+    sequence_parallel: NotRequired[bool]
+    activation_checkpointing: NotRequired[bool]
+    tensor_parallel_size: NotRequired[int]
+    context_parallel_size: NotRequired[int]
+    custom_parallel_plan: NotRequired[str]
 
 
 class SequencePackingConfig(TypedDict):
@@ -93,7 +93,7 @@ class MegatronConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: str
+    chat_template: NotRequired[str]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -116,9 +116,11 @@ class DynamicBatchingConfig(TypedDict):
     # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
     # training and logprob stages respectively.
     enabled: bool
-    train_mb_tokens: int
+
+    ## required if enabled is true
+    train_mb_tokens: NotRequired[int]
     logprob_mb_tokens: NotRequired[int]
-    sequence_length_round: int
+    sequence_length_round: NotRequired[int]
 
 
 class PolicyConfig(TypedDict):
@@ -126,22 +128,22 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
-    learning_rate: float
-    logprob_batch_size: int
-    generation: Optional[GenerationConfig]
+    logprob_batch_size: NotRequired[int]
+    generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation
     precision: str
     dtensor_cfg: DTensorConfig
-    megatron_cfg: MegatronConfig
+    megatron_cfg: NotRequired[MegatronConfig]
     dynamic_batching: DynamicBatchingConfig
-    sequence_packing: SequencePackingConfig
+    sequence_packing: NotRequired[SequencePackingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    max_grad_norm: Optional[Union[float, int]]
+    max_grad_norm: NotRequired[Union[float, int]]
     fsdp_offload_enabled: bool
     activation_checkpointing_enabled: bool
+    refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig] = None
     scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (
         None
