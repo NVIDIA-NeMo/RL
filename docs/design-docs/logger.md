@@ -21,7 +21,7 @@ class LoggerInterface(ABC):
     """Abstract base class for logger backends."""
 
     @abstractmethod
-    def log_metrics(self, metrics: dict[str, Any], step: int, prefix: Optional[str]: "") -> None:
+    def log_metrics(self, metrics: Dict[str, Any], step: int, prefix: Optional[str]: "") -> None:
         """Log a dictionary of metrics."""
         pass
 
@@ -41,6 +41,10 @@ logging_config = {
 
     "wandb": {
         "project": "grpo-dev",
+        "name": "grpo-dev-logging",
+    },
+    "swanlab": {
+        "project": "nemo-rl",
         "name": "grpo-dev-logging",
     },
     "tensorboard": {
@@ -64,6 +68,7 @@ The logger supports pretty-formatted logging of validation samples to help visua
 ```python
 logger:
   wandb_enabled: false
+  swanlab_enabled: false
   tensorboard_enabled: false
   num_val_samples_to_print: 10
 ```
@@ -91,6 +96,7 @@ This feature is enabled with the `monitor_gpus` configuration parameter. The fre
 ```python
 logger:
   wandb_enabled: false
+  swanlab_enabled: false
   tensorboard_enabled: false
   monitor_gpus: true
   gpu_monitoring:
