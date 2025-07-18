@@ -29,7 +29,7 @@ dependencies = [
     "transformers>=4.51.0",
     "wandb",
     "numpy",
-    "datasets>=3.6.0",
+    "datasets>=4.0.0",
     "rich",
     "math-verify",
     "accelerate>=0.26",
