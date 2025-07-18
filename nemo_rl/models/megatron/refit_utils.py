@@ -13,7 +13,7 @@
 # limitations under the License.
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple
 
 import torch
 from megatron.core import parallel_state
