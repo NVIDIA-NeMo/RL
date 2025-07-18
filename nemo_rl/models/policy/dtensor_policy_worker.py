@@ -38,6 +38,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components._transformers.utils import sliding_window_overwrite
 from nemo_automodel.components.distributed.cp_utils import create_context_parallel_ctx, get_train_context
+from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -47,7 +48,7 @@ from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
+
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -222,15 +223,15 @@ class DTensorPolicyWorker:
             )
 
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("data_parallel", "context_parallel", "tensor_parallel")
+            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
         )
 
-        self.dp_cp_mesh = device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
+        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
 
         self.dp_mesh, self.tp_mesh, self.cp_mesh = (
-            device_mesh["data_parallel"],
-            device_mesh["tensor_parallel"],
-            device_mesh["context_parallel"],
+            device_mesh["dp"],
+            device_mesh["tp"],
+            device_mesh["cp"],
         )
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -247,6 +248,9 @@ class DTensorPolicyWorker:
                 "activation_checkpointing"
             ],
             tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            dp_mesh_name="dp",
+            tp_mesh_name="tp",
+            dp_cp_mesh_name="dp_cp",
         )
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
@@ -328,8 +332,6 @@ class DTensorPolicyWorker:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
-
-
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
