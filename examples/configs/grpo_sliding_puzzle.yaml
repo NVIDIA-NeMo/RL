@@ -53,6 +53,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"

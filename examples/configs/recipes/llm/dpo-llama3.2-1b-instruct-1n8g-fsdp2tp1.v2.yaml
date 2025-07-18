@@ -78,6 +78,7 @@ logger:
   log_dir: "logs"
   wandb_enabled: true
   tensorboard_enabled: true
+  swanlab_enabled: false # Disable SwanLab logging
   mlflow_enabled: false
   monitor_gpus: true
   num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal

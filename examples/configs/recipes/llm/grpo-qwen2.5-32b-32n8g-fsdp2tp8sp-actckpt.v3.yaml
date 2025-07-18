@@ -110,6 +110,7 @@ logger:
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true
   wandb:
     project: nemo-rl

@@ -50,6 +50,9 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
 
+class SwanlabConfig(TypedDict):
+    project: NotRequired[str]
+    name: NotRequired[str]
 
 class TensorboardConfig(TypedDict):
     log_dir: NotRequired[str]
@@ -69,9 +72,11 @@ class GPUMonitoringConfig(TypedDict):
 class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
+    swanlab_enabled: bool
     tensorboard_enabled: bool
     mlflow_enabled: bool
     wandb: WandbConfig
+    swanlab: SwanlabConfig
     tensorboard: TensorboardConfig
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
@@ -323,6 +328,74 @@ class WandbLogger(LoggerInterface):
         """
         self.run.log({name: figure}, step=step)
 
+class SwanlabLogger(LoggerInterface):
+    """Weights & Biases logger backend."""
+
+    def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
+        import swanlab
+        self.run = swanlab.init(**cfg)
+        print(
+            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
+        )
+
+    def define_metric(
+        self,
+        name: str,
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Define a metric with custom step metric.
+
+        Args:
+            name: Name of the metric or pattern (e.g. 'ray/*')
+            step_metric: Optional name of the step metric to use
+        """
+        self.run.define_metric(name, step_metric=step_metric)
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Log metrics to wandb.
+
+        Args:
+            metrics: Dict of metrics to log
+            step: Global step value
+            prefix: Optional prefix for metric names
+            step_metric: Optional name of a field in metrics to use as step instead
+                         of the provided step value
+        """
+        if prefix:
+            metrics = {
+                f"{prefix}/{k}" if k != step_metric else k: v
+                for k, v in metrics.items()
+            }
+
+        # If step_metric is provided, use the corresponding value from metrics as step
+        if step_metric and step_metric in metrics:
+            # commit=False so the step does not get incremented
+            self.run.log(metrics, commit=False)
+        else:
+            self.run.log(metrics, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to swanlab.
+
+        Args:
+            params: Dict of hyperparameters to log
+        """
+        self.run.config.update(params)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to swanlab.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+        """
+        self.run.log({name: figure}, step=step)
 
 class GpuMetricSnapshot(TypedDict):
     step: int
@@ -727,6 +800,7 @@ class Logger(LoggerInterface):
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
+        self.swanlab_logger = None
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -736,6 +810,12 @@ class Logger(LoggerInterface):
             os.makedirs(wandb_log_dir, exist_ok=True)
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
+
+        if cfg["swanlab_enabled"]:
+            swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
+            os.makedirs(swanlab_log_dir, exist_ok=True)
+            self.swanlab_logger = SwanlabLogger(cfg["swanlab"], log_dir=swanlab_log_dir)
+            self.loggers.append(self.swanlab_logger)
 
         if cfg["tensorboard_enabled"]:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
@@ -758,6 +838,11 @@ class Logger(LoggerInterface):
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
                 self.wandb_logger.define_metric(
+                    f"{metric_prefix}/*", step_metric=step_metric
+                )
+
+            if cfg["swanlab_enabled"] and self.swanlab_logger:
+                self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
