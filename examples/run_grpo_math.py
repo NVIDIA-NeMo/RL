@@ -133,14 +133,15 @@ def setup_data(
     )
 
     # Load OpenMathInstruct2Dataset using nemo rl datasets
-    if data_config["dataset_name"] == "OpenMathInstruct-2":
+    dataset_name = data_config["dataset_name"]
+    if "OpenMathInstruct-2" in dataset_name:
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
-        data: Any = OpenMathInstruct2Dataset()
-    elif data_config["dataset_name"] == "DeepScaler":
+        data: Any = OpenMathInstruct2Dataset(repo_id=dataset_name)
+    elif "DeepScaler" in dataset_name:
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
-        data: Any = DeepScalerDataset()
+        data: Any = DeepScalerDataset(repo_id=dataset_name)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
