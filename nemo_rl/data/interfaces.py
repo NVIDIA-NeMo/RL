@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
 
 import torch
-from transformers import PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 # OpenAI-API-like message log, but every messsage may contain associated tensors (i.e. tokenized strings and logprobs) in addition to the original "content" string
 LLMMessageLogType = list[dict[str, Union[str, torch.Tensor]]]

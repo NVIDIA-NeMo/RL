@@ -339,7 +339,7 @@ class SlidingPuzzleRunner:
 
 
 @ray.remote  # pragma: no cover
-class SlidingPuzzleEnv(EnvironmentInterface):
+class SlidingPuzzleEnv(EnvironmentInterface[SlidingPuzzleMetadata]):
     """Sliding Puzzle environment (Ray Actor)."""
 
     def __init__(self, cfg: Optional[SlidingPuzzleConfig] = None):
@@ -350,13 +350,13 @@ class SlidingPuzzleEnv(EnvironmentInterface):
     def step(
         self,
         message_log_batch: list[LLMMessageLogType],
-        metadata_batch: list[SlidingPuzzleMetadata],
-    ) -> EnvironmentReturn:
+        metadata: list[SlidingPuzzleMetadata],
+    ) -> EnvironmentReturn[SlidingPuzzleMetadata]:
         """Processes a batch of sliding puzzle interactions."""
         # Since logic is synchronous, process sequentially (can parallelize if logic becomes heavy)
         results = [
             self.runner.process_turn(log, meta)
-            for log, meta in zip(message_log_batch, metadata_batch)
+            for log, meta in zip(message_log_batch, metadata)
         ]
 
         # Unpack results and format according to EnvironmentReturn NamedTuple
