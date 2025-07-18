@@ -31,6 +31,14 @@ def _patch_gemma3_mm():
 
     Patch taken from:https://github.com/vllm-project/vllm/pull/19151/files#diff-5890909300e4e6c3160444e4587ec3fd80498bb83f598b22ce81337f75992b06
     """
+    from packaging.version import Version as PkgVersion
+
+    assert PkgVersion(vllm.__version__) < PkgVersion("0.9.2"), (
+        f"You are using vllm version {vllm.__version__}. "
+        "Please remove this patch (_patch_gemma3_mm in nemo_rl/models/generation/vllm_backend.py) "
+        "since it is included in vllm>=0.9.2."
+    )
+
     from vllm.logger import init_logger
     from vllm.model_executor.models import gemma3_mm
     from vllm.model_executor.models.utils import (
