@@ -71,7 +71,10 @@ def is_gemma_model(model_name: str) -> bool:
 
 
 def group_and_cat_tensors(
-    tensors: list[torch.Tensor], group_sizes: list[int], padding_value: int = 0
+    tensors: list[torch.Tensor],
+    group_sizes: list[int],
+    padding_value: int = 0,
+    min_seq_len: int = 0,
 ) -> torch.Tensor:
     """Groups and concatenates tensors according to group_sizes, then pads them to form a 2D tensor.
 
@@ -82,6 +85,7 @@ def group_and_cat_tensors(
         tensors: List of 1D tensors of varying lengths.
         group_sizes: List of integers. Each integer specifies how many tensors to group.
         padding_value: Integer used to pad shorter sequences.
+        min_seq_len: Minimum sequence length.
 
     Returns:
         A 2D tensor where each row is a padded concatenation of the grouped tensors.
@@ -108,6 +112,7 @@ def group_and_cat_tensors(
 
     # Compute the maximum length for padding
     max_len = max(t.size(0) for t in grouped)
+    max_len = max(max_len, min_seq_len)
 
     # Pad each tensor to max_len
     padded = torch.stack(
@@ -126,6 +131,7 @@ def pack_sequences(
     packed_sequence_size: list[int],
     padding_value: int = 0,
     return_attention_mask: bool = True,
+    min_seq_len: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Packs sequences into rows where each row concatenates multiple sequences.
 
@@ -138,6 +144,7 @@ def pack_sequences(
         packed_sequence_size (List[int]): How many sequences to pack per row
         padding_value (int): Pad value for input_ids
         return_attention_mask (bool): Whether to return per-row causal attention mask
+        min_seq_len (int): Minimum sequence length.
 
     Returns:
         Tuple:
@@ -197,10 +204,10 @@ def pack_sequences(
 
     # Group and pad
     input_ids_packed = group_and_cat_tensors(
-        flat_input_ids, packed_sequence_size, padding_value
+        flat_input_ids, packed_sequence_size, padding_value, min_seq_len=min_seq_len
     )
     position_ids_packed = group_and_cat_tensors(
-        position_ids, packed_sequence_size, padding_value=0
+        position_ids, packed_sequence_size, padding_value=0, min_seq_len=min_seq_len
     )
 
     # Compute max length

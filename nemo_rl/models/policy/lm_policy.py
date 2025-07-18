@@ -193,7 +193,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
 
@@ -202,7 +201,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
@@ -218,24 +217,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
             )
 
-        # sharded_data_2d = []
-        # shard_idx = 0
-        # # Convert to 2d dim array
-        # for _ in range(dp_size):
-        # cp_data = []
-        # for _ in range(cp_size):
-        # cp_data.append(sharded_data[shard_idx])
-        # shard_idx += 1
-        #     sharded_data_2d.append(cp_data)
-        sharded_data_2d = sharded_data
-
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_logprobs",
-            data=sharded_data_2d,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
                 "context_parallel",
@@ -269,7 +257,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         Returns: Identical to get_logprobs.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
         if self.use_dynamic_batches:
@@ -277,7 +264,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
@@ -292,24 +279,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
             )
 
-        sharded_data_2d = sharded_data
-        # sharded_data_2d = []
-        # shard_idx = 0
-        # # Convert to 2d dim array
-        # for _ in range(dp_size):
-        # cp_data = []
-        # for _ in range(cp_size):
-        # cp_data.append(sharded_data[shard_idx])
-        # shard_idx += 1
-        # sharded_data_2d.append(cp_data)
-
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_reference_policy_logprobs",
-            data=sharded_data_2d,
+            data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
                 "context_parallel",

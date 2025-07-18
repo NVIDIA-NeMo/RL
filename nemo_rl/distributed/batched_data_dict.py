@@ -645,6 +645,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         sliced_batch = SlicedDataDict()
         for k in self.data:
+            if isinstance(self.data[k], torch.Tensor):
+                assert end <= self.data[k].shape[0], (
+                    f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
+                )
             sliced_batch[k] = self.data[k][start:end]
         return sliced_batch
 
