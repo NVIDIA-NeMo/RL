@@ -196,24 +196,46 @@ jobs:
                 echo "   Common ancestor: $common_ancestor"
                 git log --oneline -1 "$common_ancestor" 2>/dev/null || echo "   (Unable to show common ancestor)"
                 echo ""
-                echo "   Path from common ancestor → TARGET commit:"
-                git log --oneline --graph "$common_ancestor".."$target_commit" 2>/dev/null || echo "   (Unable to show target path)"
-                echo ""
-                echo "   Path from common ancestor → CURRENT commit:"
-                git log --oneline --graph "$common_ancestor".."$current_commit" 2>/dev/null || echo "   (Unable to show current path)"
-                echo ""
-                echo "   Combined divergence view:"
-                git log --oneline --graph --boundary "$target_commit"..."$current_commit" 2>/dev/null || echo "   (Unable to show combined view)"
+                echo "   For detailed commit history inspection:"
+                
+                # Get GitHub repository URL dynamically from git remote
+                remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+                if [[ "$remote_url" == *.git ]]; then
+                  github_repo="${remote_url%.git}"
+                else
+                  github_repo="$remote_url"
+                fi
+                
+                if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
+                  echo "   TARGET commit history:  $github_repo/commits/$target_commit/"
+                  echo "   CURRENT commit history: $github_repo/commits/$current_commit/"
+                else
+                  echo "   Repository: $github_repo (unable to generate GitHub URLs)"
+                  echo "   TARGET commit: $target_commit"
+                  echo "   CURRENT commit: $current_commit"
+                fi
               else
                 echo "❌ $submodule_name: Commits have NO COMMON ANCESTOR"
                 echo "   This indicates commits are from completely different repositories or history"
                 echo ""
-                echo "📊 Commit details:"
-                echo "   Target commit:"
-                git log --oneline -1 "$target_commit" 2>/dev/null || echo "   (Target commit not found in current repository)"
-                echo ""
-                echo "   Current commit:"
-                git log --oneline -1 "$current_commit" 2>/dev/null || echo "   (Current commit not found in current repository)"
+                echo "📊 For detailed commit inspection:"
+                
+                # Get GitHub repository URL dynamically from git remote
+                remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+                if [[ "$remote_url" == *.git ]]; then
+                  github_repo="${remote_url%.git}"
+                else
+                  github_repo="$remote_url"
+                fi
+                
+                if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
+                  echo "   TARGET commit:  $github_repo/commits/$target_commit/"
+                  echo "   CURRENT commit: $github_repo/commits/$current_commit/"
+                else
+                  echo "   Repository: $github_repo (unable to generate GitHub URLs)"
+                  echo "   TARGET commit: $target_commit"
+                  echo "   CURRENT commit: $current_commit"
+                fi
               fi
               
               failed=1
