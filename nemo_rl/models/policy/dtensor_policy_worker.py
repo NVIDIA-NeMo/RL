@@ -217,13 +217,27 @@ class DTensorPolicyWorker:
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         dp_size = world_size // tp_size // cp_size
+        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
         assert world_size == dp_size * tp_size * cp_size, (
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )
 
+        if sequence_parallel_enabled:
+            assert tp_size > 1, (
+                "Sequence parallel needs to be used together with tensor parallel. "
+                "Please either set tp_size > 1 or disable sequence parallel."
+            )
+
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
-                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+                "Context parallel is not supported for Gemma3ForCausalLM. Torch context parallel has many limitations. "
+                "Please refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+
+            assert not sequence_parallel_enabled, (
+                "It's a known issue that context parallel can't be used together with sequence parallel in DTensor worker. "
+                "Please either set cp_size = 1 or disable sequence parallel. "
+                "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
             )
 
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
@@ -247,7 +261,7 @@ class DTensorPolicyWorker:
             self.dp_cp_mesh,
             self.tp_mesh,
             param_dtype=self.dtype,
-            sequence_parallel=self.cfg["dtensor_cfg"]["sequence_parallel"],
+            sequence_parallel=sequence_parallel_enabled,
             cpu_offload=self.cpu_offload,
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
