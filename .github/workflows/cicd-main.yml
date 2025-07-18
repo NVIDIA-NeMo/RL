@@ -154,21 +154,62 @@ jobs:
             
             echo "Target commit:  $target_commit"
             
-            # Check if current commit is the same or a fast-forward of target commit
+            # Analyze the relationship between target and current commits
+            cd "$submodule_path"
+            
+            # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
               echo "✅ $submodule_name: Same commit as target branch"
+              
+            # Case 2: Check if target commit is an ancestor of current commit (current is fast-forward)
+            elif git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
+              echo "✅ $submodule_name: Current commit is a fast-forward of target branch"
+              echo "📊 Commits added since target branch:"
+              git log --oneline --graph "$target_commit".."$current_commit" 2>/dev/null || echo "   (Unable to show progression - possibly shallow clone)"
+              
+            # Case 3: Check if current commit is an ancestor of target commit (current is behind)
+            elif git merge-base --is-ancestor "$current_commit" "$target_commit" 2>/dev/null; then
+              echo "❌ $submodule_name: Current commit is BEHIND target branch"
+              echo "   Current commit is an ancestor of target - submodule needs to be updated forward"
+              echo "📊 Missing commits that should be included:"
+              git log --oneline --graph "$current_commit".."$target_commit" 2>/dev/null || echo "   (Unable to show missing commits)"
+              failed=1
+              
             else
-              # Check if target commit is an ancestor of current commit (i.e., current is fast-forward)
-              cd "$submodule_path"
-              if git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
-                echo "✅ $submodule_name: Current commit is a fast-forward of target branch"
+              # Case 4: Commits have diverged or have no common ancestor
+              common_ancestor=$(git merge-base "$target_commit" "$current_commit" 2>/dev/null)
+              
+              if [ -n "$common_ancestor" ]; then
+                echo "❌ $submodule_name: Commits have DIVERGED from a common ancestor"
+                echo "   This indicates parallel development - manual merge may be required"
+                echo ""
+                echo "📊 Divergence analysis:"
+                echo "   Common ancestor: $common_ancestor"
+                git log --oneline -1 "$common_ancestor" 2>/dev/null || echo "   (Unable to show common ancestor)"
+                echo ""
+                echo "   Path from common ancestor → TARGET commit:"
+                git log --oneline --graph "$common_ancestor".."$target_commit" 2>/dev/null || echo "   (Unable to show target path)"
+                echo ""
+                echo "   Path from common ancestor → CURRENT commit:"
+                git log --oneline --graph "$common_ancestor".."$current_commit" 2>/dev/null || echo "   (Unable to show current path)"
+                echo ""
+                echo "   Combined divergence view:"
+                git log --oneline --graph --boundary "$target_commit"..."$current_commit" 2>/dev/null || echo "   (Unable to show combined view)"
               else
-                echo "❌ $submodule_name: Current commit is NOT a fast-forward of target branch"
-                echo "   This indicates the submodule may have been rebased or contains non-linear history"
-                failed=1
+                echo "❌ $submodule_name: Commits have NO COMMON ANCESTOR"
+                echo "   This indicates commits are from completely different repositories or history"
+                echo ""
+                echo "📊 Commit details:"
+                echo "   Target commit:"
+                git log --oneline -1 "$target_commit" 2>/dev/null || echo "   (Target commit not found in current repository)"
+                echo ""
+                echo "   Current commit:"
+                git log --oneline -1 "$current_commit" 2>/dev/null || echo "   (Current commit not found in current repository)"
               fi
-              cd "$GITHUB_WORKSPACE"
+              
+              failed=1
             fi
+            cd "$GITHUB_WORKSPACE"
             
           done < <(git submodule status)
           
