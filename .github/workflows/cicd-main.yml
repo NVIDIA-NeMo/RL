@@ -119,6 +119,7 @@ jobs:
           git fetch origin ${{ github.base_ref }}
       
       - name: Check submodule fast-forward status
+        shell: bash -x -e {0}
         run: |
           echo "Checking submodules are fast-forwarded..."
           
