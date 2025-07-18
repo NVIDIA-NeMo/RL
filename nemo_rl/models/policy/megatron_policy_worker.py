@@ -1279,8 +1279,6 @@ class MegatronPolicyWorker:
     def prepare_refit_info(self) -> None:
         # Get parameter info for refit
         ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
         refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Create a map that maps any local parameter name to a list of global parameter names.
@@ -1323,8 +1321,6 @@ class MegatronPolicyWorker:
 
         # Get parameter info for refit
         ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
         refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
