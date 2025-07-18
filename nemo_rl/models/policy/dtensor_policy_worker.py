@@ -31,23 +31,23 @@ from torch.distributed.fsdp import (
     FSDPModule,
 )
 from torch.distributed.tensor import DTensor, Shard
-from torch.distributed.tensor.experimental import context_parallel
-from torch.distributed.tensor.experimental._attention import (
-    set_rotate_method,
-)
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components._transformers.utils import sliding_window_overwrite
+from nemo_automodel.components.distributed.cp_utils import create_context_parallel_ctx, get_train_context
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.dtensor.parallelize import (
-    _parallelize_model,
     clip_grad_by_total_norm_,
     get_grad_norm,
     get_logprobs_from_vocab_parallel_logits,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -58,7 +58,6 @@ from nemo_rl.models.policy.utils import (
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -180,7 +179,7 @@ class DTensorPolicyWorker:
         full_state_dict = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = AutoModelForCausalLM.from_pretrained(
+            model = NeMoAutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
@@ -194,7 +193,7 @@ class DTensorPolicyWorker:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_config(
+            self.model = NeMoAutoModelForCausalLM.from_config(
                 model_config,
             )
 
@@ -223,32 +222,31 @@ class DTensorPolicyWorker:
             )
 
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
+            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("data_parallel", "context_parallel", "tensor_parallel")
         )
 
-        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        self.dp_cp_mesh = device_mesh[("data_parallel", "context_parallel")]._flatten(mesh_dim_name="dp_cp")
 
         self.dp_mesh, self.tp_mesh, self.cp_mesh = (
-            device_mesh["dp"],
-            device_mesh["tp"],
-            device_mesh["cp"],
+            device_mesh["data_parallel"],
+            device_mesh["tensor_parallel"],
+            device_mesh["context_parallel"],
         )
         self.dp_size = dp_size
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.device_mesh = device_mesh
 
-        self.model = _parallelize_model(
+        self.model = fsdp2_strategy_parallelize(
             self.model,
-            self.dp_cp_mesh,
-            self.tp_mesh,
+            device_mesh=self.device_mesh,
             param_dtype=self.dtype,
             sequence_parallel=self.cfg["dtensor_cfg"]["sequence_parallel"],
             cpu_offload=self.cpu_offload,
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
             ],
-            custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
         )
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
@@ -331,57 +329,7 @@ class DTensorPolicyWorker:
                 "No weights path provided. Starting from scratch (default policy init)"
             )
 
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
-    @staticmethod
-    def create_context_parallel_ctx(
-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
-        cp_buffers: List[torch.Tensor],
-        cp_seq_dims: List[int],
-        cp_no_restore_buffers: Set[torch.Tensor],
-        cp_rotate_method: Optional[str] = None,
-    ):
-        """Create a context parallel context.
 
-        Args:
-            cp_mesh (DeviceMesh): The device mesh for context parallel.
-            cp_buffers (List[torch.Tensor]): The buffers for context parallel.
-            cp_seq_dims (List[int]): The sequence dimensions for context parallel.
-            cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
-            cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
-        """
-        if cp_rotate_method is not None:
-            set_rotate_method(cp_rotate_method)
-
-        return context_parallel(
-            cp_mesh,
-            buffers=cp_buffers,
-            buffer_seq_dims=cp_seq_dims,
-            no_restore_buffers=cp_no_restore_buffers,
-        )
-
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
-    @staticmethod
-    @contextlib.contextmanager
-    def train_context(cp_context: Optional[Generator[None, None, None]] = None):
-        with contextlib.ExitStack() as stack:
-            if cp_context is not None:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-                # TODO (xilunwu): support cuDNN backend
-
-                stack.enter_context(
-                    sdpa_kernel(
-                        [
-                            SDPBackend.FLASH_ATTENTION,
-                            SDPBackend.EFFICIENT_ATTENTION,
-                        ]
-                    )
-                )
-
-                stack.enter_context(cp_context)
-
-            yield
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
@@ -537,14 +485,14 @@ class DTensorPolicyWorker:
                         )
 
                         # Create context parallel context
-                        context_parallel_ctx = self.create_context_parallel_ctx(
+                        context_parallel_ctx = create_context_parallel_ctx(
                             cp_mesh=self.cp_mesh,
                             cp_buffers=cp_buffers,
                             cp_seq_dims=[sequence_dim] * len(cp_buffers),
                             cp_no_restore_buffers=set(cp_buffers),
                         )
 
-                    with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with get_train_context(False, False, context_parallel_ctx)():
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
                             outputs = self.model(
                                 input_ids=input_ids,
