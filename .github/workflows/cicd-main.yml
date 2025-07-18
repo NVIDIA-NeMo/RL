@@ -148,7 +148,7 @@ jobs:
             target_commit=$(git ls-tree origin/${{ github.base_ref }} "$submodule_path" | awk '{print $3}')
             
             if [[ -z "$target_commit" ]]; then
-              echo "❌ Could not find $submodule_name in target branch"
+              echo "❌ Could not find $submodule_name in ${{ github.base_ref }} branch"
               failed=1
               continue
             fi
@@ -168,19 +168,19 @@ jobs:
             
             # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
-              echo "✅ $submodule_name: Same commit as target branch"
+              echo "✅ $submodule_name: PR branch matches ${{ github.base_ref }} branch (same commit)"
               
             # Case 2: Check if target commit is an ancestor of current commit (current is fast-forward)
             elif git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
-              echo "✅ $submodule_name: Current commit is a fast-forward of target branch"
-              echo "📊 Commits added since target branch:"
+              echo "✅ $submodule_name: PR branch is ahead of ${{ github.base_ref }} branch (fast-forward)"
+              echo "📊 Commits added in PR #${{ github.event.number }} (${{ github.head_ref }} branch):"
               git log --oneline --graph "$target_commit".."$current_commit" 2>/dev/null || echo "   (Unable to show progression - possibly shallow clone)"
               
             # Case 3: Check if current commit is an ancestor of target commit (current is behind)
             elif git merge-base --is-ancestor "$current_commit" "$target_commit" 2>/dev/null; then
-              echo "❌ $submodule_name: Current commit is BEHIND target branch"
-              echo "   Current commit is an ancestor of target - submodule needs to be updated forward"
-              echo "📊 Missing commits that should be included:"
+              echo "❌ $submodule_name: PR branch is BEHIND ${{ github.base_ref }} branch"
+              echo "   Submodule needs to be updated to include recent changes from ${{ github.base_ref }}"
+              echo "📊 Missing commits from ${{ github.base_ref }} that should be included:"
               git log --oneline --graph "$current_commit".."$target_commit" 2>/dev/null || echo "   (Unable to show missing commits)"
               failed=1
               
@@ -207,12 +207,12 @@ jobs:
                 fi
                 
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
-                  echo "   TARGET commit history:  $github_repo/commits/$target_commit/"
-                  echo "   CURRENT commit history: $github_repo/commits/$current_commit/"
+                  echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
+                  echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
-                  echo "   TARGET commit: $target_commit"
-                  echo "   CURRENT commit: $current_commit"
+                  echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
+                  echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"
                 fi
               else
                 echo "❌ $submodule_name: Commits have NO COMMON ANCESTOR"
@@ -229,12 +229,12 @@ jobs:
                 fi
                 
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
-                  echo "   TARGET commit:  $github_repo/commits/$target_commit/"
-                  echo "   CURRENT commit: $github_repo/commits/$current_commit/"
+                  echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
+                  echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
-                  echo "   TARGET commit: $target_commit"
-                  echo "   CURRENT commit: $current_commit"
+                  echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
+                  echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"
                 fi
               fi
               
@@ -247,7 +247,7 @@ jobs:
           if [[ $failed -eq 1 ]]; then
             echo ""
             echo "❌ One or more submodules are not fast-forwarded"
-            echo "Please ensure submodule commits are fast-forwards of the target branch"
+            echo "Please ensure submodule commits are fast-forwards of the ${{ github.base_ref }} branch"
             exit 1
           fi
           
