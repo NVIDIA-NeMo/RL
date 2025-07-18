@@ -158,6 +158,14 @@ jobs:
             # Analyze the relationship between target and current commits
             cd "$submodule_path"
             
+            # Check if this is a shallow repository and unshallow if needed
+            if git rev-parse --is-shallow-repository >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              echo "📦 $submodule_name: Detected shallow clone, fetching full history..."
+              git fetch --unshallow >/dev/null 2>&1 || {
+                echo "⚠️  Warning: Failed to unshallow repository. Ancestry checks may be limited."
+              }
+            fi
+            
             # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
               echo "✅ $submodule_name: Same commit as target branch"
