@@ -131,13 +131,15 @@ jobs:
       # TODO: this is a temporary check and should be removed once we have 100% correctness
       - name: Check if any files with zero errors not in whitelist
         run: |
+          missing_count=0
           for file in $(uv run --group dev pyrefly check $(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py') --output-format json | jq -r --slurpfile all_files <(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py' | jq -R -s 'split("\n")[:-1]') '(.errors | group_by(.path) | map({(.[0].path | sub("/home/terryk/nemo-rl/"; "")): length}) | add // {}) as $error_counts | $all_files[0][] | . as $file | if ($error_counts[$file] // 0) == 0 then $file else empty end'); do
             if ! fgrep -q "$file" pyrefly.toml; then
               echo "File $file has zero errors but is not in pyrefly.toml in the 'project-includes' list. Please add it to this whitelist."
-              exit 1
+              ((missing_count++))
             fi
           done
-          echo "All files accounted for!"
+          
+          exit $missing_count
       - name: Minimize uv cache
         run: uv cache prune --ci
 
