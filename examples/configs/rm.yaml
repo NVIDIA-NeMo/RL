@@ -119,6 +119,11 @@ policy:
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   dataset_name: "HelpSteer3"
+  # You can optionally configure (multiple) custom validation preference datasets as follows:
+  # val_dataset_name: [
+  #   "PreferenceData:<NameOfValidationDataset1>:<LocalPathToValidationDataset1>",
+  #   "PreferenceData:<NameOfValidationDataset2>:<LocalPathToValidationDataset2>",
+  #  ]
 
 logger:
   log_dir: "logs"  # Base directory for all logs
