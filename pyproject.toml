@@ -43,7 +43,10 @@ dependencies = [
     "debugpy",
     "nvtx",
     "matplotlib",
-    "plotly"
+    "plotly",
+    "sympy>=1.14.0",
+    "pillow>=11.2.1",
+    "torchvision>=0.22.0",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +58,7 @@ automodel = [
     "flash-attn==2.7.4.post1",
 ]
 vllm = [
-    "vllm==0.9.0",
+    "vllm==0.9.1",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
 ]
@@ -181,7 +184,7 @@ concurrency = ["thread", "multiprocessing"]
 omit = ["/tmp/*"]
 
 [tool.coverage.paths]
-source = ["nemo_rl/", "/opt/nemo-rl/nemo_rl/"]
+source = ["nemo_rl/"]
 
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the

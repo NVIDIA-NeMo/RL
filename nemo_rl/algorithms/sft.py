@@ -31,6 +31,7 @@ from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
+    get_vlm_keys_from_datumspec_batch,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -249,6 +250,7 @@ def validate(
                 make_sequence_length_divisible_by=master_config["policy"][
                     "make_sequence_length_divisible_by"
                 ],
+                skip_padding_keys=get_vlm_keys_from_datumspec_batch(val_batch)
             )
 
             val_data: BatchedDataDict = BatchedDataDict(

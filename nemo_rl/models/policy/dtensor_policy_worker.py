@@ -21,7 +21,6 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
-from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -35,7 +34,7 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
@@ -60,12 +59,15 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     sliding_window_overwrite,
+    freeze_hf_model_by_regex,
+    freeze_hf_model_towers
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-
+from nemo_rl.models.policy.utils import load_hf_model
+from nemo_rl.distributed.batched_data_dict import get_vlm_keys_from_flattened_batch
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -133,6 +135,7 @@ class DTensorPolicyWorker:
         self,
         config: PolicyConfig,
         tokenizer: AutoTokenizer,
+        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -170,37 +173,12 @@ class DTensorPolicyWorker:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        model_config = AutoConfig.from_pretrained(
-            model_name,
-            # Always load the model in float32 to keep master weights in float32.
-            # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            torch_dtype=torch.float32,
-            trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
-        )
+        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+        self.model, full_state_dict = load_hf_model(model_name, self)
 
-        full_state_dict = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-            )
-            full_state_dict = model.state_dict()
-            del model
-
-        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
-        # All ranks initialize model on meta device, so FSDP can shard it.
-        # The actual weights will be broadcast from rank 0.
-
-        with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_config(
-                model_config,
-            )
+        # freeze parameters by provided regex
+        freeze_hf_model_towers(self.model, self.cfg.get("freeze_language_model", False), self.cfg.get("freeze_vision_model", False))
+        freeze_hf_model_by_regex(self.model, self.cfg.get("freeze_param_regex", None))
 
         # caching since this property is not always preserved after FSDP
         self.num_tied_weights = len(find_tied_parameters(self.model))
@@ -209,6 +187,9 @@ class DTensorPolicyWorker:
         ) or ModelFlag.SKIP_DTENSOR_TIED_WEIGHTS_CHECK.matches(model_name)
 
         self.tokenizer = tokenizer
+        self.processor = processor
+        self.is_vlm = processor is not None
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -440,6 +421,25 @@ class DTensorPolicyWorker:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
+    def _extract_vlm_kwargs(self, mb: BatchedDataDict[Any], vlm_keys: list[str]) -> dict[str, Any]:
+        """Extract VLM (Vision Language Model) specific kwargs from a message batch.
+        
+        This function extracts VLM-specific keys from the message batch while filtering out
+        keys that are already handled by the model input (input_ids, attention_mask).
+        
+        Args:
+            mb: Message batch containing potentially VLM-specific keys
+            
+        Returns:
+            Dictionary of VLM kwargs to pass to the model, empty if not a VLM or no VLM keys
+        """
+        vlm_kwargs = {}
+        # Handle vlm_keys from flattened message data
+        for key in vlm_keys:
+            if key in mb:
+                vlm_kwargs[key] = mb[key]
+        return vlm_kwargs
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -469,7 +469,14 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        # get vlm keys from data
+        vlm_keys = get_vlm_keys_from_flattened_batch(data)
+
         for k, v in data.items():
+            if k in vlm_keys:
+                continue
+
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
@@ -555,6 +562,9 @@ class DTensorPolicyWorker:
                             seq_len, device=input_ids.device
                         ).repeat(batch_size, 1)
 
+                        # add vlm kwargs to model call
+                        vlm_kwargs = self._extract_vlm_kwargs(mb, vlm_keys)
+
                     context_parallel_ctx = None
                     if self.cp_size > 1:
                         seq_index = torch.arange(
@@ -581,6 +591,7 @@ class DTensorPolicyWorker:
                                 attention_mask=attention_mask_input_all_ones,
                                 position_ids=position_ids,
                                 use_cache=False,
+                                **vlm_kwargs,
                             )
 
                         # Get logprobs
@@ -751,7 +762,14 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        # get vlm keys from data
+        vlm_keys = get_vlm_keys_from_flattened_batch(data)
+
         for k, v in data.items():
+            if k in vlm_keys:
+                continue
+
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
@@ -795,11 +813,14 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
+                    vlm_kwargs = self._extract_vlm_kwargs(lp_batch, vlm_keys)
+
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask_input_all_ones,
                         position_ids=position_ids,
                         use_cache=False,
+                        **vlm_kwargs,
                     )
 
                 if isinstance(outputs.logits, DTensor):
@@ -954,6 +975,7 @@ class DTensorPolicyWorker:
 
         # Get state_dict
         self.model = self.move_to_cuda(self.model)
+
         self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
             self.model.state_dict()
         )
@@ -1132,10 +1154,13 @@ class DTensorPolicyWorker:
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
+            # optimizer and scheduler
             optimizer=self.optimizer if optimizer_path else None,
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
+            # tokenizer and processor
             tokenizer=self.tokenizer if tokenizer_path else None,
+            processor=self.processor if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
         )
 

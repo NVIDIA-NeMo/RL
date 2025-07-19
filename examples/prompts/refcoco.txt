@@ -1,0 +1,5 @@
+Think step-by-step to solve the following problem, and answer in the following format: <think> step-by-step thought process </think> <answer> answer here </answer> 
+Note that your final answer must only contain a bounding box with top-left and bottom-right coordinates: i.e. [x1, y1, x2, y2].
+
+Let's think step-by-step: 
+{}

@@ -79,7 +79,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
 
-        for k in sorted(batches[0]):
+        for k in sorted(batches[0]):  
             list_of_tensors = [item[k] for item in batches]
 
             if isinstance(list_of_tensors[0], list):
@@ -268,7 +268,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             assert batch_size is None, (
                 "batch_size must be None if allow_uneven_shards is True"
             )
-
         # Get the total batch size
         batch_sizes = set()
         for val in self.data.values():
@@ -512,7 +511,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""
+        vlm_keys = get_vlm_keys_from_flattened_batch(self)
+
         for k, v in self.items():
+            # skip truncation for VLM keys
+            if k in vlm_keys:
+                continue
+
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
 
@@ -610,3 +615,24 @@ class SlicedDataDict(BatchedDataDict):
     """
 
     pass
+
+def get_vlm_keys_from_flattened_batch(batch: BatchedDataDict[Any]) -> list[str]:
+    """
+    Get VLM keys from a batch of data in a flattened format.
+
+    Note that in this case, the `vlm_keys` key is added to the batch dict before `get_logprobs` or `get_reference_policy_logprobs` functions are called.
+
+    This function is fundamentally different from the `get_vlm_keys_from_datumspec_batch` function, which is used for the `DatumSpec` format, and is 
+    only supposed to be used inside the `get_logprobs` function. Try not to use it elsewhere.
+    """
+    vlm_keys = batch.get("vlm_keys", [])
+    if len(vlm_keys) > 0:
+        if isinstance(vlm_keys[0], dict):
+            vlm_keys = [key for subdict in vlm_keys for key in subdict.keys()]
+            vlm_keys = list(set(vlm_keys))
+        elif isinstance(vlm_keys[0], str):
+            vlm_keys = list(set(vlm_keys))
+        elif isinstance(vlm_keys[0], list):
+            vlm_keys = [key for sublist in vlm_keys for key in sublist]
+            vlm_keys = list(set(vlm_keys))
+    return vlm_keys
