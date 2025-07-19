@@ -40,6 +40,11 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
+from nemo_rl.utils.flops_tracker import (
+    FLOPTracker,
+    get_default_hf_config,
+    get_theoretical_flops,
+)
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -142,6 +147,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             }
         else:
             self.use_dynamic_batches = False
+
+        # initialize FLOPs tracker
+        try:
+            self.flops_tracker = FLOPTracker.from_config(
+                config["model_name"], get_default_hf_config(config["model_name"])
+            )
+        except ValueError as e:
+            self.flops_tracker = None
+            print(f"FLOPS tracker not supported for model {config['model_name']}: {e}")
 
         self.cfg = config
 
@@ -300,6 +314,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_size=batch_size,
             )
 
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for shard in sharded_data:
+                input_lengths = shard["input_lengths"]
+                self.flops_tracker.track_batch(input_lengths.tolist())
+
         # Train each shard in parallel
         futures = self.worker_group.run_all_workers_sharded_data(
             "train",
@@ -329,6 +349,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
         }
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = len(results)
+
+            try:
+                aggregated_results["theoretical_flops"] = sum(
+                    get_theoretical_flops(r["gpu_name"], r["model_dtype"])
+                    for r in results
+                )
+            except Exception as e:
+                print(f"Error getting theoretical flops: {e}")
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
