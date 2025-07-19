@@ -222,10 +222,9 @@ class DTensorPolicyWorker:
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )
 
-        if sequence_parallel_enabled:
-            assert tp_size > 1, (
-                "Sequence parallel needs to be used together with tensor parallel. "
-                "Please either set tp_size > 1 or disable sequence parallel."
+        if sequence_parallel_enabled and tp_size == 1:
+            print(
+                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
 
         if cp_size > 1:

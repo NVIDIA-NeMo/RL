@@ -300,8 +300,7 @@ def training_setup(request, two_gpu_virtual_cluster):
 @pytest.mark.parametrize(
     "training_setup",
     [
-        # model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing
-        # Split grid over tp/cp/cpu/sp/act across qwen and llama
+        # model_name                        tp cp  sp     cpu    act
         (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, False, False),
         (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, True, False, False),
         (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, True, False),
@@ -317,7 +316,14 @@ def training_setup(request, two_gpu_virtual_cluster):
         (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, False, True, True),
         (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, True, True),
         (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, True, False),
+        (
+            TEST_ASSETS.TINY_GEMMA3_MODEL_PATH,
+            1,
+            1,
+            True,
+            True,
+            False,
+        ),  # gemma3 doesn't support spda
         (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, False, True),
         (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, False, True, True),
         (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, True, True),
