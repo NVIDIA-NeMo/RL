@@ -24,6 +24,7 @@ from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
+    SequencePackingArgs,
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -140,8 +141,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
                 "max_tokens_per_microbatch": 0,  # Override this in each different call (presumably different sizes)
             }
+            assert not config["sequence_packing"]["enabled"], (
+                "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
+            )
         else:
             self.use_dynamic_batches = False
+
+        if config["sequence_packing"]["enabled"]:
+            assert (
+                config["megatron_cfg"]["enabled"] or config["dtensor_cfg"]["enabled"]
+            ), "Sequence packing requires Megatron or DTensor policies."
+            self.use_sequence_packing = True
+            self.sequence_packing_args: SequencePackingArgs = {
+                "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
+                "logprob_mb_tokens": config["sequence_packing"].get(
+                    "logprob_mb_tokens", None
+                ),
+                "algorithm": config["sequence_packing"]["algorithm"],
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_pad_multiple": (cp_size * 2 * tp_size)
+                if cp_size > 1
+                else tp_size,
+            }
+            assert not config["dynamic_batching"]["enabled"], (
+                "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
+            )
+        else:
+            self.use_sequence_packing = False
 
         self.cfg = config
 
@@ -166,7 +193,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
 
@@ -175,32 +201,40 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            # we just shard into DP shards here as Sequence packing allows for CP.
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
             )
 
-        sharded_data_2d = []
-        shard_idx = 0
-        # Convert to 2d dim array
-        for _ in range(dp_size):
-            cp_data = []
-            for _ in range(cp_size):
-                cp_data.append(sharded_data[shard_idx])
-                shard_idx += 1
-            sharded_data_2d.append(cp_data)
-
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_logprobs",
-            data=sharded_data_2d,
-            in_sharded_axes=["data_parallel", "context_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
         )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
@@ -208,7 +242,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
@@ -223,7 +257,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         Returns: Identical to get_logprobs.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
         if self.use_dynamic_batches:
@@ -231,32 +264,39 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
-                cp_size * dp_size,
+                dp_size,
                 batch_size=None,
             )
 
-        sharded_data_2d = []
-        shard_idx = 0
-        # Convert to 2d dim array
-        for _ in range(dp_size):
-            cp_data = []
-            for _ in range(cp_size):
-                cp_data.append(sharded_data[shard_idx])
-                shard_idx += 1
-            sharded_data_2d.append(cp_data)
-
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_reference_policy_logprobs",
-            data=sharded_data_2d,
-            in_sharded_axes=["data_parallel", "context_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
@@ -267,7 +307,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
@@ -293,6 +333,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=batch_size,
                 dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["train_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+                sequence_packing_args=self.sequence_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(

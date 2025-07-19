@@ -51,6 +51,9 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+  
+  megatron_cfg:
+    enabled: false
 
   # dynamic_batching improves performance by ensuring logprob and training microbatches
   # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
@@ -58,9 +61,16 @@ policy:
   # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
   # training and logprob stages respectively.
   dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
     enabled: True
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
