@@ -26,7 +26,7 @@ import sys
 project = "NeMo-RL"
 copyright = "2025, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "0.2.1"
+release = "latest"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -75,6 +75,13 @@ autodoc2_docstring_parser_regexes = [
 
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
+    "icon_links": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/NVIDIA-NeMo/RL",
+            "icon": "fa-brands fa-github",
+        }
+    ],
     "switcher": {
         "json_url": "../versions1.json",
         "version_match": release,

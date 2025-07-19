@@ -1,0 +1,2 @@
+env_vars:
+  RAY_OVERRIDE_JOB_RUNTIME_ENV: "1"

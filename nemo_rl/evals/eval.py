@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 from typing import TypedDict
 
 import ray
+import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -38,6 +40,7 @@ class EvalConfig(TypedDict):
     metric: str
     num_tests_per_prompt: int
     seed: int
+    pass_k_value: int
 
 
 class MasterConfig(TypedDict):
@@ -83,15 +86,25 @@ def setup(
 
     # Check settings
     metric = eval_config["metric"]
+    pass_k_value = eval_config["pass_k_value"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     temperature = generation_config["temperature"]
     top_k = generation_config["top_k"]
-    # TODO @yukih: support pass@k and cons@k
-    assert metric in ["pass@1"], f"Invalid metric: {metric}"
+
+    # TODO @yukih: support cons@k
+    # Validate metrics
+    assert metric in ["pass@k"], f"Invalid metric: {metric}"
     if num_tests_per_prompt > 1:
         assert temperature > 0 and top_k != 1, (
             "temperature > 0 and top_k != 1 are required for multiple samples"
         )
+
+    assert pass_k_value >= 1, (
+        "pass_k_value must be greater than or equal to 1 for pass@k metric"
+    )
+    assert num_tests_per_prompt >= pass_k_value, (
+        "num_tests_per_prompt must be greater than or equal to pass_k_value for pass@k metric"
+    )
 
     # ==========================
     #           Data
@@ -150,6 +163,34 @@ def setup(
 # ===============================================================================
 
 
+def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> float:
+    """Evaluate pass@k score using an unbiased estimator.
+
+    Reference: https://github.com/huggingface/evaluate/blob/32546aafec25cdc2a5d7dd9f941fc5be56ba122f/metrics/code_eval/code_eval.py#L198-L213
+    Args:
+        rewards: Tensor of shape (batch_size * num_tests_per_prompt)
+        k: int (pass@k value)
+
+    Returns:
+        pass_k_score: float
+    """
+
+    def eval_single_chunk(n: int, c: int, k: int) -> float:
+        """Calculates 1 - comb(n - c, k) / comb(n, k)."""
+        if n - c < k:
+            return 1.0
+        return float(1.0 - torch.prod(1.0 - k / torch.arange(n - c + 1, n + 1)).item())
+
+    # rewards is a 1d tensor of size (batch_size * num_tests_per_prompt)
+    group_rewards = rewards.split(num_tests_per_prompt)
+    pass_k_score = 0.0
+    for group_reward in group_rewards:
+        num_correct = group_reward.sum().item()
+        pass_k_score += eval_single_chunk(num_tests_per_prompt, num_correct, k)
+
+    return pass_k_score
+
+
 def run_env_eval(vllm_generation, dataloader, env, master_config):
     """Main entry point for running evaluation using environment.
 
@@ -161,18 +202,35 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         env: Environment that scores responses.
         master_config: Configuration settings.
     """
+    # Check if async engine is enabled and run appropriate version
+    if master_config["generation"]["vllm_cfg"]["async_engine"]:
+        asyncio.run(
+            _run_env_eval_impl(
+                vllm_generation, dataloader, env, master_config, use_async=True
+            )
+        )
+    else:
+        asyncio.run(
+            _run_env_eval_impl(
+                vllm_generation, dataloader, env, master_config, use_async=False
+            )
+        )
+
+
+async def _run_env_eval_impl(
+    vllm_generation, dataloader, env, master_config, use_async=False
+):
+    """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
     generation_config = master_config["generation"]
     eval_config = master_config["eval"]
     metric = eval_config["metric"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
+    pass_k_value = eval_config["pass_k_value"]
 
     # Run evaluation loop
-    score, count = 0.0, 0
+    score = 0.0
     for batch in dataloader:
-        # update stats
-        count += batch.size * num_tests_per_prompt
-
         # measure multiple samples
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
@@ -186,7 +244,7 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
-        outputs = vllm_generation.generate_text(inputs)["texts"]
+        outputs = await _generate_texts(vllm_generation, inputs, use_async)
 
         # append to message_log
         for idx, output in enumerate(outputs):
@@ -203,10 +261,10 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
             for i in range(len(batch["message_log"]))
         ]
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
-
+        rewards = env_return.rewards
         # update stats
-        if metric == "pass@1":
-            score += env_return.rewards.sum().item()
+        if metric == "pass@k":
+            score += eval_pass_k(rewards, num_tests_per_prompt, pass_k_value)
         else:
             raise ValueError(f"Invalid metric: {metric}")
 
@@ -215,17 +273,54 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
     vllm_generation.shutdown()
 
     # Print results
+    _print_results(
+        master_config,
+        generation_config,
+        score,
+        len(dataloader.dataset),
+        metric,
+        pass_k_value,
+        num_tests_per_prompt,
+    )
+
+
+async def _generate_texts(vllm_generation, inputs, use_async):
+    """Generate texts using either sync or async method."""
+    if use_async:
+        # Use async generation - collect all results
+        results = []
+        async for idx, result in vllm_generation.generate_text_async(inputs):
+            results.append((idx, result["texts"][0]))
+
+        # Sort by index to maintain order
+        results.sort(key=lambda x: x[0])
+        return [text for _, text in results]
+    else:
+        # Use sync generation
+        return vllm_generation.generate_text(inputs)["texts"]
+
+
+def _print_results(
+    master_config,
+    generation_config,
+    score,
+    dataset_size,
+    metric,
+    pass_k_value,
+    num_tests_per_prompt,
+):
+    """Print evaluation results."""
     dataset_name = os.path.basename(master_config["data"]["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
     max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]
     top_k = generation_config["top_k"]
-    average_score = score / count
+    average_score = score / dataset_size
 
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
     print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
-    print(f"{metric=} {num_tests_per_prompt=}\n")
-    print(f"score={average_score:.4f} ({score}/{count})")
+    print(f"{metric=} {pass_k_value=} {num_tests_per_prompt=}\n")
+    print(f"score={average_score:.4f} ({score}/{dataset_size})")
     print("=" * 60 + "\n")

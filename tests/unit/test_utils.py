@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -28,10 +28,13 @@ class SimpleLoss:
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor | None,
         global_valid_toks: torch.Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # Just return mean of logprobs as the loss for testing
         loss = next_token_logits.mean()
         metrics = {
+            "loss": loss.item(),
             "test_metric": loss.item() * 0.5,
             "num_valid_samples": 1,
         }
@@ -48,6 +51,8 @@ class SimpleNLLLoss:
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor | None,
         global_valid_toks: torch.Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position

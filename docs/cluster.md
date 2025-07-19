@@ -25,9 +25,9 @@ sbatch \
     ray.sub
 ```
 
-```{tip}
+:::{tip}
 Depending on your Slurm cluster configuration, you may or may not need to include the `--gres=gpu:8` option in the `sbatch` command.
-```
+:::
 
 Upon successful submission, Slurm will print the `SLURM_JOB_ID`:
 ```text

@@ -28,7 +28,7 @@ from nemo_rl.environments.code_environment import (
 from nemo_rl.experience.rollouts import run_multi_turn_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy.hf_policy import HfPolicy, PolicyConfig
+from nemo_rl.models.policy.lm_policy import Policy, PolicyConfig
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 
@@ -58,6 +58,14 @@ basic_vllm_test_config: VllmConfig = {
         "disable_log_stats": True,
         "disable_log_requests": True,
         "gpu_memory_utilization": 0.6,
+        "enforce_eager": "False",
+    },
+    "colocated": {
+        "enabled": True,
+        "resources": {
+            "gpus_per_node": None,
+            "num_nodes": None,
+        },
     },
 }
 
@@ -290,7 +298,7 @@ def test_hf_execute_code(cluster, tokenizer, code_env):
         hf_config["generation"],
         tokenizer,
     )
-    hf_policy = HfPolicy(
+    policy = Policy(
         cluster, hf_config, tokenizer, init_reference_model=False, init_optimizer=False
     )
 
@@ -298,13 +306,13 @@ def test_hf_execute_code(cluster, tokenizer, code_env):
     task_to_env = {"code_execution": code_env}
 
     # Run rollout
-    hf_policy.prepare_for_generation()
+    policy.prepare_for_generation()
     output_batches = []
-    # Currently run_multi_turn_rollout only supports batch size = 1 for HFPolicy
+    # Currently run_multi_turn_rollout only supports batch size = 1 for Policy
     # so we shard the batch here
     for input_batch in initial_batch.shard_by_batch_size(shards=len(codes)):
         output_batch, _ = run_multi_turn_rollout(
-            policy_generation=hf_policy,
+            policy_generation=policy,
             input_batch=input_batch,
             tokenizer=tokenizer,
             task_to_env=task_to_env,
@@ -314,7 +322,7 @@ def test_hf_execute_code(cluster, tokenizer, code_env):
         )
         output_batches.append(output_batch)
     final_batch = BatchedDataDict.from_batches(output_batches)
-    hf_policy.finish_generation()
+    policy.finish_generation()
 
     # Check results
     for i, msg_log in enumerate(final_batch["message_log"]):

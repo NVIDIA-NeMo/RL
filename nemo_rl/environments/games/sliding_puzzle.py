@@ -338,7 +338,7 @@ class SlidingPuzzleRunner:
         )
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class SlidingPuzzleEnv(EnvironmentInterface):
     """Sliding Puzzle environment (Ray Actor)."""
 

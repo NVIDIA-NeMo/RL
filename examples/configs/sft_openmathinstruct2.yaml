@@ -34,7 +34,11 @@ policy:
     sequence_parallel: false
     activation_checkpointing: false
     tensor_parallel_size: 4
+    context_parallel_size: 1
     custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training

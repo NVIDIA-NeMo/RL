@@ -1,0 +1,125 @@
+dpo:
+  max_num_epochs: 1
+  max_num_steps: 150
+  val_period: 50
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: false
+  seed: 42
+
+  reference_policy_kl_penalty: 0.05
+  preference_average_log_probs: False
+  sft_average_log_probs: ${.preference_average_log_probs}
+  preference_loss_weight: 1
+  sft_loss_weight: 0.01
+
+checkpointing:
+  enabled: false #true
+  checkpoint_dir: "results/dpo"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 10000
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+  fsdp_offload_enabled: false
+  activation_checkpointing_enabled: false
+
+  dtensor_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: False
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "aux_loss"
+    moe_router_bias_update_rate: 1e-3
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6 #4.0e-5
+      min_lr: 5.0e-6 #4.0e-5
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "linear"
+      lr_decay_iters: 1000000000
+      lr_warmup_iters: 2
+      lr_warmup_init: 0.00000001
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+data:
+  dataset_name: "HelpSteer3"
+  max_input_seq_length: ${policy.max_total_sequence_length}
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

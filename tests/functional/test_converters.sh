@@ -1,0 +1,1 @@
+uv run --extra mcore tests/functional/test_converter_roundtrip.py

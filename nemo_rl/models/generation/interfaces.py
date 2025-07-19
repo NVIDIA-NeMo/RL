@@ -14,6 +14,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, NotRequired, Optional, TypedDict, Union
 
+import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -98,6 +99,15 @@ def verify_right_padding(
     return True, None
 
 
+class ColocationConfig(TypedDict):
+    class ResourcesConfig(TypedDict):
+        gpus_per_node: int
+        num_nodes: int
+
+    enabled: bool
+    resources: NotRequired[ResourcesConfig]
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -110,6 +120,7 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int]
     stop_strings: NotRequired[list[str]]
     pad_token_id: NotRequired[int]
+    colocated: NotRequired[ColocationConfig]
 
 
 class GenerationDatumSpec(TypedDict):
@@ -197,6 +208,13 @@ class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
     @abstractmethod
+    def init_collective(
+        self, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication."""
+        pass
+
+    @abstractmethod
     def generate(
         self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
     ) -> BatchedDataDict["GenerationOutputSpec"]:
@@ -210,6 +228,14 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
-    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        raise NotImplementedError
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
+        raise NotImplementedError
+
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+        """Update the model weights from collective communication."""
         raise NotImplementedError

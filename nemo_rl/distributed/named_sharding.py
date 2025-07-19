@@ -31,7 +31,7 @@ class NamedSharding:
         print(sharding.get_ranks(dp=0, pp=1)) # Output: [4, 5, 6, 7]
     """
 
-    def __init__(self, layout: Sequence[Any], names: list[str]):
+    def __init__(self, layout: Sequence[Any] | np.ndarray, names: list[str]):
         """Initializes the NamedSharding object.
 
         Args:

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
+import ray
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -94,6 +95,12 @@ class PolicyInterface(ABC):
 
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
+    def init_collective(
+        self, ip: str, port: int, world_size: int
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
     def offload_before_refit(self) -> None:
         pass
 
@@ -102,9 +109,17 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        pass
+
+    @abstractmethod
     def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
         pass
 
     @abstractmethod
     def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         pass

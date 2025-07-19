@@ -78,7 +78,7 @@ jobs:
         - name: Setup docker run command
           run: |
             GITHUB_ACTION_DIR=$(dirname $GITHUB_STEP_SUMMARY)
-            DOCKER_RUN_CMD="docker run -u root --runtime=nvidia --gpus all \
+            DOCKER_RUN_CMD="docker run --rm -u root --runtime=nvidia --gpus all \
             --shm-size=64g \
             --env TRANSFORMERS_OFFLINE=0 \
             --env HYDRA_FULL_ERROR=1 \
@@ -138,7 +138,7 @@ jobs:
             RUN_TEST_EOF
             )
             GITHUB_ACTION_DIR=$(dirname $GITHUB_STEP_SUMMARY)
-            docker run \
+            docker run --rm \
             --env GITHUB_STEP_SUMMARY \
             --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
             --volume $GITHUB_WORKSPACE:/opt/nemo-rl \
@@ -157,4 +157,4 @@ jobs:
           if: always()
           run: |
             # Ensure any added files in the mounted directory are owned by the runner user to allow it to clean up
-            docker run nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -c "find /opt/nemo-rl -path '/opt/nemo-rl/datasets' -prune -o -exec chown $(id -u):$(id -g) {} +"
+            docker run --rm nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -c "find /opt/nemo-rl -path '/opt/nemo-rl/datasets' -prune -o -exec chown $(id -u):$(id -g) {} +"
