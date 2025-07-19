@@ -207,7 +207,7 @@ class RayVirtualCluster:
         self.placement_group_strategy = placement_group_strategy
 
     def _init_placement_groups(
-        self, strategy: str | None = None, use_unified_pg: bool | None = None
+        self, strategy: str | None = None, use_unified_pg: bool = False
     ) -> list[PlacementGroup]:
         """Creates placement groups based on whether cross-node model parallelism is needed.
 
@@ -244,10 +244,9 @@ class RayVirtualCluster:
                 )
                 time.sleep(2**i)
                 continue
-        else:
-            raise ResourceInsufficientError(
-                f"Maximum number of retries reached ({max_retries}). Cluster resources may be insufficient or cluster itself is highly unstable. Please check your cluster configuration and your cluster logs."
-            )
+        raise ResourceInsufficientError(
+            f"Maximum number of retries reached ({max_retries}). Cluster resources may be insufficient or cluster itself is highly unstable. Please check your cluster configuration and your cluster logs."
+        )
 
     def _create_placement_groups_internal(
         self, strategy: str, use_unified_pg: bool = False

@@ -14,7 +14,7 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
@@ -47,7 +47,7 @@ class SFTSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: float
+    val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -94,10 +94,10 @@ def setup(
     StatefulDataLoader,
     StatefulDataLoader,
     NLLLoss,
-    MasterConfig,
     Logger,
-    TaskDataSpec,
+    CheckpointManager,
     SFTSaveState,
+    MasterConfig,
 ]:
     """Main entry point for running SFT algorithm.
 
@@ -124,8 +124,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    sft_save_state: Optional[SFTSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    sft_save_state: Optional[SFTSaveState] = cast(
+        Optional[SFTSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
 
     # ==========================
@@ -322,8 +322,8 @@ def sft_train(
     logger,
     sft_task_spec,
     checkpointer,
-    sft_save_state,
-):
+    sft_save_state: SFTSaveState,
+) -> None:
     # Run basic sft training
     timer = Timer()
 

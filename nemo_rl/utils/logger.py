@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import ray
 import requests
@@ -36,7 +36,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
-from typing_extensions import NotRequired
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -67,6 +66,7 @@ class LoggerConfig(TypedDict):
     tensorboard: TensorboardConfig
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
+    num_val_samples_to_print: int
 
 
 class LoggerInterface(ABC):
@@ -350,6 +350,7 @@ class RayGpuMonitorLogger:
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
+        self.start_time: float = float("-inf")
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""

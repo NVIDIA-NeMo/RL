@@ -24,7 +24,7 @@ def is_free(port):
 print("Size\tRange")
 print("-" * 20)
 
-start = None
+start: int | None = None
 for port in range(1024, 65536):
     if is_free(port):
         if start is None:

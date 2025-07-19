@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from typing import NamedTuple, Optional
+from typing import Generic, NamedTuple, TypeVar
 
 from torch import Tensor
 
+from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Type variable for environment-specific metadata
+MetadataT = TypeVar("MetadataT")
 
-class EnvironmentReturn(NamedTuple):
+
+class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     """Standard batched return type for environment step methods.
 
     **All elements are batched.**
@@ -37,21 +41,19 @@ class EnvironmentReturn(NamedTuple):
     """
 
     observations: list[dict[str, str]]
-    metadata: list[Optional[dict]]
+    metadata: list[MetadataT]
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
     terminateds: Tensor
 
 
-class EnvironmentInterface(abc.ABC):
+class EnvironmentInterface(abc.ABC, Generic[MetadataT]):
     @abc.abstractmethod
     def step(
         self,
-        message_log_batch: list[list[dict[str, str]]],
-        metadata: list[Optional[dict]],
-        *args,
-        **kwargs,
-    ) -> EnvironmentReturn:
+        message_log_batch: list[LLMMessageLogType],
+        metadata: list[MetadataT],
+    ) -> EnvironmentReturn[MetadataT]:
         """Runs a step in the environment. Allows for asynchrony with remote servers, but it's not required (this function is a ray remote).
 
         message_log_batch: batch of OpenAI-API-like message logs that represent interactions with the LLM.

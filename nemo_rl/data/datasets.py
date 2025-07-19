@@ -49,13 +49,13 @@ class AllTaskProcessedDataset:
 
     def __init__(
         self,
-        dataset: Union[Dataset, Any],
+        dataset: Dataset | Any,
         tokenizer: TokenizerType,
         default_task_data_spec: TaskDataSpec,
-        task_data_processors: Union[
-            dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]],
-            TaskDataProcessFnCallable,
-        ],
+        task_data_processors: (
+            dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]]
+            | TaskDataProcessFnCallable
+        ),
         max_seq_length: Optional[int] = None,
     ):
         self.dataset = dataset
