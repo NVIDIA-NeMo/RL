@@ -22,6 +22,8 @@ ckpts/
 # Test
 coverage.json
 .coverage*
+unit_results.json
+unit_results/
 test_assets/
 
 # Cache

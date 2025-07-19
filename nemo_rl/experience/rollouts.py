@@ -42,6 +42,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.policy.lm_policy import Policy
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -331,6 +332,10 @@ def run_multi_turn_rollout(
     batch_size = len(current_batch["message_log"])
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
+    if isinstance(policy_generation, Policy):
+        assert batch_size == 1, (
+            "Batch size > 1 is not supported for multi-turn rollout with HF policy"
+        )
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -410,6 +415,8 @@ def run_multi_turn_rollout(
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
+            # tokenizer returns torch.float32 when env_obs_content is empty
+            tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
             # check if new message overflows max_seq_len
             if (
