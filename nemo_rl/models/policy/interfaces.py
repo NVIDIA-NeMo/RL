@@ -117,7 +117,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    def get_weights_ipc_handles(
+        self, keys: list[str], refit_idx: int
+    ) -> dict[str, Any]:
         pass
 
     @abstractmethod

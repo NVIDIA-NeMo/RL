@@ -970,7 +970,17 @@ class DTensorPolicyWorker:
         return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
-    def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
+    def get_weights_ipc_handles(
+        self, keys: list[str], refit_idx: int
+    ) -> dict[str, Any]:
+        """Get IPC handles for the requested DTensor model weights.
+
+        Args:
+            keys: List of parameter names to get handles for
+            refit_idx: not used for DTensor model
+        Returns:
+            Dict mapping device UUID to list of (mapped_key, handle) tuples
+        """
         from torch.multiprocessing.reductions import reduce_tensor
 
         assert self._held_sharded_state_dict_reference is not None, (

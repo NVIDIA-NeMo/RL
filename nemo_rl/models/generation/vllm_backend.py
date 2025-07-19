@@ -15,6 +15,7 @@ import os
 from typing import Any, Iterable, Optional
 
 import torch
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 try:
     import vllm  # noqa: F401
@@ -108,25 +109,34 @@ class VllmInternalWorkerExtension:
             non-colocated inference: not implemented yet
         """
         self.state_dict_info = state_dict_info
+        self.refit_offset_info = []  # used for tensor packing case
 
-    def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
+    def update_weights_from_global_ipc_handles(
+        self, global_device_ipc_handles, refit_idx: int
+    ):
         """Update weights from global IPC handles.
 
         Args:
             global_device_ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
+            refit_idx (int): index of the refit step.
 
         Returns:
             bool: True if weights were successfully updated.
         """
         device_uuid = self.report_device_id()
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
-        return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
+        return self.update_weights_from_local_ipc_handles(
+            local_device_ipc_handles, refit_idx
+        )
 
-    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
+    def update_weights_from_local_ipc_handles(
+        self, local_device_ipc_handles, refit_idx: int
+    ):
         """Update weights from local IPC handles.
 
         Args:
             local_device_ipc_handles (dict): parameter IPC handles for local device.
+            refit_idx (int): index of the refit step.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -150,25 +160,34 @@ class VllmInternalWorkerExtension:
                 # Extract packed tensor from IPC handle
                 dtype_to_packed_tensor = {}
                 for dtype, tensor_handle in all_handles:
-                    func, args = tensor_handle
+                    func = rebuild_cuda_tensor
+                    args = tensor_handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
                     tensor = func(*list_args)
                     dtype_to_packed_tensor[dtype] = tensor
 
-                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
-                # using extra memory.
-                for key, metadata in tensor_metadata.items():
-                    # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                    if isinstance(metadata, tuple):
-                        # use dtype of current step
-                        offset, dtype = metadata
-                        shape, _, size = self.state_dict_info[key]
-                        # update record
-                        self.state_dict_info[key] = (shape, dtype, size)
-                    else:
-                        offset = metadata
-                        shape, dtype, size = self.state_dict_info[key]
+                if refit_idx >= len(self.refit_offset_info):
+                    assert tensor_metadata is not None, (
+                        "tensor_metadata should not be None when refit_idx >= len(self.refit_offset_info)"
+                    )
+                    assert refit_idx == len(self.refit_offset_info), (
+                        f"refit_idx {refit_idx} should be equal to len(self.refit_offset_info) {len(self.refit_offset_info)}"
+                    )
+                    self.refit_offset_info.append(tensor_metadata)
+                elif tensor_metadata is None:
+                    # None means the tensor_metadata is the same as the record
+                    # we can directly use the record to avoid extra data transfer
+                    tensor_metadata = self.refit_offset_info[refit_idx]
+                else:
+                    # Not None means the tensor_metadata is different from the record
+                    # we need to update the record
+                    self.refit_offset_info[refit_idx] = tensor_metadata
+
+                # Unpack tensor to weights.
+                for key, offset in tensor_metadata.items():
+                    shape, dtype, size = self.state_dict_info[key]
+                    # Here we only return a view of the tensor to avoid using extra memory.
                     tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
                         *shape
                     )
@@ -176,7 +195,8 @@ class VllmInternalWorkerExtension:
             else:
                 # Process each handle to get the tensor
                 for name, handle in name_and_handle_list:
-                    func, args = handle
+                    func = rebuild_cuda_tensor
+                    args = handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
                     tensor = func(*list_args)

@@ -49,6 +49,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.module import Float16Module
 from megatron.inference.text_generation.mcore_engine_server import (
     run_mcore_engine,
 )
@@ -179,11 +180,25 @@ def setup_megatron_model(
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
         def freeze_moe_router(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
             for layer in model_module.decoder.layers:
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.weight.requires_grad = False
 
+        # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
+        # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
+        def re_enable_float32_expert_bias(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
+            for layer in model_module.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router._maintain_float32_expert_bias()
+
         model_post_init_fns.append(freeze_moe_router)
+        model_post_init_fns.append(re_enable_float32_expert_bias)
 
     # Model, optimizer, and learning rate.
     model = get_model_from_config(
@@ -688,9 +703,10 @@ class MegatronPolicyWorker:
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
-        self.refit_param_info_hf = None
+        self.refit_param_info_mcore = None
         self.local_key_to_global_keys = None
         ## used for streaming update inference engine weights
+        self._refit_offset_info = []  # used for tensor packing case
         self._held_gather_buffer = None
 
     def is_alive(self):
@@ -1265,20 +1281,18 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     def prepare_refit_info(self) -> None:
         # Get parameter info for refit
-        ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
-        refit_param_info_mcore = get_param_info(self.model, self.dtype)
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Create a map that maps any local parameter name to a list of global parameter names.
         # This map is repeatedly used by parameter gatherring phase during refit of every step.
         self.local_key_to_global_keys = get_local_key_to_global_keys(
-            self.model, state_dict_info=refit_param_info_mcore
+            self.model, state_dict_info=self.refit_param_info_mcore
         )
 
         # Collect tensor metadata for refit
-        self.refit_param_info_hf = {}
-        for key, _ in refit_param_info_mcore:
+        refit_param_info_hf = {}
+        for key, _ in self.refit_param_info_mcore:
             # gather megatron params
             gathered_megatron_params = gather_params(
                 self.model,
@@ -1291,15 +1305,14 @@ class MegatronPolicyWorker:
             )
             # collect tensor metadata
             for name, tensor in gathered_hf_params.items():
-                self.refit_param_info_hf[name] = (
+                refit_param_info_hf[name] = (
                     tensor.shape,
                     tensor.dtype,
                     tensor.numel(),
                 )
 
-        return self.refit_param_info_hf
+        return refit_param_info_hf
 
-    @torch.no_grad()
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1307,12 +1320,6 @@ class MegatronPolicyWorker:
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        # Get parameter info for refit
-        ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
-        refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1323,15 +1330,25 @@ class MegatronPolicyWorker:
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
 
-        return refit_param_info_mcore, total_available_bytes
+        return self.refit_param_info_mcore, total_available_bytes
+
+    def get_handle_from_tensor(self, tensor: torch.Tensor) -> tuple[str, Any]:
+        """Get IPC handle from a tensor."""
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        # skip serializing the function for better refit performance
+        return reduce_tensor(tensor.detach())[1:]
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
-    def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
+    def get_weights_ipc_handles(
+        self, *, keys: list[str], refit_idx: int
+    ) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
         Args:
             keys: List of parameter names to get handles for
+            refit_idx: Index of the refit step, used for tensor packing case
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
@@ -1351,7 +1368,6 @@ class MegatronPolicyWorker:
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
-        from torch.multiprocessing.reductions import reduce_tensor
 
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
@@ -1370,21 +1386,7 @@ class MegatronPolicyWorker:
 
             # Record offset of the tensor
             for key, tensor in gathered_hf_params.items():
-                # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                if tensor.dtype == self.refit_param_info_hf[key][1]:
-                    tensor_metadata[key] = type_to_total_size[tensor.dtype]
-                else:
-                    # also send dtype if it changes
-                    tensor_metadata[key] = (
-                        type_to_total_size[tensor.dtype],
-                        tensor.dtype,
-                    )
-                    # update record
-                    self.refit_param_info_hf[key] = (
-                        tensor.shape,
-                        tensor.dtype,
-                        tensor.numel(),
-                    )
+                tensor_metadata[key] = type_to_total_size[tensor.dtype]
                 type_to_total_size[tensor.dtype] += tensor.numel()
 
             # Allocate consolidated tensors for each dtype
@@ -1401,8 +1403,6 @@ class MegatronPolicyWorker:
             # Copy tensors into consolidated buffers
             for key, tensor in gathered_hf_params.items():
                 offset = tensor_metadata[key]
-                if isinstance(offset, tuple):
-                    offset, _ = offset
                 dtype = tensor.dtype
                 size = tensor.numel()
                 packed_tensors[dtype][offset : offset + size].copy_(
@@ -1411,18 +1411,44 @@ class MegatronPolicyWorker:
 
             # Create IPC handles for consolidated tensors
             all_handles = [
-                (dtype, reduce_tensor(tensor.detach()))
+                (dtype, self.get_handle_from_tensor(tensor))
                 for dtype, tensor in packed_tensors.items()
             ]
 
             # Store reference to prevent garbage collection
             self._held_gather_buffer = packed_tensors
 
-            serialized = (pack_tensor_for_ipc, all_handles, tensor_metadata)
+            # Choose how to serialize the tensor packing info
+            if refit_idx >= len(self._refit_offset_info):
+                # add record and send full tensor_metadata
+                assert refit_idx == len(self._refit_offset_info), (
+                    f"refit_idx {refit_idx} should be equal to len(self._refit_offset_info) {len(self._refit_offset_info)}"
+                )
+                self._refit_offset_info.append(tensor_metadata)
+                serialized = (pack_tensor_for_ipc, all_handles, tensor_metadata)
+            else:
+                # check if the tensor_metadata is the same as the record
+                is_equal = True
+                record = self._refit_offset_info[refit_idx]
+                if len(record) != len(tensor_metadata):
+                    is_equal = False
+                else:
+                    for key, offset in tensor_metadata.items():
+                        if key not in record or record[key] != offset:
+                            is_equal = False
+                            break
+
+                if is_equal:
+                    # only pass refit_idx to minimize data transfer
+                    serialized = (pack_tensor_for_ipc, all_handles, None)
+                else:
+                    # update record and send full tensor_metadata
+                    self._refit_offset_info[refit_idx] = tensor_metadata
+                    serialized = (pack_tensor_for_ipc, all_handles, tensor_metadata)
         else:
             all_handles = []
             for key, tensor in gathered_hf_params.items():
-                handle = reduce_tensor(tensor.detach())
+                handle = self.get_handle_from_tensor(tensor)
                 all_handles.append((key, handle))
             self._held_gather_buffer = gathered_hf_params
             serialized = (False, all_handles)

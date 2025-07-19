@@ -424,10 +424,10 @@ def refit_policy_generation(
             f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
         )
         # do update
-        for keys in grouped_param_keys:
-            ipc_handles = policy.get_weights_ipc_handles(keys)
+        for idx, keys in enumerate(grouped_param_keys):
+            ipc_handles = policy.get_weights_ipc_handles(keys, refit_idx=idx)
             update_success = policy_generation.update_weights_from_ipc_handles(
-                ipc_handles
+                ipc_handles, refit_idx=idx
             )
             if not update_success:
                 break

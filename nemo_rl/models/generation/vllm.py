@@ -1029,11 +1029,14 @@ class VllmGenerationWorker:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(
+        self, ipc_handles: dict[str, Any], refit_idx: int
+    ) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            refit_idx (int): index of the refit step.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -1053,7 +1056,7 @@ class VllmGenerationWorker:
                 assert len(self.vllm_device_ids) == 1
                 result_or_coro = self.llm.collective_rpc(
                     "update_weights_from_local_ipc_handles",
-                    args=(ipc_handles[self.vllm_device_ids[0]],),
+                    args=(ipc_handles[self.vllm_device_ids[0]], refit_idx),
                 )
             else:
                 """
@@ -1061,7 +1064,7 @@ class VllmGenerationWorker:
                 leading to unnecessary network serialization overhead and potential performance degradation.
 
                 result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_global_ipc_handles", args=(ipc_handles,)
+                    "update_weights_from_global_ipc_handles", args=(ipc_handles, refit_idx)
                 )
                 """
                 ray_worker_outputs = []
@@ -1073,6 +1076,7 @@ class VllmGenerationWorker:
                         worker.execute_method.remote(
                             "update_weights_from_local_ipc_handles",
                             ipc_handles[device_id],
+                            refit_idx,
                         )
                     )
 
@@ -1095,12 +1099,13 @@ class VllmGenerationWorker:
             return False
 
     async def update_weights_from_ipc_handles_async(
-        self, ipc_handles: dict[str, Any]
+        self, ipc_handles: dict[str, Any], refit_idx: int
     ) -> bool:
         """Async version of update_weights_from_ipc_handles.
 
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            refit_idx (int): index of the refit step.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -1117,7 +1122,7 @@ class VllmGenerationWorker:
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_global_ipc_handles", args=(ipc_handles,)
+                "update_weights_from_global_ipc_handles", args=(ipc_handles, refit_idx)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1935,13 +1940,16 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(
+        self, ipc_handles: dict[str, Any], refit_idx: int
+    ) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
 
         For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
 
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            refit_idx (int): index of the refit step.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -1971,6 +1979,7 @@ class VllmGeneration(GenerationInterface):
                 method_name,
                 ipc_handles=ipc_handles_list,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                common_kwargs={"refit_idx": refit_idx},
             )
             # Wait for all futures to complete
             results = ray.get(futures)

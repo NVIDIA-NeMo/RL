@@ -459,7 +459,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return grouped_param_keys
 
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    def get_weights_ipc_handles(
+        self, keys: list[str], refit_idx: int
+    ) -> dict[str, Any]:
         """Fetch weight IPC handles from all workers.
 
         Returns:
@@ -468,7 +470,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Collect IPC handles from all workers
         worker_handles: list[dict[str, Any]] = ray.get(
             [
-                worker.get_weights_ipc_handles.remote(keys=keys)
+                worker.get_weights_ipc_handles.remote(keys=keys, refit_idx=refit_idx)
                 for worker in self.worker_group.workers
             ]
         )
