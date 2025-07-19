@@ -17,7 +17,7 @@ import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, List, Optional, Set, Union, cast
+from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
 import torch
@@ -27,9 +27,6 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
-from torch.distributed.fsdp import (
-    FSDPModule,
-)
 from torch.distributed.tensor import DTensor, Shard
 from transformers import AutoConfig, AutoTokenizer
 from transformers.integrations.accelerate import find_tied_parameters
@@ -38,15 +35,23 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components._transformers.utils import sliding_window_overwrite
 from nemo_automodel.components.distributed.cp_utils import create_context_parallel_ctx, get_train_context
-from nemo_automodel.components.distributed.parallelizer import fsdp2_strategy_parallelize
+from nemo_automodel.components.distributed.parallelizer import (
+    fsdp2_strategy_parallelize,
+    unshard_fsdp2_model,
+)
+from nemo_automodel.components.distributed.tensor_utils import (
+    get_cpu_state_dict,
+    to_local_if_dtensor,
+)
+from nemo_automodel.components.distributed.grad_utils import (
+    clip_grad_by_total_norm_,
+    get_grad_norm,
+)
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.dtensor.parallelize import (
-    clip_grad_by_total_norm_,
-    get_grad_norm,
+from nemo_rl.distributed.model_utils import (
     get_logprobs_from_vocab_parallel_logits,
-    to_local_if_dtensor,
 )
 
 from nemo_rl.models.huggingface.common import ModelFlag
@@ -64,54 +69,6 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-
-
-@contextmanager
-def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
-    """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
-    try:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.unshard()
-        yield
-    finally:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.reshard()
-
-
-@torch.no_grad()
-def get_cpu_state_dict(
-    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
-    pin_memory: bool = False,
-) -> dict[str, torch.Tensor]:
-    """Copy the state dict generator to CPU memory.
-
-    Args:
-        state_generator (Iterable[tuple[str, Union[torch.Tensor, DTensor]]]):
-            An iterable that yields (key, tensor) pairs from a model state.
-        pin_memory (bool, optional):
-            Whether to allocate the CPU tensors in pinned memory for faster GPU transfer.
-            Defaults to False.
-
-    Returns:
-        dict[str, torch.Tensor]: A dictionary mapping parameter names to CPU tensors.
-    """
-    new_state_dict = {}
-    for k, v in state_generator:
-        val = to_local_if_dtensor(v)
-
-        if len(val.shape) == 0:
-            new_state_dict[k] = val.cpu()
-        else:
-            cpu_tensor = torch.empty(
-                *val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype
-            )
-            cpu_tensor.copy_(val, non_blocking=True)
-            new_state_dict[k] = cpu_tensor
-
-    torch.cuda.synchronize()
-    return new_state_dict
 
 
 @ray.remote(
