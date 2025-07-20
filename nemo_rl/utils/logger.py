@@ -38,7 +38,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
-from typing_extensions import NotRequired
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
