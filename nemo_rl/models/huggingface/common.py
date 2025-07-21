@@ -40,8 +40,7 @@ class ModelFlag(Enum):
 
     Flags:
         SKIP_DTENSOR_TIED_WEIGHTS_CHECK: Models that should skip the tied weights check
-                                 for the DTensor Policy even without setting the
-                                 NRL_SKIP_TIED_WEIGHT_CHECK flag.
+                                 for the DTensor Policy.
         VLLM_LOAD_FORMAT_AUTO: Models that should use the "auto" load format when initializing
                                VLLM.
 
