@@ -159,6 +159,9 @@ logger:
     project: "grpo-dev"
     name: "sj_megatron_1B"
   tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "sj_megatron_1B"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
