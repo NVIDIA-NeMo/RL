@@ -132,11 +132,15 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
   tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
   tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-logger"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

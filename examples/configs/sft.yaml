@@ -133,12 +133,16 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "sft-dev-${data.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
