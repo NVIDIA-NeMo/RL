@@ -108,6 +108,9 @@ jobs:
     needs: [pre-flight]
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    outputs:
+      failed: ${{ steps.check.outputs.failed }}
+      comment_body: ${{ steps.check.outputs.comment_body }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -119,6 +122,7 @@ jobs:
           git fetch origin ${{ github.base_ref }}
       
       - name: Check submodule fast-forward status
+        id: check
         shell: bash -x -e {0}
         run: |
           echo "Checking submodules are fast-forwarded..."
@@ -128,6 +132,7 @@ jobs:
           git submodule status
           
           failed=0
+          comment_body=""
           
           # Process each submodule from git submodule status
           while read -r line; do
@@ -166,6 +171,14 @@ jobs:
               }
             fi
             
+            # Get GitHub repository URL for comment
+            remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+            if [[ "$remote_url" == *.git ]]; then
+              github_repo="${remote_url%.git}"
+            else
+              github_repo="$remote_url"
+            fi
+            
             # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
               echo "✅ $submodule_name: PR branch matches ${{ github.base_ref }} branch (same commit)"
@@ -183,6 +196,11 @@ jobs:
               echo "📊 Missing commits from ${{ github.base_ref }} that should be included:"
               git log --oneline --graph "$current_commit".."$target_commit" 2>/dev/null || echo "   (Unable to show missing commits)"
               failed=1
+              if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
+                comment_body+="$submodule_name: ❌ PR branch is BEHIND ${{ github.base_ref }} branch"$'\n'
+                comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
+              fi
               
             else
               # Case 4: Commits have diverged or have no common ancestor
@@ -197,18 +215,13 @@ jobs:
                 git log --oneline -1 "$common_ancestor" 2>/dev/null || echo "   (Unable to show common ancestor)"
                 echo ""
                 echo "   For detailed commit history inspection:"
-                
-                # Get GitHub repository URL dynamically from git remote
-                remote_url=$(git remote get-url origin 2>/dev/null || echo "")
-                if [[ "$remote_url" == *.git ]]; then
-                  github_repo="${remote_url%.git}"
-                else
-                  github_repo="$remote_url"
-                fi
-                
+                failed=1
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
                   echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
+                  comment_body+="$submodule_name: ❌ Commits have DIVERGED from a common ancestor"$'\n'
+                  comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                  comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
                   echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
@@ -219,30 +232,31 @@ jobs:
                 echo "   This indicates commits are from completely different repositories or history"
                 echo ""
                 echo "📊 For detailed commit inspection:"
-                
-                # Get GitHub repository URL dynamically from git remote
-                remote_url=$(git remote get-url origin 2>/dev/null || echo "")
-                if [[ "$remote_url" == *.git ]]; then
-                  github_repo="${remote_url%.git}"
-                else
-                  github_repo="$remote_url"
-                fi
-                
+                failed=1
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
                   echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
+                  comment_body+="$submodule_name: ❌ Commits have NO COMMON ANCESTOR"$'\n'
+                  comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                  comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
                   echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"
                 fi
               fi
-              
-              failed=1
             fi
             cd "$GITHUB_WORKSPACE"
             
           done < <(git submodule status)
+          
+          # Set outputs
+          echo "failed=$failed" >> $GITHUB_OUTPUT
+          if [[ $failed -eq 1 ]]; then
+            echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+            echo "$comment_body" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
           
           if [[ $failed -eq 1 ]]; then
             echo ""
@@ -253,6 +267,31 @@ jobs:
           
           echo ""
           echo "✅ All submodules are properly fast-forwarded"
+
+  submodule-comment:
+    name: Comment on submodule check failure
+    needs: [submodule-check]
+    runs-on: ubuntu-latest
+    if: always() && needs.submodule-check.outputs.failed == '1' && github.event_name == 'pull_request'
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentBody = `## ❌ Submodule Fast-Forward Check Failed
+            
+            The following submodules need attention:
+            
+            ${{ needs.submodule-check.outputs.comment_body }}
+            
+            Please ensure all submodule commits are fast-forwards of the ${{ github.base_ref }} branch before merging.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
 
   #lint-check:
   #  name: Lint check
