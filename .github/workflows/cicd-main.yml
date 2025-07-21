@@ -110,6 +110,7 @@ jobs:
     if: github.event_name == 'pull_request'
     outputs:
       failed: ${{ steps.check.outputs.failed }}
+      changed: ${{ steps.check.outputs.changed }}
       comment_body: ${{ steps.check.outputs.comment_body }}
     steps:
       - name: Checkout repository
@@ -132,7 +133,9 @@ jobs:
           git submodule status
           
           failed=0
-          comment_body=""
+          changed=0
+          success_body=""
+          failed_body=""
           
           # Process each submodule from git submodule status
           while read -r line; do
@@ -182,12 +185,15 @@ jobs:
             # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
               echo "✅ $submodule_name: PR branch matches ${{ github.base_ref }} branch (same commit)"
+              # No change, so don't add to changed count or comment
               
             # Case 2: Check if target commit is an ancestor of current commit (current is fast-forward)
             elif git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
               echo "✅ $submodule_name: PR branch is ahead of ${{ github.base_ref }} branch (fast-forward)"
               echo "📊 Commits added in PR #${{ github.event.number }} (${{ github.head_ref }} branch):"
               git log --oneline --graph "$target_commit".."$current_commit" 2>/dev/null || echo "   (Unable to show progression - possibly shallow clone)"
+              changed=1
+              success_body+="$submodule_name: ✅ PR branch is ahead of ${{ github.base_ref }} branch (fast-forward)"$'\n'
               
             # Case 3: Check if current commit is an ancestor of target commit (current is behind)
             elif git merge-base --is-ancestor "$current_commit" "$target_commit" 2>/dev/null; then
@@ -196,10 +202,11 @@ jobs:
               echo "📊 Missing commits from ${{ github.base_ref }} that should be included:"
               git log --oneline --graph "$current_commit".."$target_commit" 2>/dev/null || echo "   (Unable to show missing commits)"
               failed=1
+              changed=1
               if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
-                comment_body+="$submodule_name: ❌ PR branch is BEHIND ${{ github.base_ref }} branch"$'\n'
-                comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
-                comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
+                failed_body+="$submodule_name: ❌ PR branch is BEHIND ${{ github.base_ref }} branch"$'\n'
+                failed_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                failed_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
               fi
               
             else
@@ -216,16 +223,20 @@ jobs:
                 echo ""
                 echo "   For detailed commit history inspection:"
                 failed=1
+                changed=1
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
                   echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
-                  comment_body+="$submodule_name: ❌ Commits have DIVERGED from a common ancestor"$'\n'
-                  comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
-                  comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
+                  failed_body+="$submodule_name: ❌ Commits have DIVERGED from a common ancestor"$'\n'
+                  failed_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                  failed_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
                   echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"
+                  failed_body+="$submodule_name: ❌ Commits have DIVERGED from a common ancestor"$'\n'
+                  failed_body+="   TARGET (${{ github.base_ref }} branch): $target_commit"$'\n'
+                  failed_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"$'\n\n'
                 fi
               else
                 echo "❌ $submodule_name: Commits have NO COMMON ANCESTOR"
@@ -233,16 +244,20 @@ jobs:
                 echo ""
                 echo "📊 For detailed commit inspection:"
                 failed=1
+                changed=1
                 if [[ -n "$github_repo" && "$github_repo" == https://github.com/* ]]; then
                   echo "   TARGET (${{ github.base_ref }} branch):  $github_repo/commits/$target_commit/"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"
-                  comment_body+="$submodule_name: ❌ Commits have NO COMMON ANCESTOR"$'\n'
-                  comment_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
-                  comment_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
+                  failed_body+="$submodule_name: ❌ Commits have NO COMMON ANCESTOR"$'\n'
+                  failed_body+="   TARGET (${{ github.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
+                  failed_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
                 else
                   echo "   Repository: $github_repo (unable to generate GitHub URLs)"
                   echo "   TARGET (${{ github.base_ref }} branch): $target_commit"
                   echo "   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"
+                  failed_body+="$submodule_name: ❌ Commits have NO COMMON ANCESTOR"$'\n'
+                  failed_body+="   TARGET (${{ github.base_ref }} branch): $target_commit"$'\n'
+                  failed_body+="   CURRENT (PR #${{ github.event.number }} from ${{ github.head_ref }}): $current_commit"$'\n\n'
                 fi
               fi
             fi
@@ -252,7 +267,17 @@ jobs:
           
           # Set outputs
           echo "failed=$failed" >> $GITHUB_OUTPUT
-          if [[ $failed -eq 1 ]]; then
+          echo "changed=$changed" >> $GITHUB_OUTPUT
+          if [[ $changed -eq 1 ]]; then
+            comment_body=""
+            if [[ -n "$success_body" ]]; then
+              comment_body+="### ✅ Submodules that are properly updated:"$'\n'
+              comment_body+="$success_body"$'\n'
+            fi
+            if [[ -n "$failed_body" ]]; then
+              comment_body+="### ❌ Submodules that need attention:"$'\n'
+              comment_body+="$failed_body"
+            fi
             echo "comment_body<<EOF" >> $GITHUB_OUTPUT
             echo "$comment_body" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
@@ -272,21 +297,23 @@ jobs:
     name: Comment on submodule check failure
     needs: [submodule-check]
     runs-on: ubuntu-latest
-    if: always() && needs.submodule-check.outputs.failed == '1' && github.event_name == 'pull_request'
+    if: always() && needs.submodule-check.outputs.changed == '1' && github.event_name == 'pull_request'
     steps:
       - name: Comment on PR
         uses: actions/github-script@v7
         with:
           script: |
-            const commentBody = `## ❌ Submodule Fast-Forward Check Failed
+            const failed = '${{ needs.submodule-check.outputs.failed }}' === '1';
+            const title = failed ? 
+              '## ❌ Submodule Fast-Forward Check Failed' : 
+              '## ✅ Submodule Fast-Forward Check Results';
             
-            **Check based on commit:** \`${{ github.event.pull_request.head.sha }}\` (PR #${{ github.event.number }} from \`${{ github.head_ref }}\`)
+            const commentBody = `${title}
             
-            The following submodules need attention:
+            **Check based on commit:** ${{ github.event.pull_request.head.sha }} (PR #${{ github.event.number }} from \`${{ github.head_ref }}\`)
             
             ${{ needs.submodule-check.outputs.comment_body }}
-            
-            Please ensure all submodule commits are fast-forwards of the ${{ github.base_ref }} branch before merging.`;
+            ${failed ? 'Please ensure all submodule commits are fast-forwards of the ${{ github.base_ref }} branch before merging.' : 'All submodule changes look good! ✨'}`;
             
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
