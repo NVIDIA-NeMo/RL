@@ -45,6 +45,9 @@ Note that the evaluation script only supports the Hugging Face format model. If 
 # Run evaluation script with default config (examples/configs/evals/eval.yaml)
 uv run python examples/run_eval.py
 
+# Run evaluation script with default config and enable thinking (examples/configs/evals/eval_enable_thinking.yaml)
+uv run python examples/run_eval.py --config=examples/configs/evals/eval_enable_thinking.yaml
+
 # Run evaluation script with converted model
 uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
 

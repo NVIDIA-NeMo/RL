@@ -1,0 +1,12 @@
+# Math evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen3-14B"
+  enable_thinking: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  vllm_cfg:
+    max_model_len: 32768
+

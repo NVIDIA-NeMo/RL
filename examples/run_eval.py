@@ -53,7 +53,7 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+def setup_data(tokenizer: AutoTokenizer, data_config, env_configs, enable_thinking):
     print("Setting up data...")
 
     # load dataset
@@ -68,6 +68,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
         }
     ).remote(env_configs["math"])
 
+    base_dataset.task_spec.enable_thinking = enable_thinking
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
@@ -109,6 +110,7 @@ def main():
 
     # Setup tokenizer
     tokenizer = get_tokenizer(config["tokenizer"])
+    enable_thinking = config["generation"].get("enable_thinking", False)
     config["generation"] = configure_generation_config(
         config["generation"], tokenizer, is_eval=True
     )
@@ -118,7 +120,7 @@ def main():
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["data"], config["env"], enable_thinking)
 
     # Setup
     (
