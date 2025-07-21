@@ -50,7 +50,7 @@ policy:
       fused: false
 data:
   max_input_seq_length: 1024
-  dataset_name: squad
+  dataset_name: squad 
   add_bos: true
   add_eos: true
   add_generation_prompt: false
@@ -58,6 +58,7 @@ logger:
   log_dir: logs/sft-llama3.2-1b-1n8g-fsdp2tp1
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl

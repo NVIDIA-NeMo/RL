@@ -58,6 +58,7 @@ logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl
