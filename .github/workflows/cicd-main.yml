@@ -280,7 +280,7 @@ jobs:
           script: |
             const commentBody = `## ❌ Submodule Fast-Forward Check Failed
             
-            **Check based on commit:** \`${{ github.sha }}\` (PR #${{ github.event.number }} from \`${{ github.head_ref }}\`)
+            **Check based on commit:** \`${{ github.event.pull_request.head.sha }}\` (PR #${{ github.event.number }} from \`${{ github.head_ref }}\`)
             
             The following submodules need attention:
             
