@@ -65,6 +65,9 @@ simple_policy_config = {
     "dynamic_batching": {
         "enabled": False,
     },
+    "sequence_packing": {
+        "enabled": False,
+    },
     "max_grad_norm": 1.0,
     "generation": {
         "backend": "vllm",

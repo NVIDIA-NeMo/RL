@@ -81,6 +81,7 @@ def create_test_config() -> Dict[str, Any]:
                 "custom_parallel_plan": None,
             },
             "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
             "make_sequence_length_divisible_by": 1,
             "max_grad_norm": 1.0,
             "optimizer": {

@@ -28,12 +28,28 @@ from typing import (
 import torch
 from typing_extensions import Self
 
+from nemo_rl.data.packing import get_packer
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
 )
 
 DictT = TypeVar("DictT", bound=Mapping[str, Any])
+
+
+class SequencePackingArgs(TypedDict):
+    """Configuration settings for sequence packing.
+
+    Pass this to 'shard_by_batch_size()' to preprocess batches for sequence packing.
+    """
+
+    max_tokens_per_microbatch: int
+    input_key: str
+    input_lengths_key: str
+    algorithm: str
+    sequence_length_pad_multiple: (
+        int  # pad each sequence to a multiple of this value (for CP/TP alignment)
+    )
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -58,6 +74,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         self.micro_batch_indices = None
         self.micro_batch_lengths = None
+        self.elem_counts_per_gb = None
 
     @classmethod
     def from_batches(
@@ -204,6 +221,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         batch_size: Optional[int] = None,
         allow_uneven_shards: bool = False,
         dynamic_batching_args: Optional[DynamicBatchingArgs] = None,
+        sequence_packing_args: Optional[SequencePackingArgs] = None,
     ) -> list["SlicedDataDict"] | tuple[list["SlicedDataDict"], list[int]]:
         """Shards a batch by first dividing it into chunks of size batch_size, then further dividing each chunk into shards equal parts. Finally aggregates the sub-shards by their position.
 
@@ -219,7 +237,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             allow_uneven_shards (bool): Whether to allow shards to be unevenly sized.
                                         If True, the last shard may be smaller than the others.
             dynamic_batching_args (dict): If passed, preprocess batch for dynamic batching. This
-                                            dict requires two keys:
+                                            dict requires four keys:
                                             1. max_tokens_per_microbatch (int): the maximum
                                                 number of tokens in a microbatch
                                             2. sequence_length_round (int): round each all
@@ -229,6 +247,21 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                                             4. input_lengths_key (str): the key in the batch
                                                 which holds the sequence length per value.
                                                 The sequence dim index is assumed to be 1.
+                                          Cannot be passed with sequence_packing_args.
+
+            sequence_packing_args (dict): If passed, preprocess batch for sequence packing. This
+                                            dict requires five keys:
+                                            1. max_tokens_per_microbatch (int): the maximum
+                                                number of tokens in a microbatch
+                                            2. input_key (str): the key in the batch
+                                                which holds input ids.
+                                            3. input_lengths_key (str): the key in the batch
+                                                which holds the sequence length per value.
+                                                The sequence dim index is assumed to be 1.
+                                            4. algorithm (str): the algorithm to use for sequence packing.
+                                            5. sequence_length_pad_multiple (int): the multiple to pad each sequence to.
+                                               With CP enabled, this should be set to a multiple of 2*CP and SP.
+                                          Cannot be passed with dynamic_batching_args.
 
         Returns:
             list[BatchedDataDict]: A list of BatchedDataDicts, length equal to shards.
@@ -268,6 +301,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             assert batch_size is None, (
                 "batch_size must be None if allow_uneven_shards is True"
             )
+        assert dynamic_batching_args is None or sequence_packing_args is None, (
+            "dynamic_batching_args and sequence_packing_args cannot be passed together"
+        )
 
         # Get the total batch size
         batch_sizes = set()
@@ -336,6 +372,112 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 else:
                     sorted_v = [v[i] for i in batch_sorted_indices]
                 data[k] = sorted_v
+
+        elif sequence_packing_args is not None:
+            bin_packer = get_packer(
+                algorithm=sequence_packing_args["algorithm"],
+                bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
+                collect_metrics=False,  # TODO(ahmadki): make configurable
+            )
+
+            input_lengths_key = sequence_packing_args["input_lengths_key"]
+            input_lens = self.data[input_lengths_key]
+            if not isinstance(input_lens, torch.Tensor):
+                input_lens = torch.tensor(input_lens)
+
+            pad_multiple = sequence_packing_args["sequence_length_pad_multiple"]
+
+            def _get_padded_seqlen(seqlen: int) -> int:
+                return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
+
+            # Store bin assignments for each chunk to reuse later
+            all_chunk_bin_assignments = []
+
+            # Process each chunk separately to respect chunk boundaries
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * batch_size
+                chunk_end = (chunk_idx + 1) * batch_size
+
+                # Get sequence lengths for this chunk
+                chunk_seqlens = input_lens[chunk_start:chunk_end]
+                chunk_padded_seqlens_list = [
+                    _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
+                ]
+
+                # Pack sequences in this chunk into bins
+                chunk_bin_assignments = bin_packer.pack(
+                    sequence_lengths=chunk_padded_seqlens_list,
+                )
+                all_chunk_bin_assignments.append(chunk_bin_assignments)
+
+            # create shards with the packed bins
+            sharded_data: list[list[dict]] = [[] for _ in range(shards)]
+            sharded_micro_indices: list = [[] for _ in range(shards)]
+            sharded_micro_lengths: list = [[] for _ in range(shards)]
+            sharded_elem_counts_per_gb: list = [[] for _ in range(shards)]
+            global_indices_per_shard: list[list[int]] = [[] for _ in range(shards)]
+            for chunk_idx in range(num_chunks):
+                chunk_sharded_micro_indices: list[list[list[int]]] = [
+                    [] for _ in range(shards)
+                ]
+                chunk_sharded_micro_lengths: list[list[int]] = [
+                    [] for _ in range(shards)
+                ]
+
+                num_bins = len(all_chunk_bin_assignments[chunk_idx])
+                chunk_start = chunk_idx * batch_size
+                for bin_idx in range(num_bins):
+                    shard_idx = bin_idx % shards
+                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
+                    global_bin_indices = [i + chunk_start for i in bin_indices]
+                    sharded_data[shard_idx].append(
+                        self.select_indices(global_bin_indices)
+                    )
+                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                    bin_seqlen = sum(
+                        [
+                            _get_padded_seqlen(input_lens[i].item())
+                            for i in global_bin_indices
+                        ]
+                    )
+
+                    if chunk_sharded_micro_indices[shard_idx] == []:
+                        chunk_sharded_micro_indices[shard_idx].append(
+                            [0, len(bin_indices)]
+                        )
+                    else:
+                        prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
+                        chunk_sharded_micro_indices[shard_idx].append(
+                            [prev_bin_end, prev_bin_end + len(bin_indices)]
+                        )
+                    chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
+
+                for shard_idx in range(shards):
+                    sharded_micro_indices[shard_idx].append(
+                        chunk_sharded_micro_indices[shard_idx]
+                    )
+                    sharded_micro_lengths[shard_idx].append(
+                        chunk_sharded_micro_lengths[shard_idx]
+                    )
+                    sharded_elem_counts_per_gb[shard_idx].append(
+                        chunk_sharded_micro_indices[shard_idx][-1][1]
+                    )
+
+            # flatten global_indices_per_shard
+            batch_sorted_indices = []
+            for shard_idx in range(shards):
+                batch_sorted_indices.extend(global_indices_per_shard[shard_idx])
+
+            aggregated_shards = []
+            for shard_idx in range(shards):
+                shard = SlicedDataDict.from_batches(sharded_data[shard_idx])
+                shard.micro_batch_indices = sharded_micro_indices[shard_idx]
+                shard.micro_batch_lengths = sharded_micro_lengths[shard_idx]
+                shard.elem_counts_per_gb = sharded_elem_counts_per_gb[shard_idx]
+                aggregated_shards.append(shard)
+
+            return aggregated_shards, batch_sorted_indices
+
         else:
             data = self.data
 
@@ -457,7 +599,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         return aggregated_shards
 
-    def get_batch(self, batch_idx, batch_size) -> "SlicedDataDict":
+    def get_batch(self, batch_idx, batch_size=None) -> "SlicedDataDict":
         """Slices a subbatch from the batch.
 
         Args:
@@ -467,6 +609,21 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         Returns:
             BatchedDataDict: A new BatchedDataDict containing the sliced data
         """
+        if self.elem_counts_per_gb is not None:
+            assert self.micro_batch_indices is not None, (
+                "micro_batch_indices must be provided if sequence_packing is True"
+            )
+            elem_count = self.elem_counts_per_gb[batch_idx]
+            cum_elem_count = [0]
+            for i in range(len(self.elem_counts_per_gb)):
+                cum_elem_count.append(cum_elem_count[i] + self.elem_counts_per_gb[i])
+
+            batch = self.slice(cum_elem_count[batch_idx], cum_elem_count[batch_idx + 1])
+            batch.micro_batch_indices = [self.micro_batch_indices[batch_idx]]
+            batch.micro_batch_lengths = [self.micro_batch_lengths[batch_idx]]  # type: ignore # This exists if idxs do
+            batch.elem_counts_per_gb = [elem_count]
+            return batch
+
         start = batch_size * batch_idx
         end = batch_size * (batch_idx + 1)
         batch = self.slice(start, end)
@@ -488,6 +645,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         sliced_batch = SlicedDataDict()
         for k in self.data:
+            if isinstance(self.data[k], torch.Tensor):
+                assert end <= self.data[k].shape[0], (
+                    f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
+                )
             sliced_batch[k] = self.data[k][start:end]
         return sliced_batch
 
@@ -520,7 +681,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self,
         sequence_dim: int = 1,
     ) -> Iterator["SlicedDataDict"]:
-        """Makes an interator that yields microbatchs of dynamic batch and sequence sizes.
+        """Makes an iterator that yields microbatchs of dynamic batch and sequence sizes.
 
         Args:
             sequence_dim: the index of the sequence dim for all tensors in the data dict
@@ -542,8 +703,28 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             yield mb
 
     def get_microbatch_iterator_dynamic_shapes_len(self) -> int:
-        """Get the length of the microbatch iterator with dynamic shapes."""
+        """Get the length of the microbatch iterator for dynamic shapes."""
         return len(self.micro_batch_indices[0])
+
+    def make_microbatch_iterator_for_packable_sequences(
+        self,
+    ) -> Iterator["SlicedDataDict"]:
+        """Make an iterator over the batch that yields microbatches that can be packed into a given max_tokens_per_microbatch."""
+        assert (
+            self.micro_batch_indices is not None
+            and len(self.micro_batch_indices) == 1
+            and self.micro_batch_lengths is not None
+        )
+
+        for seqlen, (start_idx, end_idx) in zip(
+            self.micro_batch_lengths[0], self.micro_batch_indices[0]
+        ):
+            mb = self.slice(start_idx, end_idx)
+            yield mb
+
+    def get_microbatch_iterator_for_packable_sequences_len(self) -> tuple[int, int]:
+        """Get the length of the microbatch iterator for sequence packing and the max packed seqlen."""
+        return len(self.micro_batch_indices[0]), max(self.micro_batch_lengths[0])
 
     def make_microbatch_iterator(
         self, microbatch_size: int
