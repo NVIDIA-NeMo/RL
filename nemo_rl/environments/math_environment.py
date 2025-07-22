@@ -152,7 +152,7 @@ class EnglishMultichoiceVerifyWorker:
             ground_truth = answer_parsing.normalize_response(ground_truth)
             response = answer_parsing.normalize_response(response)
             extracted_answer = None
-            match = re.search("(?i)Answer\s*:[ \t]*([A-Z])", response)
+            match = re.search(r"(?i)Answer\s*:[ \t]*([A-Z])", response)
             if match:
                 extracted_answer = answer_parsing.normalize_extracted_answer(
                     match.group(1)
