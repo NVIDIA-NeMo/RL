@@ -103,6 +103,17 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
+  submodule-check:
+    name: Check submodule fast-forward
+    needs: [pre-flight]
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/_submodule_check.yml
+    with:
+      base_ref: ${{ github.base_ref }}
+      head_ref: ${{ github.head_ref }}
+      pr_number: ${{ github.event.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+
   lint-check:
     name: Lint check
     needs: [pre-flight]
