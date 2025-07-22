@@ -31,9 +31,6 @@ policy:
   train_micro_batch_size: 2
   max_total_sequence_length: 1024
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
-
   dtensor_cfg:
     enabled: true
     cpu_offload: False
