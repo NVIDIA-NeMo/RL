@@ -43,7 +43,7 @@ What you can expect:
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.3_
+✅ _Available now_
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
 - ✅ **HuggingFace Integration** - Works with 1-32B models (Qwen2.5, Llama).
@@ -57,10 +57,9 @@ What you can expect:
 - ✅ **Environment Isolation** - Dependency isolation between components.
 - ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
-
-- 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
-- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
+- ✅ **Improved Native Performance** - Improve training time for Native Pytorch Models.
+- ✅ **MoE Models** - Support DeepseekV3 and Qwen3.
+- ✅ **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
 
