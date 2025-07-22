@@ -37,10 +37,10 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
-  sequence_packing:
-    enabled: False
-
   dynamic_batching:
+    enabled: false
+
+  sequence_packing:
     enabled: false
 
   # makes the training sequence length divisible by the tensor parallel size
