@@ -16,6 +16,7 @@ import asyncio
 import os
 from typing import TypedDict
 
+import pandas as pd
 import ray
 import torch
 from torch.utils.data import DataLoader
@@ -41,6 +42,7 @@ class EvalConfig(TypedDict):
     num_tests_per_prompt: int
     seed: int
     pass_k_value: int
+    save_path: str | None
 
 
 class MasterConfig(TypedDict):
@@ -228,6 +230,9 @@ async def _run_env_eval_impl(
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     pass_k_value = eval_config["pass_k_value"]
 
+    # List to collect evaluation data for parquet file
+    evaluation_data = []
+
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
@@ -262,6 +267,24 @@ async def _run_env_eval_impl(
         ]
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
         rewards = env_return.rewards
+        
+        # Collect data for parquet file
+        for i, (prompt, output, message_log, reward, extra_info) in enumerate(zip(
+            prompts, 
+            outputs, 
+            batch["message_log"], 
+            rewards.tolist(), 
+            batch["extra_env_info"]
+        )):
+            evaluation_data.append({
+                "prompt": prompt,
+                "response": output,
+                "reward": reward,
+                "message_log": message_log,
+                "extra_env_info": extra_info,
+                "sample_index": len(evaluation_data),
+            })
+        
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, pass_k_value)
@@ -271,6 +294,11 @@ async def _run_env_eval_impl(
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()
+
+    # Save evaluation data to parquet file if save_path is specified
+    save_path = eval_config.get("save_path")
+    if evaluation_data and save_path is not None:
+        _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path)
 
     # Print results
     _print_results(
@@ -298,6 +326,43 @@ async def _generate_texts(vllm_generation, inputs, use_async):
     else:
         # Use sync generation
         return vllm_generation.generate_text(inputs)["texts"]
+
+
+def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path):
+    """Save evaluation data to a parquet file."""
+    # Convert message_log and extra_env_info to string representations for parquet compatibility
+    processed_data = []
+    for sample in evaluation_data:
+        processed_sample = sample.copy()
+        processed_sample["message_log"] = str(sample["message_log"])
+        processed_sample["extra_env_info"] = str(sample["extra_env_info"])
+        
+        # Add configuration information
+        processed_sample["model_name"] = master_config["generation"]["model_name"]
+        processed_sample["dataset_name"] = master_config["data"]["dataset_name"]
+        processed_sample["metric"] = master_config["eval"]["metric"]
+        processed_sample["pass_k_value"] = master_config["eval"]["pass_k_value"]
+        processed_sample["num_tests_per_prompt"] = master_config["eval"]["num_tests_per_prompt"]
+        processed_sample["temperature"] = master_config["generation"]["temperature"]
+        processed_sample["top_p"] = master_config["generation"]["top_p"]
+        processed_sample["top_k"] = master_config["generation"]["top_k"]
+        
+        processed_data.append(processed_sample)
+    
+    # Create DataFrame and save to parquet
+    df = pd.DataFrame(processed_data)
+    
+    # Create directory if it doesn't exist
+    save_dir = os.path.dirname(save_path)
+    if save_dir and not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # Save to parquet file
+    df.to_parquet(save_path, index=False)
+    print(f"\n✓ Evaluation data saved to: {save_path}")
+    print(f"  Total samples: {len(processed_data)}")
+    print(f"  Columns: {list(df.columns)}")
+    print(f"  File size: {os.path.getsize(save_path) / 1024 / 1024:.2f} MB")
 
 
 def _print_results(
