@@ -109,7 +109,7 @@ class VllmInternalWorkerExtension:
 
         MegatronPolicyWorker:
             colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype, numel)}
-            non-colocated inference: not implemented yet
+            non-colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
