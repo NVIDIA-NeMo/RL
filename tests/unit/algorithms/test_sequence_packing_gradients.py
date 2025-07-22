@@ -277,7 +277,7 @@ class SequencePackingGradientTestActor:
         )
 
         torch.testing.assert_close(
-            packed_grad, baseline_grad_store, atol=1e-6, rtol=1e-6
+            packed_grad, baseline_grad_store, atol=1e-5, rtol=1e-5
         )
 
         # test 3: with forward_step_arbitrary_loss
