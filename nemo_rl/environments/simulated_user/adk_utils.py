@@ -1,9 +1,20 @@
 import asyncio
+import logging
+import random
 
 from google.adk import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from google.genai.errors import ServerError
+
+
+# Initialize logging
+logging.basicConfig(
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    level=logging.WARNING,
+)
+logger = logging.getLogger(__name__)
 
 
 # Define the agents
@@ -42,28 +53,47 @@ def extract_conversation_history(runner: Runner, user_id: str, silence: bool = T
         if event.content.parts and event.content.parts[0].text:
             convo.append({"role": event.author, "content": event.content.parts[0].text})
             if not silence:
-                print(f"[{convo[-1]['role']}]: {convo[-1]['content']}")
+                logger.info(f"[{convo[-1]['role']}]: {convo[-1]['content']}")
     return session.id, convo
 
 
-async def run_prompt_async(runner: Runner, user_id: str, new_message: str, silence: bool = True):
+async def run_prompt_async(runner: Runner, user_id: str, new_message: str, silence: bool = True,
+                        max_retries: int = 3, initial_delay: float = 2) -> str:
+            
+    new_message = new_message.strip()
     content = types.Content(role='user', parts=[types.Part.from_text(text=new_message)])
     if not silence:
-        print('** User says:', new_message)
+        logger.info(f'** [User]->|||{new_message}|||')
 
     session = get_session_from_runner(runner, user_id)
 
-    async for event in runner.run_async(
-        user_id=session.user_id,
-        session_id=session.id,
-        new_message=content,
-    ):
-        if event.content.parts and event.content.parts[0].text:
-            if not silence:
-                print(f'** {event.author} says: {event.content.parts[0].text}')
-            return event.content.parts[0].text.strip()
-        
-    return "<no response>" 
+    retries = 0
+    delay = initial_delay
+    while retries < max_retries:
+        try:
+            async for event in runner.run_async(
+                user_id=session.user_id,
+                session_id=session.id,
+                new_message=content,
+            ):
+                if event.content.parts and event.content.parts[0].text:
+                    if not silence:
+                        logger.info(f'** [{event.author}]->|||{event.content.parts[0].text.strip()}|||')
+                    return event.content.parts[0].text.strip()
+                else:
+                    return "<Empty response>"
+        except ServerError as e:
+            retries += 1
+            delay_with_jitter = delay + (random.random() * 2 - 1) * (delay * 0.5)
+            logger.error(f"Gemini API call (with message {new_message}) failed with ServerError {e} (attempt {retries}/{max_retries}). Retrying in {delay_with_jitter} seconds...")
+            await asyncio.sleep(delay_with_jitter)
+            delay *= 2  # Exponential backoff
+        except Exception as e:
+            logger.error(f"Gemini API call (with message {new_message}) failed with an unexpected error: {e}.")
+            return f"<No response due to unexpected error: {e}>"
+
+    logger.error(f"Gemini API call (with message {new_message}) reached maximum retries ({max_retries}) without success.")
+    return f"<No response due after {max_retries} retries>"
 
 async def setup_runner_async(agent: Agent, app_name: str, user_id: str):
     runner = Runner(
@@ -103,16 +133,16 @@ async def main():
     await run_prompt_async(simulated_user_runner, sample_id_2, 'Now add another 100.')
 
     # Print conversation
-    print("-" * 100)
+    logger.info("-" * 100)
     _, convo1 = extract_conversation_history(simulated_user_runner, sample_id_1, silence=False)
-    print("-" * 100)
+    logger.info("-" * 100)
     _, convo2 = extract_conversation_history(simulated_user_runner, sample_id_2, silence=False)
-    print("-" * 100)
+    logger.info("-" * 100)
 
     # Grade conversation
     await run_prompt_async(grader_runner, sample_id_1, f'Grade the above conversation and give a score between 0-10. \n\n{convo1}', silence=False)
-    print("-" * 100)
-    print("DONE!")
+    logger.info("-" * 100)
+    logger.info("DONE!")
 
 
 if __name__ == "__main__":

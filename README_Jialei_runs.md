@@ -29,14 +29,14 @@ example ADK script is here: nemo_rl/environments/simulated_user/adk_utils.py
 
 Intergrated into training:
 ```
-export GOOGLE_GENAI_USE_VERTEXAI=1 && export GOOGLE_API_KEY="xxxxxxxxxxxxxx" && export GOOGLE_CLOUD_PROJECT="xxxxxxx" && export GOOGLE_CLOUD_LOCATION="xxxxxx" 
+export GOOGLE_GENAI_USE_VERTEXAI=1 && export GOOGLE_CLOUD_PROJECT="xxxxxxx" && export GOOGLE_CLOUD_LOCATION="xxxxxx" 
 uv run python examples/run_grpo_unique_numbers.py --config examples/configs/grpo_adk_llama8b.yaml
 ```
 
 - 07/16: there are 3 issues found:
     1) Gemini endpoint may fail with 500 error sometimes, maybe related to rate limit. Need to understand more.
     2) training is very slow, took ~ 20min for 64x32 samples completing rollout for 1 step on a 8GPU H100 node.
-    3) chat format has issue. <- mostly fixed by chat_template and some hacks but not elegent.
+    3) chat format has issue. 
 
     Also added a debug script for samller run
     ```
@@ -44,3 +44,12 @@ uv run python examples/run_grpo_unique_numbers.py --config examples/configs/grpo
     ```
 
     Also added logs for ADK agent convo history printout. Seems to work as expected.
+
+
+- 07/22: fixed issues:
+    1) Did many debugging, did not find the root cause (ruled out the rate limit issue, special token issue, and context length issue). Added retry logic when calling endpoint, seems the error rate is very low < 0.01% and 1 retry is enough. Adding logging to track the error and ignore the error for now.
+    2) add parallel enviroment.step() achives > 3x speedup (1625s -> 475s). Surprise that the current enviroment is single-threaded, so it is very slow.
+    3) mostly fixed by chat_template and some hacks but not elegent.
+
+Now seems to work well.
+

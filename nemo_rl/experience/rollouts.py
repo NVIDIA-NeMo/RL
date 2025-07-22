@@ -19,6 +19,7 @@ import asyncio
 import copy
 from typing import Any
 
+from datetime import datetime
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -352,6 +353,9 @@ def run_multi_turn_rollout(
         if len(active_indices) == 0:
             break
 
+        if max_rollout_turns > 0:
+            print(f"▶ ▶ ▶ Running rollout turn {turn + 1} / {max_rollout_turns} with {len(active_indices)} active samples...")
+
         active_samples_per_turn.append(len(active_indices))
 
         # Convert LLMMessageLogType to FlatMessagesType for generation
@@ -376,10 +380,7 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
-
         # generate_responses updates active_batch["message_log"] in-place
-        # print(f"[jialei][debug] - generation_input_data {turn=} - {generation_input_data}")
-        # print(f"[jialei][debug] - before {turn=} - {active_batch['message_log'][0]}")
         active_batch, generated_ids, gen_metrics = generate_responses(
             policy_generation,
             generation_input_data,
@@ -388,7 +389,6 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
-        # print(f"[jialei][debug] - after {turn=} -  {active_batch['message_log'][0]}")
 
         # Record token usage - assistant
         for i, global_idx in enumerate(active_indices.tolist()):

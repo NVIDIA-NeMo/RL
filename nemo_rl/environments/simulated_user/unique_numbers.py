@@ -6,7 +6,9 @@ import asyncio
 import random
 import re
 import os
+from datetime import datetime
 from typing import Optional, TypedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import ray
 import torch
@@ -21,6 +23,18 @@ from nemo_rl.environments.simulated_user.prompt import simulated_user_instructio
 from google.genai import types
 from google.adk.agents import Agent
 from google.adk.runners import Runner as ADKRunner
+
+
+PENALTY_FOR_NO_GUESS = -0.2
+PENALTY_FOR_INCORRECT_GUESS = 0.0
+PENALTY_FOR_EVERY_ASK = 0.0
+PENALTY_FOR_INCORRECT_FORMAT = 0.0
+
+ADK_LOG_FOLDER = None # 'logs/adk' or None to disable logging
+if ADK_LOG_FOLDER is not None:
+    os.makedirs(ADK_LOG_FOLDER, exist_ok=True)
+
+GEMINI_CALL_MAX_WORKERS = 64 # if 1 then it will be single-threaded, otherwise it will use ThreadPoolExecutor
 
 class UniqueNumbersConfig(TypedDict, total=False):
     """Configuration for :class:`UniqueNumbersEnv`."""
@@ -40,20 +54,14 @@ class UniqueNumbersMetadata(TypedDict):
     simulated_user_runner: Optional[ADKRunner]
     grader_runner: Optional[ADKRunner]
 
-PENALTY_FOR_NO_GUESS = -0.2
-PENALTY_FOR_INCORRECT_GUESS = 0.0
-PENALTY_FOR_EVERY_ASK = 0.0
-PENALTY_FOR_INCORRECT_FORMAT = 0.0
-
-ADK_LOG_FOLDER = 'logs/adk'
-os.makedirs(ADK_LOG_FOLDER, exist_ok=True)
-
 class _UniqueNumbersRunner:
 
     query_re = re.compile(r"what is number (\d+)\??$", re.IGNORECASE)
     guess_re = re.compile(r"there are (\d+) unique number", re.IGNORECASE)
 
-    def _dump_adk_messages_to_file(self, runner: ADKRunner, user_id:str, log_name_suffix:str = "", dump_folder: str = ADK_LOG_FOLDER):
+    def _maybe_dump_adk_messages_to_file(self, runner: ADKRunner, user_id:str, log_name_suffix:str = "", dump_folder: str = ADK_LOG_FOLDER):
+        if dump_folder is None:
+            return
         session_id, messages = extract_conversation_history(runner, user_id, silence=True)
         file_name = f"{user_id}_{session_id}{log_name_suffix}.log"
         with open(os.path.join(dump_folder, file_name), "a") as f:
@@ -63,6 +71,7 @@ class _UniqueNumbersRunner:
     def process_turn(
         self, message_log: LLMMessageLogType, metadata: UniqueNumbersMetadata
     ) -> tuple[dict[str, str], float, bool, None, Optional[UniqueNumbersMetadata]]:
+
         turn = metadata["turn"]
         max_turns = metadata["max_turns"]
 
@@ -78,7 +87,7 @@ class _UniqueNumbersRunner:
             metadata["grader_runner"] = asyncio.run(setup_runner_async(grader_agent, "grader_app", "grader"))
 
         if turn >= max_turns:
-            self._dump_adk_messages_to_file(metadata["simulated_user_runner"], "simulated_user", "_maxturns")
+            self._maybe_dump_adk_messages_to_file(metadata["simulated_user_runner"], "simulated_user", "_maxturns")
             return {"role": "user", "content": "<done>"}, PENALTY_FOR_NO_GUESS, True, None, None
 
         last_msg = ""
@@ -120,8 +129,8 @@ class _UniqueNumbersRunner:
                 except Exception as e:
                     print(f"Failed to parse grade from grader response '{grading_response}': {e}")
             
-            self._dump_adk_messages_to_file(metadata["simulated_user_runner"], "simulated_user", "_stop")
-            self._dump_adk_messages_to_file(metadata["grader_runner"], "grader")
+            self._maybe_dump_adk_messages_to_file(metadata["simulated_user_runner"], "simulated_user", "_stop")
+            self._maybe_dump_adk_messages_to_file(metadata["grader_runner"], "grader")
 
             return {"role": "user", "content": "<done>"}, reward, True, None, None
 
@@ -155,12 +164,20 @@ class UniqueNumbersEnv(EnvironmentInterface):
         message_log_batch: list[LLMMessageLogType],
         metadata_batch: list[Optional[UniqueNumbersMetadata]],
     ) -> EnvironmentReturn:
-        results = []
+
+        args = []
         for log, meta in zip(message_log_batch, metadata_batch):
             assert meta is not None, "Metadata must not be None for UniqueNumbersEnv."
             assert meta["numbers"] is not None, "Numbers must not be None in metadata."
             assert meta["unique_count"] > 0, "Unique count must be greater than 0 in metadata."
-            results.append(self.runner.process_turn(log, meta))
+            args.append((log, meta))
+
+        # Process either serially or in parallel
+        if GEMINI_CALL_MAX_WORKERS is None or GEMINI_CALL_MAX_WORKERS <= 1:
+            results = [self.runner.process_turn(log, meta) for log, meta in args]
+        else:
+            with ThreadPoolExecutor(max_workers=GEMINI_CALL_MAX_WORKERS) as executor:
+                results = list(executor.map(lambda p: self.runner.process_turn(*p), args))
 
         observations, rewards, terminateds, stop_strings, next_metadata = [], [], [], [], []
         for obs, rew, term, stops, meta in results:
