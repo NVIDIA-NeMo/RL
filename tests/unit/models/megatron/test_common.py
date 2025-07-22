@@ -567,7 +567,7 @@ class PackSequencesTestActor:
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
-    f"tests.unit.models.{PackSequencesTestActor.__module__}.PackSequencesTestActor"
+    f"{PackSequencesTestActor.__module__}.PackSequencesTestActor"
 )
 
 
