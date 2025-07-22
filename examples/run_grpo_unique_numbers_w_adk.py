@@ -14,6 +14,7 @@ from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.simulated_user.prompt import starting_user_prompt
 from nemo_rl.environments.simulated_user.unique_numbers import (
     UniqueNumbersEnv,
     UniqueNumbersMetadata,
@@ -22,19 +23,27 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
-from nemo_rl.environments.simulated_user.prompt import starting_user_prompt
-
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run GRPO with unique numbers simulator")
-    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
+    parser = argparse.ArgumentParser(
+        description="Run GRPO with unique numbers simulator"
+    )
+    parser.add_argument(
+        "--config", type=str, default=None, help="Path to YAML config file"
+    )
     args, overrides = parser.parse_known_args()
     return args, overrides
 
 
-def generate_datum(tokenizer: AutoTokenizer, env_cfg: dict, task_name: str, idx: int, add_system_prompt: bool) -> DatumSpec:
+def generate_datum(
+    tokenizer: AutoTokenizer,
+    env_cfg: dict,
+    task_name: str,
+    idx: int,
+    add_system_prompt: bool,
+) -> DatumSpec:
     formatted_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": starting_user_prompt}],
         tokenize=False,
@@ -42,9 +51,13 @@ def generate_datum(tokenizer: AutoTokenizer, env_cfg: dict, task_name: str, idx:
         add_generation_prompt=True,
         add_special_tokens=False,
     ).strip()
-    token_ids = tokenizer(formatted_prompt, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+    token_ids = tokenizer(
+        formatted_prompt, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
 
-    def _generate_numbers(min_length, max_length, max_integer, default_max_turns) -> UniqueNumbersMetadata:
+    def _generate_numbers(
+        min_length, max_length, max_integer, default_max_turns
+    ) -> UniqueNumbersMetadata:
         length = random.randint(min_length, max_length)
         numbers = [random.randint(0, max_integer) for _ in range(length)]
         return UniqueNumbersMetadata(
@@ -123,27 +136,39 @@ def setup_data(tokenizer, env_cfg, task_name, length, val_length, add_system_pro
 def main():
     args, overrides = parse_args()
     if not args.config:
-        args.config = os.path.join(os.path.dirname(__file__), "configs", "grpo_unique_numbers_gemma1b.yaml")
+        args.config = os.path.join(
+            os.path.dirname(__file__), "configs", "grpo_unique_numbers_gemma1b.yaml"
+        )
     config = load_config(args.config)
     if overrides:
         config = parse_hydra_overrides(config, overrides)
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
 
     now_pst = datetime.utcnow() + timedelta(hours=-7)
-    config["logger"]["wandb"]["name"] = config["logger"]["wandb"]["name"].replace("__NOW__", now_pst.strftime("%m/%d-%H:%M"))
+    config["logger"]["wandb"]["name"] = config["logger"]["wandb"]["name"].replace(
+        "__NOW__", now_pst.strftime("%m/%d-%H:%M")
+    )
 
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
     if config["checkpointing"]["enabled"]:
-        print(f"\U0001F4CA Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}")
+        print(
+            f"\U0001f4ca Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+        )
 
     pprint.pprint(config)
 
     init_ray()
 
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    config["policy"]["generation"] = configure_generation_config(config["policy"]["generation"], tokenizer)
+    config["policy"]["generation"] = configure_generation_config(
+        config["policy"]["generation"], tokenizer
+    )
 
-    ds_length = config["grpo"]["num_prompts_per_step"] * config["grpo"]["num_generations_per_prompt"] * config["grpo"]["max_num_steps"]
+    ds_length = (
+        config["grpo"]["num_prompts_per_step"]
+        * config["grpo"]["num_generations_per_prompt"]
+        * config["grpo"]["max_num_steps"]
+    )
     dataset, val_dataset, task_to_env, val_task_to_env = setup_data(
         tokenizer=tokenizer,
         env_cfg=config["env"],
