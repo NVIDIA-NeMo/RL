@@ -56,6 +56,7 @@ from nemo_rl.utils.logger import (
     print_message_log_samples,
 )
 from nemo_rl.utils.timer import Timer
+import json
 
 # ===============================================================================
 # Configuration
@@ -648,6 +649,14 @@ def grpo_train(
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
+
+        # Add environment metadata for each sample. Serialise to JSON strings for safe logging.
+        try:
+            extra_env_info = repeated_batch["extra_env_info"]
+        except KeyError:
+            extra_env_info = [None] * len(rewards)
+
+        log_data["metadata"] = [json.dumps(m, default=str) if m is not None else "" for m in extra_env_info]
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
         table = logger.log_batched_dict_as_table(log_data, prefix="train", step=step)
 

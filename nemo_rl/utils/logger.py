@@ -507,9 +507,19 @@ class Logger(LoggerInterface):
         self.loggers = []
         self.wandb_logger = None
         self.wandb_tables = {}
+        # Pre-define the schema for W&B tables so that the "metadata" column
+        # is always present even on the very first row (avoids schema mismatch
+        # when the first row happens to have an empty/None metadata field).
         self.wandb_tables_df = defaultdict(
             lambda: pd.DataFrame(
-                columns=["step", "prompt", "response", "environment", "reward"]
+                columns=[
+                    "step",
+                    "prompt",
+                    "response",
+                    "environment",
+                    "metadata",
+                    "reward",
+                ]
             )
         )
 
@@ -523,7 +533,14 @@ class Logger(LoggerInterface):
             self.loggers.append(self.wandb_logger)
             self.wandb_tables = defaultdict(
                 lambda: wandb.Table(
-                    columns=["step", "prompt", "response", "environment", "reward"]
+                    columns=[
+                        "step",
+                        "prompt",
+                        "response",
+                        "environment",
+                        "metadata",
+                        "reward",
+                    ]
                 )
             )
 
@@ -611,15 +628,40 @@ class Logger(LoggerInterface):
 
         print(f"Logged data to {filepath}")
 
-    def log_table_contents(self, step, prompt, response, environment, reward, prefix):
+    def log_table_contents(
+        self,
+        step,
+        prompt,
+        response,
+        environment,
+        reward,
+        prefix,
+        metadata=None,
+    ):
+        """Log a single row of data to a W&B table.
+
+        Args:
+            step: Current training/validation step.
+            prompt: User prompt text.
+            response: Assistant response text.
+            environment: Environment observation text.
+            reward: Scalar reward value.
+            prefix: Namespace/prefix for the table (e.g. "train", "validation").
+            metadata: (Optional) JSON-serialised metadata string or any object convertible to str.
+        """
         if self.wandb_logger is None:
             return
+
+        # If metadata is a dict/list etc., convert to string for table display
+        if metadata is not None and not isinstance(metadata, str):
+            metadata = str(metadata)
 
         new_row = {
             "step": step,
             "prompt": prompt,
             "response": response,
             "environment": environment,
+            "metadata": metadata,
             "reward": reward,
         }
 
@@ -645,13 +687,23 @@ class Logger(LoggerInterface):
                     sample[key] = value.tolist()
 
                 content = sample["content"][0]
+
+                # Extract metadata if present; ensure index 0 if list-like
+                if "metadata" in sample:
+                    metadata_val = sample["metadata"]
+                    if isinstance(metadata_val, list):
+                        metadata_val = metadata_val[0]
+                else:
+                    metadata_val = None
+
                 return self.log_table_contents(
                     step,
                     content[0],
-                    content[1],
-                    content[2],
+                    content[1] if len(content) > 1 else "",
+                    content[2] if len(content) > 2 else "",
                     sample["rewards"][0],
                     prefix,
+                    metadata_val,
                 )
 
     def __del__(self):
