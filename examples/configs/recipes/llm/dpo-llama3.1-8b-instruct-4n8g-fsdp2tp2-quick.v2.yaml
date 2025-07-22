@@ -43,7 +43,10 @@ policy:
     custom_parallel_plan: null
   
   dynamic_batching:
-    enabled: False
+    enabled: false
+
+  sequence_packing:
+    enabled: false
 
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
   max_grad_norm: 1.0

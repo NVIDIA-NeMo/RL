@@ -84,6 +84,9 @@ def create_test_config(
             "logprob_mb_tokens": 128,
             "sequence_length_round": 4,
         },
+        "sequence_packing": {
+            "enabled": False,
+        },
         "optimizer": {
             "name": "torch.optim.AdamW",
             "kwargs": {

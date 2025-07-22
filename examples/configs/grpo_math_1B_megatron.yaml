@@ -49,14 +49,19 @@ policy:
   # responses are sorted by sequence length and bucketed into microbatches with a total
   # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
   # training and logprob stages respectively.
+  # 
+  # We disable it for Megatron as it is incompatible with Pipeline parallelism. Instead, we use sequence packing
   dynamic_batching:
     enabled: False
-
-  sequence_packing:
-    enabled: False # coming soon
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_ffd"
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
   max_grad_norm: 1.0
