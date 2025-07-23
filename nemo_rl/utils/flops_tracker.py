@@ -20,9 +20,10 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
-from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2
+from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2, qwen3
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -51,6 +52,19 @@ def convert_config_to_flops_config(
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
         ), qwen2
+    elif isinstance(config, Qwen3Config):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            query_groups=config.num_attention_heads / config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            # for non-MoE models, we use the intermediate size as the ffn hidden size
+            moe_ffn_hidden_size=config.intermediate_size,
+            moe_router_topk=1,
+        ), qwen3
     elif isinstance(config, LlamaConfig):
         return FLOPSConfig(
             gbs=0,
@@ -65,13 +79,16 @@ def convert_config_to_flops_config(
         raise ValueError(f"Unsupported config type: {type(config)}")
 
 
-THEORETICAL_FLOPS = {("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2}
+THEORETICAL_TFLOPS = {
+    ("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2,
+    ("NVIDIA H100 80GB HBM3", torch.float32): 67.0,
+}
 
 
-def get_theoretical_flops(device_name: str, model_dtype: torch.dtype) -> float:
+def get_theoretical_tflops(device_name: str, model_dtype: torch.dtype) -> float:
     """Get the theoretical total flops for a device name."""
-    if (device_name, model_dtype) in THEORETICAL_FLOPS:
-        return THEORETICAL_FLOPS[(device_name, model_dtype)]
+    if (device_name, model_dtype) in THEORETICAL_TFLOPS:
+        return THEORETICAL_TFLOPS[(device_name, model_dtype)]
     else:
         raise ValueError(
             f"Unknown device name: {device_name} and dtype name: {model_dtype}"

@@ -519,12 +519,12 @@ def dpo_train(
                 print(
                     f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
                 )
-                if "theoretical_flops" in train_results:
-                    theoretical_flops = train_results["theoretical_flops"]
+                if "theoretical_tflops" in train_results:
+                    theoretical_tflops = train_results["theoretical_tflops"]
                     print(
-                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_flops:.2f}%"
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
                     )
-                    metrics["train_fp_utilization"] = total_tflops / theoretical_flops
+                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

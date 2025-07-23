@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union
 
@@ -43,7 +44,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_default_hf_config,
-    get_theoretical_flops,
+    get_theoretical_tflops,
 )
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -355,12 +356,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             aggregated_results["num_ranks"] = len(results)
 
             try:
-                aggregated_results["theoretical_flops"] = sum(
-                    get_theoretical_flops(r["gpu_name"], r["model_dtype"])
+                aggregated_results["theoretical_tflops"] = sum(
+                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
                     for r in results
                 )
             except Exception as e:
-                print(f"Error getting theoretical flops: {e}")
+                warnings.warn(f"Error getting theoretical flops: {e}")
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
