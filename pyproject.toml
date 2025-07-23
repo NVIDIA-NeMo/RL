@@ -43,6 +43,7 @@ dependencies = [
     "nvtx",
     "matplotlib",
     "plotly",
+    "google-adk",
     "mlflow",
 ]
 
