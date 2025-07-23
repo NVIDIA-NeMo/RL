@@ -1,8 +1,8 @@
 # Sliding Puzzle using GRPO
 
-This guide explains how to use Nemo-RL to train a model to solve the sliding puzzle game through multi-turn interactions. This environment implements a classic **n×n sliding puzzle** where numbered tiles must be arranged in sequential order by sliding them into an empty space.
+This guide explains how to use Nemo-RL to train a model to solve the classic **nxn sliding puzzle** game through multi-turn, reinforcement learning interactions. This environment implements a classic **n×n sliding puzzle** where numbered tiles must be arranged in sequential order by sliding them into an empty space.
 
-This example serves as a basic example to understand how multi-turn RL works, with a fundamental implementation of tool-calling. 
+The sliding puzzle task serves as a simple yet effective benchmark to illustrate how multi-turn RL and tool-calling are implemented within Nemo-RL. This example provides a minimal setup for understanding the core components of Guided Reward Policy Optimization (GRPO) and sequential decision-making.
 
 ## Table of Contents
 
@@ -10,8 +10,8 @@ This example serves as a basic example to understand how multi-turn RL works, wi
 2. [Game Mechanics](#game-mechanics)
 3. [Data Generation](#data-generation)
 4. [Environment Interface](#environment-interface)
-5. [Reward System](#reward-system)\
-6. [Results](#results-and-performance) 
+5. [Reward System](#reward-system)
+6. [Results and Performance](#results-and-performance) 
 
 ## Quick Start Guide
 
@@ -21,32 +21,40 @@ This example serves as a basic example to understand how multi-turn RL works, wi
 git clone https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 
+# Initialize submodules
 git submodule update --init --recursive
 
+# Install uv package manager
 pip install uv
 
+# Create and activate a virtual environment
 uv venv
 ```
 
 Refer to [this guide](https://docs.nvidia.com/nemo/rl/latest/index.html#prerequisites) for detailed instructions on installation.
 
 #### 2. Training Run
+
+Train a model to solve the sliding puzzle using the default 2×2 configuration and GRPO
+
 ```bash
-# Run with default 2×2 puzzle configuration
 uv run python examples/run_grpo_sliding_puzzle.py 
 ```
 
 #### 3. Custom Configuration
 
-By default, this uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides.
+By default, this uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty
 ```bash
-# Train on 3×3 puzzles with more scrambling
+# Train on a 3×3 puzzle with 10 random moves to scramble the board
 python examples/run_grpo_sliding_puzzle.py \
     env.sliding_puzzle_game.cfg.game_config.size=3 \
     env.sliding_puzzle_game.cfg.game_config.shuffle_moves=10
 ```
 
 #### 4. Monitor Progress
+
+You can enable logging via Weights & Biases and TensorBoard to monitor training metrics such as rewards, success rate, and loss curves
+
 ```bash
 # Enable logging (optional)
 python examples/run_grpo_sliding_puzzle.py \
@@ -60,12 +68,12 @@ python examples/run_grpo_sliding_puzzle.py \
 ### Puzzle Structure
 
 The sliding puzzle consists of:
-- **Grid**: An n×n grid containing numbered tiles and one empty space
-- **Tiles**: Numbered from 1 to n²-1 in sequential order
-- **Empty Space**: Represented by 0, initially positioned at bottom-right corner
-- **Goal State**: Sequential arrangement (1, 2, 3, ..., n²-1) with empty space at bottom-right
+- **Grid**: An `n×n` grid with numbered tiles and one empty space
+- **Tiles**: Numbered from `1` to `n²-1`, placed in random order
+- **Empty Space**: Represented by `0`, typically starting at the bottom-right corner
+- **Goal State**: Sequential arrangement `1, 2, 3, ..., n²-1` with `0` at bottom-right
 
-### Example data sample:
+### Example Data Sample:
 ```
 ===== SLIDING PUZZLE =====
 Arrange the 3x3 grid by sliding tiles into the empty space.
@@ -93,38 +101,44 @@ Think carefully step-by-step before acting.
 
 ### Movement Rules
 
-1. **Valid Moves**: Only tiles adjacent to the empty space can be moved
-2. **Movement Direction**: Tiles slide into the empty space
-3. **Grid Boundaries**: Moves cannot exceed grid boundaries
-4. **Single Tile Movement**: Only one tile can move per action
+1. **Valid Moves**: Only tiles adjacent to the empty space `0` can be moved
+2. **Movement Direction**: Tiles slide into the empty space, not the other way around
+3. **Grid Boundaries**: Moves that would go beyond the grid are invalid
+4. **Single Tile Movement**: Each action affects only one tile at a time
 
-All actions must be wrapped in XML tags:
+All actions must be wrapped in XML-style tags and follow one of the formats below:
 ```xml
-<action>up</action>
-<action>slide 2 1</action>
-<action>view</action>
+<action>up</action>          <!-- Slide a tile up into the empty space -->
+<action>slide 2 1</action>   <!-- Slide tile at row 2, column 1 -->
+<action>view</action>        <!-- View the current board state -->
 ```
 
 ## Data Generation
 
 ### Configuration Parameters
 
-The puzzle generation system uses the following parameters:
+Sliding puzzle instances are generated using the following parameters, which can be customized via the configuration file:
 
 ```yaml
 env:
   sliding_puzzle_game:
     cfg:
       game_config:
-        size: 5           
-        shuffle_moves: 4     # Number of scrambling moves
-      max_moves: 40          # Maximum moves allowed per episode
+        size: 5              # Size of the puzzle grid (e.g., 3x3, 4x4, 5x5)
+        shuffle_moves: 4     # Number of random moves to scramble the puzzle
+      max_moves: 40          # Maximum number of moves allowed per episode
 ```
+#### Description
 
-Grids are generated with sizes ranging from 2 to game_config.size. Each grid starts with a solved state and is shuffled by moving random tiles to the empty space n times, where n is a random number between 1 and shuffle_moves. The grid is shuffled using only valid moves. 
+- **`size`**: Determines the dimensions of the puzzle board (`n×n`).
+- **`shuffle_moves`**: Controls the initial difficulty by randomly moving tiles to scramble the puzzle.
+- **`max_moves`**: Sets an upper limit on the number of actions the agent can take in one episode.
+
+Grids are generated with sizes ranging from 2 to game_config.size. Each grid starts with a solved state and is shuffled by moving random tiles to the empty space n times, where n is a random number between 1 and `shuffle_moves`. The grid is shuffled using only valid moves. 
 The `generate_puzzle_datum()` function in [run_grpo_sliding_puzzle.py](../../examples/run_grpo_sliding_puzzle.py) is responsible for generating the dataset. [sliding_puzzle.py](../../nemo_rl/environments/games/sliding_puzzle.py) contains the `SlidingPuzzleGameLogic` class, responsible for puzzle generation and initialization logic. The number of shuffle moves and size of the grid will control puzzle difficulty.
 
 #### Generation Algorithm
+The puzzle configuration is randomly generated by sampling the grid size and number of shuffling moves within the defined maximums
 
 ```python
 def generate_random_config(max_config: dict[str, Any]) -> dict[str, Any]:
@@ -145,15 +159,15 @@ def generate_random_config(max_config: dict[str, Any]) -> dict[str, Any]:
 
 ### Dataset Size Calculation
 
-Dataset sizes are defined based on the values in grpo_sliding_puzzle.yaml
+Dataset size is defined by parameters in grpo_sliding_puzzle.yaml
 ```
 Training Size = num_prompts_per_step × num_generations_per_prompt × max_num_steps
-Validation Size = max_val_samples (defined in config yaml)
+Validation Size = max_val_samples
 ```
 
 ### Data Structure
 
-Each generated datum returns a `DatumSpec`:
+Each training sample is returned as a `DatumSpec` dictionary with the following structure:
 
 ```python
 datum: DatumSpec = {
@@ -243,17 +257,17 @@ class SlidingPuzzleRunner:
 
 The step function creates a processing pipeline where each class handles specific responsibilities:
 
-1. **Process Turn and parse action** (SlidingPuzzleRunner): Extract action from model response using XML tag parsing via `process_turn` method
-2. **Validate Move** (SlidingPuzzleGameLogic): Check if action is valid for current game state and execute the move
-3. **Execute Action** (SlidingPuzzleGameLogic): Apply move to game state using `SlidingPuzzleGameLogic.step` method
-4. **Calculate Reward** (SlidingPuzzleGameLogic): Determine reward based on puzzle completion status (step function)
-6. **Return Results** (SlidingPuzzleEnv): Package response as `EnvironmentReturn` object for training pipeline
+1. **Parse action** (`SlidingPuzzleRunner`): Extracts action from model response using XML tag parsing via `process_turn` method
+2. **Validate Move** (`SlidingPuzzleGameLogic`): Checks if action is valid for current game state and execute the move
+3. **Execute Action** (`SlidingPuzzleGameLogic`): Applies move to game state using `SlidingPuzzleGameLogic.step` method
+4. **Calculate Reward** (`SlidingPuzzleGameLogic`): Assigns a reward based on progress toward solving the puzzle (step function)
+6. **Return Results** (`SlidingPuzzleEnv`):  Returns the updated interaction state as an `EnvironmentReturn` object.
 
 ## Reward System
 
 ### Reward Structure
 
-The environment implements a sparse reward system focusing on task completion, i.e encourages learning of complete solution strategies
+The environment uses a sparse reward scheme designed to encourage complete solution strategies rather than incremental progress.
 
 | Condition | Reward | Termination |
 |-----------|--------|-------------|
@@ -262,6 +276,8 @@ The environment implements a sparse reward system focusing on task completion, i
 | Puzzle solved | 1.0 | True |
 | Max moves reached | 0.0 | True |
 | Invalid action format | 0.0 | False |
+
+>Goal: The agent receives a reward only upon successfully solving the puzzle, promoting long-horizon planning.
 
 ### Reward Calculation Logic
 

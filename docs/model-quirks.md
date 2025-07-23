@@ -31,8 +31,16 @@ NeMo-RL uses the vLLM V1 runtime for both synchronous and asynchronous inference
 
 ### Context Parallel with FSDP2
 
-NeMo-RL implemented this feature based on torch CP [implementation](https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/experimental/_attention.py). And we inherit its limitations.
+- NeMo-RL implemented this feature based on torch CP [implementation](https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/experimental/_attention.py). And we inherit its limitations.
 Whether model level support CP only depends on arguments passed to `torch.nn.functional.scaled_dot_product_attention`. Current NeMo-RL passed all ones attention mask to `model.forward`. For Gemma-3, it won't ignore attention mask as result `attn_bias` is not None which is not supported by torch CP. Please see [assertion](https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/tensor/experimental/_attention.py#L262) .
+ - Context parallel can't be used together with sequence packing. Sequence packing requires `attn_implementation="flash_attention_2"`, this conflict with context parallel requires SDPA impl. Refer to [here](https://github.com/huggingface/transformers/blob/bda75b4011239d065de84aa3e744b67ebfa7b245/src/transformers/modeling_utils.py#L2317) for more details.
+
+
+- It's a known issue that context parallel can't be used together with sequence parallel.
+Refer to [here](https://github.com/NVIDIA-NeMo/RL/issues/659) for more details.
+
+- It's a known issue that context parallel can't be used together with sequence parallel.
+Refer to [here](https://github.com/NVIDIA-NeMo/RL/issues/659) for more details.
 
 ## vLLM Async Rollout Timeout
 
