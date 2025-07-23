@@ -43,23 +43,25 @@ What you can expect:
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.3_
+✅ _Available now_ | 🔜 _Coming in v0.4_
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-32B models (Qwen2.5, Llama).
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP) support and Ray-based infrastructure.
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support and Ray-based infrastructure.
 - ✅ **Environment Support** - Support for multi-environment training.
 - ✅ **Learning Algorithms** - GRPO (Group Relative Policy Optimization), SFT (Supervised Fine-Tuning), and DPO (Direct Preference Optimization).
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 32B parameters.
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, and SP for efficient training.
+- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
+- ✅ **(even) Larger Model Support with Long(er) Sequences** - Advanced parallelisms with Megatron Core (TP/PP/CP/SP/EP).
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
-- ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE(small) models
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
+
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
