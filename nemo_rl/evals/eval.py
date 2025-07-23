@@ -352,24 +352,20 @@ def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, 
         processed_sample["extra_env_info"] = str(sample["extra_env_info"])
         processed_data.append(processed_sample)
     
+    # Create directory if it doesn't exist
+    save_dir = os.path.dirname(save_path)
+    if save_dir and not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+
     # Save configuration to separate JSON file if requested
     if save_config:
         config_path = f"{os.path.splitext(save_path)[0]}-config.json"
-        config_dir = os.path.dirname(config_path)
-        if config_dir and not os.path.exists(config_dir):
-            os.makedirs(config_dir, exist_ok=True)
-        
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=2)
         print(f"\n✓ Configuration saved to: {config_path}")
     
     # Create DataFrame and save to parquet
     df = pd.DataFrame(processed_data)
-    
-    # Create directory if it doesn't exist
-    save_dir = os.path.dirname(save_path)
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
     
     # Save to parquet file
     df.to_parquet(save_path, index=False)
