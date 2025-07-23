@@ -266,7 +266,6 @@ class DTensorPolicyWorker:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
         # caching since this property is not always preserved after FSDP
-        self.num_tied_weights = len(find_tied_parameters(self.model))
         self.tokenizer = tokenizer
 
         # ------------------------------------------------
