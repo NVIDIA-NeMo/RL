@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 from typing import TypedDict
 
@@ -43,6 +44,7 @@ class EvalConfig(TypedDict):
     seed: int
     pass_k_value: int
     save_path: str | None
+    save_config: bool
 
 
 class MasterConfig(TypedDict):
@@ -298,7 +300,7 @@ async def _run_env_eval_impl(
     # Save evaluation data to parquet file if save_path is specified
     save_path = eval_config.get("save_path")
     if evaluation_data and save_path is not None:
-        _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path)
+        _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, eval_config.get("save_config", True))
 
     # Print results
     _print_results(
@@ -328,26 +330,38 @@ async def _generate_texts(vllm_generation, inputs, use_async):
         return vllm_generation.generate_text(inputs)["texts"]
 
 
-def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path):
+def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, save_config=True):
     """Save evaluation data to a parquet file."""
+    # Extract configuration information
+    config_data = {
+        "model_name": master_config["generation"]["model_name"],
+        "dataset_name": master_config["data"]["dataset_name"],
+        "metric": master_config["eval"]["metric"],
+        "pass_k_value": master_config["eval"]["pass_k_value"],
+        "num_tests_per_prompt": master_config["eval"]["num_tests_per_prompt"],
+        "temperature": master_config["generation"]["temperature"],
+        "top_p": master_config["generation"]["top_p"],
+        "top_k": master_config["generation"]["top_k"],
+    }
+    
     # Convert message_log and extra_env_info to string representations for parquet compatibility
     processed_data = []
     for sample in evaluation_data:
         processed_sample = sample.copy()
         processed_sample["message_log"] = str(sample["message_log"])
         processed_sample["extra_env_info"] = str(sample["extra_env_info"])
-        
-        # Add configuration information
-        processed_sample["model_name"] = master_config["generation"]["model_name"]
-        processed_sample["dataset_name"] = master_config["data"]["dataset_name"]
-        processed_sample["metric"] = master_config["eval"]["metric"]
-        processed_sample["pass_k_value"] = master_config["eval"]["pass_k_value"]
-        processed_sample["num_tests_per_prompt"] = master_config["eval"]["num_tests_per_prompt"]
-        processed_sample["temperature"] = master_config["generation"]["temperature"]
-        processed_sample["top_p"] = master_config["generation"]["top_p"]
-        processed_sample["top_k"] = master_config["generation"]["top_k"]
-        
         processed_data.append(processed_sample)
+    
+    # Save configuration to separate JSON file if requested
+    if save_config:
+        config_path = f"{os.path.splitext(save_path)[0]}-config.json"
+        config_dir = os.path.dirname(config_path)
+        if config_dir and not os.path.exists(config_dir):
+            os.makedirs(config_dir, exist_ok=True)
+        
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=2)
+        print(f"\n✓ Configuration saved to: {config_path}")
     
     # Create DataFrame and save to parquet
     df = pd.DataFrame(processed_data)

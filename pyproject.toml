@@ -44,7 +44,7 @@ dependencies = [
     "nvtx",
     "matplotlib",
     "plotly",
-    "mlflow",,
+    "mlflow",
     "pandas",
     "pyarrow"
 ]

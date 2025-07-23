@@ -4,8 +4,8 @@ eval:
   num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
   pass_k_value: 1
-  save_path: null # Path to save evaluation results as parquet file. Set to null to disable saving.
-                  # Example: "results/eval_output.parquet" or "/path/to/evaluation_results.parquet"
+  save_path: null # Path to save evaluation results as parquet file. Set to null to disable saving. Example: "results/eval_output.parquet" or "/path/to/evaluation_results.parquet"
+  save_config: true # Whether to save the configuration of the evaluation in a json file.
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation
