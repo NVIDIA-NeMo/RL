@@ -21,9 +21,6 @@ policy:
   dtensor_cfg:
     enabled: True
 
-  dynamic_batching:
-    enabled: True
-
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
