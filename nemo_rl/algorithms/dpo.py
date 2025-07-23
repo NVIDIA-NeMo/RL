@@ -111,6 +111,12 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
+
+    # Make sure we are not using dynamic batching or sequence packing.
+    # Anything that changes the order of data within a batch is currently incompatible with DPO.
+    assert not master_config["policy"]["dynamic_batching"]["enabled"], "Dynamic batching is currently not supported with DPO."
+    assert not master_config["policy"]["sequence_packing"]["enabled"], "Sequence packing is currently not supported with DPO."
+
     set_seed(master_config["dpo"]["seed"])
 
     # Extract individual configs for easier access
