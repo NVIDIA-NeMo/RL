@@ -19,7 +19,6 @@ import asyncio
 import copy
 from typing import Any
 
-from datetime import datetime
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -353,8 +352,10 @@ def run_multi_turn_rollout(
         if len(active_indices) == 0:
             break
 
-        if max_rollout_turns > 0:
-            print(f"▶ ▶ ▶ Running rollout turn {turn + 1} / {max_rollout_turns} with {len(active_indices)} active samples...")
+        if max_rollout_turns > 1:
+            print(
+                f"▶ ▶ ▶ Running rollout turn {turn + 1} / {max_rollout_turns} with {len(active_indices)} active samples..."
+            )
 
         active_samples_per_turn.append(len(active_indices))
 
@@ -415,9 +416,13 @@ def run_multi_turn_rollout(
                     [{"role": env_role, "content": env_obs_content.strip()}],
                     tokenize=False,
                 ).removeprefix("<|begin_of_text|>")
-                tokenized_obs = tokenizer(formatted_obs, return_tensors="pt", add_special_tokens=False).input_ids[0]
+                tokenized_obs = tokenizer(
+                    formatted_obs, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
             else:
-                tokenized_obs = tokenizer(env_obs_content, return_tensors="pt", add_special_tokens=False).input_ids[0]
+                tokenized_obs = tokenizer(
+                    env_obs_content, return_tensors="pt", add_special_tokens=False
+                ).input_ids[0]
             # check if new message overflows max_seq_len
             if (
                 len(tokenized_obs) + len(generated_ids[i]) + active_input_lengths[i]
@@ -669,13 +674,21 @@ async def run_sample_multi_turn_rollout(
         # Tokenize environment response
         env_role = env_output.observations[0]["role"].lower()
         if env_role in {"user", "assistant", "system"}:
-            formatted_obs = tokenizer.apply_chat_template(
-                [{"role": env_role, "content": env_obs_content.strip()}],
-                tokenize=False,
-            ).removeprefix("<|begin_of_text|>").strip()
-            tokenized_obs = tokenizer(formatted_obs, return_tensors="pt", add_special_tokens=False).input_ids[0]
+            formatted_obs = (
+                tokenizer.apply_chat_template(
+                    [{"role": env_role, "content": env_obs_content.strip()}],
+                    tokenize=False,
+                )
+                .removeprefix("<|begin_of_text|>")
+                .strip()
+            )
+            tokenized_obs = tokenizer(
+                formatted_obs, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
         else:
-            tokenized_obs = tokenizer(env_obs_content, return_tensors="pt", add_special_tokens=False).input_ids[0]
+            tokenized_obs = tokenizer(
+                env_obs_content, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
 
         # Check for sequence length overflow
         if input_lengths + gen_token_count + len(tokenized_obs) >= max_seq_len:
