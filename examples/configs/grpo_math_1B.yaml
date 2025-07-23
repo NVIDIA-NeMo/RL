@@ -55,11 +55,8 @@ policy:
   megatron_cfg:
     enabled: false
 
-  # dynamic_batching improves performance by ensuring logprob and training microbatches
-  # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
-  # responses are sorted by sequence length and bucketed into microbatches with a total
-  # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
-  # training and logprob stages respectively.
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
