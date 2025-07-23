@@ -192,7 +192,7 @@ run_grpo_sliding_puzzle.grpo_train → nemo_rl.experience.rollouts.run_multi_tur
 
 ### Core Classes
 
-[sliding_puzzle.py](../../nemo_rl/environments/games/sliding_puzzle.py) defines the environment, and the logic for interactingwith the environment. The core classes used are outlined below:
+[sliding_puzzle.py](../../nemo_rl/environments/games/sliding_puzzle.py) defines the environment, and the logic for interacting with the environment. The core classes used are outlined below:
 
 #### SlidingPuzzleEnv
 Main environment class implementing Ray remote actor for distributed processing. This class uses functions from SlidingPuzzleGameLogic and SlidingPuzzleRunner class to interact with the environment.
@@ -299,3 +299,15 @@ def step(action: str, game_state: dict[str, Any]) -> tuple[str, float, bool, dic
 ```
 ## Results
 
+We fine-tuned [`Qwen/Qwen2.5-1.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) on synthetic data for 200 steps with configs:
+
+```
+game_config:
+    size: 4 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
+    shuffle_moves: 8 # Number of random moves to shuffle the solved state
+max_moves: 30
+```
+
+The figure below shows the Training Rewards vs Steps.
+
+![Training Curve](../assets/avg_reward_sliding_puzzle.png)
