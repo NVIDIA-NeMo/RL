@@ -50,6 +50,8 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     sequence_length_round: 64
+  sequence_packing:
+    enabled: false
   make_sequence_length_divisible_by: 8
   max_grad_norm: 1
   optimizer:
@@ -109,6 +111,7 @@ logger:
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl

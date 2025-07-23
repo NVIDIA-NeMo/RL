@@ -54,7 +54,7 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: null
-      lr_warmup_iters: 50
+      lr_warmup_iters: 13
       lr_warmup_init: 3.0e-8
 
   generation:
@@ -67,7 +67,7 @@ policy:
     stop_strings: null
     vllm_cfg:
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
 cluster:

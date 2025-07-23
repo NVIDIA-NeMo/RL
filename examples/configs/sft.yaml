@@ -44,6 +44,12 @@ policy:
   dynamic_batching:
     enabled: false
 
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
@@ -121,7 +127,7 @@ policy:
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    
+
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   dataset_name: "squad"
@@ -133,12 +139,16 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "sft-dev-${data.dataset_name}"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

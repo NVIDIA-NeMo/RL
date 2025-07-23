@@ -77,17 +77,7 @@ def create_mock_batch(
 
 
 @pytest.fixture(scope="module")
-def ray_init():
-    """Initialize Ray for testing."""
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
-    yield
-    if ray.is_initialized():
-        ray.shutdown()
-
-
-@pytest.fixture(scope="module")
-def mock_env(ray_init):
+def mock_env():
     """Create a mock environment for single task tests."""
     env = MockEnvironment.remote(rewards=[1.0, 2.0])
     yield env
@@ -95,7 +85,7 @@ def mock_env(ray_init):
 
 
 @pytest.fixture(scope="module")
-def mock_envs(ray_init):
+def mock_envs():
     """Create mock environments for multiple task tests."""
     math_env = MockEnvironment.remote(rewards=[1.0, 2.0])
     code_env = MockEnvironment.remote(rewards=[3.0, 4.0])
