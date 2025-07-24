@@ -22,6 +22,15 @@ from transformers import AutoConfig
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 
+def is_vllm_v1_engine_enabled() -> bool:
+    """Check if vLLM V1 engine is enabled.
+
+    Returns:
+        bool: True if V1 engine is enabled, False otherwise (defaults to True if not set)
+    """
+    return os.environ.get("NRL_VLLM_USE_V1", "1") == "1"
+
+
 def import_class_from_path(name: str) -> Any:
     """Import a class from a string path (e.g. 'torch.optim.AdamW').
 
