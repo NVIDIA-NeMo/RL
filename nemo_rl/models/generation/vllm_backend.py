@@ -26,7 +26,6 @@ except ImportError:
         "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
     )
 
-
 class VllmInternalWorkerExtension:
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int

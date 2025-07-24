@@ -1,13 +1,19 @@
-import torch, os
+import torch, os, ray
 from accelerate import init_empty_weights
 from dataclasses import dataclass, field
 from transformers import AutoConfig, AutoModel
 from typing import Optional
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from unittest.mock import patch
 
+
+FP8_BLOCK_QUANT_KWARGS = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [128, 128],
+}
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -15,13 +21,6 @@ class FP8Config:
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
-    fp8_block_quant_cfg = {
-        "activation_scheme": "dynamic",
-        "fmt": "e4m3",
-        "quant_method": "fp8",
-        "weight_block_size": [128, 128],
-    }
-
 
 @dataclass()
 class FP8State:
@@ -33,26 +32,23 @@ class FP8State:
 
 
 # Global FP8 config that can be accessed by patched vLLM functions
-fp8_config: FP8Config = None
+# initialized by 'init_fp8_cfg()'
+global_fp8_config: FP8Config = None
 # Global FP8 state that holds runtime fp8 objects
-fp8_state: FP8Config = None
+fp8_state: FP8State = FP8State()
+
+fp8_patches_applied = False
 
 
-def init_fp8(vllm_cfg, model_name):
-    global fp8_config, fp8_state
-    fp8_config = FP8Config(
-        use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
-        use_activation_pow2_scale=vllm_cfg.get(
-            "pow2_activation_scaling_factors", False
-        ),
-        num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
-        num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
-    )
-    fp8_state = FP8State()
+from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+original_run_workers = RayDistributedExecutor._run_workers
 
-    if vllm_cfg.get("use_deep_gemm", False):
-        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-    print(f"FP8 enabled and initialized to {fp8_config}")
+
+def apply_fp8_patches(self, fp8_config):
+    global global_fp8_config, fp8_patches_applied
+
+    if global_fp8_config is None:
+        global_fp8_config = fp8_config
 
     # This patch is used to support torch.compile with vllm parameter subclasses, such as
     # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
@@ -64,7 +60,7 @@ def init_fp8(vllm_cfg, model_name):
     fp8_state.vllm_patches.append(patcher1)
     # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
     # SNR compared to plain fp32 scaling factors. This feature is still under active research.
-    if fp8_config.use_weight_pow2_scale or fp8_config.use_activation_pow2_scale:
+    if global_fp8_config.use_activation_pow2_scale:
         func2_path = "vllm.model_executor.layers.quantization.utils.fp8_utils.per_token_group_quant_fp8"
         func3_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8"
         func4_path = "vllm.model_executor.layers.quantization.utils.fp8_utils._per_token_group_quant_fp8_colmajor"
@@ -76,12 +72,44 @@ def init_fp8(vllm_cfg, model_name):
     for p in fp8_state.vllm_patches:
         p.start()
 
+    fp8_patches_applied = True
+        
+def patched_run_workers(self, *args, **kwargs):
+    global fp8_patches_applied
+    if not fp8_patches_applied:
+        apply_fp8_patches(self, global_fp8_config)
+        futures = [worker.execute_method.remote(apply_fp8_patches, global_fp8_config) for worker in self.workers]
+        [ray.get(future) for future in futures]
+    
+    return original_run_workers(self, *args, **kwargs)
 
-def get_vllm_kwargs(model_name):
-    fp8_block_quant_cfg = dict(fp8_config.fp8_block_quant_cfg)
+# we patch vllm's _run_workers so that before vllm initalizes the model, we execute a remote call that patches
+# each worker with our required fp8 vllm patches
+RayDistributedExecutor._run_workers = patched_run_workers
+
+
+def init_fp8(vllm_cfg, model_name):
+    global global_fp8_config
+    global_fp8_config = FP8Config(
+        use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
+        use_activation_pow2_scale=vllm_cfg.get(
+            "pow2_activation_scaling_factors", False
+        ),
+        num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
+        num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
+    )
+
+    if vllm_cfg.get("use_deep_gemm", False):
+        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+
+    num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
+    num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+
+    # create fp8 kwargs for vllm's LLM()
     if (
-        fp8_config.num_first_layers_in_bf16 > 0
-        or fp8_config.num_last_layers_in_bf16 > 0
+        num_first_layers_in_bf16 > 0 or
+        num_last_layers_in_bf16 > 0
     ):
         try:
             config = AutoConfig.from_pretrained(model_name)
@@ -92,27 +120,28 @@ def get_vllm_kwargs(model_name):
             raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
 
         bf16_params = []
-        if fp8_config.num_first_layers_in_bf16 > 0:
-            layers = [l for l in range(fp8_config.num_first_layers_in_bf16)]
+        if num_first_layers_in_bf16 > 0:
+            layers = [l for l in range(num_first_layers_in_bf16)]
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
-        if fp8_config.num_last_layers_in_bf16 > 0:
+        if num_last_layers_in_bf16 > 0:
             layers = [
                 l
                 for l in range(
-                    config.num_hidden_layers - fp8_config.num_last_layers_in_bf16,
+                    config.num_hidden_layers - num_last_layers_in_bf16,
                     config.num_hidden_layers,
                 )
             ]
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
-        fp8_block_quant_cfg["ignored_layers"] = bf16_params
+        fp8_block_quant_kwargs["ignored_layers"] = bf16_params
 
     vllm_kwargs = {
         "quantization": "fp8",
-        "hf_overrides": {"quantization_config": fp8_block_quant_cfg},
+        "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
     return vllm_kwargs
+
 
 
 def is_fp8_model(vllm_config):
@@ -213,7 +242,7 @@ def load_weights(weights, model_runner):
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = kitchen_block_scale(
             v.to(torch.float),
-            weight_block_size=FP8Config.fp8_block_quant_cfg["weight_block_size"],
+            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
         )
         param_scale = torch.squeeze(param_scale)
         weights_quantized.append([k, param_lp])
@@ -266,7 +295,7 @@ def kitchen_block_scale(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
-    if fp8_config.use_weight_pow2_scale:
+    if global_fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
         exponent = torch.clamp(exponent, min=-127, max=127) + 127
@@ -370,7 +399,6 @@ def _per_token_group_quant_fp8(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
-    pow2_scale: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
 
@@ -390,27 +418,23 @@ def _per_token_group_quant_fp8(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
 
-    if pow2_scale:
-        inv_scale = fp8_max / _absmax
-        exponent = tl.floor(tl.log2(inv_scale))
-        # exponent is an integer
-        exponent = tl.minimum(exponent, 126.0)
+    # pow2_scale
+    inv_scale = fp8_max / _absmax
+    exponent = tl.floor(tl.log2(inv_scale))
+    # exponent is an integer
+    exponent = tl.minimum(exponent, 126.0)
 
-        # after rounding to exponent, round back to floating
-        inv_scale_pow2 = tl.exp2(exponent)
+    # after rounding to exponent, round back to floating
+    inv_scale_pow2 = tl.exp2(exponent)
 
-        is_nan = inv_scale_pow2 != inv_scale_pow2
-        is_inf = (inv_scale_pow2 == 1.0 / 0.0) | (inv_scale_pow2 == -1.0 / 0.0)
+    is_nan = inv_scale_pow2 != inv_scale_pow2
+    is_inf = (inv_scale_pow2 == 1.0 / 0.0) | (inv_scale_pow2 == -1.0 / 0.0)
 
-        # If the value is NaN or infinity, default it to 1.0,
-        # otherwise keep its original value.
-        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
-        # finally uninverse
-        y_s = 1.0 / inv_scale_pow2
-
-    else:
-        # Original scaling logic
-        y_s = _absmax / fp8_max
+    # If the value is NaN or infinity, default it to 1.0,
+    # otherwise keep its original value.
+    inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
+    # finally uninverse
+    y_s = 1.0 / inv_scale_pow2
 
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -437,7 +461,6 @@ def _per_token_group_quant_fp8_colmajor(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
-    pow2_scale: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
 
@@ -462,23 +485,20 @@ def _per_token_group_quant_fp8_colmajor(
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
 
-    # Quant
-    if pow2_scale:
-        inv_scale = fp8_max / _absmax
-        # calculate the nearest pow2 integer
-        exponent = tl.floor(tl.log2(inv_scale))
-        exponent = tl.minimum(exponent, 126.0)
-        # round inv_scale to the nearest pow2 with the exp we just calculated
-        inv_scale_pow2 = tl.exp2(exponent)
-        # If the value is NaN or infinity, default it to 1.0,
-        # otherwise keep its original value.
-        is_nan = inv_scale_pow2 != inv_scale_pow2
-        is_inf = (inv_scale_pow2 == float("inf")) | (inv_scale_pow2 == float("-inf"))
-        inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
-        # finally uninverse
-        y_s = 1.0 / inv_scale_pow2
-    else:
-        y_s = _absmax / fp8_max
+    # Quant pow2_scale:
+    inv_scale = fp8_max / _absmax
+    # calculate the nearest pow2 integer
+    exponent = tl.floor(tl.log2(inv_scale))
+    exponent = tl.minimum(exponent, 126.0)
+    # round inv_scale to the nearest pow2 with the exp we just calculated
+    inv_scale_pow2 = tl.exp2(exponent)
+    # If the value is NaN or infinity, default it to 1.0,
+    # otherwise keep its original value.
+    is_nan = inv_scale_pow2 != inv_scale_pow2
+    is_inf = (inv_scale_pow2 == float("inf")) | (inv_scale_pow2 == float("-inf"))
+    inv_scale_pow2 = tl.where(is_nan | is_inf, 1.0, inv_scale_pow2)
+    # finally uninverse
+    y_s = 1.0 / inv_scale_pow2
 
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -487,71 +507,9 @@ def _per_token_group_quant_fp8_colmajor(
 
 
 def per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    dtype: Optional[torch.dtype] = None,
-    column_major_scales: bool = False,
-    pow2_scale: bool = False,
+    *args, **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    dtype = current_platform.fp8_dtype() if dtype is None else dtype
-    assert x.shape[-1] % group_size == 0, (
-        f"the last dimension of `x` {x.shape[-1]} must be divisible "
-        f"by `group_size` {group_size}"
-    )
-    assert x.stride(-1) == 1, "`x` groups must be contiguous"
-
-    finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
-    fp8_max = finfo.max
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    M = x.numel() // group_size
-    N = group_size
-    if column_major_scales:
-        shape = (x.shape[-1] // group_size,) + x.shape[:-1]
-        x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
-    else:
-        shape = x.shape[:-1] + (x.shape[-1] // group_size,)
-        x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
-
-    BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
-    num_stages = 1
-
-    if column_major_scales:
-        _per_token_group_quant_fp8_colmajor[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            x.shape[1],
-            x.stride(0),
-            x_s.stride(1),
-            eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            BLOCK=BLOCK,
-            pow2_scale=fp8_config.use_activation_pow2_scale,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-    else:
-        _per_token_group_quant_fp8[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            x.shape[1],
-            x.stride(0),
-            eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            BLOCK=BLOCK,
-            pow2_scale=fp8_config.use_activation_pow2_scale,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-
-    return x_q, x_s
+    assert global_fp8_config.use_activation_pow2_scale
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as vllm_per_token_group_quant_fp8
+    return vllm_per_token_group_quant_fp8(*args, **kwargs)
+   
