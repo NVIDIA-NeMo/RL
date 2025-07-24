@@ -52,6 +52,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 
 
 class VllmSpecificArgs(TypedDict):
@@ -313,7 +314,7 @@ class VllmGenerationWorker:
             # For non-parallel mode, explicitly set executor to None to avoid Ray issues
             vllm_kwargs["distributed_executor_backend"] = None
 
-        os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
+        os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
