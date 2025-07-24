@@ -153,7 +153,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             self.use_dynamic_batches = False
 
-
         # initialize FLOPs tracker
         try:
             self.flops_tracker = FLOPTracker.from_config(
