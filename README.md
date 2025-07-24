@@ -142,6 +142,8 @@ The training backend is automatically determined based on your YAML configuratio
 
 We have a reference GRPO experiment config set up trained for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
+You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
+
 ### GRPO Single Node
 
 To run GRPO on a single GPU for `Qwen/Qwen2.5-1.5B`:
