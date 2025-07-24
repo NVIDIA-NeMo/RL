@@ -14,22 +14,22 @@
 
 import os
 import sys
+from collections import defaultdict
 
+import pytest
 from datasets import Dataset
 
 abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
 
+from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import math_data_processor
 from nemo_rl.models.policy import TokenizerConfig
-
-basic_tokenizer_test_config: TokenizerConfig = {
-    "name": "Qwen/Qwen2.5-Math-1.5B-Instruct",
-    "chat_template": "default",
-}
 
 
 def test_math_data_processor():
@@ -40,7 +40,12 @@ def test_math_data_processor():
         ]
     )
 
-    tokenizer = get_tokenizer(basic_tokenizer_test_config)
+    tokenizer = get_tokenizer(
+        TokenizerConfig(
+            name="Qwen/Qwen2.5-Math-1.5B-Instruct",
+            chat_template="default",
+        )
+    )
 
     math_task_spec = TaskDataSpec(
         task_name="math",
@@ -58,3 +63,62 @@ def test_math_data_processor():
 
     assert dataset[0]["extra_env_info"]["ground_truth"] == "answer1"
     assert dataset[1]["extra_env_info"]["ground_truth"] == "answer2"
+
+
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "tokenizer_name",
+    [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",  # no bos token
+        "google/gemma-3-1b-it",
+        "Qwen/Qwen3-0.6B",  # no bos token
+    ],
+)
+@pytest.mark.parametrize(
+    "dataset_name",
+    [
+        "openmathinstruct2",
+        "deepscaler",
+    ],
+)
+def test_math_hf_data_processor(tokenizer_name, dataset_name):
+    # Initialize dataset
+    if dataset_name == "openmathinstruct2":
+        data = OpenMathInstruct2Dataset()
+    elif dataset_name == "deepscaler":
+        data = DeepScalerDataset()
+
+    # Setup tokenizer
+    tokenizer = get_tokenizer(
+        TokenizerConfig(
+            name=tokenizer_name,
+            chat_template="default",
+        )
+    )
+
+    # Configure task specification
+    math_task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
+        system_prompt_file=None,
+    )
+
+    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
+        defaultdict(lambda: (math_task_spec, hf_data_processor))
+    )
+    task_data_processors["math"] = (math_task_spec, hf_data_processor)
+
+    dataset = AllTaskProcessedDataset(
+        dataset=data.formatted_ds["train"],
+        tokenizer=tokenizer,
+        default_task_data_spec=math_task_spec,
+        task_data_processors=task_data_processors,
+        max_seq_length=128,
+    )
+
+    # Test that the first item can be retrieved when the BOS token assertion passes
+    first_item = dataset[0]
+    assert first_item is not None
+    assert "message_log" in first_item
+    assert len(first_item["message_log"]) > 0
