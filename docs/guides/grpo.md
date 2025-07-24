@@ -111,6 +111,10 @@ We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vll
 
 The function [grpo_train](../../nemo_rl/algorithms/grpo.py) contains the core GRPO training loop.
 
+## Performance Optimizations
+
+RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
+
 ## Loss
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss_functions.py) to calculate the loss for GRPO. Formally,
 
