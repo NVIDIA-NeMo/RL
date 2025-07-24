@@ -17,7 +17,7 @@ This document describes the sequence packing and dynamic batching features imple
 
 ### Challenge: Variable Sequence Lengths in RL/SFT
 
-RL and SFT exhibit highly variable sequence lengths:
+RL and SFT exhibit highly variable sequence lengths due to many datasets having seqlens following Zipf's law:
 
 - **Skewed Distribution**: Most sequences are short, with a few very long sequences
 - **Padding Inefficiency**: Traditional fixed-length batching requires padding all sequences to the maximum length, resulting in:
@@ -34,7 +34,7 @@ NeMo-RL implements two exclusive approaches to address variable sequence lengths
 1. **Sequence Packing**: Concatenates multiple sequences into a single "packed" sequence, eliminating most padding.
 2. **Dynamic Batching**: Groups sequences of similar lengths and adjusts microbatch sizes based on total token count, reducing the excess padding.
 
-### **Important Notes**
+### Important Notes
 
 - Dynamic batching and sequence packing cannot be enabled simultaneously, **they are exclusive**.
 - Compatible with Context Parallelism (CP)
@@ -58,7 +58,7 @@ Packed:
 
 ### Implementation Details
 
-**1. Packing Process (`BatchedDataDict.shard_by_batch_size`)**
+#### 1. Packing Process (`BatchedDataDict.shard_by_batch_size`)
 ```python
 # Located in: nemo_rl/distributed/batched_data_dict.py
 def shard_by_batch_size(
@@ -85,7 +85,7 @@ This method **does not** actually concatenate the sequences and create the packe
 We have the policy backends perform the actual packing because implementations can vary widely on how exactly it should be done and what metadata needs to be collected.
 
 
-**2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)**
+#### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
 Four packing algorithms are implemented, but we recommend you just use Modified First Fit Decreasing for the best packing efficiency:
 
@@ -332,7 +332,7 @@ Similar to Sequence Packing, we do not actually create the dynamic batches upon 
 
 ## Configuration
 
-#### Dynamic Batching Configuration
+### Dynamic Batching Configuration
 ```python
 class DynamicBatchingArgs(TypedDict):
     max_tokens_per_microbatch: int  # Target tokens per microbatch
@@ -341,7 +341,7 @@ class DynamicBatchingArgs(TypedDict):
     input_lengths_key: str          # Sequence lengths key ("input_lengths")
 ```
 
-#### Sequence Packing Configuration
+### Sequence Packing Configuration
 ```python
 class SequencePackingArgs(TypedDict):
     max_tokens_per_microbatch: int     # Bin capacity for packing
@@ -368,7 +368,7 @@ If your loss function cannot assume batch-independence, however, then both Dynam
 - **Packing Efficiency**: Ratio of theoretical minimum to actual bins used
 
 ## Usage
-#### Sequence Packing Configuration
+### Sequence Packing Configuration
 ```yaml
 # examples/configs/grpo_math_1B.yaml
 policy:
@@ -383,7 +383,7 @@ policy:
     enabled: False  # Mutually exclusive
 ```
 
-#### Dynamic Batching Configuration
+### Dynamic Batching Configuration
 ```yaml
 # examples/configs/grpo_math_8B.yaml
 policy:
