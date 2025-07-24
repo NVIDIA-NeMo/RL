@@ -57,7 +57,7 @@ What you can expect:
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
-- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE(small) models
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
 
 
