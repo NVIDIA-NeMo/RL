@@ -29,6 +29,7 @@ except ImportError:
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
 
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int

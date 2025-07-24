@@ -2,7 +2,6 @@ import torch, os, ray
 from accelerate import init_empty_weights
 from dataclasses import dataclass, field
 from transformers import AutoConfig, AutoModel
-from typing import Optional
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from unittest.mock import patch
@@ -15,12 +14,14 @@ FP8_BLOCK_QUANT_KWARGS = {
     "weight_block_size": [128, 128],
 }
 
+
 @dataclass(frozen=True)
 class FP8Config:
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
+
 
 @dataclass()
 class FP8State:
@@ -41,6 +42,7 @@ fp8_patches_applied = False
 
 
 from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+
 original_run_workers = RayDistributedExecutor._run_workers
 
 
@@ -73,18 +75,23 @@ def apply_fp8_patches(self, fp8_config):
         p.start()
 
     fp8_patches_applied = True
-        
+
+
 def patched_run_workers(self, *args, **kwargs):
     global fp8_patches_applied
     if not fp8_patches_applied:
         apply_fp8_patches(self, global_fp8_config)
-        futures = [worker.execute_method.remote(apply_fp8_patches, global_fp8_config) for worker in self.workers]
+        futures = [
+            worker.execute_method.remote(apply_fp8_patches, global_fp8_config)
+            for worker in self.workers
+        ]
         [ray.get(future) for future in futures]
-    
+
     return original_run_workers(self, *args, **kwargs)
 
+
 # we patch vllm's _run_workers so that before vllm initalizes the model, we execute a remote call that patches
-# each worker with our required fp8 vllm patches
+# each worker with the required fp8 vllm patches
 RayDistributedExecutor._run_workers = patched_run_workers
 
 
@@ -106,11 +113,8 @@ def init_fp8(vllm_cfg, model_name):
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
-    # create fp8 kwargs for vllm's LLM()
-    if (
-        num_first_layers_in_bf16 > 0 or
-        num_last_layers_in_bf16 > 0
-    ):
+    # create fp8 kwargs for vllm's LLM(...)
+    if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         try:
             config = AutoConfig.from_pretrained(model_name)
             with init_empty_weights():
@@ -141,7 +145,6 @@ def init_fp8(vllm_cfg, model_name):
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
     return vllm_kwargs
-
 
 
 def is_fp8_model(vllm_config):
@@ -507,9 +510,12 @@ def _per_token_group_quant_fp8_colmajor(
 
 
 def per_token_group_quant_fp8(
-    *args, **kwargs,
+    *args,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert global_fp8_config.use_activation_pow2_scale
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as vllm_per_token_group_quant_fp8
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8 as vllm_per_token_group_quant_fp8,
+    )
+
     return vllm_per_token_group_quant_fp8(*args, **kwargs)
-   
