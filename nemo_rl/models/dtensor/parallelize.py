@@ -41,7 +41,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
 from nemo_rl.models.policy.utils import import_class_from_path
 
 
@@ -92,7 +92,7 @@ def _parallelize_gemma3(
     Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
     """
     if isinstance(model, Gemma3ForConditionalGeneration):
-        model_prefix = "language_model"
+        model_prefix = "model.language_model"
     else:
         model_prefix = "model"
 
@@ -127,7 +127,7 @@ def _parallelize_gemma3(
         ),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
-        f"{model_prefix}.lm_head": PrepareModuleInput(
+        "lm_head": PrepareModuleInput(
             input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
             use_local_output=True,
@@ -621,8 +621,10 @@ def get_logprobs_from_vocab_parallel_logits(
     Args:
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
-        input_ids (torch.Tensor): Input token IDs for which to compute log probabilities,
+        input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
             with shape [batch_size, seq_len].
+        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
+            with shape [sequence_length].
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
@@ -641,7 +643,7 @@ def get_logprobs_from_vocab_parallel_logits(
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return from_parallel_logits_to_logprobs(
+    return dtensor_from_parallel_logits_to_logprobs(
         vocab_parallel_logits.to_local(),
         input_ids,
         vocab_interval_per_rank * tp_rank,

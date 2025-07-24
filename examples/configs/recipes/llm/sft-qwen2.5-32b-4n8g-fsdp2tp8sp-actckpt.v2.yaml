@@ -34,7 +34,9 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: False
+    enabled: false
+  sequence_packing:
+    enabled: false
   make_sequence_length_divisible_by: 8
   max_grad_norm: 1
   optimizer:
@@ -58,6 +60,7 @@ logger:
   log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl

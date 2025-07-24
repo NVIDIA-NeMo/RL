@@ -57,6 +57,9 @@ policy:
   dynamic_batching:
     enabled: false
 
+  sequence_packing:
+    enabled: false
+
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
@@ -153,12 +156,16 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "dpo-dev"
     name: "dpo"
   tensorboard:
     log_dir: "tb_logs-dpo-dev"
+  mlflow:
+    experiment_name: "dpo-dev"
+    run_name: "dpo"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

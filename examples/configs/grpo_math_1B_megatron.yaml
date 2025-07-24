@@ -49,14 +49,19 @@ policy:
   # responses are sorted by sequence length and bucketed into microbatches with a total
   # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
   # training and logprob stages respectively.
+  # 
+  # We disable it for Megatron as it is incompatible with Pipeline parallelism. Instead, we use sequence packing
   dynamic_batching:
     enabled: False
-
-  sequence_packing:
-    enabled: False # coming soon
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_ffd"
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
   max_grad_norm: 1.0
@@ -153,11 +158,15 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
   tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
     name: "sj_megatron_1B"
   tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "sj_megatron_1B"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
