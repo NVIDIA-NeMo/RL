@@ -29,11 +29,11 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     converter_type: "LlamaForCausalLM"
-    tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 4
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 4
+    expert_model_parallel_size: 8
     sequence_parallel: True
     pipeline_dtype: ${policy.precision}
 
@@ -68,7 +68,8 @@ policy:
     stop_strings: null
     vllm_cfg:
       tensor_parallel_size: 4
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.7
+      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
 
 cluster:

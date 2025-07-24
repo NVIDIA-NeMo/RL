@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 
@@ -24,6 +24,49 @@ except ImportError:
         "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
         "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
     )
+
+
+def _patch_gemma3_mm():
+    """Patch gemma3_mm.py to support new HF multimodal format (post transformers v4.52).
+
+    Patch taken from:https://github.com/vllm-project/vllm/pull/19151/files#diff-5890909300e4e6c3160444e4587ec3fd80498bb83f598b22ce81337f75992b06
+    """
+    from packaging.version import Version as PkgVersion
+
+    assert PkgVersion(vllm.__version__) < PkgVersion("0.9.2"), (
+        f"You are using vllm version {vllm.__version__}. "
+        "Please remove this patch (_patch_gemma3_mm in nemo_rl/models/generation/vllm_backend.py) "
+        "since it is included in vllm>=0.9.2."
+    )
+
+    from vllm.logger import init_logger
+    from vllm.model_executor.models import gemma3_mm
+    from vllm.model_executor.models.utils import (
+        AutoWeightsLoader,
+        WeightsMapper,
+    )
+
+    logger = init_logger("gemma3_mm_patch")
+
+    gemma3_mm.Gemma3ForConditionalGeneration.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+            "model.multi_modal_projector.": "multi_modal_projector.",
+            "lm_head.": "language_model.lm_head.",
+        }
+    )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    gemma3_mm.Gemma3ForConditionalGeneration.load_weights = load_weights
+    logger.info("Successfully patched gemma3_mm.py in vllm_backend.")
+
+
+_patch_gemma3_mm()
 
 
 class VllmInternalWorkerExtension:

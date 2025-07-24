@@ -19,11 +19,13 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
+import mlflow
 import ray
 import requests
 import torch
@@ -36,7 +38,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
-from typing_extensions import NotRequired
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -54,6 +55,12 @@ class TensorboardConfig(TypedDict):
     log_dir: NotRequired[str]
 
 
+class MLflowConfig(TypedDict):
+    experiment_name: str
+    run_name: str
+    tracking_uri: NotRequired[str]
+
+
 class GPUMonitoringConfig(TypedDict):
     collection_interval: int | float
     flush_interval: int | float
@@ -63,8 +70,10 @@ class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
     tensorboard_enabled: bool
+    mlflow_enabled: bool
     wandb: WandbConfig
     tensorboard: TensorboardConfig
+    mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
 
@@ -536,7 +545,7 @@ class RayGpuMonitorLogger:
                 unique_metric_addresses[metrics_address] = True
 
             # Process each node's metrics
-            collected_metrics = {}
+            collected_metrics: dict[str, Any] = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
                 metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
@@ -611,6 +620,91 @@ class RayGpuMonitorLogger:
             self.metrics_buffer = []
 
 
+class MLflowLogger(LoggerInterface):
+    """MLflow logger backend."""
+
+    def __init__(self, cfg: MLflowConfig, log_dir: Optional[str] = None):
+        """Initialize MLflow logger.
+
+        Args:
+            cfg: MLflow configuration
+            log_dir: Optional log directory
+        """
+        if cfg["tracking_uri"]:
+            mlflow.set_tracking_uri(cfg["tracking_uri"])
+
+        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        if experiment is None:
+            if log_dir:
+                mlflow.create_experiment(
+                    name=cfg["experiment_name"],
+                    artifact_location=log_dir,
+                )
+            else:
+                mlflow.create_experiment(cfg["experiment_name"])
+        else:
+            mlflow.set_experiment(cfg["experiment_name"])
+
+        # Start run
+        run_kwargs: dict[str, str] = {}
+        run_kwargs["run_name"] = cfg["run_name"]
+
+        self.run = mlflow.start_run(**run_kwargs)
+        print(
+            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
+            f"run {cfg['run_name']}"
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Log metrics to MLflow.
+
+        Args:
+            metrics: Dict of metrics to log
+            step: Global step value
+            prefix: Optional prefix for metric names
+            step_metric: Optional step metric name (ignored in MLflow)
+        """
+        for name, value in metrics.items():
+            if prefix:
+                name = f"{prefix}/{name}"
+            mlflow.log_metric(name, value, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to MLflow.
+
+        Args:
+            params: Dictionary of hyperparameters to log
+        """
+        # MLflow does not support nested dicts
+        mlflow.log_params(flatten_dict(params))
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to MLflow.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+            name: Name of the plot
+        """
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_file:
+            figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
+            mlflow.log_artifact(tmp_file.name, f"plots/{name}")
+
+    def __del__(self) -> None:
+        """Clean up resources when the logger is destroyed."""
+        try:
+            mlflow.end_run()
+        except Exception:
+            # Ignore errors during cleanup
+            pass
+
+
 class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
@@ -621,8 +715,10 @@ class Logger(LoggerInterface):
             cfg: Config dict with the following keys:
                 - wandb_enabled
                 - tensorboard_enabled
+                - mlflow_enabled
                 - wandb
                 - tensorboard
+                - mlflow
                 - monitor_gpus
                 - gpu_collection_interval
                 - gpu_flush_interval
@@ -646,6 +742,12 @@ class Logger(LoggerInterface):
                 cfg["tensorboard"], log_dir=tensorboard_log_dir
             )
             self.loggers.append(tensorboard_logger)
+
+        if cfg["mlflow_enabled"]:
+            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
+            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
+            self.loggers.append(mlflow_logger)
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
@@ -765,13 +867,15 @@ class Logger(LoggerInterface):
             return
 
         generation_logprob = generation_logprobs[
-            sample_idx, generation_start_idx:generation_end_idx
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
         prev_logprob = (
-            prev_logprobs[sample_idx, generation_start_idx:generation_end_idx]
-            * mask[sample_idx, generation_start_idx:generation_end_idx]
+            prev_logprobs[
+                sample_idx, int(generation_start_idx) : int(generation_end_idx)
+            ]
+            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
         )
-        diff_i = diff[sample_idx, generation_start_idx:generation_end_idx]
+        diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
 
         # Find max absolute error token
         max_abs_error_idx = torch.argmax(diff_i).item()
@@ -785,7 +889,7 @@ class Logger(LoggerInterface):
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()
-        step_idx = torch.arange(generation_start_idx, generation_end_idx)
+        step_idx = torch.arange(int(generation_start_idx), int(generation_end_idx))
 
         plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
         plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")
