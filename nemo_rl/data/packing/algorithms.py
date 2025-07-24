@@ -305,26 +305,7 @@ class ConcatenativePacker(SequencePacker):
 
     # Global class variable to limit the number of sequences packed in a unit
     # -1 disables this limit
-    max_sequences_per_bin = 4  # Useful for debugging and testing
-
-    def __init__(
-        self,
-        bin_capacity: int,
-        collect_metrics: bool = False,
-        min_bin_count: Optional[int] = None,
-        bin_count_multiple: Optional[int] = None,
-    ):
-        """Initialize the ConcatenativePacker.
-
-        Args:
-            bin_capacity: The maximum capacity of each bin.
-            collect_metrics: Whether to collect metrics across multiple packing operations.
-            min_bin_count: Minimum number of bins to create, even if fewer would suffice.
-            bin_count_multiple: The total number of bins must be a multiple of this value.
-        """
-        super().__init__(
-            bin_capacity, collect_metrics, min_bin_count, bin_count_multiple
-        )
+    max_sequences_per_bin = -1  # Useful for debugging and testing
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
         """Pack sequences using the Concatenative algorithm.
@@ -379,25 +360,6 @@ class FirstFitPacker(SequencePacker):
     First-Fit variants. Subclasses must implement the _prepare_sequences method
     to determine the order in which sequences are processed.
     """
-
-    def __init__(
-        self,
-        bin_capacity: int,
-        collect_metrics: bool = False,
-        min_bin_count: Optional[int] = None,
-        bin_count_multiple: Optional[int] = None,
-    ):
-        """Initialize the FirstFitPacker.
-
-        Args:
-            bin_capacity: The maximum capacity of each bin.
-            collect_metrics: Whether to collect metrics across multiple packing operations.
-            min_bin_count: Minimum number of bins to create, even if fewer would suffice.
-            bin_count_multiple: The total number of bins must be a multiple of this value.
-        """
-        super().__init__(
-            bin_capacity, collect_metrics, min_bin_count, bin_count_multiple
-        )
 
     def _prepare_sequences(self, sequence_lengths: List[int]) -> List[Tuple[int, int]]:
         """Prepare sequences for packing.
@@ -529,25 +491,6 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
     Time complexity: O(n log n) for sorting + O(n * m) for packing,
     where n is the number of sequences and m is the number of bins.
     """
-
-    def __init__(
-        self,
-        bin_capacity: int,
-        collect_metrics: bool = False,
-        min_bin_count: Optional[int] = None,
-        bin_count_multiple: Optional[int] = None,
-    ):
-        """Initialize the ModifiedFirstFitDecreasingPacker.
-
-        Args:
-            bin_capacity: The maximum capacity of each bin.
-            collect_metrics: Whether to collect metrics across multiple packing operations.
-            min_bin_count: Minimum number of bins to create, even if fewer would suffice.
-            bin_count_multiple: The total number of bins must be a multiple of this value.
-        """
-        super().__init__(
-            bin_capacity, collect_metrics, min_bin_count, bin_count_multiple
-        )
 
     def _classify_items(
         self, items: List[Tuple[int, int]]
