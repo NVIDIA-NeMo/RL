@@ -9,7 +9,6 @@ This document outlines special cases and model-specific behaviors that require c
 For Gemma-3, all model sizes have weight-tying enabled, including the larger models which require tensor parallelism. To support training of these models, we specially handle the Gemma-3 models by allowing training using the DTensor policy with TP > 1.
 
 **Special Handling:**
-- We skip the tied weights check for all Gemma-3 models when using the DTensor policy, allowing training using TP > 1.
 - We exclude `model.embed_tokens` and `lm_head` from the DTensor tensor parallel plan to maintain weight tying correctly.
 
 ### vLLM Initialization
