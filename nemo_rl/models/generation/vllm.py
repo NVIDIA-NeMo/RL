@@ -325,6 +325,7 @@ class VllmGenerationWorker:
 
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.fp8 import init_fp8
+
             fp8_kwargs = init_fp8(self.cfg["vllm_cfg"], self.model_name)
             vllm_kwargs.update(fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
