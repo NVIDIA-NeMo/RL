@@ -65,8 +65,8 @@ uv run python examples/run_eval.py \
     generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
     generation.temperature=0.6 \
     generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \ 
-    data.dataset_name="math500" \
+    generation.vllm_cfg.max_model_len=32768 \
+    data.dataset_name=math500 \
     eval.num_tests_per_prompt=16 \
     cluster.gpus_per_node=8
 ```
