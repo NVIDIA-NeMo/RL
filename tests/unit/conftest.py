@@ -88,7 +88,6 @@ def pytest_collection_modifyitems(config, items):
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
-os.makedirs(TEST_ASSETS_DIR, exist_ok=True)
 UNIT_RESULTS_FILE = os.path.join(dir_path, "unit_results.json")
 UNIT_RESULTS_FILE_DATED = os.path.join(
     dir_path, f"unit_results/{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -235,6 +234,10 @@ def tracker(request, session_data, ray_gpu_monitor):
     end_time = time.time()
     # Prefix with `_` to indicate it's automatically collected
     session_data["metrics"][qualified_name]["_elapsed"] = end_time - start_time
+
+
+def pytest_sessionstart(session):
+    os.makedirs(TEST_ASSETS_DIR, exist_ok=True)
 
 
 def pytest_sessionfinish(session, exitstatus):
