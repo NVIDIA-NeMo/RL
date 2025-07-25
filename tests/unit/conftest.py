@@ -37,6 +37,7 @@ def has_hf_token():
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
+os.makedirs(TEST_ASSETS_DIR, exist_ok=True)
 UNIT_RESULTS_FILE = os.path.join(dir_path, "unit_results.json")
 UNIT_RESULTS_FILE_DATED = os.path.join(
     dir_path, f"unit_results/{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
