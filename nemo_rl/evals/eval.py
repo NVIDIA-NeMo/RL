@@ -493,6 +493,6 @@ def _print_results(
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
     print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
-    print(f"{metric=} {k_value=} {num_tests_per_prompt=}\n")
+    print(f"metric={metric}@{k_value} {num_tests_per_prompt=}\n")
     print(f"score={average_score:.4f} ({score}/{dataset_size})")
     print("=" * 60 + "\n")
