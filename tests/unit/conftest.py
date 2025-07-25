@@ -31,22 +31,60 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 dir_path = os.path.dirname(os.path.abspath(__file__))
 
 
-def pytest_runtest_setup(item):
-    """Automatically skip tests that require special dependencies unless explicitly requested."""
-    config = item.session.config
+def pytest_addoption(parser):
+    """Add custom command line options for controlling test execution."""
+    parser.addoption(
+        "--hf-gated",
+        action="store_true",
+        default=False,
+        help="Include tests that require HuggingFace token access",
+    )
+    parser.addoption(
+        "--mcore-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY mcore tests (combine with --hf-gated to include mcore+hf_gated tests)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to skip tests based on markers unless explicitly requested."""
+    run_hf_gated = config.getoption("--hf-gated")
+    run_mcore_only = config.getoption("--mcore-only")
     marker_expr = config.getoption("-m", default="")
 
-    # Check for hf_gated marker
-    hf_gated = item.get_closest_marker("hf_gated")
-    if hf_gated and "hf_gated" not in marker_expr:
-        pytest.skip("Skipping test that requires HF token (use -m hf_gated to run)")
+    # If user specified -m marker expressions, let pytest handle everything normally
+    if marker_expr:
+        return
 
-    # Check for mcore marker
-    mcore = item.get_closest_marker("mcore")
-    if mcore and "mcore" not in marker_expr:
-        pytest.skip(
-            "Skipping test that requires mcore dependencies (use -m mcore to run)"
-        )
+    # Filter tests based on the desired configurations
+    new_items = []
+
+    if run_mcore_only and run_hf_gated:
+        # Configuration 4: Only mcore tests, including ones with hf_gated
+        new_items = [item for item in items if item.get_closest_marker("mcore")]
+    elif run_mcore_only:
+        # Configuration 3: Only mcore tests, excluding ones with hf_gated
+        new_items = [
+            item
+            for item in items
+            if item.get_closest_marker("mcore")
+            and not item.get_closest_marker("hf_gated")
+        ]
+    elif run_hf_gated:
+        # Configuration 2: Default tests + hf_gated tests, excluding mcore
+        new_items = [item for item in items if not item.get_closest_marker("mcore")]
+    else:
+        # Configuration 1: Default only - exclude both hf_gated and mcore
+        new_items = [
+            item
+            for item in items
+            if not item.get_closest_marker("hf_gated")
+            and not item.get_closest_marker("mcore")
+        ]
+
+    # Update the items list in-place
+    items[:] = new_items
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")

@@ -9,14 +9,19 @@ Unit tests require 2 GPUs to test the full suite.
 :::
 
 ```sh
-# Run the unit tests using local GPUs (by default tests requiring gated HF repos are skipped)
+# Run the unit tests using local GPUs
+
+# Configuration 1: Default tests only - excludes both hf_gated and mcore tests
 uv run --group test bash tests/run_unit.sh
 
-# Run the unit tests and include tests requiring HF gated repos
-uv run --group test bash tests/run_unit.sh -m "hf_gated"
+# Configuration 2: Default + HF gated tests, excluding mcore tests
+uv run --group test bash tests/run_unit.sh --hf-gated
 
-# Run the mcore and HF dated repo tests
-uv run --extra mcore --group test bash tests/run_unit.sh -m "hf_gated and mcore"
+# Configuration 3: ONLY mcore tests, excluding ones with hf_gated
+uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only
+
+# Configuration 4: ONLY mcore tests, including ones with hf_gated
+uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only --hf-gated
 ```
 
 ### Run Unit Tests in a Hermetic Environment
