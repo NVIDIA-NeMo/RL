@@ -45,8 +45,6 @@ dependencies = [
     "matplotlib",
     "plotly",
     "mlflow",
-    "pandas",
-    "pyarrow",
 ]
 
 [project.optional-dependencies]

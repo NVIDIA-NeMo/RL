@@ -17,7 +17,6 @@ import json
 import os
 from typing import TypedDict
 
-import pandas as pd
 import ray
 import torch
 from torch.utils.data import DataLoader
@@ -270,7 +269,7 @@ async def _run_env_eval_impl(
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
         rewards = env_return.rewards
         
-        # Collect data for parquet file
+        # Collect data for JSON file
         for i, (prompt, output, message_log, reward, extra_info) in enumerate(zip(
             prompts, 
             outputs, 
@@ -297,10 +296,10 @@ async def _run_env_eval_impl(
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()
 
-    # Save evaluation data to parquet file if save_path is specified
+    # Save evaluation data to JSON file if save_path is specified
     save_path = eval_config.get("save_path")
     if evaluation_data and save_path is not None:
-        _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, eval_config.get("save_config", True))
+        _save_evaluation_data_to_json(evaluation_data, master_config, save_path, eval_config.get("save_config", True))
 
     # Print results
     _print_results(
@@ -330,8 +329,16 @@ async def _generate_texts(vllm_generation, inputs, use_async):
         return vllm_generation.generate_text(inputs)["texts"]
 
 
-def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, save_config=True):
-    """Save evaluation data to a parquet file."""
+def _save_evaluation_data_to_json(evaluation_data, master_config, save_path, save_config=True):
+    """Save evaluation data to a JSON file.
+    
+    Args:
+        evaluation_data: List of evaluation samples
+        master_config: Configuration dictionary
+        save_path: Path to save evaluation results. Set to null to disable saving. 
+                  Example: "results/eval_output" or "/path/to/evaluation_results"
+        save_config: Whether to save configuration to separate file
+    """
     # Extract configuration information
     config_data = {
         "model_name": master_config["generation"]["model_name"],
@@ -344,35 +351,45 @@ def _save_evaluation_data_to_parquet(evaluation_data, master_config, save_path, 
         "top_k": master_config["generation"]["top_k"],
     }
     
-    # Convert message_log and extra_env_info to string representations for parquet compatibility
-    processed_data = []
-    for sample in evaluation_data:
-        processed_sample = sample.copy()
-        processed_sample["message_log"] = str(sample["message_log"])
-        processed_sample["extra_env_info"] = str(sample["extra_env_info"])
-        processed_data.append(processed_sample)
-    
     # Create directory if it doesn't exist
-    save_dir = os.path.dirname(save_path)
-    if save_dir and not os.path.exists(save_dir):
+    save_dir = save_path
+    if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
+
+    # Generate file paths within the directory
+    eval_data_path = os.path.join(save_dir, "evaluation_data.json")
+    config_path = os.path.join(save_dir, "config.json")
+
+    # Prepare the data to save
+    data_to_save = {
+        "evaluation_data": evaluation_data
+    }
 
     # Save configuration to separate JSON file if requested
     if save_config:
-        config_path = f"{os.path.splitext(save_path)[0]}-config.json"
         with open(config_path, 'w') as f:
             json.dump(config_data, f, indent=2)
         print(f"\n✓ Configuration saved to: {config_path}")
     
-    # Create DataFrame and save to parquet
-    df = pd.DataFrame(processed_data)
+    # Process data to make it JSON serializable
+    processed_data = []
+    for sample in evaluation_data:
+        processed_sample = sample.copy()
+        # Convert non-serializable objects to strings
+        processed_sample["message_log"] = str(sample["message_log"])
+        processed_sample["extra_env_info"] = str(sample["extra_env_info"])
+        processed_data.append(processed_sample)
     
-    # Save to parquet file
-    df.to_parquet(save_path, index=False)
-    print(f"\n✓ Evaluation data saved to: {save_path}")
-    print(f"  Total samples: {len(processed_data)}")
-    print(f"  Columns: {list(df.columns)}")
-    print(f"  File size: {os.path.getsize(save_path) / 1024 / 1024:.2f} MB")
+    # Update data to save with processed version
+    data_to_save["evaluation_data"] = processed_data
+    
+    # Save to JSON file
+    with open(eval_data_path, 'w') as f:
+        json.dump(data_to_save, f, indent=2)
+    
+    print(f"\n✓ Evaluation data saved to: {eval_data_path}")
+    print(f"  Total samples: {len(evaluation_data)}")
+    print(f"  File size: {os.path.getsize(eval_data_path) / 1024 / 1024:.2f} MB")
 
 
 def _print_results(
