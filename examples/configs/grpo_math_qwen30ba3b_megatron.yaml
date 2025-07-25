@@ -21,6 +21,9 @@ policy:
   dtensor_cfg:
     enabled: false
 
+  sequence_packing:
+    enabled: False
+
   optimizer: null # remove default FSDP optimizer
 
   scheduler: null # remove default FSDP scheduler
