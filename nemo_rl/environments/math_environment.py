@@ -297,7 +297,7 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
 
         # Flatten the results and extract both scores and answers
         results = []
-        extracted_answers: list[str | None] = []
+        extracted_answers: list[str | None] = [] if return_extracted_answer else None
 
         for worker_result in worker_results:
             if return_extracted_answer:
