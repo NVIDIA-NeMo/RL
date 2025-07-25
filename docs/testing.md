@@ -19,12 +19,6 @@ uv run --group test bash tests/run_unit.sh -m "hf_gated"
 uv run --extra mcore --group test bash tests/run_unit.sh -m "hf_gated and mcore"
 ```
 
-:::{note}
-Tests can also be run on Slurm with `ray.sub`, but note that some tests will be skipped
-due to no GPUs being located on the head node. To run the full suite of tests, please
-launch on a regular GPU allocation.
-:::
-
 ### Run Unit Tests in a Hermetic Environment
 
 For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`)
