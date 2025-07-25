@@ -32,20 +32,23 @@ dir_path = os.path.dirname(os.path.abspath(__file__))
 
 
 def pytest_runtest_setup(item):
-    """Automatically skip tests that require HF tokens unless explicitly requested."""
-    needs_hf_token = item.get_closest_marker("needs_hf_token")
-    if needs_hf_token:
-        # Check if the test should run based on pytest marker selection
-        # If -m needs_hf_token is specified, run the test
-        # Otherwise, skip it by default
-        config = item.session.config
+    """Automatically skip tests that require special dependencies unless explicitly requested."""
+    config = item.session.config
+    marker_expr = config.getoption("-m", default="")
 
-        # Check if needs_hf_token marker is explicitly selected
-        marker_expr = config.getoption("-m", default="")
-        if "needs_hf_token" not in marker_expr:
-            pytest.skip(
-                "Skipping test that requires HF token (use -m needs_hf_token to run)"
-            )
+    # Check for needs_hf_token marker
+    needs_hf_token = item.get_closest_marker("needs_hf_token")
+    if needs_hf_token and "needs_hf_token" not in marker_expr:
+        pytest.skip(
+            "Skipping test that requires HF token (use -m needs_hf_token to run)"
+        )
+
+    # Check for mcore marker
+    mcore = item.get_closest_marker("mcore")
+    if mcore and "mcore" not in marker_expr:
+        pytest.skip(
+            "Skipping test that requires mcore dependencies (use -m mcore to run)"
+        )
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
