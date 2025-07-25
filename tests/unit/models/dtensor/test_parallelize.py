@@ -26,7 +26,7 @@ from nemo_rl.models.dtensor.parallelize import (
 )
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "model_name, parallelize_func, sequence_parallel",
     [

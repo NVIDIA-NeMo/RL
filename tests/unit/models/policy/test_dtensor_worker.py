@@ -159,6 +159,7 @@ def policy_setup(two_gpu_virtual_cluster, tiny_llama_model_path):
     policy.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(180)
 def test_lm_policy_init(policy_setup):
     policy = policy_setup
@@ -306,7 +307,7 @@ def training_setup(request, two_gpu_virtual_cluster):
         policy.shutdown()
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize(
     "training_setup",
@@ -465,7 +466,7 @@ def logprob_setup(request, two_gpu_virtual_cluster):
         policy.shutdown()
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize(
     "logprob_setup",
@@ -508,7 +509,7 @@ def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
     )
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
     two_gpu_virtual_cluster, tiny_llama_tied_model_path
 ):
@@ -554,7 +555,7 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
     policy.shutdown()
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.timeout(180)
 def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
     two_gpu_virtual_cluster, tiny_llama_model_path

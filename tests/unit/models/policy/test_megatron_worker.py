@@ -319,7 +319,7 @@ def training_setup(request):
             cluster.shutdown()
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "training_setup",
@@ -622,7 +622,7 @@ def logprob_setup(request):
 
 
 @pytest.mark.timeout(180)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "logprob_setup",
     [
@@ -663,7 +663,7 @@ def test_megatron_policy_logprobs(logprob_setup):
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     """Test that changing microbatch size while keeping global batch size constant does not affect loss values."""
     num_gpus = 2
@@ -782,7 +782,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     """Test Megatron reference policy functionality."""
     num_gpus = 2
@@ -903,7 +903,7 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
 
 
 @pytest.mark.timeout(400)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "num_gpus,tp,pp",
     [
@@ -1158,7 +1158,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_megatron_dpo_training(tiny_llama_model_path):
     """Test DPO training with Megatron backend."""
     num_gpus = 2
@@ -1255,7 +1255,7 @@ def test_megatron_dpo_training(tiny_llama_model_path):
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_megatron_sft_training(tiny_llama_model_path):
     """Test SFT training with Megatron backend."""
     num_gpus = 2

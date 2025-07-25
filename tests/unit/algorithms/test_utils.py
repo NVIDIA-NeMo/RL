@@ -77,7 +77,7 @@ def get_format_with_simple_role_header(messages):
     return message
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_tokenizer_no_chat_template(conversation_messages):
     """Test get_tokenizer when no chat template is specified in config"""
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct"}
@@ -90,7 +90,7 @@ def test_get_tokenizer_no_chat_template(conversation_messages):
     assert formatted == expected
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_tokenizer_default_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is 'default' in config"""
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": "default"}
@@ -102,7 +102,7 @@ def test_get_tokenizer_default_chat_template(conversation_messages):
     assert formatted == expected
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_tokenizer_null_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is None in config"""
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": None}
@@ -116,7 +116,7 @@ def test_get_tokenizer_null_chat_template(conversation_messages):
     assert formatted == expected
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_tokenizer_custom_jinja_template(conversation_messages):
     """Test get_tokenizer when a custom jinja template is specified"""
     custom_template = COMMON_CHAT_TEMPLATES.simple_role_header

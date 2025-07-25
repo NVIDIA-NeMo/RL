@@ -17,7 +17,7 @@ import pytest
 from nemo_rl.models.huggingface.common import ModelFlag, is_gemma_model
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "model_name",
     [
@@ -43,7 +43,7 @@ def test_gemma_models(model_name):
     assert ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(model_name)
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "model_name",
     [

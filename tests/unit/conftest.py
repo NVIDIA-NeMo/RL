@@ -36,12 +36,10 @@ def pytest_runtest_setup(item):
     config = item.session.config
     marker_expr = config.getoption("-m", default="")
 
-    # Check for needs_hf_token marker
-    needs_hf_token = item.get_closest_marker("needs_hf_token")
-    if needs_hf_token and "needs_hf_token" not in marker_expr:
-        pytest.skip(
-            "Skipping test that requires HF token (use -m needs_hf_token to run)"
-        )
+    # Check for hf_gated marker
+    hf_gated = item.get_closest_marker("hf_gated")
+    if hf_gated and "hf_gated" not in marker_expr:
+        pytest.skip("Skipping test that requires HF token (use -m hf_gated to run)")
 
     # Check for mcore marker
     mcore = item.get_closest_marker("mcore")

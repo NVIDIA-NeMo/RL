@@ -328,7 +328,7 @@ def test_batch_pad_message_log_custom_pad_value(
     )
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_formatted_message_log_llama(
     raw_chat_message_log: LLMMessageLogType,
 ) -> None:
@@ -373,7 +373,7 @@ def test_get_formatted_message_log_llama(
     assert actual_text == expected_text
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_get_formatted_message_log_add_generation_prompt_llama(
     raw_chat_message_log: LLMMessageLogType,
 ) -> None:
@@ -501,7 +501,7 @@ def test_get_formatted_message_log_add_generation_prompt_qwen(
     assert actual_text == expected_text
 
 
-@pytest.mark.needs_hf_token
+@pytest.mark.hf_gated
 def test_formatted_message_log_empty_message():
     message_logs = [
         [
