@@ -324,3 +324,274 @@ class TestSequencePacker:
             print(
                 f"Warning: {algorithm.name} produced the same result with different seeds"
             )
+
+    @pytest.mark.parametrize(
+        "algorithm",
+        [
+            PackingAlgorithm.CONCATENATIVE,
+            PackingAlgorithm.FIRST_FIT_DECREASING,
+            PackingAlgorithm.FIRST_FIT_SHUFFLE,
+            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
+        ],
+    )
+    def test_min_bin_count(
+        self,
+        bin_capacity: int,
+        small_sequence_lengths: List[int],
+        algorithm: PackingAlgorithm,
+    ):
+        """Test minimum bin count functionality."""
+        # First get the natural packing
+        packer_natural = get_packer(algorithm, bin_capacity)
+        bins_natural = packer_natural.pack(small_sequence_lengths)
+        natural_bin_count = len(bins_natural)
+
+        # Test with min_bin_count equal to natural count (should be unchanged)
+        packer_equal = get_packer(
+            algorithm, bin_capacity, min_bin_count=natural_bin_count
+        )
+        bins_equal = packer_equal.pack(small_sequence_lengths)
+        assert len(bins_equal) == natural_bin_count
+        assert validate_solution(small_sequence_lengths, bins_equal, bin_capacity)
+
+        # Test with min_bin_count greater than natural count
+        min_bins = natural_bin_count + 2
+        if min_bins <= len(small_sequence_lengths):  # Ensure we have enough sequences
+            packer_more = get_packer(algorithm, bin_capacity, min_bin_count=min_bins)
+            bins_more = packer_more.pack(small_sequence_lengths)
+            assert len(bins_more) == min_bins
+            assert validate_solution(small_sequence_lengths, bins_more, bin_capacity)
+
+            # Verify no empty bins
+            for bin_contents in bins_more:
+                assert len(bin_contents) > 0, "Found empty bin"
+
+    @pytest.mark.parametrize(
+        "algorithm",
+        [
+            PackingAlgorithm.CONCATENATIVE,
+            PackingAlgorithm.FIRST_FIT_DECREASING,
+            PackingAlgorithm.FIRST_FIT_SHUFFLE,
+            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
+        ],
+    )
+    def test_bin_count_multiple(
+        self,
+        bin_capacity: int,
+        medium_sequence_lengths: List[int],
+        algorithm: PackingAlgorithm,
+    ):
+        """Test bin count multiple functionality."""
+        # Get natural packing
+        packer_natural = get_packer(algorithm, bin_capacity)
+        bins_natural = packer_natural.pack(medium_sequence_lengths)
+        natural_bin_count = len(bins_natural)
+
+        # Test with multiple that doesn't change the count
+        if natural_bin_count % 2 == 0:
+            multiple = 2
+        else:
+            multiple = natural_bin_count
+
+        packer_multiple = get_packer(
+            algorithm, bin_capacity, bin_count_multiple=multiple
+        )
+        bins_multiple = packer_multiple.pack(medium_sequence_lengths)
+        assert len(bins_multiple) % multiple == 0
+        assert validate_solution(medium_sequence_lengths, bins_multiple, bin_capacity)
+
+        # Test with multiple that forces more bins
+        multiple = 4
+        expected_bins = ((natural_bin_count - 1) // multiple + 1) * multiple
+        if expected_bins <= len(
+            medium_sequence_lengths
+        ):  # Ensure we have enough sequences
+            packer_force = get_packer(
+                algorithm, bin_capacity, bin_count_multiple=multiple
+            )
+            bins_force = packer_force.pack(medium_sequence_lengths)
+            assert len(bins_force) == expected_bins
+            assert len(bins_force) % multiple == 0
+            assert validate_solution(medium_sequence_lengths, bins_force, bin_capacity)
+
+            # Verify no empty bins
+            for bin_contents in bins_force:
+                assert len(bin_contents) > 0, "Found empty bin"
+
+    @pytest.mark.parametrize(
+        "algorithm",
+        [
+            PackingAlgorithm.CONCATENATIVE,
+            PackingAlgorithm.FIRST_FIT_DECREASING,
+            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
+        ],
+    )
+    def test_combined_constraints(
+        self,
+        bin_capacity: int,
+        small_sequence_lengths: List[int],
+        algorithm: PackingAlgorithm,
+    ):
+        """Test combined min_bin_count and bin_count_multiple constraints."""
+        # Get natural packing
+        packer_natural = get_packer(algorithm, bin_capacity)
+        bins_natural = packer_natural.pack(small_sequence_lengths)
+        natural_bin_count = len(bins_natural)
+
+        min_bins = natural_bin_count + 1
+        multiple = 3
+        expected_bins = ((min_bins - 1) // multiple + 1) * multiple
+
+        if expected_bins <= len(
+            small_sequence_lengths
+        ):  # Ensure we have enough sequences
+            packer_combined = get_packer(
+                algorithm,
+                bin_capacity,
+                min_bin_count=min_bins,
+                bin_count_multiple=multiple,
+            )
+            bins_combined = packer_combined.pack(small_sequence_lengths)
+
+            assert len(bins_combined) == expected_bins
+            assert len(bins_combined) >= min_bins
+            assert len(bins_combined) % multiple == 0
+            assert validate_solution(
+                small_sequence_lengths, bins_combined, bin_capacity
+            )
+
+            # Verify no empty bins
+            for bin_contents in bins_combined:
+                assert len(bin_contents) > 0, "Found empty bin"
+
+    def test_constraint_error_cases(self, bin_capacity: int):
+        """Test error cases for bin count constraints."""
+        # Test invalid min_bin_count
+        with pytest.raises(ValueError):
+            get_packer(PackingAlgorithm.CONCATENATIVE, bin_capacity, min_bin_count=-1)
+
+        # Test invalid bin_count_multiple
+        with pytest.raises(ValueError):
+            get_packer(
+                PackingAlgorithm.CONCATENATIVE, bin_capacity, bin_count_multiple=0
+            )
+
+        with pytest.raises(ValueError):
+            get_packer(
+                PackingAlgorithm.CONCATENATIVE, bin_capacity, bin_count_multiple=-5
+            )
+
+    def test_insufficient_sequences_for_constraints(self, bin_capacity: int):
+        """Test error when there aren't enough sequences to meet constraints."""
+        sequence_lengths = [50, 50]  # Only 2 sequences
+
+        # Test min_bin_count constraint with insufficient sequences
+        packer = get_packer(
+            PackingAlgorithm.CONCATENATIVE, bin_capacity, min_bin_count=3
+        )
+        with pytest.raises(
+            ValueError, match="Cannot create 3 bins with only 2 sequences"
+        ):
+            packer.pack(sequence_lengths)
+
+        # Test bin_count_multiple constraint with insufficient sequences
+        packer = get_packer(
+            PackingAlgorithm.CONCATENATIVE, bin_capacity, bin_count_multiple=4
+        )
+        with pytest.raises(
+            ValueError, match="Cannot create 4 bins with only 2 sequences"
+        ):
+            packer.pack(sequence_lengths)
+
+    @pytest.mark.parametrize(
+        "algorithm",
+        [
+            PackingAlgorithm.CONCATENATIVE,
+            PackingAlgorithm.FIRST_FIT_DECREASING,
+            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
+        ],
+    )
+    def test_packing_preservation(
+        self,
+        bin_capacity: int,
+        medium_sequence_lengths: List[int],
+        algorithm: PackingAlgorithm,
+    ):
+        """Test that original packing efficiency is preserved when constraints are applied."""
+        # Get natural packing and calculate utilization
+        packer_natural = get_packer(algorithm, bin_capacity)
+        bins_natural = packer_natural.pack(medium_sequence_lengths)
+
+        def calculate_utilization(bins, sequence_lengths, bin_capacity):
+            total_load = sum(sequence_lengths)
+            total_capacity = len(bins) * bin_capacity
+            return total_load / total_capacity if total_capacity > 0 else 0
+
+        natural_utilization = calculate_utilization(
+            bins_natural, medium_sequence_lengths, bin_capacity
+        )
+
+        # Force more bins and check that utilization doesn't degrade too much
+        min_bins = len(bins_natural) + 1
+        if min_bins <= len(medium_sequence_lengths):
+            packer_constrained = get_packer(
+                algorithm, bin_capacity, min_bin_count=min_bins
+            )
+            bins_constrained = packer_constrained.pack(medium_sequence_lengths)
+            constrained_utilization = calculate_utilization(
+                bins_constrained, medium_sequence_lengths, bin_capacity
+            )
+
+            # The utilization should decrease, but not dramatically
+            # (since we're adding one bin, it should be roughly proportional)
+            expected_utilization = (
+                natural_utilization * len(bins_natural) / len(bins_constrained)
+            )
+
+            # Allow some tolerance due to redistribution effects
+            assert constrained_utilization >= expected_utilization * 0.9, (
+                f"Utilization degraded too much: {constrained_utilization} vs expected {expected_utilization}"
+            )
+
+    def test_factory_function_with_constraints(self, bin_capacity: int):
+        """Test that the factory function properly passes constraint parameters."""
+        # Test all parameter combinations
+        packer1 = get_packer(
+            PackingAlgorithm.CONCATENATIVE, bin_capacity, min_bin_count=5
+        )
+        assert packer1.min_bin_count == 5
+        assert packer1.bin_count_multiple is None
+
+        packer2 = get_packer(
+            PackingAlgorithm.CONCATENATIVE, bin_capacity, bin_count_multiple=4
+        )
+        assert packer2.min_bin_count is None
+        assert packer2.bin_count_multiple == 4
+
+        packer3 = get_packer(
+            PackingAlgorithm.CONCATENATIVE,
+            bin_capacity,
+            min_bin_count=3,
+            bin_count_multiple=2,
+        )
+        assert packer3.min_bin_count == 3
+        assert packer3.bin_count_multiple == 2
+
+    def test_no_constraints_unchanged_behavior(
+        self, bin_capacity: int, small_sequence_lengths: List[int]
+    ):
+        """Test that behavior is unchanged when no constraints are specified."""
+        # Create packers with and without explicit None constraints
+        packer1 = get_packer(PackingAlgorithm.CONCATENATIVE, bin_capacity)
+        packer2 = get_packer(
+            PackingAlgorithm.CONCATENATIVE,
+            bin_capacity,
+            min_bin_count=None,
+            bin_count_multiple=None,
+        )
+
+        bins1 = packer1.pack(small_sequence_lengths)
+        bins2 = packer2.pack(small_sequence_lengths)
+
+        # Results should be identical
+        assert bins1 == bins2
