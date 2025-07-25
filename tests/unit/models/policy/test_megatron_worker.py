@@ -1338,6 +1338,7 @@ def test_megatron_sft_training(tiny_llama_model_path):
         cluster.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce identical logprobs with sequence packing enabled."""
@@ -1540,6 +1541,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     )
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing."""
