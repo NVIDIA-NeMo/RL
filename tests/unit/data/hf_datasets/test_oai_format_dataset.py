@@ -13,17 +13,10 @@
 # limitations under the License.
 
 import json
-import os
 import tempfile
 
 import pytest
 from transformers import AutoTokenizer
-
-
-def has_hf_token():
-    """Check if HuggingFace token is available."""
-    return os.getenv("HF_TOKEN") is not None
-
 
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.hf_datasets.oai_format_dataset import (
@@ -97,12 +90,6 @@ def test_custom_keys(sample_data):
 @pytest.mark.needs_hf_token
 @pytest.mark.parametrize("sample_data", [("messages", "system_key")], indirect=True)
 def test_message_formatting(sample_data):
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: Meta-Llama/Meta-Llama-3-8B-Instruct"
-        )
-
     train_path, val_path = sample_data
     dataset = OpenAIFormatDataset(
         train_path, val_path, chat_key="messages", system_key="system_key"

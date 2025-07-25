@@ -13,17 +13,9 @@
 # limitations under the License.
 
 
-import os
-
 import pytest
 import torch
 from transformers import AutoTokenizer
-
-
-def has_hf_token():
-    """Check if HuggingFace token is available."""
-    return os.getenv("HF_TOKEN") is not None
-
 
 from nemo_rl.data.hf_datasets import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
@@ -340,12 +332,6 @@ def test_batch_pad_message_log_custom_pad_value(
 def test_get_formatted_message_log_llama(
     raw_chat_message_log: LLMMessageLogType,
 ) -> None:
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Meta-Llama-3-8B-Instruct"
-        )
-
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
 
     ## get expected result
@@ -391,12 +377,6 @@ def test_get_formatted_message_log_llama(
 def test_get_formatted_message_log_add_generation_prompt_llama(
     raw_chat_message_log: LLMMessageLogType,
 ) -> None:
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Meta-Llama-3-8B-Instruct"
-        )
-
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
 
     ## get expected result
@@ -523,12 +503,6 @@ def test_get_formatted_message_log_add_generation_prompt_qwen(
 
 @pytest.mark.needs_hf_token
 def test_formatted_message_log_empty_message():
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Meta-Llama-3-8B-Instruct"
-        )
-
     message_logs = [
         [
             {"role": "system", "content": "You are a helpful assistant."},

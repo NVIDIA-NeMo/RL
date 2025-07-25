@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from itertools import product
 from unittest.mock import MagicMock
 
 import pytest
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from transformers import AutoModelForCausalLM
-
-
-def has_hf_token():
-    """Check if HuggingFace token is available."""
-    return os.getenv("HF_TOKEN") is not None
-
 
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_gemma3,
@@ -52,17 +45,6 @@ from nemo_rl.models.dtensor.parallelize import (
 )
 def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
     """Tests that the keys in the parallelization plans are valid by mocking parallel styles."""
-    # List of known gated models that require HF token
-    gated_models = [
-        "google/gemma-3-1b-it",
-        "google/gemma-3-4b-it",
-        "meta-llama/Llama-3.2-1B-Instruct",
-    ]
-
-    # Skip if testing a gated model and no HF token available
-    if model_name in gated_models and not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(f"HuggingFace token not available for gated model: {model_name}")
-
     model = AutoModelForCausalLM.from_pretrained(model_name)
     parallel_plan = parallelize_func(model, sequence_parallel=sequence_parallel)
 

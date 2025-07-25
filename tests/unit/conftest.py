@@ -31,9 +31,21 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 dir_path = os.path.dirname(os.path.abspath(__file__))
 
 
-def has_hf_token():
-    """Check if HuggingFace token is available."""
-    return os.getenv("HF_TOKEN") is not None
+def pytest_runtest_setup(item):
+    """Automatically skip tests that require HF tokens unless explicitly requested."""
+    needs_hf_token = item.get_closest_marker("needs_hf_token")
+    if needs_hf_token:
+        # Check if the test should run based on pytest marker selection
+        # If -m needs_hf_token is specified, run the test
+        # Otherwise, skip it by default
+        config = item.session.config
+
+        # Check if needs_hf_token marker is explicitly selected
+        marker_expr = config.getoption("-m", default="")
+        if "needs_hf_token" not in marker_expr:
+            pytest.skip(
+                "Skipping test that requires HF token (use -m needs_hf_token to run)"
+            )
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
@@ -389,12 +401,6 @@ def tiny_llama_model_path():
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B"
-        )
-
     model_path = os.path.join(TEST_ASSETS_DIR, "tiny_llama_with_llama3.2_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=128256 (so we can re-use llama3.2 1b tokenizer)
@@ -422,12 +428,6 @@ def tiny_llama_tied_model_path():
     import shutil
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
-
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B"
-        )
 
     model_path = os.path.join(
         TEST_ASSETS_DIR, "tiny_llama_tied_with_llama3.2_tokenizer"
@@ -514,12 +514,6 @@ def tiny_gemma3_model_path():
     import shutil
 
     from transformers import AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig
-
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: google/gemma-3-1b-it"
-        )
 
     model_path = os.path.join(TEST_ASSETS_DIR, "tiny_gemma3_with_gemma3_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)

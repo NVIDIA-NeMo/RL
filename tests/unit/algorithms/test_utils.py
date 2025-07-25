@@ -12,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from datetime import datetime
 
 import pytest
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
-
-
-def has_hf_token():
-    """Check if HuggingFace token is available."""
-    return os.getenv("HF_TOKEN") is not None
 
 
 @pytest.fixture
@@ -86,12 +80,6 @@ def get_format_with_simple_role_header(messages):
 @pytest.mark.needs_hf_token
 def test_get_tokenizer_no_chat_template(conversation_messages):
     """Test get_tokenizer when no chat template is specified in config"""
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B-Instruct"
-        )
-
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct"}
     tokenizer = get_tokenizer(config)
 
@@ -105,12 +93,6 @@ def test_get_tokenizer_no_chat_template(conversation_messages):
 @pytest.mark.needs_hf_token
 def test_get_tokenizer_default_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is 'default' in config"""
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B-Instruct"
-        )
-
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": "default"}
     tokenizer = get_tokenizer(config)
 
@@ -123,12 +105,6 @@ def test_get_tokenizer_default_chat_template(conversation_messages):
 @pytest.mark.needs_hf_token
 def test_get_tokenizer_null_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is None in config"""
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B-Instruct"
-        )
-
     config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": None}
     tokenizer = get_tokenizer(config)
 
@@ -143,12 +119,6 @@ def test_get_tokenizer_null_chat_template(conversation_messages):
 @pytest.mark.needs_hf_token
 def test_get_tokenizer_custom_jinja_template(conversation_messages):
     """Test get_tokenizer when a custom jinja template is specified"""
-    # Skip if no HF token available for gated model
-    if not has_hf_token() and not os.getenv("CI"):
-        pytest.skip(
-            "HuggingFace token not available for gated model: meta-llama/Llama-3.2-1B-Instruct"
-        )
-
     custom_template = COMMON_CHAT_TEMPLATES.simple_role_header
     config = {
         "name": "meta-llama/Llama-3.2-1B-Instruct",
