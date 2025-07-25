@@ -151,7 +151,7 @@ def gc_collect():
 
 
 @pytest.fixture
-def policy_setup(request):
+def policy_setup(request, tiny_llama_model_path):
     """Setup and teardown for policy tests - creates a virtual cluster and policy."""
     # Get parameters from request
     if hasattr(request, "param") and request.param is not None:
@@ -176,7 +176,7 @@ def policy_setup(request):
             max_colocated_worker_groups=1,
         )
 
-        config = create_megatron_test_config(tp=tp, pp=pp)
+        config = create_megatron_test_config(tiny_llama_model_path, tp=tp, pp=pp)
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
             config["generation"], tokenizer
@@ -389,7 +389,7 @@ def test_megatron_policy_training(training_setup):
 
 
 @pytest.fixture
-def generation_setup(request):
+def generation_setup(request, tiny_llama_model_path):
     """Setup and teardown specifically for generation tests."""
     # Parse parameters: (num_gpus, tp, pp, generation_backend)
     if hasattr(request, "param") and request.param is not None:
@@ -418,6 +418,7 @@ def generation_setup(request):
         )
 
         config = create_megatron_test_config(
+            tiny_llama_model_path,
             tp=tp,
             pp=pp,
             generation_backend=generation_backend,
@@ -1338,7 +1339,7 @@ def test_megatron_sft_training(tiny_llama_model_path):
 
 
 @pytest.mark.timeout(300)
-def test_megatron_context_parallel_logprob_agreement():
+def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce identical logprobs with sequence packing enabled."""
     num_gpus = 2
     batch_size = 4
@@ -1376,7 +1377,9 @@ def test_megatron_context_parallel_logprob_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_no_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Ensure context parallel is disabled
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
 
@@ -1456,7 +1459,9 @@ def test_megatron_context_parallel_logprob_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
 
@@ -1536,7 +1541,7 @@ def test_megatron_context_parallel_logprob_agreement():
 
 
 @pytest.mark.timeout(300)
-def test_megatron_context_parallel_training_agreement():
+def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing."""
     num_gpus = 2
     batch_size = 2
@@ -1594,7 +1599,9 @@ def test_megatron_context_parallel_training_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_no_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Ensure context parallel is disabled
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
     config_no_cp["train_global_batch_size"] = 2
@@ -1656,7 +1663,9 @@ def test_megatron_context_parallel_training_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
     config_cp["train_global_batch_size"] = 2
