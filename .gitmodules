@@ -8,3 +8,9 @@
 	url = https://github.com/chtruong814/Megatron-LM.git
 	branch = chtruong/sahil-rl
 	shallow = true
+[submodule "3rdparty/kitchen-workspace/kitchen"]
+	path = 3rdparty/kitchen-workspace/kitchen
+	url = https://gitlab-master.nvidia.com/compute/chef/kitchen.git
+[submodule "3rdparty/psx-formats-workspace/psx-formats"]
+	path = 3rdparty/psx-formats-workspace/psx-formats
+	url = https://gitlab-master.nvidia.com/compute/psx/psx-formats/psx-formats.git

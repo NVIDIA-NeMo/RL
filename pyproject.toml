@@ -67,6 +67,8 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
+    "psx-formats",
+    "kitchen",
     "transformer-engine[pytorch]==2.3.0",
     "megatron-core",
     "nemo-tron",
@@ -116,6 +118,8 @@ test = [
 ]
 
 [tool.uv.sources]
+psx-formats = { workspace = true }
+kitchen = { workspace = true }
 megatron-core = { workspace = true }
 nemo-tron = { workspace = true }
 # The NeMo Run source to be used by nemo-tron
@@ -135,6 +139,8 @@ triton = [
 members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/NeMo-workspace",
+    "3rdparty/kitchen-workspace",
+    "3rdparty/psx-formats-workspace",
 ]
 
 [[tool.uv.index]]

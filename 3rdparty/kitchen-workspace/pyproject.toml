@@ -1,0 +1,13 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+
+[build-system]
+requires = [
+    "setuptools",
+    "pybind11",
+    "torch",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kitchen"
+dynamic = ["dependencies", "version"]
