@@ -264,7 +264,7 @@ def calculate_rewards(
     all_next_stop_strings = []
     all_metadata = []  # Store extracted metadata
     all_indices_order = []
-    all_info = []
+    all_answers = []
 
     for future, result in zip(futures, results):
         indices = future_to_indices[future]
@@ -275,12 +275,12 @@ def calculate_rewards(
             next_stop_strings,
             task_rewards,
             terminateds,
-            info,
+            answers,
         ) = result
         if next_stop_strings is None:
             next_stop_strings = [None] * len(task_rewards)
-        if info is None:
-            info = [None] * len(task_rewards)
+        if answers is None:
+            answers = [None] * len(task_rewards)
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
@@ -290,7 +290,7 @@ def calculate_rewards(
             all_terminateds.append(terminateds[i])
             all_next_stop_strings.append(next_stop_strings[i])
             all_metadata.append(metadata[i])
-            all_info.append(info[i])
+            all_answers.append(answers[i])
 
     # Sort results by original index to maintain order
     sorted_indices = sorted(
@@ -301,7 +301,7 @@ def calculate_rewards(
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
     metadata = [all_metadata[i] for i in sorted_indices]  # Sort metadata
-    info = [all_info[i] for i in sorted_indices]
+    answers = [all_answers[i] for i in sorted_indices]
 
     return EnvironmentReturn(
         observations=env_observations,
@@ -309,7 +309,7 @@ def calculate_rewards(
         next_stop_strings=next_stop_strings,
         rewards=rewards,
         terminateds=terminateds,
-        info=info,
+        answers=answers,
     )
 
 

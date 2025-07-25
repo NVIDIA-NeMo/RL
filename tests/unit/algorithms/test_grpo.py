@@ -117,7 +117,7 @@ def test_calculate_rewards_single_task(mock_env):
     batch = create_mock_batch(2, task_names, message_logs)
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, info = (
+    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
         calculate_rewards(batch, task_to_env)
     )
 
@@ -127,7 +127,7 @@ def test_calculate_rewards_single_task(mock_env):
     assert len(terminateds) == 2
     assert len(next_stop_strings) == 2
     assert len(metadata) == 2
-    assert len(info) == 2
+    assert len(answers) == 2
     assert torch.allclose(rewards, torch.tensor([1.0, 2.0]))
     assert (
         ray.get(mock_env.get_calls.remote()) == 1
@@ -153,7 +153,7 @@ def test_calculate_rewards_multiple_tasks(mock_envs):
     batch = create_mock_batch(4, task_names, message_logs)
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, info = (
+    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
         calculate_rewards(batch, mock_envs)
     )
 
@@ -163,7 +163,7 @@ def test_calculate_rewards_multiple_tasks(mock_envs):
     assert len(terminateds) == 4
     assert len(next_stop_strings) == 4
     assert len(metadata) == 4
-    assert len(info) == 4
+    assert len(answers) == 4
     assert torch.allclose(rewards, torch.tensor([1.0, 2.0, 3.0, 4.0]))
     assert (
         ray.get(mock_envs["math"].get_calls.remote()) == 1
@@ -181,7 +181,7 @@ def test_calculate_rewards_empty_batch(mock_env):
     batch = create_mock_batch(0, [], [])
 
     # Calculate rewards
-    env_observations, metadata, next_stop_strings, rewards, terminateds, info = (
+    env_observations, metadata, next_stop_strings, rewards, terminateds, answers = (
         calculate_rewards(batch, task_to_env)
     )
 
@@ -191,7 +191,7 @@ def test_calculate_rewards_empty_batch(mock_env):
     assert len(terminateds) == 0
     assert len(next_stop_strings) == 0
     assert len(metadata) == 0
-    assert len(info) == 0
+    assert len(answers) == 0
     assert (
         ray.get(mock_env.get_calls.remote()) == 0
     )  # Should not call environment for empty batch

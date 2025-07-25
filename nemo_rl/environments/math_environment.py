@@ -297,13 +297,13 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
 
         # Flatten the results and extract both scores and answers
         results = []
-        extracted_answers_list: list[str | None] = []
+        extracted_answers: list[str | None] = []
 
         for worker_result in worker_results:
             if return_extracted_answer:
                 worker_scores, worker_answers = worker_result
                 results.extend(worker_scores)
-                extracted_answers_list.extend(worker_answers)
+                extracted_answers.extend(worker_answers)
             else:
                 results.extend(worker_result)
 
@@ -322,19 +322,13 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         done = torch.ones_like(rewards).cpu()
         next_stop_strings = [None] * len(message_log_batch)
 
-        info = (
-            [{"extracted_answer": answer} for answer in extracted_answers_list]
-            if extracted_answers_list
-            else [None] * len(message_log_batch)
-        )
-
         return EnvironmentReturn(
             observations=observations,
             metadata=metadata,
             next_stop_strings=next_stop_strings,
             rewards=rewards,
             terminateds=done,
-            info=info,
+            answers=extracted_answers,
         )
 
     def global_post_process_and_metrics(

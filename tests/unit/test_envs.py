@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, TypedDict
+from typing import Optional, TypedDict
 
 import ray
 import torch
@@ -100,7 +100,7 @@ class _MultiStepCalculatorLogic:
         bool,
         Optional[list[str]],
         Optional[MultiStepCalcMetadata],
-        Optional[dict[str, Any]],
+        Optional[list[str]],
     ]:
         """Processes a single turn for the multi-step calculator task."""
         last_assistant_msg = ""
@@ -169,15 +169,15 @@ class _MultiStepCalculatorLogic:
                 next_metadata = None
 
         next_observation = {"role": "environment", "content": next_observation_content}
-        # info save the extracted answer, only assigned in the verify function
-        next_info = None
+        # next_answer only assigned in the verify function
+        next_answer = None
         return (
             next_observation,
             turn_reward,
             is_terminated,
             next_stop_strings,
             next_metadata,
-            next_info,
+            next_answer,
         )
 
 
@@ -206,15 +206,15 @@ class MultiStepCalculatorEnv(EnvironmentInterface):
         terminateds = []
         all_stop_strings = []  # List of Lists or Nones
         all_next_metadata = []
-        all_info = []
+        all_answers = []
 
-        for obs, rew, term, stops, meta, info in results:
+        for obs, rew, term, stops, meta, answ in results:
             observations.append(obs)  # obs is already dict[str, str]
             rewards.append(rew)
             terminateds.append(term)
             all_stop_strings.append(stops)
             all_next_metadata.append(meta)
-            all_info.append(info)
+            all_answers.append(answ)
 
         # Convert to tensors where needed
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
@@ -228,7 +228,7 @@ class MultiStepCalculatorEnv(EnvironmentInterface):
             next_stop_strings=all_stop_strings,
             rewards=rewards_tensor,
             terminateds=done_tensor,
-            info=all_info,
+            answers=all_answers,
         )
 
     def shutdown(self):
