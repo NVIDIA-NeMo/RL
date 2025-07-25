@@ -65,8 +65,8 @@ uv run python examples/run_eval.py \
     generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
     generation.temperature=0.6 \
     generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \ 
-    data.dataset_name="math500" \
+    generation.vllm_cfg.max_model_len=32768 \
+    data.dataset_name=math500 \
     eval.num_tests_per_prompt=16 \
     cluster.gpus_per_node=8
 ```
@@ -78,10 +78,10 @@ When you complete the evaluation, you will receive a summary similar to the foll
 
 ```
 ============================================================
-model_name='Qwen2.5-Math-1.5B-Instruct' dataset_name='aime_2024'
+model_name='Qwen2.5-Math-1.5B-Instruct' dataset_name='aime2024'
 max_new_tokens=2048 temperature=0.0 top_p=1.0 top_k=-1
 
-metric='pass@1' num_tests_per_prompt=1
+metric='pass@k' pass_k_value=1 num_tests_per_prompt=1
 
 score=0.1000 (3.0/30)
 ============================================================
