@@ -576,3 +576,57 @@ def tiny_gemma3_model_path():
     tokenizer.save_pretrained(model_path)
     del model, tokenizer
     yield model_path
+
+
+def _build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
+    import shutil
+
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    config = AutoConfig.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+    config.hybrid_override_pattern = "M*-"
+    config.num_hidden_layers = 3
+    config.intermediate_size = 32
+    config.hidden_size = 256
+    config.num_attention_heads = 8
+    config.mamba_num_heads = 8
+    config.num_key_value_heads = 8
+    config.n_groups = 1
+
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+
+
+@pytest.fixture(scope="session")
+def tiny_nemotron5_h_model_path():
+    """Fixture that returns a path to a tiny nemotron model with a dummy tokenizer."""
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_nemotron5_h_with_nemotron_tokenizer"
+    )
+
+    # Run the builder inside the Automodel environment using a dedicated venv pythondd
+    from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+    # Create the ray-remote wrapped function for reuse
+    build_tiny_nemotron5_h_checkpoint_remote = ray.remote(
+        _build_tiny_nemotron5_h_checkpoint
+    )
+
+    ray.get(
+        build_tiny_nemotron5_h_checkpoint_remote.options(
+            # Need a GPU to even import mamba-ssm (just claim a super small number to not error)
+            num_gpus=0.01,
+            runtime_env={"py_executable": PY_EXECUTABLES.AUTOMODEL},
+            name="build-tiny-nemotron5-h",
+        ).remote(model_path)
+    )
+
+    yield model_path
