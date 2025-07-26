@@ -267,24 +267,28 @@ async def _run_env_eval_impl(
         ]
         env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"]))
         rewards = env_return.rewards
-        
+
         # Collect data for JSON file
-        for i, (prompt, output, message_log, reward, extra_info) in enumerate(zip(
-            prompts, 
-            outputs, 
-            batch["message_log"], 
-            rewards.tolist(), 
-            batch["extra_env_info"]
-        )):
-            evaluation_data.append({
-                "prompt": prompt,
-                "response": output,
-                "reward": reward,
-                "message_log": message_log,
-                "extra_env_info": extra_info,
-                "sample_index": len(evaluation_data),
-            })
-        
+        for i, (prompt, output, message_log, reward, extra_info) in enumerate(
+            zip(
+                prompts,
+                outputs,
+                batch["message_log"],
+                rewards.tolist(),
+                batch["extra_env_info"],
+            )
+        ):
+            evaluation_data.append(
+                {
+                    "prompt": prompt,
+                    "response": output,
+                    "reward": reward,
+                    "message_log": message_log,
+                    "extra_env_info": extra_info,
+                    "sample_index": len(evaluation_data),
+                }
+            )
+
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, pass_k_value)
@@ -330,11 +334,11 @@ async def _generate_texts(vllm_generation, inputs, use_async):
 
 def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     """Save evaluation data to a JSON file.
-    
+
     Args:
         evaluation_data: List of evaluation samples
         master_config: Configuration dictionary
-        save_path: Path to save evaluation results. Set to null to disable saving. 
+        save_path: Path to save evaluation results. Set to null to disable saving.
                   Example: "results/eval_output" or "/path/to/evaluation_results"
     """
     # Extract configuration information
@@ -348,7 +352,7 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
         "top_p": master_config["generation"]["top_p"],
         "top_k": master_config["generation"]["top_k"],
     }
-    
+
     # Create directory if it doesn't exist
     save_dir = save_path
     if not os.path.exists(save_dir):
@@ -359,15 +363,13 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     config_path = os.path.join(save_dir, "config.json")
 
     # Prepare the data to save
-    data_to_save = {
-        "evaluation_data": evaluation_data
-    }
+    data_to_save = {"evaluation_data": evaluation_data}
 
     # Save configuration to separate JSON file
-    with open(config_path, 'w') as f:
+    with open(config_path, "w") as f:
         json.dump(config_data, f, indent=2)
     print(f"\n✓ Configuration saved to: {config_path}")
-    
+
     # Process data to make it JSON serializable
     processed_data = []
     for sample in evaluation_data:
@@ -376,14 +378,14 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
         processed_sample["message_log"] = str(sample["message_log"])
         processed_sample["extra_env_info"] = str(sample["extra_env_info"])
         processed_data.append(processed_sample)
-    
+
     # Update data to save with processed version
     data_to_save["evaluation_data"] = processed_data
-    
+
     # Save to JSON file
-    with open(eval_data_path, 'w') as f:
+    with open(eval_data_path, "w") as f:
         json.dump(data_to_save, f, indent=2)
-    
+
     print(f"\n✓ Evaluation data saved to: {eval_data_path}")
     print(f"  Total samples: {len(evaluation_data)}")
     print(f"  File size: {os.path.getsize(eval_data_path) / 1024 / 1024:.2f} MB")
