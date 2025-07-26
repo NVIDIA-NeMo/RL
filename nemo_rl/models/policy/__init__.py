@@ -146,7 +146,5 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     max_grad_norm: NotRequired[Union[float, int]]
     refit_buffer_size_gb: NotRequired[float]
-    optimizer: NotRequired[PytorchOptimizerConfig] = None
-    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (
-        None
-    )
+    optimizer: NotRequired[PytorchOptimizerConfig]
+    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones]
