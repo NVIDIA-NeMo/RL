@@ -446,8 +446,8 @@ class DistributedLogprobTestActor:
 
         return log_probs
 
-    def test_distributed_logprob_forward(self):
-        """Test DistributedLogprob forward pass against PyTorch baseline."""
+    def test_distributed_logprob_forward_and_backward(self):
+        """Test DistributedLogprob forward and backward passes against PyTorch baseline."""
         rank = int(os.environ["RANK"])
 
         # Test parameters
@@ -482,81 +482,48 @@ class DistributedLogprobTestActor:
         )  # Different seed for targets to ensure they span vocab partitions
         target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
 
-        # Use the same full logits for baseline computation
-        baseline_logits = full_logits.clone().detach()
+        # === FORWARD PASS TEST ===
+        # Use the same full logits for baseline computation (without gradient tracking for forward test)
+        baseline_logits_forward = full_logits.clone().detach()
+        baseline_log_probs_forward = self._torch_baseline_logprob(
+            baseline_logits_forward, target
+        )
 
-        baseline_log_probs = self._torch_baseline_logprob(baseline_logits, target)
-
-        # 2. Compute using DistributedLogprob
-        distributed_log_probs = DistributedLogprob.apply(
-            vocab_parallel_logits,
+        # Compute using DistributedLogprob (forward only first)
+        distributed_log_probs_inference = DistributedLogprob.apply(
+            vocab_parallel_logits.clone().detach(),  # Clone to avoid affecting backward test
             target,
             vocab_start_index,
             vocab_end_index,
             self.tp_group,
-            True,  # inference_only=True for this test
+            True,  # inference_only=True for forward test
         )
 
-        # 3. Compare results
+        # Compare forward results
         torch.testing.assert_close(
-            distributed_log_probs, baseline_log_probs, rtol=1e-4, atol=1e-4
+            distributed_log_probs_inference,
+            baseline_log_probs_forward,
+            rtol=1e-4,
+            atol=1e-4,
         )
 
-        max_diff = torch.max(
-            torch.abs(distributed_log_probs - baseline_log_probs)
+        forward_max_diff = torch.max(
+            torch.abs(distributed_log_probs_inference - baseline_log_probs_forward)
         ).item()
-        return {"max_diff": max_diff}
 
-    def test_distributed_logprob_backward(self):
-        """Test DistributedLogprob backward pass against PyTorch baseline."""
-        rank = int(os.environ["RANK"])
-
-        # Test parameters
-        batch_size = 2
-        seq_len = 4
-        full_vocab_size = 128  # Smaller for easier testing
-        vocab_part_size = full_vocab_size // self.tp_size
-
-        # Calculate vocab partition for this rank
-        vocab_start_index = rank * vocab_part_size
-        vocab_end_index = (rank + 1) * vocab_part_size
-
-        # Create test data with fixed seed
-        torch.manual_seed(42)  # Same seed for consistent comparison
-
-        # Create full logits (same on all ranks for comparison)
-        full_logits = torch.randn(
-            batch_size, seq_len, full_vocab_size, device="cuda", requires_grad=True
-        )
-
-        # Extract this rank's vocab partition
-        vocab_parallel_logits = (
-            full_logits[:, :, vocab_start_index:vocab_end_index]
-            .clone()
-            .detach()
-            .requires_grad_(True)
-        )
-
-        # Create target tokens
-        torch.manual_seed(
-            43
-        )  # Different seed for targets to ensure they span vocab partitions
-        target = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
-
-        # 1. Compute baseline gradients
+        # === BACKWARD PASS TEST ===
+        # Compute baseline gradients - use full_logits with gradient tracking
         baseline_log_probs = self._torch_baseline_logprob(full_logits, target)
-
-        # Create a simple loss function
         baseline_loss = torch.sum(baseline_log_probs)
         baseline_loss.backward()
         baseline_grad = full_logits.grad[
             :, :, vocab_start_index:vocab_end_index
         ].clone()
 
-        # 2. Compute distributed gradients
-        # Reset full_logits grad
+        # Reset full_logits grad for clean comparison
         full_logits.grad = None
 
+        # Compute distributed gradients
         distributed_log_probs = DistributedLogprob.apply(
             vocab_parallel_logits,
             target,
@@ -570,12 +537,12 @@ class DistributedLogprobTestActor:
         distributed_loss.backward()
         distributed_grad = vocab_parallel_logits.grad
 
-        # 3. Compare gradients
+        # Compare gradients
         torch.testing.assert_close(
             distributed_grad, baseline_grad, rtol=1e-4, atol=1e-4
         )
 
-        # 4. Test that log probs are also equal
+        # Compare log probs again (should be same as forward test)
         torch.testing.assert_close(
             distributed_log_probs, baseline_log_probs, rtol=1e-4, atol=1e-4
         )
@@ -585,7 +552,11 @@ class DistributedLogprobTestActor:
             torch.abs(distributed_log_probs - baseline_log_probs)
         ).item()
 
-        return {"grad_max_diff": grad_max_diff, "logprob_max_diff": logprob_max_diff}
+        return {
+            "forward_max_diff": forward_max_diff,
+            "grad_max_diff": grad_max_diff,
+            "logprob_max_diff": logprob_max_diff,
+        }
 
     def test_distributed_log_softmax(self):
         """Test the _compute_distributed_log_softmax function."""
@@ -756,30 +727,22 @@ def test_distributed_logprob_all_tests(
             sharding_annotations=sharding,
         )
 
-        # Test 1: Forward pass
-        print(f"\n=== Testing TP={tp_size}: Forward Pass ===")
+        # Test 1: Combined Forward and Backward pass
+        print(f"\n=== Testing TP={tp_size}: Forward & Backward Pass ===")
         futures = worker_group.run_all_workers_single_data(
-            "test_distributed_logprob_forward"
+            "test_distributed_logprob_forward_and_backward"
         )
         results = ray.get(futures)
         for i, result in enumerate(results):
-            if "max_diff" in result:
-                print(f"Worker {i} forward max difference: {result['max_diff']:.2e}")
-
-        # Test 2: Backward pass
-        print(f"\n=== Testing TP={tp_size}: Backward Pass ===")
-        futures = worker_group.run_all_workers_single_data(
-            "test_distributed_logprob_backward"
-        )
-        results = ray.get(futures)
-        for i, result in enumerate(results):
+            if "forward_max_diff" in result:
+                print(f"Worker {i} forward max diff: {result['forward_max_diff']:.2e}")
             if "grad_max_diff" in result and "logprob_max_diff" in result:
                 print(
                     f"Worker {i} gradient max diff: {result['grad_max_diff']:.2e}, "
                     f"logprob max diff: {result['logprob_max_diff']:.2e}"
                 )
 
-        # Test 3: Log softmax function
+        # Test 2: Log softmax function
         print(f"\n=== Testing TP={tp_size}: Log Softmax ===")
         futures = worker_group.run_all_workers_single_data(
             "test_distributed_log_softmax"
@@ -791,7 +754,7 @@ def test_distributed_logprob_all_tests(
                     f"Worker {i} log softmax max difference: {result['max_diff']:.2e}"
                 )
 
-        # Test 4: Edge cases (only for TP=2)
+        # Test 3: Edge cases (only for TP=2)
         if tp_size == 2:
             print(f"\n=== Testing TP={tp_size}: Edge Cases ===")
             futures = worker_group.run_all_workers_single_data("test_edge_cases")
