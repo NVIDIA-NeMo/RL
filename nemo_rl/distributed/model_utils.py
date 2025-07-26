@@ -110,14 +110,20 @@ class DistributedLogprob(torch.autograd.Function):
             B, S, V = softmax.shape
 
             # skip `torch.nn.functional.one_hot`
-            row = torch.arange(B, device=softmax.device).view(-1, 1).expand(-1, S).reshape(-1)
+            row = (
+                torch.arange(B, device=softmax.device)
+                .view(-1, 1)
+                .expand(-1, S)
+                .reshape(-1)
+            )
             col = torch.arange(S, device=softmax.device).expand(B, -1).reshape(-1)
             flat_idx = (row * S + col) * V
 
-            flat_chosen = flat_idx.masked_select(~target_mask.reshape(-1)) + \
-                        masked_target.masked_select(~target_mask)
+            flat_chosen = flat_idx.masked_select(
+                ~target_mask.reshape(-1)
+            ) + masked_target.masked_select(~target_mask)
 
-            # `neg` is zero-copy 
+            # `neg` is zero-copy
             grad_input = softmax.neg()
             grad_input = grad_input.mul_(grad_output.unsqueeze(-1))
 
