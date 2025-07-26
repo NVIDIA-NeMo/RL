@@ -43,7 +43,6 @@ class EvalConfig(TypedDict):
     seed: int
     pass_k_value: int
     save_path: str | None
-    save_config: bool
 
 
 class MasterConfig(TypedDict):
@@ -299,7 +298,7 @@ async def _run_env_eval_impl(
     # Save evaluation data to JSON file if save_path is specified
     save_path = eval_config.get("save_path")
     if evaluation_data and save_path is not None:
-        _save_evaluation_data_to_json(evaluation_data, master_config, save_path, eval_config.get("save_config", True))
+        _save_evaluation_data_to_json(evaluation_data, master_config, save_path)
 
     # Print results
     _print_results(
@@ -329,7 +328,7 @@ async def _generate_texts(vllm_generation, inputs, use_async):
         return vllm_generation.generate_text(inputs)["texts"]
 
 
-def _save_evaluation_data_to_json(evaluation_data, master_config, save_path, save_config=True):
+def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     """Save evaluation data to a JSON file.
     
     Args:
@@ -337,7 +336,6 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path, sav
         master_config: Configuration dictionary
         save_path: Path to save evaluation results. Set to null to disable saving. 
                   Example: "results/eval_output" or "/path/to/evaluation_results"
-        save_config: Whether to save configuration to separate file
     """
     # Extract configuration information
     config_data = {
@@ -365,11 +363,10 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path, sav
         "evaluation_data": evaluation_data
     }
 
-    # Save configuration to separate JSON file if requested
-    if save_config:
-        with open(config_path, 'w') as f:
-            json.dump(config_data, f, indent=2)
-        print(f"\n✓ Configuration saved to: {config_path}")
+    # Save configuration to separate JSON file
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+    print(f"\n✓ Configuration saved to: {config_path}")
     
     # Process data to make it JSON serializable
     processed_data = []
