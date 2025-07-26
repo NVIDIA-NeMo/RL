@@ -105,16 +105,37 @@ class DistributedLogprob(torch.autograd.Function):
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         softmax, target_mask, masked_target = ctx.saved_tensors
-        partition_vocab_size = softmax.size(-1)
 
-        # 1 if it's the chosen log prob, 0 otherwise
-        is_chosen = (~target_mask).unsqueeze(-1) * torch.nn.functional.one_hot(
-            masked_target, num_classes=partition_vocab_size
-        )
+        if softmax.ndim == 3:
+            B, S, V = softmax.shape
 
-        grad_input = is_chosen.float().sub_(softmax)
+            # skip `torch.nn.functional.one_hot`
+            row = (
+                torch.arange(B, device=softmax.device)
+                .view(-1, 1)
+                .expand(-1, S)
+                .reshape(-1)
+            )
+            col = torch.arange(S, device=softmax.device).expand(B, -1).reshape(-1)
+            flat_idx = (row * S + col) * V
 
-        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+            flat_chosen = flat_idx.masked_select(
+                ~target_mask.reshape(-1)
+            ) + masked_target.masked_select(~target_mask)
+
+            # `neg` is zero-copy
+            grad_input = softmax.neg()
+            grad_input = grad_input.mul_(grad_output.unsqueeze(-1))
+
+            grad_output_selected = grad_output.masked_select(~target_mask)
+            grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+        else:
+            V = softmax.size(-1)
+            is_chosen = (~target_mask).unsqueeze(-1) * torch.nn.functional.one_hot(
+                masked_target, num_classes=V
+            )
+            grad_input = is_chosen.float().sub_(softmax)
+            grad_input.mul_(grad_output.unsqueeze(-1))
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
