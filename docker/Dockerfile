@@ -42,6 +42,29 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
 ENV RAY_USAGE_STATS_ENABLED=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
+# Build vLLM from source if using PyTorch base image
+FROM base AS build_vllm
+ARG BASE_IMAGE
+ARG MAX_JOBS=32
+WORKDIR /opt
+
+# Copy the uv.lock file to read the vLLM version
+COPY uv.lock /tmp/uv.lock
+
+# Extract vLLM version from uv.lock and build that version
+RUN if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
+        echo "Building vLLM from source for PyTorch base image" && \
+        VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
+        echo "Building vLLM version: $VLLM_VERSION" && \
+        git clone https://github.com/vllm-project/vllm.git && \
+        cd vllm && \
+        git checkout v$VLLM_VERSION && \
+        python use_existing_torch.py && \
+        pip install -r requirements/build.txt && \
+        pip wheel --no-build-isolation -v .; \
+    else \
+        echo "Skipping vLLM build for non-PyTorch base image"; \
+    fi
 
 FROM base AS hermetic
 
@@ -55,20 +78,49 @@ ARG NVTE_BUILD_THREADS_PER_JOB
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
+# Define the no-install-package arguments for PyTorch base images
+ARG BASE_IMAGE
+ENV UV_NO_INSTALL_PACKAGES=""
+RUN if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
+        echo "Setting up no-install-package arguments for PyTorch base image" && \
+        echo 'UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas-cu12 --no-install-package nvidia-cuda-cupti-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 --no-install-package nvidia-cuda-runtime-cu12 --no-install-package nvidia-cudnn-cu12 --no-install-package nvidia-cufft-cu12 --no-install-package nvidia-cufile-cu12 --no-install-package nvidia-curand-cu12 --no-install-package nvidia-cusolver-cu12 --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-nccl-cu12 --no-install-package vllm --no-install-package flash-attn"' > /tmp/uv_args.env; \
+    else \
+        echo "No PyTorch base image detected, not setting no-install-package arguments" && \
+        echo 'UV_NO_INSTALL_PACKAGES=""' > /tmp/uv_args.env; \
+    fi
+
 # This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
 # This layer has to be manually updated
 RUN <<"EOF" bash -exu
-uv venv ${UV_PROJECT_ENVIRONMENT}
-
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
+if echo "$BASE_IMAGE" | grep -q "pytorch"; then
+    echo "Creating venv with system-site-packages for PyTorch base image"
+    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+else
+    echo "Creating venv without system-site-packages"
+    uv venv ${UV_PROJECT_ENVIRONMENT}
+    VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
+    VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
+fi
 EOF
 
 # First copy only the dependency files
 COPY pyproject.toml uv.lock ./
 COPY --link 3rdparty/ ./3rdparty/
 
+# Install vLLM wheel if it was built in the build_vllm stage
+ARG BASE_IMAGE
+RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ \
+    if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
+        echo "Installing vLLM wheel from build stage" && \
+        pip install --no-cache-dir /tmp/build_vllm/vllm/vllm*.whl; \
+    fi
+
 RUN <<"EOF" bash -exu
+# Load the no-install-package arguments if they exist
+if [ -f /tmp/uv_args.env ]; then
+    source /tmp/uv_args.env
+fi
+
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -76,10 +128,10 @@ RUN <<"EOF" bash -exu
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-uv sync --link-mode symlink --locked --no-install-project
-uv sync --link-mode symlink --locked --extra vllm --no-install-project
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+uv sync --link-mode symlink --locked --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
