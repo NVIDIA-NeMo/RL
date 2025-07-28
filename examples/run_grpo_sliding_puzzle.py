@@ -34,6 +34,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -57,6 +58,7 @@ def generate_puzzle_datum(
     task_name: str,
     idx: int,
     add_system_prompt: bool,
+    chat_template_kwargs: dict[str, Any],
 ) -> DatumSpec:
     """Generates a single sliding puzzle datum (prompt and metadata)."""
 
@@ -91,6 +93,7 @@ def generate_puzzle_datum(
         add_system_prompt=add_system_prompt,
         add_generation_prompt=True,
         add_special_tokens=False,
+        **chat_template_kwargs,
     ).strip()
     tokenized_prompt = tokenizer(
         initial_prompt_content, return_tensors="pt", add_special_tokens=False
@@ -121,10 +124,18 @@ class IterablePuzzleDataset(IterableDataset):
     """An IterableDataset that generates sliding puzzle data indefinitely."""
 
     def __init__(
-        self, tokenizer, game_config, max_moves, task_name, add_system_prompt, length
+        self,
+        tokenizer,
+        chat_template_kwargs,
+        game_config,
+        max_moves,
+        task_name,
+        add_system_prompt,
+        length,
     ):
         super().__init__()
         self.tokenizer = tokenizer
+        self.chat_template_kwargs = chat_template_kwargs
         self.game_config = game_config
         self.max_moves = max_moves
         self.task_name = task_name
@@ -142,6 +153,7 @@ class IterablePuzzleDataset(IterableDataset):
                 task_name=self.task_name,
                 idx=i,
                 add_system_prompt=self.add_system_prompt,
+                chat_template_kwargs=self.chat_template_kwargs,
             )
 
     def __len__(self):
@@ -150,6 +162,7 @@ class IterablePuzzleDataset(IterableDataset):
 
 def setup_puzzle_data(
     tokenizer: AutoTokenizer,
+    tokenizer_config: TokenizerConfig,
     env_cfg: dict[str, Any],
     task_name: str,
     length: int,
@@ -168,6 +181,7 @@ def setup_puzzle_data(
     print("Creating Sliding Puzzle dataset...")
     training_dataset = IterablePuzzleDataset(
         tokenizer=tokenizer,
+        chat_template_kwargs=tokenizer_config.get("chat_template_kwargs", {}),
         game_config=dict(env_config["cfg"]["game_config"]),
         max_moves=env_config["cfg"]["max_moves"],
         task_name=task_name,
@@ -178,6 +192,7 @@ def setup_puzzle_data(
 
     validation_dataset = IterablePuzzleDataset(
         tokenizer=tokenizer,
+        chat_template_kwargs=tokenizer_config.get("chat_template_kwargs", {}),
         game_config=dict(env_config["cfg"]["game_config"]),
         max_moves=env_config["cfg"]["max_moves"],
         task_name=task_name,
@@ -226,7 +241,8 @@ def main():
     set_seed(config["grpo"]["seed"])
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer_config = config["policy"]["tokenizer"]
+    tokenizer = get_tokenizer(tokenizer_config)
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], tokenizer
     )
@@ -239,6 +255,7 @@ def main():
     )
     dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
         tokenizer=tokenizer,
+        tokenizer_config=tokenizer_config,
         env_cfg=config["env"],
         task_name="sliding_puzzle_game",
         length=ds_length,

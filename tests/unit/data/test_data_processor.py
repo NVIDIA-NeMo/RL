@@ -65,6 +65,7 @@ def test_math_data_processor():
     dataset = AllTaskProcessedDataset(
         dataset=raw_dataset,
         tokenizer=tokenizer,
+        chat_template_kwargs={},
         default_task_data_spec=math_task_spec,
         task_data_processors=math_data_processor,
         max_seq_length=128,

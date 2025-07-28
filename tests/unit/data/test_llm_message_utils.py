@@ -91,6 +91,20 @@ def raw_chat_message_log() -> list[LLMMessageLogType]:
     ]
 
 
+def qwen3_message_log(enable_thinking: bool) -> list[LLMMessageLogType]:
+    """Helper function for Qwen3 message logs."""
+    return [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"},
+        {
+            "role": "assistant",
+            "content": "<think>\noh wait.\n</think>\n\nHi there!"
+            if enable_thinking
+            else "Hi there!",
+        },
+    ]
+
+
 @pytest.fixture
 def tokenized_non_chat_message_log() -> list[LLMMessageLogType]:
     return [
@@ -394,6 +408,7 @@ def test_get_formatted_message_log_models(
     result = get_formatted_message_log(
         chat_log,
         tokenizer,
+        {},
         task_data_spec,
         add_generation_prompt=add_generation_prompt,
     )
@@ -451,6 +466,58 @@ def test_get_formatted_message_log_models(
             assert normalize(actual_concat) == normalize(expected_concat)
 
 
+@pytest.mark.parametrize(
+    "enable_thinking",
+    [True, False],
+)
+def test_get_formatted_message_log_add_generation_prompt_qwen3_enable_thinking(
+    enable_thinking,
+) -> None:
+    ## test using a tokenizer that does not have a bos token
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    assert tokenizer.bos_token is None
+
+    ## get expected result
+    ## result is equivalent to if we apply chat template to the full message log,
+    ## remove the trailing newline, and then partition by the delimiter
+    ## Separately handle the last message because of the generation prompt
+    expected_text_string = tokenizer.apply_chat_template(
+        [qwen3_message_log(enable_thinking)[:2]],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        enable_thinking=enable_thinking,
+    )[0]
+
+    delimiter = "<|im_end|>\n"
+    split_text = expected_text_string.split(delimiter, 1)
+    expected_text = []
+    for i in range(len(split_text)):
+        if i == len(split_text) - 1:
+            expected_text.append(split_text[i])
+        else:
+            expected_text.append(split_text[i] + delimiter)
+
+    formatted_assistant_message = (
+        qwen3_message_log(enable_thinking)[2]["content"] + tokenizer.eos_token
+    )
+    expected_text.append(formatted_assistant_message)
+
+    task_data_spec = TaskDataSpec(
+        task_name="test",
+    )
+    result = get_formatted_message_log(
+        qwen3_message_log(enable_thinking),
+        tokenizer,
+        dict(enable_thinking=enable_thinking),
+        task_data_spec,
+        add_generation_prompt=True,
+    )
+    actual_text = [m["content"] for m in result]
+
+    assert actual_text == expected_text
+
+
 @pytest.mark.hf_gated
 def test_formatted_message_log_empty_message():
     message_logs = [
@@ -470,6 +537,7 @@ def test_formatted_message_log_empty_message():
         get_formatted_message_log(
             message_log,
             tokenizer,
+            {},
             task_data_spec,
             add_bos_token=False,
             add_eos_token=False,

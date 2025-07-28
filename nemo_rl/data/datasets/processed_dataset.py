@@ -46,6 +46,7 @@ class AllTaskProcessedDataset:
         self,
         dataset: Dataset | Any,
         tokenizer: TokenizerType,
+        chat_template_kwargs: dict[str, Any],
         default_task_data_spec: TaskDataSpec,
         task_data_processors: (
             dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]]
@@ -55,6 +56,7 @@ class AllTaskProcessedDataset:
     ):
         self.dataset = dataset
         self.tokenizer = tokenizer
+        self.chat_template_kwargs = chat_template_kwargs
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.max_seq_length = max_seq_length
@@ -105,7 +107,12 @@ class AllTaskProcessedDataset:
             task_data_processor = self.task_data_processors
 
         datum_spec = task_data_processor(
-            entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
+            entry,
+            task_data_spec,
+            self.tokenizer,
+            self.chat_template_kwargs,
+            self.max_seq_length,
+            idx,
         )
 
         # Check the first processed item for BOS token assertion

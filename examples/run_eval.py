@@ -29,6 +29,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config
 
 TokenizerType = PreTrainedTokenizerBase
@@ -50,7 +51,12 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+def setup_data(
+    tokenizer: AutoTokenizer,
+    tokenizer_config: TokenizerConfig,
+    data_config,
+    env_configs,
+):
     print("Setting up data...")
 
     # load dataset
@@ -68,6 +74,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
+        chat_template_kwargs=tokenizer_config.get("chat_template_kwargs", {}),
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
         max_seq_length=data_config["max_input_seq_length"],
@@ -115,7 +122,7 @@ def main():
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["tokenizer"], config["data"], config["env"])
 
     # Setup
     (

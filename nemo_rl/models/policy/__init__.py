@@ -108,6 +108,7 @@ class MegatronConfig(TypedDict):
 class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
+    chat_template_kwargs: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):
