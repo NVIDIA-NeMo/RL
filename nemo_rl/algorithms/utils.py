@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import random
 import warnings
 from functools import wraps
@@ -214,8 +215,14 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         else:
-            print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            jinja_template = tokenizer_config["chat_template"]
+            if os.path.exists(jinja_template) and os.path.isfile(jinja_template):
+                print(f"Using custom chat template from file: {jinja_template}")
+                with open(jinja_template, "r", encoding="utf-8") as file:
+                    tokenizer.chat_template = file.read()
+            else:
+                print("Using custom chat template")
+                tokenizer.chat_template = jinja_template
     else:
         print("No chat template provided, using tokenizer's default")
 

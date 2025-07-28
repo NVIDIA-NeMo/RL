@@ -71,6 +71,13 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
 
+    Alternatively, use a path to a local jinja template and load directly from file:
+
+    ```yaml
+    tokenizer:
+    custom_template: /path/to/template.jinja
+    ```
+
 
 By default, NeMo RL has support for `Squad` and `OpenAssistant` datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
