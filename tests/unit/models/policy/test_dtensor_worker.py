@@ -383,9 +383,9 @@ def test_dtensor_worker_training(training_setup):
         # we don't always require theoretical_tflops since the data about the GPU
         # is not always available.
         if "theoretical_tflops" in results:
-            assert isinstance(
-                results["theoretical_tflops"], (int, float)
-            ), "training backend should report theoretical_tflops"
+            assert isinstance(results["theoretical_tflops"], (int, float)), (
+                "training backend should report theoretical_tflops"
+            )
             assert results["theoretical_tflops"] > 0, (
                 "theoretical_tflops should be positive"
             )
