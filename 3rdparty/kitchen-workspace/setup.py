@@ -163,7 +163,25 @@ def setup_extensions() -> setuptools.Extension:
     cutlass_gemm_ext_nvcc_flags = get_nvcc_flags(debug_mode, True)
     # Necessary linker flags. We need those for our extension regardless of
     # what PyTorch depends on.
-    extra_link_args = ["-lcuda", "-lcudart", "-lcublasLt"]
+    # extra_link_args = ["-lcuda", "-lcudart", "-lcublasLt"]
+
+    # cublaslt_lib_path = "/usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.12"
+    # extra_link_args = [
+    #     "-lcuda",
+    #     "-lcudart",
+    #     cublaslt_lib_path  # <-- The direct path to the file
+    # ]
+
+    cuda_lib_dir = "/usr/local/cuda/lib64"
+    cublaslt_lib_path = f"{cuda_lib_dir}/libcublasLt.so.12.9.0.13"
+
+    extra_link_args = [
+        "-lcuda",
+        "-lcudart",
+        # Set the runtime path to its directory so it's found when you import
+        f"-Wl,-rpath,{cuda_lib_dir}", f"-L{cuda_lib_dir}", "-lcublasLt", 
+    ]
+
 
     # version-dependent CUDA options
     try:
@@ -201,7 +219,11 @@ def setup_extensions() -> setuptools.Extension:
     # Exclude cutlass_gemm files
     ext_sources = ext_sources - cutlass_gemm_sources
 
-    ext_include_dirs = [str(extensions_dir)]
+    ext_include_dirs = [
+        '/usr/local/cuda/include',
+        str(extensions_dir)
+    ]
+
     cutlass_gemm_include_dirs = ext_include_dirs + [
         str(root_dir / "third_party" / "cutlass" / "include"),
         str(root_dir / "third_party" / "cutlass" / "tools" / "util" / "include"),

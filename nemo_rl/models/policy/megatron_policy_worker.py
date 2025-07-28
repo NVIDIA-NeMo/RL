@@ -513,6 +513,12 @@ class MegatronPolicyWorker:
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
 
+        from megatron.core.quantization.utils import kitchen_quantization_recipe_config
+        recipe_num = int(os.getenv("QAT_PARAMS", "5001"))
+        model_cfg.use_kitchen = True
+        model_cfg.quant_recipe = kitchen_quantization_recipe_config(recipe_num)
+
+
         checkpoint_config = CheckpointConfig(
             save_interval=100,
             save=weights_path,
