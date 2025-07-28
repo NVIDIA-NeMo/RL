@@ -17,7 +17,7 @@ import itertools
 import os
 import pprint
 import random
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from omegaconf import OmegaConf
 from torch.utils.data import IterableDataset
@@ -60,9 +60,9 @@ def generate_puzzle_datum(
 ) -> DatumSpec:
     """Generates a single sliding puzzle datum (prompt and metadata)."""
 
-    def generate_random_config(max_config: dict[str, Any]) -> dict[str, Any]:
+    def generate_random_config(max_config: Mapping[str, Any]) -> dict[str, Any]:
         """Generate a random config for the sliding puzzle game."""
-        shuffle_moves = random.randint(1, max_config.get("shuffle_moves"))
+        shuffle_moves = random.randint(1, max_config["shuffle_moves"])
         if shuffle_moves % 2 == 0:
             shuffle_moves += 1
         return {

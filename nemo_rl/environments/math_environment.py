@@ -23,6 +23,7 @@ from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
+from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import (
@@ -167,15 +168,20 @@ class MathEnvironmentMetadata(TypedDict):
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class MathEnvironment(EnvironmentInterface):
+class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
+        # TODO: split out this environment since it's doing more than just math
+        verifier_type = cfg.get("verifier_type", "math")
+        assert isinstance(verifier_type, str), (
+            f"{verifier_type=} must be a string but was {type(verifier_type)}"
+        )
         worker_cls = {
             "math": HFVerifyWorker,
             "english_multichoice": EnglishMultichoiceVerifyWorker,
             "multilingual_multichoice": MultilingualMultichoiceVerifyWorker,
-        }[cfg.get("verifier_type", "math")]
+        }[verifier_type]
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
@@ -188,11 +194,11 @@ class MathEnvironment(EnvironmentInterface):
         for worker in self.workers:
             ray.kill(worker)
 
-    def step(  # type: ignore[override]
+    def step(
         self,
-        message_log_batch: list[list[dict[str, str]]],
+        message_log_batch: list[LLMMessageLogType],
         metadata: list[MathEnvironmentMetadata],
-    ) -> EnvironmentReturn:
+    ) -> EnvironmentReturn[MathEnvironmentMetadata]:
         """Runs a step in the math environment.
 
         Args:
@@ -212,7 +218,7 @@ class MathEnvironment(EnvironmentInterface):
         assistant_response_batch = []
         for conversation in message_log_batch:
             assistant_responses = [
-                interaction["content"]
+                str(interaction["content"])
                 for interaction in conversation
                 if interaction["role"] == "assistant"
             ]

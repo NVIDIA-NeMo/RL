@@ -65,6 +65,7 @@ from nemo_rl.models.policy.utils import (
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
+    is_vllm_v1_engine_enabled,
     sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
@@ -418,6 +419,17 @@ class DTensorPolicyWorker:
 
     # Refer to nemo impl. Below is original comment.
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
+
+    def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
+        # Apply temperature scaling to logits if configured and not using V1 engine.
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            # The V1 engine returns raw logits before temperature scaling.
+            # The V0 engine returns scaled logits.
+            # Therefore, we only divide if we are not using the V1 engine.
+            if not is_vllm_v1_engine_enabled():
+                logits.div_(self.cfg["generation"]["temperature"])
+        return logits
+
     @staticmethod
     @contextlib.contextmanager
     def train_context(cp_context: Optional[Generator[None, None, None]] = None):
@@ -654,17 +666,8 @@ class DTensorPolicyWorker:
                         else:
                             logits = outputs.logits
 
-                        # Divide logits by temperature
-                        if (
-                            "generation" in self.cfg
-                            and self.cfg["generation"] is not None
-                        ):
-                            # The V1 engine returns raw logits before temperature scaling.
-                            # The V0 engine (when VLLM_USE_V1 is not '1') returns scaled logits.
-                            # Therefore, we only divide if we are NOT using the V1 engine.
-                            use_v1_engine = os.environ.get("VLLM_USE_V1") == "1"
-                            if not use_v1_engine:
-                                logits.div_(self.cfg["generation"]["temperature"])
+                        # Apply temperature scaling
+                        logits = self._apply_temperature_scaling(logits)
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (
@@ -943,6 +946,9 @@ class DTensorPolicyWorker:
                         )
 
                     logits = outputs.logits
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
 
                     if self.cp_size > 1:
                         seq_index_tensor = (

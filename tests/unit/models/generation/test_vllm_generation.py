@@ -81,8 +81,6 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_new_tokens": 16,
     "do_sample": False,
     "precision": "float32",
-    "fsdp_offload_enabled": False,
-    "activation_checkpointing_enabled": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -1620,13 +1618,15 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         # Enable packing during test
         os.environ["NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD"] = "1"
 
-        # Both policies must use the same model (Qwen2.5-0.5B) for weight transfer compatibility
-        model_name = "Qwen/Qwen2.5-0.5B"
+        # Both policies must use the same model for weight transfer compatibility
+        # NOTE: We have tried using Qwen/Qwen2.5-0.5B, but some small models exhibit variance depending
+        #  on which hardware it is run on.
+        model_name = "Qwen/Qwen3-0.6B"
         tokenizer = get_tokenizer({"name": model_name})
 
         # Create Policy
         megatron_config = get_basic_megatron_test_config(
-            tp=1, pp=1, precision="float32"
+            tp=1, pp=1, precision="bfloat16"
         )
         megatron_config["model_name"] = model_name
         megatron_config["tokenizer"]["name"] = model_name
@@ -1653,8 +1653,8 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         output_ids = outputs["output_ids"]
         generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         assert generated_texts == [
-            "Hello, my name is John. I am a",
-            "The capital of France is Paris. It is the",
+            "Hello, my name is Lina. I'm",
+            "The capital of France is Paris. The capital of",
         ], "Output should be the same as the expected output"
 
     finally:

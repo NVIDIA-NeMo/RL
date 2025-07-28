@@ -14,13 +14,13 @@
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Optional, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -87,7 +87,9 @@ class GRPOConfig(TypedDict):
 
 class GRPOSaveState(TypedDict):
     step: int
-    val_reward: float
+    val_reward: NotRequired[
+        float
+    ]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -164,8 +166,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    grpo_save_state: Optional[GRPOSaveState] = cast(
+        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()

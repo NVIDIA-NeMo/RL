@@ -37,29 +37,33 @@ What you can expect:
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
 ## 📣 News
+* [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
 * [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
 * [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.3_
+✅ _Available now_ | 🔜 _Coming in v0.4_
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-32B models (Qwen2.5, Llama).
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP) support and Ray-based infrastructure.
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support and Ray-based infrastructure.
 - ✅ **Environment Support** - Support for multi-environment training.
 - ✅ **Learning Algorithms** - GRPO (Group Relative Policy Optimization), SFT (Supervised Fine-Tuning), and DPO (Direct Preference Optimization).
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 32B parameters.
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, and SP for efficient training.
+- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
+- ✅ **(even) Larger Model Support with Long(er) Sequences** - Advanced parallelisms with Megatron Core (TP/PP/CP/SP/EP).
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
-- ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
+
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
@@ -142,6 +146,8 @@ The training backend is automatically determined based on your YAML configuratio
 ## GRPO
 
 We have a reference GRPO experiment config set up trained for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+
+You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
 
 ### GRPO Single Node
 
@@ -374,12 +380,12 @@ Run evaluation script with custom settings:
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
 #          Pass@1 accuracy averaged over 16 samples for each problem
 uv run python examples/run_eval.py \
+    --config examples/configs/evals/math_eval.yaml \
     generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
     generation.temperature=0.6 \
     generation.top_p=0.95 \
     generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=HuggingFaceH4/MATH-500 \
-    data.dataset_key=test \
+    data.dataset_name=math500 \
     eval.num_tests_per_prompt=16 \
     cluster.gpus_per_node=8
 ```

@@ -102,9 +102,9 @@ docs = [
 dev = [
     "pre-commit==3.6.0",
     "ruff==0.9.9",
-    "mypy",
     "types-PyYAML",
     "types-requests",
+    "pyrefly==0.24.2",
 ]
 test = [
     "pytest>=7.0.0",
@@ -174,7 +174,12 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
     "mcore: marks tests that require the mcore extra",
+    "hf_gated: marks tests that require HuggingFace token access for gated models",
 ]
+
+[tool.pyrefly]
+project-includes = ["**/*"]
+project-excludes = ["**/*venv/**/*"]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]

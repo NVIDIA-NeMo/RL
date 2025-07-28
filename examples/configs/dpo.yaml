@@ -42,8 +42,6 @@ policy:
   #logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 1024
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
 
   dtensor_cfg:
     enabled: true
@@ -158,6 +156,7 @@ logger:
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: "dpo-dev"
     name: "dpo"

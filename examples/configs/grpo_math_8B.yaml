@@ -15,13 +15,8 @@ policy:
   logprob_batch_size: 2
   max_total_sequence_length: 4096
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
 
   dtensor_cfg:
-    enabled: True
-
-  dynamic_batching:
     enabled: True
 
   optimizer:

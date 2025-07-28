@@ -52,6 +52,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 
 
 class VllmSpecificArgs(TypedDict):
@@ -64,6 +65,7 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    enforce_eager: NotRequired[bool]
 
 
 class VllmConfig(GenerationConfig):
@@ -313,7 +315,7 @@ class VllmGenerationWorker:
             # For non-parallel mode, explicitly set executor to None to avoid Ray issues
             vllm_kwargs["distributed_executor_backend"] = None
 
-        os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
+        os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
@@ -827,9 +829,7 @@ class VllmGenerationWorker:
         if self.cfg.get("stop_strings", None):
             stop_strings.update(self.cfg["stop_strings"])
 
-        stop_strings: list[str] | None = (
-            list(stop_strings) if len(stop_strings) > 0 else None
-        )
+        stop_strings = list(stop_strings) if len(stop_strings) > 0 else None
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1

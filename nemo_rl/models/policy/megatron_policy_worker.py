@@ -1606,7 +1606,13 @@ class MegatronPolicyWorker:
         no_grad.__exit__(None, None, None)
 
     @torch.no_grad()
-    def move_model(self, model, device: str, move_params=True, move_grads=True):
+    def move_model(
+        self,
+        model: torch.nn.Module,
+        device: str,
+        move_params: bool = True,
+        move_grads: bool = True,
+    ) -> torch.nn.Module:
         # move all param and grad buffers to the device
         if isinstance(model, DistributedDataParallel):
             # DDP case

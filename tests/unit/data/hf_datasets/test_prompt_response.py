@@ -76,6 +76,7 @@ def test_custom_keys(sample_data):
     assert dataset.output_key == "answer"
 
 
+@pytest.mark.hf_gated
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_message_formatting(sample_data):
     train_path, val_path = sample_data

@@ -103,6 +103,17 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
+  submodule-check:
+    name: Check submodule fast-forward
+    needs: [pre-flight]
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/_submodule_check.yml
+    with:
+      base_ref: ${{ github.base_ref }}
+      head_ref: ${{ github.head_ref }}
+      pr_number: ${{ github.event.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+
   lint-check:
     name: Lint check
     needs: [pre-flight]
@@ -128,31 +139,18 @@ jobs:
           uv venv
           uv run --group dev pre-commit install
           uv run --group dev pre-commit run --all-files --show-diff-on-failure --color=always
-      - name: Minimize uv cache
-        run: uv cache prune --ci
-
-  mypy-check:
-    name: Mypy check
-    needs: [pre-flight]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.7.2"
-          enable-cache: true
-          prune-cache: false
-      # Faster than uv python install since it caches python alongside runner
-      - name: "Set up Python"
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: ".python-version"
-      - name: Check mypy
+      # TODO: this is a temporary check and should be removed once we have 100% correctness
+      - name: Check if any files with zero errors not in whitelist
         run: |
-          uv venv
-          uv run --group test mypy nemo_rl examples
+          missing_count=0
+          for file in $(uv run --group dev pyrefly check $(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py') --output-format json | jq -r --slurpfile all_files <(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py' | jq -R -s 'split("\n")[:-1]') --arg pwd "$(pwd)/" '(.errors | group_by(.path) | map({(.[0].path | sub($pwd; "")): length}) | add // {}) as $error_counts | $all_files[0][] | . as $file | if ($error_counts[$file] // 0) == 0 then $file else empty end'); do
+            if ! fgrep -q "$file" pyrefly.toml; then
+              echo "File $file has zero errors but is not in pyrefly.toml in the 'project-includes' list. Please add it to this whitelist."
+              ((missing_count++))
+            fi
+          done
+          
+          exit $missing_count
       - name: Minimize uv cache
         run: uv cache prune --ci
 
@@ -210,8 +208,8 @@ jobs:
       UNIT_TEST_SCRIPT: |
         cd /opt/nemo-rl
         if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term-missing --cov-report=json -m \"not mcore\"
-          uv run --extra mcore bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-report=term-missing --cov-report=json  -m mcore
+          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --hf-gated
+          uv run --extra mcore bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
         else
           echo Skipping unit tests for docs-only level
         fi
@@ -308,8 +306,7 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success' &&
-                  (needs.mypy-check.result == 'success' || true)
+                  needs.tests.result == 'success'
                 )
               )
             }}

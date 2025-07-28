@@ -125,6 +125,7 @@ def test_input_data(tokenizer):
 
 # skip this test for now
 @pytest.mark.skip(reason="Skipping large model test until we have resources in CI.")
+@pytest.mark.hf_gated
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tensor_parallel_size", [4, 8])
 @pytest.mark.parametrize("pipeline_parallel_size", [2])
