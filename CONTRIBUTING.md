@@ -18,7 +18,7 @@ docker run -it --gpus all -v /path/to/nemo-rl:/nemo-rl nemo-rl:latest
 ```
 
 If you are using VSCode/Cursor you can also use Dev Containers. Here's a devcontainer.json to get you started:
-```json
+```jsonc
 {
 	"name": "rl-dev",
 	"image": "nemo-rl:latest",
@@ -30,8 +30,9 @@ If you are using VSCode/Cursor you can also use Dev Containers. Here's a devcont
 		"--ulimit",
 		"stack=67108864",
 		"--shm-size=24g",
-		"--privileged", "--pid=host"
-	],
+		"--privileged",
+    "--pid=host"
+	]
 
   // NOTE: Here is an example of how you can set up some common mounts, environment variables, and set up your shell.
   //       Feel free to adapt to your development workflow and remember to replace the user `terryk` with your username.
