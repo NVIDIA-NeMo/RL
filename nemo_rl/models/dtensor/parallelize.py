@@ -620,6 +620,8 @@ def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
     seq_index: Optional[torch.Tensor] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -633,6 +635,10 @@ def get_logprobs_from_vocab_parallel_logits(
             with shape [batch_size, seq_len].
         seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
             with shape [sequence_length].
+        top_k (Optional[int]): Top-k sampling parameter. If provided, only the top-k tokens
+            with highest probabilities are considered.
+        top_p (Optional[float]): Top-p (nucleus) sampling parameter. If provided, only tokens
+            with cumulative probability up to p are considered.
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
@@ -660,4 +666,6 @@ def get_logprobs_from_vocab_parallel_logits(
         tp_group,
         inference_only=not torch.is_grad_enabled(),
         seq_index=seq_index,
+        top_k=top_k,
+        top_p=top_p,
     )

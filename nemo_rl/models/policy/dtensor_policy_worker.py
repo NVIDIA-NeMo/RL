@@ -418,6 +418,12 @@ class DTensorPolicyWorker:
             no_restore_buffers=cp_no_restore_buffers,
         )
 
+    def _get_top_k_top_p_params(self) -> tuple[Optional[int], Optional[float]]:
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            if not is_vllm_v1_engine_enabled():
+                return self.cfg["generation"]["top_k"], self.cfg["generation"]["top_p"]
+        return None, None
+
     def _post_processing_logits_with_sampling_params(
         self, logits: torch.Tensor
     ) -> torch.Tensor:
@@ -1011,17 +1017,26 @@ class DTensorPolicyWorker:
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
 
+                        # Get sampling parameters if configured and not using V1 engine
+                        top_k, top_p = self._get_top_k_top_p_params()
                         token_logprobs = get_logprobs_from_vocab_parallel_logits(
                             logits.to(torch.float32),
                             input_ids_dtensor,
                             seq_index_tensor,
+                            top_k=top_k,
+                            top_p=top_p,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
+                            # Get sampling parameters if configured and not using V1 engine
+                            top_k, top_p = self._get_top_k_top_p_params()
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits.to(torch.float32), input_ids
+                                logits.to(torch.float32),
+                                input_ids,
+                                top_k=top_k,
+                                top_p=top_p,
                             )
                         else:
                             # Extract logprobs for each token in the sequence by gathering the logprob
