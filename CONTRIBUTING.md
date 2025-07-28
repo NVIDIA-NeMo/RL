@@ -20,17 +20,17 @@ docker run -it --gpus all -v /path/to/nemo-rl:/nemo-rl nemo-rl:latest
 If you are using VSCode/Cursor you can also use Dev Containers. Here's a devcontainer.json to get you started:
 ```jsonc
 {
-	"name": "rl-dev",
-	"image": "nemo-rl:latest",
-	"runArgs": [
-		"--gpus",
-		"all",
-		"--ulimit",
-		"memlock=-1",
-		"--ulimit",
-		"stack=67108864",
-		"--shm-size=24g",
-		"--privileged",
+  "name": "rl-dev",
+  "image": "nemo-rl:latest",
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--ulimit",
+    "memlock=-1",
+    "--ulimit",
+    "stack=67108864",
+    "--shm-size=24g",
+    "--privileged",
     "--pid=host"
 	]
 
