@@ -229,14 +229,12 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        raise NotImplementedError
-
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, info: dict[str, Any]
+    ) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError

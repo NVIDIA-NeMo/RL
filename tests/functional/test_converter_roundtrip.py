@@ -17,7 +17,7 @@
 Functional test for converter roundtrip functionality.
 
 This test:
-1. Starts with a HuggingFace Qwen/Qwen2-0.5B checkpoint
+1. Starts with a HuggingFace meta-llama/Llama-3.2-1B checkpoint
 2. Converts the model to torch DCP format
 3. Converts the model to Megatron format (using community import)
 4. Converts both the DCP and Megatron checkpoints back to HF format
@@ -63,8 +63,8 @@ def create_test_config() -> Dict[str, Any]:
             "save_period": 2,
         },
         "policy": {
-            "model_name": "Qwen/Qwen2-0.5B",
-            "tokenizer": {"name": "Qwen/Qwen2-0.5B"},
+            "model_name": "meta-llama/Llama-3.2-1B",
+            "tokenizer": {"name": "meta-llama/Llama-3.2-1B"},
             "train_global_batch_size": 4,
             "train_micro_batch_size": 2,
             "max_total_sequence_length": 128,
@@ -223,7 +223,7 @@ def create_megatron_checkpoint(model_name: str, temp_dir: str) -> str:
     import_model_from_hf_name(model_name, megatron_checkpoint_path)
 
     print(f"✓ Megatron checkpoint saved to: {megatron_checkpoint_path}")
-    return os.path.join(megatron_checkpoint_path, "iter_0000000")
+    return megatron_checkpoint_path
 
 
 def convert_dcp_to_hf_checkpoint(dcp_path: str, model_name: str, temp_dir: str) -> str:
@@ -275,7 +275,7 @@ def main():
     print("=" * 80)
 
     # TODO(@ashors): test more models
-    model_name = "Qwen/Qwen2-0.5B"
+    model_name = "meta-llama/Llama-3.2-1B"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         print(f"Using temporary directory: {temp_dir}")

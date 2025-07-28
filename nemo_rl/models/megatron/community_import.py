@@ -13,50 +13,13 @@
 # limitations under the License.
 
 import os
-
-from transformers import AutoConfig
-
+from megatron.bridge import CausalLMBridge
 
 def import_model_from_hf_name(hf_model_name: str, output_path: str):
-    hf_config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
-    if hf_config.model_type == "llama":
-        from nemo.tron.converter.llama import HFLlamaImporter
+    bridge = CausalLMBridge.from_hf_pretrained(hf_model_name)
+    megatron_model = bridge.to_megatron_model(wrap_with_ddp=False)
+    bridge.save_megatron_model(megatron_model, output_path)
 
-        print(f"Importing model {hf_model_name} to {output_path}...")
-        importer = HFLlamaImporter(
-            hf_model_name,
-            output_path=output_path,
-        )
-    elif hf_config.model_type == "qwen2":
-        from nemo.tron.converter.qwen import HFQwen2Importer
-
-        print(f"Importing model {hf_model_name} to {output_path}...")
-        importer = HFQwen2Importer(
-            hf_model_name,
-            output_path=output_path,
-        )
-    elif hf_config.model_type in ("qwen3", "qwen3_moe"):
-        from nemo.tron.converter.qwen import HFQwen3Importer
-
-        print(f"Importing model {hf_model_name} to {output_path}...")
-        importer = HFQwen3Importer(
-            hf_model_name,
-            output_path=output_path,
-        )
-    elif hf_config.model_type in ("deepseek_v2", "deepseek_v3"):
-        from nemo.tron.converter.deepseek import HFDeepSeekImporter
-
-        print(f"Importing model {hf_model_name} to {output_path}...")
-        importer = HFDeepSeekImporter(
-            hf_model_name,
-            output_path=output_path,
-        )
-    else:
-        raise ValueError(
-            f"Unknown model type: {hf_config.model_type}. Currently, DeepSeek, Qwen and Llama are supported. "
-            "If you'd like to run with a different model, please raise an issue or consider adding your own converter."
-        )
-    importer.apply()
     # resetting mcore state
     import megatron.core.rerun_state_machine
 
@@ -75,28 +38,10 @@ def export_model_from_megatron(
             f"HF checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
         )
 
-    hf_config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
+    bridge = CausalLMBridge.from_hf_pretrained(hf_model_name)
+    megatron_model = bridge.load_megatron_model(input_path)
+    bridge.save_hf_pretrained(megatron_model, output_path)
 
-    if hf_config.model_type == "llama":
-        from nemo.tron.converter.llama import HFLlamaExporter
-
-        exporter_cls = HFLlamaExporter
-    elif hf_config.model_type == "qwen2":
-        from nemo.tron.converter.qwen import HFQwen2Exporter
-
-        exporter_cls = HFQwen2Exporter
-    else:
-        raise ValueError(
-            f"Unknown model: {hf_model_name}. Currently, only Qwen2 and Llama are supported. "
-            "If you'd like to run with a different model, please raise an issue or consider adding your own converter."
-        )
-    print(f"Exporting model {hf_model_name} to {output_path}...")
-    exporter = exporter_cls(
-        input_path=input_path,
-        output_path=output_path,
-        hf_tokenizer_path=hf_tokenizer_path,
-    )
-    exporter.apply()
     # resetting mcore state
     import megatron.core.rerun_state_machine
 

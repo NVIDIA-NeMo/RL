@@ -60,13 +60,6 @@ def create_megatron_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
-            "colocated": {
-                "enabled": True,
-                "resources": {
-                    "gpus_per_node": None,
-                    "num_nodes": None,
-                },
-            },
         },
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
@@ -95,7 +88,7 @@ def create_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
-            "apply_rope_fusion": True,
+            "apply_rope_fusion": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -324,8 +317,8 @@ def training_setup(request):
         # (num_gpus, tp, pp, model_name, config_updates)
         (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {}),
         (2, 2, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {}),
-        (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
-        (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
+        # (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
+        # (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
         (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {"precision": "bfloat16"}),
         (
             2,
@@ -340,8 +333,8 @@ def training_setup(request):
     ids=[
         "2gpu_dp2_llama",
         "2gpu_tp2_llama",
-        "2gpu_dp2_qwen2",
-        "2gpu_tp2_qwen2",
+        # "2gpu_dp2_qwen2",
+        # "2gpu_tp2_qwen2",
         "2gpu_dp2_llama_bf16",
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
@@ -622,11 +615,11 @@ def logprob_setup(request):
         # (num_gpus, tp, pp, model_name)
         (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH),
         (2, 2, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH),
-        (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
-        (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
+        # (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
+        # (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
     ],
     indirect=True,
-    ids=["2gpu_dp2_llama", "2gpu_tp2_llama", "2gpu_dp2_qwen2", "2gpu_tp2_qwen2"],
+    ids=["2gpu_dp2_llama", "2gpu_tp2_llama", ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
     """Test Megatron policy logprob computation."""

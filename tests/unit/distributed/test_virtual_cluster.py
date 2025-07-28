@@ -214,7 +214,7 @@ def test_mcore_py_executable():
                     venv_python,
                     "-c",
                     # Importing nemo_rl must be first to ensure all of megatron is importable
-                    "import nemo_rl; print('nemo_rl is imported'); import transformer_engine.pytorch as te; print('te is imported'); import nemo.tron; print('nemo-tron is imported'); import megatron.core; print('megatron-core is imported'); import megatron.training; print('megatron-training is imported');",
+                    "import nemo_rl; print('nemo_rl is imported'); import transformer_engine.pytorch as te; print('te is imported'); import megatron.bridge; print('megatron_hub is imported'); import megatron.core; print('megatron-core is imported'); import megatron.training; print('megatron-training is imported');",
                 ],
                 capture_output=True,
                 text=True,
