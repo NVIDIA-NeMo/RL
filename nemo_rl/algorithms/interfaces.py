@@ -67,4 +67,4 @@ class LossFunction(Protocol):
                 - metrics: A dictionary of metrics related to the loss computation, which may include
                   component losses, statistics about gradients/rewards, and other diagnostic information
         """
-        pass
+        ...

@@ -74,6 +74,7 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"

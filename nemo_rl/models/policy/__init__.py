@@ -85,6 +85,9 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     pipeline_dtype: str
     sequence_parallel: bool
+    freeze_moe_router: bool
+    expert_tensor_parallel_size: int
+    expert_model_parallel_size: int
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]
@@ -104,6 +107,7 @@ class PytorchOptimizerConfig(TypedDict):
 class SinglePytorchSchedulerConfig(TypedDict):
     name: str
     kwargs: dict[str, Any]
+    milestones: NotRequired[list[int]]  # Used in SequentialLR configuration
 
 
 SchedulerMilestones = dict[str, list[int]]
@@ -142,7 +146,5 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     max_grad_norm: NotRequired[Union[float, int]]
     refit_buffer_size_gb: NotRequired[float]
-    optimizer: NotRequired[PytorchOptimizerConfig] = None
-    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (
-        None
-    )
+    optimizer: NotRequired[PytorchOptimizerConfig]
+    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones]
