@@ -30,7 +30,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
+from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.conftest import TEST_ASSETS
 from tests.unit.test_utils import SimpleLoss
 
@@ -38,10 +38,11 @@ from tests.unit.test_utils import SimpleLoss
 def create_test_config(
     model_name: str = TEST_ASSETS.TINY_LLAMA_MODEL_PATH,
     tp: int = 1,
+    cp: int = 1,
     sequence_parallel: bool = False,
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
-    custom_parallel_plan: str = None,
+    custom_parallel_plan: str | None = None,
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
@@ -60,6 +61,13 @@ def create_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
         },
         "dtensor_cfg": {
             "enabled": True,
@@ -67,6 +75,7 @@ def create_test_config(
             "sequence_parallel": sequence_parallel,
             "activation_checkpointing": activation_checkpointing,
             "tensor_parallel_size": tp,
+            "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
         },
         "dynamic_batching": {
@@ -74,6 +83,9 @@ def create_test_config(
             "train_mb_tokens": 128,
             "logprob_mb_tokens": 128,
             "sequence_length_round": 4,
+        },
+        "sequence_packing": {
+            "enabled": False,
         },
         "optimizer": {
             "name": "torch.optim.AdamW",
@@ -139,10 +151,8 @@ def policy_setup(two_gpu_virtual_cluster):
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
-    print("Creating HfPolicy...")
-    policy = HfPolicy(
-        cluster=two_gpu_virtual_cluster, config=config, tokenizer=tokenizer
-    )
+    print("Creating Policy...")
+    policy = Policy(cluster=two_gpu_virtual_cluster, config=config, tokenizer=tokenizer)
 
     yield policy
 
@@ -151,7 +161,7 @@ def policy_setup(two_gpu_virtual_cluster):
 
 
 @pytest.mark.timeout(180)
-def test_hf_policy_init(policy_setup):
+def test_lm_policy_init(policy_setup):
     policy = policy_setup
 
     # Verify we have two workers, one per GPU
@@ -230,7 +240,7 @@ def test_hf_policy_init(policy_setup):
 @pytest.fixture
 def training_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
-    model_name, tp, cpu_offload, sequence_parallel, activation_checkpointing = (
+    model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing = (
         request.param
     )
     policy = None
@@ -239,13 +249,13 @@ def training_setup(request, two_gpu_virtual_cluster):
 
     try:
         config = create_test_config(
-            model_name, tp, cpu_offload, sequence_parallel, activation_checkpointing
+            model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating training HfPolicy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
         )
-        policy = HfPolicy(
+        policy = Policy(
             cluster=two_gpu_virtual_cluster,
             config=config,
             tokenizer=tokenizer,
@@ -293,24 +303,34 @@ def training_setup(request, two_gpu_virtual_cluster):
 @pytest.mark.parametrize(
     "training_setup",
     [
-        # model_name, tp, cpu_offload, sequence_parallel, activation_checkpointing
-        # Split grid over tp/cpu/sp/act across qwen and llama
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, True, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, False, True, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, False, False, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, True, True, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, True, False, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, False, True, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, True, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, True, True, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, True, False, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, False, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, True, True, True),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, True, True, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, True, False, True),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, False, True, True),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, True, True, True),
+        # model_name                        tp cp  sp     cpu    act
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, True, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, True, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, False, True),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, False, False),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, True, False),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, False, True),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, False, True, True),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, True, True),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, False, False),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, True, False),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, False, True),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, False, True, True),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, True, True),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, False, False),
+        (
+            TEST_ASSETS.TINY_GEMMA3_MODEL_PATH,
+            1,
+            1,
+            True,
+            True,
+            False,
+        ),  # gemma3 doesn't support spda
+        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, False, True),
+        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, False, True, True),
+        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, True, True),
+        # CP doesn't support gemma3 due to spda input has attent_mask != None.
     ],
     indirect=True,
 )
@@ -352,7 +372,7 @@ def test_dtensor_worker_training(training_setup):
 @pytest.fixture
 def logprob_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
-    model_name, tp, cpu_offload, sequence_parallel, activation_checkpointing = (
+    model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing = (
         request.param
     )
     policy = None
@@ -360,13 +380,13 @@ def logprob_setup(request, two_gpu_virtual_cluster):
 
     try:
         config = create_test_config(
-            model_name, tp, cpu_offload, sequence_parallel, activation_checkpointing
+            model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating logprob HfPolicy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
         )
-        policy = HfPolicy(
+        policy = Policy(
             cluster=two_gpu_virtual_cluster,
             config=config,
             tokenizer=tokenizer,
@@ -433,19 +453,28 @@ def logprob_setup(request, two_gpu_virtual_cluster):
 @pytest.mark.parametrize(
     "logprob_setup",
     [
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, False, True, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, False, True, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, False, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, False, True, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, False, False, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, False, True, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, False, False, False),
+        # TP=2, CP=1
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, 1, False, True, False),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, 1, False, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, True, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, True, True),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, 1, False, True, False),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, 1, False, False, False),
+        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, 1, False, True, False),
+        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, 1, False, False, False),
+        # TP=1, CP=2
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, True, False),
+        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, False, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, True, False),
+        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, True, True),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, True, False),
+        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, False, False),
     ],
     indirect=True,
 )
-def test_dtensor_worker_logprob_tp2_matches_no_tp(logprob_setup):
+def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
     policy, data, logprobs = logprob_setup
 
     # Verify resources were created properly assert policy is not None, "Policy was not created properly"
@@ -467,18 +496,22 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_clu
     from torch.distributed.tensor.parallel import ColwiseParallel
     from torch.distributed.tensor.placement_types import Replicate
 
-    custom_parallel_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
+    custom_parallel_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+        "model.embed_tokens": ColwiseParallel(output_layouts=Replicate()),
+    }
     config = create_test_config(
         model_name=TEST_ASSETS.TINY_LLAMA_TIED_MODEL_PATH,
         tp=2,
-        cpu_offload=False,
+        cp=1,
         sequence_parallel=False,
+        cpu_offload=False,
         activation_checkpointing=False,
         custom_parallel_plan=custom_parallel_plan,
     )
     tokenizer = get_tokenizer(config["tokenizer"])
 
-    policy = HfPolicy(
+    policy = Policy(
         tokenizer=tokenizer,
         config=config,
         init_optimizer=False,
@@ -490,11 +523,11 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_clu
     state_dict = ray.get(policy.worker_group.workers[0].return_state_dict.remote())
     total_shape = state_dict["lm_head.weight"].shape
     sharded_shape = state_dict["lm_head.weight"].to_local().shape
-    assert total_shape[0] == sharded_shape[0] * 2, (
-        "lm_head.weight should be sharded across 2 GPUs"
+    assert total_shape[0] == sharded_shape[0], (
+        "lm_head.weight should have the same number of rows"
     )
-    assert total_shape[1] == sharded_shape[1], (
-        "lm_head.weight should have the same number of columns"
+    assert total_shape[1] == sharded_shape[1] * 2, (
+        "lm_head.weight should be sharded across 2 GPUs"
     )
 
     # Clean up
@@ -539,8 +572,8 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cl
     config = create_test_config()
     tokenizer = get_tokenizer(config["tokenizer"])
 
-    print("Creating training HfPolicy with mbs=1...")
-    policy_mbs1 = HfPolicy(
+    print("Creating training Policy with mbs=1...")
+    policy_mbs1 = Policy(
         cluster=two_gpu_virtual_cluster,
         config=config,
         init_reference_model=False,
@@ -576,8 +609,8 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cl
     config["train_micro_batch_size"] = 2
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
-    print("Creating training HfPolicy with mbs=2...")
-    policy_mbs2 = HfPolicy(
+    print("Creating training Policy with mbs=2...")
+    policy_mbs2 = Policy(
         cluster=two_gpu_virtual_cluster,
         config=config,
         init_reference_model=False,

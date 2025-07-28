@@ -41,7 +41,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
 from nemo_rl.models.policy.utils import import_class_from_path
 
 
@@ -92,7 +92,7 @@ def _parallelize_gemma3(
     Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
     """
     if isinstance(model, Gemma3ForConditionalGeneration):
-        model_prefix = "language_model.model"
+        model_prefix = "model.language_model"
     else:
         model_prefix = "model"
 
@@ -127,7 +127,7 @@ def _parallelize_gemma3(
         ),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
-        f"{model_prefix}.lm_head": PrepareModuleInput(
+        "lm_head": PrepareModuleInput(
             input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
             use_local_output=True,
@@ -146,10 +146,6 @@ def _parallelize_llama(
     sequence_parallel: bool = False,
 ):
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
-
     base_model_tp_plan = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
@@ -206,9 +202,6 @@ def _parallelize_qwen(
                     f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
                 )
 
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
     if sequence_parallel:
         base_model_tp_plan = {
             "lm_head": ColwiseParallel(
@@ -399,7 +392,7 @@ def _parallelize_model(
     """
     model_cls = type(model)
     if model_cls == Gemma3ForConditionalGeneration:
-        layers: torch.nn.ModuleList = model.language_model.model.layers  # type: ignore
+        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     else:
@@ -544,7 +537,7 @@ def clip_grad_by_total_norm_(
 
 def get_grad_norm(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
-    dp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
     tp_group: torch.distributed.ProcessGroup,
     norm_type: Union[int, float] = 2,
     dtype: torch.dtype = torch.float32,
@@ -558,6 +551,7 @@ def get_grad_norm(
             An iterable of Tensors or DTensors, or a single Tensor or DTensor
             that will have gradient norm calculated.
         dp_group (torch.distributed.ProcessGroup): Process group for data parallel communication.
+        cp_group (torch.distributed.ProcessGroup): Process group for context parallel communication.
         tp_group (torch.distributed.ProcessGroup): Process group for tensor parallel communication.
         norm_type (Union[int, float]): Type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
@@ -587,8 +581,9 @@ def get_grad_norm(
         )
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
         )
+
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=tp_group
         )
@@ -602,8 +597,9 @@ def get_grad_norm(
         total_norm = total_norm.cuda()  # type: ignore
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_group
+            total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
         )
+
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
@@ -613,7 +609,9 @@ def get_grad_norm(
 
 
 def get_logprobs_from_vocab_parallel_logits(
-    vocab_parallel_logits: DTensor, input_ids: torch.Tensor
+    vocab_parallel_logits: DTensor,
+    input_ids: torch.Tensor | DTensor,
+    seq_index: Optional[torch.Tensor] = None,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -623,22 +621,34 @@ def get_logprobs_from_vocab_parallel_logits(
     Args:
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
-        input_ids (torch.Tensor): Input token IDs for which to compute log probabilities,
+        input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
             with shape [batch_size, seq_len].
+        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
+            with shape [sequence_length].
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
     """
-    tp_mesh = vocab_parallel_logits.device_mesh
-    tp_rank: int = tp_mesh.get_local_rank()
+    device_mesh = vocab_parallel_logits.device_mesh
+    if seq_index is not None:
+        assert "cp" in device_mesh.mesh_dim_names, (
+            "seq_index must be provided for cp sharded logits"
+        )
 
-    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
+    tp_size = 1
 
-    return from_parallel_logits_to_logprobs(
+    tp_group = device_mesh.get_group("tp")
+    tp_rank = tp_group.rank()
+    tp_size = tp_group.size()
+
+    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
+
+    return dtensor_from_parallel_logits_to_logprobs(
         vocab_parallel_logits.to_local(),
         input_ids,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
-        tp_mesh.get_group(),
+        tp_group,
         inference_only=not torch.is_grad_enabled(),
+        seq_index=seq_index,
     )

@@ -17,6 +17,7 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+3rdparty/vllm
 
 # Test
 coverage.json
@@ -38,3 +39,7 @@ wandb/
 checkpoints/
 results/
 code_snapshots/
+
+# Runtime env
+*runtime_env.yaml
+!default_runtime_env.yaml

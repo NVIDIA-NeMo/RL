@@ -34,7 +34,14 @@ policy:
     sequence_parallel: false
     activation_checkpointing: false
     tensor_parallel_size: 4
+    context_parallel_size: 1
     custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
@@ -67,12 +74,16 @@ logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"
   tensorboard:
     log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "openmathinstruct-nemorl-1M_train"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

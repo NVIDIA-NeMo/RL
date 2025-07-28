@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict, TypeVar
 
 import torch
 
@@ -21,11 +21,12 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
 from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
 )
 
-Tensor = torch.Tensor
+Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
 class ClippedPGLossConfig(TypedDict):
@@ -41,13 +42,13 @@ class ClippedPGLossConfig(TypedDict):
 class ClippedPGLossDataDict(TypedDict):
     """Required keys for the Clipped Policy Gradient loss function."""
 
-    input_ids: Tensor
-    advantages: Tensor
-    prev_logprobs: Tensor
-    generation_logprobs: Tensor
-    reference_policy_logprobs: Tensor
-    token_mask: Tensor
-    sample_mask: Tensor
+    input_ids: torch.Tensor
+    advantages: torch.Tensor
+    prev_logprobs: torch.Tensor
+    generation_logprobs: torch.Tensor
+    reference_policy_logprobs: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
     __extra__: Any
 
 
@@ -111,6 +112,9 @@ class ClippedPGLossFn(LossFunction):
         data: BatchedDataDict[ClippedPGLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
@@ -119,6 +123,7 @@ class ClippedPGLossFn(LossFunction):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
         reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -134,9 +139,24 @@ class ClippedPGLossFn(LossFunction):
 
         next_token_logits = next_token_logits.to(torch.float32)
 
-        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            curr_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
+                next_token_logits, data["input_ids"], seq_index=seq_index
             )
         else:
             next_token_logits_wo_last = next_token_logits[
@@ -294,9 +314,12 @@ class NLLLoss(LossFunction):
         data: BatchedDataDict[Any],
         global_valid_seqs: Tensor | None,
         global_valid_toks: Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
-    ) -> tuple[Tensor, dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
         token_mask = data["token_mask"][:, 1:]
@@ -306,7 +329,22 @@ class NLLLoss(LossFunction):
         next_token_logits = next_token_logits.to(torch.float32)
 
         # Gather the logprobs for the actual next tokens
-        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            token_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                 next_token_logits, data["input_ids"]
             )
@@ -354,10 +392,10 @@ class DPOLossConfig(TypedDict):
 class DPOLossDataDict(TypedDict):
     """Required keys for the DPO loss function."""
 
-    input_ids: Tensor
-    reference_policy_logprobs: Tensor
-    token_mask: Tensor
-    sample_mask: Tensor
+    input_ids: torch.Tensor
+    reference_policy_logprobs: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
 
 
 class DPOLossFn(LossFunction):
@@ -434,13 +472,31 @@ class DPOLossFn(LossFunction):
         next_token_logits: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
         global_valid_seqs: Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
 
         next_token_logits = next_token_logits.to(torch.float32)
-        if isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            token_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                 next_token_logits, data["input_ids"]
             )
@@ -502,7 +558,10 @@ class DPOLossFn(LossFunction):
         data: BatchedDataDict[DPOLossDataDict],
         global_valid_seqs: Tensor,
         global_valid_toks: Tensor | None,
-    ) -> tuple[Tensor, dict[str, Any]]:
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         sft_loss_chosen = torch.tensor(0.0)
         if self.sft_loss_weight > 0:
             assert global_valid_toks is not None, (
@@ -513,6 +572,9 @@ class DPOLossFn(LossFunction):
                 data,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,  ## unused because sft loss returned is at the sample level
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
                 dpo_loss=True,
                 dpo_average_log_probs=self.sft_average_log_probs,
             )
@@ -528,7 +590,14 @@ class DPOLossFn(LossFunction):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._preference_loss(next_token_logits, data, global_valid_seqs)
+        ) = self._preference_loss(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
 
         dpo_loss = (
             self.sft_loss_weight * sft_loss_chosen
@@ -547,3 +616,83 @@ class DPOLossFn(LossFunction):
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
         }
+
+
+class SequencePackingLossWrapper:
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_q_padded: Optional[Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
+        unpadded_cu_seqlens = self.cu_seqlens_q
+        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
+        if self.cu_seqlens_q_padded is not None:
+            padded_cu_seqlens = self.cu_seqlens_q_padded
+            padded_seq_lengths = (
+                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
+            )
+        else:
+            padded_cu_seqlens = unpadded_cu_seqlens
+            padded_seq_lengths = unpadded_seq_lengths
+        seq_starts = padded_cu_seqlens[:-1]
+        seq_ends = padded_cu_seqlens[1:]
+
+        loss_accum = 0
+        metrics_accum = {}
+        for seq_idx in range(len(seq_starts)):
+            seq_start = seq_starts[seq_idx].item()
+            seq_end = seq_ends[seq_idx].item()
+
+            # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
+            seq_data = data.slice(seq_idx, seq_idx + 1)
+            unpadded_seq_data = {}
+            for k, v in seq_data.items():
+                if isinstance(v, torch.Tensor) and v.ndim > 1 and v.shape[1] > 1:
+                    unpadded_seq_data[k] = v[:, : unpadded_seq_lengths[seq_idx]]
+                else:
+                    unpadded_seq_data[k] = v
+
+            # get next_token_logits
+            cp_size = (
+                1
+                if context_parallel_group is None
+                else torch.distributed.get_world_size(context_parallel_group)
+            )
+            logit_slice_idxs = slice(
+                seq_start // cp_size,
+                (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+            )
+            next_token_logits_slice = next_token_logits[:, logit_slice_idxs, :]
+
+            loss, metrics = self.loss_fn(
+                next_token_logits_slice,
+                unpadded_seq_data,
+                global_valid_seqs,
+                global_valid_toks,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            loss_accum += loss
+            for k, v in metrics.items():
+                if k not in metrics_accum:
+                    metrics_accum[k] = 0
+                metrics_accum[k] += v
+
+        return loss_accum, metrics_accum

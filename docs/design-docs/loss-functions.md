@@ -22,8 +22,6 @@ In NeMo RL, this information is passed to the loss function directly. Each loss 
 For our simple example above, this would look like:
 
 ```{testcode}
-from typing import Tuple
-
 import torch
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import LossType
@@ -44,7 +42,7 @@ class SimpleAverageLoss(LossFunction):
         next_token_losses: torch.Tensor,
         data: BatchedDataDict,
         total_valid_tokens_or_seqs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict]:
         """Compute the simple average loss with proper microbatch handling."""
         token_mask = data["token_mask"] ## token mask for this microbatch
         sample_mask = data["sample_mask"] ## sample mask for this microbatch

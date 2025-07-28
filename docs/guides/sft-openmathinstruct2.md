@@ -26,7 +26,7 @@ The default config uses 8 GPUs (`cluster.gpus_per_node`) on 1 node (`cluster.num
 Throughout training, the checkpoints of the model will be saved to the `results/sft_openmathinstruct2` folder (specified by `checkpointing.checkpoint_dir`). To evaluate the model, we first need to convert the PyTorch distributed checkpoint to Hugging Face format:
 
 ```
-uv run examples/convert_dcp_to_hf.py \
+uv run examples/converters/convert_dcp_to_hf.py \
     --config=results/sft_openmathinstruct2/step_1855/config.yaml \
     --dcp-ckpt-path=results/sft_openmathinstruct2/step_1855/policy/weights \
     --hf-ckpt-path=results/sft_openmathinstruct2/step_1855/hf
@@ -38,7 +38,7 @@ To evaluate on the [MATH-500 benchmark](https://huggingface.co/datasets/HuggingF
 
 ```
 uv run examples/run_eval.py \
-    --config=examples/configs/eval.yaml \
+    --config=examples/configs/evals/eval.yaml \
     generation.model_name=results/sft_openmathinstruct2/step_1855/hf \
     tokenizer.name=meta-llama/Llama-3.1-8B-Instruct \
     data.dataset_name=HuggingFaceH4/MATH-500 \

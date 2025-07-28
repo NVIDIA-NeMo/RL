@@ -12,23 +12,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
 class DTensorConfig(TypedDict):
     enabled: bool
-    cpu_offload: bool
-    sequence_parallel: bool
+    cpu_offload: NotRequired[bool]
+    sequence_parallel: NotRequired[bool]
+    activation_checkpointing: NotRequired[bool]
+    tensor_parallel_size: NotRequired[int]
+    context_parallel_size: NotRequired[int]
+    custom_parallel_plan: NotRequired[str]
+
+
+class SequencePackingConfig(TypedDict):
+    enabled: bool
+    train_mb_tokens: int
+    logprob_mb_tokens: int
+    algorithm: str
+
+
+class MegatronOptimizerConfig(TypedDict):
+    optimizer: str
+    lr: float
+    min_lr: float
+    weight_decay: float
+    bf16: bool
+    fp16: bool
+    params_dtype: str
+    # adam
+    adam_beta1: float
+    adam_beta2: float
+    adam_eps: float
+    # sgd
+    sgd_momentum: float
+    # distributed optimizer
+    use_distributed_optimizer: bool
+    use_precision_aware_optimizer: bool
+    clip_grad: float
+
+
+class MegatronSchedulerConfig(TypedDict):
+    start_weight_decay: float
+    end_weight_decay: float
+    weight_decay_incr_style: str
+    lr_decay_style: str
+    lr_decay_iters: int
+    lr_warmup_iters: int
+    lr_warmup_init: float
+
+
+class MegatronDDPConfig(TypedDict):
+    grad_reduce_in_fp32: bool
+    overlap_grad_reduce: bool
+    overlap_param_gather: bool
+    average_in_collective: bool
+    use_custom_fsdp: bool
+    data_parallel_sharding_strategy: str
+
+
+class MegatronConfig(TypedDict):
+    enabled: bool
+    empty_unused_memory_level: int
     activation_checkpointing: bool
-    tensor_parallel_size: int
-    custom_parallel_plan: str
+    converter_type: str
+    tensor_model_parallel_size: int
+    pipeline_model_parallel_size: int
+    num_layers_in_first_pipeline_stage: int
+    num_layers_in_last_pipeline_stage: int
+    context_parallel_size: int
+    pipeline_dtype: str
+    sequence_parallel: bool
+
+    optimizer: NotRequired[MegatronOptimizerConfig]
+    scheduler: NotRequired[MegatronSchedulerConfig]
+    distributed_data_parallel_config: MegatronDDPConfig
 
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: str
+    chat_template: NotRequired[str]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -51,9 +116,11 @@ class DynamicBatchingConfig(TypedDict):
     # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
     # training and logprob stages respectively.
     enabled: bool
-    train_mb_tokens: int
-    logprob_mb_tokens: int
-    sequence_length_round: int
+
+    ## required if enabled is true
+    train_mb_tokens: NotRequired[int]
+    logprob_mb_tokens: NotRequired[int]
+    sequence_length_round: NotRequired[int]
 
 
 class PolicyConfig(TypedDict):
@@ -61,20 +128,22 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
-    learning_rate: float
-    logprob_batch_size: int
-    generation: Optional[GenerationConfig]
+    logprob_batch_size: NotRequired[int]
+    generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation
     precision: str
     dtensor_cfg: DTensorConfig
+    megatron_cfg: NotRequired[MegatronConfig]
     dynamic_batching: DynamicBatchingConfig
+    sequence_packing: NotRequired[SequencePackingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    max_grad_norm: Optional[Union[float, int]]
+    max_grad_norm: NotRequired[Union[float, int]]
     fsdp_offload_enabled: bool
     activation_checkpointing_enabled: bool
+    refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig] = None
     scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (
         None

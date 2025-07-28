@@ -18,15 +18,19 @@ import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
+import mlflow
 import ray
 import requests
 import torch
 import wandb
+from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 from rich.box import ROUNDED
@@ -43,12 +47,18 @@ _rich_logging_configured = False
 
 
 class WandbConfig(TypedDict):
-    project: str
-    name: str
+    project: NotRequired[str]
+    name: NotRequired[str]
 
 
 class TensorboardConfig(TypedDict):
-    log_dir: str
+    log_dir: NotRequired[str]
+
+
+class MLflowConfig(TypedDict):
+    experiment_name: str
+    run_name: str
+    tracking_uri: NotRequired[str]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -60,8 +70,10 @@ class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
     tensorboard_enabled: bool
+    mlflow_enabled: bool
     wandb: WandbConfig
     tensorboard: TensorboardConfig
+    mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
 
@@ -122,15 +134,134 @@ class TensorboardLogger(LoggerInterface):
         # Flatten the params because add_hparams does not support nested dicts
         self.writer.add_hparams(flatten_dict(params), {})
 
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to Tensorboard.
+
+        Args:
+            plot_data: Dictionary of plot data
+            step: Global step value
+        """
+        self.writer.add_figure(name, figure, step)
+
 
 class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         self.run = wandb.init(**cfg, dir=log_dir)
+        self._log_code()
+        self._log_diffs()
         print(
             f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
         )
+
+    def _log_diffs(self):
+        """Log git diffs to wandb.
+
+        This function captures and logs two types of diffs:
+        1. Uncommitted changes (working tree diff against HEAD)
+        2. All changes (including uncommitted) against the main branch
+
+        Each diff is saved as a text file in a wandb artifact.
+        """
+        try:
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            current_branch = branch_result.stdout.strip()
+
+            diff_artifact = wandb.Artifact(
+                name=f"git-diffs-{self.run.project}-{self.run.id}", type="git-diffs"
+            )
+
+            # 1. Log uncommitted changes (working tree diff)
+            uncommitted_result = subprocess.run(
+                ["git", "diff", "HEAD"], capture_output=True, text=True, check=True
+            )
+            uncommitted_diff = uncommitted_result.stdout
+
+            if uncommitted_diff:
+                diff_path = os.path.join(
+                    wandb.run.dir if wandb.run else ".", "uncommitted_changes_diff.txt"
+                )
+                with open(diff_path, "w") as f:
+                    f.write(uncommitted_diff)
+
+                # Add file to artifact
+                diff_artifact.add_file(diff_path, name="uncommitted_changes_diff.txt")
+                print("Logged uncommitted changes diff to wandb")
+            else:
+                print("No uncommitted changes found")
+
+            # 2. Log diff against main branch (if current branch is not main)
+            if current_branch != "main":
+                # Log diff between main and working tree (includes uncommitted changes)
+                working_diff_result = subprocess.run(
+                    ["git", "diff", "main"], capture_output=True, text=True, check=True
+                )
+                working_diff = working_diff_result.stdout
+
+                if working_diff:
+                    # Save diff to a temporary file
+                    diff_path = os.path.join(
+                        wandb.run.dir if wandb.run else ".", "main_diff.txt"
+                    )
+                    with open(diff_path, "w") as f:
+                        f.write(working_diff)
+
+                    # Add file to artifact
+                    diff_artifact.add_file(diff_path, name="main_diff.txt")
+                    print("Logged diff against main branch")
+                else:
+                    print("No differences found between main and working tree")
+
+            self.run.log_artifact(diff_artifact)
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error during git operations: {e}")
+        except Exception as e:
+            print(f"Unexpected error during git diff logging: {e}")
+
+    def _log_code(self):
+        """Log code that is tracked by git to wandb.
+
+        This function gets a list of all files tracked by git in the project root
+        and manually uploads them to the current wandb run as an artifact.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "ls-files"], capture_output=True, text=True, check=True
+            )
+
+            tracked_files = result.stdout.strip().split("\n")
+
+            if not tracked_files:
+                print(
+                    "Warning: No git repository found. Wandb logs will not track code changes for reproducibility."
+                )
+                return
+
+            code_artifact = wandb.Artifact(
+                name=f"source-code-{self.run.project}", type="code"
+            )
+
+            for file_path in tracked_files:
+                if os.path.isfile(file_path):
+                    try:
+                        code_artifact.add_file(file_path, name=file_path)
+                    except Exception as e:
+                        print(f"Error adding file {file_path}: {e}")
+
+            self.run.log_artifact(code_artifact)
+            print(f"Logged {len(tracked_files)} git-tracked files to wandb")
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error getting git-tracked files: {e}")
+        except Exception as e:
+            print(f"Unexpected error during git code logging: {e}")
 
     def define_metric(
         self,
@@ -181,6 +312,15 @@ class WandbLogger(LoggerInterface):
             params: Dict of hyperparameters to log
         """
         self.run.config.update(params)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to wandb.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+        """
+        self.run.log({name: figure}, step=step)
 
 
 class GpuMetricSnapshot(TypedDict):
@@ -284,8 +424,8 @@ class RayGpuMonitorLogger:
                 )
                 time.sleep(self.collection_interval)  # Continue despite errors
 
-    def _parse_gpu_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
-        """Parse a GPU metric sample into a standardized format.
+    def _parse_metric(self, sample: Sample, node_idx: int) -> dict[str, Any]:
+        """Parse a metric sample into a standardized format.
 
         Args:
             sample: Prometheus metric sample
@@ -294,28 +434,28 @@ class RayGpuMonitorLogger:
         Returns:
             Dictionary with metric name and value
         """
-        # Expected labels for GPU metrics
-        expected_labels = ["GpuIndex"]
-        for label in expected_labels:
-            if label not in sample.labels:
-                # This is probably a CPU node
-                return {}
-
         metric_name = sample.name
-        # Rename known metrics to match wandb naming convention
+        labels = sample.labels
+        value = sample.value
+
         if metric_name == "ray_node_gpus_utilization":
-            metric_name = "gpu"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.util"
         elif metric_name == "ray_node_gram_used":
-            metric_name = "memory"
+            index = labels["GpuIndex"]
+            metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
+            # NOTE: It appears their docs say bytes, but it appears to be MB
+            value /= 1024
+        elif metric_name == "ray_node_mem_used":
+            metric_name = f"node.{node_idx}.mem_gb"
+            value /= 1024 * 1024 * 1024
+        elif metric_name == "ray_node_mem_total":
+            metric_name = f"node.{node_idx}.mem_total_gb"
+            value /= 1024 * 1024 * 1024
         else:
             # Skip unexpected metrics
             return {}
 
-        labels = sample.labels
-        index = labels["GpuIndex"]
-        value = sample.value
-
-        metric_name = f"node.{node_idx}.gpu.{index}.{metric_name}"
         return {metric_name: value}
 
     def _parse_gpu_sku(self, sample: Sample, node_idx: int) -> dict[str, str]:
@@ -382,7 +522,7 @@ class RayGpuMonitorLogger:
         assert metrics ^ sku, (
             f"Must collect either metrics or sku, not both: {metrics=}, {sku=}"
         )
-        parser_fn = self._parse_gpu_metric if metrics else self._parse_gpu_sku
+        parser_fn = self._parse_metric if metrics else self._parse_gpu_sku
 
         if not ray.is_initialized():
             print("Ray is not initialized. Cannot collect GPU metrics.")
@@ -405,12 +545,12 @@ class RayGpuMonitorLogger:
                 unique_metric_addresses[metrics_address] = True
 
             # Process each node's metrics
-            collected_metrics = {}
+            collected_metrics: dict[str, Any] = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
-                gpu_metrics = self._fetch_and_parse_metrics(
+                metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
                 )
-                collected_metrics.update(gpu_metrics)
+                collected_metrics.update(metrics)
 
             return collected_metrics
 
@@ -443,13 +583,6 @@ class RayGpuMonitorLogger:
 
             # Parse the Prometheus format
             for family in text_string_to_metric_families(metrics_text):
-                # Skip non-GPU metrics
-                if family.name not in (
-                    "ray_node_gram_used",
-                    "ray_node_gpus_utilization",
-                ):
-                    continue
-
                 for sample in family.samples:
                     metrics = parser_fn(sample, node_idx)
                     gpu_metrics.update(metrics)
@@ -487,6 +620,91 @@ class RayGpuMonitorLogger:
             self.metrics_buffer = []
 
 
+class MLflowLogger(LoggerInterface):
+    """MLflow logger backend."""
+
+    def __init__(self, cfg: MLflowConfig, log_dir: Optional[str] = None):
+        """Initialize MLflow logger.
+
+        Args:
+            cfg: MLflow configuration
+            log_dir: Optional log directory
+        """
+        if cfg["tracking_uri"]:
+            mlflow.set_tracking_uri(cfg["tracking_uri"])
+
+        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        if experiment is None:
+            if log_dir:
+                mlflow.create_experiment(
+                    name=cfg["experiment_name"],
+                    artifact_location=log_dir,
+                )
+            else:
+                mlflow.create_experiment(cfg["experiment_name"])
+        else:
+            mlflow.set_experiment(cfg["experiment_name"])
+
+        # Start run
+        run_kwargs: dict[str, str] = {}
+        run_kwargs["run_name"] = cfg["run_name"]
+
+        self.run = mlflow.start_run(**run_kwargs)
+        print(
+            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
+            f"run {cfg['run_name']}"
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Log metrics to MLflow.
+
+        Args:
+            metrics: Dict of metrics to log
+            step: Global step value
+            prefix: Optional prefix for metric names
+            step_metric: Optional step metric name (ignored in MLflow)
+        """
+        for name, value in metrics.items():
+            if prefix:
+                name = f"{prefix}/{name}"
+            mlflow.log_metric(name, value, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to MLflow.
+
+        Args:
+            params: Dictionary of hyperparameters to log
+        """
+        # MLflow does not support nested dicts
+        mlflow.log_params(flatten_dict(params))
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to MLflow.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+            name: Name of the plot
+        """
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_file:
+            figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
+            mlflow.log_artifact(tmp_file.name, f"plots/{name}")
+
+    def __del__(self) -> None:
+        """Clean up resources when the logger is destroyed."""
+        try:
+            mlflow.end_run()
+        except Exception:
+            # Ignore errors during cleanup
+            pass
+
+
 class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
@@ -497,8 +715,10 @@ class Logger(LoggerInterface):
             cfg: Config dict with the following keys:
                 - wandb_enabled
                 - tensorboard_enabled
+                - mlflow_enabled
                 - wandb
                 - tensorboard
+                - mlflow
                 - monitor_gpus
                 - gpu_collection_interval
                 - gpu_flush_interval
@@ -522,6 +742,12 @@ class Logger(LoggerInterface):
                 cfg["tensorboard"], log_dir=tensorboard_log_dir
             )
             self.loggers.append(tensorboard_logger)
+
+        if cfg["mlflow_enabled"]:
+            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
+            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
+            self.loggers.append(mlflow_logger)
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
@@ -598,6 +824,106 @@ class Logger(LoggerInterface):
                 f.write(json.dumps({**sample, "idx": i}) + "\n")
 
         print(f"Logged data to {filepath}")
+
+    def log_plot_token_mult_prob_error(
+        self, data: dict[str, Any], step: int, name: str
+    ) -> None:
+        """Log a plot of log probability errors in samples.
+
+        This function logs & plots the per-token log-probabilities and errors over the sequence
+        for the sample with the highest multiplicative probability error in the batch.
+
+        Args:
+            log_data: Dictionary of log probability samples
+            step: Global step value
+            name: Name of the plot
+        """
+        # find the sample with the highest log probability error
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        generation_logprobs = data["generation_logprobs"][:, 1:]
+        prev_logprobs = data["prev_logprobs"][:, 1:]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+
+        sample_idx = torch.argmax(mult_prob_error)
+        sample_error = mult_prob_error[sample_idx]
+
+        # plot the sample with the highest log probability error
+        # offset by 1 token for next token prediction
+        generation_start_idx, generation_end_idx = (
+            data["prompt_lengths"][sample_idx] - 1,
+            data["full_lengths"][sample_idx] - 1,
+        )
+
+        if generation_start_idx >= generation_end_idx:
+            print(
+                f"Skipping token_mult_prob_error plot because generation_start_idx ({generation_start_idx}) >= generation_end_idx ({generation_end_idx})"
+            )
+            return
+
+        generation_logprob = generation_logprobs[
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
+        ]
+        prev_logprob = (
+            prev_logprobs[
+                sample_idx, int(generation_start_idx) : int(generation_end_idx)
+            ]
+            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        )
+        diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+
+        # Find max absolute error token
+        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error = diff_i[max_abs_error_idx].item()
+
+        # Find max relative error token (ratio of probabilities)
+        gen_prob = torch.exp(generation_logprob)
+        prev_prob = torch.exp(prev_logprob)
+        relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
+        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error = relative_error[max_rel_error_idx].item()
+
+        fig = plt.figure()
+        step_idx = torch.arange(int(generation_start_idx), int(generation_end_idx))
+
+        plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
+        plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")
+        plt.plot(
+            step_idx,
+            diff_i,
+            label=f"abs diff (token_mult_prob_error={sample_error:.2f})",
+        )
+
+        # Highlight max errors with points
+        plt.plot(
+            step_idx[max_abs_error_idx],
+            diff_i[max_abs_error_idx],
+            "ro",
+            markersize=8,
+            label=f"Max abs error: {max_abs_error:.4f}",
+        )
+        plt.plot(
+            step_idx[max_rel_error_idx],
+            diff_i[max_rel_error_idx],
+            "bo",
+            markersize=8,
+            label=f"Max rel error (prob): {max_rel_error:.4f}",
+        )
+
+        plt.xlabel("Token Position (starting from prompt end)")
+        plt.ylabel("Log Probability/Difference")
+        plt.legend()
+        plt.tight_layout()
+
+        for logger in self.loggers:
+            logger.log_plot(fig, step, name)
+
+        plt.close(fig)
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""

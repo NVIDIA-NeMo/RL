@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import warnings
 from pathlib import Path
-from typing import Any, Optional, TypedDict, cast
+from typing import Any, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
+import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
@@ -37,30 +39,37 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+)
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
 )
-from nemo_rl.experience.rollouts import run_multi_turn_rollout
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.hf_policy import HfPolicy
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import Timer
 
 # ===============================================================================
 # Configuration
 # ===============================================================================
-TokenizerType = PreTrainedTokenizerBase
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
 class GRPOConfig(TypedDict):
@@ -74,7 +83,6 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
-    checkpoint_dir: str
 
 
 class GRPOSaveState(TypedDict):
@@ -119,7 +127,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
-    RayVirtualCluster,
+    tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
@@ -131,13 +139,12 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
     """
     # Extract individual configs for easier access
     policy_config = master_config["policy"]
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
-    data_config = master_config["data"]
     grpo_config = master_config["grpo"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
@@ -163,19 +170,6 @@ def setup(
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()
 
-    # config validation checks
-    if master_config["checkpointing"]["enabled"]:
-        assert master_config["checkpointing"]["save_period"] > 0
-        assert (
-            master_config["checkpointing"]["save_period"]
-            % master_config["grpo"]["val_period"]
-            == 0
-        ), (
-            f"Checkpointing save period {master_config['checkpointing']['save_period']} "
-            f"must be a multiple of validation period {master_config['grpo']['val_period']}"
-            f", or we won't know what metric to save!"
-        )
-
     # ==========================
     #           Data
     # ==========================
@@ -184,6 +178,7 @@ def setup(
         batch_size=grpo_config["num_prompts_per_step"],
         shuffle=False,
         collate_fn=rl_collate_fn,
+        drop_last=True,
     )
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
@@ -212,16 +207,91 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    colocated_inference = generation_config["backend"] != "hf"
-    cluster = RayVirtualCluster(
-        name="grpo_policy_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
-        use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
-        max_colocated_worker_groups=2 if colocated_inference else 1,
-    )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    colocated_inference = generation_config["colocated"]["enabled"]
+
+    if colocated_inference:
+        cluster = RayVirtualCluster(
+            name="grpo_policy_cluster",
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
+            * cluster_config["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=cluster_config["gpus_per_node"],
+            max_colocated_worker_groups=1
+            if generation_config["backend"] == "megatron"
+            else 2,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+        print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+
+    else:
+        assert generation_config["backend"] != "megatron", (
+            "Non-colocated inference is not supported for Megatron generation backends. "
+            "Please use vLLM backend for generation."
+        )
+
+        # train resources will be updated through overall and inference resources below
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_nodes = cluster_config["num_nodes"]
+
+        inference_resources = generation_config["colocated"]["resources"]
+        inference_gpus_per_node = inference_resources["gpus_per_node"]
+        inference_nodes = inference_resources["num_nodes"]
+
+        # validate and configure resources
+        if cluster_config["num_nodes"] == 1:
+            assert inference_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            assert inference_nodes is None or inference_nodes == 1, (
+                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
+                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            inference_nodes = 1
+            train_gpus_per_node -= inference_gpus_per_node
+        else:
+            assert inference_nodes > 0, (
+                "policy.generation.colocated.resources.num_nodes must be > 0 "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            assert (
+                inference_gpus_per_node is None
+                or inference_gpus_per_node == cluster_config["gpus_per_node"]
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            inference_gpus_per_node = cluster_config["gpus_per_node"]
+            train_nodes -= inference_nodes
+
+        # initialize train cluster
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        print(
+            f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node"
+        )
+
+        # initialize inference cluster
+        inference_cluster = RayVirtualCluster(
+            name="grpo_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        print(
+            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node"
+        )
 
     # ==========================
     #   Training and Inference
@@ -232,12 +302,16 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    if backend == "hf":
+    if backend == "megatron":
         policy_generation = None
-        print(f"  ✓ Using HF backend for generation with {policy_config['model_name']}")
+        print(
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}"
+        )
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
-        policy_generation = VllmGeneration(cluster=cluster, config=generation_config)
+        policy_generation = VllmGeneration(
+            cluster=inference_cluster, config=generation_config
+        )
         # Worker groups are not initialized until the first call to run something on workergroups.
         # vllm 0.8 fails in initialization if its called in the first training step since it has no clean view of the GPU memory (HF is sharing the same memory).
         policy_generation.finish_generation()
@@ -245,18 +319,37 @@ def setup(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}"
         )
 
-    policy = HfPolicy(
-        cluster=cluster,
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
+
+    policy = Policy(
+        cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
     )
+
+    # if it is not colocated inference, initialize collective communication for update weights
+    if not colocated_inference:
+        ip, port = train_cluster.get_master_address_and_port()
+        print(f"Using ip: {ip}, port: {port} for collective communication")
+        # inference cluster + head node of the train cluster
+        world_size = inference_nodes * inference_gpus_per_node + 1
+        # init collective
+        futures_train = policy.init_collective(ip, port, world_size)
+        futures_inference = policy_generation.init_collective(ip, port, world_size)  # type: ignore
+        # wait for all futures to complete
+        ray.get(futures_train + futures_inference)
+
+    # prepare refit info
+    state_dict_info = policy.prepare_refit_info()
+    policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
 
@@ -267,7 +360,7 @@ def setup(
     return (
         policy,
         policy_generation,
-        cluster,
+        (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
         loss_fn,
@@ -283,9 +376,27 @@ def setup(
 # ===============================================================================
 
 
+def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
+    """Determine if async rollouts should be used based on the configuration.
+
+    Returns True if vLLM backend is used with async_engine enabled.
+    """
+    generation_config = master_config["policy"]["generation"]
+    if generation_config is None:
+        return False
+
+    backend = generation_config.get("backend", "")
+    if backend != "vllm":
+        return False
+
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    return vllm_cfg.get("async_engine", False)
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
+    colocated_inference: bool,
     _refit_buffer_size_gb: Optional[int] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
@@ -297,24 +408,51 @@ def refit_policy_generation(
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
     """
-    policy.offload_before_refit()
-    policy_generation.prepare_for_generation(tags=["weights"])
-    # get model param keys, which is grouped by size
-    grouped_param_keys = policy.prepare_weights_for_ipc(
-        _refit_buffer_size_gb=_refit_buffer_size_gb
-    )
-    # do update
-    for keys in grouped_param_keys:
-        ipc_handles = policy.get_weights_ipc_handles(keys)
-        if not policy_generation.update_weights(ipc_handles):
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                "This often indicates an issue with cuda-ipc or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
+    if colocated_inference:
+        policy.offload_before_refit()
+        policy_generation.prepare_for_generation(tags=["weights"])
+
+    # update weights
+    update_success = False
+    if colocated_inference:
+        # get model param keys, which is grouped by size
+        grouped_param_keys = policy.prepare_weights_for_ipc(
+            _refit_buffer_size_gb=_refit_buffer_size_gb
+        )
+        total_num_keys = sum(len(k) for k in grouped_param_keys)
+        print(
+            f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
+        )
+        # do update
+        for keys in grouped_param_keys:
+            ipc_handles = policy.get_weights_ipc_handles(keys)
+            update_success = policy_generation.update_weights_from_ipc_handles(
+                ipc_handles
             )
-            raise RuntimeError(error_message)
-    policy.offload_after_refit()
-    policy_generation.prepare_for_generation(tags=["kv_cache"])
+            if not update_success:
+                break
+    else:
+        # update weights through nccl
+        futures_train = policy.broadcast_weights_for_collective()
+        futures_inference = policy_generation.update_weights_from_collective()
+        # wait for all futures to complete
+        ray.get(futures_train)
+        results = ray.get(futures_inference)
+        update_success = all(result for result in results if result is not None)
+
+    # check if update is successful
+    if not update_success:
+        error_tag = "cuda-ipc" if colocated_inference else "nccl"
+        error_message = (
+            "❌ Error: Updating weights for the generation policy failed during refit.\n"
+            f"This often indicates an issue with {error_tag} or "
+            "a problem within the generation backend (e.g., vLLM worker).\n"
+        )
+        raise RuntimeError(error_message)
+
+    if colocated_inference:
+        policy.offload_after_refit()
+        policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 # ===============================================================================
@@ -339,7 +477,7 @@ def grpo_train(
     """Run GRPO training algorithm."""
     timer = Timer()
     NEED_REFIT = True
-    # If policy_generation is None, use the policy as the generation interface (hf framework backend)
+    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
@@ -351,12 +489,13 @@ def grpo_train(
     consumed_samples = grpo_save_state["consumed_samples"]
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
+    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Run validation at the start if configured
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation)
+            refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -378,6 +517,9 @@ def grpo_train(
         print(
             f"\n{'=' * 25} Step {step + 1}/{min(len(dataloader), master_config['grpo']['max_num_steps'])} {'=' * 25}"
         )
+        maybe_gpu_profile_step(policy, step + 1)
+        if policy != policy_generation:
+            maybe_gpu_profile_step(policy_generation, step + 1)
         val_metrics, validation_timings = None, None
 
         with timer.time("total_step_time"):
@@ -399,21 +541,42 @@ def grpo_train(
             print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
             with timer.time("prepare_for_generation"):
                 if NEED_REFIT and POLICY_GENERATION_STALE:
-                    refit_policy_generation(policy, policy_generation)
+                    refit_policy_generation(
+                        policy, policy_generation, colocated_inference
+                    )
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
-                repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
+                # Use async rollouts if vLLM async engine is enabled
+                if _should_use_async_rollouts(master_config):
+                    (
+                        repeated_batch,
+                        rollout_metrics,
+                    ) = run_async_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+                else:
+                    repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
                 policy_generation.finish_generation()
 
             # Calculate rewards & advantages
@@ -509,9 +672,11 @@ def grpo_train(
             )
 
             # Run validation if it's a validation step
-            if is_last_step or (val_period > 0 and (step + 1) % val_period == 0):
+            if val_period > 0 and (step + 1) % val_period == 0:
                 if NEED_REFIT and POLICY_GENERATION_STALE:
-                    refit_policy_generation(policy, policy_generation)
+                    refit_policy_generation(
+                        policy, policy_generation, colocated_inference
+                    )
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
@@ -538,8 +703,23 @@ def grpo_train(
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1
-                grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                if val_metrics is not None:
+                    grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                elif "val_reward" in grpo_save_state:
+                    del grpo_save_state["val_reward"]
                 grpo_save_state["consumed_samples"] = consumed_samples
+
+                if master_config["checkpointing"]["metric_name"] is not None:
+                    if (
+                        master_config["checkpointing"]["metric_name"]
+                        not in grpo_save_state
+                    ):
+                        warnings.warn(
+                            f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                            "Saving most recent k checkpoints instead."
+                        )
+                        master_config["checkpointing"]["metric_name"] = None
+
                 with timer.time("checkpointing"):
                     print(f"Saving checkpoint for step {step + 1}...")
                     checkpoint_path = checkpointer.init_tmp_checkpoint(
@@ -570,7 +750,6 @@ def grpo_train(
         log_data["input_lengths"] = input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
-        print("\n📊 Training Results:")
         metrics = {
             "loss": train_results["loss"].numpy(),
             "reward": rewards.numpy(),
@@ -578,13 +757,29 @@ def grpo_train(
         }
         metrics.update(train_results["all_mb_metrics"])
         for k, v in metrics.items():
-            if k in {"lr", "reward", "global_valid_seqs", "global_valid_toks"}:
+            if k in {"lr", "wd", "reward", "global_valid_seqs", "global_valid_toks"}:
                 metrics[k] = np.mean(v).item()
             else:
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+        # track example with high token mult prob error above 1.05
+        if metrics["token_mult_prob_error"] > 1.05:
+            logger.log_plot_token_mult_prob_error(
+                {
+                    "prompt_lengths": repeated_batch["length"],
+                    "full_lengths": input_lengths,
+                    "generation_logprobs": train_data["generation_logprobs"],
+                    "prev_logprobs": train_data["prev_logprobs"],
+                    "token_mask": train_data["token_mask"],
+                    "sample_mask": train_data["sample_mask"],
+                },
+                step + 1,
+                name="train/token_mult_prob_error_plot_sample",
+            )
+
+        print("\n📊 Training Results:")
 
         print(f"  • Loss: {metrics['loss']:.4f}")
         print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
@@ -644,15 +839,27 @@ def validate(
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            val_batch, gen_metrics = run_multi_turn_rollout(
-                policy_generation,
-                val_batch,
-                tokenizer,
-                val_task_to_env,
-                max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                greedy=False,
-            )
+            # Use async rollouts if vLLM async engine is enabled
+            if _should_use_async_rollouts(master_config):
+                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
+            else:
+                val_batch, gen_metrics = run_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
             rewards = val_batch["total_reward"]
 
             total_rewards.extend(rewards.tolist())

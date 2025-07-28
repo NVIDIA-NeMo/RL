@@ -31,9 +31,12 @@ policy:
     sequence_parallel: true
     activation_checkpointing: false
     tensor_parallel_size: 2
+    context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
-    enabled: False
+    enabled: false
+  sequence_packing:
+    enabled: false
   make_sequence_length_divisible_by: 2
   max_grad_norm: 1
   optimizer:
@@ -57,6 +60,7 @@ logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
   wandb_enabled: true
   tensorboard_enabled: true
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl
