@@ -16,22 +16,8 @@ The sliding puzzle task serves as a simple yet effective benchmark to illustrate
 ## Quick Start Guide
 
 #### 1. Installation
-```bash
-# Clone the repository
-git clone https://github.com/NVIDIA-NeMo/RL.git
-cd RL
 
-# Initialize submodules
-git submodule update --init --recursive
-
-# Install uv package manager
-pip install uv
-
-# Create and activate a virtual environment
-uv venv
-```
-
-Refer to [this guide](https://docs.nvidia.com/nemo/rl/latest/index.html#prerequisites) for detailed instructions on installation.
+Refer to [this guide](https://github.com/NVIDIA-NeMo/RL/tree/main?tab=readme-ov-file#prerequisites) for detailed instructions on installation.
 
 #### 2. Training Run
 
