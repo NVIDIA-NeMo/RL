@@ -28,7 +28,6 @@ from nemo_rl.environments.code_environment import (
 from nemo_rl.experience.rollouts import run_multi_turn_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy.hf_policy import HfPolicy, PolicyConfig
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 
@@ -58,43 +57,15 @@ basic_vllm_test_config: VllmConfig = {
         "disable_log_stats": True,
         "disable_log_requests": True,
         "gpu_memory_utilization": 0.6,
+        "enforce_eager": "False",
     },
-}
-
-basic_hf_test_config: PolicyConfig = {
-    "model_name": MODEL_NAME,
-    "tokenizer_name": None,
-    "generation_batch_size": 1,
-    "generation": {
-        "backend": "hf",
-        "max_new_tokens": 100,
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "top_k": None,
-        "stop_token_ids": None,
-        "stop_strings": None,
-    },
-    # Required training parameters
-    "train_global_batch_size": 1,
-    "train_micro_batch_size": 1,
-    "learning_rate": 5e-6,
-    "logprob_batch_size": 1,
-    "max_new_tokens": 16,
-    "do_sample": False,
-    "precision": "float32",
-    "activation_checkpointing_enabled": False,
-    "fsdp_offload_enabled": False,
-    "optimizer": {
-        "name": "torch.optim.AdamW",
-        "kwargs": {
-            "lr": 5e-6,
-            "weight_decay": 0.01,
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
+    "colocated": {
+        "enabled": True,
+        "resources": {
+            "gpus_per_node": None,
+            "num_nodes": None,
         },
     },
-    "dtensor_cfg": {"enabled": False},
-    "dynamic_batching": {"enabled": False},
 }
 
 
@@ -237,78 +208,6 @@ def test_vllm_execute_code(cluster, tokenizer, code_env):
         greedy=True,
     )
     vllm_generation.finish_generation()
-
-    # Check results
-    for i, msg_log in enumerate(final_batch["message_log"]):
-        # Get the last message which should contain the result
-        last_msg = msg_log[-1]
-        assert last_msg["role"] == "environment"
-        assert last_msg["content"] == results[i], (
-            f"Expected {results[i]}, got {last_msg['content']}"
-        )
-
-
-def test_hf_execute_code(cluster, tokenizer, code_env):
-    """Test that Huggingface models can call the code executor."""
-    # Prepare test data
-    codes = [
-        "<code>x = 3; y = 4</code>\nThis is some regular text.\n<code>x + y</code>\n",
-        "<code>\ndef f(x):\n    return x * x\n\nf(2)\n</code>\n",
-    ]
-    results = ["<result>7</result>", "\n<result>\n4\n</result>"]
-
-    # Create message logs
-    message_logs = []
-    metadata_batch = []
-    temp_dirs = []
-    for code in codes:
-        # Tokenize the message content
-        prompt = code * 4
-        token_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)[
-            "input_ids"
-        ][0]
-        temp_dir = TemporaryDirectory()
-        message_logs.append(
-            [{"role": "user", "content": prompt, "token_ids": token_ids}]
-        )
-        metadata_batch.append(CodeEnvMetadata(context={}, working_dir=temp_dir.name))
-        temp_dirs.append(temp_dir)
-
-    # Create initial batch
-    initial_batch = BatchedDataDict(
-        {
-            "message_log": message_logs,
-            "extra_env_info": metadata_batch,
-            "task_name": ["code_execution"] * len(codes),
-            "stop_strings": [["</code>"]] * len(codes),
-        }
-    )
-
-    # Create HF policy
-    hf_config = basic_hf_test_config.copy()
-    hf_config["generation"] = configure_generation_config(
-        hf_config["generation"],
-        tokenizer,
-    )
-    hf_policy = HfPolicy(
-        cluster, hf_config, tokenizer, init_reference_model=False, init_optimizer=False
-    )
-
-    # Create code environment
-    task_to_env = {"code_execution": code_env}
-
-    # Run rollout
-    hf_policy.prepare_for_generation()
-    final_batch, _ = run_multi_turn_rollout(
-        policy_generation=hf_policy,
-        input_batch=initial_batch,
-        tokenizer=tokenizer,
-        task_to_env=task_to_env,
-        max_seq_len=256,
-        max_rollout_turns=2,
-        greedy=True,
-    )
-    hf_policy.finish_generation()
 
     # Check results
     for i, msg_log in enumerate(final_batch["message_log"]):

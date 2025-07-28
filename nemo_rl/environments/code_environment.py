@@ -48,7 +48,6 @@ class CodeEnvMetadata(TypedDict):
 
 @ray.remote
 class CodeExecutionWorker:
-    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
     """Helper class to process individual code execution steps."""
 
     def __init__(self):
@@ -188,7 +187,6 @@ class CodeExecutionWorker:
 
 @ray.remote
 class CodeEnvironment(EnvironmentInterface):
-    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
     """Code execution environment that maintains state between steps."""
 
     def __init__(self, cfg: CodeEnvConfig):
@@ -197,7 +195,7 @@ class CodeEnvironment(EnvironmentInterface):
         self.terminate_on_evaluation = cfg["terminate_on_evaluation"]
         self.workers = [
             CodeExecutionWorker.options(
-                runtime_env={"py_executable": CodeExecutionWorker.DEFAULT_PY_EXECUTABLE}
+                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
             ).remote()
             for _ in range(self.num_workers)
         ]
