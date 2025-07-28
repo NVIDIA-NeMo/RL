@@ -17,7 +17,7 @@ NeMo RL supports Nsight profiling for Ray workers through environment variable p
 Set the `NRL_NSYS_WORKER_PATTERNS` environment variable with a comma-separated list of patterns to match worker names:
 
 ```bash
-export NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*"
+export NRL_NSYS_WORKER_PATTERNS="*policy*,*other-worker*"
 ```
 
 Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its
@@ -40,7 +40,7 @@ export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 
 The supported worker types are:
 - **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
-- **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **MegatronPolicyWorker**: Pattern matched against `"megatron_policy_worker"`
 
 ## Example Usage
 
@@ -49,16 +49,10 @@ The supported worker types are:
 NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="*policy*" uv run examples/run_grpo_math.py grpo.max_num_steps=5
 ```
 
-### Profile Multiple Worker Types
-
-```bash
-NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv run examples/run_grpo_math.py grpo.max_num_steps=5
-```
-
 ### Profile Workers with Exact Names
 
 ```bash
-NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run examples/run_grpo_math.py grpo.max_num_steps=5
+NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker" uv run examples/run_grpo_math.py grpo.max_num_steps=5
 ```
 
 ### Profile Megatron Workers
@@ -69,7 +63,7 @@ To profile a Megatron worker, you should set `LD_LIBRARY_PATH` as follows, other
 
 ```bash
 LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/x86_64-linux-gnu" \
-NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker,vllm_generation_worker" uv run examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml grpo.max_num_steps=5
+NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker" uv run examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml grpo.max_num_steps=5
 ```
 
 ## Profile Output
@@ -84,7 +78,6 @@ When profiling is enabled, it generates the following logs and files:
 2. **Profile Files**: Each profiled worker generates a `.nsys-rep` file with naming pattern:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
-   vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    ```
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node.
