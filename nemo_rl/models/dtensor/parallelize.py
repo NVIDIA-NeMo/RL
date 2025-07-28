@@ -14,14 +14,19 @@
 
 from functools import lru_cache
 from types import FunctionType
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, cast
 
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    fully_shard,
+)
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -33,6 +38,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -86,7 +92,7 @@ class RotaryEmbedParallel(SequenceParallel):
 def _parallelize_gemma3(
     model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
     sequence_parallel: bool = False,
-):
+) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma3ForCausalLM model across data parallel dimensions.
 
     Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
@@ -98,7 +104,7 @@ def _parallelize_gemma3(
 
     # For gemma3 models, we don't include the model.embed_tokens and lm_head in the
     # parallelization plans because they have tied weights.
-    base_model_tp_plan = {
+    base_model_tp_plan: dict[str, ParallelStyle] = {
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
@@ -136,17 +142,17 @@ def _parallelize_gemma3(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(base_model_sp_plan)
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 def _parallelize_llama(
     model: LlamaForCausalLM,
     sequence_parallel: bool = False,
-):
+) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
-    base_model_tp_plan = {
+    base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
@@ -174,15 +180,15 @@ def _parallelize_llama(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(base_model_sp_plan)
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
     sequence_parallel: bool = False,
-):
+) -> dict[str, ParallelStyle]:
     """Parallelizes a Qwen2ForCausalLM model across data and tensor parallel dimensions."""
 
     class Qwen3QKNorm(SequenceParallel):
@@ -192,6 +198,7 @@ def _parallelize_qwen(
 
             if isinstance(input_tensor, DTensor):
                 assert input_tensor.placements == (Shard(dim=2),)
+                return input_tensor
             elif isinstance(input_tensor, torch.Tensor):
                 # assume the input passed in already sharded on the sequence dim and create the DTensor
                 return DTensor.from_local(
@@ -245,7 +252,7 @@ def _parallelize_qwen(
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
         }
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 PARALLIZE_FUNCTIONS: dict[
@@ -285,7 +292,7 @@ def translate_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
-def get_hf_tp_plan(model):
+def get_hf_tp_plan(model: PreTrainedModel):
     """Get the Hugging Face tensor parallel plan from the model.
 
     This function:
@@ -316,6 +323,9 @@ def get_hf_tp_plan(model):
 
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
+        assert isinstance(model_cls._tp_plan, dict), (
+            f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
+        )
         hf_tp_plan.update(model_cls._tp_plan)
 
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
@@ -468,9 +478,7 @@ def _parallelize_model(
     )
 
     offload_policy = (
-        CPUOffloadPolicy(pin_memory=False)
-        if cpu_offload
-        else torch.distributed.fsdp.OffloadPolicy
+        CPUOffloadPolicy(pin_memory=False) if cpu_offload else OffloadPolicy()
     )
 
     for layer in layers:
@@ -587,14 +595,14 @@ def get_grad_norm(
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=tp_group
         )
-        total_norm = total_norm_cuda[0].item()
+        total_norm = float(total_norm_cuda[0].item())
 
     else:
+        total_norm = torch.tensor(0.0, dtype=torch.float32, device="cuda")
         for grad in grads_for_norm:
             grad_norm = torch.norm(grad, norm_type)
-            total_norm += grad_norm**norm_type
+            total_norm += torch.pow(grad_norm, norm_type)
 
-        total_norm = total_norm.cuda()  # type: ignore
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
@@ -631,9 +639,10 @@ def get_logprobs_from_vocab_parallel_logits(
     """
     device_mesh = vocab_parallel_logits.device_mesh
     if seq_index is not None:
-        assert "cp" in device_mesh.mesh_dim_names, (
-            "seq_index must be provided for cp sharded logits"
-        )
+        assert (
+            device_mesh.mesh_dim_names is not None
+            and "cp" in device_mesh.mesh_dim_names
+        ), "seq_index must be provided for cp sharded logits"
 
     tp_size = 1
 

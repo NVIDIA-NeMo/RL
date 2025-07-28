@@ -63,7 +63,7 @@ class DistributedLogprob(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore[bad-override]  Always ignore torch.autograd.Function.forward's type since it's always more specific than the base class
         ctx: Any,
         vocab_parallel_logits: torch.Tensor,
         target: torch.Tensor,
@@ -170,7 +170,11 @@ def dtensor_from_parallel_logits_to_logprobs(
     """
     cp_size = 1
 
-    if isinstance(target, DTensor) and "cp" in target.device_mesh.mesh_dim_names:
+    if (
+        isinstance(target, DTensor)
+        and target.device_mesh.mesh_dim_names is not None
+        and "cp" in target.device_mesh.mesh_dim_names
+    ):
         cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
         cp_size = target.device_mesh.shape[cp_dim_index]
 

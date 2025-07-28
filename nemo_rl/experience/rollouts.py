@@ -655,7 +655,7 @@ async def run_sample_multi_turn_rollout(
         # Get environment feedback
         env_output = calculate_rewards(sample_batch, task_to_env)
         # Update total reward
-        total_reward += env_output.rewards[0].item()
+        total_reward += float(env_output.rewards[0].item())
         # Check termination
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
