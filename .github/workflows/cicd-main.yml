@@ -168,6 +168,8 @@ jobs:
         run: uv cache prune --ci
 
   sphinx-build:
+    needs: [pre-flight]
+    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.48.0
 
   build-container:
