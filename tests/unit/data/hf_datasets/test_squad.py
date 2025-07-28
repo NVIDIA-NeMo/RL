@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 from nemo_rl.data.hf_datasets.squad import SquadDataset
 
 
+@pytest.mark.hf_gated
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_squad_dataset():
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")

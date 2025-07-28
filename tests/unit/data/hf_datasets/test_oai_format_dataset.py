@@ -87,6 +87,7 @@ def test_custom_keys(sample_data):
     assert dataset.system_prompt == "You are a helpful assistant."
 
 
+@pytest.mark.hf_gated
 @pytest.mark.parametrize("sample_data", [("messages", "system_key")], indirect=True)
 def test_message_formatting(sample_data):
     train_path, val_path = sample_data
