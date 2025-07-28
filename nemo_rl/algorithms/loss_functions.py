@@ -37,6 +37,10 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     token_level_loss: bool
+    # If True, apply the off-policy importance-sampling correction at the
+    # sequence level (one weight per generated sample).  If False (default)
+    # correction is applied at the token level as in the original GRPO paper.
+    sequence_level_importance_sampling: bool
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -101,6 +105,11 @@ class ClippedPGLossFn(LossFunction):
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
         ]
+        # Whether to compute importance weights per-sequence instead of per-token.
+        self.sequence_level_importance_sampling = cfg.get(
+            "sequence_level_importance_sampling",
+            False,
+        )
 
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
@@ -229,13 +238,27 @@ class ClippedPGLossFn(LossFunction):
                 advantages < 0, torch.min(clip_loss, loss3), clip_loss
             )
 
-        # See: docs/guides/grpo.md#importance-sampling-correction
-        actor_importance_weights = torch.exp(prev_logprobs - generation_logprobs)
-        actor_importance_weights = torch.nan_to_num(
-            actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        # -------------------------------------------------------------
+        # Off-policy (actor) importance-sampling correction
+        # -------------------------------------------------------------
+        if self.sequence_level_importance_sampling:
+            # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
+            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            actor_importance_weights = torch.exp(seq_lp_diff).detach()
+            actor_importance_weights = torch.nan_to_num(
+                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            # Broadcast to token dimension so we can reuse existing reduction
+            actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
+        else:
+            # Token-level correction (original GRPO implementation)
+            actor_importance_weights_expanded = torch.exp(prev_logprobs - generation_logprobs)
+            actor_importance_weights_expanded = torch.nan_to_num(
+                actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
+            )
+
         if self.use_importance_sampling_correction:
-            importance_weights_to_use = actor_importance_weights
+            importance_weights_to_use = actor_importance_weights_expanded
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
@@ -256,12 +279,19 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_seqs,
             )
 
-        # See: docs/guides/grpo.md#sampling-importance-ratio
-        sample_importance_ratio = masked_mean(
-            actor_importance_weights,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        )
+        # Metric: sampling importance ratio (mean over samples)
+        if self.sequence_level_importance_sampling:
+            sample_importance_ratio = masked_mean(
+                actor_importance_weights,
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+        else:
+            sample_importance_ratio = masked_mean(
+                actor_importance_weights_expanded,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
 
         # Approximating entropy as E_{s ~ \pi_{gen}(s)}[-(\pi_{curr}/\pi_{gen})log(\pi_{curr}(s))]
         # See more details and other metrics in docs/guides/grpo.md#metrics
