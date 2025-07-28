@@ -37,18 +37,18 @@ If you are using VSCode/Cursor you can also use Dev Containers. Here's a devcont
   // NOTE: Here is an example of how you can set up some common mounts, environment variables, and set up your shell.
   //       Feel free to adapt to your development workflow and remember to replace the user `terryk` with your username.
 
-	//"mounts": [
-	//	{"source": "/home/terryk", "target": "/home/terryk", "type": "bind"},
-	//	{"source": "/home/terryk/.ssh", "target": "/root/terryk-ssh", "type": "bind"}
-	//],
-	//"containerEnv": {
-	//	"HF_TOKEN_PATH": "/home/terryk/.cache/huggingface/token",
-	//	"HF_HOME": "/home/terryk/.cache/huggingface",
-	//	"HF_DATASETS_CACHE": "/home/terryk/.cache/huggingface/datasets",
-	//	"WANDB_API_KEY": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-	//},
+  //"mounts": [
+  //	{"source": "/home/terryk", "target": "/home/terryk", "type": "bind"},
+  //	{"source": "/home/terryk/.ssh", "target": "/root/terryk-ssh", "type": "bind"}
+  //],
+  //"containerEnv": {
+  //	"HF_TOKEN_PATH": "/home/terryk/.cache/huggingface/token",
+  //	"HF_HOME": "/home/terryk/.cache/huggingface",
+  //	"HF_DATASETS_CACHE": "/home/terryk/.cache/huggingface/datasets",
+  //	"WANDB_API_KEY": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+  //},
   // // This (1) marks all directories safe (2) copies in ssh keys (3) sources user's bashrc file
-	//"postStartCommand": "git config --global --add safe.directory '*' && cp -r /root/terryk-ssh/* /root/.ssh/ && source /home/terryk/.bashrc"
+  //"postStartCommand": "git config --global --add safe.directory '*' && cp -r /root/terryk-ssh/* /root/.ssh/ && source /home/terryk/.bashrc"
 }
 ```
 
