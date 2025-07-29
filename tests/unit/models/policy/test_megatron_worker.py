@@ -393,12 +393,16 @@ def test_megatron_policy_training(training_setup):
             "training backend should report num_ranks"
         )
         assert results["num_ranks"] > 0, "num_ranks should be positive"
-        assert "theoretical_tflops" in results and isinstance(
-            results["theoretical_tflops"], (int, float)
-        ), "training backend should report theoretical_tflops"
-        assert results["theoretical_tflops"] > 0, (
-            "theoretical_tflops should be positive"
-        )
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert "theoretical_tflops" in results and isinstance(
+                results["theoretical_tflops"], (int, float)
+            ), "training backend should report theoretical_tflops"
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
 
 
 @pytest.fixture
