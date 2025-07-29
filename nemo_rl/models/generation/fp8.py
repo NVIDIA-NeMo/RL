@@ -6,6 +6,8 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from unittest.mock import patch
 
+from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.utils import CoreEngineProcManager
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -21,6 +23,7 @@ class FP8Config:
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
+    model_parallel_size: int = None
 
 
 @dataclass()
@@ -40,16 +43,57 @@ fp8_state: FP8State = FP8State()
 
 fp8_patches_applied = False
 
+original_run_engine_core = EngineCoreProc.run_engine_core
+original_init = CoreEngineProcManager.__init__
 
-from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+
+def my_init(*args, **kwargs):
+    kwargs["vllm_config"].nrl_fp8_cfg = global_fp8_config
+    return original_init(*args, **kwargs)
+
+
+def my_run_engine_core(*args, **kwargs):
+    fp8_cfg = kwargs["vllm_config"].nrl_fp8_cfg
+    del kwargs["vllm_config"].nrl_fp8_cfg
+    monkey_patch_vllm_ray_executor(fp8_cfg)
+    return original_run_engine_core(*args, **kwargs)
+
+
+def monkey_patch_vllm_ray_executor(fp8_config):
+    if fp8_config.model_parallel_size > 1:
+        # we patch vllm's _run_workers so that before vllm initalizes the model on each rank, we execute
+        # a ray remote that patches each worker with the required fp8 vllm patches
+        from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
+
+        original_run_workers = RayDistributedExecutor._run_workers
+
+        def patched_run_workers(self, *args, **kwargs):
+            global fp8_patches_applied
+            if not fp8_patches_applied:
+                futures = [
+                    worker.execute_method.remote(apply_fp8_patches, fp8_config)
+                    for worker in self.workers
+                ]
+                [ray.get(future) for future in futures]
+                fp8_patches_applied = True
+
+            return original_run_workers(self, *args, **kwargs)
+
+        RayDistributedExecutor._run_workers = patched_run_workers
+    else:
+        # for single gpu there is no ray, so just call the patches
+        apply_fp8_patches(None, fp8_config)
+
+        global fp8_patches_applied
+        fp8_patches_applied = True
 
 
 def apply_fp8_patches(self, fp8_config):
+    print(f"APPLYING FP8 PATCHES {fp8_config}")
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
 
-    if global_fp8_config is None:
-        global_fp8_config = fp8_config
+    global_fp8_config = fp8_config
 
     # This patch is used to support torch.compile with vllm parameter subclasses, such as
     # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
@@ -75,23 +119,9 @@ def apply_fp8_patches(self, fp8_config):
 
     fp8_patches_applied = True
 
-original_run_workers = RayDistributedExecutor._run_workers
-
-def patched_run_workers(self, *args, **kwargs):
-    global fp8_patches_applied
-    if not fp8_patches_applied:
-        apply_fp8_patches(self, global_fp8_config)
-        futures = [
-            worker.execute_method.remote(apply_fp8_patches, global_fp8_config)
-            for worker in self.workers
-        ]
-        [ray.get(future) for future in futures]
-
-    return original_run_workers(self, *args, **kwargs)
-
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    global global_fp8_config, fp8_patches_applied
+    global global_fp8_config
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale=vllm_cfg.get(
@@ -99,18 +129,20 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         ),
         num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
+        model_parallel_size=model_parallel_size,
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
 
-    if model_parallel_size > 1:
-        # we patch vllm's _run_workers so that before vllm initalizes the model on each rank, we execute 
-        # a remote call that patches each worker with the required fp8 vllm patches
-        RayDistributedExecutor._run_workers = patched_run_workers
+    if vllm_cfg["async_engine"]:
+        # for async engine, vllm spawns a process for each DP, so we patch
+        # vllm so that upon spawning the thread it applies our FP8 patches
+        EngineCoreProc.run_engine_core = my_run_engine_core
+        CoreEngineProcManager.__init__ = my_init
     else:
-        apply_fp8_patches(None, global_fp8_config)
-        fp8_patches_applied = True
+        # if not async, just directly monkey patch the ray executor
+        monkey_patch_vllm_ray_executor(global_fp8_config)
 
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
@@ -301,6 +333,7 @@ def kitchen_block_scale(
     # Calculate descale factor
     descale = max_abs / max_dtype
 
+    global global_fp8_config
     if global_fp8_config.use_weight_pow2_scale:
         exponent = torch.ceil(torch.log2(descale))
         # Post process exponent to be in range of -127 to 127 and to be E8M0 biased
