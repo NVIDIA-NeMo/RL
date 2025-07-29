@@ -126,9 +126,9 @@ fi
 
 # The venv is symlinked to avoid bloating the layer size
 uv sync --link-mode symlink --locked --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --link-mode symlink --locked --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --link-mode symlink --locked --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
@@ -156,7 +156,4 @@ COPY . /opt/nemo-rl
 RUN <<"EOF" bash -exu
 echo "Installing nemo-rl"
 UV_NO_SYNC=0 UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
-
-echo "Pretch worker venvs"
-UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 EOF
