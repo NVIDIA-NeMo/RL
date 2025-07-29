@@ -46,7 +46,7 @@ class CodeEnvMetadata(TypedDict):
     working_dir: str  # Working directory for file operations
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class CodeExecutionWorker:
     """Helper class to process individual code execution steps."""
 
@@ -185,7 +185,7 @@ class CodeExecutionWorker:
         return builtins.__import__(name, *args, **kwargs)
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class CodeEnvironment(EnvironmentInterface):
     """Code execution environment that maintains state between steps."""
 

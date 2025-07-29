@@ -131,7 +131,7 @@ class BM25Retriever:
         return results
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class RAGEnvironment(EnvironmentInterface):
     """RAG environment that uses BM25 for document retrieval."""
 

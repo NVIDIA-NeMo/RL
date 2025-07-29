@@ -152,6 +152,7 @@ def test_untrusted_code(code_env):
     assert responses == results, f"Got wrong output {responses}"
 
 
+@pytest.mark.hf_gated
 def test_vllm_execute_code(cluster, tokenizer, code_env):
     """Test that vLLM can call the code executor."""
     # Prepare test data

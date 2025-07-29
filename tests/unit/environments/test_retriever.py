@@ -113,6 +113,7 @@ def cluster():
             cluster_instance.shutdown()
 
 
+@pytest.mark.hf_gated
 def test_vllm_retrieve(cluster, tokenizer, rag_env):
     """Test that vLLM can use the RAG environment for document retrieval."""
     # Prepare test data
