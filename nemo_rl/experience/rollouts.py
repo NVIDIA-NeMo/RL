@@ -421,8 +421,9 @@ def run_multi_turn_rollout(
                     formatted_obs, return_tensors="pt", add_special_tokens=False
                 ).input_ids[0]
             else:
+                formatted_obs = env_obs_content.strip()
                 tokenized_obs = tokenizer(
-                    env_obs_content, return_tensors="pt", add_special_tokens=False
+                    formatted_obs, return_tensors="pt", add_special_tokens=False
                 ).input_ids[0]
             # check if new message overflows max_seq_len
             if (
@@ -684,8 +685,9 @@ async def run_sample_multi_turn_rollout(
                 formatted_obs, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
         else:
+            formatted_obs = env_obs_content.strip()
             tokenized_obs = tokenizer(
-                env_obs_content, return_tensors="pt", add_special_tokens=False
+                formatted_obs, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
 
         # Check for sequence length overflow
