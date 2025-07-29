@@ -43,11 +43,10 @@ fp8_patches_applied = False
 
 from vllm.executor.ray_distributed_executor import RayDistributedExecutor
 
-original_run_workers = RayDistributedExecutor._run_workers
-
 
 def apply_fp8_patches(self, fp8_config):
     global global_fp8_config, fp8_patches_applied
+    assert not fp8_patches_applied
 
     if global_fp8_config is None:
         global_fp8_config = fp8_config
@@ -76,6 +75,7 @@ def apply_fp8_patches(self, fp8_config):
 
     fp8_patches_applied = True
 
+original_run_workers = RayDistributedExecutor._run_workers
 
 def patched_run_workers(self, *args, **kwargs):
     global fp8_patches_applied
@@ -90,13 +90,8 @@ def patched_run_workers(self, *args, **kwargs):
     return original_run_workers(self, *args, **kwargs)
 
 
-# we patch vllm's _run_workers so that before vllm initalizes the model, we execute a remote call that patches
-# each worker with the required fp8 vllm patches
-RayDistributedExecutor._run_workers = patched_run_workers
-
-
-def init_fp8(vllm_cfg, model_name):
-    global global_fp8_config
+def init_fp8(vllm_cfg, model_name, model_parallel_size):
+    global global_fp8_config, fp8_patches_applied
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale=vllm_cfg.get(
@@ -109,11 +104,19 @@ def init_fp8(vllm_cfg, model_name):
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
 
+    if model_parallel_size > 1:
+        # we patch vllm's _run_workers so that before vllm initalizes the model on each rank, we execute 
+        # a remote call that patches each worker with the required fp8 vllm patches
+        RayDistributedExecutor._run_workers = patched_run_workers
+    else:
+        apply_fp8_patches(None, global_fp8_config)
+        fp8_patches_applied = True
+
+    # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
-    # create fp8 kwargs for vllm's LLM(...)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         try:
             config = AutoConfig.from_pretrained(model_name)
