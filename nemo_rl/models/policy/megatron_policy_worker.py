@@ -369,6 +369,13 @@ class MegatronPolicyWorker:
         }
         self.dtype = dtype_map[self.cfg["precision"]]
 
+        # Reward models are not yet supported with Megatron.
+        if self.cfg.get("reward_model_cfg", {}).get("enabled", False):
+            raise NotImplementedError(
+                "Reward models are not yet supported with the Megatron backend, this issue is "
+                "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
+            )
+
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
 

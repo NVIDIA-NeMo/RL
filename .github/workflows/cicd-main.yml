@@ -155,33 +155,9 @@ jobs:
         run: uv cache prune --ci
 
   sphinx-build:
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    name: Sphinx build
     needs: [pre-flight]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.7.2"
-          enable-cache: true
-          prune-cache: false
-      # Faster than uv python install since it caches python alongside runner
-      - name: "Set up Python"
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: ".python-version"
-      - name: build docs
-        run: |
-          uv venv
-          cd docs/
-          uv run --group docs sphinx-build --fail-on-warning --builder html . _build/html
-      - name: Minimize uv cache
-        run: uv cache prune --ci
+    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.48.0
 
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
@@ -229,6 +205,7 @@ jobs:
           time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
           time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
           time uv run --no-sync bash ./tests/functional/dpo.sh
+          time uv run --no-sync bash ./tests/functional/rm.sh
           time uv run --no-sync bash ./tests/functional/eval.sh
           time uv run --no-sync bash ./tests/functional/eval_async.sh
           time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh

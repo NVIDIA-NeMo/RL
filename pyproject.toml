@@ -25,7 +25,9 @@ dependencies = [
     "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
-    "transformers>=4.51.0",
+    # vllm<0.10.0 and transformers>=4.54.0 has a conflict
+    # Remove this once we upgrade vllm to >=0.10.0
+    "transformers>=4.51.0,<4.54.0",
     "wandb",
     "numpy",
     "datasets>=4.0.0",
