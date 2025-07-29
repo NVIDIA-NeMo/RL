@@ -33,6 +33,7 @@ datasets/
 docker/*
 !docker/Dockerfile
 !docker/README.md
+!docker/no-install-pytorch-deps.txt
 wandb/
 checkpoints/
 results/
