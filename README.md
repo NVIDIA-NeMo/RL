@@ -135,6 +135,7 @@ bash tools/build-flash-attn-in-uv-cache.sh
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
 - On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your `uv`'s cache dir making subsequent installs much quicker.
+- If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 ## Training Backends
@@ -413,7 +414,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   git submodule update --init --recursive
   ```
 
-  and then force a rebuild of the virutal environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
+  and then force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
 
   ```sh
   NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
