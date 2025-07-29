@@ -5,6 +5,6 @@
 	shallow = true
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
-	url = https://github.com/terrykong/Megatron-LM.git
-	branch = sahilj/megatron-external-loss-norm
+	url = https://github.com/chtruong814/Megatron-LM.git
+	branch = chtruong/sahil-rl
 	shallow = true
