@@ -36,7 +36,7 @@ logger:
 
 policy:
   train_global_batch_size: 512
-  logprob_batch_sitokleze: 1
+  logprob_batch_size: 1
   model_name: google/gemma-3-4b-it
   dynamic_batching:
     enabled: True
