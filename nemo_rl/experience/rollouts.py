@@ -410,6 +410,8 @@ def run_multi_turn_rollout(
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
+            # tokenizer returns torch.float32 when env_obs_content is empty
+            tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
             # check if new message overflows max_seq_len
             if (
