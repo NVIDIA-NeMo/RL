@@ -326,7 +326,9 @@ class VllmGenerationWorker:
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.fp8 import init_fp8
 
-            fp8_kwargs = init_fp8(self.cfg["vllm_cfg"], self.model_name, model_parallel_size)
+            fp8_kwargs = init_fp8(
+                self.cfg["vllm_cfg"], self.model_name, model_parallel_size
+            )
             vllm_kwargs.update(fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
@@ -364,6 +366,14 @@ class VllmGenerationWorker:
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+
+        # from nemo_rl.models.generation.fp8 import global_fp8_config
+        # self.llm.collective_rpc(
+        #     "init_fp8",
+        #     args=(
+        #         global_fp8_config,
+        #     ),
+        # )
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
