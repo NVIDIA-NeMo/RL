@@ -2554,7 +2554,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchdata" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.3.0" },
-    { name = "transformers", specifier = ">=4.51.0" },
+    { name = "transformers", specifier = ">=4.51.0,<4.54.0" },
     { name = "triton", index = "https://download.pytorch.org/whl/cu128" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.9.0" },
     { name = "wandb" },
