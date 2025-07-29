@@ -35,7 +35,9 @@ ARG UV_VERSION=0.7.2
 ARG PYTHON_VERSION=3.12
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    uv python install ${PYTHON_VERSION}
+    if echo "$BASE_IMAGE" | grep -q "cuda-dl"; then \
+        uv python install ${PYTHON_VERSION}; \
+    fi
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -80,21 +82,16 @@ ENV UV_LINK_MODE=copy
 
 # Define the no-install-package arguments for PyTorch base images
 ARG BASE_IMAGE
-ENV UV_NO_INSTALL_PACKAGES=""
-RUN if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
-        echo "Setting up no-install-package arguments for PyTorch base image" && \
-        echo 'UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas-cu12 --no-install-package nvidia-cuda-cupti-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 --no-install-package nvidia-cuda-runtime-cu12 --no-install-package nvidia-cudnn-cu12 --no-install-package nvidia-cufft-cu12 --no-install-package nvidia-cufile-cu12 --no-install-package nvidia-curand-cu12 --no-install-package nvidia-cusolver-cu12 --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-nccl-cu12 --no-install-package vllm --no-install-package flash-attn --no-install-package transformer-engine --no-install-package transformer-engine-cu12 --no-install-package transformer-engine-torch"' > /tmp/uv_args.env; \
-    else \
-        echo "No PyTorch base image detected, not setting no-install-package arguments" && \
-        echo 'UV_NO_INSTALL_PACKAGES=""' > /tmp/uv_args.env; \
-    fi
+ARG UV_NO_INSTALL_PACKAGES
+ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
+ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 
 # This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
 # This layer has to be manually updated
 RUN <<"EOF" bash -exu
 if echo "$BASE_IMAGE" | grep -q "pytorch"; then
     echo "Creating venv with system-site-packages for PyTorch base image"
-    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+    uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 else
     echo "Creating venv without system-site-packages"
     uv venv ${UV_PROJECT_ENVIRONMENT}
@@ -134,7 +131,6 @@ uv sync --link-mode symlink --locked --extra mcore --no-install-project $UV_NO_I
 uv sync --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
-ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 WORKDIR /opt/nemo-rl
@@ -144,6 +140,9 @@ FROM hermetic AS release
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
+ARG UV_NO_INSTALL_PACKAGES
+ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
+ENV UV_NO_SYNC=1
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
@@ -154,5 +153,10 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Copy in source and prefetch all virtual environments
 COPY . /opt/nemo-rl
-RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+RUN <<"EOF" bash -exu
+echo "Installing nemo-rl"
+UV_NO_SYNC=0 UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
 
+echo "Pretch worker venvs"
+UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+EOF

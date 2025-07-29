@@ -78,11 +78,19 @@ def create_local_venv(
     logger.info(f"Creating new venv at {venv_path}")
 
     # Create the virtual environment
-    uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
+    excluded_packages = os.environ.get("UV_NO_INSTALL_PACKAGES", "")
+    excluded_packages = [package_arg for package_arg in excluded_packages.split(" ") if package_arg]
+    print(f"Excluded packages: {excluded_packages}")
+    if len(excluded_packages) > 0:
+        uv_venv_cmd = ["uv", "venv", "--allow-existing", "--system-site-packages", venv_path]
+    else:
+        uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
+
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
     env = os.environ.copy()
+    env["UV_NO_SYNC"] = "0"
     # NOTE: UV_PROJECT_ENVIRONMENT is appropriate here only b/c there should only be
     #  one call to this in the driver. It is not safe to use this in a multi-process
     #  context.
@@ -95,7 +103,9 @@ def create_local_venv(
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync"], env=env, check=True)
+    subprocess.run(["uv", "sync"] + excluded_packages, env=env, check=True)
+
+    env["UV_NO_SYNC"] = "1"
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
