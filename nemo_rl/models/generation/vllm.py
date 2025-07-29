@@ -431,6 +431,68 @@ class VllmGenerationWorker:
             stop=stop_strings,
             include_stop_str_in_output=True,
         )
+    
+    def _format_prompt_for_vllm_generation(self, data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None) -> list[dict[str, Any]]:
+        """
+        Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method)
+
+        See https://docs.vllm.ai/en/v0.9.1/features/multimodal_inputs.html for prompt format for multimodal inputs.
+        """
+        # Prepare prompts for vLLM (removing padding)
+        prompts = []
+
+        input_ids = data['input_ids']
+        batch_size = input_ids.shape[0]
+        input_lengths = data['input_lengths']
+
+        # if sample_idx is None, return list of all prompts for the entire batch  
+        # else, return the prompt for the single sample specified by sample_idx
+        return_all = sample_idx is None
+        if sample_idx is None:
+            start_idx = 0
+            end_idx = batch_size
+        else:
+            start_idx = sample_idx
+            end_idx = sample_idx + 1
+        
+        def _get_regular_prompt(index: int):
+            valid_length = input_lengths[index].item()
+            valid_ids = (
+                input_ids[index, :valid_length] if valid_length > 0 else input_ids[index, :0]
+            )
+            token_ids = valid_ids.tolist()
+            return {"prompt_token_ids": token_ids}
+        
+        # Check if this is VLM generation by looking for message_log with images
+        # Support for videos/audio/etc. can be added here
+        # if 'message_log' in data and any('images' in msg for msg in data['message_log']):
+        if 'vllm_content' in data:
+            # VLM generation using content and multi_modal_data
+            for i in range(start_idx, end_idx):
+                msg = data['vllm_content'][i]
+                # if msg is None, this conversation had no multimodal content, fallback to regular prompt
+                if msg is None:
+                    prompts.append(_get_regular_prompt(i))
+                    continue
+                # init prompt dict
+                prompt_dict = {
+                    'prompt': msg
+                }
+                # add additional data if present
+                images = data.get('vllm_images', None)
+                if images is not None:
+                    prompt_dict['multi_modal_data'] = {
+                        'image': images[i][0] if len(images[i]) == 1 else images[i]
+                    }
+                prompts.append(prompt_dict)
+        else:
+            # Regular LLM generation using token_ids
+            for i in range(start_idx, end_idx):
+                # Use input_lengths to get only valid tokens (not padding)
+                prompts.append(_get_regular_prompt(i))
+
+        return prompts if return_all else prompts[0]
+
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -471,24 +533,11 @@ class VllmGenerationWorker:
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
-
-        # Convert inputs to vLLM format
-        batch_size = input_ids.shape[0]
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Prepare prompts for vLLM (removing padding)
-        prompts = []
-
-        for i in range(batch_size):
-            # Use input_lengths to get only valid tokens (not padding)
-            valid_length = input_lengths[i].item()
-            valid_ids = (
-                input_ids[i, :valid_length] if valid_length > 0 else input_ids[i, :0]
-            )
-            token_ids = valid_ids.tolist()
-
-            prompts.append({"prompt_token_ids": token_ids})
+        # Convert inputs to vLLM format
+        prompts = self._format_prompt_for_vllm_generation(data)
 
         # Generate outputs
         assert self.llm is not None, (
@@ -612,13 +661,10 @@ class VllmGenerationWorker:
         # Create tasks for each sample in the batch
         async def process_single_sample(sample_idx):
             """Process a single sample and return the result."""
+
             current_input_actual_length = input_lengths_batch[sample_idx].item()
-            prompt_token_ids_list = (
-                input_ids_batch[sample_idx, :current_input_actual_length].tolist()
-                if current_input_actual_length > 0
-                else []
-            )
-            prompt = {"prompt_token_ids": prompt_token_ids_list}
+
+            prompt = self._format_prompt_for_vllm_generation(data, sample_idx)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(

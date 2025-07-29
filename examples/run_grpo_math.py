@@ -157,6 +157,7 @@ def setup_data(
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
     ).remote(env_configs["math"])
+
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,

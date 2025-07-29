@@ -20,6 +20,7 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -70,7 +71,6 @@ from nemo_rl.utils.timer import Timer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
 
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
@@ -126,6 +126,7 @@ def setup(
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -332,6 +333,7 @@ def setup(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
@@ -475,6 +477,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -492,6 +495,7 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    is_vlm = processor is not None
 
     # Run validation at the start if configured
     if val_at_start and step == 0:
@@ -535,7 +539,9 @@ def grpo_train(
                 # Convert LLMMessageLogType to FlatMessagesType for generation
                 batched_flat, input_lengths = batched_message_log_to_flat_message(
                     repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    pad_value_dict={
+                        "token_ids": tokenizer.pad_token_id
+                    },
                 )
                 input_ids = batched_flat["token_ids"]
 
@@ -552,6 +558,7 @@ def grpo_train(
 
             with timer.time("generation"):
                 # Use async rollouts if vLLM async engine is enabled
+
                 if _should_use_async_rollouts(master_config):
                     (
                         repeated_batch,
@@ -645,6 +652,8 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+                # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")

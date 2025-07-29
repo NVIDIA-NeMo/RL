@@ -14,12 +14,34 @@
 
 import importlib
 import os
-from typing import Any
+import re
+from typing import Any, Optional
+from accelerate import init_empty_weights
+from collections import defaultdict
 
 import torch
-from transformers import AutoConfig
-
+from torch import nn
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForTextToWaveform
+
+# an automodel factory for loading the huggingface models from correct class
+AUTOMODEL_FACTORY = defaultdict(lambda: AutoModelForCausalLM)
+AUTOMODEL_FACTORY["qwen2.5-vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2-vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2.5-omni"] = AutoModelForTextToWaveform
+AUTOMODEL_FACTORY["llava"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["internvl3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["gemma-3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["smolvlm2"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["mistral-small-3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["llama-4"] = AutoModelForImageTextToText
+
+def resolve_model_class(model_name: str) -> nn.Module:
+    for model_substr in AUTOMODEL_FACTORY.keys():
+        if model_substr in model_name.lower():
+            return AUTOMODEL_FACTORY[model_substr]
+    return AutoModelForCausalLM
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -138,6 +160,72 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         )
 
     return overwrite_dict
+
+def freeze_hf_model_towers(model: nn.Module, freeze_language_model: bool = False, freeze_vision_model: bool = False):
+    # TODO: needs to be updated for different model architectures
+    if freeze_language_model:
+        language_tower_names = ["language_model", "lm_head"]
+        for name, param in model.named_parameters():
+            if any([name.startswith(x) or name.startswith("model." + x) for x in language_tower_names]):
+                param.requires_grad = False
+                print(f"Freezing {name} as part of language model")
+
+    if freeze_vision_model:
+        visual_tower_names = ["vision_model", "vision_tower", "visual", "projection_layer", "multi_modal_projector"]
+        for name, param in model.named_parameters():
+            if any([name.startswith(x) or name.startswith("model." + x) for x in visual_tower_names]):
+                param.requires_grad = False
+                print(f"Freezing {name} as part of vision model")
+
+
+def freeze_hf_model_by_regex(model: nn.Module, regex: Optional[str] = None):
+    if regex is None:
+        return
+    for name, param in model.named_parameters():
+        if re.match(regex, name):
+            param.requires_grad = False
+
+
+def load_hf_model(model_name: str, policy_worker) -> nn.Module:
+    """Load a Hugging Face model with optional sliding window support."""
+
+    AutoModelClass = resolve_model_class(model_name)
+    print(f"Loading model {model_name} with class {AutoModelClass.__name__}")
+
+    model_config = AutoConfig.from_pretrained(
+        model_name,
+        # Always load the model in float32 to keep master weights in float32.
+        # Keeping the master weights in lower precision has shown to cause issues with convergence.
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+        **sliding_window_overwrite(
+            model_name
+        ),  # due to https://github.com/huggingface/transformers/issues/38002
+    )
+
+    full_state_dict = None
+    if policy_worker.rank == 0:
+        print(f"[Rank {policy_worker.rank}] Loading model {model_name} on CPU...")
+        model = AutoModelClass.from_pretrained(
+            model_name,
+            device_map="cpu",  # load weights onto CPU initially
+            trust_remote_code=True,
+            config=model_config,
+        )
+        full_state_dict = model.state_dict()
+        del model
+
+    print(f"[Rank {policy_worker.rank}] Initializing empty model for FSDP...")
+    # All ranks initialize model on meta device, so FSDP can shard it.
+    # The actual weights will be broadcast from rank 0.
+
+    # not all models support `from_config`, so use AutoModel instead
+    with init_empty_weights():
+        model = AutoModelClass.from_config(
+            model_config,
+        )
+
+    return model, full_state_dict
 
 
 def configure_expandable_segments() -> None:

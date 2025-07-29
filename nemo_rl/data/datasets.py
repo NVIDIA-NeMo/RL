@@ -15,7 +15,7 @@ from typing import Any, Optional, Union
 
 import torch
 from datasets import Dataset
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase, AutoProcessor
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -29,7 +29,7 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-TokenizerType = PreTrainedTokenizerBase
+TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
 
 
 # TODO @sahilj handle too-long prompts and masking them out throughout the whole process and renormalizing on loss
@@ -75,6 +75,7 @@ class AllTaskProcessedDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
+    # TODO @rohitkumarj: not used anywhere
     def encode_single(
         self, text: Union[str, list[str]]
     ) -> tuple[list[int] | torch.Tensor, int]:
@@ -98,7 +99,7 @@ class AllTaskProcessedDataset:
         entry = self.dataset[idx]
 
         if isinstance(self.task_data_processors, dict):
-            task_name = entry["task_name"]
+            task_name = entry["task_name"]   
 
             assert task_name in self.task_data_processors, (
                 f"task processor not provided for {task_name}. Provided processors: {self.task_data_processors.keys()}"
@@ -133,6 +134,16 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
+    # check if any of the data batch has vllm content and images
+    extra_args = {}
+    if any([datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch]):
+        vllm_content = [datum_spec.get("vllm_content", None) for datum_spec in data_batch]
+        vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
+        vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
+        extra_args["vllm_content"] = vllm_content
+        extra_args["vllm_images"] = vllm_images
+        extra_args["vllm_videos"] = vllm_videos
+
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,
@@ -142,7 +153,9 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
+        **extra_args,
     )
+
     return output
 
 

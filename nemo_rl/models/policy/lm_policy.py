@@ -17,8 +17,8 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import ray
+from transformers import PreTrainedTokenizerBase, AutoProcessor
 from ray.util.queue import Queue as RayQueue
-from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
@@ -57,6 +57,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
+        processor: Optional[AutoProcessor] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -111,6 +112,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_builder_cls,
             config,
             tokenizer=tokenizer,
+            processor=processor,
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,

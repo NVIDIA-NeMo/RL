@@ -33,11 +33,11 @@ def _patch_gemma3_mm():
     """
     from packaging.version import Version as PkgVersion
 
-    assert PkgVersion(vllm.__version__) < PkgVersion("0.9.2"), (
-        f"You are using vllm version {vllm.__version__}. "
+    if PkgVersion(vllm.__version__) < PkgVersion("0.9.2"):
+        print (f"You are using vllm version {vllm.__version__}. "
         "Please remove this patch (_patch_gemma3_mm in nemo_rl/models/generation/vllm_backend.py) "
-        "since it is included in vllm>=0.9.2."
-    )
+        "since it is included in vllm>=0.9.2.")
+        return
 
     from vllm.logger import init_logger
     from vllm.model_executor.models import gemma3_mm

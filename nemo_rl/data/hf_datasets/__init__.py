@@ -22,6 +22,7 @@ from nemo_rl.data.hf_datasets.prompt_response_dataset import (
     PromptResponseDataset,
 )
 from nemo_rl.data.hf_datasets.squad import SquadDataset
+from nemo_rl.data.hf_datasets.clevr import CLEVRCoGenTDataset
 
 __all__ = [
     "DPODataset",
@@ -32,4 +33,5 @@ __all__ = [
     "PromptResponseDataset",
     "SquadDataset",
     "COMMON_CHAT_TEMPLATES",
+    "CLEVRCoGenTDataset",
 ]

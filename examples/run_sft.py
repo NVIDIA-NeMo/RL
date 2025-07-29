@@ -16,10 +16,10 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any
+from typing import Any, Optional, Callable
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -59,8 +59,14 @@ def sft_preprocessor(
     add_bos: bool = True,
     add_eos: bool = True,
     add_generation_prompt: bool = False,
+    datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
+
+    # optional preprocessor  
+    if datum_preprocessor is not None:
+        datum_dict = datum_preprocessor(datum_dict)
+
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,
@@ -94,6 +100,8 @@ def sft_preprocessor(
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
+
+    datum_preprocessor = None
     if data_cls == "open_assistant":
         data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
     elif data_cls == "squad":
@@ -119,6 +127,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             data_config["system_key"],
             data_config["system_prompt"],
         )
+    elif data_cls == "clevr_cogent":
+        from nemo_rl.data.hf_datasets.clevr import format_clevr_cogent_dataset
+        data = hf_datasets.CLEVRCoGenTDataset(
+            split=data_config["split"],
+            seed=data_config["seed"],
+            prompt_file=data_config["prompt_file"],
+            task_name=data_config["task_name"],
+        )
+        datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
     else:
         raise ValueError(f"Unknown dataset class: {data_cls}")
     print(
@@ -138,6 +155,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -151,6 +169,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -189,9 +208,17 @@ def main():
 
     init_ray()
 
-    # setup tokenizer
+    # setup tokenizer (or processor)
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        # inherit pad and eos tokens from the tokenizer
+        tokenizer.pad_token = tokenizer.tokenizer.pad_token
+        tokenizer.eos_token = tokenizer.tokenizer.eos_token
+        tokenizer.bos_token = tokenizer.tokenizer.bos_token
+        tokenizer.pad_token_id = tokenizer.tokenizer.pad_token_id
+        tokenizer.eos_token_id = tokenizer.tokenizer.eos_token_id
+        tokenizer.bos_token_id = tokenizer.tokenizer.bos_token_id
+    
     # setup data
     (
         dataset,
@@ -210,6 +237,7 @@ def main():
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     sft_train(
         policy,
         train_dataloader,

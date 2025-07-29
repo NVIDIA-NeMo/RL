@@ -13,6 +13,9 @@ tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.sh
 # Functional 32b run
 tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt.v3.sh
 
+# Functional VLM run
+tests/test_suites/vlm/grpo-qwen2.5-vl-3b-instruct-1n2g-dtensor2tp1.v1.sh
+
 #######
 # SFT #
 #######

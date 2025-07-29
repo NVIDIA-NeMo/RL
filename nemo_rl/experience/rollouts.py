@@ -17,7 +17,7 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -368,7 +368,8 @@ def run_multi_turn_rollout(
 
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
-
+        
+        # Prepare generation input data
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": active_input_ids,
@@ -376,6 +377,34 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        # add the multimodal data to the generation input data
+        multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
+        generation_input_data.update(multimodal_data)
+        # keep message log for generation
+        message_log_for_generation = []
+        # if there is some multimodal data, then we need to reconstruct the message log for generation
+        # if len(multimodal_data) > 0:
+        #     ## Reconstruct message_log from flat messages for vLLM generation
+        #     for i in range(len(active_batch["message_log"])):
+        #         msg = {
+        #             'content': active_flat_messages.get('content', [None] * len(active_batch["message_log"]))[i],
+        #         }
+                
+        #         # Add images if present
+        #         if 'images' in active_flat_messages:
+        #             images = active_flat_messages['images']
+        #             if i < len(images) and images[i] is not None:
+        #                 msg['images'] = images[i] if isinstance(images[i], list) else [images[i]]
+                
+        #         message_log_for_generation.append(msg)
+            
+        #     generation_input_data['message_log'] = message_log_for_generation
+        if 'vllm_content' in active_batch:
+            generation_input_data['vllm_content'] = active_batch['vllm_content']
+        if 'vllm_images' in active_batch:
+            generation_input_data['vllm_images'] = active_batch['vllm_images']
+        if 'vllm_videos' in active_batch:
+            generation_input_data['vllm_videos'] = active_batch['vllm_videos']
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(
