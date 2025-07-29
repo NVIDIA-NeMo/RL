@@ -47,6 +47,9 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    get_actor_python_env,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.simulated_user.prompt import starting_user_prompt
 from nemo_rl.environments.simulated_user.unique_numbers import (
@@ -78,13 +81,15 @@ def generate_datum(
     idx: int,
     add_system_prompt: bool,
 ) -> DatumSpec:
+    # please check the specific  chat_template in the yaml file
     formatted_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": starting_user_prompt}],
         tokenize=False,
-        add_system_prompt=add_system_prompt,
+        # add_system_prompt=add_system_prompt,
+        add_bos_token=True,
         add_generation_prompt=True,
         add_special_tokens=False,
-    ).strip()
+    )
     token_ids = tokenizer(
         formatted_prompt, return_tensors="pt", add_special_tokens=False
     )["input_ids"][0]
@@ -146,7 +151,16 @@ class IterableNumbersDataset(IterableDataset):
 
 def setup_data(tokenizer, env_cfg, task_name, length, val_length, add_system_prompt):
     env_config = env_cfg[task_name]
-    env = UniqueNumbersEnv.options(num_gpus=0).remote(cfg=dict(env_config["cfg"]))
+    env = UniqueNumbersEnv.options(  # type: ignore # it's wrapped with ray.remote
+        num_gpus=0,
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.simulated_user.unique_numbers.UniqueNumbersEnv"
+            ),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        },
+    ).remote(cfg=dict(env_config["cfg"]))
+
     task_to_env = {task_name: env}
 
     train_ds = IterableNumbersDataset(

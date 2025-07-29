@@ -2,7 +2,7 @@ starting_user_prompt = (
     "I will play a game with you. I have a list of integers in mind and can NOT tell you. "
     "Your goal is to guess the count of UNIQUE numbers in my list. The only 2 things you can do is the following: "
     "You can either ask me 'what is number k?' to get the number at position k in my list, "
-    "or answer 'there are m unique numbers' whenever you feel you want to make a guess."
+    "or answer 'there are m unique numbers' whenever you feel you want to make a guess. "
     "Please do not say anything else. You cannot ask me to provide the list of integers."
 )
 

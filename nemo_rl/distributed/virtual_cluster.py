@@ -54,7 +54,7 @@ class PY_EXECUTABLES:
     # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
     MCORE = "uv run --reinstall --extra mcore"
 
-    ADK = "uv run --locked --extra akd"
+    ADK = "uv run --locked --extra adk"
 
 
 @ray.remote  # pragma: no cover

@@ -2,12 +2,6 @@ import asyncio
 import logging
 import random
 
-from google.adk import Agent
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types
-from google.genai.errors import ServerError
-
 # Initialize logging
 logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -21,7 +15,10 @@ def create_agent(
     instruction: str | None = None,
     name: str = "simulated_user",
     model: str = "gemini-2.0-flash",
-) -> Agent:
+):
+    from google.adk.agents import Agent
+    from google.genai import types
+
     return Agent(
         model=model,
         name=name,
@@ -39,7 +36,7 @@ def create_agent(
     )
 
 
-def get_session_from_runner(runner: Runner, user_id: str):
+def get_session_from_runner(runner, user_id: str):
     app_session_map = runner.session_service.sessions
     assert len(app_session_map) == 1, "Expected exactly one app in session_service"
     user_sessions_map = next(iter(app_session_map.values()))
@@ -48,11 +45,11 @@ def get_session_from_runner(runner: Runner, user_id: str):
     return next(iter(sessions.values()))
 
 
-def get_agent_instruction_from_runner(runner: Runner):
+def get_agent_instruction_from_runner(runner):
     return runner.agent.instruction
 
 
-def extract_conversation_history(runner: Runner, user_id: str, silence: bool = True):
+def extract_conversation_history(runner, user_id: str, silence: bool = True):
     session = get_session_from_runner(runner, user_id)
     instruction = get_agent_instruction_from_runner(runner)
     convo = [{"role": "instruction", "content": instruction}]
@@ -65,13 +62,16 @@ def extract_conversation_history(runner: Runner, user_id: str, silence: bool = T
 
 
 async def run_prompt_async(
-    runner: Runner,
+    runner,
     user_id: str,
     new_message: str,
     silence: bool = True,
     max_retries: int = 3,
     initial_delay: float = 2,
 ) -> str:
+    from google.genai import types
+    from google.genai.errors import ServerError
+
     new_message = new_message.strip()
     content = types.Content(role="user", parts=[types.Part.from_text(text=new_message)])
     if not silence:
@@ -116,7 +116,10 @@ async def run_prompt_async(
     return f"<No response due after {max_retries} retries>"
 
 
-async def setup_runner_async(agent: Agent, app_name: str, user_id: str):
+async def setup_runner_async(agent, app_name: str, user_id: str):
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+
     runner = Runner(
         agent=agent, app_name=app_name, session_service=InMemorySessionService()
     )
@@ -125,6 +128,9 @@ async def setup_runner_async(agent: Agent, app_name: str, user_id: str):
 
 
 async def main():
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+
     sample_id_1 = "sample_1"
     sample_id_2 = "sample_2"
 

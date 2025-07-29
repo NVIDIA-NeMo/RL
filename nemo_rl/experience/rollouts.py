@@ -415,7 +415,8 @@ def run_multi_turn_rollout(
                 formatted_obs = tokenizer.apply_chat_template(
                     [{"role": env_role, "content": env_obs_content.strip()}],
                     tokenize=False,
-                ).removeprefix("<|begin_of_text|>")
+                    add_generation_prompt=True,
+                )
                 tokenized_obs = tokenizer(
                     formatted_obs, return_tensors="pt", add_special_tokens=False
                 ).input_ids[0]
@@ -442,7 +443,7 @@ def run_multi_turn_rollout(
 
             tokenized_env_obs_message = {
                 "role": env_output.observations[i]["role"],
-                "content": env_obs_content,
+                "content": formatted_obs,
                 "token_ids": tokenized_obs,
             }
             current_batch["message_log"][global_idx].append(tokenized_env_obs_message)
@@ -674,13 +675,10 @@ async def run_sample_multi_turn_rollout(
         # Tokenize environment response
         env_role = env_output.observations[0]["role"].lower()
         if env_role in {"user", "assistant", "system"}:
-            formatted_obs = (
-                tokenizer.apply_chat_template(
-                    [{"role": env_role, "content": env_obs_content.strip()}],
-                    tokenize=False,
-                )
-                .removeprefix("<|begin_of_text|>")
-                .strip()
+            formatted_obs = tokenizer.apply_chat_template(
+                [{"role": env_role, "content": env_obs_content.strip()}],
+                tokenize=False,
+                add_generation_prompt=True,
             )
             tokenized_obs = tokenizer(
                 formatted_obs, return_tensors="pt", add_special_tokens=False
@@ -702,7 +700,7 @@ async def run_sample_multi_turn_rollout(
 
         env_message = {
             "role": env_output.observations[0]["role"],
-            "content": env_obs_content,
+            "content": formatted_obs,
             "token_ids": tokenized_obs,
         }
         current_message_log.append(env_message)
