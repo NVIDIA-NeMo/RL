@@ -624,7 +624,7 @@ class DPOLossFn(PreferenceLoss):
         )
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLoss)
-    def __call__( # type: ignore
+    def __call__(  # type: ignore
         self,
         next_token_logits: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
