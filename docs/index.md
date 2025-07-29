@@ -28,6 +28,7 @@ guides/sft.md
 guides/dpo.md
 guides/grpo.md
 guides/grpo-deepscaler.md
+guides/rm.md
 guides/eval.md
 guides/deepseek.md
 model-quirks.md
