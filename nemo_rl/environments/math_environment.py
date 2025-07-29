@@ -74,7 +74,7 @@ class HFVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None] | None]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -82,14 +82,12 @@ class HFVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            Union[list[float], tuple[list[float], list[str | None]| None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] | None = (
-            [] if return_extracted_answer else None
-        )
+        extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
@@ -135,7 +133,7 @@ class MultilingualMultichoiceVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None] | None]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -143,14 +141,12 @@ class MultilingualMultichoiceVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            Union[list[float], tuple[list[float], list[str | None]| None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] | None = (
-            [] if return_extracted_answer else None
-        )
+        extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             response = answer_parsing.normalize_response(response)
@@ -182,7 +178,7 @@ class EnglishMultichoiceVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None] | None]]:
+    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -190,14 +186,12 @@ class EnglishMultichoiceVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            Union[list[float], tuple[list[float], list[str | None]| None]].
+            Union[list[float], tuple[list[float], list[str | None]]].
             If return_extracted_answer is False, returns only the scores.
             If return_extracted_answer is True, returns (scores, extracted_answers).
         """
         results = []
-        extracted_answers: list[str | None] | None = (
-            [] if return_extracted_answer else None
-        )
+        extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             ground_truth = answer_parsing.normalize_response(ground_truth)
