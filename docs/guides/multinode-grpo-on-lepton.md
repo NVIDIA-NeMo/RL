@@ -1,4 +1,4 @@
-# NeMo RL GRPO | DGX Create (Lepton) Guide
+# NeMo RL GRPO | Lepton Guide
 
 This guide outlines the steps needed to perform multi-node GRPO (Group Relative Policy Optimization) training on a DGX Lepton cluster using NeMo RL.
 
