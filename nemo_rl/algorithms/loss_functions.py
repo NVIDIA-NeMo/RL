@@ -155,8 +155,22 @@ class ClippedPGLossFn(LossFunction):
             # slice off to the correct length to remove potential CP padding
             curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            target = data["input_ids"]
+
+            cp_size = 1
+            if (
+                target.device_mesh.mesh_dim_names is not None
+                and "cp" in target.device_mesh.mesh_dim_names
+            ):
+                cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
+                cp_size = target.device_mesh.shape[cp_dim_index]
+            if cp_size > 1:
+                assert seq_index is not None, (
+                    "seq_index must be provided when CP is enabled"
+                )
+
             curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits, target, seq_index=seq_index
             )
         else:
             next_token_logits_wo_last = next_token_logits[
@@ -346,8 +360,21 @@ class NLLLoss(LossFunction):
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            target = data["input_ids"]
+
+            cp_size = 1
+            if (
+                target.device_mesh.mesh_dim_names is not None
+                and "cp" in target.device_mesh.mesh_dim_names
+            ):
+                cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
+                cp_size = target.device_mesh.shape[cp_dim_index]
+            if cp_size > 1:
+                assert seq_index is not None, (
+                    "seq_index must be provided when CP is enabled"
+                )
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits, target, seq_index=seq_index
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -600,8 +627,21 @@ class DPOLossFn(PreferenceLoss):
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            target = data["input_ids"]
+
+            cp_size = 1
+            if (
+                target.device_mesh.mesh_dim_names is not None
+                and "cp" in target.device_mesh.mesh_dim_names
+            ):
+                cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
+                cp_size = target.device_mesh.shape[cp_dim_index]
+            if cp_size > 1:
+                assert seq_index is not None, (
+                    "seq_index must be provided when CP is enabled"
+                )
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits, target, seq_index=seq_index
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
