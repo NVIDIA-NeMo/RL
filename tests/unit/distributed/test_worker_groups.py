@@ -175,20 +175,17 @@ def register_test_actor(request):
     # Default to PY_EXECUTABLES.SYSTEM if no param is given
     py_exec_to_register = getattr(request, "param", PY_EXECUTABLES.SYSTEM)
     
-    # Get the actor FQN from the request, defaulting to MY_TEST_ACTOR_FQN
-    actor_fqn = getattr(request, "actor_fqn", MY_TEST_ACTOR_FQN)
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(MY_TEST_ACTOR_FQN)
+    ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN] = py_exec_to_register
 
-    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(actor_fqn)
-    ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] = py_exec_to_register
-
-    yield actor_fqn  # Provide the FQN to the test
+    yield MY_TEST_ACTOR_FQN  # Provide the FQN to the test
 
     # Clean up: revert ACTOR_ENVIRONMENT_REGISTRY to its original state for this FQN
-    if actor_fqn in ACTOR_ENVIRONMENT_REGISTRY:  # Check if key still exists
+    if MY_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:  # Check if key still exists
         if original_registry_value is None:
-            del ACTOR_ENVIRONMENT_REGISTRY[actor_fqn]
+            del ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN]
         else:
-            ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] = original_registry_value
+            ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN] = original_registry_value
 
 
 # Create fixtures for each actor class
@@ -1130,8 +1127,8 @@ def test_environment_variable_precedence_full(register_precedence_actor, virtual
     """Test that the order of precedence is as follows (from highest to lowest):
     - configure_worker
     - RayWorkerGroup
-    - @ray.remote runtime_env
     - system
+    - @ray.remote runtime_env
     """
     # Set up system environment variables
     original_env = dict(os.environ)
