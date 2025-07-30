@@ -24,7 +24,7 @@ There are a number of ways to pass environment variables to Ray workers in NeMo-
     megatron_cfg:
       env_vars:
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
-    ```
+  ```
 
 ### 4. Worker-specific `configure_worker` Method (highest)
 - Set via static `configure_worker` method in worker classes
