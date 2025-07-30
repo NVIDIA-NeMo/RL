@@ -239,7 +239,9 @@ class CodeEnvironment(EnvironmentInterface):
 
         next_stop_strings = [["</code>"]] * len(message_log_batch)
 
-        assert return_extracted_answer == False, "The 'return_extracted_answer' parameter is not supported in this environment implementation. Please set it to False or remove this parameter from your configuration."    
+        assert return_extracted_answer == False, (
+            "return_extracted_answer is not supported in CodeEnvironment. Please set it to False."
+        )
         answers_tensor = None
 
         return EnvironmentReturn(
