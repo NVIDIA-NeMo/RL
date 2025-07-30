@@ -42,7 +42,6 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
 )
-from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
