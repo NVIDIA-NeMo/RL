@@ -244,7 +244,7 @@ class CodeEnvironment(EnvironmentInterface):
         assert return_extracted_answer == False, (
             "return_extracted_answer is not supported in CodeEnvironment. Please set it to False."
         )
-        answers_tensor = None
+        extracted_answers = None
 
         return EnvironmentReturn(
             observations=observations,
@@ -252,7 +252,7 @@ class CodeEnvironment(EnvironmentInterface):
             next_stop_strings=next_stop_strings,
             rewards=rewards_tensor,
             terminateds=terminated_tensor,
-            answers=answers_tensor,
+            answers=extracted_answers,
         )
 
     def shutdown(self):
