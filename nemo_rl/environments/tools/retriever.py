@@ -162,6 +162,7 @@ class RAGEnvironment(EnvironmentInterface):
         self,
         message_log_batch: List[LLMMessageLogType],
         metadata_batch: List[Dict[str, Any]],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         """Process a batch of retrieval steps."""
         # Extract queries from the last message in each log
@@ -186,12 +187,18 @@ class RAGEnvironment(EnvironmentInterface):
         terminated_tensor = torch.ones(batch_size, dtype=torch.bool)
         next_stop_strings = [["</retrieve>"]] * batch_size
 
+        assert return_extracted_answer == False, (
+            "return_extracted_answer is not supported in RAGEnvironment. Please set it to False."
+        )
+        extracted_answers = None
+
         return EnvironmentReturn(
             observations=results,
             metadata=metadata_batch,
             next_stop_strings=next_stop_strings,
             rewards=rewards_tensor,
             terminateds=terminated_tensor,
+            answers=extracted_answers,
         )
 
     def shutdown(self):
