@@ -291,7 +291,6 @@ class TestSwanlabLogger:
             entity="custom-entity",
             group="custom-group",
             tags=["tag1", "tag2"],
-            dir=temp_dir,
         )
 
     @patch("nemo_rl.utils.logger.swanlab")
@@ -1139,6 +1138,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         """Test GPU monitoring initialization when no main loggers (wandb/tensorboard) are enabled."""
         cfg = {
             "wandb_enabled": False,
+            "swanlab_enabled": False,
             "tensorboard_enabled": False,
             "mlflow_enabled": False,
             "monitor_gpus": True,
@@ -1583,7 +1583,7 @@ class TestLogger:
 
         # Check that log_metrics was called on all loggers
         mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        moc_swanlab_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_swanlab_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
         mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
         mock_mlflow_instance.log_metrics.assert_called_once_with(
             metrics, step, "", None

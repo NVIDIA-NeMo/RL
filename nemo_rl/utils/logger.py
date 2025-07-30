@@ -30,6 +30,7 @@ import ray
 import requests
 import torch
 import wandb
+import swanlab
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -332,7 +333,6 @@ class SwanlabLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
-        import swanlab
         self.run = swanlab.init(**cfg)
         print(
             f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
