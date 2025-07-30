@@ -220,3 +220,11 @@ def get_megatron_checkpoint_dir() -> str:
             )
     print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
     return checkpoint_dir
+
+
+def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
+    """Get IPC handle from a tensor."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    # skip serializing the function for better refit performance
+    return reduce_tensor(tensor.detach())[1:]
