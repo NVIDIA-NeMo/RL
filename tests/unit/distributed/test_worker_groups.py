@@ -109,34 +109,35 @@ class MyTestActor:
         "env_vars": {
             "TEST_VAR_1": "ray_remote_runtime_value",
             "TEST_VAR_3": "ray_remote_runtime_value",
-            "RAY_REMOTE_VAR": "ray_remote_only"
+            "RAY_REMOTE_VAR": "ray_remote_only",
         }
     }
 )
 class PrecedenceActor:
     """Actor with configure_worker method that sets environment variables."""
+
     _default_options = {}
-    
+
     def __init__(self, *args, **kwargs):
         self.init_args = args
         self.init_kwargs = kwargs
         self.env_vars = dict(os.environ)
-    
+
     def get_env_var(self, var_name):
         return self.env_vars.get(var_name)
-    
+
     def get_all_env_vars(self):
         return dict(self.env_vars)
-    
+
     @classmethod
     def configure_worker(cls, num_gpus, bundle_indices=None):
         return (
             {"num_gpus": num_gpus},  # resources
             {
                 "TEST_VAR_1": "configure_worker_value",
-                "WORKER_VAR": "worker_only"
+                "WORKER_VAR": "worker_only",
             },  # env_vars
-            {}  # init_kwargs
+            {},  # init_kwargs
         )
 
 
@@ -174,7 +175,6 @@ class NsightDummyActor:
 def register_test_actor(request):
     # Default to PY_EXECUTABLES.SYSTEM if no param is given
     py_exec_to_register = getattr(request, "param", PY_EXECUTABLES.SYSTEM)
-    
     original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(MY_TEST_ACTOR_FQN)
     ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN] = py_exec_to_register
 
@@ -1123,7 +1123,9 @@ def test_get_nsight_config_output_format():
 
 
 # Environment Variable Precedence Test
-def test_environment_variable_precedence_full(register_precedence_actor, virtual_cluster):
+def test_environment_variable_precedence_full(
+    register_precedence_actor, virtual_cluster
+):
     """Test that the order of precedence is as follows (from highest to lowest):
     - configure_worker
     - RayWorkerGroup
@@ -1135,17 +1137,17 @@ def test_environment_variable_precedence_full(register_precedence_actor, virtual
     os.environ["TEST_VAR_1"] = "system_value"
     os.environ["TEST_VAR_3"] = "system_value"
     os.environ["TEST_VAR_4"] = "system_value"
-    
+
     try:
         # Create a worker builder with configure_worker method
         builder = RayWorkerBuilder(register_precedence_actor)
-        
+
         # Create RayWorkerGroup environment variables
         env_vars = {
             "TEST_VAR_1": "yaml_worker_group_value",
-            "TEST_VAR_2": "yaml_worker_group_value"
+            "TEST_VAR_2": "yaml_worker_group_value",
         }
-        
+
         # Create worker group
         worker_group = RayWorkerGroup(
             cluster=virtual_cluster,
@@ -1153,22 +1155,35 @@ def test_environment_variable_precedence_full(register_precedence_actor, virtual
             workers_per_node=1,
             ## passing env_vars here mimics passing env vars from yaml config
             ## because lm_policy automicatically passes env vars to RayWorkerGroup
-            env_vars=env_vars
+            env_vars=env_vars,
         )
-        
+
         assert len(worker_group.workers) == 1
         worker = worker_group.workers[0]
-        
+
         # Verify configure_worker has highest precedence
-        assert ray.get(worker.get_env_var.remote("TEST_VAR_1")) == "configure_worker_value"  # configure_worker overrides all
-        assert ray.get(worker.get_env_var.remote("TEST_VAR_2")) == "yaml_worker_group_value"  # RayWorkerGroup value preserved
-        assert ray.get(worker.get_env_var.remote("TEST_VAR_3")) == "system_value"  # configure_worker value set
-        assert ray.get(worker.get_env_var.remote("TEST_VAR_4")) == "system_value"  # system value preserved
-        assert ray.get(worker.get_env_var.remote("WORKER_VAR")) == "worker_only"  # configure_worker value set
-        assert ray.get(worker.get_env_var.remote("RAY_REMOTE_VAR")) == "ray_remote_only"  # ray.remote runtime_env value preserved
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_1")) == "configure_worker_value"
+        )  # configure_worker overrides all
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_2"))
+            == "yaml_worker_group_value"
+        )  # RayWorkerGroup value preserved
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_3")) == "system_value"
+        )  # configure_worker value set
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_4")) == "system_value"
+        )  # system value preserved
+        assert (
+            ray.get(worker.get_env_var.remote("WORKER_VAR")) == "worker_only"
+        )  # configure_worker value set
+        assert (
+            ray.get(worker.get_env_var.remote("RAY_REMOTE_VAR")) == "ray_remote_only"
+        )  # ray.remote runtime_env value preserved
 
         worker_group.shutdown(force=True)
-    
+
     finally:
         # Restore original environment
         for key in ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3"]:
