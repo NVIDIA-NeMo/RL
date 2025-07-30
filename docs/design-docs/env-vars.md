@@ -15,8 +15,9 @@ There are a number of ways to pass environment variables to Ray workers in NeMo-
 - Useful for controlling environment variables from a high level. If not overwritten by higher priority methods, all workers will inherit these environment variables
 - Example: `export HF_TOKEN=<your_token>`
 
-### 3. YAML Configuration env_vars (high)
+### 3. YAML Configuration `env_vars` (high)
 - Set in YAML config files under `policy.megatron_cfg.env_vars` or `policy.dtensor_cfg.env_vars`
+- Useful for controlling environment variables on an experiment level
 - Example:
   ```yaml
   policy:
@@ -24,9 +25,8 @@ There are a number of ways to pass environment variables to Ray workers in NeMo-
       env_vars:
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
     ```
-- Useful for controlling environment variables on an experiment level
 
-### 4. Worker-specific configure_worker Method (highest)
+### 4. Worker-specific `configure_worker` Method (highest)
 - Set via static `configure_worker` method in worker classes
 - Applied to specific worker instances based on configuration
-- See an example in `VllmGenerationWorker` [here](https://github.com/NVIDIA-NeMo/RL/blob/def76820d7838c63c1ee4900e63f73a93d927ff2/nemo_rl/models/generation/vllm.py#L88).
+- See an example in `VllmGenerationWorker` [here](https://github.com/NVIDIA-NeMo/RL/blob/def76820d7838c63c1ee4900e63f73a93d927ff2/nemo_rl/models/generation/vllm.py#L88)
