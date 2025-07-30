@@ -22,6 +22,7 @@ from nemo_rl.data.hf_datasets.prompt_response_dataset import (
     PromptResponseDataset,
 )
 from nemo_rl.data.hf_datasets.squad import SquadDataset
+from nemo_rl.data.hf_datasets.tulu3 import Tulu3PreferenceDataset
 
 __all__ = [
     "DPODataset",
@@ -31,5 +32,6 @@ __all__ = [
     "OpenMathInstruct2Dataset",
     "PromptResponseDataset",
     "SquadDataset",
+    "Tulu3PreferenceDataset",
     "COMMON_CHAT_TEMPLATES",
 ]

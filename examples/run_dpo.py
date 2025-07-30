@@ -176,13 +176,19 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
 
     if data_config["dataset_name"] == "HelpSteer3":
         data = hf_datasets.HelpSteer3Dataset()
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = data.formatted_ds["validation"]
+    elif data_config["dataset_name"] == "Tulu3Preference":
+        data = hf_datasets.Tulu3PreferenceDataset()
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = None
     else:
         data = hf_datasets.DPODataset(
             train_data_path=data_config["train_data_path"],
             val_data_path=data_config["val_data_path"],
         )
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = data.formatted_ds["validation"]
 
     dpo_task_spec = data.task_spec
 
@@ -195,13 +201,14 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = AllTaskProcessedDataset(
-        val_dataset,
-        tokenizer,
-        dpo_task_spec,
-        dpo_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    if val_dataset:
+        val_dataset = AllTaskProcessedDataset(
+            val_dataset,
+            tokenizer,
+            dpo_task_spec,
+            dpo_preprocessor,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
 
     return train_dataset, val_dataset, tokenizer, dpo_task_spec
 
