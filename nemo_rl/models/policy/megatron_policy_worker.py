@@ -514,8 +514,8 @@ class MegatronPolicyWorker:
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
 
         from megatron.core.quantization.utils import kitchen_quantization_recipe_config
-        recipe_num = int(os.getenv("QAT_PARAMS", "5001"))
-        model_cfg.use_kitchen = True
+        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5001"))
+        model_cfg.use_kitchen = self.cfg["megatron_cfg"].get("use_kitchen", False)
         model_cfg.quant_recipe = kitchen_quantization_recipe_config(recipe_num)
 
 
