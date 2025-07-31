@@ -26,6 +26,7 @@ from nemo_rl.utils.logger import (
     TensorboardLogger,
     WandbLogger,
     flatten_dict,
+    print_message_log_samples,
 )
 
 
@@ -1441,3 +1442,23 @@ class TestLogger:
         mock_wandb_instance.log_hyperparams.assert_called_once_with(params)
         mock_tb_instance.log_hyperparams.assert_called_once_with(params)
         mock_mlflow_instance.log_hyperparams.assert_called_once_with(params)
+
+
+def test_print_message_log_samples(capsys):
+    """Test that print_message_log_samples displays full content correctly."""
+    # Test message with full content (verifies our bug fix)
+    message_logs = [
+        [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "2+2 = 4"},
+        ]
+    ]
+    rewards = [1.0]
+
+    print_message_log_samples(message_logs, rewards, num_samples=1, step=0)
+
+    captured = capsys.readouterr()
+    # Verify content is displayed properly
+    assert "What is 2+2?" in captured.out
+    assert "2+2 = 4" in captured.out
+    assert "Sample 1 | Reward: 1.0000" in captured.out
