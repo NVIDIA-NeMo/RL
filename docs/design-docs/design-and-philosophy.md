@@ -112,3 +112,27 @@ def grpo_train(
         policy.train(generations, logprobs, reference_logprobs, GRPOLossFn)
 ```
 For a complete implementation of GRPO, including validation, checkpointing, memory movement, and the data processing steps not detailed here, see [grpo_train](../../nemo_rl/algorithms/grpo.py).
+
+
+### TypedDict and Configuration Defaults
+
+In NeMo RL we use yaml files for configuration and load it with `omegaconf` into a recursive `dict`. Within the codebase,
+the root `dict` and sub-`dict`s are typed with `TypedDict` subclasses, to provide type hints when accessing attributes; this
+lets our type checker validate if an undocumented attribute is accessed (when not present in the `TypeDict` subclass, or with an incompatible type).
+
+We have chosen this design since it is simple and allows users the flexibility of using old configs without erroring
+during config load due to an unexpected attribute (potentially obselete or user-defined). We considered using dataclasses, or
+other structured configs, but those solutions require more boiler-plate and configs would need some versioning to allow
+loading in different versions of NeMo RL.
+
+We have a few design principles we stick to wih regards to configuration:
+
+1. We forbid defaults in the code (with few exceptions like an alpha feature). Defaults should be in yaml configs. Defaults in code make it difficult to debug where values are being set.
+    * Forbidden examples include:
+        * `grpo_config.get("num_prompts_per_step", 32)`
+        * `policy_config.get("model_name", "meta-llama/Llama-3.1-8B-Instruct")`
+    * Acceptable examples:
+        * If an attribute is typed `typing.NotRequired[...]` it is okay for the code to check for absense/`None`, e.g., `assert "milestones" in scheduler_cfg` or `if "milestones" in scheduler_cfg`
+1. All configs under [examples/configs/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) are exemplars and should contain the defaults for `typing.Required` or `typing.NotRequired` attributes (as well as documentation).
+   * All configs under [examples/configs/recipes/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes) do not require documentation and are snapshots of functional configurations.
+2. All configs under [examples/configs/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) should ahhere to their `TypedDict` subclass configuration. Unit tests under [tests/unit/test_config_validation.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/unit/test_config_validation.py) will be run to validate.
