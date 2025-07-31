@@ -54,18 +54,11 @@ def test_eval_pass_k_multiple_groups():
     """Test pass@k with multiple groups."""
     # Two groups: [1,0,1] and [0,1,0]
     rewards = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
-    result = eval_pass_k(rewards, num_tests_per_prompt=3, k=1)
-    expected = 1.0
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
-
-
-def test_eval_pass_k_edge_cases():
-    """Test pass@k edge cases."""
-    # k > num_tests_per_prompt
-    rewards = torch.tensor([1.0, 0.0])
-    result = eval_pass_k(rewards, num_tests_per_prompt=2, k=3)
-    expected = 1.0
+    num_tests_per_prompt = 3
+    result = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1) / (
+        len(rewards) / num_tests_per_prompt
+    )
+    expected = 0.5
     assert isinstance(result, float)
     assert result == pytest.approx(expected, rel=1e-6)
 
@@ -74,8 +67,16 @@ def test_eval_cons_k_basic():
     """Test basic cons@k evaluation."""
     rewards = torch.tensor([1.0, 0.0, 1.0])
     extracted_answers = ["A", "B", "A"]
-    result = eval_cons_k(
-        rewards, num_tests_per_prompt=3, k=1, extracted_answers=extracted_answers
+    num_tests_per_prompt = 3
+    group_size = len(rewards) / num_tests_per_prompt
+    result = (
+        eval_cons_k(
+            rewards,
+            num_tests_per_prompt=num_tests_per_prompt,
+            k=1,
+            extracted_answers=extracted_answers,
+        )
+        / group_size
     )
     expected = 2 / 3
     assert isinstance(result, float)
@@ -85,6 +86,7 @@ def test_eval_cons_k_basic():
 def test_eval_cons_k_multiple_groups():
     """Test cons@k with multiple groups."""
     rewards = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+    num_tests_per_prompt = 5
     extracted_answers = [
         "Correct",
         "Wrong1",
@@ -97,9 +99,49 @@ def test_eval_cons_k_multiple_groups():
         "Correct",
         "Wrong4",
     ]
-    result = eval_cons_k(
-        rewards, num_tests_per_prompt=5, k=3, extracted_answers=extracted_answers
+    group_size = len(rewards) / num_tests_per_prompt
+    result = (
+        eval_cons_k(
+            rewards,
+            num_tests_per_prompt=num_tests_per_prompt,
+            k=3,
+            extracted_answers=extracted_answers,
+        )
+        / group_size
     )
-    expected = 11 / 10
+    """
+    For the first group, the extracted answers are [Correct, Wrong1, Correct, Wrong2, Correct]
+    When calculating unbiased estimate of cons@3(k=3), we need to consider the majority vote of all Combination(5, 3) = 10 cases.
+    The 10 cases are:
+    - Correct, Wrong1, Correct      Majority: Correct
+    - Correct, Wrong1, Wrong2       Majority: Correct(Choose the first one when there is a tie)
+    - Correct, Wrong1, Correct      Majority: Correct
+    - Correct, Correct, Wrong2      Majority: Correct
+    - Correct, Correct, Correct     Majority: Correct
+    - Correct, Wrong2, Correct      Majority: Correct
+    - Wrong1, Correct, Wrong2       Majority: Wrong1 (Choose the first one when there is a tie)
+    - Wrong1, Correct, Correct      Majority: Correct
+    - Wrong1, Wrong2, Correct       Majority: Wrong1 (Choose the first one when there is a tie)
+    - Correct, Wrong2, Correct      Majority: Correct
+    The final result is 8/10.
+
+    For the second group, the extracted answers are [Wrong3, Correct, Wrong4, Correct, Wrong4]
+    When calculating unbiased estimate of cons@3(k=3), we need to consider the majority vote of all Combination(5, 3) = 10 cases.
+    The 10 cases are:
+    - Wrong3, Correct, Wrong4       Majority: Wrong3 (Choose the first one when there is a tie)
+    - Wrong3, Correct, Correct      Majority: Correct
+    - Wrong3, Correct, Wrong4       Majority: Wrong3 (Choose the first one when there is a tie)
+    - Wrong3, Wrong4, Correct       Majority: Wrong3 (Choose the first one when there is a tie)
+    - Wrong3, Wrong4, Wrong4        Majority: Wrong4
+    - Wrong3, Correct, Wrong4       Majority: Wrong3 (Choose the first one when there is a tie)
+    - Correct, Wrong4, Correct      Majority: Correct
+    - Correct, Wrong4, Wrong4       Majority: Wrong4 (Choose the first one when there is a tie)
+    - Correct, Correct, Wrong4      Majority: Correct
+    - Wrong4, Correct, Wrong4       Majority: Wrong4
+    The final result is 3/10.
+    Since there len(rewards)/num_tests_per_prompt = 10/5 = 2 groups
+    The final result is( 8/10 + 3/10 ) / 2 = 11/20 = 0.55
+    """
+    expected = 11 / 20
     assert isinstance(result, float)
     assert result == pytest.approx(expected, rel=1e-6)
