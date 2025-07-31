@@ -523,7 +523,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         assert (
             self.micro_batch_indices is not None and len(self.micro_batch_indices) == 1
-        )
+        ), f"{self.micro_batch_indices} is None or {len(self.micro_batch_indices)} != 1"
 
         for seqlen, (start_idx, end_idx) in zip(
             self.micro_batch_lengths[0], self.micro_batch_indices[0]

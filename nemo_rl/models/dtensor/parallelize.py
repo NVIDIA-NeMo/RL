@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -38,7 +38,10 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import (
+    DistributedLogprob,
+    DistributedTokenLevelEntropy,
+)
 
 
 class RotaryEmbedParallel(SequenceParallel):
@@ -446,6 +449,53 @@ def clip_grad_by_total_norm_(
             g.mul_(clip_coeff)
 
 
+def get_grad_sparsity(
+    named_parameters: Union[
+        List[Tuple[str, Union[torch.Tensor, DTensor]]],
+        Tuple[str, Union[torch.Tensor, DTensor]],
+    ],
+    dp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+) -> float:
+    """NOTE: This function is somewhat incorrect if the grads are not all reduced across the data parallel GPUs.
+        * this is because the zeros might not be all in the same place across DP ranks
+
+    Args:
+        parameters (Union[List[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]]):
+            An iterable of Tensors or DTensors, or a single Tensor or DTensor
+            that will have gradient norm calculated.
+        dp_group (torch.distributed.ProcessGroup): Process group for data parallel communication.
+        tp_group (torch.distributed.ProcessGroup): Process group for tensor parallel communication.
+        norm_type (Union[int, float]): Type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        float: Total norm of the gradients (viewed as a single vector)
+    """
+    grad_sparsity_dict = {}
+    grads_dict = {
+        name: to_local_if_dtensor(p.grad.detach())
+        for name, p in sorted(named_parameters)
+        if p.grad is not None
+    }
+
+    total_num_zeros, total_num_elements = 0, 0
+    for name, grad in grads_dict.items():
+        num_zeros = grad.numel() - grad.count_nonzero()
+        num_elements = grad.numel()
+
+        to_reduce = torch.tensor(
+            [num_zeros, num_elements], dtype=torch.float32, device="cuda"
+        )
+        torch.distributed.all_reduce(to_reduce, group=dp_group)
+        torch.distributed.all_reduce(to_reduce, group=tp_group)
+        grad_sparsity_dict[name] = (to_reduce[0] / to_reduce[1]).item()
+        total_num_zeros += to_reduce[0]
+        total_num_elements += to_reduce[1]
+
+    return (total_num_zeros / total_num_elements).item(), grad_sparsity_dict
+
+
 def get_grad_norm(
     parameters: Union[List[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     dp_group: torch.distributed.ProcessGroup,
@@ -516,6 +566,31 @@ def get_grad_norm(
     return total_norm
 
 
+def token_level_entropy_from_vocab_parallel_logits(
+    vocab_parallel_logits: DTensor,
+):
+    """Computes token-level entropy from vocabulary-parallel logits.
+
+    Args:
+        vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
+            with shape [batch_size, seq_len, vocab_size/tp_size].
+
+    Returns:
+        torch.Tensor: Token-level entropy tensor with shape [batch_size, seq_len-1].
+            The sequence dimension is reduced by 1 due to the target shifting.
+
+    NOTE: this function assumes the vocab dimension includes all valid tokens(no padding)
+    """
+    tp_mesh = vocab_parallel_logits.device_mesh
+
+    entropy = DistributedTokenLevelEntropy.apply(
+        vocab_parallel_logits.to_local(),
+        tp_mesh.get_group(),
+        not torch.is_grad_enabled(),
+    ).contiguous()
+    return entropy[:, :-1]
+
+
 def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor, input_ids: torch.Tensor
 ):
@@ -538,11 +613,13 @@ def get_logprobs_from_vocab_parallel_logits(
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
 
-    return from_parallel_logits_to_logprobs(
+    target = input_ids.roll(shifts=-1, dims=-1)
+    probs = DistributedLogprob.apply(
         vocab_parallel_logits.to_local(),
-        input_ids,
+        target,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
         tp_mesh.get_group(),
-        inference_only=not torch.is_grad_enabled(),
-    )
+        not torch.is_grad_enabled(),
+    ).contiguous()
+    return probs[:, :-1]
