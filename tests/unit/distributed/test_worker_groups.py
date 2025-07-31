@@ -1135,6 +1135,7 @@ def test_environment_variable_precedence_full(
     # Set up system environment variables
     original_env = dict(os.environ)
     os.environ["TEST_VAR_1"] = "system_value"
+    os.environ["TEST_VAR_2"] = "system_value"
     os.environ["TEST_VAR_3"] = "system_value"
     os.environ["TEST_VAR_4"] = "system_value"
 
@@ -1171,7 +1172,7 @@ def test_environment_variable_precedence_full(
         )  # RayWorkerGroup value preserved
         assert (
             ray.get(worker.get_env_var.remote("TEST_VAR_3")) == "system_value"
-        )  # configure_worker value set
+        )  # system value takes precedence over worker env vars
         assert (
             ray.get(worker.get_env_var.remote("TEST_VAR_4")) == "system_value"
         )  # system value preserved
