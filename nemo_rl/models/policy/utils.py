@@ -183,6 +183,16 @@ def configure_expandable_segments() -> None:
                         )
 
 
+def configure_dynamo_cache() -> None:
+    """Disable dynamo autotune_local_cache.
+
+    Dynamo may fail at cached_autotune when there's already a cache with different order of node_bundles.
+    Disable autotune_local_cache as a workaround.
+    See https://github.com/pytorch/pytorch/issues/153791 for more details.
+    """
+    torch._inductor.config.autotune_local_cache = False
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 

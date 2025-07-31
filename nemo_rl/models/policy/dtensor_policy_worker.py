@@ -66,6 +66,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
     configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
@@ -160,6 +161,10 @@ class DTensorPolicyWorker:
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.is_generation_colocated:
             os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
+        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+        # with different order of node_bundles
+        configure_dynamo_cache()
 
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
