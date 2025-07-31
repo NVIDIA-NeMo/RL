@@ -808,7 +808,7 @@ def grpo_train(
         )
         metrics.update(
             {
-                "throughput_per_gpu": metrics["total_num_tokens"]
+                "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
                 / total_time
                 / total_num_gpus
             }
