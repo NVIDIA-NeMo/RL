@@ -333,9 +333,9 @@ class SwanlabLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
-        self.run = swanlab.init(**cfg)
+        self.run = swanlab.init(**cfg, logdir=log_dir)
         print(
-            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
+            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
         )
 
     def define_metric(
