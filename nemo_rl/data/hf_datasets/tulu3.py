@@ -15,7 +15,7 @@ def format_tulu3_preference(data: dict[str, Any]) -> dict[str, str | dict[str, s
     # We assume that except last assistant response, all messages in
     # chosen and rejected conversations are similar. Validating this...
     assert json.dumps(context, ensure_ascii=False) == json.dumps(
-        context, ensure_ascii=False
+        rejected_conversation[:-1], ensure_ascii=False
     ), (
         f"Context mismatch.\n\nchosen: {chosen_conversation}\n\n rejected: {rejected_conversation}"
     )
