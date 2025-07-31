@@ -7,8 +7,7 @@ There are a number of ways to pass environment variables to Ray workers in NeMo 
 ### 1. Ray Runtime Environment Variables (lowest)
 - Set via `ray.remote(runtime_env={'env_vars': {...}})` decorators.
 - Applied to all instances of specific worker classes. These define the default environment variables for the class if not overwritten by a method of higher precedence.
-- Example: `@ray.remote(runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"))` (see [here](https://github.com/NVIDIA-NeMo/RL/blob/def76820d7838c63c1ee4900e63f73a93d927ff2/nemo_rl/models/policy/megatron_policy_worker.py#L338))
-    - `get_runtime_env_for_policy_worker` will be applied to all instances of `MegatronPolicyWorker`
+- Example: `@ray.remote(runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"))`. See [here](https://github.com/NVIDIA-NeMo/RL/blob/def76820d7838c63c1ee4900e63f73a93d927ff2/nemo_rl/models/policy/megatron_policy_worker.py#L338) where `get_runtime_env_for_policy_worker` will be applied to all instances of `MegatronPolicyWorker`.
 
 ### 2. System-level Environment Variables (medium)
 - Set via `export` in shell or `os.environ` in Python.
