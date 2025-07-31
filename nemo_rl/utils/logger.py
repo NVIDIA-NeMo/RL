@@ -77,7 +77,7 @@ class LoggerConfig(TypedDict):
     tensorboard_enabled: bool
     mlflow_enabled: bool
     wandb: WandbConfig
-    swanlab: SwanlabConfig
+    swanlab: NotRequired[SwanlabConfig]
     tensorboard: TensorboardConfig
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
