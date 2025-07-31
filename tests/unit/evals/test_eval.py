@@ -26,28 +26,36 @@ def test_eval_pass_k_basic():
     """Test basic pass@k evaluation."""
     # Test case: 3 samples, 2 correct, k=1
     rewards = torch.tensor([1.0, 0.0, 1.0])
-    result = eval_pass_k(rewards, num_tests_per_prompt=3, k=1)
+    num_tests_per_prompt = 3
+    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1)
+    group_size = len(rewards) / num_tests_per_prompt
+    average_score = score / group_size
     expected = 2 / 3
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
 
 
 def test_eval_pass_k_all_correct():
     """Test pass@k when all samples are correct."""
     rewards = torch.tensor([1.0, 1.0, 1.0])
-    result = eval_pass_k(rewards, num_tests_per_prompt=3, k=1)
+    num_tests_per_prompt = 3
+    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1)
+    group_size = len(rewards) / num_tests_per_prompt
+    average_score = score / group_size
     expected = 1.0
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
 
 
 def test_eval_pass_k_none_correct():
     """Test pass@k when no samples are correct."""
     rewards = torch.tensor([0.0, 0.0, 0.0])
-    result = eval_pass_k(rewards, num_tests_per_prompt=3, k=1)
+    num_tests_per_prompt = 3
+    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1)
+    average_score = score / (len(rewards) / num_tests_per_prompt)
     expected = 0.0
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
 
 
 def test_eval_pass_k_multiple_groups():
@@ -55,12 +63,11 @@ def test_eval_pass_k_multiple_groups():
     # Two groups: [1,0,1] and [0,1,0]
     rewards = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
     num_tests_per_prompt = 3
-    result = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1) / (
-        len(rewards) / num_tests_per_prompt
-    )
+    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1)
+    average_score = score / (len(rewards) / num_tests_per_prompt)
     expected = 0.5
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
 
 
 def test_eval_cons_k_basic():
@@ -69,18 +76,16 @@ def test_eval_cons_k_basic():
     extracted_answers = ["A", "B", "A"]
     num_tests_per_prompt = 3
     group_size = len(rewards) / num_tests_per_prompt
-    result = (
-        eval_cons_k(
-            rewards,
-            num_tests_per_prompt=num_tests_per_prompt,
-            k=1,
-            extracted_answers=extracted_answers,
-        )
-        / group_size
+    score = eval_cons_k(
+        rewards,
+        num_tests_per_prompt=num_tests_per_prompt,
+        k=1,
+        extracted_answers=extracted_answers,
     )
+    average_score = score / group_size
     expected = 2 / 3
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
 
 
 def test_eval_cons_k_multiple_groups():
@@ -100,15 +105,14 @@ def test_eval_cons_k_multiple_groups():
         "Wrong4",
     ]
     group_size = len(rewards) / num_tests_per_prompt
-    result = (
-        eval_cons_k(
-            rewards,
-            num_tests_per_prompt=num_tests_per_prompt,
-            k=3,
-            extracted_answers=extracted_answers,
-        )
-        / group_size
+    score = eval_cons_k(
+        rewards,
+        num_tests_per_prompt=num_tests_per_prompt,
+        k=3,
+        extracted_answers=extracted_answers,
     )
+    average_score = score / group_size
+
     """
     For the first group, the extracted answers are [Correct, Wrong1, Correct, Wrong2, Correct]
     When calculating unbiased estimate of cons@3(k=3), we need to consider the majority vote of all Combination(5, 3) = 10 cases.
@@ -143,5 +147,5 @@ def test_eval_cons_k_multiple_groups():
     The final result is( 8/10 + 3/10 ) / 2 = 11/20 = 0.55
     """
     expected = 11 / 20
-    assert isinstance(result, float)
-    assert result == pytest.approx(expected, rel=1e-6)
+    assert isinstance(average_score, float)
+    assert average_score == pytest.approx(expected, rel=1e-6)
