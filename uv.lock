@@ -412,6 +412,16 @@ wheels = [
 ]
 
 [[package]]
+name = "causal-conv1d"
+version = "1.5.0.post8"
+source = { git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8#82867a9d2e6907cc0f637ac6aff318f696838548" }
+dependencies = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+
+[[package]]
 name = "certifi"
 version = "2025.6.15"
 source = { registry = "https://pypi.org/simple" }
@@ -2010,6 +2020,20 @@ wheels = [
 ]
 
 [[package]]
+name = "mamba-ssm"
+version = "2.2.4"
+source = { git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4#2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+dependencies = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "setuptools" },
+    { name = "torch" },
+    { name = "transformers" },
+    { name = "triton" },
+]
+
+[[package]]
 name = "markdown"
 version = "3.8.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2479,7 +2503,9 @@ dependencies = [
 
 [package.optional-dependencies]
 automodel = [
+    { name = "causal-conv1d" },
     { name = "flash-attn" },
+    { name = "mamba-ssm" },
 ]
 mcore = [
     { name = "flash-attn" },
@@ -2488,7 +2514,9 @@ mcore = [
     { name = "transformer-engine", extra = ["pytorch"] },
 ]
 vllm = [
+    { name = "causal-conv1d" },
     { name = "flash-attn" },
+    { name = "mamba-ssm" },
     { name = "vllm" },
 ]
 
@@ -2528,6 +2556,8 @@ test = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "blobfile" },
+    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
+    { name = "causal-conv1d", marker = "extra == 'vllm'", git = "https://github.com/Dao-AILab/causal-conv1d?tag=v1.5.0.post8" },
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
@@ -2535,6 +2565,8 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
     { name = "hydra-core" },
+    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
+    { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-LM-workspace" },
