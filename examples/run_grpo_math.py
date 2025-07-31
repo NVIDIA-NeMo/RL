@@ -90,7 +90,7 @@ def hf_data_processor(
         add_special_tokens=False,
     )
     user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
-    user_message["content"] = message[0]
+    user_message["content"] = message
     message_log.append(user_message)
 
     length = sum(len(m["token_ids"]) for m in message_log)
