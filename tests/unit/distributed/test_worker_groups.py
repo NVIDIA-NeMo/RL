@@ -1187,7 +1187,7 @@ def test_environment_variable_precedence_full(
 
     finally:
         # Restore original environment
-        for key in ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3"]:
+        for key in ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3", "TEST_VAR_4"]:
             if key in original_env:
                 os.environ[key] = original_env[key]
             else:
