@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from collections import defaultdict
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
@@ -28,49 +27,6 @@ except ImportError:
     )
 
 
-def _patch_gemma3_mm():
-    """Patch gemma3_mm.py to support new HF multimodal format (post transformers v4.52).
-
-    Patch taken from:https://github.com/vllm-project/vllm/pull/19151/files#diff-5890909300e4e6c3160444e4587ec3fd80498bb83f598b22ce81337f75992b06
-    """
-    from packaging.version import Version as PkgVersion
-
-    assert PkgVersion(vllm.__version__) < PkgVersion("0.9.2"), (
-        f"You are using vllm version {vllm.__version__}. "
-        "Please remove this patch (_patch_gemma3_mm in nemo_rl/models/generation/vllm_backend.py) "
-        "since it is included in vllm>=0.9.2."
-    )
-
-    from vllm.logger import init_logger
-    from vllm.model_executor.models import gemma3_mm
-    from vllm.model_executor.models.utils import (
-        AutoWeightsLoader,
-        WeightsMapper,
-    )
-
-    logger = init_logger("gemma3_mm_patch")
-
-    gemma3_mm.Gemma3ForConditionalGeneration.hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    gemma3_mm.Gemma3ForConditionalGeneration.load_weights = load_weights
-    logger.info("Successfully patched gemma3_mm.py in vllm_backend.")
-
-
-_patch_gemma3_mm()
-
-
 class VllmInternalWorkerExtension:
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
@@ -81,10 +37,6 @@ class VllmInternalWorkerExtension:
 
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
-
-        # Temporary fix for vllm==0.9.0 which overrides the NCCL_CUMEM_ENABLE to 0 and causes
-        # https://github.com/NVIDIA-NeMo/RL/issues/564. This can be removed after it is upgraded to vllm>=0.9.1rc1.
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size

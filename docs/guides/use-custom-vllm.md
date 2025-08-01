@@ -28,8 +28,8 @@ dependencies = [
 
 [project.optional-dependencies]
 vllm = [
-    #"vllm==0.9.0",  # <-- BEFORE
-    "vllm",          # <-- AFTER
+    #"vllm==0.10.0",  # <-- BEFORE
+    "vllm",           # <-- AFTER
 ]
 
 # ...<OMITTED>
