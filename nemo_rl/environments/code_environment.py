@@ -98,7 +98,9 @@ class CodeExecutionWorker:
                 result = result[len(lookahead) :]
         return result
 
-    def execute(self, message_batch: str, metadata_batch: List[CodeEnvMetadata]) -> str:
+    def execute(
+        self, message_batch: str, metadata_batch: List[CodeEnvMetadata]
+    ) -> Tuple[List[Dict[str, str]], List[bool], List[Any]]:
         """Execute code in a sandboxed environment."""
         results = []
         terminateds = []
