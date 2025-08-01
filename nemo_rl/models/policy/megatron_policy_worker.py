@@ -378,6 +378,15 @@ class MegatronPolicyWorker:
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        if not self.is_generation_colocated:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
         self.cfg = config
         dtype_map = {
             "float32": torch.float32,
@@ -416,7 +425,8 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        if get_rank_safe() == 0:
+        self.rank = get_rank_safe()
+        if self.rank == 0:
             if pt_checkpoint_exists:
                 print(
                     f"Checkpoint already exists at {pretrained_path}. Skipping import."
@@ -724,6 +734,18 @@ class MegatronPolicyWorker:
         self.local_key_to_global_keys = None
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        if self.rank == 0:
+            pg = StatelessProcessGroup.create(
+                host=ip, port=port, rank=0, world_size=world_size
+            )
+            device = torch.cuda.current_device()
+            self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self):
         return True
@@ -1407,11 +1429,11 @@ class MegatronPolicyWorker:
             )
             # collect tensor metadata
             for name, tensor in gathered_hf_params.items():
-                refit_param_info_hf[name] = (
-                    tensor.shape,
-                    tensor.dtype,
-                    tensor.numel(),
-                )
+                if self.is_generation_colocated:
+                    metadata = (tensor.shape, tensor.dtype, tensor.numel())
+                else:
+                    metadata = (tensor.shape, tensor.dtype)
+                refit_param_info_hf[name] = metadata
 
         return refit_param_info_hf
 
@@ -1523,6 +1545,25 @@ class MegatronPolicyWorker:
             serialized = (False, all_handles)
 
         return {device_uuid: serialized}
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(self) -> None:
+        """Broadcast the weights for collective communication."""
+        for key, _ in self.refit_param_info_mcore:
+            # gather megatron params
+            gathered_megatron_params = gather_params(
+                self.model,
+                [key],
+                key_to_global_keys=self.local_key_to_global_keys,
+            )
+            # convert to hf params
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            # broadcast from train rank0 worker to inference workers
+            if self.rank == 0:
+                for _, tensor in gathered_hf_params.items():
+                    self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
