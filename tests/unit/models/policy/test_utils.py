@@ -16,10 +16,162 @@ import os
 import unittest.mock
 from unittest.mock import MagicMock, patch
 
+import torch
+import torch.nn.functional as F
+
 from nemo_rl.models.policy.utils import (
+    apply_top_k_top_p,
     configure_expandable_segments,
     get_megatron_checkpoint_dir,
 )
+
+
+def manual_top_k(logits, k):
+    """Manual reference implementation for top-k"""
+    top_k_values, _ = torch.topk(logits, k, dim=-1)
+    threshold = top_k_values[..., -1:].expand_as(logits)
+    mask = logits >= threshold
+    return torch.where(
+        mask,
+        logits,
+        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
+    )
+
+
+def manual_top_p(logits, p):
+    """Manual reference implementation for top-p"""
+    probs = F.softmax(logits, dim=-1)
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    mask = cumulative_probs <= p
+    # Always keep at least one
+    mask[..., 0] = True
+    keep_indices = torch.zeros_like(logits, dtype=torch.bool)
+    for b in range(logits.shape[0]):
+        for s in range(logits.shape[1]):
+            keep = sorted_indices[b, s][mask[b, s]]
+            keep_indices[b, s, keep] = True
+    return torch.where(
+        keep_indices,
+        logits,
+        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
+    )
+
+
+class TestSamplingUtils(unittest.TestCase):
+    """Test cases for sampling utility functions."""
+
+    def test_top_k_only(self):
+        """Test top-k only sampling"""
+        torch.manual_seed(0)
+        logits = torch.randn(2, 3, 10)
+        k = 4
+        result = apply_top_k_top_p(logits.clone(), top_k=k)
+        expected = manual_top_k(logits, k)
+        self.assertTrue(torch.allclose(result, expected))
+        # Check only k values per row are not -inf
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf == k))
+
+    def test_top_p_only(self):
+        """Test top-p only sampling"""
+        torch.manual_seed(1)
+        logits = torch.randn(2, 3, 10)
+        p = 0.7
+        result = apply_top_k_top_p(logits.clone(), top_p=p)
+
+        # Check that we have at least one non-inf value per position
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf >= 1))
+
+        # Check that probability sums to 1.0
+        result_probs = F.softmax(result, dim=-1)
+        result_sum = result_probs.sum(dim=-1)
+        self.assertTrue(torch.allclose(result_sum, torch.ones_like(result_sum)))
+
+    def test_top_k_and_top_p(self):
+        """Test both top-k and top-p sampling"""
+        torch.manual_seed(2)
+        logits = torch.randn(2, 3, 10)
+        k = 5
+        p = 0.8
+        result = apply_top_k_top_p(logits.clone(), top_k=k, top_p=p)
+
+        # Check basic properties
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf >= 1))
+        self.assertTrue(torch.all(non_inf <= k))
+
+        # Check that probability sums to 1.0
+        result_probs = F.softmax(result, dim=-1)
+        result_sum = result_probs.sum(dim=-1)
+        self.assertTrue(torch.allclose(result_sum, torch.ones_like(result_sum)))
+
+    def test_no_sampling(self):
+        """Test no sampling (should return original logits)"""
+        torch.manual_seed(3)
+        logits = torch.randn(2, 3, 10)
+        result = apply_top_k_top_p(logits.clone())
+        self.assertTrue(torch.allclose(result, logits))
+
+    def test_edge_cases(self):
+        """Test edge cases for sampling parameters"""
+        torch.manual_seed(4)
+        logits = torch.randn(2, 3, 10)
+
+        # k = vocab size (should return original logits)
+        result = apply_top_k_top_p(logits.clone(), top_k=10)
+        self.assertTrue(torch.allclose(result, logits))
+
+        # k = 1 (should keep only one token)
+        result = apply_top_k_top_p(logits.clone(), top_k=1)
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf == 1))
+
+        # p = 1.0 (should return original logits)
+        result = apply_top_k_top_p(logits.clone(), top_p=1.0)
+        self.assertTrue(torch.allclose(result, logits))
+
+        # p = 0.0 (should keep only the highest probability token)
+        result = apply_top_k_top_p(logits.clone(), top_p=0.0)
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf == 1))
+
+        # k > vocab size (should return original logits)
+        result = apply_top_k_top_p(logits.clone(), top_k=20)
+        self.assertTrue(torch.allclose(result, logits))
+
+    def test_gradient_flow(self):
+        """Test that gradients flow through the sampling operations"""
+        torch.manual_seed(5)
+        logits = torch.randn(2, 3, 10, requires_grad=True)
+        result = apply_top_k_top_p(logits, top_k=3, top_p=0.7)
+        loss = result.sum()
+        loss.backward()
+
+        # Check that gradients exist and are non-zero
+        self.assertIsNotNone(logits.grad)
+        self.assertEqual(logits.grad.shape, logits.shape)
+        self.assertTrue(torch.any(logits.grad != 0))
+
+    def test_large_vocab(self):
+        """Test with larger vocabulary size"""
+        torch.manual_seed(6)
+        logits = torch.randn(1, 2, 1000)  # Large vocab
+        k = 50
+        p = 0.9
+
+        result = apply_top_k_top_p(logits.clone(), top_k=k, top_p=p)
+
+        # Check basic properties
+        non_inf = (result != -float("inf")).sum(dim=-1)
+        self.assertTrue(torch.all(non_inf >= 1))
+        self.assertTrue(torch.all(non_inf <= k))
+
+        # Check that probability sums to 1.0
+        result_probs = F.softmax(result, dim=-1)
+        result_sum = result_probs.sum(dim=-1)
+        self.assertTrue(torch.allclose(result_sum, torch.ones_like(result_sum)))
 
 
 class TestConfigureExpandableSegments(unittest.TestCase):
