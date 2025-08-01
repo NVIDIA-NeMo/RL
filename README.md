@@ -413,11 +413,11 @@ uv run python examples/converters/convert_dcp_to_hf.py \
     --hf-ckpt-path results/grpo/hf
 ```
 
-If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation:
+If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires mcore, so make sure to launch with the mcore extra:
 
 ```sh
 # Example for a GRPO checkpoint at step 170
-uv run python examples/converters/convert_megatron_to_hf.py \
+uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
     --config results/grpo/step_170/config.yaml \
     --dcp-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
     --hf-ckpt-path results/grpo/hf
