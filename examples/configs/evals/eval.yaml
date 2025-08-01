@@ -1,9 +1,9 @@
 # Evaluation Configuration
 eval:
-  metric: "pass@k"
+  metric: "pass@k" # pass@k and cons@k are supported
   num_tests_per_prompt: 1 # every prompt will be tested num_tests_per_prompt times and use the average score as the final score
   seed: 42
-  pass_k_value: 1
+  k_value: 1
   save_path: null # Path to save evaluation results and configuration of the evaluation. Set to null to disable saving. Example: "results/eval_output" or "/path/to/evaluation_results"
 
 generation:

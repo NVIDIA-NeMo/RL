@@ -38,6 +38,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
                        similar. This field lets you control this per turn.
     rewards: the rewards for this turn.
     terminateds: whether the episode ended this turn.
+    answers: the answers for this turn.
     """
 
     observations: list[dict[str, str]]
@@ -45,6 +46,7 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     next_stop_strings: list[list[str] | None] | list[None]
     rewards: Tensor
     terminateds: Tensor
+    answers: list[str | None] | None
 
 
 class EnvironmentInterface(abc.ABC, Generic[MetadataT]):
