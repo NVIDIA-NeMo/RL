@@ -133,14 +133,6 @@ def create_megatron_test_config(
     }
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-    yield
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 @pytest.fixture(scope="function")
 def gc_collect():
     """Helper function to force garbage collection after a test"""

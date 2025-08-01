@@ -305,17 +305,6 @@ def test_input_data(tokenizer):
     )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 def test_vllm_missing_required_config_key(cluster):
     """Test that an assertion error is raised when a required config key is missing."""
     # Create a config missing a required key by removing 'model_name'

@@ -342,19 +342,12 @@ def get_hf_tp_plan(model: PreTrainedModel):
     )
 
     # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if (
-        f"{model_prefix}.embed_tokens" not in hf_tp_plan
-        and not model.config.tie_word_embeddings
-    ):
+    if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
     for k, v in hf_tp_plan.items():
         # speed up the tp plan for lm_head
-        if (
-            k == "lm_head"
-            and v == "colwise_rep"
-            and not model.config.tie_word_embeddings
-        ):
+        if k == "lm_head" and v == "colwise_rep":
             hf_tp_plan[k] = ColwiseParallel(
                 output_layouts=Shard(-1), use_local_output=False
             )

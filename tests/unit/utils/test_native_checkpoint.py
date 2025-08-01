@@ -130,17 +130,6 @@ def policy(cluster, tokenizer):
     policy.worker_group.shutdown()
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 def get_dummy_state_dict(state_dict, dummy_dict={}):
     """Recursively get the dummy state dict
     by replacing tensors with random ones of the same shape.
