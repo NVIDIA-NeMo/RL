@@ -8,6 +8,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  overlong_filtering: false
   max_val_samples: 480
   val_batch_size: 32
 

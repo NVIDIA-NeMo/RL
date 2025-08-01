@@ -187,6 +187,30 @@ By multiplying the first term of the loss function by the importance weights $\f
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
+#### Overlong Filtering (overlong_filtering)
+
+When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
+
+The implementation modifies the loss calculation as follows:
+
+For each sample $i$ in the batch:
+- Let $\text{truncated}_i = \begin{cases} 1 & \text{if sample } i \text{ reached max length without EOS} \\ 0 & \text{otherwise} \end{cases}$
+- The sample mask becomes: $\text{sample\_mask}_i = \text{loss\_multiplier}_i \cdot (1 - \text{truncated}_i)$
+
+This results in the effective loss:
+$$L_{\text{effective}} = \sum_{i} \text{sample\_mask}_i \cdot L_i$$
+
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
+
+Configuration:
+```yaml
+grpo:
+  overlong_filtering: false  # default
+```
+
+Set to `true` when training on tasks where truncation at max sequence length is expected (e.g., long-form reasoning, mathematical proofs).
+
+
 ## Metrics ({wandb, tb}_name)
 We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
