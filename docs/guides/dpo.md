@@ -32,129 +32,90 @@ uv run examples/run_dpo.py \
 
 ## Datasets
 
-Each class representing a NeMo RL DPO dataset is expected to have the following attributes:
-1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
+Each DPO dataset class is expected to have the following attributes:
+1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
+```
+{
+    "context": list of dicts, # The prompt message (including previous turns, if any)
+    "completions": list of dicts, # The list of completions
+        {
+            "rank": int, # The rank of the completion (lower rank is preferred)
+            "completion": list of dicts, # The completion message(s)
+        }
+}
+```
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
-DPO datasets are expected to follow a specific format with three key fields:
-- `prompt`: The input prompt/context
-- `chosen_response`: The preferred/winning response
-- `rejected_response`: The non-preferred/losing response
-
-[data/hf_datasets/helpsteer3.py](../../nemo_rl/data/hf_datasets/helpsteer3.py) provides an example of how to format data for DPO:
-
-```python
-def format_helpsteer3(data):
-    response_1 = data["response1"]
-    response_2 = data["response2"]
-    overall_preference = data["overall_preference"]
-
-    if overall_preference < 0:
-        chosen = response_1
-        rejected = response_2
-    elif overall_preference == 0:
-        chosen = response_1
-        rejected = response_1
-    else:
-        chosen = response_2
-        rejected = response_1
-
-    return {
-        "prompt": data["context"],
-        "chosen_response": chosen,
-        "rejected_response": rejected,
-    }
+Currently, DPO training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```
-
-We also provide a [DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class that is compatible with jsonl-formatted preference datsets. This class assumes train and validation datasets have been split and processed into the expected format offline. The jsonl files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
-
-## Adding Custom DPO Datasets
-
-Adding a new DPO dataset is straightforward. Your custom dataset class should:
-1. Implement the required format conversion in the constructor
-2. Set up the appropriate `task_spec`
-
-Here's a minimal example which simply re-keys an existing jsonl dataset:
-
-```{testcode}
-from datasets import load_dataset
-from nemo_rl.data.interfaces import TaskDataSpec
-from docs.helpers import make_dpo_dataset
-
-class CustomDPODataset:
-    def preprocess_dataset(
-        self,
-        data,
-        prompt_key: str = "context",
-        chosen_key: str = "chosen",
-        rejected_key: str = "rejected"
-    ):
-        return {
-            "prompt": data[prompt_key],
-            "chosen_response": data[chosen_key],
-            "rejected_response": data[rejected_key],
+{
+    "context": [
+        {
+            "role": "user",
+            "content": "What's the capital of France?"
+        },
+        {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        },
+        {
+            "role": "user",
+            "content": "Thanks! And what's the capital of Germany?"
         }
-    
-    def __init__(
-        self,
-        train_data_path: str,
-        val_data_path: str,
-        prompt_key: str,
-        chosen_key: str,
-        rejected_key: str,
-    ):
-        # Load and format your dataset
-        fn_kwargs={
-                "prompt_key": prompt_key, 
-                "chosen_key": chosen_key, 
-                "rejected_key": rejected_key
-            }
-        formatted_ds = {
-            "train": load_dataset("json", data_files=train_data_path, split="train").map(
-                self.preprocess_dataset, 
-                fn_kwargs=fn_kwargs,
-            ),
-            "validation": load_dataset("json", data_files=val_data_path, split="train").map(
-                self.preprocess_dataset, 
-                fn_kwargs=fn_kwargs,
-            ),
+    ],
+    "completions": [
+        {
+            "rank": 0,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Berlin."
+                }
+            ]
+        },
+        {
+            "rank": 1,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Munich."
+                }
+            ]
         }
-        
-        # Initialize task spec with dataset name
-        self.task_spec = TaskDataSpec(
-            task_name="custom_dpo",
-        )
-        self.formatted_ds = formatted_ds
-
-# Create temporary files using helper function
-train_file, val_file = make_dpo_dataset()
-
-# Initialize dataset
-dataset = CustomDPODataset(
-    train_data_path=train_file.name,
-    val_data_path=val_file.name,
-    prompt_key="context",
-    chosen_key="chosen",
-    rejected_key="rejected"
-)
-
-# Test dataset properties
-print(f"Task name: {dataset.task_spec.task_name}")
-print(f"Train examples: {len(dataset.formatted_ds['train'])}")
-print(f"Validation examples: {len(dataset.formatted_ds['validation'])}")
-print(f"First train example prompt: {dataset.formatted_ds['train'][0]['prompt']}")
-print(f"First train example chosen response: {dataset.formatted_ds['train'][0]['chosen_response']}")
-print(f"First train example rejected response: {dataset.formatted_ds['train'][0]['rejected_response']}")
+    ]
+}
 ```
 
-```{testoutput}
-Task name: custom_dpo
-Train examples: 2
-Validation examples: 2
-First train example prompt: What is 2+2?
-First train example chosen response: 4
-First train example rejected response: 5
+NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows:
 ```
+data:
+  dataset_name: PreferenceData
+  train_data_path: <LocalPathToTrainingDataset>
+  val_datasets:
+    - dataset_name: PreferenceData
+      val_data_name: <NameOfValidationDataset1>
+      val_data_path: <LocalPathToValidationDataset1>
+    - dataset_name: PreferenceData
+      val_data_name: <NameOfValidationDataset2>
+      val_data_path: <LocalPathToValidationDataset2>
+```
+Note:
+- If you are using a custom preference dataset for training, you must specify a custom preference dataset for validation.
+- If you are using a logger, the prefix used for the custom validation preference dataset will be `validation-<NameOfValidationDataset>`.
+
+When using `HelpSteer3` as the training dataset, the default validation set is also used and logged under the prefix `validation`. You can replace it with a custom preference dataset as follows:
+```
+data:
+  dataset_name: HelpSteer3
+  val_datasets:
+    - dataset_name: PreferenceData
+      val_data_name: validation
+      val_data_path: <LocalPathToValidationDataset>
+```
+
+[DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class is deprecated. This class is also compatible with JSONL-formatted preference datsets. It assumes train and validation datasets have been split and processed into the expected format offline. The JSONL files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 
 ## DPO-Specific Parameters
 

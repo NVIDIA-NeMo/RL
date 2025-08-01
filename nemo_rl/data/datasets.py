@@ -23,10 +23,6 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.data.llm_message_utils import (
-    add_loss_mask_to_message_log,
-    batched_message_log_to_flat_message,
-)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 TokenizerType = PreTrainedTokenizerBase
@@ -241,44 +237,3 @@ def preference_collate_fn(
     )
 
     return batch
-
-
-def dpo_collate_fn(
-    data_batch: list[DPODatumSpec],
-    tokenizer: TokenizerType,
-    make_sequence_length_divisible_by: int,
-) -> BatchedDataDict[Any]:
-    """Collate function for DPO training.
-
-    Args:
-        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
-        tokenizer: Tokenizer for text processing
-        make_sequence_length_divisible_by: Make the sequence length divisible by this value
-
-    Returns:
-        BatchedDataDict with input_ids, input_lengths, token_mask, and sample_mask fields.
-    """
-    batch = preference_collate_fn(data_batch)
-
-    ## add loss mask based on role to every message
-    add_loss_mask_to_message_log(
-        batch["message_log"],
-        only_unmask_final=True,
-    )
-
-    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
-        batch["message_log"],
-        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
-    )
-
-    train_data: BatchedDataDict[Any] = BatchedDataDict(
-        {
-            "input_ids": cat_and_padded["token_ids"],
-            "input_lengths": input_lengths,
-            "token_mask": cat_and_padded["token_loss_mask"],
-            "sample_mask": batch["loss_multiplier"],
-        }
-    )
-
-    return train_data

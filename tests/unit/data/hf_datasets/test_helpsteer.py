@@ -17,7 +17,7 @@ import pytest
 
 from nemo_rl.data.hf_datasets.helpsteer3 import (
     HelpSteer3Dataset,
-    format_helpsteer3,
+    to_preference_data_format,
 )
 
 
@@ -31,7 +31,7 @@ def helpsteer3_dataset():
         yield
 
 
-def test_format_helpsteer3():
+def test_to_preference_data_format():
     """Test the format_helpsteer3 function with different preference values."""
     # Test case 1: response1 is preferred (overall_preference < 0)
     data1 = {
@@ -40,10 +40,12 @@ def test_format_helpsteer3():
         "response2": "I don't know.",
         "overall_preference": -1,
     }
-    result1 = format_helpsteer3(data1)
-    assert result1["prompt"] == "What is 2+2?"
-    assert result1["chosen_response"] == "The answer is 4."
-    assert result1["rejected_response"] == "I don't know."
+    result1 = to_preference_data_format(data1)
+    assert result1["context"] == [{"content": "What is 2+2?", "role": "user"}]
+    assert result1["completions"] == [
+        {"rank": 0, "completion": [{"role": "assistant", "content": "The answer is 4."}]},
+        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]
+    }]
 
     # Test case 2: response2 is preferred (overall_preference > 0)
     data2 = {
@@ -52,10 +54,12 @@ def test_format_helpsteer3():
         "response2": "The capital of France is Paris.",
         "overall_preference": 1,
     }
-    result2 = format_helpsteer3(data2)
-    assert result2["prompt"] == "What is the capital of France?"
-    assert result2["chosen_response"] == "The capital of France is Paris."
-    assert result2["rejected_response"] == "The capital of France is London."
+    result2 = to_preference_data_format(data2)
+    assert result2["context"] == [{"content": "What is the capital of France?", "role": "user"}]
+    assert result2["completions"] == [
+        {"rank": 0, "completion": [{"role": "assistant", "content": "The capital of France is Paris."}]},
+        {"rank": 1, "completion": [{"role": "assistant", "content": "The capital of France is London."}]}
+    ]
 
     # Test case 3: no preference (overall_preference = 0)
     data3 = {
@@ -64,13 +68,36 @@ def test_format_helpsteer3():
         "response2": "The weather is sunny.",
         "overall_preference": 0,
     }
-    result3 = format_helpsteer3(data3)
-    assert result3["prompt"] == "What is the weather like?"
+    result3 = to_preference_data_format(data3)
+    assert result3["context"] == [{"content": "What is the weather like?", "role": "user"}]
     # When preference is 0, neither response is preferred, so
     # response 1 is used for both chosen and rejected
-    assert result3["chosen_response"] == "It's sunny today."
-    assert result3["rejected_response"] == "It's sunny today."
+    assert result3["completions"] == [
+        {"rank": 0, "completion": [{"role": "assistant", "content": "It's sunny today."}]},
+        {"rank": 1, "completion": [{"role": "assistant", "content": "It's sunny today."}]}
+    ]
 
+    # Test case 4: context is a list of dicts
+    data1 = {
+        "context": [
+            {"role": "user", "content": "Can I ask you a question?"},
+            {"role": "assistant", "content": "Sure, what do you want to know?"},
+            {"role": "user", "content": "What is 2+2?"}
+        ],
+        "response1": "4.",
+        "response2": "I don't know.",
+        "overall_preference": -1,
+    }
+    result1 = to_preference_data_format(data1)
+    assert result1["context"] == [
+        {"role": "user", "content": "Can I ask you a question?"},
+        {"role": "assistant", "content": "Sure, what do you want to know?"},
+        {"role": "user", "content": "What is 2+2?"}
+    ]
+    assert result1["completions"] == [
+        {"rank": 0, "completion": [{"role": "assistant", "content": "4."}]},
+        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]
+    }]
 
 def test_helpsteer3_dataset_initialization(helpsteer3_dataset):
     """Test that HelpSteer3Dataset initializes correctly."""
@@ -96,6 +123,5 @@ def test_helpsteer3_dataset_data_format(helpsteer3_dataset):
 
     # Verify data format
     sample = dataset.formatted_ds["train"][0]
-    assert "prompt" in sample
-    assert "chosen_response" in sample
-    assert "rejected_response" in sample
+    assert "context" in sample
+    assert "completions" in sample

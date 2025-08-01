@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import defaultdict
 import os
 import warnings
 from pathlib import Path
@@ -98,12 +99,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset,
+    val_dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader,
+    StatefulDataLoader | dict[str, StatefulDataLoader],
     PreferenceLoss,
     MasterConfig,
     Logger,
@@ -156,13 +157,18 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    val_dataloader = StatefulDataLoader(
-        val_dataset,
-        batch_size=rm_config["val_global_batch_size"],
-        shuffle=False,
-        collate_fn=preference_collate_fn,
-        drop_last=True,
-    )
+    if not isinstance(val_dataset, dict):
+        val_dataset = {"validation": val_dataset}
+
+    val_dataloader = {
+        k: StatefulDataLoader(
+            v,
+            batch_size=rm_config["val_global_batch_size"],
+            shuffle=False,
+            collate_fn=preference_collate_fn,
+            drop_last=True,
+        ) for k, v in val_dataset.items()
+    }
 
     # ==========================
     #          Cluster
@@ -220,17 +226,40 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
+    val_dataloader: StatefulDataLoader | dict[str, StatefulDataLoader],
+    tokenizer,
+    loss_fn,
+    step: int,
+    master_config: MasterConfig,
+    val_batches: int,
+    val_batch_size: int,
+    val_mbs: int,
+    logger: Logger,
+):
+    for k, v in val_dataloader.items():
+        k_val_metrics, k_validation_timings = validate_one_dataset(policy, v, tokenizer, loss_fn, step, master_config, val_batches, val_batch_size, val_mbs)
+        if k == "validation":
+            prefix = "validation"
+        else:
+            prefix = f"validation-{k}"
+
+        logger.log_metrics(k_val_metrics, step, prefix=prefix)
+        logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
+    return None, None
+
+
+def validate_one_dataset(
+    policy: PolicyInterface,
     val_dataloader: StatefulDataLoader,
     tokenizer,
     loss_fn,
     step: int,
     master_config: MasterConfig,
-    rm_task_spec: TaskDataSpec,
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
 ):
-    """Run validation on the validation dataset."""
+    """Run validation on one validation dataset."""
     if val_dataloader is None:
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
@@ -243,7 +272,7 @@ def validate(
         # Show a progress indicator for validation
         # val_total = len(val_dataloader)
 
-        list_of_val_metrics = []
+        dict_val_metrics = defaultdict(list)
 
         num_valid_batches = 0
 
@@ -289,21 +318,12 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                list_of_val_metrics.append(
-                    RMValMetrics(
-                        val_loss=sum(val_results["all_mb_metrics"]["loss"]),
-                        accuracy=sum(val_results["all_mb_metrics"]["accuracy"]),
-                        rewards_chosen_mean=sum(
-                            val_results["all_mb_metrics"]["rewards_chosen_mean"]
-                        ),
-                        rewards_rejected_mean=sum(
-                            val_results["all_mb_metrics"]["rewards_rejected_mean"]
-                        ),
-                        num_valid_samples=sum(
-                            val_results["all_mb_metrics"]["num_valid_samples"]
-                        ),
-                    )
-                )
+                sum_num_valid_samples = sum(val_results["all_mb_metrics"]["num_valid_samples"])
+                for k in ["loss", "accuracy", "rewards_chosen_mean", "rewards_rejected_mean"]:
+                    dict_val_metrics[k if k != "loss" else "val_loss"] += [
+                        value * sum_num_valid_samples for value in val_results["all_mb_metrics"][k]
+                    ]
+                dict_val_metrics["num_valid_samples"] += val_results["all_mb_metrics"]["num_valid_samples"]
 
                 num_valid_batches += 1
 
@@ -311,39 +331,18 @@ def validate(
                 break
 
         if num_valid_batches > 0:
-            sum_num_valid_samples = sum(
-                [m["num_valid_samples"] for m in list_of_val_metrics]
-            )
+            assert len(dict_val_metrics["val_loss"]) == len(dict_val_metrics["accuracy"]) \
+            == len(dict_val_metrics["rewards_chosen_mean"]) == len(dict_val_metrics["rewards_rejected_mean"]) \
+            == len(dict_val_metrics["num_valid_samples"])
+
+            sum_num_valid_samples = sum(dict_val_metrics["num_valid_samples"])
             val_metrics = RMValMetrics(
-                val_loss=sum(
-                    [
-                        m["val_loss"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                accuracy=sum(
-                    [
-                        m["accuracy"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                rewards_chosen_mean=sum(
-                    [
-                        m["rewards_chosen_mean"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
-                rewards_rejected_mean=sum(
-                    [
-                        m["rewards_rejected_mean"] * m["num_valid_samples"]
-                        for m in list_of_val_metrics
-                    ]
-                )
-                / sum_num_valid_samples,
                 num_valid_samples=sum_num_valid_samples,
+                **{
+                    k: sum([value * weight for value, weight in zip(dict_val_metrics[k], dict_val_metrics["num_valid_samples"])])
+                    / sum_num_valid_samples
+                    for k in ["val_loss", "accuracy", "rewards_chosen_mean", "rewards_rejected_mean"]
+                }
             )
         else:
             warnings.warn(
@@ -432,14 +431,11 @@ def rm_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            rm_task_spec=rm_task_spec,
             val_batches=rm_config["val_batches"],
             val_batch_size=rm_config["val_global_batch_size"],
             val_mbs=rm_config["val_micro_batch_size"],
+            logger=logger,
         )
-
-        logger.log_metrics(val_metrics, total_steps, prefix="validation")
-        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
     policy.prepare_for_training()
 
@@ -512,16 +508,10 @@ def rm_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        rm_task_spec=rm_task_spec,
                         val_batches=rm_config["val_batches"],
                         val_batch_size=rm_config["val_global_batch_size"],
                         val_mbs=rm_config["val_micro_batch_size"],
-                    )
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
+                        logger=logger,
                     )
 
                 ## Checkpointing
