@@ -64,6 +64,7 @@ class ClippedPGLossFn(LossFunction):
     - PPO (Clipped) - https://arxiv.org/abs/1707.06347
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
+    - GSPO (set sequence_level_importance_sampling = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -110,10 +111,14 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_sampling",
             False,
         )
-
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
+        # FIXME(pjin): sequence-level importance sampling must be exclusive to token-level loss.
+        if False and self.sequence_level_importance_sampling:
+            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
+                "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
 
     def __call__(
         self,
@@ -214,7 +219,19 @@ class ClippedPGLossFn(LossFunction):
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if not self.disable_ppo_ratio:
-            ratios = (curr_logprobs - prev_logprobs).exp()
+            log_ratios = curr_logprobs - prev_logprobs
+            if self.sequence_level_importance_sampling:
+                # NB(pjin): this masked mean is only "sequence level" when micro batch size = 1.
+                assert micro_batch_size == 1
+                seq_log_ratio = masked_mean(
+                    log_ratios,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+                seq_ratio = seq_log_ratio.exp()
+                ratios = seq_ratio.repeat(advantages.shape[0], advantages.shape[1])
+            else:
+                ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
                 1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
             )
@@ -256,9 +273,9 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
-
+        actor_importance_weights = actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
-            importance_weights_to_use = actor_importance_weights_expanded
+            importance_weights_to_use = actor_importance_weights
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
