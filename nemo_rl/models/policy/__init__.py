@@ -151,6 +151,7 @@ class PolicyConfig(TypedDict):
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
     max_grad_norm: NotRequired[Union[float, int]]
+    drop_last_validation: NotRequired[bool]
     refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig]
     scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones]
