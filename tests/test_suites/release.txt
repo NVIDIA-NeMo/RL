@@ -11,17 +11,23 @@ tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long.v3.sh
 # Long Gemma3 27b run
 tests/test_suites/llm/grpo-gemma3-27b-it-16n8g-fsdp2tp8sp-actckpt-long.sh
 
+# Long Megatron Qwen3 30B-A3B run
+tests/test_suites/llm/grpo-qwen3-30ba3b-16n8g-megatron.sh
+
 #######
 # SFT #
 #######
 
 # Long 8b convergence
-tests/test_suites/llm/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long.v2.sh
+tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-long.sh
+
+# 300 step 70b convergence
+tests/test_suites/llm/sft-llama3.1-70b-8n8g-tp4pp2-long-megatron.sh
 
 #######
 # DPO #
 #######
 
 # Long 8b convergence
-tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1.v2.sh
-tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.sh
+tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp4.sh
+tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.sh
