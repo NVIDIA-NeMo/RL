@@ -40,6 +40,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -70,6 +71,7 @@ def hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
+    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
@@ -88,6 +90,7 @@ def hf_data_processor(
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
+        **chat_template_kwargs,
     )
     user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
     user_message["content"] = message
@@ -117,6 +120,7 @@ def hf_data_processor(
 
 def setup_data(
     tokenizer: TokenizerType,
+    tokenizer_config: TokenizerConfig,
     data_config: DataConfig,
     env_configs: dict[str, Any],
 ) -> tuple[
@@ -160,6 +164,7 @@ def setup_data(
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
+        tokenizer_config.get("chat_template_kwargs", {}),
         math_task_spec,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
@@ -170,6 +175,7 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
+            tokenizer_config.get("chat_template_kwargs", {}),
             math_task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
@@ -217,7 +223,8 @@ def main() -> None:
     init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer_config = config["policy"]["tokenizer"]
+    tokenizer = get_tokenizer(tokenizer_config)
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
@@ -231,7 +238,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, tokenizer_config, config["data"], config["env"])
 
     (
         policy,
