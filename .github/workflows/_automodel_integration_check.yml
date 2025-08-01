@@ -1,0 +1,215 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Automodel Integration Check"
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        required: true
+        type: string
+        description: "Target branch to check against"
+      head_ref:
+        required: true
+        type: string
+        description: "Feature branch name"
+      pr_number:
+        required: true
+        type: string
+        description: "Pull request number"
+      head_sha:
+        required: true
+        type: string
+        description: "Head commit SHA of the feature branch"
+
+jobs:
+  check:
+    name: Check parallel plans synchronization
+    runs-on: ubuntu-latest
+    outputs:
+      needs_attention: ${{ steps.check.outputs.needs_attention }}
+      comment_body: ${{ steps.check.outputs.comment_body }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Fetch target branch reference
+        run: |
+          git fetch origin ${{ inputs.base_ref }}
+      
+      - name: Check parallel plans sync status
+        id: check
+        shell: bash -x -e {0}
+        run: |
+          echo "Checking if parallel plan files are synchronized..."
+          
+          # Define the file paths
+          PARALLELIZE_FILE="nemo_rl/models/dtensor/parallelize.py"
+          OPTIMIZED_TP_PLANS_FILE="3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/optimized_tp_plans.py"
+          
+          needs_attention=0
+          comment_body=""
+          
+          # Check if parallelize.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${PARALLELIZE_FILE}$"; then
+            echo "✅ Found changes in ${PARALLELIZE_FILE}"
+            parallelize_changed=1
+          else
+            echo "ℹ️  No changes found in ${PARALLELIZE_FILE}"
+            parallelize_changed=0
+          fi
+          
+          # Check if optimized_tp_plans.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${OPTIMIZED_TP_PLANS_FILE}$"; then
+            echo "✅ Found changes in ${OPTIMIZED_TP_PLANS_FILE}"
+            optimized_tp_plans_changed=1
+          else
+            echo "ℹ️  No changes found in ${OPTIMIZED_TP_PLANS_FILE}"
+            optimized_tp_plans_changed=0
+          fi
+          
+          # Check if both files exist
+          if [[ ! -f "$PARALLELIZE_FILE" ]]; then
+            echo "⚠️  Warning: ${PARALLELIZE_FILE} does not exist"
+          fi
+          
+          if [[ ! -f "$OPTIMIZED_TP_PLANS_FILE" ]]; then
+            echo "⚠️  Warning: ${OPTIMIZED_TP_PLANS_FILE} does not exist"
+          fi
+          
+          # Analyze the relationship between the changes
+          if [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 0 ]]; then
+            echo "❌ parallelize.py was modified but optimized_tp_plans.py was not updated"
+            needs_attention=1
+            comment_body+="### ⚠️  Parallel Plans Synchronization Warning"$'\n\n'
+            comment_body+="The file \`${PARALLELIZE_FILE}\` was modified in this PR, but \`${OPTIMIZED_TP_PLANS_FILE}\` was not updated."$'\n\n'
+            comment_body+="**Why this matters:**"$'\n'
+            comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
+            comment_body+="**Action required:**"$'\n'
+            comment_body+="- Please review if the changes in \`${PARALLELIZE_FILE}\` should also be applied to \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
+            comment_body+="- Update \`${OPTIMIZED_TP_PLANS_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
+            comment_body+="**Files to check:**"$'\n'
+            comment_body+="- Modified: \`${PARALLELIZE_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n\n'
+            
+          elif [[ $parallelize_changed -eq 0 && $optimized_tp_plans_changed -eq 1 ]]; then
+            echo "❌ optimized_tp_plans.py was modified but parallelize.py was not updated"
+            needs_attention=1
+            comment_body+="### ⚠️  Parallel Plans Synchronization Warning"$'\n\n'
+            comment_body+="The file \`${OPTIMIZED_TP_PLANS_FILE}\` was modified in this PR, but \`${PARALLELIZE_FILE}\` was not updated."$'\n\n'
+            comment_body+="**Why this matters:**"$'\n'
+            comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
+            comment_body+="**Action required:**"$'\n'
+            comment_body+="- Please review if the changes in \`${OPTIMIZED_TP_PLANS_FILE}\` should also be applied to \`${PARALLELIZE_FILE}\`"$'\n'
+            comment_body+="- Update \`${PARALLELIZE_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
+            comment_body+="**Files to check:**"$'\n'
+            comment_body+="- Modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${PARALLELIZE_FILE}\`"$'\n\n'
+            
+          elif [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 1 ]]; then
+            echo "✅ Both parallel plan files were modified"
+            comment_body+="### ✅ Parallel Plans Synchronization Check"$'\n\n'
+            comment_body+="Both parallel plan files were modified in this PR:"$'\n'
+            comment_body+="- \`${PARALLELIZE_FILE}\`"$'\n'
+            comment_body+="- \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n\n'
+            comment_body+="Please ensure that the changes are consistent between both files where applicable."$'\n\n'
+            
+          else
+            echo "ℹ️  No parallel plan files were modified in this PR"
+            # Don't set comment_body in this case to avoid unnecessary comments
+          fi
+          
+          # Additional check: Compare specific functions that should be similar
+          if [[ $parallelize_changed -eq 1 || $optimized_tp_plans_changed -eq 1 ]]; then
+            echo ""
+            echo "📊 Performing content analysis..."
+            
+            # Check if both files have the critical functions
+            functions_to_check=("_parallelize_gemma3" "_parallelize_llama" "_parallelize_qwen" "RotaryEmbedParallel")
+            
+            for func in "${functions_to_check[@]}"; do
+              if [[ -f "$PARALLELIZE_FILE" ]] && grep -q "$func" "$PARALLELIZE_FILE"; then
+                parallelize_has_func=1
+              else
+                parallelize_has_func=0
+              fi
+              
+              if [[ -f "$OPTIMIZED_TP_PLANS_FILE" ]] && grep -q "$func" "$OPTIMIZED_TP_PLANS_FILE"; then
+                optimized_has_func=1
+              else
+                optimized_has_func=0
+              fi
+              
+              if [[ $parallelize_has_func -eq 1 && $optimized_has_func -eq 0 ]]; then
+                echo "⚠️  Function $func exists in parallelize.py but not in optimized_tp_plans.py"
+              elif [[ $parallelize_has_func -eq 0 && $optimized_has_func -eq 1 ]]; then
+                echo "⚠️  Function $func exists in optimized_tp_plans.py but not in parallelize.py"
+              elif [[ $parallelize_has_func -eq 1 && $optimized_has_func -eq 1 ]]; then
+                echo "✅ Function $func exists in both files"
+              fi
+            done
+          fi
+          
+          # Set outputs
+          echo "needs_attention=$needs_attention" >> $GITHUB_OUTPUT
+          if [[ -n "$comment_body" ]]; then
+            echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+            echo "$comment_body" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          
+          if [[ $needs_attention -eq 1 ]]; then
+            echo ""
+            echo "⚠️  Parallel plans synchronization needs attention"
+            echo "Please review the changes and ensure both files are properly synchronized"
+          else
+            echo ""
+            echo "✅ Parallel plans synchronization check completed"
+          fi
+
+  comment:
+    name: Comment on PR
+    needs: [check]
+    runs-on: ubuntu-latest
+    if: always() && needs.check.outputs.comment_body != ''
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needsAttention = '${{ needs.check.outputs.needs_attention }}' === '1';
+            const title = needsAttention ? 
+              '## ⚠️  Parallel Plans Synchronization Check' : 
+              '## ℹ️  Parallel Plans Synchronization Check';
+            
+            const commentBody = `${title}
+            
+            **Check based on commit:** ${{ inputs.head_sha }} (PR #${{ inputs.pr_number }} from \`${{ inputs.head_ref }}\`)
+            
+            ${{ needs.check.outputs.comment_body }}
+            
+            ---
+            <sub>This check ensures that parallel plan implementations remain synchronized across the codebase. If you believe this warning is incorrect or the files should intentionally differ, please add a comment explaining the reasoning.</sub>`;
+            
+            await github.rest.issues.createComment({
+              issue_number: ${{ inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
