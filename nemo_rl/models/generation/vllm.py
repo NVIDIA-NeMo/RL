@@ -1360,6 +1360,8 @@ class VllmGeneration(GenerationInterface):
         ) * self.sharding_annotations.get_axis_size("pipeline_parallel")
 
         # non-colocated needs to use PACK strategy to avoid uneven node_bundles
+        # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
+        # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
         strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
 
         # Determine if we need cross-node model parallelism
