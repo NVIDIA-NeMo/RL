@@ -222,6 +222,7 @@ class ClippedPGLossFn(LossFunction):
             log_ratios = curr_logprobs - prev_logprobs
             if self.sequence_level_importance_sampling:
                 # NB(pjin): this masked mean is only "sequence level" when micro batch size = 1.
+                micro_batch_size = int(advantages.shape[0])
                 assert micro_batch_size == 1
                 seq_log_ratio = masked_mean(
                     log_ratios,
@@ -229,7 +230,7 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=global_valid_toks,
                 )
                 seq_ratio = seq_log_ratio.exp()
-                ratios = seq_ratio.repeat(advantages.shape[0], advantages.shape[1])
+                ratios = seq_ratio.repeat(micro_batch_size, advantages.shape[1])
             else:
                 ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
