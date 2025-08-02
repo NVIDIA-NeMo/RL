@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 from datetime import datetime
 
 import pytest
@@ -123,6 +124,30 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     config = {
         "name": "meta-llama/Llama-3.2-1B-Instruct",
         "chat_template": custom_template,
+    }
+    tokenizer = get_tokenizer(config)
+
+    # Verify that the custom template is used
+    formatted = tokenizer.apply_chat_template(conversation_messages, tokenize=False)
+    expected = get_format_with_simple_role_header(conversation_messages)
+    assert formatted == expected
+
+
+@pytest.mark.hf_gated
+def test_get_tokenizer_custom_jinja_template_from_file(conversation_messages):
+    """Test get_tokenizer when a custom jinja template is specified as a file path"""
+    custom_template = COMMON_CHAT_TEMPLATES.simple_role_header
+
+    # Create a temporary file with the template
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jinja", delete=False
+    ) as temp_file:
+        temp_file.write(custom_template)
+        temp_file_path = temp_file.name
+
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "chat_template": temp_file_path,
     }
     tokenizer = get_tokenizer(config)
 
