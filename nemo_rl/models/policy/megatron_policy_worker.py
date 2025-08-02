@@ -979,6 +979,8 @@ class MegatronPolicyWorker:
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor(
                 mb_metrics["grad_norm"][-1]

@@ -806,6 +806,20 @@ def grpo_train(
         print(
             f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
         )
+        if "total_flops" in train_results:
+            total_tflops = (
+                train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+            )
+            num_ranks = train_results["num_ranks"]
+            print(
+                f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+            )
+            if "theoretical_tflops" in train_results:
+                theoretical_tflops = train_results["theoretical_tflops"]
+                print(
+                    f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                )
+                metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
 
         print("\n⏱️  Timing:")
         # Display total time first, separately
