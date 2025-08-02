@@ -300,7 +300,9 @@ def dpo_collate_fn(
     return train_data
 
 
-def assert_start_with_single_bos(token_ids: list[int], tokenizer: TokenizerType) -> None:
+def assert_start_with_single_bos(
+    token_ids: list[int], tokenizer: TokenizerType
+) -> None:
     """Assert that the first token is a BOS token and the second token is not a BOS token.
 
     Args:
