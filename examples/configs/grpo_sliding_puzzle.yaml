@@ -4,8 +4,10 @@ defaults: "grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
-  max_rollout_turns: 50 # Maximum turns allowed per rollout
-  max_num_steps: 10000
+  max_rollout_turns: 30 # Maximum turns allowed per rollout
+  max_num_steps: 200
+  val_at_start: true
+  max_val_samples: 1024
 
 checkpointing:
   enabled: true
@@ -17,7 +19,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 3072
+  max_total_sequence_length: 512
 
   generation:
     backend: "vllm"
@@ -43,9 +45,9 @@ env:
   sliding_puzzle_game:
     cfg:
       game_config:
-        size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 15 # Number of random moves to shuffle the solved state
-      max_moves: 50 # Maximum moves allowed per episode
+        size: 4 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
+        shuffle_moves: 8 # Number of random moves to shuffle the solved state
+      max_moves: 30 # Maximum moves allowed per episode
 
 logger:
   log_dir: "logs"  # Base directory for all logs
