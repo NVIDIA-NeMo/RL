@@ -19,7 +19,8 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
 cd $PROJECT_ROOT
-uv run $PROJECT_ROOT/examples/run_grpo_math.py \
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_grpo_math.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
     policy.model_name=Qwen/Qwen2.5-0.5B \
     grpo.num_prompts_per_step=2 \
