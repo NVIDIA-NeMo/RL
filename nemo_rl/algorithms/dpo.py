@@ -36,7 +36,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class DPOSaveState(TypedDict):
@@ -364,6 +364,11 @@ def dpo_train(
 ) -> None:
     # Run dpo training
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
 
     if dpo_save_state is None:
         dpo_save_state = _default_dpo_save_state()
@@ -465,11 +470,20 @@ def dpo_train(
                 dpo_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if master_config["checkpointing"]["enabled"] and (
+                timeout.mark_iteration()
+
+                should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
-                ):  # +1 because step is 0-indexed
+                )
+                # +1 because step is 0-indexed
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     dpo_save_state["total_steps"] = total_steps + 1
                     dpo_save_state["epoch"] = current_epoch

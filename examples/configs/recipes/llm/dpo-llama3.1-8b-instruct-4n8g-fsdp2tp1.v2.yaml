@@ -21,6 +21,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10000
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"

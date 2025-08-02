@@ -65,7 +65,7 @@ from nemo_rl.utils.logger import (
     print_message_log_samples,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 # ===============================================================================
 # Configuration
@@ -487,6 +487,12 @@ def grpo_train(
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
@@ -707,10 +713,19 @@ def grpo_train(
 
             ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
-            if master_config["checkpointing"]["enabled"] and (
+            timeout.mark_iteration()
+
+            should_save_by_step = (
                 is_last_step
                 or (step + 1) % master_config["checkpointing"]["save_period"] == 0
-            ):  # +1 because step is 0-indexed
+            )
+            # +1 because step is 0-indexed
+            # Check if timeout-based checkpointing is enabled in config.
+            should_save_by_timeout = timeout.check_save()
+
+            if master_config["checkpointing"]["enabled"] and (
+                should_save_by_step or should_save_by_timeout
+            ):
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1

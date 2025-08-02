@@ -28,6 +28,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 10
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA-NeMo/RL/issues/227)

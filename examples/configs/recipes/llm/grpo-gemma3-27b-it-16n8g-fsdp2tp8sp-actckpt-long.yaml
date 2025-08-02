@@ -24,6 +24,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 policy:
   model_name: google/gemma-3-27b-it
   tokenizer:
