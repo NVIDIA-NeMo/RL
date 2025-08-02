@@ -122,8 +122,10 @@ class AllTaskProcessedDataset:
             first_message = datum_spec["message_log"][0]
             if "token_ids" in first_message:
                 token_ids = first_message["token_ids"]
-                if isinstance(token_ids, torch.Tensor):
-                    assert_start_with_single_bos(token_ids, self.tokenizer)
+                assert isinstance(token_ids, torch.Tensor), (
+                    f"token_ids must be a torch.Tensor, got {type(token_ids)}"
+                )
+                assert_start_with_single_bos(token_ids, self.tokenizer)
             self._bos_checked = True
 
         return datum_spec
