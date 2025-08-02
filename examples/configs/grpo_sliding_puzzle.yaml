@@ -38,6 +38,7 @@ policy:
 
 data:
   add_system_prompt: false
+  shuffle: false  # disable dataloader shuffle, shuffle is handled within the dataset
 
 env:
   sliding_puzzle_game:

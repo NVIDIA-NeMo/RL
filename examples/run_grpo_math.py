@@ -119,6 +119,7 @@ def setup_data(
     tokenizer: TokenizerType,
     data_config: DataConfig,
     env_configs: dict[str, Any],
+    seed: int,
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],
@@ -135,12 +136,12 @@ def setup_data(
     # Load OpenMathInstruct2Dataset using nemo rl datasets
     if data_config["dataset_name"] == "OpenMathInstruct-2":
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
-        data: Any = OpenMathInstruct2Dataset()
+        data: Any = OpenMathInstruct2Dataset(seed=seed)
     elif data_config["dataset_name"] == "DeepScaler":
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
-        data: Any = DeepScalerDataset()
+        data: Any = DeepScalerDataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
@@ -231,7 +232,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
 
     (
         policy,

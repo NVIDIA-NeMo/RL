@@ -106,6 +106,7 @@ policy:
 data:
   dataset_name: "HelpSteer3"
   max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
 
 logger:
   log_dir: "logs"

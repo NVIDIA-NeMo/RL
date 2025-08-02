@@ -29,7 +29,7 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
 from nemo_rl.data.interfaces import (
@@ -149,12 +149,16 @@ def setup(
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
     grpo_config = master_config["grpo"]
+    data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+
+    # Set seed for all random number generators
+    set_seed(grpo_config["seed"])
 
     # ==========================
     #         Logger
@@ -179,7 +183,7 @@ def setup(
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
-        shuffle=False,
+        shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
     )

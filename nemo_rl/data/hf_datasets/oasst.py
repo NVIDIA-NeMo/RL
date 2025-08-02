@@ -123,8 +123,8 @@ def download_and_process_oasst(
 
 
 class OasstDataset:
-    def __init__(self, output_dir: str = ".") -> None:
-        self.formatted_ds = download_and_process_oasst(output_dir)
+    def __init__(self, output_dir: str = ".", seed: int = 42) -> None:
+        self.formatted_ds = download_and_process_oasst(output_dir, seed)
         self.task_spec = TaskDataSpec(
             task_name="OASST",
         )

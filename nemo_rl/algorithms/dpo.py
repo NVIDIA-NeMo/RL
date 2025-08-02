@@ -152,7 +152,7 @@ def setup(
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
-        shuffle=True,
+        shuffle=data_config["shuffle"],
         collate_fn=partial(
             dpo_collate_fn,
             tokenizer=tokenizer,

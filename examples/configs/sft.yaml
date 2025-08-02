@@ -132,6 +132,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+  shuffle: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
