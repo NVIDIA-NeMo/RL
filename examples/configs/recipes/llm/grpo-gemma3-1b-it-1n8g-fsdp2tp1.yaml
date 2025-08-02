@@ -108,6 +108,7 @@ logger:
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
+  swanlab_enabled: false # Disable SwanLab logging
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
