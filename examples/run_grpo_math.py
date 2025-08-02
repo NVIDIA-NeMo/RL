@@ -89,7 +89,16 @@ def hf_data_processor(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
+    # add bos token if not in chat template
+    bos_token_in_chat_template = tokenizer.chat_template.startswith(
+        "{{- bos_token }}"
+    ) or tokenizer.chat_template.startswith("{{ bos_token }}")
+
+    user_message["token_ids"] = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=not bos_token_in_chat_template,
+    )["input_ids"][0]
     user_message["content"] = message
     message_log.append(user_message)
 
