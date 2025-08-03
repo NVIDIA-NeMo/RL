@@ -63,6 +63,7 @@ class AllTaskProcessedDataset:
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.max_seq_length = max_seq_length
+        self._bos_checked = False
 
         if isinstance(task_data_processors, dict):
             # apply defaults to all task data specs
@@ -111,6 +112,22 @@ class AllTaskProcessedDataset:
         datum_spec = task_data_processor(
             entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
         )
+
+        # Check the first processed item for BOS token assertion
+        if (
+            not self._bos_checked
+            and "message_log" in datum_spec
+            and datum_spec["message_log"]
+        ):
+            first_message = datum_spec["message_log"][0]
+            if "token_ids" in first_message:
+                token_ids = first_message["token_ids"]
+                assert isinstance(token_ids, torch.Tensor), (
+                    f"token_ids must be a torch.Tensor, got {type(token_ids)}"
+                )
+                assert_start_with_single_bos(token_ids, self.tokenizer)
+            self._bos_checked = True
+
         return datum_spec
 
 
@@ -282,3 +299,28 @@ def dpo_collate_fn(
     )
 
     return train_data
+
+
+def assert_start_with_single_bos(
+    token_ids: torch.Tensor, tokenizer: TokenizerType
+) -> None:
+    """Assert that the first token is a BOS token and the second token is not a BOS token.
+
+    Args:
+        token_ids: List of token IDs
+        tokenizer: Tokenizer
+    """
+    if tokenizer.bos_token_id is not None:
+        token_ids_list = token_ids.tolist()
+        if len(token_ids_list) > 0:
+            assert token_ids_list[0] == tokenizer.bos_token_id, (
+                f"Expected BOS token at the start of the message, but got {token_ids_list[0]}"
+            )
+        if len(token_ids_list) > 1:
+            assert token_ids_list[1] != tokenizer.bos_token_id, (
+                f"Expected non-BOS token at the second position of the message, but got {token_ids_list[1]}"
+            )
+    else:
+        print(
+            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
+        )
