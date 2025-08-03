@@ -149,7 +149,7 @@ jobs:
               ((missing_count++))
             fi
           done
-          
+
           exit $missing_count
       - name: Minimize uv cache
         run: uv cache prune --ci
@@ -173,93 +173,78 @@ jobs:
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}
 
-  tests:
-    name: Tests
-    needs: [build-container, pre-flight]
-    uses: ./.github/workflows/_run_test.yml
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    with:
-      RUNNER: self-hosted-azure
-      TIMEOUT: 180
-      UNIT_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --hf-gated
-          uv run --extra mcore bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
-        else
-          echo Skipping unit tests for docs-only level
-        fi
-      DOC_TEST_SCRIPT: |
-        cd /opt/nemo-rl/docs
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(docs|L0|L1|L2)$ ]]; then
-          uv run --no-sync sphinx-build -b doctest . _build/doctest
-        else
-          echo Skipping doc tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      FUNCTIONAL_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L1|L2)$ ]]; then
-          time uv run --no-sync bash ./tests/functional/sft.sh
-          time uv run --no-sync bash ./tests/functional/grpo.sh
-          time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-          time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
-          time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-          time uv run --no-sync bash ./tests/functional/dpo.sh
-          time uv run --no-sync bash ./tests/functional/rm.sh
-          time uv run --no-sync bash ./tests/functional/eval.sh
-          time uv run --no-sync bash ./tests/functional/eval_async.sh
-          time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
-        else
-          echo Skipping functional tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      # TODO: enable once we have convergence tests in CI
-      #CONVERGENCE_TEST_SCRIPT: |
-      #  cd /opt/nemo-rl
-      #  if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L2)$  ]]; then
-      #    echo "Running convergence tests"
-      #    # Add your convergence test commands here
-      #    # uv run --no-sync bash ./tests/convergence/test.sh
-      #  else
-      #    echo "Skipping convergence tests for level ${{ needs.pre-flight.outputs.test_level }}"
-      #  fi
-      AFTER_SCRIPT: |
-        cd /opt/nemo-rl
-        cat <<EOF | tee -a $GITHUB_STEP_SUMMARY
-        # Test Summary for level: ${{ needs.pre-flight.outputs.test_level }}
-
-        ## Unit test results
-        \`\`\`json
-        $(if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then cat tests/unit/unit_results.json || echo "n/a"; else echo "Not run"; fi)
-        \`\`\`
-
-        ## Test Level: ${{ needs.pre-flight.outputs.test_level }}
-        EOF
-    secrets:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-  coverage:
-    name: Upload coverage to Codecov
-    needs: [tests]
-    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
-    runs-on: ubuntu-latest
+  cicd-doc-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: Docs_Tests
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container]
+    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    environment: nemo-ci
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Download coverage artifact
-        uses: actions/download-artifact@v4
+      - name: main
+        uses: ./.github/actions/test-template
         with:
-          name: unit-test-coverage-report
-          path: .
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          is_doc_test: "true"
 
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+  cicd-unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L0_Unit_Tests_Generation
+            runner: self-hosted-azure
+          - script: L0_Unit_Tests_Policy
+            runner: self-hosted-azure
+          - script: L0_Unit_Tests_Other
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container, cicd-doc-tests]
+    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.script }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.json
-          flags: unit-tests
-          verbose: true
-          override_branch: ${{ github.event_name == 'merge_group' && 'main' || '' }}
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          is_unit_test: "true"
+          cpu-only: ${{ matrix.cpu-only || false }}
+
+  cicd-functional-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L1_Functional_Tests_GPU
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container, cicd-unit-tests]
+    runs-on: ${{ matrix.runner }}
+    if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
+    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    environment: nemo-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
 
   CI_QA_Gate:
     name: CI quality check
@@ -269,7 +254,9 @@ jobs:
       - pre-flight
       - lint-check
       - sphinx-build
-      - tests
+      - cicd-doc-tests
+      - cicd-unit-tests
+      - cicd-functional-tests
     steps:
       - name: main
         env:
@@ -283,7 +270,13 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success'
+                  (
+                    (
+                      (needs.cicd-doc-tests.result == 'skipped' || needs.cicd-doc-tests.result == 'success') &&
+                      (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
+                      (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success')
+                    )
+                  )
                 )
               )
             }}
@@ -300,6 +293,73 @@ jobs:
           fi
 
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
+
+  Coverage:
+    runs-on: ubuntu-latest
+    needs:
+      - CI_QA_Gate
+      - cicd-doc-tests
+      - cicd-unit-tests
+      - cicd-functional-tests
+    if: always()
+    strategy:
+      matrix:
+        flag: [doc-test, unit-test, e2e]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download coverage reports of current branch
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-${{ matrix.flag }}-*
+
+      - name: Check if artifacts were downloaded
+        id: check-artifacts
+        run: |
+          # Check if any coverage directories were downloaded
+          if ls coverage-* 1> /dev/null 2>&1; then
+            echo "artifacts-found=true" >> $GITHUB_OUTPUT
+            echo "Found coverage artifacts for ${{ matrix.flag }}"
+          else
+            echo "artifacts-found=false" >> $GITHUB_OUTPUT
+            echo "No coverage artifacts found for ${{ matrix.flag }}"
+          fi
+
+      - name: Get total coverage of current branch
+        shell: bash -x -e -u -o pipefail {0}
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        run: |
+          pip install coverage
+
+          ls -al .
+          ls -al coverage-*/
+          coverage combine --keep $(ls coverage-*/.coverage)
+          coverage report -i --show-missing
+          rm -rf coverage-*
+          ls -al
+
+      - name: Skip coverage processing
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
+        run: |
+          echo "No coverage artifacts found for ${{ matrix.flag }}, skipping coverage processing"
+
+      - name: Upload coverage reports to Codecov
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          flags: ${{ matrix.flag }}
+
+      - name: Upload artifacts
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.flag }}-aggregated
+          path: |
+            .coverage
+          include-hidden-files: true
 
   DCO_merge_group:
     name: DCO
