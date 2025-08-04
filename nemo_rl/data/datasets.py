@@ -125,7 +125,7 @@ class AllTaskProcessedDataset:
                 assert isinstance(token_ids, torch.Tensor), (
                     f"token_ids must be a torch.Tensor, got {type(token_ids)}"
                 )
-                assert_start_with_single_bos(token_ids, self.tokenizer)
+                assert_no_double_bos(token_ids, self.tokenizer)
             self._bos_checked = True
 
         return datum_spec
@@ -301,10 +301,8 @@ def dpo_collate_fn(
     return train_data
 
 
-def assert_start_with_single_bos(
-    token_ids: torch.Tensor, tokenizer: TokenizerType
-) -> None:
-    """Assert that the first token is a BOS token and the second token is not a BOS token.
+def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
+    """Assert that there are no double starting BOS tokens in the message.
 
     Args:
         token_ids: List of token IDs
@@ -312,14 +310,11 @@ def assert_start_with_single_bos(
     """
     if tokenizer.bos_token_id is not None:
         token_ids_list = token_ids.tolist()
-        if len(token_ids_list) > 0:
-            assert token_ids_list[0] == tokenizer.bos_token_id, (
-                f"Expected BOS token at the start of the message, but got {token_ids_list[0]}"
-            )
         if len(token_ids_list) > 1:
-            assert token_ids_list[1] != tokenizer.bos_token_id, (
-                f"Expected non-BOS token at the second position of the message, but got {token_ids_list[1]}"
-            )
+            assert not (
+                token_ids_list[0] == tokenizer.bos_token_id
+                and token_ids_list[1] == tokenizer.bos_token_id
+            ), "Found double BOS token in the first two positions of the message."
     else:
         print(
             f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
