@@ -23,9 +23,9 @@ from nemo_rl.utils.logger import (
     Logger,
     MLflowLogger,
     RayGpuMonitorLogger,
+    SwanlabLogger,
     TensorboardLogger,
     WandbLogger,
-    SwanlabLogger,
     flatten_dict,
     print_message_log_samples,
 )
@@ -1519,7 +1519,12 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
     def test_init_all_loggers(
-        self, mock_swanlab_logger, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
+        self,
+        mock_swanlab_logger,
+        mock_mlflow_logger,
+        mock_tb_logger,
+        mock_wandb_logger,
+        temp_dir,
     ):
         """Test initialization with all loggers enabled."""
         cfg = {
@@ -1551,7 +1556,12 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
     def test_log_metrics_with_mlflow(
-        self, mock_swanlab_logger, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
+        self,
+        mock_swanlab_logger,
+        mock_mlflow_logger,
+        mock_tb_logger,
+        mock_wandb_logger,
+        temp_dir,
     ):
         """Test logging metrics to all enabled loggers including MLflow."""
         cfg = {
@@ -1595,7 +1605,12 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.MLflowLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
     def test_log_hyperparams_with_mlflow(
-        self, mock_swanlab_logger, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
+        self,
+        mock_swanlab_logger,
+        mock_mlflow_logger,
+        mock_tb_logger,
+        mock_wandb_logger,
+        temp_dir,
     ):
         """Test logging hyperparameters to all enabled loggers including MLflow."""
         cfg = {

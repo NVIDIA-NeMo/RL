@@ -28,9 +28,9 @@ from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 import mlflow
 import ray
 import requests
+import swanlab
 import torch
 import wandb
-import swanlab
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
