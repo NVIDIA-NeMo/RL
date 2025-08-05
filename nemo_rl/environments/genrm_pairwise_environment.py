@@ -47,8 +47,8 @@ class GenRMPairwiseConfig(TypedDict):
     max_concurrency: Optional[int]  # Maximum concurrent step calls for the environment actor
     reasoning_split_word: Optional[str]  # Default: "</think>"
     # Reward aggregation configuration
-    aggregator_method: Optional[str]  # e.g., "win_rate", "weighted_win_loss", "elo_rating", etc.
-    aggregator_config: Optional[Dict[str, Any]]  # Additional config for the aggregator (e.g., k_factor for Elo)
+    aggregator_method: Optional[str]  # e.g., "individual_scores", "weighted_win_loss", "simple_tiebreaker", etc.
+    aggregator_config: Optional[Dict[str, Any]]  # Additional config for the aggregator
 
 
 class GenRMEnvironmentMetadata(TypedDict):
@@ -291,7 +291,7 @@ class GenRMPairwiseEnvironment(EnvironmentInterface):
         self.num_generations_per_prompt = cfg["num_generations_per_prompt"]
         
         # Initialize the reward aggregator
-        aggregator_method = cfg.get("aggregator_method", "win_rate")  # Default to win_rate
+        aggregator_method = cfg.get("aggregator_method", "simple_tiebreaker")  # Default to simple_tiebreaker
         aggregator_config = cfg.get("aggregator_config", {})
         self.reward_aggregator = create_aggregator(aggregator_method, **aggregator_config)
         logging.info(f"Initialized GenRM environment with {self.reward_aggregator.name} aggregator")
@@ -522,70 +522,3 @@ class GenRMPairwiseEnvironment(EnvironmentInterface):
             metrics.update(self._last_additional_metrics)
 
         return batch, metrics
-
-
-# # Example configurations for different aggregator methods
-# EXAMPLE_CONFIGS = {
-#     "win_rate": {
-#         "aggregator_method": "win_rate",
-#         "aggregator_config": {}
-#     },
-    
-#     "weighted_win_loss": {
-#         "aggregator_method": "weighted_win_loss", 
-#         "aggregator_config": {
-#             "score_mapping": {1: 1.0, 2: 0.75, 3: 0.6, 4: 0.4, 5: 0.25, 6: 0.0}
-#         }
-#     },
-    
-#     "elo_rating": {
-#         "aggregator_method": "elo_rating",
-#         "aggregator_config": {
-#             "k_factor": 32.0,
-#             "initial_rating": 1500.0
-#         }
-#     },
-    
-#     "individual_scores": {
-#         "aggregator_method": "individual_scores",
-#         "aggregator_config": {
-#             "score_range": (1.0, 5.0)
-#         }
-#     },
-    
-#     "combined": {
-#         "aggregator_method": "combined",
-#         "aggregator_config": {
-#             "alpha": 0.3,  # 30% individual scores, 70% pairwise
-#             "individual_range": (1.0, 5.0)
-#         }
-#     },
-    
-#     "bradley_terry": {
-#         "aggregator_method": "bradley_terry",
-#         "aggregator_config": {
-#             "max_iterations": 100,
-#             "tolerance": 1e-6
-#         }
-#     }
-# }
-
-
-# def get_aggregator_config(method: str) -> Dict[str, Any]:
-#     """Get example configuration for a specific aggregator method.
-    
-#     Args:
-#         method: Aggregator method name (e.g., "weighted_win_loss", "elo_rating")
-        
-#     Returns:
-#         Dictionary with aggregator_method and aggregator_config fields
-        
-#     Raises:
-#         ValueError: If method is not supported
-#     """
-#     if method not in EXAMPLE_CONFIGS:
-#         available = list(EXAMPLE_CONFIGS.keys())
-#         raise ValueError(f"Unknown aggregator method: {method}. Available: {available}")
-    
-#     return EXAMPLE_CONFIGS[method].copy()
-

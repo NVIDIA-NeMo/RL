@@ -164,7 +164,7 @@ env:
     reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor
     # Reward aggregation configuration
-    aggregator_method: "win_rate" # Options: "win_rate", "weighted_win_loss", "elo_rating", "individual_scores", "combined", "bradley_terry"
+    aggregator_method: "simple_tiebreaker" # Options: "weighted_win_loss", "simple_tiebreaker", "individual_scores"
     # aggregator_config: # Additional config for the aggregator
     #   score_mapping: # Mapping from ranking scores (1-6) to weighted points for weighted_win_loss
     #     1: 1.0    # Much better

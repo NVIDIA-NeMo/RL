@@ -68,97 +68,6 @@ class PairwiseRewardAggregator(ABC):
         pass
 
 
-class WinRateAggregator(PairwiseRewardAggregator):
-    """Current approach: Binary win-loss converted to win rates."""
-    
-    def aggregate_scores(
-        self,
-        comparison_results: List[Tuple[str, float, float, float]],
-        comparison_metadata: List[Tuple[str, int, int]],
-        prompt_groups: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, List[float]]:
-        """Aggregate using binary win-loss counting."""
-        
-        # Initialize win counts for each response group
-        win_counts = {}
-        total_comparisons = {}
-        
-        for prompt_key, group_data in prompt_groups.items():
-            num_responses = len(group_data["conversations"])
-            win_counts[prompt_key] = [0 for _ in range(num_responses)]
-            total_comparisons[prompt_key] = [0 for _ in range(num_responses)]
-        
-        # Process each comparison result
-        for (request_id, score_1, score_2, ranking_score), (prompt_key, resp_i, resp_j) in zip(
-            comparison_results, comparison_metadata
-        ):
-            # Convert ranking score to binary win/loss
-            # Ranking scores: 1-3 means response_1 is better, 4-6 means response_2 is better
-            if ranking_score <= 3.0:
-                win_counts[prompt_key][resp_i] += 1
-            else:
-                win_counts[prompt_key][resp_j] += 1
-                
-            # Update total comparisons for both responses
-            total_comparisons[prompt_key][resp_i] += 1
-            total_comparisons[prompt_key][resp_j] += 1
-        
-        # Calculate final scores as win rates
-        final_scores = {}
-        for prompt_key, group_data in prompt_groups.items():
-            num_responses = len(group_data["conversations"])
-            final_scores[prompt_key] = []
-            for resp_idx in range(num_responses):
-                if total_comparisons[prompt_key][resp_idx] > 0:
-                    win_rate = win_counts[prompt_key][resp_idx] / total_comparisons[prompt_key][resp_idx]
-                else:
-                    win_rate = 0.5  # Neutral score if no comparisons
-                final_scores[prompt_key].append(win_rate)
-            
-        return final_scores
-    
-    def get_additional_metrics(
-        self,
-        comparison_results: List[Tuple[str, float, float, float]],
-        comparison_metadata: List[Tuple[str, int, int]],
-        prompt_groups: Dict[str, Dict[str, Any]],
-        final_scores: Dict[str, List[float]]
-    ) -> Dict[str, float]:
-        """Compute individual score metrics alongside the win-rate scores."""
-        
-        # Collect individual scores for metrics
-        all_individual_scores = []
-        all_ranking_scores = []
-        
-        # Process each comparison result to extract individual scores
-        for (request_id, score_1, score_2, ranking_score), (prompt_key, resp_i, resp_j) in zip(
-            comparison_results, comparison_metadata
-        ):
-            all_individual_scores.extend([score_1, score_2])
-            all_ranking_scores.append(ranking_score)
-        
-        # Compute statistics for individual scores
-        individual_metrics = {}
-        if all_individual_scores:
-            individual_metrics.update({
-                "mean_individual_score": np.mean(all_individual_scores),
-                "std_individual_score": np.std(all_individual_scores),
-                "min_individual_score": np.min(all_individual_scores),
-                "max_individual_score": np.max(all_individual_scores),
-            })
-        
-        if all_ranking_scores:
-            individual_metrics.update({
-                "mean_ranking_score": np.mean(all_ranking_scores),
-                "std_ranking_score": np.std(all_ranking_scores),
-            })
-        
-        return individual_metrics
-    
-    @property
-    def name(self) -> str:
-        return "win_rate"
-
 
 class IndividualScoreAggregator(PairwiseRewardAggregator):
     """Use GenRM's individual helpfulness scores directly."""
@@ -333,53 +242,6 @@ class WeightedWinLossAggregator(PairwiseRewardAggregator):
         return "weighted_win_loss"
 
 
-class CombinedAggregator(PairwiseRewardAggregator):
-    """Combine individual scores with pairwise rankings."""
-    
-    def __init__(self, alpha: float = 0.5, individual_range: Tuple[float, float] = (1.0, 5.0)):
-        """
-        Args:
-            alpha: Weight for individual component (1-alpha for pairwise component)
-            individual_range: (min_score, max_score) for individual score normalization
-        """
-        self.alpha = alpha
-        self.individual_aggregator = IndividualScoreAggregator(individual_range)
-        self.pairwise_aggregator = WeightedWinLossAggregator()
-    
-    def aggregate_scores(
-        self,
-        comparison_results: List[Tuple[str, float, float, float]],
-        comparison_metadata: List[Tuple[str, int, int]],
-        prompt_groups: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, List[float]]:
-        """Aggregate using combined individual + pairwise approach."""
-        
-        # Get scores from both methods
-        individual_scores = self.individual_aggregator.aggregate_scores(
-            comparison_results, comparison_metadata, prompt_groups
-        )
-        pairwise_scores = self.pairwise_aggregator.aggregate_scores(
-            comparison_results, comparison_metadata, prompt_groups
-        )
-        
-        # Combine the scores
-        final_scores = {}
-        for prompt_key in prompt_groups.keys():
-            combined = []
-            for i in range(len(individual_scores[prompt_key])):
-                individual_component = individual_scores[prompt_key][i]
-                pairwise_component = pairwise_scores[prompt_key][i]
-                combined_score = self.alpha * individual_component + (1 - self.alpha) * pairwise_component
-                combined.append(combined_score)
-            final_scores[prompt_key] = combined
-        
-        return final_scores
-    
-    @property
-    def name(self) -> str:
-        return f"combined_alpha_{self.alpha}"
-
-
 
 class SimpleTiebreakerAggregator(PairwiseRewardAggregator):
     """Use individual scores primarily, with simple ranking-based tiebreaking when scores are equal.
@@ -518,10 +380,8 @@ class SimpleTiebreakerAggregator(PairwiseRewardAggregator):
 def create_aggregator(method: str, **kwargs) -> PairwiseRewardAggregator:
     """Create a reward aggregator by name."""
     aggregators = {
-        "win_rate": WinRateAggregator,
         "individual_scores": IndividualScoreAggregator,
         "weighted_win_loss": WeightedWinLossAggregator,
-        "combined": CombinedAggregator,
         "simple_tiebreaker": SimpleTiebreakerAggregator,
     }
     
@@ -529,35 +389,3 @@ def create_aggregator(method: str, **kwargs) -> PairwiseRewardAggregator:
         raise ValueError(f"Unknown aggregation method: {method}. Available: {list(aggregators.keys())}")
     
     return aggregators[method](**kwargs)
-
-
-# Example usage and comparison
-def compare_aggregation_methods(
-    comparison_results: List[Tuple[str, float, float, float]],
-    comparison_metadata: List[Tuple[str, int, int]],
-    prompt_groups: Dict[str, Dict[str, Any]]
-) -> Dict[str, Dict[str, List[float]]]:
-    """Compare different aggregation methods on the same data."""
-    
-    methods = [
-        ("win_rate", {}),
-        ("individual_scores", {}),
-        ("elo_rating", {"k_factor": 32}),
-        ("weighted_win_loss", {}),
-        ("combined", {"alpha": 0.3}),
-        ("bradley_terry", {}),
-        ("simple_tiebreaker", {}),
-    ]
-    
-    results = {}
-    for method_name, kwargs in methods:
-        try:
-            aggregator = create_aggregator(method_name, **kwargs)
-            scores = aggregator.aggregate_scores(comparison_results, comparison_metadata, prompt_groups)
-            results[aggregator.name] = scores
-            logging.info(f"Successfully computed scores using {aggregator.name}")
-        except Exception as e:
-            logging.error(f"Error with {method_name}: {e}")
-            results[method_name] = None
-    
-    return results 
