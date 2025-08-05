@@ -73,6 +73,8 @@ def test_math_data_processor():
         "Qwen/Qwen2.5-1.5B-Instruct",  # no bos token
         "google/gemma-3-1b-it",
         "Qwen/Qwen3-0.6B",  # no bos token
+        "deepseek-ai/DeepSeek-V3",
+        "moonshotai/Moonlight-16B-A3B-Instruct",
     ],
 )
 @pytest.mark.parametrize(
