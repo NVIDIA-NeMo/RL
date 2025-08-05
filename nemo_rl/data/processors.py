@@ -64,7 +64,7 @@ def math_data_processor(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
+    user_message["token_ids"] = tokenizer(message, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
     user_message["content"] = message
     message_log.append(user_message)
 
