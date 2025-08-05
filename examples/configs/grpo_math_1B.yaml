@@ -20,6 +20,8 @@ loss_fn:
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
   token_level_loss: true
+  # see https://arxiv.org/pdf/2506.09477
+  use_correct_grad_kl: false
 
 checkpointing:
   enabled: true
