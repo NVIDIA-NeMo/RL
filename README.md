@@ -105,41 +105,37 @@ sudo apt-get update
 sudo apt-get install cudnn-cuda-12
 ```
 
-Install `uv`.
+For faster setup and environment isolation, we use [uv](https://docs.astral.sh/uv/).
+Follow [these instructions](https://docs.astral.sh/uv/getting-started/installation/) to install uv.
+
+Then, initialize NeMo RL project virtual environment via:
 ```sh
-# For faster setup and environment isolation, we use `uv`
-pip install uv
-
-# Initialize NeMo RL project virtual environment
-# NOTE: Please do not use -p/--python and instead allow uv venv to read it from .python-version
-#       This ensures that the version of python used is always what we prescribe.
 uv venv
-
-# If working outside a container, it can help to build flash-attn and warm the
-# uv cache before your first run. The NeMo RL Dockerfile will warm the uv cache
-# with flash-attn. See https://docs.nvidia.com/nemo/rl/latest/docker.html for
-# instructions if you are looking for the NeMo RL container.
-bash tools/build-flash-attn-in-uv-cache.sh
-# If sucessful, you should see "✅ flash-attn successfully added to uv cache"
-
-# If you cannot install at the system level, you can install for your user with
-# pip install --user uv
-
-# Use `uv run` to launch all commands. It handles pip installing implicitly and
-# ensures your environment is up to date with our lock file.
-
-# Note that it is not recommended to activate the venv and instead use `uv run` since
-# it ensures consistent environment usage across different shells and sessions.
-# Example: uv run python examples/run_grpo_math.py
 ```
+> [!NOTE]
+> Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
+> This ensures that the version of python used is always what we prescribe.
 
-**Important Notes:**
+If working outside a container, it can help to build [flash-attn](https://github.com/Dao-AILab/flash-attention) and warm the uv cache before your first run.
+```sh
+bash tools/build-flash-attn-in-uv-cache.sh
+```
+> [!NOTE]
+> On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache dir making subsequent installs much quicker.
 
-- Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
-- Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
-- On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your `uv`'s cache dir making subsequent installs much quicker.
-- If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
-- **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+> [!TIP]
+> The NeMo RL Dockerfile will warm the uv cache with flash-attn.
+> See https://docs.nvidia.com/nemo/rl/latest/docker.html for instructions if you are looking for the NeMo RL container.
+
+If sucessful, you should see `✅ flash-attn successfully added to uv cache`.
+
+Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
+> [!NOTE]
+> - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
+>   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo_math.py`
+> - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
+> - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
+> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 ## Training Backends
 
