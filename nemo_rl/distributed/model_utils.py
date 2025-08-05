@@ -17,6 +17,64 @@ from typing import Any, Optional
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
+from nemo_rl.models.policy.utils import apply_top_k_top_p
+
+
+def _compute_distributed_log_softmax_with_sampling(
+    vocab_parallel_logits: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> torch.Tensor:
+    """Compute distributed log softmax with sampling in one optimized pass.
+
+    Since we need to all-gather for sampling anyway, we compute the global
+    statistics directly instead of re-sharding and calling distributed functions.
+
+    Args:
+        vocab_parallel_logits: Logits tensor with shape [batch_size, seq_length, vocab_size//TP]
+        group: Process group for distributed communication
+        top_k: Top-k sampling parameter (scalar)
+        top_p: Top-p sampling parameter (scalar)
+
+    Returns:
+        Log softmax output with sampling applied, same shape as input
+    """
+    if (top_k is not None and top_k == -1) and (top_p is not None and top_p == 1.0):
+        return _compute_distributed_log_softmax(vocab_parallel_logits, group)
+
+    # 1. All-gather logits to get full vocabulary on each worker
+    world_size = torch.distributed.get_world_size(group)
+    gathered_logits: list[torch.Tensor] = [
+        torch.empty_like(vocab_parallel_logits) for _ in range(world_size)
+    ]
+    torch.distributed.all_gather(gathered_logits, vocab_parallel_logits, group=group)
+    full_logits = torch.cat(gathered_logits, dim=-1)
+
+    # 2. Apply sampling on full vocabulary (if needed)
+    full_logits = apply_top_k_top_p(full_logits, top_k=top_k, top_p=top_p)
+
+    # 3. Compute global statistics directly (no need for all-reduce since we have full vocab)
+    logits_max = torch.amax(full_logits, dim=-1, keepdim=True)
+
+    # 4. Subtract the maximum value for numerical stability
+    full_logits = full_logits - logits_max
+
+    # 5. Compute sum of exponentials (no all-reduce needed)
+    sum_exp_logits = full_logits.exp().sum(-1, keepdim=True).float()
+
+    # 6. Get the start and end indices for the current rank
+    vocab_size_per_rank = full_logits.size(-1) // world_size
+    rank = torch.distributed.get_rank(group)
+    start_idx = rank * vocab_size_per_rank
+    end_idx = (rank + 1) * vocab_size_per_rank
+
+    # 7. Calculate the log_softmax for the vocab_parallel_logits
+    # The returned tensor has the same shape as the input partition for this rank
+    return full_logits[..., start_idx:end_idx] - sum_exp_logits.log_().to(
+        full_logits.dtype
+    )
+
 
 @torch.no_grad()
 def _compute_distributed_log_softmax(
@@ -71,15 +129,24 @@ class DistributedLogprob(torch.autograd.Function):
         vocab_end_index: int,
         group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> torch.Tensor:
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target - vocab_start_index
         masked_target[target_mask] = 0
 
-        log_softmax_output = _compute_distributed_log_softmax(
-            vocab_parallel_logits, group=group
-        )
+        # Use sampling-aware distributed log softmax if sampling parameters are provided
+        if (top_k is not None and top_k != -1) or (top_p is not None and top_p != 1.0):
+            log_softmax_output = _compute_distributed_log_softmax_with_sampling(
+                vocab_parallel_logits, group=group, top_k=top_k, top_p=top_p
+            )
+        else:
+            log_softmax_output = _compute_distributed_log_softmax(
+                vocab_parallel_logits, group=group
+            )
+
         log_probs = log_softmax_output.clone()
         softmax_output = log_softmax_output.exp_()
 
@@ -102,7 +169,7 @@ class DistributedLogprob(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         softmax, target_mask, masked_target = ctx.saved_tensors
 
@@ -138,7 +205,7 @@ class DistributedLogprob(torch.autograd.Function):
             grad_input.mul_(grad_output.unsqueeze(-1))
 
         # if you add an argument to the forward method, then you must add a corresponding None here
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None, None
 
 
 def dtensor_from_parallel_logits_to_logprobs(
@@ -149,11 +216,13 @@ def dtensor_from_parallel_logits_to_logprobs(
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     seq_index: Optional[torch.Tensor] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
     Args:
-        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
+        vocab_parallel_logits (torch.Tensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
         target (DTensor): Target token indices with shape [batch_size, seq_len].
             NOTE: Must be the unmodified targets as this function will shift them internally.
@@ -163,6 +232,8 @@ def dtensor_from_parallel_logits_to_logprobs(
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         seq_index (Optional[torch.Tensor]): Sequence index tensor with shape [seq_len].
             It is only provided for cp sharded logits. It represents how tensor is sharded across the sequence dimension.
+        top_k (int, optional): Top-k sampling parameter.
+        top_p (float, optional): Top-p (nucleus) sampling parameter.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -201,6 +272,8 @@ def dtensor_from_parallel_logits_to_logprobs(
         vocab_end_index,
         tp_group,
         inference_only,
+        top_k,
+        top_p,
     ).contiguous()
 
     if cp_size > 1:
@@ -221,6 +294,8 @@ def from_parallel_logits_to_logprobs(
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -234,6 +309,8 @@ def from_parallel_logits_to_logprobs(
         tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
+        top_k (int, optional): Top-k sampling parameter.
+        top_p (float, optional): Top-p (nucleus) sampling parameter.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -261,6 +338,8 @@ def from_parallel_logits_to_logprobs(
         vocab_end_index,
         tp_group,
         inference_only,
+        top_k,
+        top_p,
     ).contiguous()
 
     if cp_size > 1:
@@ -285,6 +364,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -301,6 +382,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         group (torch.distributed.ProcessGroup): Process group for distributed communication.
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
+        top_k (int, optional): Top-k sampling parameter.
+        top_p (float, optional): Top-p (nucleus) sampling parameter.
 
     Returns:
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
@@ -341,6 +424,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         vocab_end_index,
         group,
         inference_only,
+        top_k,
+        top_p,
     ).contiguous()
 
     # Remove batch dimension for filtering
