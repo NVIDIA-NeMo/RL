@@ -28,7 +28,7 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset, preference_collate_fn
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -154,7 +154,7 @@ def setup(
         batch_size=policy_config["train_global_batch_size"],
         shuffle=True,
         collate_fn=partial(
-            dpo_collate_fn,
+            preference_collate_fn,
             tokenizer=tokenizer,
             make_sequence_length_divisible_by=policy_config[
                 "make_sequence_length_divisible_by"
@@ -169,19 +169,24 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    val_dataloader = StatefulDataLoader(
-        val_dataset,
-        batch_size=dpo_config["val_global_batch_size"],
-        shuffle=False,
-        collate_fn=partial(
-            dpo_collate_fn,
-            tokenizer=tokenizer,
-            make_sequence_length_divisible_by=policy_config[
-                "make_sequence_length_divisible_by"
-            ],
-        ),
-        drop_last=True,
-    )
+    if not isinstance(val_dataset, dict):
+        val_dataset = {"validation": val_dataset}
+
+    val_dataloader = {
+        k: StatefulDataLoader(
+            v,
+            batch_size=dpo_config["val_global_batch_size"],
+            shuffle=False,
+            collate_fn=partial(
+                preference_collate_fn,
+                tokenizer=tokenizer,
+                make_sequence_length_divisible_by=policy_config[
+                    "make_sequence_length_divisible_by"
+                ],
+            ),
+            drop_last=True,
+        ) for k, v in val_dataset.items()
+    }
 
     # ==========================
     #          Cluster
@@ -234,7 +239,7 @@ def setup(
     )
 
 
-def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
+def add_ref_logprobs_to_data(dataloader, policy, master_config, tokenizer, is_val=False):
     dataloader_iter = iter(dataloader)
     while True:
         try:
@@ -266,6 +271,36 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
 # =======================================================
 def validate(
     policy: PolicyInterface,
+    val_dataloader: StatefulDataLoader | dict[str, StatefulDataLoader],
+    tokenizer,
+    loss_fn,
+    step: int,
+    master_config: MasterConfig,
+    val_batches: int,
+    val_batch_size: int,
+    val_mbs: int,
+    logger: Logger,
+):
+    val_metrics, validation_timings = {}, {}
+    for k, v in val_dataloader.items():
+        k_val_metrics, k_validation_timings = validate_one_dataset(policy, v, tokenizer, loss_fn, step, master_config, val_batches, val_batch_size, val_mbs, k)
+        if k == "validation":
+            prefix = "val"
+        else:
+            prefix = f"{k}-val"
+
+        logger.log_metrics(k_val_metrics, step, prefix=prefix)
+        logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
+
+        val_metrics[prefix+"_loss"] = k_val_metrics["val_loss"]
+        val_metrics[prefix+"_accuracy"] = k_val_metrics["accuracy"]
+        validation_timings[prefix+"_total_validation_time"] = k_validation_timings["total_validation_time"]
+
+    return val_metrics, validation_timings
+
+
+def validate_one_dataset(
+    policy: PolicyInterface,
     val_dataloader: StatefulDataLoader,
     tokenizer,
     loss_fn,
@@ -274,6 +309,7 @@ def validate(
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
+    dataset_name: str,
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -288,7 +324,7 @@ def validate(
         val_metrics = defaultdict(lambda: 0.0)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(
-            add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
+            add_ref_logprobs_to_data(val_dataloader, policy, master_config, tokenizer, is_val=True)
         ):
             ## just run model fwd
             val_results = policy.train(
@@ -336,12 +372,12 @@ def validate(
 
     else:
         # Print summary of validation results
-        print("\n📊 Validation Results:")
+        print(f"\n📊 Validation Results for `{dataset_name}` set:")
         print(f"    • Validation loss: {float(val_metrics['loss']):.4f}")
         print(f"    • Validation accuracy: {float(val_metrics['accuracy']):.4f}")
 
         # Print timing information
-        print("\n  ⏱️  Validation Timing:")
+        print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
         validation_time = timing_metrics.get("total_validation_time", 0)
         print(f"    • Total validation time: {validation_time:.2f}s")
 
@@ -394,14 +430,12 @@ def dpo_train(
             val_batches=dpo_config["val_batches"],
             val_batch_size=dpo_config["val_global_batch_size"],
             val_mbs=dpo_config["val_micro_batch_size"],
+            logger=logger,
         )
         if validation_result is not None:
             val_metrics, validation_timings = validation_result
         else:
             val_metrics, validation_timings = None, None
-
-        logger.log_metrics(val_metrics, total_steps, prefix="validation")
-        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
     policy.prepare_for_training()
 
@@ -411,7 +445,7 @@ def dpo_train(
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
-        for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config):
+        for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config, tokenizer):
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
             )
@@ -449,17 +483,12 @@ def dpo_train(
                         val_batches=dpo_config["val_batches"],
                         val_batch_size=dpo_config["val_global_batch_size"],
                         val_mbs=dpo_config["val_micro_batch_size"],
+                        logger=logger,
                     )
                     if validation_result is not None:
                         val_metrics, validation_timings = validation_result
                     else:
                         val_metrics, validation_timings = None, None
-                    logger.log_metrics(
-                        validation_timings, total_steps + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(
-                        val_metrics, total_steps + 1, prefix="validation"
-                    )
 
                 ## Checkpointing
                 dpo_save_state["consumed_samples"] += master_config["policy"][
@@ -474,7 +503,7 @@ def dpo_train(
                     dpo_save_state["total_steps"] = total_steps + 1
                     dpo_save_state["epoch"] = current_epoch
                     if val_metrics is not None:
-                        dpo_save_state["val_loss"] = val_metrics["loss"]
+                        dpo_save_state.update(val_metrics)
                     elif "val_loss" in dpo_save_state:
                         del dpo_save_state["val_loss"]
 

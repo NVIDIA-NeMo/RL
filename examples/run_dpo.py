@@ -69,9 +69,11 @@ def dpo_preprocessor(
         >>> task_spec = TaskDataSpec(task_name="test_dpo")
         >>>
         >>> datum = {
-        ...     "prompt": "What is 2+2?",
-        ...     "chosen_response": "4",
-        ...     "rejected_response": "5"
+        ...     "context": [{"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
         ... }
         >>>
         >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
@@ -84,11 +86,13 @@ def dpo_preprocessor(
         >>> processed["message_log_rejected"][-1]["content"]
         '5<|eot_id|>'
         >>>
-        >>> # prompt can also be a list with multiple messages
+        >>> # context can also contain multiple turns
         >>> datum = {
-        ...     "prompt": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
-        ...     "chosen_response": "4",
-        ...     "rejected_response": "5"
+        ...     "context": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
         ... }
         >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
         >>> len(processed["message_log_chosen"])
@@ -102,36 +106,18 @@ def dpo_preprocessor(
 
         ```
     """
-    if isinstance(datum_dict["prompt"], list):
-        messages_chosen = datum_dict["prompt"].copy()
-        messages_rejected = datum_dict["prompt"].copy()
+    assert len(datum_dict["completions"]) == 2
+    # Lower rank is preferred
+    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][0]
+        rejected_completion = datum_dict["completions"][1]
+    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][1]
+        rejected_completion = datum_dict["completions"][0]
     else:
-        messages_chosen = [
-            {
-                "role": "user",
-                "content": datum_dict["prompt"],
-            },
-        ]
-        messages_rejected = [
-            {
-                "role": "user",
-                "content": datum_dict["prompt"],
-            },
-        ]
-
-    messages_chosen.append(
-        {
-            "role": "assistant",
-            "content": datum_dict["chosen_response"],
-        },
-    )
-
-    messages_rejected.append(
-        {
-            "role": "assistant",
-            "content": datum_dict["rejected_response"],
-        },
-    )
+        raise NotImplementedError("Ties are not supported yet.")
+    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
+    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 
     message_log_chosen = get_formatted_message_log(
         messages_chosen, tokenizer, task_data_spec
@@ -173,16 +159,35 @@ def dpo_preprocessor(
 
 def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
     print("\n▶ Setting up data...")
+    data_cls = data_config["dataset_name"]
 
-    if data_config["dataset_name"] == "HelpSteer3":
+    if data_cls == "PreferenceDataset":
+        data_path = data_config["train_data_path"]
+        data = hf_datasets.PreferenceDataset(data_path, split="train")
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = None
+        print(
+            f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples."
+        )
+    elif data_cls == "HelpSteer3":
         data = hf_datasets.HelpSteer3Dataset()
-    else:
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = data.formatted_ds["validation"]
+        print(
+            f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
+        )
+    elif data_cls == "DPODataset":
         data = hf_datasets.DPODataset(
             train_data_path=data_config["train_data_path"],
             val_data_path=data_config["val_data_path"],
         )
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = data.formatted_ds["validation"]
+        print(
+            f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
+        )
+    else:
+        raise ValueError(f"Unknown dataset class: {data_cls}")
 
     dpo_task_spec = data.task_spec
 
@@ -195,16 +200,48 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = AllTaskProcessedDataset(
-        val_dataset,
-        tokenizer,
-        dpo_task_spec,
-        dpo_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    val_dataset = {
+        "validation": AllTaskProcessedDataset(
+            val_dataset,
+            tokenizer,
+            dpo_task_spec,
+            dpo_preprocessor,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+    } if val_dataset else {}
+
+    if data_cls == "PreferenceDataset":
+        if data_config.get("val_data_path"):
+            assert data_config.get("val_data_paths") is None, "val_data_path and val_data_paths cannot be used together"
+            val_data_paths = [{"validation": data_config.get("val_data_path")}]
+
+        elif data_config.get("val_data_paths"):
+            assert isinstance(data_config["val_data_paths"], list), f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
+            val_data_paths = data_config.get("val_data_paths")
+
+        else:
+            raise ValueError("Either val_data_path or val_data_paths must be provided")
+
+        for d in val_data_paths:
+            assert len(d) == 1, "val_data_paths must be a list of <val_dataset_name: val_dataset_path> pairs."
+            val_dataset_name = list(d.keys())[0]
+            val_dataset_path = list(d.values())[0]
+            assert val_dataset_name not in val_dataset or val_dataset_name == "validation" # Users can override the default "validation" set
+            if val_dataset_name == "validation" and "validation" in val_dataset:
+                print(f"  ✓ Overriding the default validation dataset")
+            val_data = hf_datasets.PreferenceDataset(val_dataset_path, split="validation")
+            print(
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds["validation"])} samples."
+            )
+            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
+                val_data.formatted_ds["validation"],
+                tokenizer,
+                val_data.task_spec,
+                dpo_preprocessor,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
 
     return train_dataset, val_dataset, tokenizer, dpo_task_spec
-
 
 def main():
     """Main entry point."""

@@ -19,7 +19,7 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def format_helpsteer3(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
+def to_preference_data_format(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
     response_1 = data["response1"]
     response_2 = data["response2"]
     overall_preference = data["overall_preference"]
@@ -40,9 +40,11 @@ def format_helpsteer3(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
         rejected = response_1
 
     return {
-        "prompt": data["context"],
-        "chosen_response": chosen,
-        "rejected_response": rejected,
+        "context": [{"role": "user", "content": data["context"]}] if isinstance(data["context"], str) else data["context"],
+        "completions": [
+            {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
+            {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},
+        ],
     }
 
 
@@ -51,7 +53,7 @@ class HelpSteer3Dataset:
 
     def __init__(self) -> None:
         ds = load_dataset("nvidia/HelpSteer3", "preference")
-        self.formatted_ds = ds.map(format_helpsteer3)
+        self.formatted_ds = ds.map(to_preference_data_format)
 
         self.task_spec = TaskDataSpec(
             task_name="HelpSteer3",

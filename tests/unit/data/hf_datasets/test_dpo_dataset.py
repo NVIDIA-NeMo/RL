@@ -94,11 +94,13 @@ def test_dpo_dataset_data_format(mock_dpo_data):
 
     # Verify data format
     train_sample = dataset.formatted_ds["train"][0]
-    assert "prompt" in train_sample
-    assert "chosen_response" in train_sample
-    assert "rejected_response" in train_sample
+    assert "context" in train_sample
+    assert "completions" in train_sample
 
     # Verify data content
-    assert train_sample["prompt"] == "What is 2+2?"
-    assert train_sample["chosen_response"] == "The answer is 4."
-    assert train_sample["rejected_response"] == "I don't know."
+    print(train_sample["completions"])
+    assert train_sample["context"] == [{'content': 'What is 2+2?', 'role': 'user'}]
+    assert train_sample["completions"] == [
+        {'completion': [{'content': 'The answer is 4.', 'role': 'assistant'}], 'rank': 0},
+        {'completion': [{'content': "I don't know.", 'role': 'assistant'}], 'rank': 1}
+    ]
