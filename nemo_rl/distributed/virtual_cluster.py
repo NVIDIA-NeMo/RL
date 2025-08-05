@@ -145,7 +145,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     ray.init(
         log_to_driver=True,
-        include_dashboard=True,
+        include_dashboard=False,    # failed to start dashboard on vllm0.9.2? logs are also empty?!
         runtime_env=local_runtime_env,
         _temp_dir=os.path.abspath(log_dir) if log_dir else None,
         resources={cvd_tag: 1},

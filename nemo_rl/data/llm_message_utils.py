@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Any, Optional, cast
+from typing import Any, Optional, cast, Union
+from nemo_rl.data.interfaces import DatumSpec
 
 import torch
 from datasets import Dataset
@@ -24,6 +25,7 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.data.multimodal_utils import PackedGenericDataItem, get_multimodal_keys_from_processor
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
@@ -94,6 +96,15 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
+        elif result[key] and isinstance(result[key][0], PackedGenericDataItem):
+            try:
+                # returning as item because we are probably not going to shard this batch into individual items
+                concat[key] = result[key][0].__class__.concat_packed_items(result[key], return_as_item=True)  
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise RuntimeError(f"Error concatenating packed multimodal data for {key=}") from e
+
     output: FlatMessagesType = {**result, **concat}
     return output
 
@@ -276,6 +287,7 @@ def batched_message_log_to_flat_message(
     # Find max length and identify tensor keys
     max_len = 0
     tensor_keys = []
+    multimodal_keys = []
     for seq in sequenced_lists:
         for key, value in seq.items():
             if isinstance(value, Tensor):
@@ -313,6 +325,12 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
+
+        # if the values are packed multimodal data, then concatenate them
+        if values and isinstance(values[0], PackedGenericDataItem):
+            result[key] = values[0].__class__.concat_packed_items(values, return_as_item=False)
+            continue
+        # if not a tensor or DNE, then return the list of values
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
@@ -334,7 +352,9 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
+
         padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
+
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
@@ -371,6 +391,17 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
             return i
     return min(len(str1), len(str2))
 
+def get_images_from_message(message: dict[str, Any]) -> list[Any]:
+    """Get all images from a message log item."""
+    if isinstance(message["content"], str):
+        return []
+    # iterate over the content list
+    images = []
+    for item in message["content"]:
+        if item["type"] == "image":
+            images.extend(list(item["image"])) if isinstance(item["image"], (list, tuple)) else images.append(item["image"])
+    return images
+    
 
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
@@ -399,14 +430,25 @@ def get_formatted_message_log(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
 
+    multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+
+    def _format_content_helper(content: Union[str, list[dict[str, Any]]]) -> Union[str, list[dict[str, Any]]]:
+        if isinstance(content, str):
+            return task_data_spec.prompt.format(content)
+        # this is a list of dicts, format only the text ones
+        for item in content:
+            if item["type"] == "text":
+                item["text"] = task_data_spec.prompt.format(item["text"])
+        return content
+
     if task_data_spec.prompt:
         message_log_strs = [
             {
                 "role": "user",
-                "content": task_data_spec.prompt.format(message_log_strs[0]["content"]),
+                "content": _format_content_helper(message_log_strs[0]["content"]),
             }
         ] + message_log_strs[1:]
-
+    
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
@@ -444,20 +486,50 @@ def get_formatted_message_log(
                     )
                 elif not message_chunk.endswith(tokenizer.eos_token):
                     message_chunk += tokenizer.eos_token
+        
+        # get images too (extend this for other modalities)
+        images_cur_message = get_images_from_message(message)
 
         new_message = message.copy()
-        new_message["token_ids"] = tokenizer(
-            message_chunk, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
+        # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
+        if len(images_cur_message) == 0:
+            new_message["token_ids"] = tokenizer(
+                text=message_chunk, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0]
+        else:
+            # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            processed_chunk = tokenizer(
+                text=[message_chunk], images=images_cur_message, return_tensors="pt", add_special_tokens=True
+            )
+            new_message["token_ids"] = processed_chunk["input_ids"][0]
+
+            # add all vlm keys to the message
+            for key in multimodal_keys:
+                if key in processed_chunk:
+                    new_message[key] = PackedGenericDataItem(processed_chunk[key], dim_to_pack=0)
+
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
             # which causes `_validate_tensor_consistency` to fail. To fix this, we convert the
             # empty tensor to int64.
             new_message["token_ids"] = new_message["token_ids"].to(torch.int64)  # type: ignore
 
-        new_message["content"] = message_chunk
-        new_message_log.append(new_message)
+        # format content correctly
+        if isinstance(message['content'], str):
+            new_message["content"] = message_chunk
+        else:
+            # format the content list of new message the same way as the original message but replace the text with the new message chunk
+            new_message["content"] = []
+            for item in message['content']:
+                if item['type'] == 'text':
+                    new_message["content"].append({
+                        "type": "text",
+                        "text": message_chunk
+                    })
+                else:
+                    new_message["content"].append(item)
 
+        new_message_log.append(new_message)
         prev_formatted_message = formatted_message
 
     return new_message_log
@@ -485,3 +557,4 @@ def remap_dataset_keys(
         lambda x: {v: x[k] for k, v in mapping_dict.items()},
         remove_columns=list(mapping_dict.keys()),
     )
+

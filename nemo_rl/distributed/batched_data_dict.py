@@ -35,6 +35,10 @@ from nemo_rl.distributed.collectives import (
     rebalance_nd_tensor,
 )
 
+from nemo_rl.data.multimodal_utils import (
+    PackedGenericDataBatch,
+)
+
 DictT = TypeVar("DictT", bound=Mapping[str, Any])
 
 
@@ -70,12 +74,36 @@ class DynamicBatchingArgs(TypedDict):
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
+
+    # keys that are model specific, but not part of the PackedGenericDataBatch 
+    ADDITIONAL_OPTIONAL_KEY_TENSORS = [
+        'token_type_ids',   # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
+    ]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.micro_batch_indices = None
         self.micro_batch_lengths = None
         self.elem_counts_per_gb = None
+    
+    def get_multimodal_dict(self, as_tensors: bool = False, device: Optional[torch.device] = None) -> dict[str, Any]:
+        '''
+        Return a regular dict of tensors or packed multimodal data items
+        '''
+        multimodal_dict = {}
+        for k, v in self.data.items():
+            if isinstance(v, PackedGenericDataBatch):
+                multimodal_dict[k] = v.as_tensor(as_tensors, device=device)
+            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
+                multimodal_dict[k] = v
+        
+        if as_tensors:
+            print("\t returning multimodal dict as tensors")
+            for k, v in multimodal_dict.items():
+                print(f"\t\t{k}: {v.shape}")
+
+        return multimodal_dict
 
     @classmethod
     def from_batches(
@@ -97,7 +125,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
 
-        for k in sorted(batches[0]):
+        for k in sorted(batches[0]):  
             list_of_tensors = [item[k] for item in batches]
 
             if isinstance(list_of_tensors[0], list):
@@ -183,6 +211,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k in self.data:
             if torch.is_tensor(self.data[k]):
                 chunked_batch[k] = self.data[k][indices].clone()
+            elif isinstance(self.data[k], PackedGenericDataBatch):
+                chunked_batch[k] = self.data[k].slice(indices)
             else:
                 chunked_batch[k] = [self.data[k][i] for i in indices]
 
@@ -212,6 +242,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 sorted_v = v.index_select(
                     dim=0, index=torch.IntTensor(reordered_indices)
                 )
+            elif isinstance(v, PackedGenericDataBatch):
+                sorted_v = v.slice(reordered_indices)
             else:
                 sorted_v = [v[i] for i in reordered_indices]
             self.data[k] = sorted_v
@@ -315,7 +347,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 batch_sizes.add(len(val))
 
         assert len(batch_sizes) == 1, (
-            "Batch sizes are not the same across the rollout batch"
+            "Batch sizes are not the same across the rollout batch, found sizes: " + "[" + ", ".join(str(size) for size in batch_sizes) + "]"
         )
         total_batch_size = batch_sizes.pop()
         if batch_size is None:
@@ -365,11 +397,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             # finally reorder the data along the sorted sequence len indices
             for k, v in self.data.items():
-                sorted_v: torch.Tensor | list[Any]
+                sorted_v: torch.Tensor | list[Any] | PackedGenericDataBatch
                 if torch.is_tensor(v):
                     sorted_v = v.index_select(
                         dim=0, index=torch.IntTensor(batch_sorted_indices)
                     )
+                elif isinstance(v, PackedGenericDataBatch):
+                    sorted_v = v.slice(batch_sorted_indices)
                 else:
                     sorted_v = [v[i] for i in batch_sorted_indices]
                 data[k] = sorted_v
@@ -505,6 +539,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         # First time seeing this key for this shard, initialize it
                         if torch.is_tensor(data[k]):
                             aggregated_shards[shard_idx][k] = data[k][indices].clone()
+                        elif isinstance(data[k], PackedGenericDataBatch):
+                            aggregated_shards[shard_idx][k] = data[k].slice(indices.tolist())
                         else:
                             aggregated_shards[shard_idx][k] = [
                                 data[k][i] for i in indices
@@ -516,6 +552,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                                 [
                                     aggregated_shards[shard_idx][k],
                                     data[k][indices].clone(),
+                                ]
+                            )
+                        elif isinstance(data[k], PackedGenericDataBatch):
+                            aggregated_shards[shard_idx][k] = data[k].__class__.concat_packed_batches(
+                                [
+                                    aggregated_shards[shard_idx][k],
+                                    data[k].slice(indices.tolist()),
                                 ]
                             )
                         else:
@@ -648,6 +691,10 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         sliced_batch = SlicedDataDict()
         for k in self.data:
+            if isinstance(self.data[k], PackedGenericDataBatch):
+                sliced_batch[k] = self.data[k].slice(list(range(start, end)))
+                continue
+
             if isinstance(self.data[k], torch.Tensor):
                 assert end <= self.data[k].shape[0], (
                     f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
@@ -667,6 +714,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if torch.is_tensor(v):
                 # For tensors, use repeat_interleave to repeat each element
                 repeated_batch[k] = v.repeat_interleave(num_repeats, dim=0)
+            elif isinstance(v, PackedGenericDataBatch):
+                repeated_batch[k] = v.repeat_interleave(num_repeats)
             else:
                 # For lists or other sequences, use a list comprehension to repeat each element
                 repeated_batch[k] = [
@@ -679,6 +728,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.items():
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+            # assumed this is safe to do (no image / multimodal tokens are truncated)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,
@@ -757,6 +807,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.data.items():
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)
+            elif isinstance(v, PackedGenericDataBatch):
+                self.data[k] = v.to(device)
         return self
 
     def select_indices(self, indices: Union[list[int], torch.Tensor]) -> Self:
@@ -772,6 +824,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.data.items():
             if torch.is_tensor(v):
                 selected_batch[k] = v[indices]
+            elif isinstance(v, PackedGenericDataBatch):
+                selected_batch[k] = v.slice(indices)
             elif isinstance(v, list):
                 selected_batch[k] = [v[i] for i in indices]
             else:

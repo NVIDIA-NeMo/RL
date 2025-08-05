@@ -1,0 +1,43 @@
+# GRPO Algorithm Configuration
+# inherit from grpo_clevr_cogent_trainA.yaml
+defaults:
+  - grpo_clevr_cogent_trainA.yaml
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/geometry3k_grpo_${policy.model_name}" 
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false # Only for internal testing, will be enabled by https://github.com/NVIDIA/NeMo-RL/issues/447.
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
+
+data:
+  prompt_file: "examples/prompts/geo3k.txt"
+  dataset_name: "geometry3k"
+  split: "train"
+  task_name: "geometry3k"   # must match the task_name in the dataset

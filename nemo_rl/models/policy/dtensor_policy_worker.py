@@ -21,8 +21,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
-import torch
 from accelerate import init_empty_weights
+import torch
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -38,6 +38,8 @@ from torch.distributed.tensor.experimental._attention import (
 )
 from transformers import (
     AutoConfig,
+    AutoTokenizer,
+    AutoProcessor,
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -45,6 +47,7 @@ from transformers import (
 from transformers.integrations.accelerate import find_tied_parameters
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
+from nemo_rl.models.policy.utils import resolve_model_class
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -74,12 +77,13 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     is_vllm_v1_engine_enabled,
     sliding_window_overwrite,
+    freeze_hf_model_by_regex,
+    freeze_hf_model_towers
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -147,6 +151,7 @@ class DTensorPolicyWorker:
         self,
         config: PolicyConfig,
         tokenizer: AutoTokenizer,
+        processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
@@ -168,6 +173,15 @@ class DTensorPolicyWorker:
 
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
+
+        # vars used for refit
+        ## will be initialized in prepare_refit_info
+        self.refit_param_info = None
+        ## used for streaming update inference engine weights
+        self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
+            None
+        )
+        self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
@@ -210,6 +224,7 @@ class DTensorPolicyWorker:
             else None,
         )
 
+        # reward model
         self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
             "enabled", False
         )
@@ -240,7 +255,8 @@ class DTensorPolicyWorker:
             else:
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
-            model_class = AutoModelForCausalLM
+            # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
+            model_class = resolve_model_class(model_name)
 
         full_state_dict = None
         if self.rank == 0:
@@ -257,11 +273,14 @@ class DTensorPolicyWorker:
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
-
         with init_empty_weights():
             self.model = model_class.from_config(
                 model_config,
             )
+
+        # freeze parameters by provided regex
+        freeze_hf_model_towers(self.model, self.cfg.get("freeze_language_model", False), self.cfg.get("freeze_vision_model", False))
+        freeze_hf_model_by_regex(self.model, self.cfg.get("freeze_param_regex", None))
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -273,6 +292,9 @@ class DTensorPolicyWorker:
         ) or ModelFlag.SKIP_DTENSOR_TIED_WEIGHTS_CHECK.matches(model_name)
 
         self.tokenizer = tokenizer
+        self.processor = processor
+        self.is_vlm = processor is not None
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -425,14 +447,6 @@ class DTensorPolicyWorker:
                 "No weights path provided. Starting from scratch (default policy init)"
             )
 
-        # vars used for refit
-        ## will be initialized in prepare_refit_info
-        self.refit_param_info = None
-        ## used for streaming update inference engine weights
-        self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
-            None
-        )
-        self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
     # Refer to nemo impl. Below is original comment.
     # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
@@ -553,6 +567,7 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
@@ -643,6 +658,7 @@ class DTensorPolicyWorker:
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
+
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()
                             input_ids, position_ids, _ = pack_sequences(
@@ -677,8 +693,18 @@ class DTensorPolicyWorker:
                             ).repeat(batch_size, 1)
                             flash_attn_kwargs = {}
 
+                        # add vlm kwargs to model call
+                        vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+                        flash_attn_kwargs_wrap = {}
+                        # set flash_attn_kwargs if there are no multimodal kwargs
+                        if len(vlm_kwargs) == 0:
+                            flash_attn_kwargs_wrap['flash_attn_kwargs'] = flash_attn_kwargs
+                        else:
+                            position_ids = None
+
                     context_parallel_ctx = None
                     if self.cp_size > 1:
+                        assert len(vlm_kwargs) == 0, "multimodal kwargs are not supported for context parallel"
                         seq_index = torch.arange(
                             seq_len, device=input_ids.device
                         ).repeat(1, 1)
@@ -704,6 +730,7 @@ class DTensorPolicyWorker:
                                 position_ids=position_ids,
                                 use_cache=False,
                                 flash_attn_kwargs=flash_attn_kwargs,
+                                **vlm_kwargs,
                             )
 
                             if self._is_reward_model:
@@ -711,6 +738,9 @@ class DTensorPolicyWorker:
                                 # Note that it should be empty anyway since sequence packing
                                 # is not supported for reward models.
                                 assert not flash_attn_kwargs
+                                del model_args["flash_attn_kwargs"]
+                            # remove flash_attn_kwargs if there are multimodal kwargs
+                            if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
                             outputs = self.model(**model_args)
@@ -890,6 +920,7 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
@@ -933,9 +964,11 @@ class DTensorPolicyWorker:
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
+                vlm_kwargs = lp_batch.get_multimodal_dict(as_tensors=True, device=input_ids.device)
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
+                    assert len(vlm_kwargs) == 0, "multimodal kwargs are not supported for sequence packing"
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
@@ -965,7 +998,7 @@ class DTensorPolicyWorker:
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
-
+                
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     # DTensor requires the casual attention kernel to hit,
                     # yet our attention mask above is not always all 1s
@@ -975,8 +1008,14 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
+                # only add flash_attn_kwargs if there are no multimodal kwargs
+                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
+                if len(vlm_kwargs) > 0:
+                    position_ids = None
+
                 context_parallel_ctx = None
                 if self.cp_size > 1:
+                    assert len(vlm_kwargs) == 0, "multimodal kwargs are not supported for context parallel"
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
                         1, 1
                     )
@@ -992,13 +1031,18 @@ class DTensorPolicyWorker:
 
                 with DTensorPolicyWorker.train_context(context_parallel_ctx):
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        outputs = self.model(
+                        model_args = dict(
                             input_ids=input_ids,
                             attention_mask=attention_mask_input_all_ones,
                             position_ids=position_ids,
                             use_cache=False,
                             flash_attn_kwargs=flash_attn_kwargs,
+                            **vlm_kwargs,
                         )
+                        if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        outputs = self.model(**model_args)
 
                     logits = outputs.logits
 
@@ -1224,6 +1268,7 @@ class DTensorPolicyWorker:
 
         # Get state_dict
         self.model = self.move_to_cuda(self.model)
+
         self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
             self.model.state_dict()
         )
@@ -1400,10 +1445,13 @@ class DTensorPolicyWorker:
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
+            # optimizer and scheduler
             optimizer=self.optimizer if optimizer_path else None,
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
+            # tokenizer and processor
             tokenizer=self.tokenizer if tokenizer_path else None,
+            processor=self.processor if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
         )
 

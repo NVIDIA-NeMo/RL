@@ -1,0 +1,5 @@
+Think step-by-step to solve the following problem, and answer in the following format: <think> step-by-step thought process </think> <answer> answer here </answer> 
+Note that your final answer must only contain a number or mathematical expression in latex format (for example, <answer> 2 </answer> or <answer> 2 \sqrt {{221}} + \pi </answer> ).
+
+Let's think step-by-step: 
+{}

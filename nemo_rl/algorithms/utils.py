@@ -18,7 +18,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedTokenizerBase, AutoProcessor
 
 from nemo_rl.data import hf_datasets
 from nemo_rl.models.policy import TokenizerConfig
@@ -144,7 +144,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
+def get_tokenizer(tokenizer_config: TokenizerConfig, ) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -200,11 +200,22 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         >>> assert formatted == " START: You are a helpful AI assistant. END. START: Hello! END."
         ```
     """
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_config["name"], trust_remote_code=True
-    )
+    processor = None
+    is_tokenizer_processor = tokenizer_config.get("is_tokenizer_processor", False)
+
+    if is_tokenizer_processor:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
@@ -219,4 +230,4 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
     else:
         print("No chat template provided, using tokenizer's default")
 
-    return tokenizer
+    return tokenizer if processor is None else processor
