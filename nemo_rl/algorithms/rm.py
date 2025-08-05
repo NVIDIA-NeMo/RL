@@ -161,7 +161,7 @@ def setup(
         batch_size=rm_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=preference_collate_fn,
-        drop_last=True,
+        drop_last=policy_config.get("val_drop_last", True),
     )
 
     # ==========================
@@ -248,7 +248,11 @@ def validate(
         num_valid_batches = 0
 
         policy.prepare_for_training()
+
         for batch_idx, val_batch in enumerate(val_dataloader):
+            print(
+                f"batch_idx: {batch_idx}, batch size: {val_batch.size}, Total size dataloader: {len(val_dataloader)}"
+            )
             ## add loss mask based on role to every message
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
@@ -281,6 +285,7 @@ def validate(
                 ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                 gbs=val_batch_size * 2,
                 mbs=val_mbs * 2,
+                is_preference_model=True,
             )
 
             if len(val_results["all_mb_metrics"]) == 0:
@@ -304,7 +309,6 @@ def validate(
                         ),
                     )
                 )
-
                 num_valid_batches += 1
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
@@ -493,6 +497,7 @@ def rm_train(
                     ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                     gbs=master_config["policy"]["train_global_batch_size"] * 2,
                     mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    is_preference_model=True,
                 )
 
                 is_last_step = (

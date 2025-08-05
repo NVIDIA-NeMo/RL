@@ -203,6 +203,7 @@ def setup(
             batch_size=grpo_config["val_batch_size"],
             shuffle=False,
             collate_fn=rl_collate_fn,
+            drop_last=policy_config.get("val_drop_last", True),
         )
         print(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
 
@@ -870,7 +871,6 @@ def validate(
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
-
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
