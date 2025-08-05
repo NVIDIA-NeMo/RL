@@ -42,6 +42,7 @@ def create_test_config(
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
+    dtensor_v2: bool = False,
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
@@ -69,6 +70,7 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
+            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
             "cpu_offload": cpu_offload,
             "sequence_parallel": sequence_parallel,
@@ -144,9 +146,10 @@ def gc_collect():
 
 
 @pytest.fixture
-def policy_setup(two_gpu_virtual_cluster, tiny_llama_model_path):
+def policy_setup(request, two_gpu_virtual_cluster, tiny_llama_model_path):
     """Setup and teardown for policy tests - creates a virtual cluster and policy."""
-    config = create_test_config(tiny_llama_model_path)
+    use_v2 = request.param if hasattr(request, "param") else False
+    config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
@@ -161,6 +164,7 @@ def policy_setup(two_gpu_virtual_cluster, tiny_llama_model_path):
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("policy_setup", [True, False], indirect=True)
 def test_lm_policy_init(policy_setup):
     policy = policy_setup
 
@@ -240,6 +244,25 @@ def test_lm_policy_init(policy_setup):
 @pytest.fixture
 def training_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
+    # Get the use_v2 parameter from the test function
+    use_v2 = getattr(request.function, "pytestmark", [])
+    use_v2_value = False
+    for mark in use_v2:
+        if (
+            hasattr(mark, "args")
+            and len(mark.args) > 1
+            and "use_v2" in str(mark.args[0])
+        ):
+            for param_set in mark.args[1]:
+                if isinstance(param_set, bool):
+                    use_v2_value = param_set
+                    break
+
+    # If multiple parametrize decorators, we need to check the node id
+    if hasattr(request, "node") and hasattr(request.node, "callspec"):
+        if "use_v2" in request.node.callspec.params:
+            use_v2_value = request.node.callspec.params["use_v2"]
+
     (
         model_fixture_name,
         tp,
@@ -257,7 +280,13 @@ def training_setup(request, two_gpu_virtual_cluster):
 
     try:
         config = create_test_config(
-            model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing
+            model_name,
+            tp,
+            cp,
+            sequence_parallel,
+            cpu_offload,
+            activation_checkpointing,
+            dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
@@ -309,6 +338,7 @@ def training_setup(request, two_gpu_virtual_cluster):
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
 @pytest.mark.parametrize(
     "training_setup",
     [
@@ -343,7 +373,7 @@ def training_setup(request, two_gpu_virtual_cluster):
     ],
     indirect=True,
 )
-def test_dtensor_worker_training(training_setup):
+def test_dtensor_worker_training(use_v2, training_setup):
     def verify_loss_tensor(loss_tensor):
         assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
         assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
@@ -381,6 +411,12 @@ def test_dtensor_worker_training(training_setup):
 @pytest.fixture
 def logprob_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
+    # Get the use_v2 parameter from the test function
+    use_v2_value = False
+    if hasattr(request, "node") and hasattr(request.node, "callspec"):
+        if "use_v2" in request.node.callspec.params:
+            use_v2_value = request.node.callspec.params["use_v2"]
+
     (
         model_fixture_name,
         tp,
@@ -397,7 +433,13 @@ def logprob_setup(request, two_gpu_virtual_cluster):
 
     try:
         config = create_test_config(
-            model_name, tp, cp, sequence_parallel, cpu_offload, activation_checkpointing
+            model_name,
+            tp,
+            cp,
+            sequence_parallel,
+            cpu_offload,
+            activation_checkpointing,
+            dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
@@ -468,6 +510,7 @@ def logprob_setup(request, two_gpu_virtual_cluster):
 
 @pytest.mark.hf_gated
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
 @pytest.mark.parametrize(
     "logprob_setup",
     [
@@ -492,7 +535,7 @@ def logprob_setup(request, two_gpu_virtual_cluster):
     ],
     indirect=True,
 )
-def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
+def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_setup):
     policy, data, logprobs = logprob_setup
 
     # Verify resources were created properly assert policy is not None, "Policy was not created properly"
@@ -510,8 +553,9 @@ def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
 
 
 @pytest.mark.hf_gated
+@pytest.mark.parametrize("use_v2", [True, False])
 def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
-    two_gpu_virtual_cluster, tiny_llama_tied_model_path
+    use_v2, two_gpu_virtual_cluster, tiny_llama_tied_model_path
 ):
     """Test that DTensor with a tp > 1 and a tied model with a custom parallel plan works."""
     from torch.distributed.tensor.parallel import ColwiseParallel
@@ -529,6 +573,7 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         cpu_offload=False,
         activation_checkpointing=False,
         custom_parallel_plan=custom_parallel_plan,
+        dtensor_v2=use_v2,
     )
     tokenizer = get_tokenizer(config["tokenizer"])
 

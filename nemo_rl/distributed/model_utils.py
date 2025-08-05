@@ -494,3 +494,49 @@ class AllGatherCPTensor(torch.autograd.Function):
         )
 
         return grad_input, None, None  # , None
+
+
+def get_logprobs_from_vocab_parallel_logits(
+    vocab_parallel_logits: DTensor,
+    input_ids: torch.Tensor | DTensor,
+    seq_index: Optional[torch.Tensor] = None,
+):
+    """Computes log probabilities from vocabulary-parallel logits.
+
+    This function takes logits that are sharded across the vocabulary dimension (tensor parallel)
+    and computes the log probabilities for the given input IDs.
+
+    Args:
+        vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
+            with shape [batch_size, seq_len, vocab_size/tp_size].
+        input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
+            with shape [batch_size, seq_len].
+        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
+            with shape [sequence_length].
+
+    Returns:
+        torch.Tensor: Log probabilities for the given input IDs.
+    """
+    device_mesh = vocab_parallel_logits.device_mesh
+    if seq_index is not None:
+        assert "cp" in device_mesh.mesh_dim_names, (
+            "seq_index must be provided for cp sharded logits"
+        )
+
+    tp_size = 1
+
+    tp_group = device_mesh.get_group("tp")
+    tp_rank = tp_group.rank()
+    tp_size = tp_group.size()
+
+    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
+
+    return dtensor_from_parallel_logits_to_logprobs(
+        vocab_parallel_logits.to_local(),
+        input_ids,
+        vocab_interval_per_rank * tp_rank,
+        (tp_rank + 1) * vocab_interval_per_rank,
+        tp_group,
+        inference_only=not torch.is_grad_enabled(),
+        seq_index=seq_index,
+    )
