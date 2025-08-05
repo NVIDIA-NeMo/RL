@@ -23,7 +23,7 @@ import os
 import shutil
 import warnings
 from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, Mapping, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
@@ -38,14 +38,14 @@ class CheckpointingConfig(TypedDict):
     Attributes:
     enabled (bool): Whether checkpointing is enabled.
     checkpoint_dir (PathLike): Directory where checkpoints will be saved.
-    metric_name (str): Name of the metric to use for determining best checkpoints.
+    metric_name (str | None): Name of the metric to use for determining best checkpoints.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
     """
 
     enabled: bool
     checkpoint_dir: PathLike
-    metric_name: str
+    metric_name: str | None
     higher_is_better: bool
     save_period: int
     keep_top_k: NotRequired[int]
@@ -86,8 +86,8 @@ class CheckpointManager:
     def init_tmp_checkpoint(
         self,
         step: int,
-        training_info: dict[str, Any],
-        run_config: Optional[dict[str, Any]] = None,
+        training_info: Mapping[str, Any],
+        run_config: Optional[Mapping[str, Any]] = None,
     ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
@@ -181,6 +181,7 @@ class CheckpointManager:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
             try:
+                assert self.metric_name is not None  # Type checker hint
                 # sort by metric value first, then by step number (for equal metrics, prefer more recent)
                 if self.higher_is_better:
                     # For higher_is_better=True: higher metric values first, then higher step numbers

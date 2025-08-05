@@ -328,7 +328,7 @@ def test_sequence_packing_basic():
 
 def test_sequence_packing_uniform_lengths():
     """Test sequence packing when all sequences have the same length."""
-    batch_size = 12
+    batch_size = 16
     seq_length = 256
 
     batch_data = BatchedDataDict(
@@ -359,8 +359,8 @@ def test_sequence_packing_uniform_lengths():
     len_1 = len(
         list(sharded_batches[1].make_microbatch_iterator_for_packable_sequences())
     )
-    assert len_0 + len_1 == 3
-    assert min(len_0, len_1) == 1
+    assert len_0 + len_1 == 4
+    assert min(len_0, len_1) == 2
 
     # Each microbatch should pack as many sequences as possible
     for shard in sharded_batches:
@@ -574,8 +574,8 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
         )
 
         pack_efficiency_standards = {
-            1: (0.97, 1.0),
-            32: (0.92, 0.97),
+            1: (0.955, 1.0),
+            32: (0.91, 0.97),
             64: (0.85, 0.92),
             256: (0.60, 0.80),
         }

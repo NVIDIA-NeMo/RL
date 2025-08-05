@@ -32,7 +32,15 @@ export PYTHONPATH=$(realpath ${SCRIPT_DIR}/..):${PYTHONPATH:-}
 
 # Run unit tests
 echo "Running unit tests..."
-if ! pytest unit/ "$@"; then
+if [[ "$#" -eq 0 ]]; then
+    pytest_args="unit/"
+elif [[ "$1" != unit/* ]]; then
+    pytest_args="unit/ $@"
+else
+    pytest_args="$@"
+fi
+
+if ! pytest $pytest_args; then
     echo "[ERROR]: Unit tests failed."
     exit 1
 fi

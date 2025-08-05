@@ -1,8 +1,18 @@
 # Nemo RL: A Scalable and Efficient Post-Training Library
 
+## 📣 News
+* [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
+    * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
+* [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
+* [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
+    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
+
+## Table of Contents
 <!-- markdown all in one -->
 - [Nemo RL: A Scalable and Efficient Post-Training Library](#nemo-rl-a-scalable-and-efficient-post-training-library)
   - [📣 News](#-news)
+  - [Table of Contents](#table-of-contents)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
   - [Training Backends](#training-backends)
@@ -17,6 +27,9 @@
   - [DPO](#dpo)
     - [DPO Single Node](#dpo-single-node)
     - [DPO Multi-node](#dpo-multi-node)
+  - [RM](#rm)
+    - [RM Single Node](#rm-single-node)
+    - [RM Multi-node](#rm-multi-node)
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
@@ -36,30 +49,27 @@ What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
-## 📣 News
-* [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
-* [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
-    * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
-
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.3_
+✅ _Available now_ | 🔜 _Coming in v0.4_
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-32B models (Qwen2.5, Llama).
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP) support and Ray-based infrastructure.
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support and Ray-based infrastructure.
 - ✅ **Environment Support** - Support for multi-environment training.
 - ✅ **Learning Algorithms** - GRPO (Group Relative Policy Optimization), SFT (Supervised Fine-Tuning), and DPO (Direct Preference Optimization).
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 32B parameters.
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, and SP for efficient training.
+- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
+- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
+- ✅ **(even) Larger Model Support with Long(er) Sequences** - Advanced parallelisms with Megatron Core (TP/PP/CP/SP/EP).
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
-- ✅ **(even) Larger Model Support with Long(er) Sequence** - Support advanced parallelism in training with Megatron Core.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
+
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **MoE Models** - Support DeepseekV3 and Llama4.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
 ## Prerequisites
@@ -128,6 +138,7 @@ bash tools/build-flash-attn-in-uv-cache.sh
 - Use the `uv run <command>` to execute scripts within the managed environment. This helps maintain consistency across different shells and sessions.
 - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
 - On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your `uv`'s cache dir making subsequent installs much quicker.
+- If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 ## Training Backends
@@ -142,6 +153,8 @@ The training backend is automatically determined based on your YAML configuratio
 ## GRPO
 
 We have a reference GRPO experiment config set up trained for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+
+You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
 
 ### GRPO Single Node
 
@@ -328,7 +341,50 @@ For distributed DPO training across multiple nodes, modify the following script 
 NUM_ACTOR_NODES=2
 
 COMMAND="uv run ./examples/run_dpo.py --config examples/configs/dpo.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 dpo.val_global_batch_size=32 checkpointing.checkpoint_dir='results/dpo_llama81_2nodes' logger.wandb_enabled=True logger.wandb.name='dpo-llama1b'" \
-RAY_DEDUP_LOGS=0 \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
+```
+
+## RM
+
+We provide a sample RM experiment that uses the [HelpSteer3 dataset](https://huggingface.co/datasets/nvidia/HelpSteer3) for preference-based training.
+
+### RM Single Node
+
+The default RM experiment is configured to run on a single GPU. To launch the experiment:
+
+```sh
+uv run python examples/run_rm.py
+```
+
+This trains a RM based on `meta-llama/Llama-3.2-1B-Instruct` on one GPU.
+
+If you have access to more GPUs, you can update the experiment accordingly. To run on 8 GPUs, we update the cluster configuration:
+
+```sh
+uv run python examples/run_rm.py cluster.gpus_per_node=8
+```
+
+Refer to the [RM documentation](docs/guides/rm.md) for more information.
+
+### RM Multi-node
+
+For distributed RM training across multiple nodes, modify the following script for your use case:
+
+```sh
+# Run from the root of NeMo RL repo
+## number of nodes to use for your job
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_rm.py --config examples/configs/rm.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/rm_llama1b_2nodes' logger.wandb_enabled=True logger.wandb.name='rm-llama1b-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -356,6 +412,17 @@ uv run python examples/converters/convert_dcp_to_hf.py \
     --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
     --hf-ckpt-path results/grpo/hf
 ```
+
+If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation:
+
+```sh
+# Example for a GRPO checkpoint at step 170
+uv run python examples/converters/convert_megatron_to_hf.py \
+    --config results/grpo/step_170/config.yaml \
+    --dcp-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
+    --hf-ckpt-path results/grpo/hf
+```
+
 > **Note:** Adjust the paths according to your training output directory structure.
 
 For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/design-docs/checkpointing.md).
@@ -374,12 +441,12 @@ Run evaluation script with custom settings:
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
 #          Pass@1 accuracy averaged over 16 samples for each problem
 uv run python examples/run_eval.py \
+    --config examples/configs/evals/math_eval.yaml \
     generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
     generation.temperature=0.6 \
     generation.top_p=0.95 \
     generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=HuggingFaceH4/MATH-500 \
-    data.dataset_key=test \
+    data.dataset_name=math500 \
     eval.num_tests_per_prompt=16 \
     cluster.gpus_per_node=8
 ```
@@ -404,7 +471,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   git submodule update --init --recursive
   ```
 
-  and then force a rebuild of the virutal environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
+  and then force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run:
 
   ```sh
   NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...

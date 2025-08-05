@@ -13,14 +13,15 @@
 # limitations under the License.
 import os
 import warnings
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Optional, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -87,7 +88,9 @@ class GRPOConfig(TypedDict):
 
 class GRPOSaveState(TypedDict):
     step: int
-    val_reward: float
+    val_reward: NotRequired[
+        float
+    ]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -164,8 +167,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    grpo_save_state: Optional[GRPOSaveState] = cast(
+        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()
@@ -398,6 +401,7 @@ def refit_policy_generation(
     policy_generation: GenerationInterface,
     colocated_inference: bool,
     _refit_buffer_size_gb: Optional[int] = None,
+    timer: Optional[Timer] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -412,43 +416,50 @@ def refit_policy_generation(
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    # update weights
-    update_success = False
-    if colocated_inference:
-        # get model param keys, which is grouped by size
-        grouped_param_keys = policy.prepare_weights_for_ipc(
-            _refit_buffer_size_gb=_refit_buffer_size_gb
-        )
-        total_num_keys = sum(len(k) for k in grouped_param_keys)
-        print(
-            f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
-        )
-        # do update
-        for keys in grouped_param_keys:
-            ipc_handles = policy.get_weights_ipc_handles(keys)
-            update_success = policy_generation.update_weights_from_ipc_handles(
-                ipc_handles
+    # Create a context manager that does nothing when timer is None
+    timer_context = (
+        timer.time("prepare_for_generation/transfer_and_update_weights")
+        if timer is not None
+        else nullcontext()
+    )
+    with timer_context:
+        # update weights
+        update_success = False
+        if colocated_inference:
+            # get model param keys, which is grouped by size
+            grouped_param_keys = policy.prepare_weights_for_ipc(
+                _refit_buffer_size_gb=_refit_buffer_size_gb
             )
-            if not update_success:
-                break
-    else:
-        # update weights through nccl
-        futures_train = policy.broadcast_weights_for_collective()
-        futures_inference = policy_generation.update_weights_from_collective()
-        # wait for all futures to complete
-        ray.get(futures_train)
-        results = ray.get(futures_inference)
-        update_success = all(result for result in results if result is not None)
+            total_num_keys = sum(len(k) for k in grouped_param_keys)
+            print(
+                f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
+            )
+            # do update
+            for keys in grouped_param_keys:
+                ipc_handles = policy.get_weights_ipc_handles(keys)
+                update_success = policy_generation.update_weights_from_ipc_handles(
+                    ipc_handles
+                )
+                if not update_success:
+                    break
+        else:
+            # update weights through nccl
+            futures_train = policy.broadcast_weights_for_collective()
+            futures_inference = policy_generation.update_weights_from_collective()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
 
-    # check if update is successful
-    if not update_success:
-        error_tag = "cuda-ipc" if colocated_inference else "nccl"
-        error_message = (
-            "❌ Error: Updating weights for the generation policy failed during refit.\n"
-            f"This often indicates an issue with {error_tag} or "
-            "a problem within the generation backend (e.g., vLLM worker).\n"
-        )
-        raise RuntimeError(error_message)
+        # check if update is successful
+        if not update_success:
+            error_tag = "cuda-ipc" if colocated_inference else "nccl"
+            error_message = (
+                "❌ Error: Updating weights for the generation policy failed during refit.\n"
+                f"This often indicates an issue with {error_tag} or "
+                "a problem within the generation backend (e.g., vLLM worker).\n"
+            )
+            raise RuntimeError(error_message)
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -542,7 +553,7 @@ def grpo_train(
             with timer.time("prepare_for_generation"):
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
-                        policy, policy_generation, colocated_inference
+                        policy, policy_generation, colocated_inference, timer=timer
                     )
                     POLICY_GENERATION_STALE = False
                 else:
@@ -754,10 +765,19 @@ def grpo_train(
             "loss": train_results["loss"].numpy(),
             "reward": rewards.numpy(),
             "grad_norm": train_results["grad_norm"].numpy(),
+            "mean_prompt_length": repeated_batch["length"].numpy(),
+            "total_num_tokens": input_lengths.numpy(),
         }
         metrics.update(train_results["all_mb_metrics"])
         for k, v in metrics.items():
-            if k in {"lr", "wd", "reward", "global_valid_seqs", "global_valid_toks"}:
+            if k in {
+                "lr",
+                "wd",
+                "reward",
+                "global_valid_seqs",
+                "global_valid_toks",
+                "mean_prompt_length",
+            }:
                 metrics[k] = np.mean(v).item()
             else:
                 metrics[k] = np.sum(v).item()
@@ -804,6 +824,19 @@ def grpo_train(
         print("\n⏱️  Timing:")
         # Display total time first, separately
         total_time = timing_metrics.get("total_step_time", 0)
+
+        total_num_gpus = (
+            master_config["cluster"]["num_nodes"]
+            * master_config["cluster"]["gpus_per_node"]
+        )
+        metrics.update(
+            {
+                "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
+                / total_time
+                / total_num_gpus
+            }
+        )
+
         print(f"  • Total step time: {total_time:.2f}s")
 
         # Display all other timing metrics

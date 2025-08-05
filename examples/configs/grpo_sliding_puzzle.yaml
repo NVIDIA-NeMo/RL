@@ -19,6 +19,12 @@ policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
   max_total_sequence_length: 3072
 
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: true
+    activation_checkpointing: true
+    sequence_parallel: true
+
   generation:
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}

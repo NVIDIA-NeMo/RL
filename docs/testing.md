@@ -10,14 +10,19 @@ Unit tests require 2 GPUs to test the full suite.
 
 ```sh
 # Run the unit tests using local GPUs
-uv run --group test bash tests/run_unit.sh
-```
 
-:::{note}
-Tests can also be run on Slurm with `ray.sub`, but note that some tests will be skipped
-due to no GPUs being located on the head node. To run the full suite of tests, please
-launch on a regular GPU allocation.
-:::
+# Configuration 1: Default tests only - excludes both hf_gated and mcore tests
+uv run --group test bash tests/run_unit.sh
+
+# Configuration 2: Default + HF gated tests, excluding mcore tests
+uv run --group test bash tests/run_unit.sh --hf-gated
+
+# Configuration 3: ONLY mcore tests, excluding ones with hf_gated
+uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only
+
+# Configuration 4: ONLY mcore tests, including ones with hf_gated
+uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only --hf-gated
+```
 
 ### Run Unit Tests in a Hermetic Environment
 

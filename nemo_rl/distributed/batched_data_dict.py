@@ -19,6 +19,7 @@ from typing import (
     Iterator,
     Mapping,
     Optional,
+    Sequence,
     Type,
     TypedDict,
     TypeVar,
@@ -79,8 +80,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     @classmethod
     def from_batches(
         cls: Type[Self],
-        batches: list[dict[Any, Any]],
-        pad_value_dict: Optional[dict[str, int]] = None,
+        batches: Sequence[Mapping[Any, Any]],
+        pad_value_dict: Optional[dict[str, int | float]] = None,
     ) -> Self:
         """Given a list of batches, stack the tensors/lists within and put them in a single dictionary.
 
@@ -104,7 +105,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     item for sublist in list_of_tensors for item in sublist
                 ]
             elif all(x.ndim == 1 for x in list_of_tensors):
-                tensor_or_list: torch.Tensor = torch.cat(list_of_tensors)
+                tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
 
@@ -112,7 +113,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     row.flatten() for tensor in list_of_tensors for row in tensor
                 ]
                 # TODO: can we avoid padding locally then padding globally?
-                tensor_or_list: torch.Tensor = torch.nn.utils.rnn.pad_sequence(
+                tensor_or_list = torch.nn.utils.rnn.pad_sequence(
                     list_of_tensors, batch_first=True, padding_value=pad_value
                 )
             else:
@@ -378,6 +379,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
                 collect_metrics=False,  # TODO(ahmadki): make configurable
+                min_bin_count=shards,
+                bin_count_multiple=shards,
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]

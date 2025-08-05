@@ -68,11 +68,22 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
-    def train(self, data: BatchedDataDict, loss_fn: LossFunction) -> dict[str, Any]:
+    def train(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
         Args:
             data: BatchedDataDict containing rollouts (tokens)
+            loss_fn: Loss function to use for training
+            eval_mode: Whether to run in evaluation mode (no gradient updates)
+            gbs: Global batch size override (if None, uses config default)
+            mbs: Micro batch size override (if None, uses config default)
         """
         pass
 

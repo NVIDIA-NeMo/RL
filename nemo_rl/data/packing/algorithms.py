@@ -18,7 +18,7 @@ import enum
 import math
 import random
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple, Type, Union
+from typing import Dict, List, Optional, Tuple, Type, Union
 
 
 class PackingAlgorithm(enum.Enum):
@@ -37,16 +37,37 @@ class SequencePacker(ABC):
     lengths into fixed-capacity bins (batches) to maximize computational efficiency.
     """
 
-    def __init__(self, bin_capacity: int, collect_metrics: bool = False):
+    def __init__(
+        self,
+        bin_capacity: int,
+        collect_metrics: bool = False,
+        min_bin_count: Optional[int] = None,
+        bin_count_multiple: Optional[int] = None,
+    ):
         """Initialize the sequence packer.
 
         Args:
             bin_capacity: The maximum capacity of each bin.
             collect_metrics: Whether to collect metrics across multiple packing operations.
+            min_bin_count: Minimum number of bins to create, even if fewer would suffice.
+                          If None, no minimum is enforced.
+            bin_count_multiple: The total number of bins must be a multiple of this value.
+                               If None, no multiple constraint is enforced.
+
+        Raises:
+            ValueError: If min_bin_count or bin_count_multiple are invalid.
         """
         self.bin_capacity = bin_capacity
         self.collect_metrics = collect_metrics
+        self.min_bin_count = min_bin_count
+        self.bin_count_multiple = bin_count_multiple
         self.metrics = None
+
+        # Validate parameters
+        if min_bin_count is not None and min_bin_count < 0:
+            raise ValueError("min_bin_count must be nonnegative")
+        if bin_count_multiple is not None and bin_count_multiple < 1:
+            raise ValueError("bin_count_multiple must be positive")
 
         if collect_metrics:
             from nemo_rl.data.packing.metrics import PackingMetrics
@@ -66,6 +87,84 @@ class SequencePacker(ABC):
         """
         pass
 
+    def _adjust_bin_count(self, bins: List[List[int]]) -> List[List[int]]:
+        """Adjust the number of bins to meet minimum and multiple constraints.
+
+        This method preserves the existing bin packing as much as possible and only
+        moves sequences one at a time to create additional bins when needed.
+
+        Args:
+            bins: The original bins from the packing algorithm.
+
+        Returns:
+            Adjusted bins with minimal changes to meet constraints.
+
+        Raises:
+            ValueError: If there aren't enough sequences to fill the required number of bins.
+        """
+        current_bin_count = len(bins)
+        target_bin_count = current_bin_count
+
+        if self.min_bin_count is not None:
+            target_bin_count = max(target_bin_count, self.min_bin_count)
+
+        if self.bin_count_multiple is not None:
+            remainder = target_bin_count % self.bin_count_multiple
+            if remainder != 0:
+                target_bin_count += self.bin_count_multiple - remainder
+
+        if target_bin_count == current_bin_count:
+            return bins
+
+        # Count total sequences
+        total_sequences = sum(len(bin_contents) for bin_contents in bins)
+        if total_sequences < target_bin_count:
+            raise ValueError(
+                f"Cannot create {target_bin_count} bins with only {total_sequences} sequences. "
+                f"Each bin must contain at least one sequence. "
+                f"Either reduce min_bin_count/bin_count_multiple or provide more sequences."
+            )
+
+        adjusted_bins = [bin_contents.copy() for bin_contents in bins]
+        additional_bins_needed = target_bin_count - current_bin_count
+        for _ in range(additional_bins_needed):
+            adjusted_bins.append([])
+
+        # Move sequences from existing bins to new bins
+        bin_sizes = [
+            (len(bin_contents), i)
+            for i, bin_contents in enumerate(adjusted_bins[:current_bin_count])
+        ]
+        bin_sizes.sort(reverse=True)  # Sort by size, largest first
+
+        source_bin_idx = 0
+
+        for new_bin_idx in range(current_bin_count, target_bin_count):
+            # Find a bin with at least 2 sequences (so we can move one and leave at least one)
+            while source_bin_idx < len(bin_sizes):
+                bin_size, original_bin_idx = bin_sizes[source_bin_idx]
+                current_size = len(adjusted_bins[original_bin_idx])
+
+                if current_size > 1:
+                    # Move one sequence from this bin to the new bin
+                    sequence_to_move = adjusted_bins[original_bin_idx].pop()
+                    adjusted_bins[new_bin_idx].append(sequence_to_move)
+                    break
+                else:
+                    # This bin only has one sequence, try the next one
+                    source_bin_idx += 1
+            else:
+                # If we get here, we couldn't find any bin with more than 1 sequence
+                # This should not happen given our earlier validation, but let's handle it
+                raise ValueError(
+                    f"Cannot create additional bins: insufficient sequences to redistribute. "
+                    f"Need {additional_bins_needed} additional bins but cannot find enough "
+                    f"bins with multiple sequences to redistribute from."
+                    f"WARNING: Triggering this section of code is a bug. Please report it."
+                )
+
+        return adjusted_bins
+
     def pack(self, sequence_lengths: List[int]) -> List[List[int]]:
         """Pack sequences into bins and update metrics if enabled.
 
@@ -74,10 +173,14 @@ class SequencePacker(ABC):
 
         Returns:
             A list of bins, where each bin is a list of indices into the original
-            sequence_lengths list.
+            sequence_lengths list. The number of bins will satisfy min_bin_count
+            and bin_count_multiple constraints if specified.
         """
         # Call the implementation
         bins = self._pack_implementation(sequence_lengths)
+
+        # Adjust bin count to meet constraints
+        bins = self._adjust_bin_count(bins)
 
         # Update metrics if collection is enabled
         if self.collect_metrics and self.metrics:
@@ -202,7 +305,7 @@ class ConcatenativePacker(SequencePacker):
 
     # Global class variable to limit the number of sequences packed in a unit
     # -1 disables this limit
-    max_sequences_per_bin = 4  # Useful for debugging and testing
+    max_sequences_per_bin = -1  # Useful for debugging and testing
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
         """Pack sequences using the Concatenative algorithm.
@@ -528,6 +631,8 @@ def get_packer(
     algorithm: Union[PackingAlgorithm, str],
     bin_capacity: int,
     collect_metrics: bool = False,
+    min_bin_count: Optional[int] = None,
+    bin_count_multiple: Optional[int] = None,
 ) -> SequencePacker:
     """Factory function to get a sequence packer based on the algorithm.
 
@@ -536,6 +641,10 @@ def get_packer(
                   or a string (case-insensitive) matching one of the enum names.
         bin_capacity: The maximum capacity of each bin.
         collect_metrics: Whether to collect metrics across multiple packing operations.
+        min_bin_count: Minimum number of bins to create, even if fewer would suffice.
+                      If None, no minimum is enforced.
+        bin_count_multiple: The total number of bins must be a multiple of this value.
+                           If None, no multiple constraint is enforced.
 
     Returns:
         A SequencePacker instance for the specified algorithm.
@@ -568,4 +677,9 @@ def get_packer(
             f"Available algorithms: {available_algorithms}"
         )
 
-    return packers[algorithm](bin_capacity, collect_metrics=collect_metrics)
+    return packers[algorithm](
+        bin_capacity,
+        collect_metrics=collect_metrics,
+        min_bin_count=min_bin_count,
+        bin_count_multiple=bin_count_multiple,
+    )
