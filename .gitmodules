@@ -8,3 +8,8 @@
 	url = https://github.com/terrykong/Megatron-LM.git
 	branch = sahilj/megatron-external-loss-norm
 	shallow = true
+[submodule "3rdparty/Automodel-workspace/Automodel"]
+	path = 3rdparty/Automodel-workspace/Automodel
+	url = https://github.com/NVIDIA-NeMo/Automodel.git
+	branch = nemo-rl-submodule
+	shallow = true

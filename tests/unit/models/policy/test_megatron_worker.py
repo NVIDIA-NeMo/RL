@@ -487,7 +487,7 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping megatorn generation tests for now")
+@pytest.mark.skip(reason="Skipping megatron generation tests for now")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",
