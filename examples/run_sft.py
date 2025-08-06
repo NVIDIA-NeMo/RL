@@ -28,6 +28,7 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -54,6 +55,7 @@ def sft_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer,
+    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
     add_bos: bool = True,
@@ -64,6 +66,7 @@ def sft_preprocessor(
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,
+        chat_template_kwargs,
         task_data_spec,
         add_bos_token=add_bos,
         add_eos_token=add_eos,
@@ -91,7 +94,9 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_data(
+    tokenizer: AutoTokenizer, tokenizer_config: TokenizerConfig, data_config: DataConfig
+):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
     if data_cls == "open_assistant":
@@ -132,6 +137,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,
+        tokenizer_config.get("chat_template_kwargs", {}),
         sft_task_spec,
         partial(
             sft_preprocessor,
@@ -145,6 +151,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     val_dataset = AllTaskProcessedDataset(
         val_dataset,
         tokenizer,
+        tokenizer_config.get("chat_template_kwargs", {}),
         sft_task_spec,
         partial(
             sft_preprocessor,
@@ -190,14 +197,15 @@ def main():
     init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer_config = config["policy"]["tokenizer"]
+    tokenizer = get_tokenizer(tokenizer_config)
 
     # setup data
     (
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    ) = setup_data(tokenizer, tokenizer_config, config["data"])
 
     (
         policy,

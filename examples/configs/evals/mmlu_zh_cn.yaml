@@ -4,3 +4,6 @@ defaults: "mmlu.yaml"
 data:
   dataset_name: "mmlu_ZH-CN"
 
+env:
+  math:
+    verifier_type: "multilingual_multichoice"
