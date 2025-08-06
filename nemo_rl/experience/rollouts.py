@@ -16,7 +16,9 @@
 # Supports multi-turn rollouts and many simultaneous environments (E.g. you can train on math, code, multi-turn games and more at once)
 
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+import asyncio
+import copy
 
 import ray
 import torch
@@ -49,8 +51,21 @@ def generate_responses(
     input_lengths: torch.Tensor,
     include_logprobs: bool = True,
     greedy: bool = False,
-) -> Tuple[BatchedDataDict[DatumSpec], List[torch.Tensor], dict]:
-    """Generate responses from policy."""
+    enable_principle_genrm_logprobs: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int], BatchedDataDict]:
+    """Generate responses from policy using synchronous generation.
+    
+    Args:
+        enable_principle_genrm_logprobs: If True, extracts Yes/No logprobs via additional 
+                                       forward pass for principle-based reward calculation.
+    
+    Returns:
+        Tuple containing:
+            - Updated batch with assistant messages appended
+            - List of generated token tensors
+            - Generation metrics dictionary  
+            - Generation outputs (including logprobs, token_ids, and optionally principle_genrm logprobs)
+    """
     # Add stop_strings to generation_input_data if present in the batch
     if "stop_strings" in batch:
         generation_input_data["stop_strings"] = batch["stop_strings"]
@@ -58,9 +73,10 @@ def generate_responses(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Generate responses
+    # POLICY GENERATION CALL:
+    # This calls the vLLM generation with optional principle_genrm logprob extraction
     generation_outputs = policy_generation.generate(
-        generation_input_data, greedy=greedy
+        generation_input_data, greedy=greedy, enable_principle_genrm_logprobs=enable_principle_genrm_logprobs
     )
 
     # Extract generated tokens
@@ -98,18 +114,22 @@ def generate_responses(
         "max_seqlen": torch.max(unpadded_sequence_lengths).item(),
     }
 
-    return batch, generated_ids, metrics
+    return batch, generated_ids, metrics, generation_outputs
 
 
 def calculate_rewards(
     batch: BatchedDataDict[DatumSpec],
-    task_to_env: Dict[str, EnvironmentInterface],
+    task_to_env: dict[str, EnvironmentInterface],
+    generation_outputs: Optional[BatchedDataDict] = None,
 ) -> EnvironmentReturn:
     """Calculate rewards for generated responses and get environment feedback.
 
     Args:
         batch: Batch containing message_log (LLMMessageLogType) with generated responses
         task_to_env: Dictionary mapping task names to their corresponding environments
+        generation_outputs: Optional BatchedDataDict containing generation outputs (e.g., logprobs, token_ids)
+                           from the policy generation step. Used by environments that need
+                           additional generation metadata for reward calculation.
 
     Returns:
         EnvironmentReturn namedtuple containing:
@@ -147,8 +167,40 @@ def calculate_rewards(
         # Get corresponding environment info
         env_info = [batch["extra_env_info"][i] for i in indices]
 
-        # Submit task to environment and store future
-        future = task_to_env[task_name].step.remote(messages, env_info)
+        # BACKWARD COMPATIBILITY CHECK:
+        # Some environments (like principle_genrm) need generation outputs for reward calculation,
+        # while others (like math_environment) don't. We use introspection to detect which
+        # environments support the generation_outputs parameter to maintain compatibility.
+        env_step_method = task_to_env[task_name].step
+        import inspect
+        step_signature = inspect.signature(env_step_method.remote if hasattr(env_step_method, 'remote') else env_step_method)
+        supports_generation_outputs = 'generation_data' in step_signature.parameters
+
+        # DATA SLICING FOR MULTI-ENVIRONMENT BATCHES:
+        # When multiple task types are in the same batch, each environment only needs
+        # the generation outputs for its specific samples. We slice the data accordingly.
+        group_generation_outputs = None
+        if supports_generation_outputs and generation_outputs is not None:
+            # Extract generation outputs for this specific group of sample indices
+            group_generation_outputs = {}
+            for key, value in generation_outputs.items():
+                if isinstance(value, torch.Tensor):
+                    # Slice tensors to get only this group's samples
+                    group_generation_outputs[key] = value[indices]
+                elif isinstance(value, list):
+                    # Slice lists to get only this group's samples
+                    group_generation_outputs[key] = [value[i] for i in indices]
+                else:
+                    # Copy scalar values as-is
+                    group_generation_outputs[key] = value
+            group_generation_outputs = BatchedDataDict(group_generation_outputs)
+
+        # ENVIRONMENT CALL WITH CONDITIONAL PARAMETERS:
+        # Call the environment with generation outputs if supported, otherwise use legacy interface
+        if supports_generation_outputs:
+            future = task_to_env[task_name].step.remote(messages, env_info, group_generation_outputs)  # type: ignore # ray actor call
+        else:
+            future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
         futures.append(future)
         future_to_indices[future] = indices
 
@@ -205,7 +257,8 @@ def run_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
-) -> Tuple[BatchedDataDict[DatumSpec], Dict[str, Any]]:
+    enable_principle_genrm_logprobs: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Runs a multi-turn rollout loop, interacting with the environment.
 
     Args:
@@ -216,6 +269,7 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
+        enable_principle_genrm_logprobs: Whether to extract Yes/No logprobs for principle_genrm training.
 
     Returns:
         Tuple containing:
@@ -273,13 +327,14 @@ def run_multi_turn_rollout(
         )
 
         # generate_responses updates active_batch["message_log"] in-place
-        active_batch, generated_ids, gen_metrics = generate_responses(
+        active_batch, generated_ids, gen_metrics, generation_outputs = generate_responses(
             policy_generation,
             generation_input_data,
             active_batch,
             tokenizer,
             active_input_lengths,
             greedy=greedy,
+            enable_principle_genrm_logprobs=enable_principle_genrm_logprobs,
         )
 
         # Record token usage - assistant
@@ -291,7 +346,10 @@ def run_multi_turn_rollout(
         total_gen_tokens_per_turn.append(sum(len(ids) for ids in generated_ids))
 
         # Calculate rewards and get environment feedback
-        env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
+        # ENVIRONMENT INTERACTION WITH GENERATION OUTPUTS:
+        # Pass the generation outputs (including any principle_genrm logprobs) to environments
+        # that need them for reward calculation. Legacy environments ignore this parameter.
+        env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env, generation_outputs)
 
         total_rewards[active_indices] += env_output.rewards
 

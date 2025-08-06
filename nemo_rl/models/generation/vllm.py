@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import logging
 import os
 from typing import List, Optional, TypedDict, Union
 
@@ -215,13 +216,14 @@ class VllmGenerationWorker:
         return True
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False, enable_principle_genrm_logprobs: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
             greedy: Whether to use greedy decoding instead of sampling
+            enable_principle_genrm_logprobs: Whether to extract Yes/No logprobs for principle_genrm training
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
@@ -229,6 +231,8 @@ class VllmGenerationWorker:
                 - logprobs: Log probabilities for tokens
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - principle_genrm_yes_logprobs: (optional) Yes token logprobs for principle_genrm
+                - principle_genrm_no_logprobs: (optional) No token logprobs for principle_genrm
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -300,6 +304,8 @@ class VllmGenerationWorker:
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
+        complete_sequences = []  # For principle_genrm logprob calculation
+        
         max_length = 0
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
@@ -343,6 +349,13 @@ class VllmGenerationWorker:
 
             logprobs_list.append(full_logprobs)
 
+            # Store complete sequence for principle_genrm if needed
+            if enable_principle_genrm_logprobs:
+                # Create the complete sequence: input + generated tokens
+                input_tokens = input_ids[i, :sequence_length].tolist()
+                complete_sequence = input_tokens + generated_tokens
+                complete_sequences.append(complete_sequence)
+
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -362,6 +375,18 @@ class VllmGenerationWorker:
                 ),
             }
         )
+
+        # Add principle_genrm logprobs if enabled - do additional forward pass
+        if enable_principle_genrm_logprobs and complete_sequences:
+            try:
+                yes_logprobs, no_logprobs = self._get_yes_no_logprobs_for_sequences(complete_sequences)
+                return_data["principle_genrm_yes_logprobs"] = torch.tensor(yes_logprobs, dtype=torch.float)
+                return_data["principle_genrm_no_logprobs"] = torch.tensor(no_logprobs, dtype=torch.float)
+            except Exception as e:
+                logging.error(f"Error in additional forward pass for principle_genrm: {e}")
+                # Add fallback tensors with -inf values
+                return_data["principle_genrm_yes_logprobs"] = torch.full((len(complete_sequences),), -float('inf'), dtype=torch.float)
+                return_data["principle_genrm_no_logprobs"] = torch.full((len(complete_sequences),), -float('inf'), dtype=torch.float)
 
         return return_data
 
@@ -468,6 +493,87 @@ class VllmGenerationWorker:
         else:
             self.llm.wake_up()
 
+    def _get_yes_no_logprobs_for_sequences(self, sequences: list[list[int]]) -> tuple[list[float], list[float]]:
+        """Get Yes/No logprobs for a batch of sequences using an additional forward pass.
+        
+        This method takes complete sequences (input + generated tokens) and uses sequence[:-1] 
+        as the prompt to generate the last token, extracting Yes/No logprobs from the generation.
+        
+        Args:
+            sequences: List of complete token sequences (input + generated tokens)
+            
+        Returns:
+            Tuple of (yes_logprobs, no_logprobs) lists
+        """
+        if not sequences:
+            return [], []
+        
+        # Get tokenizer from the vLLM engine and compute the *single* token ids for
+        # " Yes" and " No".  Using a leading space guarantees that most BPE/GPT
+        # tokenizers treat each as a single token (e.g., "ĠYes").
+        tokenizer = self.llm.llm_engine.tokenizer.tokenizer
+
+        yes_token_id = tokenizer.encode(" Yes", add_special_tokens=False)[-1]
+        no_token_id = tokenizer.encode(" No", add_special_tokens=False)[-1]
+        
+        # Prepare prompts using sequence[:-1] to regenerate the last token
+        prompts = []
+        last_tokens = []
+        for seq in sequences:
+            if len(seq) <= 1:
+                raise ValueError(f"Sequence is too short: {seq}, likely a bug in the code")
+            else:
+                # Use everything except the last token as prompt
+                prompt_tokens = seq[:-1]
+                prompts.append({"prompt_token_ids": prompt_tokens})
+                last_tokens.append(seq[-1])
+        
+        # Create sampling params to generate exactly 1 token with logprobs
+        sampling_params = self.SamplingParams(
+            # Use temperature=1.0 so the logits are unscaled when computing probabilities.
+            # Explicitly disable top-k / top-p filtering as they would renormalise the
+            # distribution and shift log-probs.  We still request the top-50 tokens so
+            # Yes/No are almost certainly returned even for large vocabularies.
+            temperature=1.0,
+            top_k=-1,
+            top_p=1.0,
+            max_tokens=1,  # Generate exactly one token
+            logprobs=50,   # Get top-50 logprobs to ensure we capture Yes/No tokens
+            prompt_logprobs=None,  # Don't need prompt logprobs
+        )
+        
+        # Do the additional forward pass
+        outputs = self.llm.generate(prompts, sampling_params)
+        
+        yes_logprobs = []
+        no_logprobs = []
+        
+        for output, expected_last_token in zip(outputs, last_tokens):
+            yes_logprob = -float('inf')
+            no_logprob = -float('inf')
+            
+            try:
+                generation = output.outputs[0]
+                # Check if we have logprobs for the generated token
+                if hasattr(generation, 'logprobs') and generation.logprobs and len(generation.logprobs) > 0:
+                    # Get logprobs for the first (and only) generated token
+                    first_token_logprobs = generation.logprobs[0]
+                    
+                    if first_token_logprobs:
+                        # Extract Yes/No logprobs from the logprob dictionary
+                        if yes_token_id in first_token_logprobs:
+                            yes_logprob = first_token_logprobs[yes_token_id].logprob
+                        if no_token_id in first_token_logprobs:
+                            no_logprob = first_token_logprobs[no_token_id].logprob
+                
+            except Exception as e:
+                logging.error(f"Error extracting Yes/No logprobs from generation: {e}")
+            
+            yes_logprobs.append(yes_logprob)
+            no_logprobs.append(no_logprob)
+        
+        return yes_logprobs, no_logprobs
+
 
 class VllmGeneration(GenerationInterface):
     def __init__(
@@ -548,7 +654,7 @@ class VllmGeneration(GenerationInterface):
         return tied_worker_groups
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False, enable_principle_genrm_logprobs: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM."""
         assert isinstance(data, BatchedDataDict), (
@@ -563,7 +669,7 @@ class VllmGeneration(GenerationInterface):
         future_bundle = self.worker_group.run_all_workers_multiple_data(
             "generate",
             sharded_data,
-            common_kwargs={"greedy": greedy},
+            common_kwargs={"greedy": greedy, "enable_principle_genrm_logprobs": enable_principle_genrm_logprobs},
             only_on="tied_leader",
         )
 
