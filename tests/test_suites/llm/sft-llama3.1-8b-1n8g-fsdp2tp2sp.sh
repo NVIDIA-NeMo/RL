@@ -38,5 +38,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 0.6' \
         'data["train/loss"]["50"] < 0.38' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 70'
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 70' \
+        'mean(data["timing/train/total_step_time"][1:]) < 32'
 fi 
