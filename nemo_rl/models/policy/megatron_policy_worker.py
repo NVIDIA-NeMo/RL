@@ -56,7 +56,7 @@ from megatron.inference.text_generation.mcore_engine_server import (
     run_mcore_engine,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from megatron.bridge import CausalLMBridge
+from megatron.bridge import AutoBridge
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
@@ -691,7 +691,7 @@ class MegatronPolicyWorker:
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-        self.megatron_bridge = CausalLMBridge.from_hf_pretrained(hf_model_name)
+        self.megatron_bridge = AutoBridge.from_hf_pretrained(hf_model_name)
 
         # Create a map that maps any local parameter name to a list of global parameter names.
         # This map is repeatedly used by parameter gatherring phase during refit of every step.
