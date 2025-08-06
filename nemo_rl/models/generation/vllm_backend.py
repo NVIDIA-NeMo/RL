@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-from typing import Any, Iterable, Optional
+from collections import defaultdict
+from typing import Any, Optional
 
 import torch
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 try:
     import vllm  # noqa: F401
@@ -24,49 +25,6 @@ except ImportError:
         "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
         "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
     )
-
-
-def _patch_gemma3_mm():
-    """Patch gemma3_mm.py to support new HF multimodal format (post transformers v4.52).
-
-    Patch taken from:https://github.com/vllm-project/vllm/pull/19151/files#diff-5890909300e4e6c3160444e4587ec3fd80498bb83f598b22ce81337f75992b06
-    """
-    from packaging.version import Version as PkgVersion
-
-    assert PkgVersion(vllm.__version__) < PkgVersion("0.9.2"), (
-        f"You are using vllm version {vllm.__version__}. "
-        "Please remove this patch (_patch_gemma3_mm in nemo_rl/models/generation/vllm_backend.py) "
-        "since it is included in vllm>=0.9.2."
-    )
-
-    from vllm.logger import init_logger
-    from vllm.model_executor.models import gemma3_mm
-    from vllm.model_executor.models.utils import (
-        AutoWeightsLoader,
-        WeightsMapper,
-    )
-
-    logger = init_logger("gemma3_mm_patch")
-
-    gemma3_mm.Gemma3ForConditionalGeneration.hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            # mapping for new names in checkpoint saved after transformers v4.52
-            "model.language_model.": "language_model.model.",
-            "model.vision_tower.": "vision_tower.",
-            "model.multi_modal_projector.": "multi_modal_projector.",
-            "lm_head.": "language_model.lm_head.",
-        }
-    )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    gemma3_mm.Gemma3ForConditionalGeneration.load_weights = load_weights
-    logger.info("Successfully patched gemma3_mm.py in vllm_backend.")
-
-
-_patch_gemma3_mm()
 
 
 class VllmInternalWorkerExtension:
@@ -79,10 +37,6 @@ class VllmInternalWorkerExtension:
 
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
-
-        # Temporary fix for vllm==0.9.0 which overrides the NCCL_CUMEM_ENABLE to 0 and causes
-        # https://github.com/NVIDIA-NeMo/RL/issues/564. This can be removed after it is upgraded to vllm>=0.9.1rc1.
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size
@@ -136,7 +90,7 @@ class VllmInternalWorkerExtension:
         try:
             is_tensor_packed = local_device_ipc_handles[0]
             if is_tensor_packed:
-                _, all_handles, tensor_metadata = local_device_ipc_handles
+                _, all_handles, list_keys = local_device_ipc_handles
             else:
                 _, name_and_handle_list = local_device_ipc_handles
 
@@ -152,33 +106,40 @@ class VllmInternalWorkerExtension:
                 # Extract packed tensor from IPC handle
                 dtype_to_packed_tensor = {}
                 for dtype, tensor_handle in all_handles:
-                    func, args = tensor_handle
+                    func = rebuild_cuda_tensor
+                    args = tensor_handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
                     tensor = func(*list_args)
                     dtype_to_packed_tensor[dtype] = tensor
 
-                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
-                # using extra memory.
-                for key, metadata in tensor_metadata.items():
-                    # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                    if isinstance(metadata, tuple):
-                        # use dtype of current step
-                        offset, dtype = metadata
-                        shape, _, size = self.state_dict_info[key]
-                        # update record
-                        self.state_dict_info[key] = (shape, dtype, size)
-                    else:
-                        offset = metadata
-                        shape, dtype, size = self.state_dict_info[key]
-                    tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
-                        *shape
+                weights = []
+                dtype_to_offset = defaultdict(lambda: 0)
+                for key in list_keys:
+                    shape, dtype, size = self.state_dict_info[key]
+                    weights.append(
+                        (
+                            key,
+                            dtype_to_packed_tensor[dtype][
+                                dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                            ].view(*shape),
+                        )
                     )
-                    weights.append((key, tensor))
+                    dtype_to_offset[dtype] += size
+
+                expected_sizes = {
+                    dtype: tensor.numel()
+                    for dtype, tensor in dtype_to_packed_tensor.items()
+                }
+                assert dtype_to_offset == expected_sizes, (
+                    f"Packed tensor size mismatch: expected sizes from keys list {expected_sizes} != actual packed tensor sizes {dtype_to_offset}. "
+                    f"This indicates the keys list order doesn't match the order used when packing tensors."
+                )
             else:
                 # Process each handle to get the tensor
                 for name, handle in name_and_handle_list:
-                    func, args = handle
+                    func = rebuild_cuda_tensor
+                    args = handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
                     tensor = func(*list_args)

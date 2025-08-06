@@ -51,6 +51,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.module import Float16Module
 from megatron.inference.text_generation.mcore_engine_server import (
     run_mcore_engine,
 )
@@ -116,8 +117,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
     configure_expandable_segments,
     get_gpu_info,
+    get_handle_from_tensor,
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
@@ -185,11 +188,25 @@ def setup_megatron_model(
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
         def freeze_moe_router(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
             for layer in model_module.decoder.layers:
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.weight.requires_grad = False
 
+        # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
+        # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
+        def re_enable_float32_expert_bias(model_module):
+            # Handle both wrapped (Float16Module) and unwrapped models
+            if isinstance(model_module, Float16Module):
+                model_module = model_module.module
+            for layer in model_module.decoder.layers:
+                if hasattr(layer.mlp, "router"):
+                    layer.mlp.router._maintain_float32_expert_bias()
+
         model_post_init_fns.append(freeze_moe_router)
+        model_post_init_fns.append(re_enable_float32_expert_bias)
 
     # Model, optimizer, and learning rate.
     model = get_model_from_config(
@@ -368,6 +385,17 @@ class MegatronPolicyWorker:
             "float16": torch.float16,
         }
         self.dtype = dtype_map[self.cfg["precision"]]
+
+        # Reward models are not yet supported with Megatron.
+        if self.cfg.get("reward_model_cfg", {}).get("enabled", False):
+            raise NotImplementedError(
+                "Reward models are not yet supported with the Megatron backend, this issue is "
+                "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
+            )
+
+        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+        # with different order of node_bundles
+        configure_dynamo_cache()
 
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
@@ -692,7 +720,7 @@ class MegatronPolicyWorker:
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
-        self.refit_param_info_hf = None
+        self.refit_param_info_mcore = None
         self.local_key_to_global_keys = None
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -951,6 +979,8 @@ class MegatronPolicyWorker:
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor(
                 mb_metrics["grad_norm"][-1]
@@ -1355,20 +1385,18 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     def prepare_refit_info(self) -> None:
         # Get parameter info for refit
-        ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
-        refit_param_info_mcore = get_param_info(self.model, self.dtype)
+        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
+        self.refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Create a map that maps any local parameter name to a list of global parameter names.
         # This map is repeatedly used by parameter gatherring phase during refit of every step.
         self.local_key_to_global_keys = get_local_key_to_global_keys(
-            self.model, state_dict_info=refit_param_info_mcore
+            self.model, state_dict_info=self.refit_param_info_mcore
         )
 
         # Collect tensor metadata for refit
-        self.refit_param_info_hf = {}
-        for key, _ in refit_param_info_mcore:
+        refit_param_info_hf = {}
+        for key, _ in self.refit_param_info_mcore:
             # gather megatron params
             gathered_megatron_params = gather_params(
                 self.model,
@@ -1381,15 +1409,14 @@ class MegatronPolicyWorker:
             )
             # collect tensor metadata
             for name, tensor in gathered_hf_params.items():
-                self.refit_param_info_hf[name] = (
+                refit_param_info_hf[name] = (
                     tensor.shape,
                     tensor.dtype,
                     tensor.numel(),
                 )
 
-        return self.refit_param_info_hf
+        return refit_param_info_hf
 
-    @torch.no_grad()
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1397,12 +1424,6 @@ class MegatronPolicyWorker:
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        # Get parameter info for refit
-        ## param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        # Cannot cache refit_param_info_mcore since dtype and size_in_bytes for the 1st and 2nd steps may be different
-        ## e.g. e_score_correction_bias
-        refit_param_info_mcore = get_param_info(self.model, self.dtype)
 
         # Collect current available memory for refit
         ## Get current device index from torch
@@ -1413,7 +1434,7 @@ class MegatronPolicyWorker:
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
 
-        return refit_param_info_mcore, total_available_bytes
+        return self.refit_param_info_mcore, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
@@ -1441,7 +1462,6 @@ class MegatronPolicyWorker:
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
-        from torch.multiprocessing.reductions import reduce_tensor
 
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
@@ -1456,25 +1476,9 @@ class MegatronPolicyWorker:
             # Pack tensors in gathered_hf_params into consolidated tensors by dtype
             # First calculate total size needed for each dtype
             type_to_total_size = defaultdict(lambda: 0)
-            tensor_metadata = dict()
 
             # Record offset of the tensor
             for key, tensor in gathered_hf_params.items():
-                # dtype for the 1st and 2nd steps may be different (e.g. e_score_correction_bias)
-                if tensor.dtype == self.refit_param_info_hf[key][1]:
-                    tensor_metadata[key] = type_to_total_size[tensor.dtype]
-                else:
-                    # also send dtype if it changes
-                    tensor_metadata[key] = (
-                        type_to_total_size[tensor.dtype],
-                        tensor.dtype,
-                    )
-                    # update record
-                    self.refit_param_info_hf[key] = (
-                        tensor.shape,
-                        tensor.dtype,
-                        tensor.numel(),
-                    )
                 type_to_total_size[tensor.dtype] += tensor.numel()
 
             # Allocate consolidated tensors for each dtype
@@ -1488,31 +1492,34 @@ class MegatronPolicyWorker:
                 for dtype, total_size in type_to_total_size.items()
             }
 
+            dtype_to_offset = defaultdict(lambda: 0)
             # Copy tensors into consolidated buffers
             for key, tensor in gathered_hf_params.items():
-                offset = tensor_metadata[key]
-                if isinstance(offset, tuple):
-                    offset, _ = offset
                 dtype = tensor.dtype
                 size = tensor.numel()
-                packed_tensors[dtype][offset : offset + size].copy_(
-                    tensor.detach().view(-1)
-                )
+                packed_tensors[dtype][
+                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                ].copy_(tensor.detach().view(-1))
+                dtype_to_offset[dtype] += size
 
             # Create IPC handles for consolidated tensors
             all_handles = [
-                (dtype, reduce_tensor(tensor.detach()))
+                (dtype, get_handle_from_tensor(tensor))
                 for dtype, tensor in packed_tensors.items()
             ]
 
             # Store reference to prevent garbage collection
             self._held_gather_buffer = packed_tensors
 
-            serialized = (pack_tensor_for_ipc, all_handles, tensor_metadata)
+            serialized = (
+                pack_tensor_for_ipc,
+                all_handles,
+                tuple(gathered_hf_params.keys()),
+            )
         else:
             all_handles = []
             for key, tensor in gathered_hf_params.items():
-                handle = reduce_tensor(tensor.detach())
+                handle = get_handle_from_tensor(tensor)
                 all_handles.append((key, handle))
             self._held_gather_buffer = gathered_hf_params
             serialized = (False, all_handles)

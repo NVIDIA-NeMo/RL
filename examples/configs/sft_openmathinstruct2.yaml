@@ -16,6 +16,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B"
@@ -67,6 +68,7 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  shuffle: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
