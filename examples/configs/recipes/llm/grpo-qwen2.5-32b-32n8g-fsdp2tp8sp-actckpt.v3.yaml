@@ -2,6 +2,7 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_rollout_turns: 1
+  max_num_epochs: 1
   max_num_steps: 2
   normalize_rewards: true
   use_leave_one_out_baseline: true

@@ -4,6 +4,7 @@ defaults: "grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
+  max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
