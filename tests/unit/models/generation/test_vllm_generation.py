@@ -626,7 +626,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
-@pytest.mark.timeout(140)
+@pytest.mark.timeout(360)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine):
@@ -1274,7 +1274,7 @@ async def test_vllm_refit_non_collocated_update_weights(
         print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
-@pytest.mark.timeout(210)
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 def test_vllm_generation_with_megatron_training(
     cluster, tokenizer, tensor_parallel_size

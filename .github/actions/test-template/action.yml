@@ -1,0 +1,216 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: "Test Template"
+description: "Template for running NeMo tests in a containerized environment"
+
+inputs:
+  runner:
+    description: "Runner to use for test"
+    required: true
+  script:
+    description: "Test script to execute"
+    required: true
+  is_optional:
+    description: "Failure will cancel all other tests if set to true"
+    required: false
+    default: "false"
+  is_doc_test:
+    description: "Upload coverage as doc test"
+    required: false
+    default: "false"
+  is_unit_test:
+    description: "Upload coverage as unit test"
+    required: false
+    default: "false"
+  image:
+    description: "Image to use for test"
+    required: false
+    default: "nemo_rl_container"
+  cpu-only:
+    description: "Run tests on CPU only"
+    required: false
+    default: "false"
+  azure-client-id:
+    description: "Azure Client ID"
+    required: true
+  azure-tenant-id:
+    description: "Azure Tenant ID"
+    required: true
+  azure-subscription-id:
+    description: "Azure Subscription ID"
+    required: true
+  has-azure-credentials:
+    description: "Has Azure credentials"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Azure CLI
+      if: ${{ inputs.has-azure-credentials == 'true' }}
+      shell: bash
+      run: |
+        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Azure Login
+      if: ${{ inputs.has-azure-credentials == 'true' }}
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.azure-client-id }}
+        tenant-id: ${{ inputs.azure-tenant-id }}
+        subscription-id: ${{ inputs.azure-subscription-id }}
+
+    - name: Azure ACR Login
+      if: ${{ inputs.has-azure-credentials == 'true' }}
+      shell: bash
+      run: |
+        az acr login --name nemoci
+
+    - name: Azure Fileshare
+      if: ${{ inputs.has-azure-credentials == 'true' && inputs.is_unit_test == 'false' && inputs.is_doc_test == 'false' }}
+      shell: bash
+      id: azure-fileshare
+      run: |
+        sudo apt update
+        sudo apt install -y cifs-utils
+
+        RESOURCE_GROUP_NAME="azure-gpu-vm-runner_group"
+        STORAGE_ACCOUNT_NAME="nemocistorageaccount2"
+        FILE_SHARE_NAME="fileshare"
+
+        MNT_ROOT="/media"
+        MNT_PATH="$MNT_ROOT/$STORAGE_ACCOUNT_NAME/$FILE_SHARE_NAME"
+
+        echo "MNT_PATH=$MNT_PATH" | tee -a "$GITHUB_OUTPUT"
+
+        sudo mkdir -p $MNT_PATH
+
+        # Create a folder to store the credentials for this storage account and
+        # any other that you might set up.
+        CREDENTIAL_ROOT="/etc/smbcredentials"
+        sudo mkdir -p "/etc/smbcredentials"
+
+        # Get the storage account key for the indicated storage account.
+        # You must be logged in with az login and your user identity must have
+        # permissions to list the storage account keys for this command to work.
+        STORAGE_ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group $RESOURCE_GROUP_NAME \
+            --account-name $STORAGE_ACCOUNT_NAME \
+            --query "[0].value" --output tsv | tr -d '"')
+
+        # Create the credential file for this individual storage account
+        SMB_CREDENTIAL_FILE="$CREDENTIAL_ROOT/$STORAGE_ACCOUNT_NAME.cred"
+        if [ ! -f $SMB_CREDENTIAL_FILE ]; then
+            echo "username=$STORAGE_ACCOUNT_NAME" | sudo tee $SMB_CREDENTIAL_FILE > /dev/null
+            echo "password=$STORAGE_ACCOUNT_KEY" | sudo tee -a $SMB_CREDENTIAL_FILE > /dev/null
+        else
+            echo "The credential file $SMB_CREDENTIAL_FILE already exists, and was not modified."
+        fi
+
+        # Change permissions on the credential file so only root can read or modify the password file.
+        sudo chmod 600 $SMB_CREDENTIAL_FILE
+
+        # This command assumes you have logged in with az login
+        HTTP_ENDPOINT=$(az storage account show --resource-group $RESOURCE_GROUP_NAME --name $STORAGE_ACCOUNT_NAME --query "primaryEndpoints.file" --output tsv | tr -d '"')
+        SMB_PATH=$(echo $HTTP_ENDPOINT | cut -c7-${#HTTP_ENDPOINT})$FILE_SHARE_NAME
+
+        STORAGE_ACCOUNT_KEY=$(az storage account keys list --resource-group $RESOURCE_GROUP_NAME --account-name $STORAGE_ACCOUNT_NAME --query "[0].value" --output tsv | tr -d '"')
+
+        sudo mount -t cifs $SMB_PATH $MNT_PATH -o credentials=$SMB_CREDENTIAL_FILE,serverino,nosharesock,actimeo=30,mfsymlinks
+
+        ls -al $MNT_PATH/TestData
+
+    - name: Docker pull image
+      shell: bash
+      run: |
+        docker pull nemoci.azurecr.io/${{ inputs.image }}:${{ github.run_id }}
+
+    - name: Create UUID
+      id: uuid
+      shell: bash
+      run: |
+        echo "id=$(uuidgen)" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout NeMo
+      uses: actions/checkout@v2
+      env:
+        DIR: ${{ github.run_id }}
+      with:
+        submodules: 'recursive'
+        path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
+
+    - name: Run tests
+      id: test
+      shell: bash
+      run: |
+        COVERAGE_PREFIX=$([[ "${{ inputs.is_doc_test }}" == "true" ]] && echo "doc-test" || ([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e"))
+        echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
+
+        docker run --rm -u root --runtime=nvidia --gpus all \
+          --shm-size=64g \
+          --env TRANSFORMERS_OFFLINE=0 \
+          --env HYDRA_FULL_ERROR=1 \
+          --env HF_HOME=/home/TestData/nemo-rl/hf_home \
+          --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
+          --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
+          --env HF_TOKEN \
+          --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
+          --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
+          --volume /mnt/datadrive/TestData/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \
+          --volume /mnt/datadrive/TestData/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
+          --volume /mnt/datadrive/TestData/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
+          --volume /mnt/datadrive/TestData/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
+          nemoci.azurecr.io/nemo_rl_container:${{ github.run_id }} bash -eux -o pipefail -c '\
+            git config --global --add safe.directory /opt/nemo-rl
+            # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary
+            umask 000
+            bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
+            echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
+
+    - name: Check result
+      id: check
+      shell: bash
+      run: |
+        coverage_report=coverage-${{ steps.test.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
+        echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
+
+        IS_SUCCESS=$(tail -n 1 err.log | grep -q "Finished successfully." && echo "true" || echo "false")
+
+        if [[ "$IS_SUCCESS" == "false" && "{% raw %}${{ inputs.is_optional }}" == "true" ]]; then
+          echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
+          IS_SUCCESS=true
+        fi
+
+        if [[ "$IS_SUCCESS" == "false" ]]; then
+          echo Test did not finish successfully.
+          exit 1
+        fi
+
+        exit $EXIT_CODE
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      if: ${{ steps.check.outputs.coverage_report != 'none' }}
+      with:
+        name: ${{ steps.check.outputs.coverage_report }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/.coverage
+        include-hidden-files: true
+
+    - name: Container shutdown
+      if: always()
+      shell: bash
+      run: |
+        rm -rf $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }} || true

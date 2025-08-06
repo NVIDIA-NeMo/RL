@@ -29,6 +29,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -146,6 +147,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "OpenMathInstruct-2"
+  shuffle: true
 
 env:
   math:

@@ -98,7 +98,9 @@ class CodeExecutionWorker:
                 result = result[len(lookahead) :]
         return result
 
-    def execute(self, message_batch: str, metadata_batch: List[CodeEnvMetadata]) -> str:
+    def execute(
+        self, message_batch: str, metadata_batch: List[CodeEnvMetadata]
+    ) -> Tuple[List[Dict[str, str]], List[bool], List[Any]]:
         """Execute code in a sandboxed environment."""
         results = []
         terminateds = []
@@ -204,6 +206,7 @@ class CodeEnvironment(EnvironmentInterface):
         self,
         message_log_batch: List[LLMMessageLogType],
         metadata_batch: List[CodeEnvMetadata],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         """Process a batch of code execution steps."""
         message_batch = [ml[-1]["content"] for ml in message_log_batch]
@@ -238,12 +241,18 @@ class CodeEnvironment(EnvironmentInterface):
 
         next_stop_strings = [["</code>"]] * len(message_log_batch)
 
+        assert return_extracted_answer == False, (
+            "return_extracted_answer is not supported in CodeEnvironment. Please set it to False."
+        )
+        extracted_answers = None
+
         return EnvironmentReturn(
             observations=observations,
             metadata=new_metadata_batch,
             next_stop_strings=next_stop_strings,
             rewards=rewards_tensor,
             terminateds=terminated_tensor,
+            answers=extracted_answers,
         )
 
     def shutdown(self):

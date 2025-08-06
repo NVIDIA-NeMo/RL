@@ -14,7 +14,7 @@ policy:
     cpu_offload: true
     sequence_parallel: true
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -46,3 +46,7 @@ policy:
       # For most cases, use "dummy" to load the initial weights, since they will be overwritten during refit
       # For Gemma models, we need to use "auto" due to a vllm bug
       load_format: dummy
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

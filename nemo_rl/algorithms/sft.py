@@ -40,7 +40,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class SFTSaveState(TypedDict):
@@ -134,7 +134,7 @@ def setup(
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
-        shuffle=True,
+        shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
@@ -326,6 +326,11 @@ def sft_train(
 ) -> None:
     # Run basic sft training
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
 
     if sft_save_state is None:
         sft_save_state = _default_sft_save_state()
@@ -405,7 +410,8 @@ def sft_train(
                     )
 
                 print("▶ Taking a training step...")
-                train_results = policy.train(train_data, loss_fn)
+                with timer.time("policy_training"):
+                    train_results = policy.train(train_data, loss_fn)
 
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
@@ -439,12 +445,19 @@ def sft_train(
                 sft_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if master_config["checkpointing"]["enabled"] and (
+                timeout.mark_iteration()
+                should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
+                )
+                # +1 because step is 0-indexed
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
                 ):
-                    ## +1 because step is 0-indexed
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     sft_save_state["total_steps"] = total_steps + 1
                     sft_save_state["epoch"] = current_epoch
@@ -502,6 +515,22 @@ def sft_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            if "total_flops" in train_results:
+                total_tflops = (
+                    train_results["total_flops"]
+                    / timing_metrics["policy_training"]
+                    / 1e12
+                )
+                num_ranks = train_results["num_ranks"]
+                print(
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+                )
+                if "theoretical_tflops" in train_results:
+                    theoretical_tflops = train_results["theoretical_tflops"]
+                    print(
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                    )
+                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

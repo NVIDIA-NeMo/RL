@@ -18,7 +18,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class TestTimer:
@@ -188,3 +188,48 @@ class TestTimer:
         # Check the elapsed time
         assert elapsed == 5.0
         assert timer._timers["precise_test"][0] == 5.0
+
+
+class TestTimeoutChecker:
+    def test_infinite_timeout(self):
+        checker = TimeoutChecker(timeout=None)
+        time.sleep(0.1)
+        assert checker.check_save() is False
+
+    def test_short_timeout(self):
+        checker = TimeoutChecker(timeout="00:00:00:01")
+        time.sleep(1.1)
+        assert checker.check_save() is True
+
+    def test_double_save_prevented(self):
+        checker = TimeoutChecker(timeout="00:00:00:01")
+        time.sleep(1.1)
+        assert checker.check_save() is True
+        assert checker.check_save() is False
+
+    def test_fit_last_save_time_enabled(self):
+        # Create a TimeoutChecker with a 3-second timeout and enable fit_last_save_time logic
+        checker = TimeoutChecker(timeout="00:00:00:03", fit_last_save_time=True)
+        checker.start_iterations()
+
+        # Simulate 10 iterations, each taking about 0.1 seconds
+        # This builds up a stable average iteration time
+        for _ in range(10):
+            time.sleep(0.1)
+            checker.mark_iteration()
+
+        # Wait an additional ~2.0 seconds so that:
+        # elapsed time + avg iteration time >= timeout (3 seconds)
+        time.sleep(2.0)
+
+        result = checker.check_save()
+        # Assert that the checker triggers a save due to timeout
+        assert result is True
+
+    def test_iteration_tracking(self):
+        checker = TimeoutChecker()
+        checker.start_iterations()
+        time.sleep(0.05)
+        checker.mark_iteration()
+        assert len(checker.iteration_times) == 1
+        assert checker.iteration_times[0] > 0

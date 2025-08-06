@@ -76,5 +76,8 @@ print("[Nemo/Mcore imports successful]")
 EOF
 
 # Sync just to return the environment to the original base state
-uv sync
+uv sync --link-mode symlink --locked --no-install-project
+uv sync --link-mode symlink --locked --extra vllm --no-install-project
+uv sync --link-mode symlink --locked --extra mcore --no-install-project
+uv sync --link-mode symlink --locked --all-groups --no-install-project
 echo Success
