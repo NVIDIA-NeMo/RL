@@ -540,6 +540,9 @@ def grpo_train(
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
+                # Check if principle_genrm environment is being used to enable special logprob extraction
+                enable_principle_genrm_logprobs = "principle_genrm" in task_to_env
+                
                 repeated_batch, rollout_metrics = run_multi_turn_rollout(
                     policy_generation=policy_generation,
                     input_batch=repeated_batch,
@@ -548,6 +551,7 @@ def grpo_train(
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                    enable_principle_genrm_logprobs=enable_principle_genrm_logprobs,
                 )
                 policy_generation.finish_generation()
 
@@ -909,6 +913,9 @@ def validate(
             return
 
         # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+        # Check if principle_genrm environment is being used to enable special logprob extraction
+        enable_principle_genrm_logprobs = "principle_genrm" in val_task_to_env
+        
         val_batch, gen_metrics = run_multi_turn_rollout(
             policy_generation,
             val_batch,
@@ -917,6 +924,7 @@ def validate(
             max_seq_len=master_config["policy"]["max_total_sequence_length"],
             max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
             greedy=False,
+            enable_principle_genrm_logprobs=enable_principle_genrm_logprobs,
         )
 
         # Apply environment post-processing for validation

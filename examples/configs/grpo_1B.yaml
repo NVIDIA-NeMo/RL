@@ -178,6 +178,10 @@ env:
     #     4: 0.4    # Slightly worse
     #     5: 0.2   # Worse
     #     6: 0.0    # Much worse
+  principle_genrm: # Configuration for the PrincipleGenrmEnvironment
+    enable: false
+    num_workers: 8 # Number of parallel principle verification workers
+    stop_strings: null # Default stop strings for this environment
   ifeval:
     num_workers: 8
     enable: false

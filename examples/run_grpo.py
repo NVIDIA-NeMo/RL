@@ -29,6 +29,7 @@ from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.environments.genrm_pairwise_environment import GenRMPairwiseEnvironment
+from nemo_rl.environments.principle_genrm_environment import PrincipleGenrmEnvironment
 from nemo_rl.models.generation.interfaces import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -126,6 +127,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
             },
         ).remote(env_configs["genrm_pairwise"])
         task_to_env["rlhf_genrm"] = genrm_pairwise_env
+
+    if "principle_genrm" in env_configs and env_configs["principle_genrm"]["enable"]:
+        principle_genrm_env = PrincipleGenrmEnvironment.options(
+            runtime_env={
+                "py_executable": PrincipleGenrmEnvironment.DEFAULT_PY_EXECUTABLE,
+                "env_vars": dict(os.environ),
+            },
+        ).remote(env_configs["principle_genrm"])
+        task_to_env["principle_genrm"] = principle_genrm_env
 
     return train_ds, val_ds, task_to_env, task_to_env
 

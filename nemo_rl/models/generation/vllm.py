@@ -383,10 +383,7 @@ class VllmGenerationWorker:
                 return_data["principle_genrm_yes_logprobs"] = torch.tensor(yes_logprobs, dtype=torch.float)
                 return_data["principle_genrm_no_logprobs"] = torch.tensor(no_logprobs, dtype=torch.float)
             except Exception as e:
-                logging.error(f"Error in additional forward pass for principle_genrm: {e}")
-                # Add fallback tensors with -inf values
-                return_data["principle_genrm_yes_logprobs"] = torch.full((len(complete_sequences),), -float('inf'), dtype=torch.float)
-                return_data["principle_genrm_no_logprobs"] = torch.full((len(complete_sequences),), -float('inf'), dtype=torch.float)
+                raise e
 
         return return_data
 
@@ -513,8 +510,21 @@ class VllmGenerationWorker:
         # tokenizers treat each as a single token (e.g., "ĠYes").
         tokenizer = self.llm.llm_engine.tokenizer.tokenizer
 
-        yes_token_id = tokenizer.encode(" Yes", add_special_tokens=False)[-1]
-        no_token_id = tokenizer.encode(" No", add_special_tokens=False)[-1]
+        yes_token_ids = tokenizer.encode(" Yes", add_special_tokens=False)
+        if len(yes_token_ids) != 1:
+            raise ValueError(
+                f"Expected ' Yes' to be a single token, but got {len(yes_token_ids)} tokens: {yes_token_ids}"
+                " This is required for principle_genrm logprob calculation."
+            )
+        yes_token_id = yes_token_ids[0]
+
+        no_token_ids = tokenizer.encode(" No", add_special_tokens=False)
+        if len(no_token_ids) != 1:
+            raise ValueError(
+                f"Expected ' No' to be a single token, but got {len(no_token_ids)} tokens: {no_token_ids}"
+                " This is required for principle_genrm logprob calculation."
+            )
+        no_token_id = no_token_ids[0]
         
         # Prepare prompts using sequence[:-1] to regenerate the last token
         prompts = []

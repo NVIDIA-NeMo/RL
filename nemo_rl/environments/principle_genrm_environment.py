@@ -51,8 +51,8 @@ class PrincipleGenrmVerifyWorker:
         """Calculate rewards for principle_genrm based on logprobs and ground truth.
 
         Reward calculation:
-        - If ground truth is "Yes": reward = logprob(" Yes") - logprob(" No")
-        - If ground truth is "No": reward = logprob(" No") - logprob(" Yes")
+        - If ground truth is "Yes": reward = logprob(" Yes") - logprob(" No") # speicial note on the whitespace
+        - If ground truth is "No": reward = logprob(" No") - logprob(" Yes") # speicial note on the whitespace
 
         Args:
             pred_responses: list[str]. The predicted responses from the LLM.
@@ -72,9 +72,9 @@ class PrincipleGenrmVerifyWorker:
             no_logprob = no_logprobs[i]
             
             # Calculate reward: logprob(correct) - logprob(incorrect)
-            if ground_truth.lower() == "yes":
+            if ground_truth == "Yes":
                 reward = yes_logprob - no_logprob
-            elif ground_truth.lower() == "no":
+            elif ground_truth == "No":
                 reward = no_logprob - yes_logprob
             else:
                 raise ValueError(f"Invalid ground truth: {ground_truth}")
@@ -93,12 +93,14 @@ class PrincipleGenrmEnvironment(EnvironmentInterface):
     using log probabilities of "Yes"/"No" tokens for precise reward calculation.
     """
     
+    DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
+    
     def __init__(self, cfg: PrincipleGenrmEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
         self.workers = [
             PrincipleGenrmVerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
-                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+                runtime_env={"py_executable": self.DEFAULT_PY_EXECUTABLE}
             ).remote()
             for _ in range(self.num_workers)
         ]
@@ -141,7 +143,8 @@ class PrincipleGenrmEnvironment(EnvironmentInterface):
                 if interaction["role"] == "assistant"
             ]
             assistant_response_batch.append("".join(assistant_responses))
-
+        
+        print(f"example assistant response: {assistant_response_batch[0]}")
         # EXTRACT LOGPROBS FROM GENERATION OUTPUTS:
         # These come from the additional forward pass in vLLM when enable_principle_genrm_logprobs=True
         yes_logprobs = None
