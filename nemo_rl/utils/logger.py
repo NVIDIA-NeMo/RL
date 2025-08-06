@@ -51,9 +51,11 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
 
+
 class SwanlabConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
+
 
 class TensorboardConfig(TypedDict):
     log_dir: NotRequired[str]
@@ -329,6 +331,7 @@ class WandbLogger(LoggerInterface):
         """
         self.run.log({name: figure}, step=step)
 
+
 class SwanlabLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 
@@ -396,6 +399,7 @@ class SwanlabLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
 
 class GpuMetricSnapshot(TypedDict):
     step: int
@@ -1337,5 +1341,6 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
 
     # Create the new log directory
     os.makedirs(new_log_dir, exist_ok=True)
+
 
     return new_log_dir

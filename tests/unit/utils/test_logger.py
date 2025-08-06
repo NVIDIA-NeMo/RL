@@ -264,6 +264,7 @@ class TestWandbLogger:
         mock_run = mock_wandb.init.return_value
         mock_run.config.update.assert_called_once_with(params)
 
+
 class TestSwanlabLogger:
     """Test the SwanlabLogger class."""
 
@@ -1594,11 +1595,14 @@ class TestLogger:
 
         # Check that log_metrics was called on all loggers
         mock_wandb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
-        mock_swanlab_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
+        mock_swanlab_instance.log_metrics.assert_called_once_with(
+            metrics, step, "", None
+        )
         mock_tb_instance.log_metrics.assert_called_once_with(metrics, step, "", None)
         mock_mlflow_instance.log_metrics.assert_called_once_with(
             metrics, step, "", None
         )
+
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
