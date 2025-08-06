@@ -1603,7 +1603,6 @@ class TestLogger:
             metrics, step, "", None
         )
 
-
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")

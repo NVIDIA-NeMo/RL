@@ -1342,5 +1342,4 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     # Create the new log directory
     os.makedirs(new_log_dir, exist_ok=True)
 
-
     return new_log_dir
