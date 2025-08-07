@@ -7,7 +7,7 @@ from vllm.triton_utils import tl, triton
 from unittest.mock import patch
 
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.utils import CoreEngineProcManager
+from vllm.v1.engine.utils import CoreEngineProcManager
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -89,7 +89,6 @@ def monkey_patch_vllm_ray_executor(fp8_config):
 
 
 def apply_fp8_patches(self, fp8_config):
-    print(f"APPLYING FP8 PATCHES {fp8_config}")
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
 
@@ -121,6 +120,10 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
+    config = AutoConfig.from_pretrained(model_name)
+    if hasattr(config, "num_experts"):
+        assert config.num_experts == 0, "FP8 generation for MoE models is currently not supported"
+
     global global_fp8_config
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
@@ -150,13 +153,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
-        try:
-            config = AutoConfig.from_pretrained(model_name)
-            with init_empty_weights():
-                model = AutoModel.from_config(config)
-            param_names = [name for name, _ in model.named_parameters()]
-        except OSError as e:
-            raise ConnectionError(f"Cannot download model for '{model_name}'.") from e
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [name for name, _ in model.named_parameters()]
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
