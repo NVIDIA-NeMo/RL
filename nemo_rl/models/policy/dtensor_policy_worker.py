@@ -79,6 +79,7 @@ from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 @contextmanager
@@ -519,6 +520,7 @@ class DTensorPolicyWorker:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -868,6 +870,7 @@ class DTensorPolicyWorker:
 
             return metrics
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -1148,6 +1151,7 @@ class DTensorPolicyWorker:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
@@ -1242,6 +1246,7 @@ class DTensorPolicyWorker:
         return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_weights_ipc_handles")
     def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
         assert self._held_sharded_state_dict_reference is not None, (
             "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
@@ -1290,6 +1295,7 @@ class DTensorPolicyWorker:
                 tensor = tensor.to(self.dtype, non_blocking=True)
                 self.model_update_group.broadcast(tensor.data, src=0)
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1299,6 +1305,7 @@ class DTensorPolicyWorker:
         self.model.eval()
         self.offload_before_refit()
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1326,6 +1333,7 @@ class DTensorPolicyWorker:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1339,6 +1347,7 @@ class DTensorPolicyWorker:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         # Offload as much as possible on the CPU
         self.model = self.move_to_cpu(self.model)
