@@ -530,25 +530,27 @@ class VllmGenerationWorker:
         prompts = []
         last_tokens = []
         for seq in sequences:
-            if len(seq) <= 1:
-                raise ValueError(f"Sequence is too short: {seq}, likely a bug in the code")
+            if len(seq) <= 2:
+                raise ValueError(f"Sequence is too short: {seq}, need at least 3 tokens (input + content_token + eos)")
             else:
-                # Use everything except the last token as prompt
-                prompt_tokens = seq[:-1]
+                # The sequence ends with [content token(" Yes" or " No"), eos_token]
+                # We want to use everything except both the content token AND EOS token as prompt 
+                # to regenerate the content token
+                prompt_tokens = seq[:-2]  # Remove both content token and EOS token
                 prompts.append({"prompt_token_ids": prompt_tokens})
-                last_tokens.append(seq[-1])
-        
+                last_tokens.append(seq[-2])  # Use second-to-last token (the actual content token)
+                
         # Create sampling params to generate exactly 1 token with logprobs
         sampling_params = self.SamplingParams(
             # Use temperature=1.0 so the logits are unscaled when computing probabilities.
             # Explicitly disable top-k / top-p filtering as they would renormalise the
-            # distribution and shift log-probs.  We still request the top-50 tokens so
+            # distribution and shift log-probs.  We still request the top-20 tokens so
             # Yes/No are almost certainly returned even for large vocabularies.
             temperature=1.0,
             top_k=-1,
             top_p=1.0,
             max_tokens=1,  # Generate exactly one token
-            logprobs=50,   # Get top-50 logprobs to ensure we capture Yes/No tokens
+            logprobs=20,   # Get top-20 logprobs to ensure we capture Yes/No tokens (vLLM max)
             prompt_logprobs=None,  # Don't need prompt logprobs
         )
         
@@ -575,6 +577,24 @@ class VllmGenerationWorker:
                             yes_logprob = first_token_logprobs[yes_token_id].logprob
                         if no_token_id in first_token_logprobs:
                             no_logprob = first_token_logprobs[no_token_id].logprob
+                        
+                        # Debug: Check if we're getting suspiciously perfect scores
+                        if yes_logprob == 0.0 or no_logprob == 0.0:
+                            logging.warning(f"Suspiciously perfect logprob detected!")
+                            logging.warning(f"Generated token: {generation.token_ids[0] if generation.token_ids else None}")
+                            logging.warning(f"Yes logprob: {yes_logprob}, No logprob: {no_logprob}")
+                            logging.warning(f"Raw Yes entry: {first_token_logprobs.get(yes_token_id, 'NOT_FOUND')}")
+                            logging.warning(f"Raw No entry: {first_token_logprobs.get(no_token_id, 'NOT_FOUND')}")
+                            # Show top few logprobs for comparison
+                            sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1].logprob, reverse=True)
+                            logging.warning(f"Top 3 logprobs: {[(k, v.logprob) for k, v in sorted_logprobs[:3]]}")
+                        
+                        # Check for edge cases that might cause issues
+                        if yes_logprob == -float('inf') and no_logprob == -float('inf'):
+                            logging.warning(f"Neither Yes ({yes_token_id}) nor No ({no_token_id}) found in top-20 logprobs. Available: {list(first_token_logprobs.keys())[:5]}...")
+                        
+                        if expected_last_token not in [yes_token_id, no_token_id]:
+                            logging.warning(f"Expected token {expected_last_token} is not Yes ({yes_token_id}) or No ({no_token_id}). This sequence may not end with a valid judgment.")
                 
             except Exception as e:
                 logging.error(f"Error extracting Yes/No logprobs from generation: {e}")

@@ -167,14 +167,10 @@ def calculate_rewards(
         # Get corresponding environment info
         env_info = [batch["extra_env_info"][i] for i in indices]
 
-        # BACKWARD COMPATIBILITY CHECK:
-        # Some environments (like principle_genrm) need generation outputs for reward calculation,
-        # while others (like math_environment) don't. We use introspection to detect which
-        # environments support the generation_outputs parameter to maintain compatibility.
-        env_step_method = task_to_env[task_name].step
-        import inspect
-        step_signature = inspect.signature(env_step_method.remote if hasattr(env_step_method, 'remote') else env_step_method)
-        supports_generation_outputs = 'generation_data' in step_signature.parameters
+        # EXPLICIT TASK-BASED GENERATION DATA SUPPORT:
+        # Some environments (like principle_genrm) need generation outputs for reward calculation.
+        # We explicitly check for known task types that require this data.
+        supports_generation_outputs = task_name == "principle_genrm"
 
         # DATA SLICING FOR MULTI-ENVIRONMENT BATCHES:
         # When multiple task types are in the same batch, each environment only needs

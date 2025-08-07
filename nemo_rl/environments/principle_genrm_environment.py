@@ -70,12 +70,26 @@ class PrincipleGenrmVerifyWorker:
 
             yes_logprob = yes_logprobs[i]
             no_logprob = no_logprobs[i]
+
+            if yes_logprob == -float('inf') and no_logprob == -float('inf'):
+                reward = -50.0
+                results.append(reward)
+                print(f"ground_truth: {ground_truth}, yes_logprob: {yes_logprob}, no_logprob: {no_logprob}, reward: {reward} (INVALID RESPONSE PENALTY)")
+                continue
             
             # Calculate reward: logprob(correct) - logprob(incorrect)
             if ground_truth == "Yes":
-                reward = yes_logprob - no_logprob
+                no_logprob = -50.0 if no_logprob == -float('inf') else no_logprob
+                if yes_logprob == -float('inf'):
+                    reward = -50.0
+                else:
+                    reward = yes_logprob - no_logprob
             elif ground_truth == "No":
-                reward = no_logprob - yes_logprob
+                yes_logprob = -50.0 if yes_logprob == -float('inf') else yes_logprob
+                if no_logprob == -float('inf'):
+                    reward = -50.0
+                else:
+                    reward = no_logprob - yes_logprob
             else:
                 raise ValueError(f"Invalid ground truth: {ground_truth}")
 
@@ -198,7 +212,7 @@ class PrincipleGenrmEnvironment(EnvironmentInterface):
                 "role": "environment",
                 "content": "Environment: principle evaluation complete, reward: " + str(results[i])
             }
-            for _ in results
+            for i in range(len(results))
         ]
 
         # CREATE TENSORS FOR RL FRAMEWORK:
@@ -221,11 +235,18 @@ class PrincipleGenrmEnvironment(EnvironmentInterface):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         """Computes metrics for this environment given a global rollout batch."""
 
+        # Calculate prediction accuracy from rewards
+        # Since reward = logprob(correct) - logprob(incorrect), positive reward = correct prediction
+        rewards = batch["total_reward"]
+        
+        total_predictions = len(rewards)
+        correct_predictions = (rewards > 0).sum().item()
+        
+        # Calculate accuracy
+        accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+        
         metrics = {
-            "principle_genrm_mean_reward": batch["rewards"].mean().item(),
-            "principle_genrm_std_reward": batch["rewards"].std().item(),
-            "principle_genrm_min_reward": batch["rewards"].min().item(),
-            "principle_genrm_max_reward": batch["rewards"].max().item(),
+            "principle_genrm_accuracy": accuracy
         }
 
         return batch, metrics 
