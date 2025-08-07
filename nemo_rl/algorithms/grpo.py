@@ -770,7 +770,6 @@ def grpo_train(
                         os.path.join(checkpoint_path, "train_dataloader.pt"),
                     )
                     checkpointer.finalize_checkpoint(checkpoint_path)
-                policy.offload_after_refit()
 
         # Logging
         # Log training data
