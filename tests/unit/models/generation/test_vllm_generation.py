@@ -1198,7 +1198,7 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
-async def test_vllm_refit_non_collocated_update_weights(
+async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
     tokenizer,
     test_input_data,
@@ -1237,7 +1237,7 @@ async def test_vllm_refit_non_collocated_update_weights(
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
     vllm_config["colocated"]["enabled"] = False
 
-    # Megatron nee
+    # Megatron config with Qwen2.5-0.5B
     if policy_type == "megatron":
         model_name = "Qwen/Qwen2.5-0.5B"
         tokenizer = get_tokenizer({"name": model_name})
