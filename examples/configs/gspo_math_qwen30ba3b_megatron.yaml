@@ -7,8 +7,7 @@ loss_fn:
   ratio_clip_max: 0.2
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
-  use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
-  sequence_level_importance_sampling: true
-  # FIXME(pjin): should require token_level_loss = False.
-  token_level_loss: true
+  use_on_policy_kl_approximation: False
+  use_importance_sampling_correction: True
+  sequence_level_importance_sampling: True
+  token_level_loss: False

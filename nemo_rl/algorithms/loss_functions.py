@@ -114,8 +114,7 @@ class ClippedPGLossFn(LossFunction):
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
-        # FIXME(pjin): sequence-level importance sampling must be exclusive to token-level loss.
-        if False and self.sequence_level_importance_sampling:
+        if self.sequence_level_importance_sampling:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
@@ -221,16 +220,13 @@ class ClippedPGLossFn(LossFunction):
         if not self.disable_ppo_ratio:
             log_ratios = curr_logprobs - prev_logprobs
             if self.sequence_level_importance_sampling:
-                # NB(pjin): this masked mean is only "sequence level" when micro batch size = 1.
-                micro_batch_size = int(advantages.shape[0])
-                assert micro_batch_size == 1
-                seq_log_ratio = masked_mean(
+                seq_log_ratio_mean = masked_mean(
                     log_ratios,
-                    mask,
-                    global_normalization_factor=global_valid_toks,
+                    token_mask,
+                    dim=-1,
                 )
-                seq_ratio = seq_log_ratio.exp()
-                ratios = seq_ratio.repeat(micro_batch_size, advantages.shape[1])
+                seq_ratio = seq_log_ratio_mean.exp()
+                ratios = seq_ratio.repeat(1, advantages.shape[1])
             else:
                 ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
@@ -270,7 +266,9 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
         else:
             # Token-level correction (original GRPO implementation)
-            actor_importance_weights_expanded = torch.exp(prev_logprobs - generation_logprobs)
+            actor_importance_weights_expanded = torch.exp(
+                prev_logprobs - generation_logprobs
+            )
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
