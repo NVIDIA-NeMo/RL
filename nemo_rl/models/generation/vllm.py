@@ -323,6 +323,9 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        if len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0:
+            vllm_kwargs["ray_workers_use_nsight"] = True
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -341,7 +344,7 @@ class VllmGenerationWorker:
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
-            logprobs_mode="raw_logprobs",
+            # logprobs_mode="raw_logprobs",
             **vllm_kwargs,
         )
 
@@ -1317,10 +1320,14 @@ class VllmGenerationWorker:
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         torch.cuda.profiler.start()
+        if self.llm is not None:
+            self.llm.collective_rpc("start_gpu_profiling", args=tuple())
 
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+        if self.llm is not None:
+            self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
 
 class VllmGeneration(GenerationInterface):
