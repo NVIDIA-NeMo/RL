@@ -5,3 +5,14 @@ loss_fn:
   use_importance_sampling_correction: True
   sequence_level_importance_sampling: True
   token_level_loss: False
+
+policy:
+  activation_checkpointing_enabled: True
+
+  dtensor_cfg:
+    tensor_parallel_size: 2
+    activation_checkpointing: True
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
