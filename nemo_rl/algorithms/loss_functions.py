@@ -145,7 +145,7 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        next_token_logits = next_token_logits.to(torch.float32)
+        # next_token_logits = next_token_logits.to(torch.float32)
         curr_logprobs = compute_token_logprobs(next_token_logits, data["input_ids"])
 
         # Calculate KL regularization.

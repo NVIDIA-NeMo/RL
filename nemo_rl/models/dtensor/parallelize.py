@@ -39,7 +39,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
 from nemo_rl.distributed.model_utils import (
-    DistributedLogprob,
+    ChunkedDistributedLogprob,
     DistributedTokenLevelEntropy,
 )
 
@@ -592,7 +592,7 @@ def token_level_entropy_from_vocab_parallel_logits(
 
 
 def get_logprobs_from_vocab_parallel_logits(
-    vocab_parallel_logits: DTensor, input_ids: torch.Tensor
+    vocab_parallel_logits: DTensor, input_ids: torch.Tensor, chunk_size: int = 4096
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -614,12 +614,13 @@ def get_logprobs_from_vocab_parallel_logits(
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
 
     target = input_ids.roll(shifts=-1, dims=-1)
-    probs = DistributedLogprob.apply(
+    probs = ChunkedDistributedLogprob.apply(
         vocab_parallel_logits.to_local(),
         target,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
         tp_mesh.get_group(),
         not torch.is_grad_enabled(),
+        chunk_size=chunk_size,
     ).contiguous()
     return probs[:, :-1]
