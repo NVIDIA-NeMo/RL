@@ -86,7 +86,7 @@ def export_model_from_megatron(
 
         exporter_cls = HFQwen2Exporter
 
-    elif hf_config.model_type == "qwen3":
+    elif hf_config.model_type in ("qwen3", "qwen3_moe"):
         from nemo.tron.converter.qwen import HFQwen3Exporter
 
         exporter_cls = HFQwen3Exporter
