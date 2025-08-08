@@ -8,6 +8,7 @@ grpo:
 checkpointing:
   enabled: false
   checkpoint_dir: "results/grpo_8b_megatron"
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"

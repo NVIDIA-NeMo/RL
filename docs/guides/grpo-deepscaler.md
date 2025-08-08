@@ -5,12 +5,12 @@ This guide explains how to use NeMo RL to train long Chain of Thought (CoT) reas
 
 ## Train the Model
 We follow the DeepScaleR recipe and train the model in three stages. In the first stage, we train with an 8K context window. In the second stage, we train with a 16K context window. In the third stage, we train with a 24K context window.
-To train the model using NeMo RL, use the `examples/configs/grpo-deepscaler-1.5b-8K.yaml` config file. This file closely matches the experiment settings in the original DeepScaleR recipe. We then train with `examples/configs/grpo-deepscaler-1.5b-16K.yaml` and `examples/configs/grpo-deepscaler-1.5b-24K.yaml` for the second and third stages, respectively.
+To train the model using NeMo RL, use the `examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml` config file. This file closely matches the experiment settings in the original DeepScaleR recipe. We then train with `examples/configs/recipes/llm/grpo-deepscaler-1.5b-16K.yaml` and `examples/configs/recipes/llm/grpo-deepscaler-1.5b-24K.yaml` for the second and third stages, respectively.
 
 ```sh
-uv run examples/run_grpo_math.py --config=examples/configs/grpo-deepscaler-1.5b-8K.yaml
-uv run examples/run_grpo_math.py --config=examples/configs/grpo-deepscaler-1.5b-16K.yaml policy.model_name=/path/to/8K/checkpoint/hf
-uv run examples/run_grpo_math.py --config=examples/configs/grpo-deepscaler-1.5b-24K.yaml policy.model_name=/path/to/16K/checkpoint/hf
+uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml
+uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-16K.yaml policy.model_name=/path/to/8K/checkpoint/hf
+uv run examples/run_grpo_math.py --config=examples/configs/recipes/llm/grpo-deepscaler-1.5b-24K.yaml policy.model_name=/path/to/16K/checkpoint/hf
 ```
 
 At the end of each stage, you need to specify the Hugging Face checkpoint to continue training with. To get this checkpoint, we convert a model checkpoint to a Hugging Face checkpoint with the following command:

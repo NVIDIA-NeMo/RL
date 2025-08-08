@@ -63,6 +63,7 @@ class AllTaskProcessedDataset:
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.max_seq_length = max_seq_length
+        self._bos_checked = False
 
         if isinstance(task_data_processors, dict):
             # apply defaults to all task data specs
@@ -111,6 +112,22 @@ class AllTaskProcessedDataset:
         datum_spec = task_data_processor(
             entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
         )
+
+        # Check the first processed item for BOS token assertion
+        if (
+            not self._bos_checked
+            and "message_log" in datum_spec
+            and datum_spec["message_log"]
+        ):
+            first_message = datum_spec["message_log"][0]
+            if "token_ids" in first_message:
+                token_ids = first_message["token_ids"]
+                assert isinstance(token_ids, torch.Tensor), (
+                    f"token_ids must be a torch.Tensor, got {type(token_ids)}"
+                )
+                assert_no_double_bos(token_ids, self.tokenizer)
+            self._bos_checked = True
+
         return datum_spec
 
 
@@ -197,16 +214,20 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     return output
 
 
-def dpo_collate_fn(
+def preference_collate_fn(
     data_batch: list[DPODatumSpec],
-    tokenizer: TokenizerType,
-    make_sequence_length_divisible_by: int,
 ) -> BatchedDataDict[Any]:
-    """Collate function for DPO training.
+    """Collate function for preference data training.
 
     This function separates the chosen and rejected responses to create
     two examples per prompt. The chosen and rejected examples are interleaved
     along the batch dimension, resulting in a batch size of 2 * len(data_batch).
+
+    Args:
+        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
+
+    Returns:
+        BatchedDataDict with message_log, length, loss_multiplier, task_name, and idx fields.
     """
     message_log = []
     length = []
@@ -236,6 +257,26 @@ def dpo_collate_fn(
         batch_max_length=batch_max_length,
     )
 
+    return batch
+
+
+def dpo_collate_fn(
+    data_batch: list[DPODatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+) -> BatchedDataDict[Any]:
+    """Collate function for DPO training.
+
+    Args:
+        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
+        tokenizer: Tokenizer for text processing
+        make_sequence_length_divisible_by: Make the sequence length divisible by this value
+
+    Returns:
+        BatchedDataDict with input_ids, input_lengths, token_mask, and sample_mask fields.
+    """
+    batch = preference_collate_fn(data_batch)
+
     ## add loss mask based on role to every message
     add_loss_mask_to_message_log(
         batch["message_log"],
@@ -253,8 +294,28 @@ def dpo_collate_fn(
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "token_mask": cat_and_padded["token_loss_mask"],
-            "sample_mask": loss_multiplier_batch,
+            "sample_mask": batch["loss_multiplier"],
         }
     )
 
     return train_data
+
+
+def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
+    """Assert that there are no double starting BOS tokens in the message.
+
+    Args:
+        token_ids: List of token IDs
+        tokenizer: Tokenizer
+    """
+    if tokenizer.bos_token_id is not None:
+        token_ids_list = token_ids.tolist()
+        if len(token_ids_list) > 1:
+            assert not (
+                token_ids_list[0] == tokenizer.bos_token_id
+                and token_ids_list[1] == tokenizer.bos_token_id
+            ), "Found double BOS token in the first two positions of the message."
+    else:
+        print(
+            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
+        )

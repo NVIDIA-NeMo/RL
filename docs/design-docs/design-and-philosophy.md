@@ -1,6 +1,6 @@
 # Design and Philosophy
 
-This section introduces the NeMo RL APIs and addresses the challenges of online Reinforcement Learning (RL). Coordinating various software components, known as RL Actors, requires effective resource allocation, isolation, coordination, and communication. Our design philosophy focuses on creating modular abstractions for these tasks, ensuring scalability from one GPU to thousands, regardless of the RL Actor's implementation.
+This section introduces the NeMo RL APIs, configuration patterns with TypedDicts, and addresses the challenges of online Reinforcement Learning (RL). Coordinating various software components, known as RL Actors, requires effective resource allocation, isolation, coordination, and communication. Our design philosophy focuses on creating modular abstractions for these tasks, ensuring scalability from one GPU to thousands, regardless of the RL Actor's implementation.
 
 ## Motivation
 
@@ -112,3 +112,25 @@ def grpo_train(
         policy.train(generations, logprobs, reference_logprobs, GRPOLossFn)
 ```
 For a complete implementation of GRPO, including validation, checkpointing, memory movement, and the data processing steps not detailed here, see [grpo_train](../../nemo_rl/algorithms/grpo.py).
+
+
+### TypedDict and Configuration Defaults
+
+In NeMo RL, we use YAML files for configuration and load them with `omegaconf` into a recursive `dict`. Within the codebase,
+the root `dict` and sub-`dict`s are typed with `TypedDict` subclasses to provide type hints when accessing attributes. This
+allows our type checker to validate if an undocumented attribute is accessed when not present in the `TypedDict` subclass,
+or to identify an incompatible type.
+
+We chose this design because it's simple and gives users the flexibility to use older configuration files without encountering errors during config loading due to unexpected attributes, whether obsolete or user defined. While we considered using dataclasses or other structured configuration formats, those approaches introduce more boilerplate and would require config versioning to support loading across different versions of NeMo RL.
+
+We follow a few design principles regarding configuration:
+
+1. We forbid defaults in the code, except in limited cases (e.g., alpha features). Defaults should be defined in YAML configuration files. Setting defaults in code makes it difficult to trace where values originate during debugging.
+    * Forbidden examples include:
+        * `grpo_config.get("num_prompts_per_step", 32)`
+        * `policy_config.get("model_name", "meta-llama/Llama-3.1-8B-Instruct")`
+    * Acceptable examples:
+        * If an attribute is typed `typing.NotRequired[...]`, it is okay for the code to check for absence/`None`, e.g., `assert "milestones" in scheduler_cfg` or `if "milestones" in scheduler_cfg`
+1. All configs under [examples/configs/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) are exemplars and should contain the defaults for `typing.Required` or `typing.NotRequired` attributes, along with accompanying documentation.
+   * All configs under [examples/configs/recipes/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes) do not require documentation and are snapshots of functional configurations.
+1. All configs under [examples/configs/**/*.yaml](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs) should adhere to their `TypedDict` subclass configuration. Unit tests in [tests/unit/test_config_validation.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tests/unit/test_config_validation.py) are run to validate compliance.

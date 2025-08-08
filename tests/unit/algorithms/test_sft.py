@@ -78,7 +78,11 @@ def mock_components():
             "train_global_batch_size": 1,
             "make_sequence_length_divisible_by": 8,
         },
-        "checkpointing": {"enabled": False},
+        "checkpointing": {
+            "enabled": False,
+            "checkpoint_must_save_by": None,
+            "save_period": 10,
+        },
     }
 
     return {

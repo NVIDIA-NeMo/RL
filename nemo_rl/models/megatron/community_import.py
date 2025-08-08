@@ -85,9 +85,14 @@ def export_model_from_megatron(
         from nemo.tron.converter.qwen import HFQwen2Exporter
 
         exporter_cls = HFQwen2Exporter
+
+    elif hf_config.model_type in ("qwen3", "qwen3_moe"):
+        from nemo.tron.converter.qwen import HFQwen3Exporter
+
+        exporter_cls = HFQwen3Exporter
     else:
         raise ValueError(
-            f"Unknown model: {hf_model_name}. Currently, only Qwen2 and Llama are supported. "
+            f"Unknown model: {hf_model_name}. Currently, only Qwen2, Qwen3 and Llama are supported. "
             "If you'd like to run with a different model, please raise an issue or consider adding your own converter."
         )
     print(f"Exporting model {hf_model_name} to {output_path}...")

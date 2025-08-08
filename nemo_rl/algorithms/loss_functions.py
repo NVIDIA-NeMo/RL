@@ -325,6 +325,7 @@ class NLLLoss(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
+        seq_index = data.get("seq_index", None)
 
         next_token_logits = next_token_logits.to(torch.float32)
 
@@ -346,7 +347,7 @@ class NLLLoss(LossFunction):
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
+                next_token_logits, data["input_ids"], seq_index=seq_index
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -381,6 +382,110 @@ class NLLLoss(LossFunction):
         }
 
 
+class PreferenceLossDataDict(TypedDict):
+    """Required keys for the preference loss function."""
+
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+
+
+class PreferenceLoss(LossFunction):
+    """Preference Loss function.
+
+    Optimizes the model to prefer chosen responses over rejected ones
+
+    The preference loss is computed as:
+    L_pref(θ) = -E[log(σ(β * (r_chosen - r_rejected)))]
+
+    where:
+    - σ is the sigmoid function
+    - β is a scaling factor (ex: `reference_policy_kl_penalty` in DPO)
+    - r_chosen and r_rejected are the rewards for chosen and rejected responses
+
+    Returns:
+        tuple[torch.Tensor, dict]: A tuple containing:
+            - The preference loss value
+            - A dictionary with metrics including:
+                - loss: Preference loss
+                - accuracy: Fraction of examples where chosen response has higher reward
+    """
+
+    def __init__(self):
+        self.loss_type = LossType.SEQUENCE_LEVEL
+
+    def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
+        # tensor is of shape (2*micro_batch_size,)
+        return tensor[::2], tensor[1::2]
+
+    def _preference_loss(
+        self,
+        rewards: Tensor,
+        sample_mask: Tensor,
+        global_valid_seqs: Tensor,
+        beta: float = 1.0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
+        rewards_delta = rewards_chosen - rewards_rejected
+
+        per_sample_loss = (
+            -torch.nn.functional.logsigmoid(beta * rewards_delta) * sample_mask[::2]
+        )  ## zero out invalid samples
+
+        ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
+        return (
+            masked_mean(
+                per_sample_loss,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_chosen > rewards_rejected,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_chosen,
+                sample_mask[::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+            masked_mean(
+                rewards_rejected,
+                sample_mask[1::2],
+                global_normalization_factor=global_valid_seqs / 2,
+            ),
+        )
+
+    def __call__(
+        self,
+        rewards: Tensor,
+        data: BatchedDataDict[PreferenceLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        sample_mask = data["sample_mask"]
+
+        rewards = rewards.squeeze(-1)
+
+        (
+            preference_loss,
+            accuracy,
+            rewards_chosen_mean,
+            rewards_rejected_mean,
+        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs)
+
+        ## divide by 2 because we're summing over (chosen, rejected) pairs
+        num_valid_samples = sample_mask.sum() / 2
+
+        return preference_loss, {
+            "loss": preference_loss.item(),
+            "accuracy": accuracy.item(),
+            "rewards_chosen_mean": rewards_chosen_mean.item(),
+            "rewards_rejected_mean": rewards_rejected_mean.item(),
+            "num_valid_samples": num_valid_samples.item(),
+        }
+
+
 class DPOLossConfig(TypedDict):
     reference_policy_kl_penalty: float
     preference_loss_weight: float
@@ -398,7 +503,7 @@ class DPOLossDataDict(TypedDict):
     sample_mask: torch.Tensor
 
 
-class DPOLossFn(LossFunction):
+class DPOLossFn(PreferenceLoss):
     """Direct Preference Optimization (DPO) loss function.
 
     This loss function implements the DPO algorithm as described in:
@@ -464,10 +569,7 @@ class DPOLossFn(LossFunction):
 
         self.loss_type = LossType.SEQUENCE_LEVEL
 
-    def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
-        return tensor[::2], tensor[1::2]
-
-    def _preference_loss(
+    def _dpo_loss(
         self,
         next_token_logits: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
@@ -479,6 +581,7 @@ class DPOLossFn(LossFunction):
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
+        seq_index = data.get("seq_index", None)
 
         next_token_logits = next_token_logits.to(torch.float32)
         if vocab_parallel_group is not None:
@@ -498,7 +601,7 @@ class DPOLossFn(LossFunction):
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
+                next_token_logits, data["input_ids"], seq_index=seq_index
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -518,41 +621,12 @@ class DPOLossFn(LossFunction):
         if self.preference_average_log_probs:
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
-        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
-        rewards_delta = rewards_chosen - rewards_rejected
-
-        per_sample_loss = (
-            -torch.nn.functional.logsigmoid(
-                self.reference_policy_kl_penalty * rewards_delta
-            )
-            * sample_mask[::2]
-        )  ## zero out invalid samples
-
-        ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
-        return (
-            masked_mean(
-                per_sample_loss,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_chosen > rewards_rejected,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_chosen,
-                sample_mask[::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
-            masked_mean(
-                rewards_rejected,
-                sample_mask[1::2],
-                global_normalization_factor=global_valid_seqs / 2,
-            ),
+        return self._preference_loss(
+            rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty
         )
 
-    def __call__(
+    # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLoss)
+    def __call__(  # type: ignore
         self,
         next_token_logits: Tensor,
         data: BatchedDataDict[DPOLossDataDict],
@@ -590,7 +664,7 @@ class DPOLossFn(LossFunction):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._preference_loss(
+        ) = self._dpo_loss(
             next_token_logits,
             data,
             global_valid_seqs,

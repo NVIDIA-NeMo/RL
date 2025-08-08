@@ -156,7 +156,6 @@ def gather_params(model, keys: list[str], key_to_global_keys: dict[str, list[str
             if k is not None:
                 gathered_params[k] = p
 
-    print(f"Time taken to gather params: {time.perf_counter() - st}")
     return gathered_params
 
 

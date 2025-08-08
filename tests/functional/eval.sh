@@ -18,7 +18,8 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run $PROJECT_ROOT/examples/run_eval.py \
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_eval.py \
     cluster.gpus_per_node=2 \
     $@ \
     2>&1 | tee $RUN_LOG

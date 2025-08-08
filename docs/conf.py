@@ -98,3 +98,54 @@ html_theme_options = {
     },
 }
 html_extra_path = ["project.json", "versions1.json"]
+
+# -- Supporting rendering GitHub alerts correctly ----------------------------
+# https://github.com/executablebooks/MyST-Parser/issues/845
+
+_GITHUB_ADMONITIONS = {
+    "> [!NOTE]": "note",
+    "> [!TIP]": "tip",
+    "> [!IMPORTANT]": "important",
+    "> [!WARNING]": "warning",
+    "> [!CAUTION]": "caution",
+}
+
+
+def convert_gh_admonitions(app, relative_path, parent_docname, contents):
+    # loop through content lines, replace github admonitions
+    for i, orig_content in enumerate(contents):
+        orig_line_splits = orig_content.split("\n")
+        replacing = False
+        for j, line in enumerate(orig_line_splits):
+            # look for admonition key
+            line_roi = line.lstrip()
+            for admonition_key in _GITHUB_ADMONITIONS:
+                if line_roi.startswith(admonition_key):
+                    line = line.replace(
+                        admonition_key,
+                        "```{" + _GITHUB_ADMONITIONS[admonition_key] + "}",
+                    )
+                    # start replacing quotes in subsequent lines
+                    replacing = True
+                    break
+            else:  # no break
+                if not replacing:
+                    continue
+                # remove GH directive to match MyST directive
+                # since we are replacing on the original line, this will preserve the right indent, if any
+                if line_roi.startswith("> "):
+                    line = line.replace("> ", "", 1)
+                elif line_roi.rstrip() == ">":
+                    line = line.replace(">", "", 1)
+                else:
+                    # missing "> ", so stop replacing and terminate directive
+                    line = f"```\n{line}"
+                    replacing = False
+            # swap line back in splits
+            orig_line_splits[j] = line
+        # swap line back in original
+        contents[i] = "\n".join(orig_line_splits)
+
+
+def setup(app):
+    app.connect("include-read", convert_gh_admonitions)

@@ -39,6 +39,13 @@ Whether model level support CP only depends on arguments passed to `torch.nn.fun
 - It's a known issue that context parallel can't be used together with sequence parallel.
 Refer to [here](https://github.com/NVIDIA-NeMo/RL/issues/659) for more details.
 
+## DeepScaleR Recipe Convergence Issues
+
+The DeepScaleR recipe (e.g., `examples/configs/grpo-deepscaler-1.5b-8K.yaml`) has been found to experience convergence issues when CUDA graphs are enabled in vLLM.
+
+**Special Handling:**
+- CUDA graphs must be disabled by setting `enforce_eager: True` in the vLLM configuration (https://github.com/NVIDIA-NeMo/RL/pull/857 forces eager execution by default).
+
 ## vLLM Async Rollout Timeout
 
 vLLM async generation has a configurable timeout for waiting for individual sample results. This is particularly important for longer sequences on large models.

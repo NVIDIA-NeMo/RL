@@ -24,7 +24,7 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -222,6 +222,8 @@ def main():
         )
 
     init_ray()
+
+    set_seed(config["grpo"]["seed"])
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])

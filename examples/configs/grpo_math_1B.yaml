@@ -10,6 +10,7 @@ grpo:
   val_at_start: false
   max_val_samples: 256
   val_batch_size: 256
+  seed: 42
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -28,6 +29,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA-NeMo/RL/issues/227)
@@ -127,6 +129,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "OpenMathInstruct-2"
+  shuffle: true
 
 env:
   math:

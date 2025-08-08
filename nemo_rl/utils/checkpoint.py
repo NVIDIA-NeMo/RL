@@ -49,6 +49,7 @@ class CheckpointingConfig(TypedDict):
     higher_is_better: bool
     save_period: int
     keep_top_k: NotRequired[int]
+    checkpoint_must_save_by: NotRequired[str | None]
 
 
 class CheckpointManager:

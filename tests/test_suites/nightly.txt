@@ -13,6 +13,11 @@ tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.sh
 # Functional 32b run
 tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt.v3.sh
 
+# Deepscaler (short tests)
+tests/test_suites/llm/grpo-deepscaler-1.5b-16K.sh
+tests/test_suites/llm/grpo-deepscaler-1.5b-24K.sh
+tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
+
 #######
 # SFT #
 #######
