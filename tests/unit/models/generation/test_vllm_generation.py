@@ -918,9 +918,8 @@ def test_vllm_generate_text(cluster, tokenizer):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("enable_dtensor", [True, False])
 def test_vllm_weight_update_and_prefix_cache_reset(
-    cluster, tokenizer, tensor_parallel_size, enable_dtensor
+    cluster, tokenizer, tensor_parallel_size
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -1024,8 +1023,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("enable_dtensor", [True, False])
-def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
+def test_vllm_weight_update_memory(cluster, tokenizer):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1084,12 +1082,8 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
     assert current_reserved == 0.0, "Memory should be 0 after refit completed"
     # memory threshold: memory during non-streaming weight update on 0.6B model on 2 GPUs
     # memory during streaming weight update should less than this baseline threshold
-    if enable_dtensor:
-        assert peak_allocated < 4005, "Peak allocated memory should < 4005 MB"
-        assert peak_reserved < 4016, "Peak reserved memory should < 4016 MB"
-    else:
-        assert peak_allocated < 5736, "Peak allocated memory should < 5736 MB"
-        assert peak_reserved < 5748, "Peak reserved memory should < 5748 MB"
+    assert peak_allocated < 4005, "Peak allocated memory should < 4005 MB"
+    assert peak_reserved < 4016, "Peak reserved memory should < 4016 MB"
 
     # Clean up
     vllm_policy.shutdown()
@@ -1097,10 +1091,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
 
 
 @pytest.mark.parametrize("is_eval", [True, False])
-@pytest.mark.parametrize("enable_dtensor", [True, False])
-def test_vllm_generation_with_stop(
-    cluster, test_input_data, tokenizer, is_eval, enable_dtensor
-):
+def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval):
     """Test vLLM generation with stop."""
     from nemo_rl.models.policy.lm_policy import Policy
 
