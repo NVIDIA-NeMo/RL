@@ -1228,8 +1228,11 @@ class DTensorPolicyWorker:
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
         # Get state_dict
-        self.model = self.move_to_cuda(self.model)
         self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
             self.model.state_dict()
         )
@@ -1287,12 +1290,26 @@ class DTensorPolicyWorker:
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        # Broadcast the weights for collective communication
         for _, tensor in self.model.state_dict().items():
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             if self.rank == 0:
                 tensor = tensor.to(self.dtype, non_blocking=True)
                 self.model_update_group.broadcast(tensor.data, src=0)
+
+        # Manually move model to cpu for cpu offload case
+        # cpu offload needs model on CPU before model forward
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
 
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
@@ -1311,9 +1328,6 @@ class DTensorPolicyWorker:
             # when cpu offload is enabled, the buffers do not get moved
             # to cuda automatically, so we need to do that manually
             self.model = self.move_buffer_to_device(self.model, "cuda")
-
-        # have to move buffers to cuda manually for cpu offload case
-        self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
         # Move optimizer state to CUDA if it exists

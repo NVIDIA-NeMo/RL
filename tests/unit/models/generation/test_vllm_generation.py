@@ -623,28 +623,15 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
-@pytest.mark.timeout(360)
-@pytest.mark.asyncio
-@pytest.mark.parametrize("async_engine", [True, False])
-async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine):
-    """1. Use vLLM for generation
+async def run_hf_train_process(
+    lm_policy, vllm_policy, tokenizer, async_engine, colocated
+):
+    """Validates that the two policies can work together.
+
+    1. Use vLLM for generation
     2. Use HF policy for training and logprob computation
-
-    This test validates that the two policies can work together.
     """
-    from nemo_rl.models.policy.lm_policy import Policy
     from tests.unit.test_utils import SimpleNLLLoss
-
-    # Create separate configs for each policy
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["vllm_cfg"]["async_engine"] = async_engine
-    vllm_config = configure_generation_config(vllm_config, tokenizer)
-
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["train_global_batch_size"] = 4
-
-    vllm_policy = None
-    lm_policy = None
 
     try:
         prompts = [
@@ -677,22 +664,8 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
             }
         )
 
-        # Create both policies
-        print("Creating vLLM policy...")
-        vllm_policy = VllmGeneration(cluster, vllm_config)
-        vllm_policy.finish_generation()
-
-        print("Creating DTensor policy...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
-
-        print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
-        vllm_policy.prepare_refit_info(state_dict_info)
-
         print("refitting vllm policy...")
-        refit_policy_generation(
-            lm_policy, vllm_policy, vllm_config["colocated"]["enabled"]
-        )
+        refit_policy_generation(lm_policy, vllm_policy, colocated)
 
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
@@ -794,7 +767,7 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
         print(f"Training loss: {results['loss']}")
 
         lm_policy.finish_training()
-        lm_policy.offload_after_refit()
+        refit_policy_generation(lm_policy, vllm_policy, colocated)
 
         # Step 4: Use vLLM for generation again to complete the workflow
         print("Using vLLM for generation again...")
@@ -819,6 +792,82 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
             vllm_policy.shutdown()
         if lm_policy and hasattr(lm_policy, "shutdown"):
             lm_policy.shutdown()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+)
+async def test_vllm_generation_with_hf_training_colocated(
+    cluster, tokenizer, async_engine, cpu_offload
+):
+    """This test validates that DTensor policy can work together with colocated vLLM policy."""
+    # Create VllmGeneration Policy
+    print("Creating vLLM policy...")
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy.finish_generation()
+
+    # Create Policy
+    print("Creating DTensor policy...")
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["train_global_batch_size"] = 4
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    # Prepare refit info
+    print("Preparing refit info...")
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
+    # Test
+    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True)
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+)
+async def test_vllm_generation_with_hf_training_non_colocated(
+    policy_cluster_separate, tokenizer, async_engine, cpu_offload
+):
+    """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
+    generation_cluster_separate = get_generation_cluster_separate(1)
+
+    # Create VllmGeneration Policy
+    print("Creating vLLM policy...")
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
+    vllm_policy.finish_generation()
+
+    # Create Policy
+    print("Creating DTensor policy...")
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["generation"]["colocated"]["enabled"] = False
+    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["train_global_batch_size"] = 4
+    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+
+    # Refit
+    # initialize collective communication for update weights
+    ip, port = policy_cluster_separate.get_master_address_and_port()
+    futures_train = lm_policy.init_collective(ip, port, world_size=2)
+    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    ray.get(futures_train + futures_inference)
+
+    # prepare refit info
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
+    # Test
+    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False)
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
