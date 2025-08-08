@@ -71,7 +71,8 @@ class PrincipleGenrmVerifyWorker:
             yes_logprob = yes_logprobs[i]
             no_logprob = no_logprobs[i]
 
-            if yes_logprob == -float('inf') and no_logprob == -float('inf'):
+            # Force the model to put " Yes" or " No" in the top 20 logprobs for the last token
+            if yes_logprob == -float('inf') or no_logprob == -float('inf'):
                 reward = -50.0
                 results.append(reward)
                 print(f"ground_truth: {ground_truth}, yes_logprob: {yes_logprob}, no_logprob: {no_logprob}, reward: {reward} (INVALID RESPONSE PENALTY)")
@@ -79,17 +80,9 @@ class PrincipleGenrmVerifyWorker:
             
             # Calculate reward: logprob(correct) - logprob(incorrect)
             if ground_truth == "Yes":
-                no_logprob = -50.0 if no_logprob == -float('inf') else no_logprob
-                if yes_logprob == -float('inf'):
-                    reward = -50.0
-                else:
-                    reward = yes_logprob - no_logprob
+                reward = yes_logprob - no_logprob
             elif ground_truth == "No":
-                yes_logprob = -50.0 if yes_logprob == -float('inf') else yes_logprob
-                if no_logprob == -float('inf'):
-                    reward = -50.0
-                else:
-                    reward = no_logprob - yes_logprob
+                reward = no_logprob - yes_logprob
             else:
                 raise ValueError(f"Invalid ground truth: {ground_truth}")
 
