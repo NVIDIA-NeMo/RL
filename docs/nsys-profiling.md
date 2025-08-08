@@ -84,8 +84,9 @@ When profiling is enabled, it generates the following logs and files:
 2. **Profile Files**: Each profiled worker generates a `.nsys-rep` file with naming pattern:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
-   vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   worker_process_<PID>.nsys-rep
    ```
+The `worker_process_<PID>.nsys-rep` are nsight profiles from vllm executors, the name is determined by vllm ray distributed execotr (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
