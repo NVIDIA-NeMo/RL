@@ -1,0 +1,32 @@
+{
+    "vllm_llm_kwargs": {
+        "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        "skip_tokenizer_init": false,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "gpu_memory_utilization": 0.95,
+        "enable_prefix_caching": true,
+        "dtype": "bfloat16",
+        "seed": 4,
+        "enforce_eager": false,
+        "max_model_len": 8192,
+        "trust_remote_code": true,
+        "worker_extension_cls": "nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
+        "enable_sleep_mode": true,
+        "disable_log_stats": true,
+        "logprobs_mode": "raw_logprobs",
+        "distributed_executor_backend": null
+    },
+    "sampling_params": {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "max_tokens": 8192,
+        "logprobs": 0,
+        "stop_token_ids": [
+            151643
+        ],
+        "stop": null,
+        "include_stop_str_in_output": true
+    }
+}
