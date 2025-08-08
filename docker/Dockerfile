@@ -110,7 +110,7 @@ ARG BASE_IMAGE
 RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ \
     if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
         echo "Installing vLLM wheel from build stage" && \
-        uv pip install --no-cache-dir /tmp/build_vllm/vllm/vllm*.whl; \
+        uv pip install --no-cache-dir /tmp/build_vllm/vllm/dist/vllm*.whl; \
     fi
 
 RUN <<"EOF" bash -exu
