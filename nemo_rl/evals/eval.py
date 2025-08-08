@@ -427,7 +427,7 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
         "model_name": master_config["generation"]["model_name"],
         "dataset_name": master_config["data"]["dataset_name"],
         "metric": master_config["eval"]["metric"],
-        "pass_k_value": master_config["eval"]["pass_k_value"],
+        "k_value": master_config["eval"]["k_value"],
         "num_tests_per_prompt": master_config["eval"]["num_tests_per_prompt"],
         "temperature": master_config["generation"]["temperature"],
         "top_p": master_config["generation"]["top_p"],

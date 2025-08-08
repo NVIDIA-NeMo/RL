@@ -8,6 +8,7 @@ loss_fn:
 
 policy:
   max_total_sequence_length: 24576
+  logprob_batch_size: 2
 
   dtensor_cfg:
     enabled: true
@@ -44,9 +45,6 @@ policy:
       gpu_memory_utilization: 0.8
       enforce_eager: True
       max_model_len: ${policy.max_total_sequence_length}
-      # For most cases, use "dummy" to load the initial weights, since they will be overwritten during refit
-      # For Gemma models, we need to use "auto" due to a vllm bug
-      load_format: dummy
 
 cluster:
   gpus_per_node: 8
