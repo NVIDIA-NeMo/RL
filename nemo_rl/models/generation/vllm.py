@@ -53,6 +53,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 class VllmSpecificArgs(TypedDict):
@@ -448,6 +449,7 @@ class VllmGenerationWorker:
             include_stop_str_in_output=True,
         )
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -811,6 +813,7 @@ class VllmGenerationWorker:
                 await asyncio.gather(*sample_tasks, return_exceptions=True)
                 raise e
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1045,6 +1048,7 @@ class VllmGenerationWorker:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
@@ -1156,6 +1160,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
