@@ -16,7 +16,6 @@ import os
 from typing import Protocol
 
 import rich
-
 import torch
 
 NRL_NSYS_WORKER_PATTERNS = os.environ.get("NRL_NSYS_WORKER_PATTERNS", "")
