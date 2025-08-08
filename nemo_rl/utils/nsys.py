@@ -79,13 +79,17 @@ def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
             policy.stop_gpu_profiling()
             policy.__NRL_PROFILE_STARTED = False
 
+
 def wrap_with_nvtx_name(name: str):
-    """ A decorator to wrap a function with an NVTX range with the given name. """
+    """A decorator to wrap a function with an NVTX range with the given name."""
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             torch.cuda.nvtx.range_push(name)
             ret = func(*args, **kwargs)
             torch.cuda.nvtx.range_pop()
             return ret
+
         return wrapper
+
     return decorator
