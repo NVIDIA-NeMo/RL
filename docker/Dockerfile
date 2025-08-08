@@ -62,6 +62,7 @@ RUN if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
         cd vllm && \
         git checkout v$VLLM_VERSION && \
         python use_existing_torch.py && \
+        uv venv --system-site-packages && \
         uv pip install -r requirements/build.txt && \
         uv build --wheel --no-build-isolation -v .; \
     else \
