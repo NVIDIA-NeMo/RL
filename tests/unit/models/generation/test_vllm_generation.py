@@ -794,7 +794,7 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.timeout(480)
+@pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload"), [(True, False), (False, True)]
@@ -827,7 +827,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True)
 
 
-@pytest.mark.timeout(480)
+@pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload"), [(True, False), (False, True)]
@@ -857,7 +857,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
 
     # Refit
     # initialize collective communication for update weights
-    ip, port = ray.get(_get_node_ip_and_free_port.remote())
+    ip, port = policy_cluster_separate.get_master_address_and_port()
     futures_train = lm_policy.init_collective(ip, port, world_size=2)
     futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
     ray.get(futures_train + futures_inference)
