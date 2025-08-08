@@ -162,13 +162,15 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.30.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
     with:
       build-ref: ${{ github.sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
       target: hermetic
+      build-contexts: |
+        nemo-rl=.
       build-args: |
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}

@@ -1,6 +1,8 @@
 # Adding to .gitignore helps reduce the size of your working_dir
 
-.git
+# Note: removing .git from .dockerignore since it is valuable to have the git history to
+#       know where this container was built
+# .git
 *.out
 *.log
 *.tar

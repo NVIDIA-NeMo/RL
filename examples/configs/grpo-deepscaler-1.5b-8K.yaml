@@ -102,7 +102,7 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: False
+      enforce_eager: True
       # For most cases, use "dummy" to load the initial weights, since they will be overwritten during refit
       # For Gemma models, we need to use "auto" due to a vllm bug
       load_format: dummy
