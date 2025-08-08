@@ -73,7 +73,9 @@ class VllmConfig(GenerationConfig):
     vllm_kwargs: NotRequired[dict[str, Any]]
 
 
-@ray.remote
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -321,7 +323,10 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
-        if len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0:
+        if (
+            len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
+            and vllm_kwargs["distributed_executor_backend"] == "ray"
+        ):
             logger.warning(
                 "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
                 "The nsight command-line args and output file names are automatically picked by the ray distributed "
