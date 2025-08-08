@@ -75,7 +75,7 @@ class VllmConfig(GenerationConfig):
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -353,7 +353,7 @@ class VllmGenerationWorker:
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
-            # logprobs_mode="raw_logprobs",
+            logprobs_mode="raw_logprobs",
             **vllm_kwargs,
         )
 
