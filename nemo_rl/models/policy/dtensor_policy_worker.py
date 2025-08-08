@@ -1069,15 +1069,13 @@ class DTensorPolicyWorker:
                             # Output shape: [batch_size, sequence_length] - logprob of each token given previous
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
                             logits = outputs.logits.to(torch.float32)
-                            log_probs = torch.nn.functional.log_softmax(
-                                logits, dim=-1
-                            )
+                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]
                             token_logprobs = log_probs.gather(
                                 dim=-1, index=next_tokens.unsqueeze(-1)
                             ).squeeze(-1)
-                    
+
                 del outputs, logits
 
                 token_logprobs = torch.cat(
