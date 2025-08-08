@@ -1283,16 +1283,10 @@ async def test_vllm_refit_non_colocated_update_weights(
             "The capital of France is Paris. The capital of",
         ]
     else:
-        if async_engine:
-            expected_texts = [
-                "Hello, my name is John. I am a",
-                "The capital of France is Paris. It is the",
-            ]
-        else:
-            expected_texts = [
-                "Hello, my name is John and I am a",
-                "The capital of France is Paris. It is the",
-            ]
+        expected_texts = [
+            "Hello, my name is Kaitlin and I",
+            "The capital of France is Paris. It is the",
+        ]
     assert generated_texts == expected_texts, (
         "Output should be the same as the expected output"
     )
