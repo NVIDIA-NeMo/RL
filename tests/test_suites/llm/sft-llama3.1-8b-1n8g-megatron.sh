@@ -31,9 +31,9 @@ uv run examples/run_sft.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# TODO: @ashors tighter bounds
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 2' \
-        'data["train/loss"]["250"] < 0.3'
+        'data["train/loss"]["1"] < 0.6' \
+        'data["train/loss"]["250"] < 0.36' \
+        'mean(data["timing/train/total_step_time"][1:]) < 20'
 fi 

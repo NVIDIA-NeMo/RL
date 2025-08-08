@@ -3,11 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
-STEPS_PER_RUN=500
-MAX_STEPS=500
+NUM_NODES=4
+STEPS_PER_RUN=30
+MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -35,6 +35,7 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'mean(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["500"] < 1.1' \
-        'mean(data["timing/train/total_step_time"][-6:-1]) < 14'
+        'data["train/token_mult_prob_error"]["30"] < 1.1' \
+	    'mean(data["train/reward"]) > 0.56' \
+        'mean(data["timing/train/total_step_time"][1:]) < 60'
 fi

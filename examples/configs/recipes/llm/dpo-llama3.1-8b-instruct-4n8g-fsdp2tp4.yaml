@@ -20,7 +20,7 @@ checkpointing:
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: 3
-  save_period: 10000
+  save_period: 50
   checkpoint_must_save_by: null
 
 policy:
@@ -29,14 +29,14 @@ policy:
     name: ${policy.model_name}
   train_global_batch_size: 256
   train_micro_batch_size: 1
-  max_total_sequence_length: 2048
+  max_total_sequence_length: 8192
   precision: "bfloat16"
   dtensor_cfg:
     enabled: true
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
-    tensor_parallel_size: 1
+    tensor_parallel_size: 4
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -85,7 +85,7 @@ logger:
   num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
-    name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1
+    name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp4
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10

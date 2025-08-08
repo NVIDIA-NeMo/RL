@@ -7,7 +7,7 @@ NUM_NODES=1
 STEPS_PER_RUN=500
 MAX_STEPS=500
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -36,5 +36,7 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'mean(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["500"] < 1.1' \
-        'mean(data["timing/train/total_step_time"][-6:-1]) < 14'
+        'data["train/reward"]["500"] > 0.1' \
+        'mean(data["timing/train/total_step_time"][-6:-1]) < 10.5'
+
 fi

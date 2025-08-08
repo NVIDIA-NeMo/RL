@@ -1,6 +1,6 @@
 sft:
   max_num_epochs: 1
-  max_num_steps: 2730
+  max_num_steps: 20
   val_period: 10
   val_batches: 8
   val_global_batch_size: 32
@@ -9,27 +9,27 @@ sft:
   seed: 42
 checkpointing:
   enabled: true
-  checkpoint_dir: results/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
+  checkpoint_dir: results/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   metric_name: val_loss
   higher_is_better: false
   keep_top_k: 3
-  save_period: 10
+  save_period: 100
   checkpoint_must_save_by: null
 policy:
-  model_name: meta-llama/Llama-3.1-8B-Instruct
+  model_name: Qwen/Qwen2.5-32B
   tokenizer:
-    name: meta-llama/Llama-3.1-8B-Instruct
+    name: Qwen/Qwen2.5-32B
     chat_template: '{% for message in messages %}{%- if message[''role''] == ''system''  %}{{''Context: '' + message[''content''].strip()}}{%- elif message[''role''] == ''user''  %}{{'' Question: '' + message[''content''].strip() + '' Answer:''}}{%- elif message[''role''] == ''assistant''  %}{{'' '' + message[''content''].strip()}}{%- endif %}{% endfor %}'
   train_global_batch_size: 32
   train_micro_batch_size: 1
-  max_total_sequence_length: 1024
+  max_total_sequence_length: 16000
   precision: bfloat16
   dtensor_cfg:
     enabled: true
     cpu_offload: false
-    sequence_parallel: false
-    activation_checkpointing: false
-    tensor_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    tensor_parallel_size: 8
     context_parallel_size: 1
     custom_parallel_plan: null
   dynamic_batching:
@@ -39,7 +39,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
-  make_sequence_length_divisible_by: 1
+  make_sequence_length_divisible_by: 8
   max_grad_norm: 1
   optimizer:
     name: torch.optim.AdamW
@@ -53,14 +53,17 @@ policy:
       foreach: false
       fused: false
 data:
-  max_input_seq_length: 1024
-  dataset_name: squad
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "openmathinstruct2"
+  prompt_file: examples/prompts/math.txt
+  split: "train_1M"
   add_bos: true
   add_eos: true
-  add_generation_prompt: false
+  add_generation_prompt: true
+  output_key: 'generated_solution'
   shuffle: true
 logger:
-  log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
+  log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
@@ -68,13 +71,12 @@ logger:
   num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
-    name: sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
+    name: sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   tensorboard:
-    log_dir: tb_logs-sft-dev-squad
+    log_dir: tb_logs-sft-dev-openmathinstruct2
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
-
+  num_nodes: 4
