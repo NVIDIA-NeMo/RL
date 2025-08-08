@@ -62,8 +62,8 @@ RUN if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
         cd vllm && \
         git checkout v$VLLM_VERSION && \
         python use_existing_torch.py && \
-        pip install -r requirements/build.txt && \
-        pip wheel --no-build-isolation -v .; \
+        uv pip install -r requirements/build.txt && \
+        uv build --wheel --no-build-isolation -v .; \
     else \
         echo "Skipping vLLM build for non-PyTorch base image"; \
     fi
@@ -109,7 +109,7 @@ ARG BASE_IMAGE
 RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ \
     if echo "$BASE_IMAGE" | grep -q "pytorch"; then \
         echo "Installing vLLM wheel from build stage" && \
-        pip install --no-cache-dir /tmp/build_vllm/vllm/vllm*.whl; \
+        uv pip install --no-cache-dir /tmp/build_vllm/vllm/vllm*.whl; \
     fi
 
 RUN <<"EOF" bash -exu
