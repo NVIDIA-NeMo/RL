@@ -286,7 +286,8 @@ class VllmGenerationWorker:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
                 "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-                "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+                "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
+                "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
@@ -325,7 +326,9 @@ class VllmGenerationWorker:
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
-            skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
+            # vllm==0.10.0 breaks skip_tokenizer_init=True.
+            # This will be reverted to `self.cfg["vllm_cfg"]["skip_tokenizer_init"]` once https://github.com/NVIDIA-NeMo/RL/issues/818 is resolved.
+            skip_tokenizer_init=False,
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -338,6 +341,7 @@ class VllmGenerationWorker:
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
+            logprobs_mode="raw_logprobs",
             **vllm_kwargs,
         )
 
@@ -1359,13 +1363,21 @@ class VllmGeneration(GenerationInterface):
             "tensor_parallel"
         ) * self.sharding_annotations.get_axis_size("pipeline_parallel")
 
+        # non-colocated needs to use PACK strategy to avoid uneven node_bundles
+        # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
+        # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
+        strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
+
         # Determine if we need cross-node model parallelism
         needs_cross_node_parallelism = (
             self.model_parallel_size > cluster.num_gpus_per_node
         )
 
         # Initialize placement groups with the appropriate mode
-        cluster._init_placement_groups(use_unified_pg=needs_cross_node_parallelism)
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node_parallelism,
+        )
 
         # Create worker builder for VllmGenerationWorker
         worker_builder = RayWorkerBuilder(
@@ -1377,7 +1389,7 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         env_vars = {}
         if not self.cfg["colocated"]["enabled"]:
-            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+            env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

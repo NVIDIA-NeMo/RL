@@ -387,6 +387,26 @@ def test_megatron_policy_training(training_setup):
     # Verify loss changed between iterations (model parameters were updated)
     assert losses[0] > losses[-1], "Loss should decrease over training iterations"
 
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert "theoretical_tflops" in results and isinstance(
+                results["theoretical_tflops"], (int, float)
+            ), "training backend should report theoretical_tflops"
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
+
 
 @pytest.fixture
 def generation_setup(request, tiny_llama_model_path):

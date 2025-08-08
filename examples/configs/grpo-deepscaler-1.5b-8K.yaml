@@ -10,6 +10,7 @@ grpo:
   val_at_start: false
   max_val_samples: 480
   val_batch_size: 32
+  seed: 42
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -28,6 +29,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 10
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA-NeMo/RL/issues/227)
@@ -43,9 +45,9 @@ policy:
 
   dtensor_cfg:
     enabled: true
-    cpu_offload: False
-    sequence_parallel: false
-    activation_checkpointing: false
+    cpu_offload: true
+    sequence_parallel: true
+    activation_checkpointing: true
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -100,7 +102,7 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: False
+      enforce_eager: True
       # For most cases, use "dummy" to load the initial weights, since they will be overwritten during refit
       # For Gemma models, we need to use "auto" due to a vllm bug
       load_format: dummy
@@ -118,6 +120,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "DeepScaler"
+  shuffle: true
 
 env:
   math:
