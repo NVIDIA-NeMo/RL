@@ -3,7 +3,7 @@ defaults: "grpo-deepscaler-1.5b-8K.yaml"
 
 loss_fn:
   use_importance_sampling_correction: True
-  sequence_level_importance_sampling: True
+  sequence_level_importance_ratios: True
   token_level_loss: False
 
 policy:
