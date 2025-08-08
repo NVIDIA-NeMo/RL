@@ -46,6 +46,7 @@ dependencies = [
     "matplotlib",
     "plotly",
     "mlflow",
+    "swanlab",
 ]
 
 [project.optional-dependencies]
