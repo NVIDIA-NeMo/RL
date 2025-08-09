@@ -16,6 +16,7 @@ import os
 from typing import Protocol
 
 import rich
+import torch
 
 NRL_NSYS_WORKER_PATTERNS = os.environ.get("NRL_NSYS_WORKER_PATTERNS", "")
 NRL_NSYS_PROFILE_STEP_RANGE = os.environ.get("NRL_NSYS_PROFILE_STEP_RANGE", "")
@@ -76,3 +77,18 @@ def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
             )
             policy.stop_gpu_profiling()
             policy.__NRL_PROFILE_STARTED = False
+
+
+def wrap_with_nvtx_name(name: str):
+    """A decorator to wrap a function with an NVTX range with the given name."""
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            torch.cuda.nvtx.range_push(name)
+            ret = func(*args, **kwargs)
+            torch.cuda.nvtx.range_pop()
+            return ret
+
+        return wrapper
+
+    return decorator

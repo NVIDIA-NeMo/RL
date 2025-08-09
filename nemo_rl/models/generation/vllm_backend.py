@@ -17,6 +17,8 @@ from typing import Any, Optional
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
 try:
     import vllm  # noqa: F401
 except ImportError:
@@ -66,6 +68,9 @@ class VllmInternalWorkerExtension:
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_global_ipc_handles"
+    )
     def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
         """Update weights from global IPC handles.
 
@@ -79,6 +84,9 @@ class VllmInternalWorkerExtension:
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
         return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_local_ipc_handles"
+    )
     def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
         """Update weights from local IPC handles.
 
@@ -155,6 +163,9 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_collective"
+    )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
@@ -174,3 +185,11 @@ class VllmInternalWorkerExtension:
             return False
 
         return True
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()
