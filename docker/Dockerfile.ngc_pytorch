@@ -90,7 +90,7 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 # The venv is symlinked to avoid bloating the layer size
-uv pip install --no-cache-dir /tmp/build_vllm/vllm/vllm*.whl
+uv pip install --no-cache-dir /tmp/build_vllm/vllm/dist/vllm*.whl
 source /tmp/uv_args.env
 uv sync --link-mode symlink --locked --extra vllm --exxtra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
