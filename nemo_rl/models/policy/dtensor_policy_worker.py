@@ -888,6 +888,7 @@ class DTensorPolicyWorker:
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
+        logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
@@ -1045,16 +1046,19 @@ class DTensorPolicyWorker:
                             )
 
                         token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                            logits.to(torch.float32),
+                            logits,
                             input_ids_dtensor,
                             seq_index_tensor,
+                            chunk_size=logprob_chunk_size,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits.to(torch.float32), input_ids
+                                logits,
+                                input_ids,
+                                chunk_size=logprob_chunk_size,
                             )
                         else:
                             # Extract logprobs for each token in the sequence by gathering the logprob
@@ -1066,7 +1070,7 @@ class DTensorPolicyWorker:
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
 
                             log_probs = torch.nn.functional.log_softmax(
-                                outputs.logits.to(torch.float32), dim=-1
+                                logits.to(torch.float32), dim=-1
                             )
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]

@@ -93,6 +93,7 @@ class MegatronConfig(TypedDict):
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
+    defer_fp32_logits: NotRequired[bool]
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]
@@ -138,6 +139,7 @@ class PolicyConfig(TypedDict):
     train_global_batch_size: int
     train_micro_batch_size: int
     logprob_batch_size: NotRequired[int]
+    logprob_chunk_size: NotRequired[int]
     generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
         int
