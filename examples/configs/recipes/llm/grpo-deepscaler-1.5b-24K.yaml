@@ -45,7 +45,3 @@ policy:
       gpu_memory_utilization: 0.8
       enforce_eager: True
       max_model_len: ${policy.max_total_sequence_length}
-
-cluster:
-  gpus_per_node: 8
-  num_nodes: 4
