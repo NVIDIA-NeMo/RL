@@ -398,6 +398,11 @@ def _parallelize_model(
         layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
+    elif "GSAI-ML.LLaDA" in str(model_cls):
+        # Adding this for LlaDA compatibility which uses a different naming convention compared to GPT Llama style models
+        layers: torch.nn.ModuleList = model.model.transformer.blocks
+        num_attention_heads = model.model.config.n_heads
+        num_key_value_heads = model.model.config.n_kv_heads
     else:
         layers: torch.nn.ModuleList = model.model.layers  # type: ignore
         num_attention_heads = model.config.num_attention_heads

@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import inspect
 import itertools
 import os
 from collections import defaultdict
@@ -259,6 +260,7 @@ class DTensorPolicyWorker:
         with init_empty_weights():
             self.model = model_class.from_config(
                 model_config,
+                trust_remote_code=True,  # otherwise there's a crash when loading remote code models, e.g. LlaDA
             )
 
         if self.model.config.pad_token_id is None:
@@ -667,11 +669,11 @@ class DTensorPolicyWorker:
                         seq_index = torch.arange(
                             seq_len, device=input_ids.device
                         ).repeat(1, 1)
-                        cp_buffers = (
-                            [input_ids, position_ids, seq_index]
-                            if self.cp_size > 1
-                            else []
-                        )
+                        cp_buffers = []
+                        if "position_ids" in inspect.signature(self.model).parameters:
+                            cp_buffers = [input_ids, position_ids, seq_index]
+                        else:
+                            cp_buffers = [input_ids, seq_index]
 
                         # Create context parallel context
                         context_parallel_ctx = self.create_context_parallel_ctx(
@@ -697,6 +699,10 @@ class DTensorPolicyWorker:
                                 # is not supported for reward models.
                                 assert not flash_attn_kwargs
                                 del model_args["flash_attn_kwargs"]
+
+                            if "position_ids" not in inspect.signature(self.model).parameters:
+                                # not all models support position_ids to the forward call, e.g. LlaDA
+                                del model_args["position_ids"]
 
                             outputs = self.model(**model_args)
 
