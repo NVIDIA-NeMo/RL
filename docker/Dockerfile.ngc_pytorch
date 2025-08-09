@@ -1,9 +1,3 @@
-# Usage:
-# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
-# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
-# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
-# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
-
 ARG BASE_IMAGE=nvcr.io/nvidia/nemo:25.06-py3
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
@@ -46,9 +40,10 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Build vLLM from source if using PyTorch base image
 FROM base AS build_vllm
-ARG BASE_IMAGE
+
 ARG MAX_JOBS=32
 WORKDIR /opt
+COPY --from=nemo-rl uv.lock /tmp/uv.lock
 
 # Extract vLLM version from uv.lock and build that version
 RUN echo "Building vLLM from source for PyTorch base image" && \
