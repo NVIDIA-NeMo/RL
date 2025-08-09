@@ -251,6 +251,7 @@ def main():
         dpo_save_state,
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
+    logger.log_hyperparams(master_config)
     dpo_train(
         policy,
         train_dataloader,
