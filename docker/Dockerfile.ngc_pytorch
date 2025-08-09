@@ -75,13 +75,6 @@ ARG UV_NO_INSTALL_PACKAGES
 ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 
-# This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
-# This layer has to be manually updated
-RUN <<"EOF" bash -exu
-    echo "Creating venv with system-site-packages for PyTorch base image"
-    uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
-EOF
-
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
@@ -90,8 +83,9 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 # The venv is symlinked to avoid bloating the layer size
-uv pip install --no-cache-dir /tmp/build_vllm/vllm/dist/vllm*.whl
-uv sync --link-mode symlink --locked --extra vllm --exxtra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+pip install --no-cache-dir /tmp/build_vllm/vllm/dist/vllm*.whl
+uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
+uv sync --link-mode symlink --locked --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
