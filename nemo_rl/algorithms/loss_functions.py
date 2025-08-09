@@ -256,6 +256,7 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
+        # See: docs/guides/grpo.md#importance-sampling-correction
         if self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
