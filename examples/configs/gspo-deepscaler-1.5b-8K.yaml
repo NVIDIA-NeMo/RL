@@ -1,0 +1,7 @@
+# GRPO Algorithm Configuration
+defaults: "recipes/llm/grpo-deepscaler-1.5b-8K.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: true
+  token_level_loss: false
