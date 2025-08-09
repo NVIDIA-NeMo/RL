@@ -79,7 +79,6 @@ def create_local_venv(
 
     # Create the virtual environment
     uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
-
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
@@ -97,7 +96,6 @@ def create_local_venv(
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync"], env=env, check=True)
-
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
