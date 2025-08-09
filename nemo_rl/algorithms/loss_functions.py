@@ -298,6 +298,7 @@ class ClippedPGLossFn(LossFunction):
             )
 
         # Metric: sampling importance ratio (mean over samples)
+        # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
                 actor_importance_weights,
