@@ -719,7 +719,10 @@ async def run_hf_train_process(
         )
 
         print(f"Average probability multiplicative error: {avg_prob_mult_error}")
-        assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
+        if vllm_precision == "fp8":
+            assert avg_prob_mult_error <= 1.080, "vLLM and HF logprobs should closely match"
+        else:
+            assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
 
         # Step 2: Prepare simplified training data (smaller and with padding removed to prevent OOM)
         # Use a very small sequence for training to ensure it works

@@ -281,7 +281,7 @@ def load_weights(weights, model_runner):
             v.to(torch.float),
             weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
         )
-        param_scale = torch.squeeze(param_scale)
+        param_scale = torch.squeeze(param_scale, dim=-1)
         weights_quantized.append([k, param_lp])
         weights_quantized.append([k + "_scale_inv", param_scale])
     # Monkey patch the param class to their subclass, as certain models
