@@ -619,8 +619,8 @@ def get_logprobs_from_vocab_parallel_logits(
         target,
         vocab_interval_per_rank * tp_rank,
         (tp_rank + 1) * vocab_interval_per_rank,
+        chunk_size,
         tp_mesh.get_group(),
         not torch.is_grad_enabled(),
-        chunk_size=chunk_size,
     ).contiguous()
     return probs[:, :-1]
