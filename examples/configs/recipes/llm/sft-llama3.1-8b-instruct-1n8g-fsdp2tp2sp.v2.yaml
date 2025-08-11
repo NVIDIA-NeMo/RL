@@ -14,6 +14,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:
@@ -35,6 +36,9 @@ policy:
     enabled: false
   sequence_packing:
     enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
   make_sequence_length_divisible_by: 2
   max_grad_norm: 1
   optimizer:
@@ -54,6 +58,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+  shuffle: true
 logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
   wandb_enabled: true

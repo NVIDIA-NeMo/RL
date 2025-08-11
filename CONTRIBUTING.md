@@ -7,40 +7,95 @@ Thanks for your interest in contributing to Nemo-RL!
 ### Development Environment
 
 1. **Build and run the Docker container**:
-```bash
-docker buildx build -t nemo-rl -f Dockerfile .
+```sh
+docker buildx build -t nemo-rl:latest -f Dockerfile .
+```
+
+To start a shell in the container to interactively run/develop:
+```sh
 # Run the container with your local nemo-rl directory mounted
-docker run -it --gpus all -v /path/to/nemo-rl:/workspace/nemo-rl nemo-rl
+docker run -it --gpus all -v /path/to/nemo-rl:/nemo-rl nemo-rl:latest
+```
+
+If you are using VSCode/Cursor you can also use Dev Containers. Here's a devcontainer.json to get you started:
+```jsonc
+{
+    "name": "rl-dev",
+    "image": "nemo-rl:latest",
+    "runArgs": [
+        "--gpus",
+        "all",
+        "--ulimit",
+        "memlock=-1",
+        "--ulimit",
+        "stack=67108864",
+        "--shm-size=24g",
+        "--privileged",
+        "--pid=host"
+	]
+
+    // NOTE: Here is an example of how you can set up some common mounts, environment variables, and set up your shell.
+    //       Feel free to adapt to your development workflow and remember to replace the user `terryk` with your username.
+
+    //"mounts": [
+    //    {"source": "/home/terryk", "target": "/home/terryk", "type": "bind"},
+    //    {"source": "/home/terryk/.ssh", "target": "/root/terryk-ssh", "type": "bind"}
+    //],
+    //"containerEnv": {
+    //    "HF_TOKEN_PATH": "/home/terryk/.cache/huggingface/token",
+    //    "HF_HOME": "/home/terryk/.cache/huggingface",
+    //    "HF_DATASETS_CACHE": "/home/terryk/.cache/huggingface/datasets",
+    //    "WANDB_API_KEY": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    //},
+    // // This (1) marks all directories safe (2) copies in ssh keys (3) sources user's bashrc file
+    //"postStartCommand": "git config --global --add safe.directory '*' && cp -r /root/terryk-ssh/* /root/.ssh/ && source /home/terryk/.bashrc"
+}
 ```
 
 ## Making Changes
 
-### Workflow: Clone and Branch (No Fork Required)
+### Workflow: For External Contributors (Fork Required)
 
 #### Before You Start: Install pre-commit
 
-From the [`nemo-rl` root directory](.), run:
-```bash
-python3 -m pip install pre-commit
-pre-commit install
-```
+Pre-commit checks (using `ruff`/`pyrefly`) will help ensure your code follows our formatting and style guidelines.
 
-Pre-commit checks (using `ruff`) will help ensure your code follows our formatting and style guidelines.
+If you're an external contributor, you'll need to fork the repository:
 
-We follow a direct clone and branch workflow for now:
+1. **Create a fork**: Click the "Fork" button on the [GitHub repository page](https://github.com/NVIDIA-NeMo/RL) or follow this direct link: https://github.com/NVIDIA-NeMo/RL/fork
 
-1. Clone the repository directly:
+2. **Clone your fork**:
    ```bash
-   git clone https://github.com/NVIDIA-NeMo/RL
+   git clone https://github.com/YOUR-USERNAME/RL nemo-rl
    cd nemo-rl
    ```
 
-2. Create a new branch for your changes:
+3. **Add upstream remote** to keep your fork updated:
    ```bash
-   git checkout -b your-feature-name
+   git remote add upstream https://github.com/NVIDIA-NeMo/RL.git
    ```
 
-3. Make your changes and commit them:
+4. **Install pre-commit**:
+   ```bash
+   # Requires `uv` to be installed
+   uv run --group dev pre-commit install
+   ```
+
+5. **Keep your fork updated** before starting new work:
+   ```bash
+   git fetch upstream
+   git checkout main
+   git merge upstream/main
+   git push origin main
+   ```
+
+6. **Create a new branch** for your changes:
+   ```bash
+   git checkout main
+   git switch -c your-feature-name
+   ```
+
+7. **Make your changes and commit** them:
    ```bash
    git add .
    git commit --signoff -m "Your descriptive commit message"
@@ -48,12 +103,46 @@ We follow a direct clone and branch workflow for now:
 
 We require signing commits with `--signoff` (or `-s` for short). See [Signing Your Work](#signing-your-work) for details.
 
-4. Push your branch to the repository:
+8. **Push to your fork**:
    ```bash
-   git push origin feature/your-feature-name
+   git push origin your-feature-name
    ```
 
-5. Create a pull request from your branch to the `main` branch.
+9. **Create a pull request** from your fork's branch to the main repository's `main` branch through the GitHub web interface. For example, if your GitHub username is `terrykong` and your feature branch is `your-feature-name`, the compare URL would look like: https://github.com/NVIDIA-NeMo/RL/compare/main...terrykong:RL:your-feature-name?expand=1
+
+### Workflow: For NVIDIA Contributors (Direct Access)
+
+If you have write access to the repository (NVIDIA contributors):
+
+1. Clone the repository directly:
+   ```bash
+   git clone https://github.com/NVIDIA-NeMo/RL nemo-rl
+   cd nemo-rl
+   ```
+
+2. **Install pre-commit** from the [`nemo-rl` root directory](.):
+   ```bash
+   # Requires `uv` to be installed
+   uv run --group dev pre-commit install
+   ```
+
+3. Create a new branch for your changes:
+   ```bash
+   git switch -c your-feature-name
+   ```
+
+4. Make your changes and commit them:
+   ```bash
+   git add .
+   git commit --signoff -m "Your descriptive commit message"
+   ```
+
+5. Push your branch to the repository:
+   ```bash
+   git push origin your-feature-name
+   ```
+
+6. Create a pull request from your branch to the `main` branch.
 
 ### Design Documentation Requirement
 

@@ -264,15 +264,23 @@ def calculate_rewards(
     all_next_stop_strings = []
     all_metadata = []  # Store extracted metadata
     all_indices_order = []
+    all_answers = []
 
     for future, result in zip(futures, results):
         indices = future_to_indices[future]
         # Environment step returns: EnvironmentReturn
-        env_observations, metadata, next_stop_strings, task_rewards, terminateds = (
-            result
-        )
+        (
+            env_observations,
+            metadata,
+            next_stop_strings,
+            task_rewards,
+            terminateds,
+            answers,
+        ) = result
         if next_stop_strings is None:
             next_stop_strings = [None] * len(task_rewards)
+        if answers is None:
+            answers = [None] * len(task_rewards)
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
@@ -282,6 +290,7 @@ def calculate_rewards(
             all_terminateds.append(terminateds[i])
             all_next_stop_strings.append(next_stop_strings[i])
             all_metadata.append(metadata[i])
+            all_answers.append(answers[i])
 
     # Sort results by original index to maintain order
     sorted_indices = sorted(
@@ -292,6 +301,7 @@ def calculate_rewards(
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
     metadata = [all_metadata[i] for i in sorted_indices]  # Sort metadata
+    answers = [all_answers[i] for i in sorted_indices]
 
     return EnvironmentReturn(
         observations=env_observations,
@@ -299,6 +309,7 @@ def calculate_rewards(
         next_stop_strings=next_stop_strings,
         rewards=rewards,
         terminateds=terminateds,
+        answers=answers,
     )
 
 
@@ -410,6 +421,8 @@ def run_multi_turn_rollout(
             tokenized_obs = tokenizer(
                 env_obs_content, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
+            # tokenizer returns torch.float32 when env_obs_content is empty
+            tokenized_obs = tokenized_obs.to(dtype=torch.int64)
 
             # check if new message overflows max_seq_len
             if (

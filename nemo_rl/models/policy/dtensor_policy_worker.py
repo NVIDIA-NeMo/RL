@@ -36,8 +36,12 @@ from torch.distributed.tensor.experimental import context_parallel
 from torch.distributed.tensor.experimental._attention import (
     set_rotate_method,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.integrations.accelerate import find_tied_parameters
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
@@ -51,7 +55,6 @@ from nemo_rl.models.dtensor.parallelize import (
     to_local_if_dtensor,
 )
 from nemo_rl.models.huggingface.common import (
-    ModelFlag,
     get_flash_attention_kwargs,
     pack_sequences,
 )
@@ -61,8 +64,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
     configure_expandable_segments,
     get_gpu_info,
+    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     is_vllm_v1_engine_enabled,
@@ -155,6 +160,10 @@ class DTensorPolicyWorker:
         if not self.is_generation_colocated:
             os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
+        # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
+        # with different order of node_bundles
+        configure_dynamo_cache()
+
         # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
         configure_expandable_segments()
 
@@ -199,10 +208,42 @@ class DTensorPolicyWorker:
             else None,
         )
 
+        self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
+            "enabled", False
+        )
+        if self._is_reward_model:
+            # Ensure sequence packing is disabled.
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sequence packing is not supported for reward models"
+                )
+            # Load model as a Reward Model.
+            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
+            if rm_type == "bradley_terry":
+                model_class = AutoModelForSequenceClassification
+                if model_config.num_labels != 1:
+                    # For Bradley-Terry reward models, the linear head has a single output.
+                    # In the transformers library, the default setting for model_config.num_labels is 2
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
+                    # Since num_labels is used as the out_features for the linear head
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
+                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
+                    # from the model checkpoint and are instead initialized using model_config.initializer_range
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
+                    print(
+                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                        "for the linear head of Bradley-Terry reward models."
+                    )
+                    model_config.num_labels = 1
+            else:
+                raise ValueError(f"Unknown reward model type: {rm_type}")
+        else:
+            model_class = AutoModelForCausalLM
+
         full_state_dict = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_class.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
@@ -216,17 +257,16 @@ class DTensorPolicyWorker:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_config(
+            self.model = model_class.from_config(
                 model_config,
             )
 
-        # caching since this property is not always preserved after FSDP
-        self.num_tied_weights = len(find_tied_parameters(self.model))
-        self.skip_tie_check = os.environ.get(
-            "NRL_SKIP_TIED_WEIGHT_CHECK"
-        ) or ModelFlag.SKIP_DTENSOR_TIED_WEIGHTS_CHECK.matches(model_name)
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = tokenizer.pad_token_id
 
+        # caching since this property is not always preserved after FSDP
         self.tokenizer = tokenizer
+
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -304,7 +344,7 @@ class DTensorPolicyWorker:
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
-        is_tied_lm_head = getattr(
+        is_tied_lm_head = hasattr(self.model, "lm_head") and getattr(
             getattr(self.model, "config", {}), "tie_word_embeddings", False
         )
         if is_tied_lm_head:
@@ -482,15 +522,6 @@ class DTensorPolicyWorker:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        # Check if the model has tied weights
-        if (
-            self.num_tied_weights != 0
-            and self.cfg["dtensor_cfg"]["tensor_parallel_size"] > 1
-            and not self.skip_tie_check
-        ):
-            raise ValueError(
-                f"Using dtensor policy with tp size {self.cfg['dtensor_cfg']['tensor_parallel_size']} for model ({self.cfg['model_name']}) that has tied weights (num_tied_weights={self.num_tied_weights}) is not supported (https://github.com/NVIDIA-NeMo/RL/issues/227). Please use dtensor policy with tensor parallel == 1 instead."
-            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -652,7 +683,7 @@ class DTensorPolicyWorker:
 
                     with DTensorPolicyWorker.train_context(context_parallel_ctx):
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
-                            outputs = self.model(
+                            model_args = dict(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
@@ -660,11 +691,21 @@ class DTensorPolicyWorker:
                                 flash_attn_kwargs=flash_attn_kwargs,
                             )
 
+                            if self._is_reward_model:
+                                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
+                                # Note that it should be empty anyway since sequence packing
+                                # is not supported for reward models.
+                                assert not flash_attn_kwargs
+                                del model_args["flash_attn_kwargs"]
+
+                            outputs = self.model(**model_args)
+
                         # Get logprobs
                         if not hasattr(outputs, "logits"):
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
+                        del outputs
 
                         # Apply temperature scaling
                         logits = self._apply_temperature_scaling(logits)
@@ -731,6 +772,7 @@ class DTensorPolicyWorker:
                             global_valid_seqs,
                             global_valid_toks,
                         )
+                        del logits
 
                         # skip the update for dummy batches
                         if mb_idx < iterator_len:
@@ -806,6 +848,8 @@ class DTensorPolicyWorker:
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,
                 "rank": torch.distributed.get_rank(),
+                "gpu_name": torch.cuda.get_device_name(),
+                "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
             }
 
@@ -987,8 +1031,9 @@ class DTensorPolicyWorker:
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
 
+                        logits = logits.to(torch.float32)
                         token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                            logits.to(torch.float32),
+                            logits,
                             input_ids_dtensor,
                             seq_index_tensor,
                         )
@@ -996,8 +1041,9 @@ class DTensorPolicyWorker:
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
+                            logits = logits.to(torch.float32)
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits.to(torch.float32), input_ids
+                                logits, input_ids
                             )
                         else:
                             # Extract logprobs for each token in the sequence by gathering the logprob
@@ -1007,15 +1053,15 @@ class DTensorPolicyWorker:
                             #   token_ids: [batch_size, sequence_length] - actual tokens
                             # Output shape: [batch_size, sequence_length] - logprob of each token given previous
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
-
-                            log_probs = torch.nn.functional.log_softmax(
-                                outputs.logits.to(torch.float32), dim=-1
-                            )
+                            logits = outputs.logits.to(torch.float32)
+                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]
                             token_logprobs = log_probs.gather(
                                 dim=-1, index=next_tokens.unsqueeze(-1)
                             ).squeeze(-1)
+
+                del outputs, logits
 
                 token_logprobs = torch.cat(
                     [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
@@ -1167,8 +1213,11 @@ class DTensorPolicyWorker:
         """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
         # Get state_dict
-        self.model = self.move_to_cuda(self.model)
         self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
             self.model.state_dict()
         )
@@ -1186,8 +1235,6 @@ class DTensorPolicyWorker:
 
     @torch.no_grad()
     def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
-        from torch.multiprocessing.reductions import reduce_tensor
-
         assert self._held_sharded_state_dict_reference is not None, (
             "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
         )
@@ -1217,7 +1264,7 @@ class DTensorPolicyWorker:
         # Create handles for the tensors
         all_handles = []
         for key, p in converted_params.items():
-            handle = reduce_tensor(p.detach())
+            handle = get_handle_from_tensor(p)
             all_handles.append((key, handle))
 
         # (pack_tensor_for_ipc: bool, handles: list)
@@ -1228,12 +1275,26 @@ class DTensorPolicyWorker:
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        # Broadcast the weights for collective communication
         for _, tensor in self.model.state_dict().items():
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             if self.rank == 0:
                 tensor = tensor.to(self.dtype, non_blocking=True)
                 self.model_update_group.broadcast(tensor.data, src=0)
+
+        # Manually move model to cpu for cpu offload case
+        # cpu offload needs model on CPU before model forward
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
 
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
@@ -1252,9 +1313,6 @@ class DTensorPolicyWorker:
             # when cpu offload is enabled, the buffers do not get moved
             # to cuda automatically, so we need to do that manually
             self.model = self.move_buffer_to_device(self.model, "cuda")
-
-        # have to move buffers to cuda manually for cpu offload case
-        self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
         # Move optimizer state to CUDA if it exists
