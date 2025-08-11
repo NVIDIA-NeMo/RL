@@ -53,6 +53,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 class VllmSpecificArgs(TypedDict):
@@ -323,6 +324,18 @@ class VllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        if (
+            len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
+            and vllm_kwargs["distributed_executor_backend"] == "ray"
+        ):
+            logger.warning(
+                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
+                "The nsight command-line args and output file names are automatically picked by the ray distributed "
+                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
+                "for more information."
+            )
+            vllm_kwargs["ray_workers_use_nsight"] = True
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -436,6 +449,7 @@ class VllmGenerationWorker:
             include_stop_str_in_output=True,
         )
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -799,6 +813,7 @@ class VllmGenerationWorker:
                 await asyncio.gather(*sample_tasks, return_exceptions=True)
                 raise e
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1033,6 +1048,7 @@ class VllmGenerationWorker:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
@@ -1144,6 +1160,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
@@ -1317,10 +1334,14 @@ class VllmGenerationWorker:
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         torch.cuda.profiler.start()
+        if self.llm is not None:
+            self.llm.collective_rpc("start_gpu_profiling", args=tuple())
 
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+        if self.llm is not None:
+            self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
 
 class VllmGeneration(GenerationInterface):
