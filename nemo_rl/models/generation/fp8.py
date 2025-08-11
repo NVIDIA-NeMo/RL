@@ -122,7 +122,9 @@ def apply_fp8_patches(self, fp8_config):
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     config = AutoConfig.from_pretrained(model_name)
     if hasattr(config, "num_experts"):
-        assert config.num_experts == 0, "FP8 generation for MoE models is currently not supported"
+        assert config.num_experts == 0, (
+            "FP8 generation for MoE models is currently not supported"
+        )
 
     global global_fp8_config
     global_fp8_config = FP8Config(
