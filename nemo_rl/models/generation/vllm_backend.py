@@ -20,6 +20,7 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 try:
     import vllm  # noqa: F401
+    from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
 except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -221,3 +222,82 @@ class VllmInternalWorkerExtension:
             return False
 
         return True
+
+
+import pickle
+from typing import Any, Callable, Optional, Union
+
+import ray
+from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
+
+
+class RayDistributedExecutorExtension(RayDistributedExecutor):
+    def _run_workers(
+        self,
+        method: Union[str, Callable],
+        *args,
+        async_run_tensor_parallel_workers_only: bool = False,
+        max_concurrent_workers: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers. Can be used in the following
+        ways:
+
+        Args:
+        - async_run_tensor_parallel_workers_only: If True the method will be
+        run only in the remote TP workers, not the driver worker.
+        It will also be run asynchronously and return a list of futures
+        rather than blocking on the results.
+        - args/kwargs: All workers share the same args/kwargs
+        """
+        print(f"method: {method}", flush=True)
+        if isinstance(method, str):
+            sent_method = method
+        else:
+            sent_method = pickle.dumps(method)
+        del method
+        if self.use_ray_spmd_worker:
+            assert not async_run_tensor_parallel_workers_only, (
+                "async_run_tensor_parallel_workers_only is not supported for spmd mode."
+            )
+
+        if max_concurrent_workers:
+            raise NotImplementedError("max_concurrent_workers is not supported yet.")
+
+        # Start the ray workers first.
+        ray_workers = self.workers
+        if async_run_tensor_parallel_workers_only:
+            ray_workers = self.non_driver_workers
+
+        if "update_weights" in sent_method:
+            ray_worker_outputs = []
+            for worker in ray_workers:
+                local_args = ((args[worker.device.index],),)
+                ray_worker_outputs.append(
+                    worker.execute_method.remote(sent_method, *local_args, **kwargs)
+                )
+        else:
+            ray_worker_outputs = [
+                worker.execute_method.remote(sent_method, *args, **kwargs)
+                for worker in ray_workers
+            ]
+
+        if async_run_tensor_parallel_workers_only:
+            # Just return futures
+            return ray_worker_outputs
+
+        driver_worker_output = []
+        # In SPMD mode, the driver worker is the same as any other worker,
+        # so we only explicitly execute on the driver worker if using a
+        # non-SPMD worker class.
+        if not self.use_ray_spmd_worker:
+            # Start the driver worker after all the ray workers.
+            driver_worker_output = [
+                self.driver_worker.execute_method(sent_method, *args, **kwargs)
+            ]
+
+        # Get the results of the ray workers.
+        if self.workers:
+            ray_worker_outputs = ray.get(ray_worker_outputs)
+
+        return driver_worker_output + ray_worker_outputs

@@ -54,6 +54,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 
+# from vllm.v1.executor.abstract import Executor
+
 
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
@@ -257,12 +259,21 @@ class VllmGenerationWorker:
                     new_line = f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})'
 
                     if new_line in content:
+                        print(
+                            f"First patch already applied to {file_to_patch}",
+                            flush=True,
+                        )
                         return
 
                     if old_line not in content:
+                        print(
+                            f"First patch target not found in {file_to_patch}",
+                            flush=True,
+                        )
                         return
 
                     patched_content = content.replace(old_line, new_line)
+                    print(f"Applied first patch to {file_to_patch}", flush=True)
 
                     # Write back the patched content
                     with open(file_to_patch, "w") as f:
@@ -272,7 +283,39 @@ class VllmGenerationWorker:
                     # Allow failures gracefully
                     pass
 
+            def _patch_vllm_args():
+                # Patch the vLLM ray_distributed_executor.py file to pass custom runtime_env in _init_workers_ray call.
+                # This allows passing custom py_executable to worker initialization.
+
+                try:
+                    import vllm.engine.arg_utils as arg_utils_module
+
+                    file_to_patch = arg_utils_module.__file__
+                    logger.info(f"file_to_patch: {file_to_patch}")
+                    with open(file_to_patch, "r") as f:
+                        content = f.read()
+                    old_line = 'not in ("ray", "mp", "external_launcher")'
+                    new_line = 'in ("ray", "mp", "external_launcher")'
+                    if old_line not in content:
+                        logger.info(f"First patch target not found in {file_to_patch}")
+                        return
+                    elif new_line in content:
+                        logger.info(f"Second patch already applied to {file_to_patch}")
+                        return
+                    else:
+                        logger.info(f"Applied second patch to {file_to_patch}")
+                        patched_content = content.replace(old_line, new_line)
+
+                    # Write back the patched content
+                    with open(file_to_patch, "w") as f:
+                        f.write(patched_content)
+
+                except (ImportError, FileNotFoundError, PermissionError):
+                    # Allow failures gracefully
+                    raise ImportError(f"Failed to patch {file_to_patch}")
+
             _patch_vllm_init_workers_ray()
+            _patch_vllm_args()
 
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
@@ -288,6 +331,107 @@ class VllmGenerationWorker:
                 "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
                 "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
             )
+        '''
+        try:
+            import pickle
+            from typing import Any, Callable, Optional, Union
+
+            import cloudpickle
+            import vllm.executor.ray_distributed_executor as ray_executor_module
+            from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+            from vllm.v1.executor.abstract import Executor
+
+            # Store the original method
+            original_run_workers = RayDistributedExecutor._run_workers
+
+            class RayDistributedExecutorExtension_0(RayDistributedExecutor):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.supports_pp = True
+
+                def _run_workers(
+                    self,
+                    method: Union[str, Callable],
+                    *args,
+                    async_run_tensor_parallel_workers_only: bool = False,
+                    max_concurrent_workers: Optional[int] = None,
+                    **kwargs,
+                ) -> Any:
+                    print(f"patched_run_workers: {method}", flush=True)
+                    """Patched version of _run_workers with custom logic for update_weights"""
+                    if isinstance(method, str):
+                        sent_method = method
+                    else:
+                        sent_method = cloudpickle.dumps(method)
+                    del method
+                    if self.use_ray_spmd_worker:
+                        assert not async_run_tensor_parallel_workers_only, (
+                            "async_run_tensor_parallel_workers_only is not supported for "
+                            "spmd mode."
+                        )
+
+                    if max_concurrent_workers:
+                        raise NotImplementedError(
+                            "max_concurrent_workers is not supported yet."
+                        )
+
+                    # Start the ray workers first.
+                    ray_workers = self.workers
+                    if async_run_tensor_parallel_workers_only:
+                        ray_workers = self.non_driver_workers
+
+                    if "update_weights" in sent_method:
+                        ray_worker_outputs = []
+                        print(f"new sent_method: {sent_method}", flush=True)
+                        # for worker in ray_workers:
+                        #     local_args=(args[worker.device.index],),
+                        #     ray_worker_outputs.append(worker.execute_method.remote(sent_method, *local_args, **kwargs))
+                        ray_worker_outputs = [
+                            worker.execute_method.remote(sent_method, *args, **kwargs)
+                            for worker in ray_workers
+                        ]
+                    else:
+                        ray_worker_outputs = [
+                            worker.execute_method.remote(sent_method, *args, **kwargs)
+                            for worker in ray_workers
+                        ]
+
+                    if async_run_tensor_parallel_workers_only:
+                        # Just return futures
+                        return ray_worker_outputs
+
+                    driver_worker_output = []
+                    # In SPMD mode, the driver worker is the same as any other worker,
+                    # so we only explicitly execute on the driver worker if using a
+                    # non-SPMD worker class.
+                    if not self.use_ray_spmd_worker:
+                        # Start the driver worker after all the ray workers.
+                        driver_worker_output = [
+                            self.driver_worker.execute_method(
+                                sent_method, *args, **kwargs
+                            )
+                        ]
+
+                    # Get the results of the ray workers.
+                    if self.workers:
+                        ray_worker_outputs = ray.get(ray_worker_outputs)
+
+                    return driver_worker_output + ray_worker_outputs
+
+            # Apply the patch
+            # ray_executor_module.RayDistributedExecutor._run_workers = patched_run_workers
+            logger.info(
+                "Successfully patched vllm.executor.ray_distributed_executor.RayDistributedExecutor._run_workers."
+            )
+
+        except ImportError:
+            raise ImportError(
+                "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
+                "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
+                "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+            )
+        '''
+
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
         # Calculate total parallel size (TP * PP)
@@ -315,6 +459,13 @@ class VllmGenerationWorker:
             # For non-parallel mode, explicitly set executor to None to avoid Ray issues
             vllm_kwargs["distributed_executor_backend"] = None
 
+        from nemo_rl.models.generation.vllm_backend import (
+            RayDistributedExecutorExtension,
+        )
+
+        vllm_kwargs["distributed_executor_backend"] = RayDistributedExecutorExtension
+        # vllm_kwargs["distributed_executor_backend"] = "nemo_rl.models.generation.vllm_backend.RayDistributedExecutorExtension"
+
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
@@ -340,6 +491,7 @@ class VllmGenerationWorker:
             disable_log_stats=True,
             **vllm_kwargs,
         )
+        print(f"llm_kwargs: {llm_kwargs}", flush=True)
 
         if self.cfg["vllm_cfg"]["async_engine"]:
             from vllm.engine.arg_utils import AsyncEngineArgs
@@ -1116,6 +1268,10 @@ class VllmGenerationWorker:
                 )
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
+            # self.llm.engine_core.core_engines
+            print(f"llm {len(self.llm.engine_core.core_engines)=}\n", flush=True)
+            print(f"llm {dir(self.llm.engine_core.core_engines[0])=}\n", flush=True)
+            # print(f"llm {dir(self.llm.engine_core.model_executor)=}\n", flush=True)
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_global_ipc_handles", args=(ipc_handles,)
             )
@@ -1181,7 +1337,6 @@ class VllmGenerationWorker:
                 raise RuntimeError(
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
-
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
             )
