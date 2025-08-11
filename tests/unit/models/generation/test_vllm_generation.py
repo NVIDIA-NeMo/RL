@@ -613,7 +613,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated
+    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
 ):
     """Validates that the two policies can work together.
 
@@ -789,16 +789,22 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+    ("async_engine", "cpu_offload", "vllm_precision"), 
+    [(True, False, "bfloat16"), 
+     (False, True, "bfloat16"),
+     (True, False, "fp8"),
+     (False, True, "fp8")]
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
@@ -816,7 +822,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True)
+    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision)
 
 
 @pytest.mark.timeout(300)
@@ -859,7 +865,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False)
+    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False, "bfloat16")
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
@@ -956,8 +962,9 @@ def test_vllm_generate_text(cluster, tokenizer):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
     from nemo_rl.models.policy.lm_policy import Policy
