@@ -43,7 +43,7 @@ You can enable logging via Weights & Biases and TensorBoard to monitor training 
 
 ```bash
 # Enable logging (optional)
-python examples/run_grpo_sliding_puzzle.py \
+uv run python examples/run_grpo_sliding_puzzle.py \
     --config examples/configs/grpo_sliding_puzzle.yaml \
     logger.wandb_enabled=true \
     logger.tensorboard_enabled=true

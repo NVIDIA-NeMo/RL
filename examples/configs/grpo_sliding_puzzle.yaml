@@ -5,13 +5,12 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 30 # Maximum turns allowed per rollout
-  max_num_steps: 200
-  val_at_start: true
+  max_num_steps: 500
   max_val_samples: 1024
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo-sliding-puzzle"
+  checkpoint_dir: "/raid/slikhite/results/grpo-sliding-puzzle"
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
@@ -20,7 +19,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 512
+  max_total_sequence_length: 1024
 
   dtensor_cfg:
     enabled: true
@@ -53,9 +52,9 @@ env:
   sliding_puzzle_game:
     cfg:
       game_config:
-        size: 4 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 8 # Number of random moves to shuffle the solved state
-      max_moves: 30 # Maximum moves allowed per episode
+        size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
+        shuffle_moves: 10 # Number of random moves to shuffle the solved state
+      max_moves: 40 # Maximum moves allowed per episode
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -74,3 +73,7 @@ logger:
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
