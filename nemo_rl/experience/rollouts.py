@@ -420,6 +420,9 @@ def run_multi_turn_rollout(
                 tokenized_obs = tokenizer(
                     formatted_obs, return_tensors="pt", add_special_tokens=False
                 ).input_ids[0]
+                # remove the bos token if added after `apply_chat_template`
+                if len(formatted_obs) > 0 and hasattr(tokenizer, "bos_token_id") and formatted_obs[0] == tokenizer.bos_token_id:
+                    formatted_obs = formatted_obs[1:]
             else:
                 formatted_obs = env_obs_content.strip()
                 tokenized_obs = tokenizer(
@@ -684,6 +687,9 @@ async def run_sample_multi_turn_rollout(
             tokenized_obs = tokenizer(
                 formatted_obs, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
+            # remove the bos token if added after `apply_chat_template`
+            if len(formatted_obs) > 0 and hasattr(tokenizer, "bos_token_id") and formatted_obs[0] == tokenizer.bos_token_id:
+                formatted_obs = formatted_obs[1:]
         else:
             formatted_obs = env_obs_content.strip()
             tokenized_obs = tokenizer(
