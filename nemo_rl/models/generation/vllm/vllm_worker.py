@@ -203,7 +203,7 @@ class BaseVllmGenerationWorker:
 
             def _patch_vllm_init_workers_ray():
                 # Patch the vLLM ray_distributed_executor.py file to pass custom runtime_env in _init_workers_ray call.
-                # This allows passing custom py_executable to worker initialization.
+                # This allows passing custom env_vars and py_executable to worker initialization.
 
                 try:
                     import vllm.executor.ray_distributed_executor as ray_executor_module
@@ -213,26 +213,36 @@ class BaseVllmGenerationWorker:
                     with open(file_to_patch, "r") as f:
                         content = f.read()
 
-                    old_line = "self._init_workers_ray(placement_group)"
-                    new_line = f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})'
+                    old_lines = [
+                        "self._init_workers_ray(placement_group)",
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+                    ]
 
-                    if new_line in content:
+                    new_lines = [
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                    ]
+
+                    need_replace = False
+                    for old_line, new_line in zip(old_lines, new_lines):
+                        if new_line in content or old_line not in content:
+                            continue
+                        content = content.replace(old_line, new_line)
+                        need_replace = True
+
+                    if not need_replace:
                         return
-
-                    if old_line not in content:
-                        return
-
-                    patched_content = content.replace(old_line, new_line)
 
                     # Write back the patched content
                     with open(file_to_patch, "w") as f:
-                        f.write(patched_content)
+                        f.write(content)
 
                 except (ImportError, FileNotFoundError, PermissionError):
                     # Allow failures gracefully
                     pass
 
             _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
 
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
