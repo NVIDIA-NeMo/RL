@@ -28,12 +28,11 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.conftest import TEST_ASSETS
 from tests.unit.test_utils import SimpleLoss
 
 
 def create_megatron_test_config(
-    model_name: str = TEST_ASSETS.TINY_LLAMA_MODEL_PATH,
+    model_name: str,
     tp: int = 1,
     pp: int = 1,
     precision: str = "float32",
@@ -134,14 +133,6 @@ def create_megatron_test_config(
     }
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-    yield
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 @pytest.fixture(scope="function")
 def gc_collect():
     """Helper function to force garbage collection after a test"""
@@ -152,7 +143,7 @@ def gc_collect():
 
 
 @pytest.fixture
-def policy_setup(request):
+def policy_setup(request, tiny_llama_model_path):
     """Setup and teardown for policy tests - creates a virtual cluster and policy."""
     # Get parameters from request
     if hasattr(request, "param") and request.param is not None:
@@ -177,7 +168,7 @@ def policy_setup(request):
             max_colocated_worker_groups=1,
         )
 
-        config = create_megatron_test_config(tp=tp, pp=pp)
+        config = create_megatron_test_config(tiny_llama_model_path, tp=tp, pp=pp)
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
             config["generation"], tokenizer
@@ -199,17 +190,20 @@ def policy_setup(request):
 @pytest.fixture
 def training_setup(request):
     """Setup and teardown specifically for training tests."""
-    # Parse parameters: (num_gpus, tp, pp, model_name, config_updates)
+    # Parse parameters: (num_gpus, tp, pp, model_fixture_name, config_updates)
     if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp, model_name, config_updates = request.param
+        num_gpus, tp, pp, model_fixture_name, config_updates = request.param
     else:
-        num_gpus, tp, pp, model_name, config_updates = (
+        num_gpus, tp, pp, model_fixture_name, config_updates = (
             2,
             1,
             1,
-            TEST_ASSETS.TINY_LLAMA_MODEL_PATH,
+            "tiny_llama_model_path",
             {},
         )
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
 
     policy = None
     cluster = None
@@ -317,24 +311,25 @@ def training_setup(request):
             cluster.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "training_setup",
     [
-        # (num_gpus, tp, pp, model_name, config_updates)
-        (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {}),
-        (2, 2, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {}),
-        (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
-        (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH, {}),
-        (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {"precision": "bfloat16"}),
+        # (num_gpus, tp, pp, model_fixture_name, config_updates)
+        (2, 1, 1, "tiny_llama_model_path", {}),
+        (2, 2, 1, "tiny_llama_model_path", {}),
+        (2, 1, 1, "tiny_qwen2_model_path", {}),
+        (2, 2, 1, "tiny_qwen2_model_path", {}),
+        (2, 1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
         (
             2,
             1,
             1,
-            TEST_ASSETS.TINY_LLAMA_MODEL_PATH,
+            "tiny_llama_model_path",
             {"activation_checkpointing": True},
         ),
-        (2, 2, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH, {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
     ],
     indirect=True,
     ids=[
@@ -384,9 +379,29 @@ def test_megatron_policy_training(training_setup):
     # Verify loss changed between iterations (model parameters were updated)
     assert losses[0] > losses[-1], "Loss should decrease over training iterations"
 
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert "theoretical_tflops" in results and isinstance(
+                results["theoretical_tflops"], (int, float)
+            ), "training backend should report theoretical_tflops"
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
+
 
 @pytest.fixture
-def generation_setup(request):
+def generation_setup(request, tiny_llama_model_path):
     """Setup and teardown specifically for generation tests."""
     # Parse parameters: (num_gpus, tp, pp, generation_backend)
     if hasattr(request, "param") and request.param is not None:
@@ -415,6 +430,7 @@ def generation_setup(request):
         )
 
         config = create_megatron_test_config(
+            tiny_llama_model_path,
             tp=tp,
             pp=pp,
             generation_backend=generation_backend,
@@ -536,11 +552,14 @@ def test_megatron_policy_generation(generation_setup):
 @pytest.fixture
 def logprob_setup(request):
     """Setup and teardown specifically for logprob tests."""
-    # Parse parameters: (num_gpus, tp, pp, model_name)
+    # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp, model_name = request.param
+        num_gpus, tp, pp, model_fixture_name = request.param
     else:
-        num_gpus, tp, pp, model_name = 2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH
+        num_gpus, tp, pp, model_fixture_name = 2, 1, 1, "tiny_llama_model_path"
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
 
     policy = None
     cluster = None
@@ -616,14 +635,15 @@ def logprob_setup(request):
 
 
 @pytest.mark.timeout(180)
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "logprob_setup",
     [
-        # (num_gpus, tp, pp, model_name)
-        (2, 1, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH),
-        (2, 2, 1, TEST_ASSETS.TINY_LLAMA_MODEL_PATH),
-        (2, 1, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
-        (2, 2, 1, TEST_ASSETS.TINY_QWEN2_MODEL_PATH),
+        # (num_gpus, tp, pp, model_fixture_name)
+        (2, 1, 1, "tiny_llama_model_path"),
+        (2, 2, 1, "tiny_llama_model_path"),
+        (2, 1, 1, "tiny_qwen2_model_path"),
+        (2, 2, 1, "tiny_qwen2_model_path"),
     ],
     indirect=True,
     ids=["2gpu_dp2_llama", "2gpu_tp2_llama", "2gpu_dp2_qwen2", "2gpu_tp2_qwen2"],
@@ -656,7 +676,8 @@ def test_megatron_policy_logprobs(logprob_setup):
 
 
 @pytest.mark.timeout(240)
-def test_megatron_loss_independent_of_microbatch_size():
+@pytest.mark.hf_gated
+def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     """Test that changing microbatch size while keeping global batch size constant does not affect loss values."""
     num_gpus = 2
     global_batch_size = 8
@@ -697,7 +718,7 @@ def test_megatron_loss_independent_of_microbatch_size():
         max_colocated_worker_groups=1,
     )
 
-    config1 = create_megatron_test_config()
+    config1 = create_megatron_test_config(tiny_llama_model_path)
     config1["train_micro_batch_size"] = 1
     tokenizer = get_tokenizer(config1["tokenizer"])
     config1["generation"] = configure_generation_config(
@@ -745,7 +766,7 @@ def test_megatron_loss_independent_of_microbatch_size():
         max_colocated_worker_groups=1,
     )
 
-    config2 = create_megatron_test_config()
+    config2 = create_megatron_test_config(tiny_llama_model_path)
     config2["train_micro_batch_size"] = 2
     config2["generation"] = configure_generation_config(
         config2["generation"], tokenizer
@@ -774,7 +795,8 @@ def test_megatron_loss_independent_of_microbatch_size():
 
 
 @pytest.mark.timeout(300)
-def test_megatron_reference_policy_functionality():
+@pytest.mark.hf_gated
+def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     """Test Megatron reference policy functionality."""
     num_gpus = 2
 
@@ -786,7 +808,7 @@ def test_megatron_reference_policy_functionality():
         max_colocated_worker_groups=1,
     )
 
-    config = create_megatron_test_config()
+    config = create_megatron_test_config(tiny_llama_model_path)
     config["megatron_cfg"]["optimizer"]["lr"] = 1e-2  # Increase from 5e-6 to 1e-2
     config["megatron_cfg"]["optimizer"]["min_lr"] = 1e-3  # Increase min_lr as well
 
@@ -894,6 +916,7 @@ def test_megatron_reference_policy_functionality():
 
 
 @pytest.mark.timeout(400)
+@pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "num_gpus,tp,pp",
     [
@@ -903,12 +926,14 @@ def test_megatron_reference_policy_functionality():
     ],
     ids=["2gpu_dp2_save_restore", "2gpu_pp2_save_restore", "2gpu_tp2_save_restore"],
 )
-def test_megatron_checkpoint_save_kill_and_restore(num_gpus, tp, pp):
+def test_megatron_checkpoint_save_kill_and_restore(
+    num_gpus, tp, pp, tiny_llama_model_path
+):
     """Test full checkpoint save/restore cycle: save -> kill worker -> restart -> verify restore."""
     from copy import deepcopy
 
     # Use tiny model for faster testing
-    model_name = TEST_ASSETS.TINY_LLAMA_MODEL_PATH
+    model_name = tiny_llama_model_path
     tokenizer = get_tokenizer({"name": model_name})
 
     with tempfile.TemporaryDirectory(prefix="megatron_save_restore_") as temp_dir:
@@ -1146,7 +1171,8 @@ def test_megatron_checkpoint_save_kill_and_restore(num_gpus, tp, pp):
 
 
 @pytest.mark.timeout(300)
-def test_megatron_dpo_training():
+@pytest.mark.hf_gated
+def test_megatron_dpo_training(tiny_llama_model_path):
     """Test DPO training with Megatron backend."""
     num_gpus = 2
     batch_size = 8
@@ -1184,7 +1210,7 @@ def test_megatron_dpo_training():
         max_colocated_worker_groups=1,
     )
 
-    config = create_megatron_test_config()
+    config = create_megatron_test_config(tiny_llama_model_path)
     tokenizer = get_tokenizer(config["tokenizer"])
 
     policy = Policy(
@@ -1242,7 +1268,8 @@ def test_megatron_dpo_training():
 
 
 @pytest.mark.timeout(300)
-def test_megatron_sft_training():
+@pytest.mark.hf_gated
+def test_megatron_sft_training(tiny_llama_model_path):
     """Test SFT training with Megatron backend."""
     num_gpus = 2
     batch_size = 8
@@ -1277,7 +1304,7 @@ def test_megatron_sft_training():
         max_colocated_worker_groups=1,
     )
 
-    config = create_megatron_test_config()
+    config = create_megatron_test_config(tiny_llama_model_path)
     tokenizer = get_tokenizer(config["tokenizer"])
 
     policy = Policy(
@@ -1323,8 +1350,9 @@ def test_megatron_sft_training():
         cluster.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
-def test_megatron_context_parallel_logprob_agreement():
+def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce identical logprobs with sequence packing enabled."""
     num_gpus = 2
     batch_size = 4
@@ -1362,7 +1390,9 @@ def test_megatron_context_parallel_logprob_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_no_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Ensure context parallel is disabled
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
 
@@ -1442,7 +1472,9 @@ def test_megatron_context_parallel_logprob_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
 
@@ -1521,8 +1553,9 @@ def test_megatron_context_parallel_logprob_agreement():
     )
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(300)
-def test_megatron_context_parallel_training_agreement():
+def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     """Test that CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing."""
     num_gpus = 2
     batch_size = 2
@@ -1580,7 +1613,9 @@ def test_megatron_context_parallel_training_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_no_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Ensure context parallel is disabled
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
     config_no_cp["train_global_batch_size"] = 2
@@ -1642,7 +1677,9 @@ def test_megatron_context_parallel_training_agreement():
         max_colocated_worker_groups=1,
     )
 
-    config_cp = create_megatron_test_config(tp=1, pp=1, precision="bfloat16")
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
     # Enable context parallel
     config_cp["megatron_cfg"]["context_parallel_size"] = 2
     config_cp["train_global_batch_size"] = 2

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict
+from typing import Any
 
 from nemo.lightning import io
 from nemo.lightning.io.state import TransformFns, _ModelState
@@ -102,7 +102,9 @@ def get_export_transforms():
     return transforms
 
 
-def get_source_fn(source: Dict[str, Any], source_config: Dict[str, Any]) -> _ModelState:
+def get_source_fn(
+    source_state_dict: dict[str, Any], source_config: dict[str, Any]
+) -> _ModelState:
     """Modify source state_dict before conversion.
 
     In deepseek, HF weight `model.layers.*.post_attention_layernorm.weight` is mapped to mcore weight
@@ -112,10 +114,15 @@ def get_source_fn(source: Dict[str, Any], source_config: Dict[str, Any]) -> _Mod
     We rename decoder.layers.*.mlp.linear_fc1.layer_norm_weight in the first case to unify key names
     """
     for layer_i in range(source_config["num_layers"]):
-        if f"decoder.layers.{layer_i}.mlp.linear_fc1.layer_norm_weight" in source:
-            weight = source.pop(
+        if (
+            f"decoder.layers.{layer_i}.mlp.linear_fc1.layer_norm_weight"
+            in source_state_dict
+        ):
+            weight = source_state_dict.pop(
                 f"decoder.layers.{layer_i}.mlp.linear_fc1.layer_norm_weight"
             )
-            source[f"decoder.layers.{layer_i}.pre_mlp_layernorm.weight"] = weight
-    modified_source = _ModelState(source)
+            source_state_dict[f"decoder.layers.{layer_i}.pre_mlp_layernorm.weight"] = (
+                weight
+            )
+    modified_source = _ModelState(source_state_dict)
     return modified_source

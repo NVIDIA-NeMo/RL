@@ -3,11 +3,9 @@ repos:
     rev: v4.4.0
     hooks:
     - id: end-of-file-fixer
-      # only include python files
-      files: \.py$
+      types_or: [python, pyi] # Only include Python files.
     - id: trailing-whitespace
-      # only include python files
-      files: \.py$
+      types_or: [python, pyi] # Only include Python files.
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: "v0.9.9" # Use the appropriate version
@@ -35,3 +33,16 @@ repos:
         files: '.*\/[^\/]*_[^\/]*\.md$'
         exclude: '^\.github/'
         types: [file]
+
+  - repo: local
+    hooks:
+      - id: pyrefly-typecheck
+        name: pyrefly check
+        entry: uv run --group dev pyrefly check
+        types_or: [python, pyi]
+        language: system
+        pass_filenames: false # Pyrefly reads config & project roots itself.
+        args: []
+        require_serial: true
+        additional_dependencies: []
+        minimum_pre_commit_version: "2.9.2"

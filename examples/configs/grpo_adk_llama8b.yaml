@@ -10,6 +10,7 @@ grpo:
 
 data:
   add_system_prompt: false
+  shuffle: false
 
 checkpointing:
   enabled: false

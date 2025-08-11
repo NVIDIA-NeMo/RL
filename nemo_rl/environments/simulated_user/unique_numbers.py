@@ -280,6 +280,7 @@ class UniqueNumbersEnv(EnvironmentInterface):
             next_stop_strings=stop_strings,
             rewards=torch.tensor(rewards, dtype=torch.float32),
             terminateds=torch.tensor(terminateds, dtype=torch.bool),
+            answers = None,
         )
 
     def shutdown(self) -> None:  # pragma: no cover

@@ -28,6 +28,7 @@ guides/sft.md
 guides/dpo.md
 guides/grpo.md
 guides/grpo-deepscaler.md
+guides/rm.md
 guides/eval.md
 guides/deepseek.md
 model-quirks.md
@@ -66,4 +67,6 @@ design-docs/checkpointing.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
+design-docs/sequence-packing-and-dynamic-batching.md
+design-docs/env-vars.md
 ```

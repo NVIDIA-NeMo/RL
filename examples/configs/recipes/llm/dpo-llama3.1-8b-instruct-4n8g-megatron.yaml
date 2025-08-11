@@ -21,6 +21,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10000
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
@@ -30,9 +31,6 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 2048
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
-
   dtensor_cfg:
     enabled: false
 
@@ -109,6 +107,7 @@ policy:
 data:
   dataset_name: "HelpSteer3"
   max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
 
 logger:
   log_dir: "logs"
@@ -116,6 +115,7 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
+  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
     name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1

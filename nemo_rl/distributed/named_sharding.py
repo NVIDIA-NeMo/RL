@@ -49,13 +49,13 @@ class NamedSharding:
             raise ValueError(f"Could not create NumPy array from layout: {e}")
 
         # Check if the inferred dtype is integer-like or float representing integers
-        self._layout: np.ndarray[Any, np.dtype[np.int_]]
+        self._layout: np.ndarray[tuple[int, ...], np.dtype[np.int32]]
         if not np.issubdtype(initial_array.dtype, np.integer):
             # Check if all elements are actually integers (handles floats like 1.0)
             if not np.equal(np.mod(initial_array, 1), 0).all():
                 raise ValueError("Layout must contain only integer rank IDs.")
             # If they are float but represent integers (e.g., 1.0), cast them
-            self._layout = initial_array.astype(int)
+            self._layout = initial_array.astype(np.int32)
         else:
             self._layout = initial_array  # Already integer type
 
@@ -96,7 +96,7 @@ class NamedSharding:
         return self._layout.size
 
     @property
-    def layout(self) -> np.ndarray[Any, np.dtype[np.int_]]:
+    def layout(self) -> np.ndarray[tuple[int, ...], np.dtype[np.int32]]:
         """Returns the underlying NumPy array representing the layout."""
         return self._layout.copy()  # Return a copy
 

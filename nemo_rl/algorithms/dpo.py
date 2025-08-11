@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
@@ -29,7 +29,6 @@ from nemo_rl.algorithms.loss_functions import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -37,14 +36,14 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class DPOSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: float
+    val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -101,16 +100,27 @@ def setup(
     StatefulDataLoader,
     StatefulDataLoader,
     DPOLossFn,
-    MasterConfig,
     Logger,
-    TaskDataSpec,
+    CheckpointManager,
     DPOSaveState,
+    MasterConfig,
 ]:
     """Main entry point for running DPO algorithm.
 
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
+    # Make sure we are not using dynamic batching or sequence packing.
+    # Anything that changes the order of data within a batch is currently incompatible with DPO.
+    assert not master_config["policy"]["dynamic_batching"]["enabled"], (
+        "Dynamic batching is currently not supported with DPO. "
+        "See https://github.com/NVIDIA-NeMo/RL/issues/719"
+    )
+    assert not master_config["policy"]["sequence_packing"]["enabled"], (
+        "Sequence packing is currently not supported with DPO. "
+        "See https://github.com/NVIDIA-NeMo/RL/issues/719"
+    )
+
     set_seed(master_config["dpo"]["seed"])
 
     # Extract individual configs for easier access
@@ -131,8 +141,8 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    dpo_save_state: Optional[DPOSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
+    dpo_save_state: Optional[DPOSaveState] = cast(
+        Optional[DPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
 
     # ==========================
@@ -142,7 +152,7 @@ def setup(
     train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=policy_config["train_global_batch_size"],
-        shuffle=True,
+        shuffle=data_config["shuffle"],
         collate_fn=partial(
             dpo_collate_fn,
             tokenizer=tokenizer,
@@ -350,10 +360,15 @@ def dpo_train(
     master_config,
     logger,
     checkpointer,
-    dpo_save_state,
-):
+    dpo_save_state: DPOSaveState,
+) -> None:
     # Run dpo training
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
 
     if dpo_save_state is None:
         dpo_save_state = _default_dpo_save_state()
@@ -374,7 +389,7 @@ def dpo_train(
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...")
-        val_metrics, validation_timings = validate(
+        validation_result = validate(
             policy,
             val_dataloader,
             tokenizer,
@@ -385,6 +400,10 @@ def dpo_train(
             val_batch_size=dpo_config["val_global_batch_size"],
             val_mbs=dpo_config["val_micro_batch_size"],
         )
+        if validation_result is not None:
+            val_metrics, validation_timings = validation_result
+        else:
+            val_metrics, validation_timings = None, None
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
@@ -406,15 +425,16 @@ def dpo_train(
 
             with timer.time("total_step_time"):
                 print("▶ Taking a training step...")
-                train_results = policy.train(
-                    batch,
-                    loss_fn,
-                    eval_mode=False,
-                    ## NOTE: we double the batch size here because each preference example corresponds to a pair of
-                    ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                    gbs=master_config["policy"]["train_global_batch_size"] * 2,
-                    mbs=master_config["policy"]["train_micro_batch_size"] * 2,
-                )
+                with timer.time("policy_training"):
+                    train_results = policy.train(
+                        batch,
+                        loss_fn,
+                        eval_mode=False,
+                        ## NOTE: we double the batch size here because each preference example corresponds to a pair of
+                        ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
+                        gbs=master_config["policy"]["train_global_batch_size"] * 2,
+                        mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][
                     "max_num_steps"
@@ -425,7 +445,7 @@ def dpo_train(
 
                 # Run validation if it's a validation step
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
-                    val_metrics, validation_timings = validate(
+                    validation_result = validate(
                         policy,
                         val_dataloader,
                         tokenizer,
@@ -436,6 +456,10 @@ def dpo_train(
                         val_batch_size=dpo_config["val_global_batch_size"],
                         val_mbs=dpo_config["val_micro_batch_size"],
                     )
+                    if validation_result is not None:
+                        val_metrics, validation_timings = validation_result
+                    else:
+                        val_metrics, validation_timings = None, None
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
@@ -447,11 +471,20 @@ def dpo_train(
                 dpo_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if master_config["checkpointing"]["enabled"] and (
+                timeout.mark_iteration()
+
+                should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
-                ):  # +1 because step is 0-indexed
+                )
+                # +1 because step is 0-indexed
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     dpo_save_state["total_steps"] = total_steps + 1
                     dpo_save_state["epoch"] = current_epoch
@@ -508,6 +541,22 @@ def dpo_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            if "total_flops" in train_results:
+                total_tflops = (
+                    train_results["total_flops"]
+                    / timing_metrics["policy_training"]
+                    / 1e12
+                )
+                num_ranks = train_results["num_ranks"]
+                print(
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+                )
+                if "theoretical_tflops" in train_results:
+                    theoretical_tflops = train_results["theoretical_tflops"]
+                    print(
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                    )
+                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

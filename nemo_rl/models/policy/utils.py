@@ -22,6 +22,15 @@ from transformers import AutoConfig
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 
+def is_vllm_v1_engine_enabled() -> bool:
+    """Check if vLLM V1 engine is enabled.
+
+    Returns:
+        bool: True if V1 engine is enabled, False otherwise (defaults to True if not set)
+    """
+    return os.environ.get("NRL_VLLM_USE_V1", "1") == "1"
+
+
 def import_class_from_path(name: str) -> Any:
     """Import a class from a string path (e.g. 'torch.optim.AdamW').
 
@@ -174,6 +183,16 @@ def configure_expandable_segments() -> None:
                         )
 
 
+def configure_dynamo_cache() -> None:
+    """Disable dynamo autotune_local_cache.
+
+    Dynamo may fail at cached_autotune when there's already a cache with different order of node_bundles.
+    Disable autotune_local_cache as a workaround.
+    See https://github.com/pytorch/pytorch/issues/153791 for more details.
+    """
+    torch._inductor.config.autotune_local_cache = False
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
@@ -211,3 +230,11 @@ def get_megatron_checkpoint_dir() -> str:
             )
     print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
     return checkpoint_dir
+
+
+def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
+    """Get IPC handle from a tensor."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    # skip serializing the function for better refit performance
+    return reduce_tensor(tensor.detach())[1:]

@@ -98,7 +98,7 @@ def calculate_baseline_and_std_per_prompt(
             prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
-                    (rewards[prompt_idx] ** 2) * valid_mask[prompt_idx],
+                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
                 )
                 / num_valid
             )

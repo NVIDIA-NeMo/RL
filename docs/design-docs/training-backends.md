@@ -25,9 +25,10 @@ The training backend is automatically determined based on your YAML configuratio
 ### Megatron Backend
 To enable Megatron-based training:
 
-1. Add the `megatron_cfg` key to your policy configuration.
-2. Set `policy.megatron_cfg.enabled=True`.
-3. Refer to [examples/configs/grpo_math_1B_megatron.yaml](../../examples/configs/grpo_math_1B_megatron.yaml) for a complete configuration example.
+1. Initialize the NeMo and Megatron submodules by running `git submodule update --init --recursive`
+2. Add the `megatron_cfg` key to your policy configuration.
+3. Set `policy.megatron_cfg.enabled=True`.
+4. Refer to [examples/configs/grpo_math_1B_megatron.yaml](../../examples/configs/grpo_math_1B_megatron.yaml) for a complete configuration example.
 
 _Note_: When using Megatron, the optimizer and learning rate schedule are configured through `policy.megatron_cfg.optimizer` and `policy.megatron_cfg.scheduler`, respectively.
 

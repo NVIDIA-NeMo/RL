@@ -76,6 +76,7 @@ class LoggerConfig(TypedDict):
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
+    num_val_samples_to_print: int
 
 
 class LoggerInterface(ABC):
@@ -359,6 +360,7 @@ class RayGpuMonitorLogger:
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
+        self.start_time: float = float("-inf")
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""

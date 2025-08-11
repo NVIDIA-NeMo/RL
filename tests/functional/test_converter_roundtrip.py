@@ -69,8 +69,6 @@ def create_test_config() -> Dict[str, Any]:
             "train_micro_batch_size": 2,
             "max_total_sequence_length": 128,
             "precision": "bfloat16",
-            "fsdp_offload_enabled": False,
-            "activation_checkpointing_enabled": False,
             "dtensor_cfg": {
                 "enabled": True,
                 "cpu_offload": False,

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 import time
 from contextlib import contextmanager
 from typing import Callable, Generator, Optional, Sequence, Union
@@ -245,3 +246,76 @@ class Timer:
         else:
             self._timers = {}
             self._start_times = {}
+
+
+def convert_to_seconds(time_string: str) -> int:
+    """Converts a time string in the format 'DD:HH:MM:SS' to total seconds.
+
+    Args:
+        time_string (str): Time duration string, e.g., '00:03:45:00'.
+
+    Returns:
+        int: Total time in seconds.
+    """
+    days, hours, minutes, seconds = map(int, time_string.split(":"))
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+class TimeoutChecker:
+    def __init__(
+        self, timeout: Optional[str] = "00:03:45:00", fit_last_save_time: bool = False
+    ):
+        """Initializes the TimeoutChecker.
+
+        Args:
+            timeout (str or None): Timeout in format 'DD:HH:MM:SS'. If None, timeout is considered infinite.
+            fit_last_save_time (bool): If True, considers average iteration time when checking timeout.
+        """
+        super().__init__()
+        self.last_save_time = (
+            float("inf") if timeout is None else convert_to_seconds(timeout)
+        )
+        self.start_time = time.time()
+        self.last_saved = False
+        self.iteration_times = []
+        self.previous_iteration_time: Optional[float] = None
+        self.fit_last_save_time = fit_last_save_time
+
+    def check_save(self):
+        # Flush
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Already saved after timeout
+        if self.last_saved:
+            return False
+
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+
+        if self.fit_last_save_time and self.iteration_times:
+            average_iteration_time = sum(self.iteration_times) / len(
+                self.iteration_times
+            )
+            if elapsed_time + average_iteration_time >= self.last_save_time:
+                self.last_saved = True
+                return True
+
+        if elapsed_time >= self.last_save_time:
+            self.last_saved = True
+            return True
+
+        return False
+
+    def start_iterations(self):
+        self.previous_iteration_time = time.time()
+
+    def mark_iteration(self):
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        current_time = time.time()
+        if self.previous_iteration_time is not None:
+            elapsed_time = current_time - self.previous_iteration_time
+            self.previous_iteration_time = current_time
+        self.iteration_times.append(elapsed_time)
