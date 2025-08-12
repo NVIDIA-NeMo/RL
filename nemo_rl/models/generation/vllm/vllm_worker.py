@@ -309,7 +309,7 @@ class BaseVllmGenerationWorker:
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
+            worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
             logprobs_mode="raw_logprobs",

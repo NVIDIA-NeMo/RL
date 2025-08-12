@@ -96,9 +96,11 @@ class VllmGeneration(GenerationInterface):
 
         # Create worker builder for VllmGenerationWorker
         if self.cfg["vllm_cfg"]["async_engine"]:
-            worker_cls = "nemo_rl.models.generation.vllm.VllmAsyncGenerationWorker"
+            worker_cls = "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
         else:
-            worker_cls = "nemo_rl.models.generation.vllm.VllmGenerationWorker"
+            worker_cls = (
+                "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
+            )
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
