@@ -32,7 +32,7 @@ uv run python examples/run_grpo_sliding_puzzle.py
 By default, this uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty
 ```bash
 # Train on a 3×3 puzzle with 10 random moves to scramble the board
-python examples/run_grpo_sliding_puzzle.py \
+uv run python examples/run_grpo_sliding_puzzle.py \
     env.sliding_puzzle_game.cfg.game_config.size=3 \
     env.sliding_puzzle_game.cfg.game_config.shuffle_moves=10
 ```
@@ -285,15 +285,18 @@ def step(action: str, game_state: dict[str, Any]) -> tuple[str, float, bool, dic
 ```
 ## Results
 
-We fine-tuned [`Qwen/Qwen2.5-1.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) on synthetic data for 200 steps with configs:
+We fine-tuned [`Qwen/Qwen2.5-1.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) on synthetic data for 120 steps with configs:
 
 ```
 game_config:
-    size: 4 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-    shuffle_moves: 8 # Number of random moves to shuffle the solved state
-max_moves: 30
+    size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
+    shuffle_moves: 10 # Number of random moves to shuffle the solved state
+max_moves: 40
 ```
 
-The figure below shows the Training Rewards vs Steps.
+The figure below shows the Training Rewards vs Steps, and validation accuracy.
 
-![Training Curve](../assets/avg_reward_sliding_puzzle.png)
+![Training Curve](../assets/train-reward-sliding-puzzle.png)
+
+
+![Validation Accuracy](../assets/valid_acc-sliding-puzzle.png)
