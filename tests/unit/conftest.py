@@ -607,26 +607,18 @@ def _build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
 
 @pytest.fixture(scope="session")
 def tiny_nemotron5_h_model_path():
-    """Fixture that returns a path to a tiny nemotron model with a dummy tokenizer."""
+    """Fixture that returns a path to a tiny nemotron model with a dummy tokenizer.
+
+    If the asset hasn't been prepared by the prepare script, skip the tests that require it.
+    """
     model_path = os.path.join(
         TEST_ASSETS_DIR, "tiny_nemotron5_h_with_nemotron_tokenizer"
     )
 
-    # Run the builder inside the Automodel environment using a dedicated venv pythondd
-    from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-
-    # Create the ray-remote wrapped function for reuse
-    build_tiny_nemotron5_h_checkpoint_remote = ray.remote(
-        _build_tiny_nemotron5_h_checkpoint
-    )
-
-    ray.get(
-        build_tiny_nemotron5_h_checkpoint_remote.options(
-            # Need a GPU to even import mamba-ssm (just claim a super small number to not error)
-            num_gpus=0.01,
-            runtime_env={"py_executable": PY_EXECUTABLES.AUTOMODEL},
-            name="build-tiny-nemotron5-h",
-        ).remote(model_path)
-    )
+    config_file = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_file):
+        pytest.skip(
+            "Tiny Nemotron-H test asset not prepared. Run `uv run tests/unit/prepare_unit_test_assets.py` first."
+        )
 
     yield model_path
