@@ -3,7 +3,7 @@
 This module provides a suite of tools to enable FP8 quantization for large language models. This module is still in developement. Currently we support FP8 generation, using Deepseek style FP8 (sub channel scaling).
 
 NeMo-RL monkey patches several vLLM functions to enable FP8 generations for reinforcement learning. The `init_fp8` function patches key `vLLM` components when initialized:
-1.  **`RayDistributedExecutor`**: For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches before model initialization.
+1.  **RayDistributedExecutor**: For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches before model initialization.
 2.  **Quantization Utilities**: Functions within `vllm.model_executor.layers.quantization` are replaced with versions that support power-of-2 scaling and other custom features.
 3.  **Weight Loading**: A custom `load_weights` function handles the on-the-fly quantization of model weights from a higher-precision format to FP8 with the correct scaling factors.
 
@@ -36,4 +36,6 @@ FP8 generations are recommended to be configured with the following settings:
 
 ## Accuracy
 
-We observe on the Llama 8b recipe a ~5% accuracy loss is incurred with FP8 generations. Convergence is still under active research and FP8 generations should be used with caution. We are investigating ways to close the accuracy gap and further improve performance. 
+We observe on the Llama 8b recipe a ~2% accuracy loss is incurred with FP8 generations. Convergence is still under active research and FP8 generations should be used with caution. We are investigating ways to close the accuracy gap and further improve performance. 
+![FP8 LLAMA8b Convergence](assets/fp8_curves.png)
+

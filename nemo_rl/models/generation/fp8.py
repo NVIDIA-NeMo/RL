@@ -295,7 +295,7 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        param_lp, param_scale = kitchen_block_scale(
+        param_lp, param_scale = cast_tensor_to_fp8_blockwise(
             v.to(torch.float),
             weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
         )
@@ -316,7 +316,7 @@ def load_weights(weights, model_runner):
             param.__class__ = param.orig_type
 
 
-def kitchen_block_scale(
+def cast_tensor_to_fp8_blockwise(
     data_hp,
     weight_block_size,
 ):
