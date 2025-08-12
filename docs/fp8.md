@@ -36,6 +36,6 @@ FP8 generations are recommended to be configured with the following settings:
 
 ## Accuracy
 
-We observe on the Llama 8b recipe a ~2% accuracy loss is incurred with FP8 generations. Convergence is still under active research and FP8 generations should be used with caution. We are investigating ways to close the accuracy gap and further improve performance. 
+We observe on the Llama 8b recipe a ~2% accuracy loss is incurred with FP8 generations. Convergence is still under active research and FP8 generations should be used with caution. We are investigating ways to close the accuracy gap and further improve performance. Note: This gap appears after ~2 *thousand* steps of RL. Prior to that, similar to other works, we find a minimal gap in accuracy
 ![FP8 LLAMA8b Convergence](assets/fp8_curves.png)
 
