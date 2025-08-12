@@ -260,6 +260,7 @@ class DTensorPolicyWorker:
         with init_empty_weights():
             self.model = model_class.from_config(
                 model_config,
+                trust_remote_code=True,
             )
 
         if self.model.config.pad_token_id is None:
