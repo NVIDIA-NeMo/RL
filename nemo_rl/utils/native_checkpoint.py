@@ -250,6 +250,10 @@ def convert_dcp_to_hf(
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
 
+    for key, value in state_dict["model"].items():
+        if value.dtype == torch.float32:
+            state_dict["model"][key] = value.to(config.torch_dtype)
+
     model = AutoModelForCausalLM.from_config(config)
 
     model.save_pretrained(
