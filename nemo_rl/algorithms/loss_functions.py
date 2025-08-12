@@ -275,6 +275,7 @@ class ClippedPGLossFn(LossFunction):
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
         actor_importance_weights = actor_importance_weights_expanded
+        del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
             importance_weights_to_use = actor_importance_weights
         else:
@@ -307,7 +308,7 @@ class ClippedPGLossFn(LossFunction):
             )
         else:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights_expanded,
+                actor_importance_weights,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
