@@ -17,9 +17,9 @@ This script exists to help load any unit asset that requires special handling.
 The initial reason for this was to help with Nemotron-H which has a requirement
 to have mamaba-ssm in the base environment in order to initialize a dummy model. Since
 the unit tests should be runable with the base environment (without mamba-ssm),
-we use ray.remotes to build the asset here. We could do this outside of a fixture
-like the other test assets because this one sometimes takes a while to build if you
-include the setup time, and can cause timeouts in the unit tests if unlucky.
+we use ray.remotes to build the asset here. We do this outside of a fixture
+like the other test assets because this one sometimes takes a while to build. This
+extra setup time can sometimes cause timeouts in the unit tests if unlucky.
 """
 
 import os
