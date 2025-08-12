@@ -58,6 +58,7 @@ def build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
     shutil.rmtree(model_path, ignore_errors=True)
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
+    print(f"✓ Built tiny Nemotron-H asset at: {model_path}")
 
 
 def main() -> None:
@@ -86,8 +87,6 @@ def main() -> None:
 
     for obj_ref in remote_calls:
         ray.get(obj_ref)
-
-    print(f"✓ Built tiny Nemotron-H asset at: {target}")
 
 
 if __name__ == "__main__":
