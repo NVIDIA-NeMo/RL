@@ -720,9 +720,13 @@ async def run_hf_train_process(
 
         print(f"Average probability multiplicative error: {avg_prob_mult_error}")
         if vllm_precision == "fp8":
-            assert avg_prob_mult_error <= 1.080, "vLLM and HF logprobs should closely match"
+            assert avg_prob_mult_error <= 1.080, (
+                "vLLM and HF logprobs should closely match"
+            )
         else:
-            assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
+            assert avg_prob_mult_error <= 1.043, (
+                "vLLM and HF logprobs should closely match"
+            )
 
         # Step 2: Prepare simplified training data (smaller and with padding removed to prevent OOM)
         # Use a very small sequence for training to ensure it works
@@ -789,11 +793,13 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload", "vllm_precision"), 
-    [(True, False, "bfloat16"), 
-     (False, True, "bfloat16"),
-     (True, False, "fp8"),
-     (False, True, "fp8")]
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision
@@ -822,7 +828,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision)
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+    )
 
 
 @pytest.mark.timeout(300)
@@ -865,7 +873,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False, "bfloat16")
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, False, "bfloat16"
+    )
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):

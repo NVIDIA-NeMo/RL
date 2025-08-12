@@ -1,11 +1,27 @@
-import torch, os, ray
-from accelerate import init_empty_weights
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
 from dataclasses import dataclass, field
+from unittest.mock import patch
+
+import ray
+import torch
+from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
-from unittest.mock import patch
-
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
@@ -374,11 +390,11 @@ def kitchen_block_scale(
 
 
 def process_weights_after_loading(self, layer) -> None:
+    from torch.nn import Parameter
     from vllm.model_executor.parameter import (
         BlockQuantScaleParameter,
         ModelWeightParameter,
     )
-    from torch.nn import Parameter
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
     assert self.quant_config.activation_scheme == "dynamic"
