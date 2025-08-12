@@ -152,3 +152,42 @@ uv run --extra vllm tools/model_diagnostics/2.long_generation_decode_vs_prefill.
 # ...
 # [Qwen/Qwen2.5-1.5B] ALL GOOD!
 ```
+
+## [3.check_hf_model_embeddings_untrained.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/3.check_hf_model_embeddings_untrained.py)
+
+Detects untrained or improperly initialized Hugging Face model embeddings by scanning for near-zero rows and rows with near-identical values in both input and output embeddings. The script also reports whether word embeddings are tied and summarizes basic statistics.
+
+```sh
+# Example run
+uv run --extra mcore tools/model_diagnostics/3.check_hf_model_embeddings_untrained.py --model nvidia/Nemotron-H-8B-Base-8K
+
+# ....
+#================================================================================
+#EMBEDDING SUMMARIES
+#================================================================================
+#
+#--- Input Embeddings Summary ---
+#Shape: torch.Size([131072, 4096]), Dtype: torch.bfloat16
+#Near-zero embeddings (abs < 1.00e-10): 1039/131072 (0.8%)
+#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,104097,108262,112147,112327,112497,114755
+#Identical embeddings (std < 1.00e-08): 1041/131072 (0.8%)
+#  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,83855,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,101707,104097,108262,112147,112327,112497,114755
+#Statistics: mean_abs=0.007874, max_abs=0.196289, std_range=[0.000000, 0.015442]
+#⚠️  POTENTIAL ISSUES: 1039 near-zero embeddings, 1041 identical embeddings
+#
+#--- Output Embeddings Summary (Tied: False) ---
+#Shape: torch.Size([131072, 4096]), Dtype: torch.bfloat16
+#Near-zero embeddings (abs < 1.00e-10): 0/131072 (0.0%)
+#Identical embeddings (std < 1.00e-08): 0/131072 (0.0%)
+#Statistics: mean_abs=0.006775, max_abs=0.200195, std_range=[0.004089, 0.021240]
+#✅ No obvious untrained patterns detected
+#
+#=== Final Summary ===
+#Model: nvidia/Nemotron-H-8B-Base-8K
+#Analysis complete.
+```
+
+- Thresholds can be adjusted via flags:
+  - `--near-zero-threshold` (default: `1e-10`)
+  - `--identical-threshold` (default: `1e-8`)
+- If any near-zero or identical rows are reported, the model may have issues of numerical instability (e.g., inf grad norms) during post-training if any of these problematic tokens are encountered. We have observed this happening when special tokens are reserved in the tokenizer and embedding, but none are encountered during pre-training. It may help to initialize these embeddings similar to how they were initialize during pre-training.
