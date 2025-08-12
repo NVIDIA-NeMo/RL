@@ -5,7 +5,7 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 30 # Maximum turns allowed per rollout
-  max_num_steps: 200
+  max_num_steps: 500
   val_at_start: true
   max_val_samples: 1024
 
@@ -53,8 +53,8 @@ env:
   sliding_puzzle_game:
     cfg:
       game_config:
-        size: 4 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 8 # Number of random moves to shuffle the solved state
+        size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
+        shuffle_moves: 10 # Number of random moves to shuffle the solved state
       max_moves: 30 # Maximum moves allowed per episode
 
 logger:

@@ -291,7 +291,7 @@ We fine-tuned [`Qwen/Qwen2.5-1.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5
 game_config:
     size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
     shuffle_moves: 10 # Number of random moves to shuffle the solved state
-max_moves: 40
+max_moves: 30
 ```
 
 The figure below shows the Training Rewards vs Steps, and validation accuracy.
