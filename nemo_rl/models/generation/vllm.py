@@ -373,46 +373,127 @@ class VllmGenerationWorker:
         self.vllm_device_ids = None
 
     def _setup_vllm_server(self) -> None:
-        from fastapi import FastAPI, Request
-        from fastapi.responses import JSONResponse, StreamingResponse
+        async def openai_server_task(
+            engine: EngineClient,
+            config: OpenAIServerConfig,
+        ) -> asyncio.Task[None]:
+            """
+            Starts an asyncio task that runs an OpenAI-compatible server.
 
-        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
+            Args:
+                engine: The vLLM engine client.
+                config: The configuration for the OpenAI-compatible server.
 
-        app = FastAPI()
+            Returns:
+                A running asyncio task for the OpenAI-compatible server. Cancel the task
+                to stop the server.
+            """
+            # Import patches before importing api_server
+            from .patches import (
+                patch_listen_for_disconnect,
+                patch_tool_parser_manager,
+                subclass_chat_completion_request,
+            )
 
-        engine_client = self.llm
-        model_config = self.llm_async_engine_args.create_model_config()
-        base_model_paths = [BaseModelPath(name=model_config.model, model_path=model_config.model)]
+            # We must subclass ChatCompletionRequest before importing api_server
+            # or logprobs will not always be returned
+            subclass_chat_completion_request()
+            from vllm.entrypoints.openai import api_server
 
-        openai_serving_models = OpenAIServingModels(
-            engine_client=engine_client,
-            model_config=model_config,
-            base_model_paths=base_model_paths,
-            lora_modules=None,
-        )
-        openai_serving_chat = OpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            response_role="assistant",
-            request_logger=None,
-            chat_template=None,
-            chat_template_content_format="auto",
-            return_tokens_as_token_ids=True,
-        )
-        @app.post("/v1/chat/completions")
-        async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-            generator = await openai_serving_chat.create_chat_completion(request, raw_request)
+            patch_listen_for_disconnect()
+            patch_tool_parser_manager()
+            set_vllm_log_file(config.get("log_file", "vllm.log"))
 
-            if isinstance(generator, ErrorResponse):
-                return JSONResponse(content=generator.model_dump(),
-                                    status_code=generator.code)
+            # Patch engine.add_lora; hopefully temporary
+            add_lora = engine.add_lora
 
-            elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(content=generator.model_dump())
+            async def _add_lora(lora_request) -> None:
+                class LoRARequest:
+                    def __getattr__(self, name: str) -> Any:
+                        if name == "lora_tensors" and not hasattr(lora_request, name):
+                            return None
+                        return getattr(lora_request, name)
 
-            return StreamingResponse(content=generator, media_type="text/event-stream")
+                    def __setattr__(self, name: str, value: Any) -> None:
+                        setattr(lora_request, name, value)
+
+                await add_lora(LoRARequest())  # type: ignore
+
+            engine.add_lora = _add_lora
+
+            @asynccontextmanager
+            async def build_async_engine_client(
+                *args: Any,
+                **kwargs: Any,
+            ) -> AsyncIterator[EngineClient]:
+                yield engine
+
+            api_server.build_async_engine_client = build_async_engine_client
+            openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
+            server_args = config.get("server_args", {})
+            client = AsyncOpenAI(
+                api_key=server_args.get("api_key"),
+                base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
+            )
+
+            async def test_client() -> None:
+                while True:
+                    try:
+                        async for _ in client.models.list():
+                            return
+                    except:  # noqa: E722
+                        await asyncio.sleep(0.1)
+
+            test_client_task = asyncio.create_task(test_client())
+            try:
+                timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
+                done, _ = await asyncio.wait(
+                    [openai_server_task, test_client_task],
+                    timeout=timeout,
+                    return_when="FIRST_COMPLETED",
+                )
+                if not done:
+                    raise TimeoutError(
+                        f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
+                    )
+                for task in done:
+                    task.result()
+
+                return openai_server_task
+            except Exception:
+                openai_server_task.cancel()
+                test_client_task.cancel()
+                raise
+
+
+        def _openai_server_coroutine(
+            config: OpenAIServerConfig,
+        ) -> Coroutine[Any, Any, None]:
+            from vllm.entrypoints.openai import api_server
+
+            parser = FlexibleArgumentParser(
+                description="vLLM OpenAI-Compatible RESTful API server."
+            )
+            parser = make_arg_parser(parser)
+            engine_args = config.get("engine_args", {})
+            server_args = config.get("server_args", {})
+            args = [
+                *[
+                    f"--{key.replace('_', '-')}{f'={item}' if item is not True else ''}"
+                    for args in [engine_args, server_args]
+                    for key, value in args.items()
+                    for item in (value if isinstance(value, list) else [value])
+                    if item is not None
+                ],
+            ]
+            namespace = parser.parse_args(args)
+            assert namespace is not None
+            validate_parsed_serve_args(namespace)
+            return api_server.run_server(
+                namespace,
+                log_config=get_uvicorn_logging_config(config.get("log_file", "vllm.log")),
+            )
+
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
