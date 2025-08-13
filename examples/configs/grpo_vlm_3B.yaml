@@ -11,6 +11,7 @@ grpo:
   val_at_start: false
   max_val_samples: 256
   val_batch_size: 256
+  seed: 42
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -29,6 +30,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -138,6 +140,7 @@ data:
   split: "trainA"
   task_name: "clevr-cogent"   # must match the task_name in the dataset
   seed: 42
+  shuffle: true
 
 env:
   clevr-cogent:
