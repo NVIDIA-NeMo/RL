@@ -393,7 +393,10 @@ class VllmGenerationWorker:
         config = Namespace(**(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""}))
         print(f"Starting server on http://{node_ip}:{config.port}/v1")
 
-        def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
+        def openai_server_wrapper(engine: EngineClient, config: Namespace):
+            asyncio.run(openai_server_task(engine, config))
+
+        async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
             """
             Starts an asyncio task that runs an OpenAI-compatible server.
 
@@ -457,7 +460,7 @@ class VllmGenerationWorker:
 
         import threading
 
-        thread = threading.Thread(target=openai_server_task, kwargs={"engine": engine, "config": config}, daemon=True)
+        thread = threading.Thread(target=openai_server_wrapper, kwargs={"engine": engine, "config": config}, daemon=True)
         thread.start()
 
         return thread
