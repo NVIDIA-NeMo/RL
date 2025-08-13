@@ -746,7 +746,7 @@ class Logger(LoggerInterface):
             self.loggers.append(tensorboard_logger)
 
         # why are we bringing new loggers without modifying configs
-        if cfg.get("mlflow_enabled", False):
+        if cfg["mlflow_enabled"]:
             mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
             os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
