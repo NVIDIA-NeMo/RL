@@ -457,7 +457,7 @@ class VllmGenerationWorker:
 
             parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
             parser = make_arg_parser(parser)
-            namespace = parser.parse_args(namespace)
+            namespace = parser.parse_args(namespace=namespace)
 
             validate_parsed_serve_args(namespace)
 
