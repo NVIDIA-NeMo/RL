@@ -70,19 +70,19 @@ if os.path.exists(bridge_src_dir):
 
     if missing_in_cached or extra_in_cached:
         print(
-            "[megatron-bridge][setup] Dependency mismatch detected against CACHED_DEPENDENCIES.",
+            "[megatron-bridge][setup] Dependency mismatch between Megatron-Bridge-workspace/Megatron-Bridge/pyproject.toml vs Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.",
             file=sys.stderr,
         )
         if missing_in_cached:
             print(
-                "  - Present in submodule pyproject but missing from CACHED_DEPENDENCIES:",
+                "  - Present in Megatron-Bridge/pyproject.toml but missing from CACHED_DEPENDENCIES:",
                 file=sys.stderr,
             )
             for dep in sorted(missing_in_cached):
                 print(f"    * {dep}", file=sys.stderr)
         if extra_in_cached:
             print(
-                "  - Present in CACHED_DEPENDENCIES but not in submodule pyproject:",
+                "  - Present in CACHED_DEPENDENCIES but not in Megatron-Bridge/pyproject.toml:",
                 file=sys.stderr,
             )
             for dep in sorted(extra_in_cached):
@@ -91,6 +91,7 @@ if os.path.exists(bridge_src_dir):
             "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
             file=sys.stderr,
         )
+        sys.exit(1)
     else:
         print(
             "[megatron-bridge][setup] Dependency sets are consistent with the submodule pyproject.",
