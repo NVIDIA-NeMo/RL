@@ -159,8 +159,6 @@ def hf_data_processor(
         tokenize=False,
         add_generation_prompt=True,
     )
-    if isinstance(string_formatted_dialog, (list, tuple)):
-        string_formatted_dialog = string_formatted_dialog[0]
     
     try:
         # this is the id-tokenized and image processed conversation template for the policy
