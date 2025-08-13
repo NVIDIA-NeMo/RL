@@ -417,6 +417,7 @@ class VllmGenerationWorker:
                 yield engine
 
             api_server.build_async_engine_client = build_async_engine_client
+            api_server.signal.signal = lambda *args, **kwargs: None
             openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
             client = AsyncOpenAI(
                 api_key=config.api_key,
