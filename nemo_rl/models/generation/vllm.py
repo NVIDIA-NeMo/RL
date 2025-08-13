@@ -387,7 +387,7 @@ class VllmGenerationWorker:
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
-        print(f"Starting server on http://{node_ip}:{config.port}/v1")
+        print(f"Starting server on http://{node_ip}:{free_port}/v1")
 
         app = FastAPI()
 
