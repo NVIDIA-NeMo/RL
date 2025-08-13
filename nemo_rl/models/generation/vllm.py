@@ -374,6 +374,7 @@ class VllmGenerationWorker:
         self.vllm_device_ids = None
 
     def _setup_vllm_server(self) -> None:
+        print("hit inside setup vllm server")
         from typing import Any, AsyncIterator, Coroutine
 
         from contextlib import asynccontextmanager
