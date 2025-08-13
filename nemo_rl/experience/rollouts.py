@@ -882,10 +882,7 @@ def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
-    task_to_env: dict[str, EnvironmentInterface],
     max_seq_len: int,
-    max_rollout_turns: int = 999999,
-    greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with sample-level processing.
 

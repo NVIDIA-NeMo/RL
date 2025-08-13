@@ -587,6 +587,18 @@ def grpo_train(
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
+                elif master_config.get("nemo_gym"):
+                    (
+                        repeated_batch,
+                        rollout_metrics,
+                    ) = run_async_multi_turn_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                    )
                 else:
                     repeated_batch, rollout_metrics = run_multi_turn_rollout(
                         policy_generation=policy_generation,
