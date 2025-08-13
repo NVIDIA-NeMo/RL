@@ -217,11 +217,14 @@ def setup(
     print("\n▶ Setting up compute cluster...")
     colocated_inference = generation_config["colocated"]["enabled"]
 
+    policy_nodes = cluster_config.get("policy_nodes", cluster_config["num_nodes"])
+    print(f"Allocating {policy_nodes} nodes for policy, leaving {cluster_config['num_nodes'] - policy_nodes} for reward model")
+
     if colocated_inference:
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-            * cluster_config["num_nodes"],
+            * policy_nodes,
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
