@@ -155,14 +155,14 @@ def setup_data(
     )
     task_data_processors["math"] = (math_task_spec, hf_data_processor)
 
-    # math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-    #     runtime_env={
-    #         "py_executable": get_actor_python_env(
-    #             "nemo_rl.environments.math_environment.MathEnvironment"
-    #         ),
-    #         "env_vars": dict(os.environ),  # Pass thru all user environment variables
-    #     }
-    # ).remote(env_configs["math"])
+    math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.math_environment.MathEnvironment"
+            ),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        }
+    ).remote(env_configs["math"])
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
@@ -170,8 +170,6 @@ def setup_data(
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
-    print(dataset[0])
-    return None, None, None, None
 
     val_dataset: Optional[AllTaskProcessedDataset] = None
     if data.formatted_ds["validation"]:
@@ -222,7 +220,7 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
 
-    # init_ray()
+    init_ray()
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
