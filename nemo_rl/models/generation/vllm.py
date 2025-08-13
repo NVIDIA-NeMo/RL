@@ -372,56 +372,33 @@ class VllmGenerationWorker:
 
     def _setup_vllm_server(self) -> None:
         from fastapi import FastAPI
+        from fastapi.responses import JSONResponse, StreamingResponse
+
         from vllm.entrypoints.openai.api_server import OpenAIServingChat, EngineClient
+
+        app = FastAPI()
+
         engine_client: EngineClient,
         vllm_config: VllmConfig,
-        state: State,
-        args: Namespace,
-        state.openai_serving_chat = OpenAIServingChat(
-        engine_client,
-        model_config,
-        state.openai_serving_models,
-        args.response_role,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.
-        exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.reasoning_parser,
-        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-        enable_force_include_usage=args.enable_force_include_usage,
-    ) if "generate" in supported_tasks else None
-        @router.post("/v1/chat/completions",
-             dependencies=[Depends(validate_json_request)],
-             responses={
-                 HTTPStatus.OK.value: {
-                     "content": {
-                         "text/event-stream": {}
-                     }
-                 },
-                 HTTPStatus.BAD_REQUEST.value: {
-                     "model": ErrorResponse
-                 },
-                 HTTPStatus.NOT_FOUND.value: {
-                     "model": ErrorResponse
-                 },
-                 HTTPStatus.INTERNAL_SERVER_ERROR.value: {
-                     "model": ErrorResponse
-                 }
-             })
-        @with_cancellation
-        @load_aware_call
-        async def create_chat_completion(request: ChatCompletionRequest,
-                                        raw_request: Request):
-            handler = chat(raw_request)
-            if handler is None:
-                return base(raw_request).create_error_response(
-                    message="The model does not support Chat Completions API")
-
-            generator = await handler.create_chat_completion(request, raw_request)
+        args: Namespace,openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,
+            model_config=model_config,
+            base_model_paths=base_model_paths,
+            lora_modules=lora_modules,
+        )
+        openai_serving_chat = OpenAIServingChat(
+            engine_client,
+            model_config,
+            state.openai_serving_models,
+            response_role="assistant",
+            request_logger=None,
+            chat_template=resolved_chat_template,
+            chat_template_content_format="auto",
+            return_tokens_as_token_ids=True,
+        )
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+            generator = await openai_serving_chat.create_chat_completion(request, raw_request)
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(content=generator.model_dump(),
