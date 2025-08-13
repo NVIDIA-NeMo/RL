@@ -107,6 +107,8 @@ policy:
       # For most cases, use "dummy" to load the initial weights, since they will be overwritten during refit
       # For Gemma models, we need to use "auto" due to a vllm bug
       load_format: dummy
+      max_num_batched_tokens: 10240  # Default is 2048
+      max_num_seqs: 1024  # Just try to be larger than (num_prompts_per_step * num_generations_per_prompt) / dp
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources
