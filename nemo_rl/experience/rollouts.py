@@ -884,19 +884,15 @@ def run_async_nemo_gym_rollout(
     tokenizer: TokenizerType,
     max_seq_len: int,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
-    """Run multi-turn rollouts with sample-level processing.
+    """Run rollouts with NeMo Gym
 
-    Each sample in the batch proceeds through its interaction independently.
     Async generation is used internally when available but the function is synchronous.
 
     Args:
         policy_generation: The generation interface (policy)
         input_batch: The starting batch containing initial message logs
         tokenizer: The tokenizer
-        task_to_env: Dictionary mapping task names to environment instances
         max_seq_len: Maximum sequence length allowed
-        max_rollout_turns: Maximum number of agent-environment interaction turns
-        greedy: Whether to use greedy decoding
 
     Returns:
         Tuple containing:
