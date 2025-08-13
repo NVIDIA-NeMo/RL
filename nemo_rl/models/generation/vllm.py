@@ -384,8 +384,12 @@ class VllmGenerationWorker:
         from vllm.engine.protocol import EngineClient
         from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
 
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
+
         engine: EngineClient = self.llm
-        namespace = Namespace(self.llm_async_engine_args_dict)
+        node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
+        config = Namespace(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""})
+        print(f"Starting server on http://{node_ip}:{config.port}/v1")
 
         async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
             """
@@ -408,10 +412,9 @@ class VllmGenerationWorker:
 
             api_server.build_async_engine_client = build_async_engine_client
             openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
-            server_args = config.get("server_args", {})
             client = AsyncOpenAI(
-                api_key=server_args.get("api_key"),
-                base_url=f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1",
+                api_key=config.api_key,
+                base_url=f"http://{config.host}:{config.port}/v1",
             )
 
             async def test_client() -> None:
@@ -449,7 +452,7 @@ class VllmGenerationWorker:
             validate_parsed_serve_args(namespace)
             return api_server.run_server(namespace)
 
-        asyncio.run(openai_server_task(engine, namespace))
+        asyncio.run(openai_server_task(engine, config))
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
