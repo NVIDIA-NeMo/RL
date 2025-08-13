@@ -365,7 +365,7 @@ class VllmGenerationWorker:
             # Grab the engine args
             self.llm_async_engine_args_dict = llm_kwargs
             self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**self.llm_async_engine_args_dict))
-            self._setup_vllm_server()
+            self.server_thread = self._setup_vllm_server()
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
@@ -393,7 +393,7 @@ class VllmGenerationWorker:
         config = Namespace(**(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""}))
         print(f"Starting server on http://{node_ip}:{config.port}/v1")
 
-        async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
+        def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
             """
             Starts an asyncio task that runs an OpenAI-compatible server.
 
@@ -455,7 +455,12 @@ class VllmGenerationWorker:
             validate_parsed_serve_args(namespace)
             return api_server.run_server(namespace)
 
-        asyncio.run(openai_server_task(engine, config))
+        import threading
+
+        thread = threading.Thread(target=openai_server_task, kwargs={"engine": engine, "config": config}, daemon=True)
+        thread.start()
+
+        return thread
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
