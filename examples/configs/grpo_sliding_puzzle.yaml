@@ -20,7 +20,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 512
+  max_total_sequence_length: 1024
 
   dtensor_cfg:
     enabled: true
