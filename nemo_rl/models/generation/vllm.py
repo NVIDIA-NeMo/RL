@@ -409,6 +409,7 @@ class VllmGenerationWorker:
 
             @asynccontextmanager
             async def build_async_engine_client(*args: Any, **kwargs: Any) -> AsyncIterator[EngineClient]:
+                print("hit inside mock build_async_engine_client")
                 yield engine
 
             api_server.build_async_engine_client = build_async_engine_client
