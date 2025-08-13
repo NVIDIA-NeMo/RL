@@ -363,8 +363,8 @@ class VllmGenerationWorker:
             from vllm.v1.engine.async_llm import AsyncLLM
 
             # Grab the engine args
-            self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-            self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+            self.llm_async_engine_args_dict = llm_kwargs
+            self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**self.llm_async_engine_args_dict))
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
@@ -373,10 +373,21 @@ class VllmGenerationWorker:
         self.vllm_device_ids = None
 
     def _setup_vllm_server(self) -> None:
-        async def openai_server_task(
-            engine: EngineClient,
-            config: OpenAIServerConfig,
-        ) -> asyncio.Task[None]:
+        from typing import Any, AsyncIterator, Coroutine
+
+        from contextlib import asynccontextmanager
+
+        from argparse import Namespace
+
+        from openai import AsyncOpenAI
+
+        from vllm.engine.protocol import EngineClient
+        from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
+
+        engine: EngineClient = self.llm
+        namespace = Namespace(self.llm_async_engine_args_dict)
+
+        async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
             """
             Starts an asyncio task that runs an OpenAI-compatible server.
 
@@ -388,44 +399,11 @@ class VllmGenerationWorker:
                 A running asyncio task for the OpenAI-compatible server. Cancel the task
                 to stop the server.
             """
-            # Import patches before importing api_server
-            from .patches import (
-                patch_listen_for_disconnect,
-                patch_tool_parser_manager,
-                subclass_chat_completion_request,
-            )
 
-            # We must subclass ChatCompletionRequest before importing api_server
-            # or logprobs will not always be returned
-            subclass_chat_completion_request()
             from vllm.entrypoints.openai import api_server
 
-            patch_listen_for_disconnect()
-            patch_tool_parser_manager()
-            set_vllm_log_file(config.get("log_file", "vllm.log"))
-
-            # Patch engine.add_lora; hopefully temporary
-            add_lora = engine.add_lora
-
-            async def _add_lora(lora_request) -> None:
-                class LoRARequest:
-                    def __getattr__(self, name: str) -> Any:
-                        if name == "lora_tensors" and not hasattr(lora_request, name):
-                            return None
-                        return getattr(lora_request, name)
-
-                    def __setattr__(self, name: str, value: Any) -> None:
-                        setattr(lora_request, name, value)
-
-                await add_lora(LoRARequest())  # type: ignore
-
-            engine.add_lora = _add_lora
-
             @asynccontextmanager
-            async def build_async_engine_client(
-                *args: Any,
-                **kwargs: Any,
-            ) -> AsyncIterator[EngineClient]:
+            async def build_async_engine_client(*args: Any, **kwargs: Any) -> AsyncIterator[EngineClient]:
                 yield engine
 
             api_server.build_async_engine_client = build_async_engine_client
@@ -465,35 +443,13 @@ class VllmGenerationWorker:
                 test_client_task.cancel()
                 raise
 
-
-        def _openai_server_coroutine(
-            config: OpenAIServerConfig,
-        ) -> Coroutine[Any, Any, None]:
+        def _openai_server_coroutine(namespace: Namespace) -> Coroutine[Any, Any, None]:
             from vllm.entrypoints.openai import api_server
 
-            parser = FlexibleArgumentParser(
-                description="vLLM OpenAI-Compatible RESTful API server."
-            )
-            parser = make_arg_parser(parser)
-            engine_args = config.get("engine_args", {})
-            server_args = config.get("server_args", {})
-            args = [
-                *[
-                    f"--{key.replace('_', '-')}{f'={item}' if item is not True else ''}"
-                    for args in [engine_args, server_args]
-                    for key, value in args.items()
-                    for item in (value if isinstance(value, list) else [value])
-                    if item is not None
-                ],
-            ]
-            namespace = parser.parse_args(args)
-            assert namespace is not None
             validate_parsed_serve_args(namespace)
-            return api_server.run_server(
-                namespace,
-                log_config=get_uvicorn_logging_config(config.get("log_file", "vllm.log")),
-            )
+            return api_server.run_server(namespace)
 
+        asyncio.run(openai_server_task(engine, namespace))
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
