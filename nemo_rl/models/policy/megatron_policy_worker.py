@@ -551,6 +551,12 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        if self.cfg["megatron_cfg"].get("tp_comm_bootstrap_backend", None):
+            model_cfg.tp_comm_bootstrap_backend = self.cfg["megatron_cfg"][
+                "tp_comm_bootstrap_backend"
+            ]
+        if self.cfg["megatron_cfg"].get("tp_comm_overlap", None):
+            model_cfg.tp_comm_overlap = self.cfg["megatron_cfg"]["tp_comm_overlap"]
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,

@@ -93,6 +93,13 @@ class MegatronConfig(TypedDict):
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
+    moe_router_dtype: str
+    moe_router_load_balancing_type: str
+    moe_router_bias_update_rate: float
+
+    apply_rope_fusion: NotRequired[bool]
+    tp_comm_bootstrap_backend: NotRequired[str]
+    tp_comm_overlap: NotRequired[bool]
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]
