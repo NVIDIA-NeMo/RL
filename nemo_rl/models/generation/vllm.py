@@ -365,6 +365,7 @@ class VllmGenerationWorker:
             # Grab the engine args
             self.llm_async_engine_args_dict = llm_kwargs
             self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**self.llm_async_engine_args_dict))
+            self._setup_vllm_server()
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
