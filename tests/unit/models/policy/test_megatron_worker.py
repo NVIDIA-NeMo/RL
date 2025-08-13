@@ -675,7 +675,20 @@ def logprob_setup(request):
         (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
     ],
     indirect=True,
-    ids=["2gpu_dp2_llama", "2gpu_tp2_llama", "2gpu_dp2_qwen2", "2gpu_tp2_qwen2"],
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
     """Test Megatron policy logprob computation."""
