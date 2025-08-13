@@ -1051,42 +1051,46 @@ class DTensorPolicyWorker:
                                 input_ids,
                                 chunk_size=logprob_chunk_size,
                             )
-                        elif logprob_chunk_size is not None:
-                            logits_seq_len = int(logits.shape[1])
-                            num_chunks = (
-                                logits_seq_len + logprob_chunk_size - 1
-                            ) // logprob_chunk_size
-                            chunked_log_probs = []
-                            for chunk_idx in range(num_chunks):
-                                chunk_start = chunk_idx * logprob_chunk_size
-                                chunk_end = min(
-                                    logits_seq_len, (chunk_idx + 1) * logprob_chunk_size
-                                )
-                                chunk_logits = logits[:, chunk_start:chunk_end, :].to(
-                                    torch.float32
-                                )
-                                log_probs = torch.nn.functional.log_softmax(
-                                    chunk_logits, dim=-1
-                                )
-                                chunked_log_probs.append(log_probs)
-                            log_probs = torch.cat(chunked_log_probs, dim=1)
-                            del chunked_log_probs
                         else:
-                            logits = logits.to(torch.float32)
-                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                        # Extract logprobs for each token in the sequence by gathering the logprob
-                        # corresponding to the next token at each position
-                        # Input shapes:
-                        #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
-                        #   token_ids: [batch_size, sequence_length] - actual tokens
-                        # Output shape: [batch_size, sequence_length] - logprob of each token given previous
-                        # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
-                        next_tokens = input_ids[:, 1:]
-                        log_probs = log_probs[:, :-1]
-                        token_logprobs = log_probs.gather(
-                            dim=-1, index=next_tokens.unsqueeze(-1)
-                        ).squeeze(-1)
-                        del log_probs
+                            if logprob_chunk_size is not None:
+                                logits_seq_len = int(logits.shape[1])
+                                num_chunks = (
+                                    logits_seq_len + logprob_chunk_size - 1
+                                ) // logprob_chunk_size
+                                chunked_log_probs = []
+                                for chunk_idx in range(num_chunks):
+                                    chunk_start = chunk_idx * logprob_chunk_size
+                                    chunk_end = min(
+                                        logits_seq_len,
+                                        (chunk_idx + 1) * logprob_chunk_size,
+                                    )
+                                    chunk_logits = logits[
+                                        :, chunk_start:chunk_end, :
+                                    ].to(torch.float32)
+                                    log_probs = torch.nn.functional.log_softmax(
+                                        chunk_logits, dim=-1
+                                    )
+                                    chunked_log_probs.append(log_probs)
+                                log_probs = torch.cat(chunked_log_probs, dim=1)
+                                del chunked_log_probs
+                            else:
+                                logits = logits.to(torch.float32)
+                                log_probs = torch.nn.functional.log_softmax(
+                                    logits, dim=-1
+                                )
+                            # Extract logprobs for each token in the sequence by gathering the logprob
+                            # corresponding to the next token at each position
+                            # Input shapes:
+                            #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
+                            #   token_ids: [batch_size, sequence_length] - actual tokens
+                            # Output shape: [batch_size, sequence_length] - logprob of each token given previous
+                            # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
+                            next_tokens = input_ids[:, 1:]
+                            log_probs = log_probs[:, :-1]
+                            token_logprobs = log_probs.gather(
+                                dim=-1, index=next_tokens.unsqueeze(-1)
+                            ).squeeze(-1)
+                            del log_probs
 
                 del outputs, logits
 
