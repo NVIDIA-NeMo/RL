@@ -20,6 +20,7 @@ import sys
 import uuid
 from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     NotRequired,
@@ -28,6 +29,9 @@ from typing import (
     Union,
     cast,
 )
+
+if TYPE_CHECKING:
+    from vllm.sampling_params import GuidedDecodingParams
 
 import numpy as np
 import ray
@@ -49,6 +53,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GuidedDecodingConfig,
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
@@ -84,6 +89,31 @@ class VllmGenerationWorker:
         This makes it easier to identify which worker is producing specific log messages.
         """
         return f"{self.__class__.__name__}"
+
+    def _get_vllm_guided_decoding_params(
+        self, guided_decoding_config: Optional[GuidedDecodingConfig]
+    ) -> Optional["GuidedDecodingParams"]:
+        """Get the guided decoding parameters for vLLM."""
+        from vllm.sampling_params import GuidedDecodingParams
+
+        if guided_decoding_config is None:
+            return None
+
+        match guided_decoding_config["mode"]:
+            case "json":
+                return GuidedDecodingParams(json=guided_decoding_config["json"])
+            case "regex":
+                return GuidedDecodingParams(regex=guided_decoding_config["regex"])
+            case "choice":
+                return GuidedDecodingParams(choice=guided_decoding_config["choice"])
+            case "grammar":
+                return GuidedDecodingParams(grammar=guided_decoding_config["grammar"])
+            case "json_object":
+                return GuidedDecodingParams(json_object=True)
+            case _:
+                raise ValueError(
+                    f"Unsupported guided decoding mode: {guided_decoding_config['mode']}"
+                )
 
     @staticmethod
     def configure_worker(
@@ -428,6 +458,7 @@ class VllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        guided_decoding_params: Optional["GuidedDecodingParams"] = None,
     ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
@@ -447,17 +478,22 @@ class VllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            guided_decoding=guided_decoding_params,
         )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
@@ -485,6 +521,9 @@ class VllmGenerationWorker:
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            guided_decoding_params=self._get_vllm_guided_decoding_params(
+                guided_decoding_config
+            ),
         )
 
         # verify inputs have correct padding
@@ -592,12 +631,14 @@ class VllmGenerationWorker:
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
+            guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
@@ -694,6 +735,9 @@ class VllmGenerationWorker:
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
                 max_new_tokens=allowed_new_tokens,
+                guided_decoding=self._get_vllm_guided_decoding_params(
+                    guided_decoding_config
+                ),
             )
 
             request_id = str(uuid.uuid4())
@@ -815,7 +859,10 @@ class VllmGenerationWorker:
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_params: Optional["GuidedDecodingParams"] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate text responses using vLLM generation.
 
@@ -1628,7 +1675,10 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM."""
         assert isinstance(data, BatchedDataDict), (
@@ -1649,7 +1699,10 @@ class VllmGeneration(GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
+            common_kwargs={
+                "greedy": greedy,
+                "guided_decoding_config": guided_decoding_config,
+            },
         )
 
         # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
