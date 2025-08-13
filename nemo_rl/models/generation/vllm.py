@@ -362,7 +362,9 @@ class VllmGenerationWorker:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
 
-            self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+            # Grab the engine args
+            self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+            self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
@@ -371,28 +373,31 @@ class VllmGenerationWorker:
         self.vllm_device_ids = None
 
     def _setup_vllm_server(self) -> None:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse, StreamingResponse
 
-        from vllm.entrypoints.openai.api_server import OpenAIServingChat, EngineClient
+        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
+        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
 
         app = FastAPI()
 
-        engine_client: EngineClient,
-        vllm_config: VllmConfig,
-        args: Namespace,openai_serving_models = OpenAIServingModels(
+        engine_client = self.llm
+        model_config = self.llm_async_engine_args.create_model_config()
+        base_model_paths = [BaseModelPath(name=model_config.model, model_path=model_config.model)]
+
+        openai_serving_models = OpenAIServingModels(
             engine_client=engine_client,
             model_config=model_config,
             base_model_paths=base_model_paths,
-            lora_modules=lora_modules,
+            lora_modules=None,
         )
         openai_serving_chat = OpenAIServingChat(
             engine_client,
             model_config,
-            state.openai_serving_models,
+            openai_serving_models,
             response_role="assistant",
             request_logger=None,
-            chat_template=resolved_chat_template,
+            chat_template=None,
             chat_template_content_format="auto",
             return_tokens_as_token_ids=True,
         )
