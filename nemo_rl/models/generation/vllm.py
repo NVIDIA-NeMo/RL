@@ -366,6 +366,66 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
+        from fastapi import FastAPI
+        engine_client: EngineClient,
+        vllm_config: VllmConfig,
+        state: State,
+        args: Namespace,
+        state.openai_serving_chat = OpenAIServingChat(
+        engine_client,
+        model_config,
+        state.openai_serving_models,
+        args.response_role,
+        request_logger=request_logger,
+        chat_template=resolved_chat_template,
+        chat_template_content_format=args.chat_template_content_format,
+        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+        enable_auto_tools=args.enable_auto_tool_choice,
+        exclude_tools_when_tool_choice_none=args.
+        exclude_tools_when_tool_choice_none,
+        tool_parser=args.tool_call_parser,
+        reasoning_parser=args.reasoning_parser,
+        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+        enable_force_include_usage=args.enable_force_include_usage,
+    ) if "generate" in supported_tasks else None
+        @router.post("/v1/chat/completions",
+             dependencies=[Depends(validate_json_request)],
+             responses={
+                 HTTPStatus.OK.value: {
+                     "content": {
+                         "text/event-stream": {}
+                     }
+                 },
+                 HTTPStatus.BAD_REQUEST.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.NOT_FOUND.value: {
+                     "model": ErrorResponse
+                 },
+                 HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+                     "model": ErrorResponse
+                 }
+             })
+        @with_cancellation
+        @load_aware_call
+        async def create_chat_completion(request: ChatCompletionRequest,
+                                        raw_request: Request):
+            handler = chat(raw_request)
+            if handler is None:
+                return base(raw_request).create_error_response(
+                    message="The model does not support Chat Completions API")
+
+            generator = await handler.create_chat_completion(request, raw_request)
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(),
+                                    status_code=generator.code)
+
+            elif isinstance(generator, ChatCompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
