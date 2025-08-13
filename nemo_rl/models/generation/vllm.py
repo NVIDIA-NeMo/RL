@@ -366,7 +366,13 @@ class VllmGenerationWorker:
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
+        # will be initialized in post_init
+        # used in update_weights_from_ipc_handles
+        self.vllm_device_ids = None
+
+    def _setup_vllm_server(self) -> None:
         from fastapi import FastAPI
+        from vllm.entrypoints.openai.api_server import OpenAIServingChat, EngineClient
         engine_client: EngineClient,
         vllm_config: VllmConfig,
         state: State,
@@ -425,10 +431,6 @@ class VllmGenerationWorker:
                 return JSONResponse(content=generator.model_dump())
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
-
-        # will be initialized in post_init
-        # used in update_weights_from_ipc_handles
-        self.vllm_device_ids = None
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
