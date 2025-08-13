@@ -65,11 +65,18 @@ source $VENV_DIR/bin/activate
 echo "Virtual environment activated."
 echo
 
-# Step 2: Install dependencies from requirements.txt using uv
-echo "[2/4] Installing Python dependencies with uv..."
-uv pip install -r notebooks/requirements.txt
+# Step 2: Prepare environment from uv.lock (+ vllm extra)
+echo "[2/4] Preparing Python environment from uv.lock (+ vllm extra)..."
+VIRTUAL_ENV="$VENV_DIR" uv sync --locked --extra vllm --no-install-project
 if [ $? -ne 0 ]; then
-    echo "Error: Failed to install dependencies. Exiting."
+    echo "Error: Failed to sync dependencies from uv.lock. Exiting."
+    exit 1
+fi
+
+# Notebook-only deps not in uv.lock
+VIRTUAL_ENV="$VENV_DIR" uv pip install jupyterlab ipykernel sentencepiece pandas matplotlib
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to install notebook dependencies. Exiting."
     exit 1
 fi
 echo "Dependencies installed successfully."
