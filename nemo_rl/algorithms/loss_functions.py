@@ -267,7 +267,7 @@ class ClippedPGLossFn(LossFunction):
             # Broadcast to token dimension so we can reuse existing reduction
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
         else:
-            # Token-level correction (original GRPO implementation)
+            # Token-level correction
             actor_importance_weights_expanded = torch.exp(
                 prev_logprobs - generation_logprobs
             )
