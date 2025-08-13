@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .config import VllmConfig
-from .vllm_generation import VllmGeneration
-from .vllm_worker import VllmGenerationWorker
-from .vllm_worker_async import VllmAsyncGenerationWorker
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
+from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorker
 
 __all__ = [
     "VllmConfig",
