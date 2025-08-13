@@ -384,7 +384,7 @@ class VllmGenerationWorker:
         from openai import AsyncOpenAI
 
         from vllm.engine.protocol import EngineClient
-        from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
+        from vllm.entrypoints.openai.cli_args import FlexibleArgumentParser, validate_parsed_serve_args, make_arg_parser
 
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 
@@ -455,7 +455,12 @@ class VllmGenerationWorker:
         def _openai_server_coroutine(namespace: Namespace) -> Coroutine[Any, Any, None]:
             from vllm.entrypoints.openai import api_server
 
+            parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
+            parser = make_arg_parser(parser)
+            namespace = parser.parse_args(namespace)
+
             validate_parsed_serve_args(namespace)
+
             return api_server.run_server(namespace)
 
         import threading
