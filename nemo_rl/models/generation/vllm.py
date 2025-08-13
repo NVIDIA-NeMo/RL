@@ -363,8 +363,8 @@ class VllmGenerationWorker:
             from vllm.v1.engine.async_llm import AsyncLLM
 
             # Grab the engine args
-            self.llm_async_engine_args_dict = llm_kwargs
-            self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**self.llm_async_engine_args_dict))
+            self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+            self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
             self.server_thread = self._setup_vllm_server()
         else:
             self.llm = vllm.LLM(**llm_kwargs)
@@ -374,99 +374,64 @@ class VllmGenerationWorker:
         self.vllm_device_ids = None
 
     def _setup_vllm_server(self) -> None:
-        print("hit inside setup vllm server")
-        from typing import Any, AsyncIterator, Coroutine
+        import threading
 
-        from contextlib import asynccontextmanager
+        from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse, StreamingResponse
 
-        from argparse import Namespace
+        import uvicorn
 
-        from openai import AsyncOpenAI
-
-        from vllm.engine.protocol import EngineClient
-        from vllm.entrypoints.openai.cli_args import FlexibleArgumentParser, validate_parsed_serve_args, make_arg_parser
+        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
+        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
 
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 
-        engine: EngineClient = self.llm
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
-        config = Namespace(**(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""}))
         print(f"Starting server on http://{node_ip}:{config.port}/v1")
 
-        def openai_server_wrapper(engine: EngineClient, config: Namespace):
-            asyncio.run(openai_server_task(engine, config))
+        app = FastAPI()
 
-        async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
-            """
-            Starts an asyncio task that runs an OpenAI-compatible server.
+        engine_client = self.llm
+        model_config = self.llm_async_engine_args.create_model_config()
+        base_model_paths = [BaseModelPath(name=model_config.model, model_path=model_config.model)]
 
-            Args:
-                engine: The vLLM engine client.
-                config: The configuration for the OpenAI-compatible server.
+        openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,
+            model_config=model_config,
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
+        openai_serving_chat = OpenAIServingChat(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+            return_tokens_as_token_ids=True,
+        )
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+            generator = await openai_serving_chat.create_chat_completion(request, raw_request)
 
-            Returns:
-                A running asyncio task for the OpenAI-compatible server. Cancel the task
-                to stop the server.
-            """
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(),
+                                    status_code=generator.code)
 
-            from vllm.entrypoints.openai import api_server
+            elif isinstance(generator, ChatCompletionResponse):
+                return JSONResponse(content=generator.model_dump())
 
-            @asynccontextmanager
-            async def build_async_engine_client(*args: Any, **kwargs: Any) -> AsyncIterator[EngineClient]:
-                print("hit inside mock build_async_engine_client")
-                yield engine
+            return StreamingResponse(content=generator, media_type="text/event-stream")
 
-            api_server.build_async_engine_client = build_async_engine_client
-            api_server.signal.signal = lambda *args, **kwargs: None
-            openai_server_task = asyncio.create_task(_openai_server_coroutine(config))
-            client = AsyncOpenAI(
-                api_key=config.api_key,
-                base_url=f"http://{config.host}:{config.port}/v1",
-            )
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=free_port,
+        )
+        server = uvicorn.Server(config=config)
 
-            async def test_client() -> None:
-                while True:
-                    try:
-                        async for _ in client.models.list():
-                            return
-                    except:  # noqa: E722
-                        await asyncio.sleep(0.1)
-
-            test_client_task = asyncio.create_task(test_client())
-            try:
-                timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
-                done, _ = await asyncio.wait(
-                    [openai_server_task, test_client_task],
-                    timeout=timeout,
-                    return_when="FIRST_COMPLETED",
-                )
-                if not done:
-                    raise TimeoutError(
-                        f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
-                    )
-                for task in done:
-                    task.result()
-
-                return openai_server_task
-            except Exception:
-                openai_server_task.cancel()
-                test_client_task.cancel()
-                raise
-
-        def _openai_server_coroutine(namespace: Namespace) -> Coroutine[Any, Any, None]:
-            from vllm.entrypoints.openai import api_server
-
-            parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
-            parser = make_arg_parser(parser)
-            namespace, _ = parser.parse_known_args(namespace=namespace)
-
-            validate_parsed_serve_args(namespace)
-
-            return api_server.run_server(namespace)
-
-        import threading
-
-        thread = threading.Thread(target=openai_server_wrapper, kwargs={"engine": engine, "config": config}, daemon=True)
+        thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread
