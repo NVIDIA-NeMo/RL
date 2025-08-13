@@ -389,7 +389,7 @@ class VllmGenerationWorker:
 
         engine: EngineClient = self.llm
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
-        config = Namespace(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""})
+        config = Namespace(**(self.llm_async_engine_args_dict | {"host": "0.0.0.0", "port": free_port, "api_key": ""}))
         print(f"Starting server on http://{node_ip}:{config.port}/v1")
 
         async def openai_server_task(engine: EngineClient, config: Namespace) -> asyncio.Task[None]:
