@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from collections import defaultdict
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 try:
     import vllm  # noqa: F401
@@ -24,8 +25,10 @@ except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
         "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-        "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+        "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
+        "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
 
 class VllmInternalWorkerExtension:
     def init_collective(
@@ -37,10 +40,6 @@ class VllmInternalWorkerExtension:
 
         local_rank = torch.distributed.get_rank()
         rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
-
-        # Temporary fix for vllm==0.9.0 which overrides the NCCL_CUMEM_ENABLE to 0 and causes
-        # https://github.com/NVIDIA-NeMo/RL/issues/564. This can be removed after it is upgraded to vllm>=0.9.1rc1.
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size
@@ -65,10 +64,13 @@ class VllmInternalWorkerExtension:
 
         MegatronPolicyWorker:
             colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype, numel)}
-            non-colocated inference: not implemented yet
+            non-colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_global_ipc_handles"
+    )
     def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
         """Update weights from global IPC handles.
 
@@ -82,6 +84,9 @@ class VllmInternalWorkerExtension:
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
         return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_local_ipc_handles"
+    )
     def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
         """Update weights from local IPC handles.
 
@@ -158,6 +163,9 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_collective"
+    )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
@@ -177,3 +185,11 @@ class VllmInternalWorkerExtension:
             return False
 
         return True
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        torch.cuda.profiler.stop()

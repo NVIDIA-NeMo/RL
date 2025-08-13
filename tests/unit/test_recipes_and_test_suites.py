@@ -283,6 +283,8 @@ def test_all_recipes_can_merge_configs_with_base_config(
 ):
     from omegaconf import OmegaConf
 
+    from nemo_rl.utils.config import load_config
+
     base_yaml = os.path.join(project_root, algo_base_yaml)
     base_config = OmegaConf.load(base_yaml)
     # Would result in an error if we couldn't merge our config with the recipe's config
@@ -293,7 +295,7 @@ def test_all_recipes_can_merge_configs_with_base_config(
             #  test_all_recipes_start_with_algo_hyphen()
             continue
         recipe_yaml_path = os.path.join(recipes_dir, recipe_yaml)
-        recipe_config = OmegaConf.load(recipe_yaml_path)
+        recipe_config = load_config(recipe_yaml_path)
         OmegaConf.set_struct(recipe_config, True)
         # This will raise a error if the config can't be merged
         print(f"Merging {recipe_yaml} with {base_yaml}")

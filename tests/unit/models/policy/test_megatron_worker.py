@@ -133,14 +133,6 @@ def create_megatron_test_config(
     }
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-    yield
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 @pytest.fixture(scope="function")
 def gc_collect():
     """Helper function to force garbage collection after a test"""
@@ -386,6 +378,26 @@ def test_megatron_policy_training(training_setup):
 
     # Verify loss changed between iterations (model parameters were updated)
     assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert "theoretical_tflops" in results and isinstance(
+                results["theoretical_tflops"], (int, float)
+            ), "training backend should report theoretical_tflops"
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
 
 
 @pytest.fixture

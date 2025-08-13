@@ -124,6 +124,7 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -378,6 +379,15 @@ class MegatronPolicyWorker:
         pre_init_communication_queue: Queue,
         **kwargs: Any,
     ):
+        self.is_generation_colocated = None
+        if "generation" in config and config["generation"] is not None:
+            self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
+
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        if not self.is_generation_colocated:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+
         self.cfg = config
         dtype_map = {
             "float32": torch.float32,
@@ -416,7 +426,8 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        if get_rank_safe() == 0:
+        self.rank = get_rank_safe()
+        if self.rank == 0:
             if pt_checkpoint_exists:
                 print(
                     f"Checkpoint already exists at {pretrained_path}. Skipping import."
@@ -725,6 +736,18 @@ class MegatronPolicyWorker:
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
+    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        if self.rank == 0:
+            pg = StatelessProcessGroup.create(
+                host=ip, port=port, rank=0, world_size=world_size
+            )
+            device = torch.cuda.current_device()
+            self.model_update_group = PyNcclCommunicator(pg, device=device)
+
     def is_alive(self):
         return True
 
@@ -743,6 +766,7 @@ class MegatronPolicyWorker:
         assert isinstance(self.model, DistributedDataParallel)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
 
+    @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict,
@@ -979,6 +1003,8 @@ class MegatronPolicyWorker:
         metrics = {
             "global_loss": global_loss.cpu(),
             "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
             "grad_norm": torch.tensor(
                 mb_metrics["grad_norm"][-1]
@@ -986,6 +1012,7 @@ class MegatronPolicyWorker:
         }
         return metrics
 
+    @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
         self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -1216,6 +1243,7 @@ class MegatronPolicyWorker:
                     self.enable_forward_pre_hook()
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug
+    @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
@@ -1238,6 +1266,7 @@ class MegatronPolicyWorker:
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
+    @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
         self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1381,6 +1410,7 @@ class MegatronPolicyWorker:
         return get_device_uuid(device_idx)
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         # Get parameter info for refit
         # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
@@ -1407,14 +1437,15 @@ class MegatronPolicyWorker:
             )
             # collect tensor metadata
             for name, tensor in gathered_hf_params.items():
-                refit_param_info_hf[name] = (
-                    tensor.shape,
-                    tensor.dtype,
-                    tensor.numel(),
-                )
+                if self.is_generation_colocated:
+                    metadata = (tensor.shape, tensor.dtype, tensor.numel())
+                else:
+                    metadata = (tensor.shape, tensor.dtype)
+                refit_param_info_hf[name] = metadata
 
         return refit_param_info_hf
 
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_weights_for_ipc")
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
 
@@ -1436,6 +1467,7 @@ class MegatronPolicyWorker:
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/get_weights_ipc_handles")
     def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
@@ -1524,6 +1556,25 @@ class MegatronPolicyWorker:
 
         return {device_uuid: serialized}
 
+    @torch.no_grad()
+    def broadcast_weights_for_collective(self) -> None:
+        """Broadcast the weights for collective communication."""
+        for key, _ in self.refit_param_info_mcore:
+            # gather megatron params
+            gathered_megatron_params = gather_params(
+                self.model,
+                [key],
+                key_to_global_keys=self.local_key_to_global_keys,
+            )
+            # convert to hf params
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            # broadcast from train rank0 worker to inference workers
+            if self.rank == 0:
+                for _, tensor in gathered_hf_params.items():
+                    self.model_update_group.broadcast(tensor, src=0)
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -1549,6 +1600,7 @@ class MegatronPolicyWorker:
 
         torch.cuda.empty_cache()
 
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
         no_grad = torch.no_grad()
@@ -1587,6 +1639,7 @@ class MegatronPolicyWorker:
         )
         no_grad.__exit__(None, None, None)
 
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
         no_grad = torch.no_grad()
         no_grad.__enter__()
