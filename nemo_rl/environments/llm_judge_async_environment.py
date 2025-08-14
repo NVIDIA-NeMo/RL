@@ -189,7 +189,7 @@ class AsyncVLLMWorker:
             reference=reference,
             criteria=criteria,
         )
-        logging.info(f"Prompt: {prompt}")
+        # logging.info(f"Prompt: {prompt}")
 
         sampling_params = self.SamplingParams(
             **sampling_params_dict, guided_decoding=self.guided_decoding_params
@@ -202,27 +202,35 @@ class AsyncVLLMWorker:
 
         score = 0.0
         if final_output and not final_output.finished:
-            logging.info(
-                f"Request {request_id} did not finish within the token limit, but we will score it anyway. Output: {final_output}"
-            )
+            ...
+            # logging.info(
+            #     f"Request {request_id} did not finish within the token limit, but we will score it anyway. Output: {final_output}"
+            # )
         elif final_output:
             try:
                 output_text = json.loads(final_output.outputs[0].text)
                 score = output_text["correct"].lower() == "yes"
-                logging.info(
-                    f"Parsed for request {request_id}. Score: {score}. Output: '{final_output.outputs[0].text}'"
-                )
-
+                ...
+                # logging.info(
+                #     f"Parsed for request {request_id}. Score: {score}. Output: '{final_output.outputs[0].text}'"
+                # )
             except:
                 score = 0.0
-                logging.info(
-                    f"cannot parse {request_id}. Score: {score}. Output: '{final_output.outputs[0].text}'"
-                )
+                # logging.info(
+                #     f"cannot parse {request_id}. Score: {score}. Output: '{final_output.outputs[0].text}'"
+                # )
 
         else:
             logging.warning(f"No output received from LLM for request {request_id}.")
 
-        return request_id, score
+        log_dict = {
+            "prompt": prompt,
+            "request_id": request_id,
+            "score": score,
+            "output": final_output.outputs[0].text,
+        }
+
+        return request_id, score, log_dict
 
 
 @ray.remote
@@ -236,6 +244,9 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
         self.num_workers = cfg["num_workers"]
 
         tensor_parallel_size = cfg.get("tensor_parallel_size", 1)
+
+        self.log_path = os.path.join(cfg["log_path"], "judge_save.jsonl")
+        self.step_counter = 0
 
         # Only create a RayVirtualCluster (and thereby reserve GPU bundles)
         # if we actually need single-GPU bundles (tensor_parallel_size == 1).
@@ -383,10 +394,17 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
 
         self._request_counter += 1  # Increment for the next step call
 
-        results_tuples: List[Tuple[str, float]] = ray.get(futures)
+        results_tuples: List[Tuple[str, float, dict]] = ray.get(futures)
 
         # Assuming ray.get(futures) preserves the order, which it does.
-        scores = [score for _, score in results_tuples]
+        scores = [score for _, score, _ in results_tuples]
+        log_dicts = [log_dict for _, _, log_dict in results_tuples]
+
+        with open(self.log_path, "a") as f:
+            for log_dict in log_dicts:
+                f.write(
+                    json.dumps(log_dict | {"step_counter": self.step_counter}) + "\n"
+                )
 
         observations = []
         for score, single_meta in zip(scores, metadata):
@@ -402,6 +420,7 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
 
         next_stop_strings = [None] * len(message_log_batch)
+        self.step_counter += 1
 
         return EnvironmentReturn(
             observations=observations,

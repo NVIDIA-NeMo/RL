@@ -151,6 +151,7 @@ env:
     max_tokens: 512  # Max tokens for the judge's evaluation
     stop: null # Stop strings for the judge's evaluation
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
+    log_path: ${logger.log_dir}
 
 logger:
   log_dir: "logs"  # Base directory for all logs
