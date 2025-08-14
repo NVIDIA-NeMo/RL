@@ -128,6 +128,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    # TODO @yukih: fix the return type
     def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
         pass
 

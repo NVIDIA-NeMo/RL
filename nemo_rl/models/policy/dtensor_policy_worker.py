@@ -1273,10 +1273,11 @@ class DTensorPolicyWorker:
             handle = get_handle_from_tensor(p)
             all_handles.append((key, handle))
 
-        # (pack_tensor_for_ipc: bool, handles: list)
-        serialized = (False, all_handles)
+        # this False means that we do not pack the tensors for IPC, which is not implemented for dtensor
+        # it is used to keep the same interface as megatron_policy_worker.py
+        metadata = (False,)
 
-        return {device_uuid: serialized}
+        return {device_uuid: all_handles}, metadata
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:

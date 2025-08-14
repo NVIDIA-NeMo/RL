@@ -71,7 +71,9 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_global_ipc_handles"
     )
-    def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
+    def update_weights_from_global_ipc_handles(
+        self, global_device_ipc_handles, metadata
+    ):
         """Update weights from global IPC handles.
 
         Args:
@@ -82,12 +84,14 @@ class VllmInternalWorkerExtension:
         """
         device_uuid = self.report_device_id()
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
-        return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
+        return self.update_weights_from_local_ipc_handles(
+            local_device_ipc_handles, metadata
+        )
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_local_ipc_handles"
     )
-    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
+    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles, metadata):
         """Update weights from local IPC handles.
 
         Args:
@@ -97,11 +101,9 @@ class VllmInternalWorkerExtension:
             bool: True if weights were successfully updated.
         """
         try:
-            is_tensor_packed = local_device_ipc_handles[0]
+            is_tensor_packed = metadata[0]
             if is_tensor_packed:
-                _, all_handles, list_keys = local_device_ipc_handles
-            else:
-                _, name_and_handle_list = local_device_ipc_handles
+                list_keys = metadata[1]
 
             device_id = self.device.index
             weights = []
@@ -114,12 +116,11 @@ class VllmInternalWorkerExtension:
 
                 # Extract packed tensor from IPC handle
                 dtype_to_packed_tensor = {}
-                for dtype, tensor_handle in all_handles:
-                    func = rebuild_cuda_tensor
+                for dtype, tensor_handle in local_device_ipc_handles:
                     args = tensor_handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
-                    tensor = func(*list_args)
+                    tensor = rebuild_cuda_tensor(*list_args)
                     dtype_to_packed_tensor[dtype] = tensor
 
                 weights = []
@@ -146,12 +147,11 @@ class VllmInternalWorkerExtension:
                 )
             else:
                 # Process each handle to get the tensor
-                for name, handle in name_and_handle_list:
-                    func = rebuild_cuda_tensor
+                for name, handle in local_device_ipc_handles:
                     args = handle[0]
                     list_args = list(args)
                     list_args[6] = device_id
-                    tensor = func(*list_args)
+                    tensor = rebuild_cuda_tensor(*list_args)
                     weights.append((name, tensor))
 
             # Load weights into the model

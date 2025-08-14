@@ -554,10 +554,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # Combine all worker handles into a single dictionary
         all_handles = {}
-        for handle in worker_handles:
+        for handle, _ in worker_handles:
             all_handles.update(handle)
 
-        return all_handles
+        # Get the metadata from the first worker
+        # All workers have the same metadata
+        metadata = worker_handles[0][1]
+
+        return all_handles, metadata
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""

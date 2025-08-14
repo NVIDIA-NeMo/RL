@@ -1486,9 +1486,13 @@ class MegatronPolicyWorker:
             key_to_global_keys=self.local_key_to_global_keys,
         )
 
-        gathered_hf_params = self.megatron_to_hf_converter.convert(
+        unsorted_gathered_hf_params = self.megatron_to_hf_converter.convert(
             gathered_megatron_params, self.model.config
         )
+        sorted_keys = sorted(unsorted_gathered_hf_params.keys())
+        gathered_hf_params = {
+            key: unsorted_gathered_hf_params[key] for key in sorted_keys
+        }
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
@@ -1541,20 +1545,17 @@ class MegatronPolicyWorker:
             # Store reference to prevent garbage collection
             self._held_gather_buffer = packed_tensors
 
-            serialized = (
-                pack_tensor_for_ipc,
-                all_handles,
-                tuple(gathered_hf_params.keys()),
-            )
+            # Save the keys of the tensors for recover packed tensors
+            metadata = (True, tuple(gathered_hf_params.keys()))
         else:
             all_handles = []
             for key, tensor in gathered_hf_params.items():
                 handle = get_handle_from_tensor(tensor)
                 all_handles.append((key, handle))
             self._held_gather_buffer = gathered_hf_params
-            serialized = (False, all_handles)
+            metadata = (False,)
 
-        return {device_uuid: serialized}
+        return {device_uuid: all_handles}, metadata
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
