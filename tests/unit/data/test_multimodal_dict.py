@@ -14,6 +14,8 @@
 import pytest
 import torch
 
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -101,6 +103,54 @@ def test_truncate_tensors_with_packed_data():
     # Verify image features were not affected (assumed safe as per comment in truncate_tensors)
     assert isinstance(batch["image_features"], PackedMultimodalData)
     assert batch["image_features"].as_tensor().shape == (5, 6, 128, 4, 2, 2)
+
+def test_multiturn_rollout_with_packed_data():
+    '''
+    test multiturn conversations
+    '''
+    message_log_1 = [
+        {
+            'role': 'user',
+            'token_ids': torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
+            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+        },
+        {
+            'role': 'assistant',
+            'token_ids': torch.tensor([9, 10, 11, 12, 13, 14, 15, 16]),
+        },
+        {
+            'role': 'user',
+            'token_ids': torch.tensor([17, 18, 19, 20, 21, 22, 23, 24]),
+            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+        }
+    ]
+    message_log_2 = [
+        {
+            'role': 'user',
+            'token_ids': torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
+            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+        },
+        {
+            'role': 'assistant',
+            'token_ids': torch.tensor([9, 10, 11, 12, 13, 14, 15, 16]),
+        },
+        {
+            'role': 'user',
+            'token_ids': torch.tensor([17, 18, 19, 20, 21, 22, 23, 24]),
+        }
+    ]
+    # data spec
+    message_logs = BatchedDataDict({
+        'message_log': [message_log_1, message_log_2],
+    })
+    flat_message, input_lengths = batched_message_log_to_flat_message(
+        message_logs["message_log"],
+        pad_value_dict={
+            "token_ids": -1,
+        },
+    )
+    shards = flat_message.shard_by_batch_size(shards=2)
+
 
 def test_sequence_packing_with_packed_data():
     """Test sequence packing with packed multimodal data."""
