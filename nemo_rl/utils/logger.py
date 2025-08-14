@@ -333,7 +333,7 @@ class WandbLogger(LoggerInterface):
 
 
 class SwanlabLogger(LoggerInterface):
-    """Weights & Biases logger backend."""
+    """SwanLab logger backend."""
 
     def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
         self.run = swanlab.init(**cfg, logdir=log_dir)
