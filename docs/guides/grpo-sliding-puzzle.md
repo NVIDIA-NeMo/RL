@@ -17,7 +17,7 @@ The sliding puzzle task serves as a simple, yet effective example, to illustrate
 
 #### 1. Install and Set Up NeMo RL with Megatron Backend (Optional)
 
-Refer to [this guide](https://github.com/NVIDIA-NeMo/RL/tree/main?tab=readme-ov-file#prerequisites) for detailed instructions on installation.
+To get started, clone and set up the NeMo RL repository by initializing submodules, installing CUDA dependencies, and configuring the environment with uv. Refer to [Prerequisites](https://github.com/NVIDIA-NeMo/RL/tree/main?tab=readme-ov-file#prerequisites) for detailed instructions on installation.
 
 #### 2. Training Run
 
