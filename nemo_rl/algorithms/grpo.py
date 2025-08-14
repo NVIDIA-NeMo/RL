@@ -600,7 +600,12 @@ def grpo_train(
                         greedy=False,
                     )
                 elif _should_use_nemo_gym(master_config):
+                    # input_ids is a tensor of shape (batch_size * num_generations, max_seq_len)
+                    # input_lengths is a tensor of shape (batch_size * num_generations,)
+                    # repeated_batch 
                     (
+                        input_ids,
+                        input_lengths,
                         repeated_batch,
                         rollout_metrics,
                     ) = run_async_nemo_gym_rollout(
