@@ -787,7 +787,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)
             elif isinstance(v, list):
-                if len(v) > 0:
+                if len(v) > 0 and isinstance(v[0], PackedMultimodalData):
                     self.data[k] = [item.to(device) for item in v]
         return self
 
