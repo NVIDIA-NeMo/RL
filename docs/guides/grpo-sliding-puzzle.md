@@ -87,7 +87,7 @@ Think carefully step-by-step before acting.
 
 ### Movement Rules
 
-1. **Valid Moves**: Only tiles adjacent to the empty space `0` can be moved
+1. **Valid Moves**: Only tiles adjacent to the empty space `0` can be moved.
 2. **Movement Direction**: Tiles slide into the empty space, not the other way around
 3. **Grid Boundaries**: Moves that would go beyond the grid are invalid
 4. **Single Tile Movement**: Each action affects only one tile at a time
