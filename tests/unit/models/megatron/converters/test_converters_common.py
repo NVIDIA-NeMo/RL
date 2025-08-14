@@ -14,6 +14,7 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from nemo_rl.models.megatron.converters.common import (
@@ -28,6 +29,9 @@ from nemo_rl.models.megatron.converters.common import (
     split_qkv_gpu,
     update_transforms_for_nemorl,
 )
+
+# Apply mcore marker to all tests in this module
+pytestmark = pytest.mark.mcore
 
 
 class TestLayerNumberFunctions:
