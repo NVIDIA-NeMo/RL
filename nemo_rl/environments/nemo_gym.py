@@ -40,8 +40,6 @@ from nemo_rl.evals import answer_parsing
 
 class MathEnvConfig(TypedDict):
     num_workers: int
-    stop_strings: Optional[list[str]]  # Default stop strings for this env
-    verifier_type: Optional[str]
 
 
 @contextlib.contextmanager
@@ -119,93 +117,6 @@ class HFVerifyWorker:
             except (Exception, TimeoutException):
                 results.append(0.0)
                 extracted_answers.append(None)
-
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
-
-
-@ray.remote  # pragma: no cover
-class MultilingualMultichoiceVerifyWorker:
-    def verify(
-        self,
-        pred_responses: list[str],
-        ground_truths: list[str],
-        return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
-        """Verify the correctness of the predicted responses against the ground truth.
-
-        Args:
-            pred_responses: list[str]. The predicted responses from the LLM.
-            ground_truths: list[str]. The ground truth responses.
-
-        Returns:
-            Union[list[float], tuple[list[float], list[str | None]]].
-            If return_extracted_answer is False, returns only the scores.
-            If return_extracted_answer is True, returns (scores, extracted_answers).
-        """
-        results = []
-        extracted_answers: list[str | None] = []
-
-        for response, ground_truth in zip(pred_responses, ground_truths):
-            response = answer_parsing.normalize_response(response)
-            extracted_answer = None
-            for answer_regex in answer_parsing.MULTILINGUAL_ANSWER_REGEXES:
-                regex = answer_parsing.MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(
-                    answer_regex
-                )
-                match = re.search(regex, response)
-                if match:
-                    extracted_answer = answer_parsing.normalize_extracted_answer(
-                        match.group(1)
-                    )
-                    break
-            score = 1.0 if extracted_answer == ground_truth else 0.0
-            results.append(score)
-            extracted_answers.append(extracted_answer)
-
-        if return_extracted_answer:
-            return results, extracted_answers
-        else:
-            return results
-
-
-@ray.remote  # pragma: no cover
-class EnglishMultichoiceVerifyWorker:
-    def verify(
-        self,
-        pred_responses: list[str],
-        ground_truths: list[str],
-        return_extracted_answer: bool = False,
-    ) -> Union[list[float], tuple[list[float], list[str | None]]]:
-        """Verify the correctness of the predicted responses against the ground truth.
-
-        Args:
-            pred_responses: list[str]. The predicted responses from the LLM.
-            ground_truths: list[str]. The ground truth responses.
-
-        Returns:
-            Union[list[float], tuple[list[float], list[str | None]]].
-            If return_extracted_answer is False, returns only the scores.
-            If return_extracted_answer is True, returns (scores, extracted_answers).
-        """
-        results = []
-        extracted_answers: list[str | None] = []
-
-        for response, ground_truth in zip(pred_responses, ground_truths):
-            ground_truth = answer_parsing.normalize_response(ground_truth)
-            response = answer_parsing.normalize_response(response)
-            extracted_answer = None
-            match = re.search(r"(?i)Answer\s*:[ \t]*([A-Z])", response)
-            if match:
-                extracted_answer = answer_parsing.normalize_extracted_answer(
-                    match.group(1)
-                )
-            score = 1.0 if extracted_answer == ground_truth else 0.0
-            results.append(score)
-            if return_extracted_answer:
-                extracted_answers.append(extracted_answer)
 
         if return_extracted_answer:
             return results, extracted_answers

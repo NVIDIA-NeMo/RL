@@ -8,6 +8,3 @@
 	url = https://github.com/terrykong/Megatron-LM.git
 	branch = sahilj/megatron-external-loss-norm
 	shallow = true
-[submodule "3rdparty/NeMo-Gym-workspace/nemo-gym"]
-	path = 3rdparty/NeMo-Gym-workspace/nemo-gym
-	url = https://gitlab-master.nvidia.com/bxyu/nemo-gym/
