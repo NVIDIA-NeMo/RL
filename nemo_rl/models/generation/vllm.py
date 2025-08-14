@@ -254,23 +254,29 @@ class VllmGenerationWorker:
                     with open(file_to_patch, "r") as f:
                         content = f.read()
 
-                    old_line = "self._init_workers_ray(placement_group)"
+                    old_lines = [
+                        "self._init_workers_ray(placement_group)",
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+                    ]
 
-                    nccl_cumem_enable = os.environ.get("NCCL_CUMEM_ENABLE", "0")
-                    nccl_nvls_enable = os.environ.get("NCCL_NVLS_ENABLE", "0")
-                    new_line = f'self._init_workers_ray(placement_group, runtime_env={{"env_vars": {{"NCCL_CUMEM_ENABLE": "{nccl_cumem_enable}", "NCCL_NVLS_ENABLE": "{nccl_nvls_enable}"}}, "py_executable": "{self.py_executable}"}})'
+                    new_lines = [
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                    ]
 
-                    if new_line in content:
+                    need_replace = False
+                    for old_line, new_line in zip(old_lines, new_lines):
+                        if new_line in content or old_line not in content:
+                            continue
+                        content = content.replace(old_line, new_line)
+                        need_replace = True
+
+                    if not need_replace:
                         return
-
-                    if old_line not in content:
-                        return
-
-                    patched_content = content.replace(old_line, new_line)
 
                     # Write back the patched content
                     with open(file_to_patch, "w") as f:
-                        f.write(patched_content)
+                        f.write(content)
 
                 except (ImportError, FileNotFoundError, PermissionError):
                     # Allow failures gracefully
