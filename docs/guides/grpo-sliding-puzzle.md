@@ -21,7 +21,7 @@ To get started, clone and set up the NeMo RL repository by initializing submodul
 
 #### 2. Train a Model
 
-Train a model to solve the sliding puzzle using the default 2×2 configuration and GRPO
+Train a model to solve the sliding puzzle using GRPO with the default 2×2 configuration.
 
 ```bash
 uv run python examples/run_grpo_sliding_puzzle.py 
