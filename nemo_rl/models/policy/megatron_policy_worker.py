@@ -133,23 +133,23 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 def broadcast_object_across_pp_ranks(obj):
     """Broadcast an object across pipeline parallel ranks.
-    
+
     This utility function handles broadcasting an object from the rank that owns it
     to all other pipeline parallel ranks. If only one rank has the object (non-None),
     it will be broadcast to all other ranks.
-    
+
     Args:
         obj: The object to broadcast. Can be None on ranks that don't own it.
-        
+
     Returns:
         The object on all ranks (either the original or the broadcast copy).
-        
+
     Raises:
         ValueError: If the object doesn't exist on any pipeline parallel rank.
     """
     pp_size = get_pipeline_model_parallel_world_size()
     pp_group = get_pipeline_model_parallel_group()
-    
+
     if pp_size == 1:
         return obj
 
@@ -1533,7 +1533,7 @@ class MegatronPolicyWorker:
                 size_in_bytes = (
                     param.element_size() * param.numel() * tp_size * ep_size * scale
                 )
-            
+
             # Broadcast size_in_bytes across pipeline parallel ranks
             return broadcast_object_across_pp_ranks(size_in_bytes)
 

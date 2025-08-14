@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Refitted Policy Comparison Script
+"""Refitted Policy Comparison Script.
 
 This script compares logprobs between a Megatron policy and a vLLM policy
 after performing model weight refitting. It demonstrates the workflow for
