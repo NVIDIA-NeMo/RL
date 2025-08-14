@@ -117,3 +117,4 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+
