@@ -361,7 +361,7 @@ class SwanlabLogger(LoggerInterface):
         prefix: Optional[str] = "",
         step_metric: Optional[str] = None,
     ) -> None:
-        """Log metrics to wandb.
+        """Log metrics to swanlab.
 
         Args:
             metrics: Dict of metrics to log
