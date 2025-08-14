@@ -108,33 +108,49 @@ echo
 
 # Step 4: Prepare and start Jupyter Lab
 echo "Starting Jupyter Lab server..."
-PORT=$(shuf -i 8000-9999 -n 1)
+REQUESTED_PORT=$(shuf -i 8000-9999 -n 1)
 TOKEN=$(openssl rand -hex 16)
 COMPUTE_NODE=$(hostname)
 
-echo
-echo "==================== CONNECTION INSTRUCTIONS ===================="
-echo
-echo "----------[ 1. LOCAL TERMINAL: Create SSH Tunnel ]----------"
-echo "Run this command on your LOCAL machine. It will seem to hang, which is normal."
-echo
-echo "   ssh -N -L ${PORT}:${COMPUTE_NODE}:${PORT} ${USER}@your_cluster_login_node"
-echo
-echo "   (Replace 'your_cluster_login_node' with your cluster's SSH address)"
-echo "------------------------------------------------------------"
-echo
-echo "----------[ 2. VS CODE / BROWSER: Connect to Server ]----------"
-echo "Use this URL to connect in your browser or in VS Code:"
-echo "   (Ctrl+Shift+P -> 'Jupyter: Specify Jupyter server...' -> Paste URL)"
-echo
-echo "   http://localhost:${PORT}/lab?token=${TOKEN}"
-echo
-echo "Once connected, select the kernel: 'SLURM Job Kernel ($USER)'"
-echo "================================================================"
+echo "Requested port: ${REQUESTED_PORT}"
+echo "Starting Jupyter Lab (it may choose a different port if ${REQUESTED_PORT} is busy)..."
 echo
 
-# Start Jupyter Lab using the virtual environment's Python, allowing it to run in the foreground
-$VENV_DIR/bin/jupyter lab --no-browser --port=${PORT} --ip=0.0.0.0 --NotebookApp.token=${TOKEN} --allow-root
+# Start Jupyter Lab and capture its output to detect the actual port
+$VENV_DIR/bin/jupyter lab --no-browser --port=${REQUESTED_PORT} --ip=0.0.0.0 --NotebookApp.token=${TOKEN} --allow-root 2>&1 | while IFS= read -r line; do
+    echo "$line"
+    
+    # Check if this line contains the actual server URL
+    if [[ "$line" =~ "Jupyter Server".*"is running at:" ]]; then
+        echo
+        echo "========== JUPYTER LAB STARTED - UPDATING CONNECTION INFO =========="
+    fi
+    
+    # Extract the actual port from the server URL line
+    if [[ "$line" =~ "http://${COMPUTE_NODE}:"([0-9]+)"/lab" ]]; then
+        ACTUAL_PORT="${BASH_REMATCH[1]}"
+        echo
+        echo "==================== UPDATED CONNECTION INSTRUCTIONS ===================="
+        echo
+        echo "----------[ 1. LOCAL TERMINAL: Create SSH Tunnel ]----------"
+        echo "Run this command on your LOCAL machine. It will seem to hang, which is normal."
+        echo
+        echo "   ssh -N -L ${ACTUAL_PORT}:${COMPUTE_NODE}:${ACTUAL_PORT} ${USER}@your_cluster_login_node"
+        echo
+        echo "   (Replace 'your_cluster_login_node' with your cluster's SSH address)"
+        echo "------------------------------------------------------------"
+        echo
+        echo "----------[ 2. VS CODE / BROWSER: Connect to Server ]----------"
+        echo "Use this URL to connect in your browser or in VS Code:"
+        echo "   (Ctrl+Shift+P -> 'Jupyter: Specify Jupyter server...' -> Paste URL)"
+        echo
+        echo "   http://localhost:${ACTUAL_PORT}/lab?token=${TOKEN}"
+        echo
+        echo "Once connected, select the kernel: 'SLURM Job Kernel ($USER)'"
+        echo "================================================================"
+        echo
+    fi
+done
 EOF
 )
 
