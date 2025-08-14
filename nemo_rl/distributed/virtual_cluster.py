@@ -48,6 +48,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies.
     AUTOMODEL = "uv run --locked --extra automodel"
 
+    # Use NeMo-RL direct dependencies and NeMo Gym.
+    NEMO_GYM = "uv run --locked --extra nemo_gym"
+
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
 

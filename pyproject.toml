@@ -58,6 +58,10 @@ automodel = [
     "mamba-ssm",
     "causal-conv1d",
 ]
+nemo_gym = [
+    # Currently, this is for internal exploration. Eventually it will be released publicly and we will update this reference.
+    "https://gitlab-master.nvidia.com/bxyu/nemo-gym.git",
+]
 vllm = [
     "vllm==0.10.0",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
