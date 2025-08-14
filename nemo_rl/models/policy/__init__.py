@@ -93,7 +93,7 @@ class MegatronConfig(TypedDict):
     freeze_moe_router: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
-    deferred_fp32_logits: NotRequired[bool]
+    defer_fp32_logits: NotRequired[bool]
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]

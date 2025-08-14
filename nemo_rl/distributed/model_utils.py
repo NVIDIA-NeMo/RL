@@ -79,11 +79,8 @@ class DistributedLogprob(torch.autograd.Function):
 
         vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
 
-        log_softmax_output = _compute_distributed_log_softmax(
-            vocab_parallel_logits, group=group
-        )
-        log_probs = log_softmax_output.clone()
-        softmax_output = log_softmax_output.exp_()
+        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=group)
+        softmax_output = log_probs.exp()
 
         log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
         log_probs[target_mask] = 0.0
@@ -181,11 +178,10 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            log_softmax_output = _compute_distributed_log_softmax(
+            log_probs = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
             )
-            log_probs = log_softmax_output.clone()
 
             log_probs = torch.gather(
                 log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
@@ -233,12 +229,11 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            log_softmax_output = _compute_distributed_log_softmax(
+            softmax_output = _compute_distributed_log_softmax(
                 logits,
                 group=tp_group,
             )
-            log_probs = log_softmax_output.clone()
-            softmax_output = log_softmax_output.exp_()
+            softmax_output = softmax_output.exp()
 
             # 1 if it's the chosen log prob, 0 otherwise
             is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
