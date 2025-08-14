@@ -365,7 +365,7 @@ class VllmGenerationWorker:
             # Grab the engine args
             self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
             self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
-            self.server_thread = self._setup_vllm_server()
+            self.server_thread, self.base_url = self._setup_vllm_server()
         else:
             self.llm = vllm.LLM(**llm_kwargs)
 
@@ -387,7 +387,8 @@ class VllmGenerationWorker:
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
-        print(f"Starting server on http://{node_ip}:{free_port}/v1")
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
 
         app = FastAPI()
 
@@ -434,13 +435,14 @@ class VllmGenerationWorker:
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
-        return thread
+        return thread, base_url
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        return self.base_url
 
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
@@ -1504,7 +1506,7 @@ class VllmGeneration(GenerationInterface):
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        self._post_init()
+        self.dp_openai_server_base_urls = self._post_init()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
