@@ -36,7 +36,6 @@ docker/*
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch
 !docker/README.md
-!docker/no-install-pytorch-deps.txt
 wandb/
 checkpoints/
 results/
