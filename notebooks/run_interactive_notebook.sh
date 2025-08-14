@@ -22,7 +22,7 @@ PARTITION="interactive"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/mfathi/containers/nemo_rl_base.sqsh"
 PROJECT_DIR=$(pwd) # Capture the current working directory
 KERNEL_NAME="slurm-job-kernel-mfathi"
-VENV_DIR=".venv"
+VENV_DIR="/opt/nemo_rl_venv"
 
 # --- Validate Environment Variables ---
 if [ -z "$ACCOUNT" ] || [ -z "$LOG" ]; then
@@ -42,39 +42,36 @@ unset UV_CACHE_DIR
 
 # --- Environment Setup on the Compute Node ---
 export PATH="/root/.local/bin:$PATH"
-VENV_DIR=".venv"
+VENV_DIR="/opt/nemo_rl_venv"
 KERNEL_NAME="slurm-job-kernel-mfathi"
-
-# Clean up previous environment to ensure a fresh start
-echo "--> Removing old virtual environment..."
-rm -rf "$VENV_DIR"
 
 echo "===================================================================="
 echo "Job running on compute node: $(hostname)"
-echo "Virtual Environment will be set up in: $(pwd)/${VENV_DIR}"
+echo "Using container's Python environment: ${VENV_DIR}"
 echo "===================================================================="
 
-# Step 1: Set up Python virtual environment using uv
+# Step 1: Activate the container's existing Python environment
 echo
-echo "[1/4] Setting up Python virtual environment with uv..."
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating new virtual environment with uv..."
-    uv venv $VENV_DIR
+echo "[1/3] Activating container's Python environment..."
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    source $VENV_DIR/bin/activate
+    echo "Container Python environment activated."
+else
+    echo "Warning: No activation script found at $VENV_DIR/bin/activate"
+    echo "Proceeding with container's default Python environment..."
 fi
-source $VENV_DIR/bin/activate
-echo "Virtual environment activated."
 echo
 
 # Step 2: Prepare environment from uv.lock (+ vllm extra)
-echo "[2/4] Preparing Python environment from uv.lock (+ vllm extra)..."
-VIRTUAL_ENV="$VENV_DIR" uv sync --locked --extra vllm --no-install-project
+echo "[2/3] Syncing dependencies to container environment from uv.lock (+ vllm extra)..."
+uv sync --locked --extra vllm --no-install-project
 if [ $? -ne 0 ]; then
     echo "Error: Failed to sync dependencies from uv.lock. Exiting."
     exit 1
 fi
 
 # Notebook-only deps not in uv.lock
-VIRTUAL_ENV="$VENV_DIR" uv pip install jupyterlab ipykernel sentencepiece pandas matplotlib
+uv pip install jupyterlab ipykernel sentencepiece pandas matplotlib
 if [ $? -ne 0 ]; then
     echo "Error: Failed to install notebook dependencies. Exiting."
     exit 1
@@ -82,13 +79,13 @@ fi
 echo "Dependencies installed successfully."
 echo
 
-# Step 3: Register the virtual environment as a Jupyter kernel
-echo "[3/4] Registering virtual environment as a Jupyter kernel..."
-# Use the specific Python executable from the virtual environment
+# Step 3: Register the container environment as a Jupyter kernel
+echo "[3/3] Registering container environment as a Jupyter kernel..."
+# Use the specific Python executable from the container environment
 $VENV_DIR/bin/python -m ipykernel install --user --name="$KERNEL_NAME" --display-name="SLURM Job Kernel ($USER)"
-echo "Jupyter kernel '$KERNEL_NAME' registered with venv Python."
+echo "Jupyter kernel '$KERNEL_NAME' registered with container Python."
 
-# Verify that the kernel is correctly pointing to our venv
+# Verify that the kernel is correctly pointing to our container environment
 echo "Kernel Python executable: $($VENV_DIR/bin/python --version)"
 echo "Kernel Python path: $($VENV_DIR/bin/python -c 'import sys; print(sys.executable)')"
 
@@ -110,7 +107,7 @@ except ImportError as e: print(f'✗ Transformers not found: {e}')
 echo
 
 # Step 4: Prepare and start Jupyter Lab
-echo "[4/4] Starting Jupyter Lab server..."
+echo "Starting Jupyter Lab server..."
 PORT=$(shuf -i 8000-9999 -n 1)
 TOKEN=$(openssl rand -hex 16)
 COMPUTE_NODE=$(hostname)
