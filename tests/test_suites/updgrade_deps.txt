@@ -1,0 +1,16 @@
+
+## qwen2.5 1.5b
+tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+## qwen3 dense
+TP_SIZE=8 NUM_NODES=4 MAX_STEPS=30 tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh Qwen/Qwen3-32B
+
+## llama3
+tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh meta-llama/Llama-3.1-8B-Instruct
+
+
+## TODO: megatron tests
+
+## ++
+## qwen3 moe
+## moonlight
