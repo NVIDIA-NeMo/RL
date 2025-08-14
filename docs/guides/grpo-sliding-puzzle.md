@@ -19,7 +19,7 @@ The sliding puzzle task serves as a simple, yet effective example, to illustrate
 
 To get started, clone and set up the NeMo RL repository by initializing submodules, installing CUDA dependencies, and configuring the environment with uv. Refer to [Prerequisites](https://github.com/NVIDIA-NeMo/RL/tree/main?tab=readme-ov-file#prerequisites) for detailed instructions on installation.
 
-#### 2. Training Run
+#### 2. Train a Model
 
 Train a model to solve the sliding puzzle using the default 2×2 configuration and GRPO
 
