@@ -55,7 +55,6 @@ def mean(value, range_start=1, range_end=0):
         if range_start <= int(step) and int(step) < range_end:
             vals.append(float(v))
 
-    print(vals)
     return statistics.mean(vals)
 
 
