@@ -294,7 +294,7 @@ game_config:
 max_moves: 30
 ```
 
-The figure below shows the Training Rewards vs Steps, and validation accuracy.
+The figure below displays training rewards vs. steps, along with validation accuracy.
 
 ![Training Curve](../assets/train-reward-sliding-puzzle.png)
 
