@@ -1,3 +1,11 @@
+# This Dockerfile is used to build a Docker image for NeMo RL with the NGC PyTorch base image.
+# However, it is still a work in progress and is not yet ready for production use.
+#
+# Usage:
+# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
+# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
 ARG BASE_IMAGE=nvcr.io/nvidia/nemo:25.06-py3
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
@@ -32,7 +40,7 @@ ARG UV_VERSION=0.7.2
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
-# Users are encouraged to enable if the wish.
+# Users are encouraged to enable if they wish.
 ENV RAY_USAGE_STATS_ENABLED=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
@@ -70,7 +78,7 @@ ENV UV_LINK_MODE=copy
 
 # Define the no-install-package arguments for PyTorch base images
 ARG BASE_IMAGE
-ARG UV_NO_INSTALL_PACKAGES
+ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas-cu12 --no-install-package nvidia-cuda-cupti-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 --no-install-package nvidia-cuda-runtime-cu12 --no-install-package nvidia-cudnn-cu12 --no-install-package nvidia-cufft-cu12 --no-install-package nvidia-cufile-cu12 --no-install-package nvidia-curand-cu12 --no-install-package nvidia-cusolver-cu12 --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-nccl-cu12 --no-install-package vllm --no-install-package flash-attn --no-install-package transformer-engine --no-install-package transformer-engine-cu12 --no-install-package transformer-engine-torch --no-install-package numpy"
 ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 
@@ -97,13 +105,12 @@ FROM hermetic AS release
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
-ARG UV_NO_INSTALL_PACKAGES
-ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV UV_NO_SYNC=1
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+# The 25.06 Pytorch container is not compatible with vllm standalone compile so we disable it
 ENV VLLM_USE_STANDALONE_COMPILE=0
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
@@ -116,4 +123,4 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN UV_NO_SYNC=0 UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
