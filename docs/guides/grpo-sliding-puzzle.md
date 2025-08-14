@@ -59,7 +59,7 @@ The sliding puzzle consists of:
 - **Empty Space**: Represented by `0`, typically starting at the bottom-right corner
 - **Goal State**: Sequential arrangement `1, 2, 3, ..., n²-1` with `0` at bottom-right
 
-### Example Data Sample:
+### Example Data Sample
 ```
 ===== SLIDING PUZZLE =====
 Arrange the 3x3 grid by sliding tiles into the empty space.
