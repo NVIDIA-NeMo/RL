@@ -39,7 +39,7 @@ uv run python examples/run_grpo_sliding_puzzle.py \
 
 #### 4. Monitor Progress
 
-You can enable logging via Weights & Biases and TensorBoard to monitor training metrics such as rewards, success rate, and loss curves
+You can enable logging via Weights & Biases and TensorBoard to monitor training metrics such as rewards, success rate, and loss curves.
 
 ```bash
 # Enable logging (optional)
