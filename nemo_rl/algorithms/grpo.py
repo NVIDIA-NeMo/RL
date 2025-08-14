@@ -599,7 +599,7 @@ def grpo_train(
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
-                elif master_config.get("nemo_gym"):
+                elif _should_use_nemo_gym(master_config):
                     (
                         repeated_batch,
                         rollout_metrics,
