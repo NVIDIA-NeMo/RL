@@ -27,7 +27,7 @@ Train a model to solve the sliding puzzle using GRPO with the default 2×2 confi
 uv run python examples/run_grpo_sliding_puzzle.py 
 ```
 
-#### 3. Custom Configuration
+#### 3. Customize Puzzle Configuration
 
 By default, this uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty
 ```bash
