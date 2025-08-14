@@ -62,7 +62,7 @@ A key design principle for generation backends is that they process tokens direc
 
 ## VLLM Backend
 
-The VLLM backend (`models/generation/vllm.py`) implements the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
+The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
 
 ### VllmGeneration Class
 
