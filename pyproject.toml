@@ -60,7 +60,7 @@ automodel = [
 ]
 nemo_gym = [
     # Currently, this is for internal exploration. Eventually it will be released publicly and we will update this reference.
-    "https://gitlab-master.nvidia.com/bxyu/nemo-gym.git",
+    "nemo_gym @ git+https://gitlab-master.nvidia.com/bxyu/nemo-gym.git@bxyu/nemo-rl-integration",
 ]
 vllm = [
     "vllm==0.10.0",
