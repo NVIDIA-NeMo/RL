@@ -242,26 +242,31 @@ def setup_megatron_model(
     pre_wrap_hook = []
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
-        def freeze_moe_router(model_module):
-            # Handle both wrapped (Float16Module) and unwrapped models
-            if isinstance(model_module, Float16Module):
-                model_module = model_module.module
-            for layer in model_module.decoder.layers:
-                if hasattr(layer.mlp, "router"):
-                    layer.mlp.router.weight.requires_grad = False
+        def freeze_moe_router(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                for layer in model_module.decoder.layers:
+                    if hasattr(layer.mlp, "router"):
+                        layer.mlp.router.weight.requires_grad = False
 
         # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
         # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
-        def re_enable_float32_expert_bias(model_module):
-            # Handle both wrapped (Float16Module) and unwrapped models
-            if isinstance(model_module, Float16Module):
-                model_module = model_module.module
-            for layer in model_module.decoder.layers:
-                if hasattr(layer.mlp, "router"):
-                    layer.mlp.router._maintain_float32_expert_bias()
+        def re_enable_float32_expert_bias(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                for layer in model_module.decoder.layers:
+                    if hasattr(layer.mlp, "router"):
+                        layer.mlp.router._maintain_float32_expert_bias()
 
-        pre_wrap_hook.append(freeze_moe_router)
-        pre_wrap_hook.append(re_enable_float32_expert_bias)
+        pre_wrap_hook.extend([freeze_moe_router, re_enable_float32_expert_bias])
 
     # Model, optimizer, and learning rate.
     model = get_model(
