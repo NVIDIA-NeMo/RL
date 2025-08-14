@@ -29,7 +29,7 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 #### 3. Customize Puzzle Configuration
 
-By default, this uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty
+By default, this training script uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty.
 ```bash
 # Train on a 3×3 puzzle with 10 random moves to scramble the board
 uv run python examples/run_grpo_sliding_puzzle.py \
