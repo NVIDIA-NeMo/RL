@@ -14,7 +14,7 @@
 
 # --- Job Configuration ---
 JOB_NAME="interactive-notebook"
-TIME="01:00:00"
+TIME="4:00:00"
 GPUS_PER_NODE=1
 CPUS_PER_TASK=16
 MEM="64G"
