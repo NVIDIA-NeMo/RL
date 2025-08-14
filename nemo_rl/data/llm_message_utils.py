@@ -326,10 +326,6 @@ def batched_message_log_to_flat_message(
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
 
-        # if the values are packed multimodal data, then concatenate them
-        if values and isinstance(values[0], PackedMultimodalData):
-            result[key] = PackedMultimodalData.concat(values)
-            continue
         # if not a tensor or DNE, then return the list of values
         if not values or not isinstance(values[0], Tensor):
             result[key] = values

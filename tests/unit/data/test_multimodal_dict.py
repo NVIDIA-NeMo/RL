@@ -150,6 +150,9 @@ def test_multiturn_rollout_with_packed_data():
         },
     )
     shards = flat_message.shard_by_batch_size(shards=2)
+    assert len(shards) == 2
+    assert tuple(PackedMultimodalData.concat(shards[0]['images']).as_tensor().shape) == (6, 128, 128)
+    assert tuple(PackedMultimodalData.concat(shards[1]['images']).as_tensor().shape) == (3, 128, 128)
 
 
 def test_sequence_packing_with_packed_data():
