@@ -47,7 +47,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
-from nemo_rl.data.multimodal_utils import PackedMultimodalDataItem, \
+from nemo_rl.data.multimodal_utils import PackedMultimodalData, \
     get_multimodal_keys_from_processor,  \
     get_dim_to_pack_along
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -181,7 +181,7 @@ def hf_data_processor(
     multimodal_keys = get_multimodal_keys_from_processor(processor)
     for key in multimodal_keys:
         if key in message:
-            user_message[key] = PackedMultimodalDataItem(message[key], dim_to_pack=get_dim_to_pack_along(processor, key))
+            user_message[key] = PackedMultimodalData(message[key], dim_to_pack=get_dim_to_pack_along(processor, key))
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
     if 'token_type_ids' in message:
