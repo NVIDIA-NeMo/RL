@@ -17,18 +17,21 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from nemo_rl.models.megatron.converters.common import (
-    get_global_expert_num,
-    get_global_key_from_local_key,
-    get_global_layer_num,
-    get_local_expert_num,
-    get_local_layer_num,
-    split_fc1_etp,
-    split_fc1_tp,
-    split_qkv_bias_gpu,
-    split_qkv_gpu,
-    update_transforms_for_nemorl,
-)
+try:
+    from nemo_rl.models.megatron.converters.common import (
+        get_global_expert_num,
+        get_global_key_from_local_key,
+        get_global_layer_num,
+        get_local_expert_num,
+        get_local_layer_num,
+        split_fc1_etp,
+        split_fc1_tp,
+        split_qkv_bias_gpu,
+        split_qkv_gpu,
+        update_transforms_for_nemorl,
+    )
+except ImportError:
+    pass
 
 # Apply mcore marker to all tests in this module
 pytestmark = pytest.mark.mcore
