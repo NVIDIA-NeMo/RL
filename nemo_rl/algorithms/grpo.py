@@ -50,6 +50,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
@@ -591,7 +592,7 @@ def grpo_train(
                     (
                         repeated_batch,
                         rollout_metrics,
-                    ) = run_async_multi_turn_rollout(
+                    ) = run_async_nemo_gym_rollout(
                         policy_generation=policy_generation,
                         input_batch=repeated_batch,
                         tokenizer=tokenizer,
