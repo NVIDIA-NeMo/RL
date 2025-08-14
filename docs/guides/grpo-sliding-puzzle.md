@@ -1,6 +1,6 @@
 # Solve a Sliding Puzzle Using GRPO
 
-This guide explains how to use Nemo-RL to train a model to solve the classic **nxn sliding puzzle** game through multi-turn reinforcement learning. This environment implements a classic **n×n sliding puzzle** where numbered tiles must be arranged in sequential order by sliding them into an empty space.
+This guide explains how to use Nemo RL to train a model to solve the classic **nxn sliding puzzle** game through multi-turn reinforcement learning. This environment implements a classic **n×n sliding puzzle** where numbered tiles must be arranged in sequential order by sliding them into an empty space.
 
 The sliding puzzle task serves as a simple yet effective example to illustrate how multi-turn RL and tool-calling are implemented within Nemo-RL. This example provides a minimal setup for understanding the core components of Group Relative Policy Optimization (GRPO) and sequential decision-making.
 
