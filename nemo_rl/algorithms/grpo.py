@@ -402,6 +402,15 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
+def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
+    """Determine if NeMo Gym should be used for rollouts and validation based on the configuration.
+
+    Returns True if the data config contains a non-empty nemo_gym key/value.
+    """
+    data_config = master_config["data"]
+    return data_config.get("nemo_gym", None) is not None
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -522,6 +531,8 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
+
+        # TODO may need to fork here or inside the validate function for NeMo Gym.
         val_metrics, validation_timings = validate(
             policy_generation,
             val_dataloader,
@@ -715,6 +726,7 @@ def grpo_train(
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
+                # TODO may need to fork here or inside the validate function for NeMo Gym.
                 val_metrics, validation_timings = validate(
                     policy_generation,
                     val_dataloader,
