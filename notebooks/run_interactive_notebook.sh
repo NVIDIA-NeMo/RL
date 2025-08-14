@@ -84,8 +84,29 @@ echo
 
 # Step 3: Register the virtual environment as a Jupyter kernel
 echo "[3/4] Registering virtual environment as a Jupyter kernel..."
-python -m ipykernel install --user --name="$KERNEL_NAME" --display-name="SLURM Job Kernel ($USER)"
-echo "Jupyter kernel '$KERNEL_NAME' registered."
+# Use the specific Python executable from the virtual environment
+$VENV_DIR/bin/python -m ipykernel install --user --name="$KERNEL_NAME" --display-name="SLURM Job Kernel ($USER)"
+echo "Jupyter kernel '$KERNEL_NAME' registered with venv Python."
+
+# Verify that the kernel is correctly pointing to our venv
+echo "Kernel Python executable: $($VENV_DIR/bin/python --version)"
+echo "Kernel Python path: $($VENV_DIR/bin/python -c 'import sys; print(sys.executable)')"
+
+# Verify key dependencies are available in the kernel
+echo "Verifying key dependencies in kernel..."
+$VENV_DIR/bin/python -c "
+import sys
+print(f'Python executable: {sys.executable}')
+try:
+    import torch; print(f'✓ PyTorch {torch.__version__}')
+except ImportError as e: print(f'✗ PyTorch not found: {e}')
+try:
+    import vllm; print(f'✓ vLLM {vllm.__version__}')
+except ImportError as e: print(f'✗ vLLM not found: {e}')
+try:
+    import transformers; print(f'✓ Transformers {transformers.__version__}')
+except ImportError as e: print(f'✗ Transformers not found: {e}')
+"
 echo
 
 # Step 4: Prepare and start Jupyter Lab
@@ -115,8 +136,8 @@ echo "Once connected, select the kernel: 'SLURM Job Kernel ($USER)'"
 echo "================================================================"
 echo
 
-# Start Jupyter Lab, allowing it to run in the foreground
-jupyter lab --no-browser --port=${PORT} --ip=0.0.0.0 --NotebookApp.token=${TOKEN} --allow-root
+# Start Jupyter Lab using the virtual environment's Python, allowing it to run in the foreground
+$VENV_DIR/bin/jupyter lab --no-browser --port=${PORT} --ip=0.0.0.0 --NotebookApp.token=${TOKEN} --allow-root
 EOF
 )
 
