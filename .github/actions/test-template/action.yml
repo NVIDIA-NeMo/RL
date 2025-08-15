@@ -162,6 +162,7 @@ runs:
           --shm-size=64g \
           --env TRANSFORMERS_OFFLINE=0 \
           --env HYDRA_FULL_ERROR=1 \
+          --env HF_HUB_OFFLINE=1 \
           --env HF_HOME=/home/TestData/nemo-rl/hf_home \
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
