@@ -58,6 +58,19 @@ class PackedMultimodalData:
             tensors.extend(batch.tensors)
         dim_to_pack = dim_to_packs[0]
         return cls(tensors, dim_to_pack)
+    
+    @classmethod
+    def from_list(cls, packed_batches: list["PackedMultimodalData"]) -> "PackedMultimodalData":
+        """Creates a PackedMultimodalData from a list of PackedMultimodalData objects.
+
+        Each PackedMultimodalData is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedMultimodalData.
+
+        Each batch must have the same dim_to_pack.
+        """
+        dim_to_packs = [batch.dim_to_pack for batch in packed_batches]
+        assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
+        tensors = [p.as_tensor() for p in packed_batches]
+        return cls(tensors, packed_batches[0].dim_to_pack)
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
