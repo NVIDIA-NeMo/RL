@@ -43,6 +43,13 @@ vllm = [
     "vllm==0.8.4",
 ]
 
+ifeval = [
+    "absl-py",
+    "langdetect",
+    "nltk==3.9.1",
+    "immutabledict",
+]
+
 [dependency-groups]
 build = [
     "torch==2.6.0",

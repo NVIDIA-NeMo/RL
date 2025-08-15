@@ -24,6 +24,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import JsonlinesDataset
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation.interfaces import configure_generation_config
@@ -80,6 +81,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
         ).remote(env_configs["math"])
         task_to_env["math"] = math_env
 
+    if "ifeval" in env_configs and env_configs["ifeval"]["enable"]:
+        ifeval_env = IFEvalEnvironment.options(
+            runtime_env={
+                "py_executable": IFEvalEnvironment.DEFAULT_PY_EXECUTABLE,
+                "env_vars": dict(os.environ),
+            },
+        ).remote(env_configs["ifeval"])
+        task_to_env["ifeval"] = ifeval_env
     if "llm_judge_async" in env_configs and env_configs["llm_judge_async"]["enable"]:
         # Extract max_concurrency from config, default to 16 if not specified
         max_concurrency = env_configs["llm_judge_async"].get("max_concurrency", 16)

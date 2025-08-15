@@ -45,6 +45,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
 
+    # Use NeMo-RL direct dependencies and ifeval dependencies.
+    IFEVAL = "uv run --locked --extra ifeval"
+
 
 @ray.remote
 def _get_node_ip_and_free_port():

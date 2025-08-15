@@ -659,6 +659,9 @@ class DTensorPolicyWorker:
                     )
 
                 logits = outputs.logits.to(torch.float32)
+                if "generation" in self.cfg and self.cfg["generation"] is not None:
+                    logits.div_(self.cfg["generation"]["temperature"])
+
                 token_logprobs = compute_token_logprobs(logits, input_ids)
 
                 del outputs, logits

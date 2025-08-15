@@ -149,8 +149,12 @@ env:
     max_model_len: 16384 # Max sequence length for the judge model
     temperature: 0.0 # Judge temperature (usually lower for more deterministic judging)
     max_tokens: 512  # Max tokens for the judge's evaluation
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
     stop: null # Stop strings for the judge's evaluation
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
+  ifeval:
+    num_workers: 8
+    enable: false
 
 logger:
   log_dir: "logs"  # Base directory for all logs
