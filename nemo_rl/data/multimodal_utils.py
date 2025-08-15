@@ -49,6 +49,19 @@ class PackedMultimodalData:
         """Concatenate a list of PackedMultimodalData objects into a single PackedMultimodalData.
 
         Each batch must have the same dim_to_pack.
+
+        Example:
+        ```{doctest}
+        >>> import torch
+        >>> from nemo_rl.data.multimodal_utils import PackedMultimodalData
+        >>> p1 = PackedMultimodalData([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
+        >>> p2 = PackedMultimodalData([torch.tensor([7, 8, 9])], dim_to_pack=0)
+        >>> p3 = PackedMultimodalData.concat([p1, p2])
+        >>> p3.tensors
+        [tensor([1, 2, 3]), tensor([4, 5, 6]), tensor([7, 8, 9])]
+        >>> p3.as_tensor()
+        tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        ```
         """
         dim_to_packs = [batch.dim_to_pack for batch in packed_batches]
         assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
@@ -58,14 +71,29 @@ class PackedMultimodalData:
             tensors.extend(batch.tensors)
         dim_to_pack = dim_to_packs[0]
         return cls(tensors, dim_to_pack)
-    
+
     @classmethod
     def from_list(cls, packed_batches: list["PackedMultimodalData"]) -> "PackedMultimodalData":
         """Creates a PackedMultimodalData from a list of PackedMultimodalData objects.
 
         Each PackedMultimodalData is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedMultimodalData.
 
+        This is different from concat which simply extends the underlying list of tensors
+
         Each batch must have the same dim_to_pack.
+
+        Example:
+        ```{doctest}
+        >>> import torch
+        >>> from nemo_rl.data.multimodal_utils import PackedMultimodalData
+        >>> p1 = PackedMultimodalData([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
+        >>> p2 = PackedMultimodalData([torch.tensor([7, 8, 9])], dim_to_pack=0)
+        >>> p3 = PackedMultimodalData.from_list([p1, p2])
+        >>> p3.tensors
+        [tensor([1, 2, 3, 4, 5, 6]), tensor([7, 8, 9])]
+        >>> p3.as_tensor()
+        tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        ```
         """
         dim_to_packs = [batch.dim_to_pack for batch in packed_batches]
         assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
