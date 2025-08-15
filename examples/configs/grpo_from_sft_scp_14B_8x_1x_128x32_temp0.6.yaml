@@ -1,6 +1,6 @@
 # GRPO Algorithm Configuration
-# training: 3622s / batch
-# validation: 1415s
+# training: 3762s / batch
+# validation: 1447s
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 32
@@ -8,7 +8,7 @@ grpo:
   max_num_steps: 400
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 3
+  val_period: 2
   val_at_start: true
   max_val_samples: 2560
   val_batch_size: 2560
@@ -29,7 +29,7 @@ checkpointing:
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: null
-  save_period: 3
+  save_period: 2
 
 policy:
   # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA/NeMo-RL/issues/227)

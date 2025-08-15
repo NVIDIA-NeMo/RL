@@ -1,6 +1,6 @@
 # GRPO Algorithm Configuration
-# training: 3758s / batch
-# validation: 1449s
+# training: 2976s / batch
+# validation: 1103s
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 32
@@ -8,7 +8,7 @@ grpo:
   max_num_steps: 400
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 2
+  val_period: 3
   val_at_start: true
   max_val_samples: 2560
   val_batch_size: 2560
@@ -25,15 +25,15 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/Qwen3-14B-Base-grpo-from-sft-scp-16k-128x32-4x-4x-temp0.6"
+  checkpoint_dir: "results/Qwen3-14B-Base-grpo-from-sft-scp-16k-128x32-1x-7x-temp0.6"
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: null
-  save_period: 2
+  save_period: 3
 
 policy:
   # Qwen/Qwen2.5-1.5B has tied weights which are only supported with dtensor policy with tp size 1 (https://github.com/NVIDIA/NeMo-RL/issues/227)
-  model_name: "/lustre/fsw/portfolios/llmservice/users/zhaochengz/reinforcer/results/Qwen3-14B-Base-sft-scp-16k-3x/hf_step_1600"
+  model_name: "/lustre/fsw/portfolios/llmservice/users/zhaochengz/reinforcer/results/Qwen3-14B-Base-sft-scp-16k-3x/hf_step_400"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512
@@ -136,7 +136,7 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-from-sft-scp"
-    name: "Qwen3-14B-Base-128x32-4x-4x-temp0.6"
+    name: "Qwen3-14B-Base-128x32-1x-7x-temp0.6"
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
