@@ -9,7 +9,14 @@ MAX_STEPS=${MAX_STEPS:-70}
 NUM_MINUTES=240
 TP_SIZE=${TP_SIZE:-1}
 CP_SIZE=${CP_SIZE:-1}
+EP_SIZE=${EP_SIZE:-1}
 VLLM_TP=${VLLM_TP:-1}
+
+SEQ_PACKING=false
+if [[ $CP_SIZE -gt 1 ]]; then
+    SEQ_PACKING=true
+fi
+
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -30,8 +37,10 @@ uv run examples/run_grpo_math.py \
     policy.model_name=$MODEL_NAME \
     cluster.num_nodes=$NUM_NODES \
     policy.generation.vllm_cfg.tensor_parallel_size=$VLLM_TP \
-    policy.dtensor_cfg.tensor_parallel_size=$TP_SIZE \
-    policy.dtensor_cfg.context_parallel_size=$CP_SIZE \
+    policy.megatron_cfg.context_parallel_size=$CP_SIZE \
+    policy.megatron_cfg.tensor_model_parallel_size=$TP_SIZE \
+    policy.megatron_cfg.expert_model_parallel_size=$EP_SIZE \
+    policy.sequence_packing.enabled=$SEQ_PACKING \
     $@ \
     2>&1 | tee $RUN_LOG
 

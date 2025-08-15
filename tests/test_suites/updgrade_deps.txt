@@ -1,16 +1,22 @@
+### DTensor
 
 ## qwen2.5 1.5b
-tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-
+MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
 ## qwen3 dense
-TP_SIZE=8 NUM_NODES=4 MAX_STEPS=30 tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh Qwen/Qwen3-32B
-
+MODEL_NAME=Qwen/Qwen3-32B TP_SIZE=8 NUM_NODES=4 MAX_STEPS=30 tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
 ## llama3
-tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh meta-llama/Llama-3.1-8B-Instruct
+MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
 
 
-## TODO: megatron tests
+### Megatron
 
-## ++
+## qwen2.5 1.5b
+MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B tests/test_suites/llm/grpo-deepscaler-1.5b-8K-megatron.sh
+## qwen3 dense
+TP_SIZE=8 NUM_NODES=4 MAX_STEPS=30 MODEL_NAME=Qwen/Qwen3-32B tests/test_suites/llm/grpo-deepscaler-1.5b-8K-megatron.sh
+## llama3
+MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct tests/test_suites/llm/grpo-deepscaler-1.5b-8K-megatron.sh
 ## qwen3 moe
+TP_SIZE=2 EP_SIZE=8 CP_SIZE=2 VLLM_TP=4 NODES=4 MAX_STEPS=10 MODEL_NAME=Qwen/Qwen3-30B-A3B tests/test_suites/llm/grpo-deepscaler-1.5b-8K-megatron.sh
 ## moonlight
+PP_SIZE=4 EP_SIZE=4 NODES=4 MAX_STEPS=20 MODEL_NAME=moonshotai/Moonlight-16B-A3B-Instruct tests/test_suites/llm/grpo-deepscaler-1.5b-8K-megatron.sh
