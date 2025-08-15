@@ -50,6 +50,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
@@ -401,6 +402,15 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
+def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
+    """Determine if NeMo Gym should be used for rollouts and validation based on the configuration.
+
+    Returns True if the data config contains a non-empty nemo_gym key/value.
+    """
+    data_config = master_config["data"]
+    return data_config.get("nemo_gym", None) is not None
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -521,6 +531,8 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
+
+        # TODO may need to fork here or inside the validate function for NeMo Gym.
         val_metrics, validation_timings = validate(
             policy_generation,
             val_dataloader,
@@ -586,6 +598,23 @@ def grpo_train(
                         ],
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
+                    )
+                elif _should_use_nemo_gym(master_config):
+                    # input_ids is a tensor of shape (batch_size * num_generations, max_seq_len)
+                    # input_lengths is a tensor of shape (batch_size * num_generations,)
+                    # repeated_batch 
+                    (
+                        input_ids,
+                        input_lengths,
+                        repeated_batch,
+                        rollout_metrics,
+                    ) = run_async_nemo_gym_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
                     )
                 else:
                     repeated_batch, rollout_metrics = run_multi_turn_rollout(
@@ -702,6 +731,7 @@ def grpo_train(
                     POLICY_GENERATION_STALE = False
                 else:
                     policy_generation.prepare_for_generation()
+                # TODO may need to fork here or inside the validate function for NeMo Gym.
                 val_metrics, validation_timings = validate(
                     policy_generation,
                     val_dataloader,
