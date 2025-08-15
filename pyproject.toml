@@ -59,6 +59,8 @@ automodel = [
     "causal-conv1d",
 ]
 vllm = [
+    "cuda-python",
+    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
     "vllm==0.10.0",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",

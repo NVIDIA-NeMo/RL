@@ -613,7 +613,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated
+    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
 ):
     """Validates that the two policies can work together.
 
@@ -719,7 +719,14 @@ async def run_hf_train_process(
         )
 
         print(f"Average probability multiplicative error: {avg_prob_mult_error}")
-        assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
+        if vllm_precision == "fp8":
+            assert avg_prob_mult_error <= 1.080, (
+                "vLLM and HF logprobs should closely match"
+            )
+        else:
+            assert avg_prob_mult_error <= 1.043, (
+                "vLLM and HF logprobs should closely match"
+            )
 
         # Step 2: Prepare simplified training data (smaller and with padding removed to prevent OOM)
         # Use a very small sequence for training to ensure it works
@@ -786,16 +793,24 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
@@ -813,7 +828,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True)
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+    )
 
 
 @pytest.mark.timeout(300)
@@ -856,7 +873,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False)
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, False, "bfloat16"
+    )
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
@@ -953,8 +972,9 @@ def test_vllm_generate_text(cluster, tokenizer):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -963,6 +983,8 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
@@ -1331,8 +1353,9 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
@@ -1353,6 +1376,7 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
