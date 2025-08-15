@@ -129,6 +129,7 @@ def setup(
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    collate_fn: callable = rl_collate_fn,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -186,7 +187,7 @@ def setup(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
         shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
+        collate_fn=collate_fn,
         drop_last=True,
     )
     if last_checkpoint_path is not None:
@@ -208,7 +209,7 @@ def setup(
             val_dataset,
             batch_size=grpo_config["val_batch_size"],
             shuffle=False,
-            collate_fn=rl_collate_fn,
+            collate_fn=collate_fn,
         )
         print(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
 
