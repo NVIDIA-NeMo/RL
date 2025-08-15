@@ -15,7 +15,8 @@
 
 import pytest
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
+from PIL import Image
 
 from nemo_rl.data.hf_datasets import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
@@ -591,3 +592,81 @@ def test_get_first_index_that_differs():
     assert get_first_index_that_differs("hello world", "hello") == 5
     assert get_first_index_that_differs("hi1", "hello2") == 1
     assert get_first_index_that_differs("hello2", "hi1") == 1
+
+
+def test_message_log_to_flat_messages_with_packed_images() -> None:
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    # two turns, each with an image tensor wrapped in PackedTensor
+    img1 = torch.randn(2, 3, 8, 8)
+    img2 = torch.randn(3, 3, 8, 8)
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": "see image", "token_ids": torch.tensor([1, 2]), "images": PackedTensor(img1, dim_to_pack=0)},
+        {"role": "assistant", "content": "ok", "token_ids": torch.tensor([3]), "images": PackedTensor(img2, dim_to_pack=0)},
+    ]
+    flat = message_log_to_flat_messages(message_log)
+    assert isinstance(flat["images"], PackedTensor)
+    assert tuple(flat["images"].as_tensor().shape) == (5, 3, 8, 8)
+    assert torch.equal(flat["token_ids"], torch.tensor([1, 2, 3]))
+
+
+def test_batched_message_log_to_flat_message_with_packed_images() -> None:
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    img_a = torch.randn(1, 3, 4, 4)
+    img_b = torch.randn(2, 3, 4, 4)
+    img_c = torch.randn(1, 3, 4, 4)
+
+    batch_logs = [
+        [
+            {"role": "user", "content": "prompt a", "token_ids": torch.tensor([1, 2, 3]), "images": PackedTensor(img_a, dim_to_pack=0)},
+            {"role": "assistant", "content": "resp", "token_ids": torch.tensor([4])},
+        ],
+        [
+            {"role": "user", "content": "prompt b", "token_ids": torch.tensor([5, 6]), "images": PackedTensor(img_b, dim_to_pack=0)},
+            {"role": "assistant", "content": "resp2", "token_ids": torch.tensor([7, 8])},
+            {"role": "user", "content": "again", "token_ids": torch.tensor([9]), "images": PackedTensor(img_c, dim_to_pack=0)},
+        ],
+    ]
+
+    batched, input_lengths = batched_message_log_to_flat_message(batch_logs, pad_value_dict={"token_ids": 0})
+    assert isinstance(batched["images"], PackedTensor)
+    # flattened_concat keeps two packed tensors (one per convo)
+    assert len(batched["images"]) == 2
+    # total packed along dim 0 = 1 + (2 + 1) = 4
+    assert tuple(batched["images"].as_tensor().shape) == (4, 3, 4, 4)
+    assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
+
+
+@pytest.mark.hf_gated
+def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    task_data_spec = TaskDataSpec(task_name="t")
+    task_data_spec.prompt = "Q: {} A:"
+
+    # one user turn with text+image, then assistant
+    image = Image.new("RGB", (16, 16), color=(0, 0, 0))
+    message_log: LLMMessageLogType = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a cat?"},
+                {"type": "image", "image": image},
+            ],
+        },
+        {"role": "assistant", "content": "okay"},
+    ]
+
+    out = get_formatted_message_log(message_log, processor, task_data_spec, add_bos_token=False, add_eos_token=False)
+    # First message text should be formatted by prompt
+    assert isinstance(out[0]["content"], list)
+    assert any(item["type"] == "text" and item["text"].startswith("Q: ") for item in out[0]["content"])  # type: ignore[index]
+    # pixel_values should be added as PackedTensor for the first message
+    from nemo_rl.data.multimodal_utils import PackedTensor
+
+    assert isinstance(out[0]["pixel_values"], PackedTensor)
+    pv = out[0]["pixel_values"].as_tensor()
+    assert pv.ndim == 4 and pv.shape[0] == 1
+    # token_ids should be non-empty tensors
+    assert isinstance(out[0]["token_ids"], torch.Tensor) and out[0]["token_ids"].numel() > 0
+    assert isinstance(out[1]["token_ids"], torch.Tensor) and out[1]["token_ids"].numel() > 0

@@ -64,6 +64,19 @@ def message_log_to_flat_messages(
     ['Hello', 'Hi there']
     >>> flat_msgs['token_ids']
     tensor([1, 2, 3, 4, 5, 6, 7])
+    >>>
+    >>> # Multimodal example:
+    >>> from nemo_rl.data.multimodal_utils import PackedTensor
+    >>> img1 = torch.randn(2, 3, 4, 4)
+    >>> img2 = torch.randn(3, 3, 4, 4)
+    >>> mm_log = [
+    ...     {'role': 'user', 'content': 'see', 'token_ids': torch.tensor([1]), 'images': PackedTensor(img1, dim_to_pack=0)},
+    ...     {'role': 'assistant', 'content': 'ok', 'token_ids': torch.tensor([2, 3]), 'images': PackedTensor(img2, dim_to_pack=0)},
+    ... ]
+    >>> flat_mm = message_log_to_flat_messages(mm_log)
+    >>> tuple(flat_mm['images'].as_tensor().shape)
+    (5, 3, 4, 4)
+    >>>
     ```
     """
     result: dict[str, list[Any]] = {}
@@ -275,6 +288,26 @@ def batched_message_log_to_flat_message(
     [['user', 'assistant'], ['user', 'assistant']]
     >>> input_lengths
     tensor([7, 9], dtype=torch.int32)
+    >>>
+    >>> # Multimodal example: include images on both conversations and verify packing
+    >>> from nemo_rl.data.multimodal_utils import PackedTensor
+    >>> mm_batch = [
+    ...     [
+    ...         {'role': 'user', 'content': 'look', 'token_ids': torch.tensor([1, 2, 3]), 'images': PackedTensor(torch.randn(2, 3, 4, 4), dim_to_pack=0)},
+    ...         {'role': 'assistant', 'content': 'ok', 'token_ids': torch.tensor([4])}
+    ...     ],
+    ...     [
+    ...         {'role': 'user', 'content': 'again', 'token_ids': torch.tensor([5, 6]), 'images': PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0)},
+    ...         {'role': 'assistant', 'content': 'fine', 'token_ids': torch.tensor([7, 8])}
+    ...     ]
+    ... ]
+    >>> mm_flat, mm_lengths = batched_message_log_to_flat_message(mm_batch, pad_value_dict={'token_ids': 0})
+    >>> isinstance(mm_flat['images'], PackedTensor)
+    True
+    >>> tuple(mm_flat['images'].as_tensor().shape)  # 2 + 1 images
+    (3, 3, 4, 4)
+    >>> mm_lengths
+    tensor([4, 4], dtype=torch.int32)
     >>>
     ```
     """
