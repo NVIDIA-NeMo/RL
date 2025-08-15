@@ -44,6 +44,27 @@ from transformers.models.gemma3.modeling_gemma3 import (
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
+)
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
+from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+from transformers.models.llava_next.modeling_llava_next import (
+    LlavaNextForConditionalGeneration,
+)
+from transformers.models.llava_next_video.modeling_llava_next_video import (
+    LlavaNextVideoForConditionalGeneration,
+)
+from transformers.models.llava_onevision.modeling_llava_onevision import (
+    LlavaOnevisionForConditionalGeneration,
+)
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3ForConditionalGeneration,
+)
+from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
 from nemo_rl.models.policy.utils import import_class_from_path
@@ -303,12 +324,45 @@ def get_hf_tp_plan(model: PreTrainedModel):
         AssertionError: If no TP plan is found
     """
     model_cls = type(model)
-    if model_cls == Gemma3ForConditionalGeneration:
+
+    # Handle VL models structure
+    if model_cls in [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Gemma3ForConditionalGeneration:
         inner_model = model.language_model
         model_prefix = "language_model"
+        config = model.config.text_config
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        inner_model = model.language_model.model
+        model_prefix = "language_model.model"
+        config = model.language_model.model.config
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
     else:
         inner_model = model.model
         model_prefix = "model"
+        config = model.config
 
     hf_tp_plan = {}
 
@@ -338,7 +392,7 @@ def get_hf_tp_plan(model: PreTrainedModel):
 
     for k, v in hf_tp_plan.items():
         # speed up the tp plan for lm_head
-        if k == "lm_head" and v == "colwise_rep":
+        if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             hf_tp_plan[k] = ColwiseParallel(
                 output_layouts=Shard(-1), use_local_output=False
             )
@@ -421,6 +475,7 @@ def _parallelize_nm5_h(
 def _parallelize_model(
     model: Union[
         Qwen2ForCausalLM,
+        Qwen3ForCausalLM,
         LlamaForCausalLM,
         Gemma3ForCausalLM,
         Gemma3ForConditionalGeneration,
@@ -455,7 +510,21 @@ def _parallelize_model(
         ValueError: If the model type is not supported for parallelization.
     """
     model_cls = type(model)
-    if model_cls.__name__ == "NemotronHForCausalLM":
+
+    # Handle different model structures
+    if model_cls == Gemma3ForConditionalGeneration:
+        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        layers: list = []
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # siglip encoder also has the same structure as clip encoder (being the same model after all)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        num_attention_heads = model.config.text_config.num_attention_heads
+        num_key_value_heads = model.config.text_config.num_key_value_heads
+
+    elif model_cls.__name__ == "NemotronHForCausalLM":
         # need to do something special for nm5, since it's harder to shard the mamba layers
         # nm5 is not importable, so we check the __name__ attribute
         return _parallelize_nm5_h(
@@ -468,11 +537,66 @@ def _parallelize_model(
             cpu_offload,
             custom_parallel_plan,
         )
-    elif model_cls == Gemma3ForConditionalGeneration:
-        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-        num_attention_heads = model.config.text_config.num_attention_heads
-        num_key_value_heads = model.config.text_config.num_key_value_heads
+
+    elif model_cls in [
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2VLForConditionalGeneration,
+    ]:
+        # VL models have the language model at model.language_model
+        layers: list = []
+        # append language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # append visual model layers
+        for layer in model.visual.blocks:
+            layers.append(layer)
+
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == SmolVLMForConditionalGeneration:
+        layers: list = []
+        for layer in model.model.text_model.layers:
+            layers.append(layer)
+        for layer in model.model.vision_model.encoder.layers:
+            layers.append(layer)
+        num_attention_heads = model.model.text_model.config.num_attention_heads
+        num_key_value_heads = model.model.text_model.config.num_key_value_heads
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        layers: list = []
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        layers: list = []
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        for layer in model.model.vision_tower.transformer.layers:
+            layers.append(layer)
+        num_attention_heads = model.model.language_model.config.num_attention_heads
+        num_key_value_heads = model.model.language_model.config.num_key_value_heads
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        layers: list = []
+        for layer in model.language_model.model.layers:
+            layers.append(layer)
+        for layer in model.vision_model.model.layers:
+            layers.append(layer)
+        num_attention_heads = model.language_model.model.config.num_attention_heads
+        num_key_value_heads = model.language_model.model.config.num_key_value_heads
+
     else:
+        # this is the default case for all other models (assumed to be a causal LM)
         layers: torch.nn.ModuleList = model.model.layers  # type: ignore
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads

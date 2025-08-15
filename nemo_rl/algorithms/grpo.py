@@ -21,6 +21,7 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -128,6 +129,7 @@ def setup(
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -338,6 +340,7 @@ def setup(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
@@ -489,6 +492,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -665,6 +669,8 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+                # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")
