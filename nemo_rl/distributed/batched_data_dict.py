@@ -94,7 +94,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedMultimodalData):
-                multimodal_dict[k] = PackedMultimodalData.concat(v).as_tensor(device=device) if as_tensors else v
+                multimodal_dict[k] = PackedMultimodalData.from_list_as_tensor(v, device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v
         
@@ -120,7 +120,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
 
-        for k in sorted(batches[0]):  
+        for k in sorted(batches[0]):
             list_of_tensors = [item[k] for item in batches]
 
             if isinstance(list_of_tensors[0], list):

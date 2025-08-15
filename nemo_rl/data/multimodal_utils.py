@@ -59,6 +59,10 @@ class PackedMultimodalData:
         dim_to_pack = dim_to_packs[0]
         return cls(tensors, dim_to_pack)
 
+    @classmethod
+    def from_list_as_tensor(cls, packed_datas: list["PackedMultimodalData"], device: Optional[torch.device] = None) -> torch.Tensor:
+        return cls.concat(packed_datas).as_tensor(device)
+
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
     '''
