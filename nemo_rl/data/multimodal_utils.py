@@ -4,11 +4,14 @@ import torch
 
 
 class PackedTensor:
-    """Wrapper around a list of torch tensors that contains multimodal data.
+    """Wrapper around a list of torch tensors and a dimension along which to pack the tensors.
 
-    This class is used to wrap a list of tensors containing multimodal data along with a `dim_to_pack` parameter.
-    Since multimodal data can be packed along different dimensions, `dim_to_pack` is used to specify the dimension along which to pack the multimodal data tensors.
-    The multimodal data can be returned as a single packed tensor by calling `as_tensor` which will concatenate the tensors along the `dim_to_pack` dimension.
+    This class is used to wrap a list of tensors along with a `dim_to_pack` parameter.
+    It can be used for data that can be packed along different dimensions (such as multimodal data).
+
+    `dim_to_pack` is used to specify the dimension along which to pack the tensors.
+
+    The list of tensors can be returned as a single packed tensor by calling `as_tensor` which will concatenate the tensors along the `dim_to_pack` dimension.
     """
 
     def __init__(self, tensors: Union[torch.Tensor, list[torch.Tensor]], dim_to_pack: int) -> None:
@@ -29,7 +32,7 @@ class PackedTensor:
         return torch.cat(self.tensors, dim=self.dim_to_pack).to(device)
     
     def __len__(self) -> int:
-        # this is the number of multimodal tensors in this data wrapper
+        # this is the number of tensors in this data wrapper
         return len(self.tensors)
     
     def to(self, device: str | torch.device) -> "PackedTensor":
@@ -63,7 +66,7 @@ class PackedTensor:
         ```
         """
         dim_to_packs = [batch.dim_to_pack for batch in from_packed_tensors]
-        assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
+        assert len(set(dim_to_packs)) == 1, "All packed tensors must have the same dim_to_pack"
         # concatenate the tensors
         tensors = []
         for packed_tensor in from_packed_tensors:
@@ -95,7 +98,7 @@ class PackedTensor:
         ```
         """
         dim_to_packs = [batch.dim_to_pack for batch in from_packed_tensors]
-        assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
+        assert len(set(dim_to_packs)) == 1, "All packed tensors must have the same dim_to_pack"
         tensors = [p.as_tensor() for p in from_packed_tensors]
         return cls(tensors, from_packed_tensors[0].dim_to_pack)
 
