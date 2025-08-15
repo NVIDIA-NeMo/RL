@@ -1,9 +1,6 @@
 from transformers import PreTrainedTokenizerBase
-from typing import Union, Optional, overload
+from typing import Union, Optional
 import torch
-import numpy as np
-from collections import defaultdict
-import re
 
 
 class PackedTensor:
