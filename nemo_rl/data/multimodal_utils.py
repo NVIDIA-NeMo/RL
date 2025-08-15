@@ -75,12 +75,12 @@ class PackedTensor:
         return cls(tensors, dim_to_pack)
 
     @classmethod
-    def from_list(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
-        """Creates a PackedTensor from a list of PackedTensor objects.
+    def flattened_concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
+        """Given a list of PackedTensor objects, flattens each PackedTensor and then concatenates them into a single PackedTensor.
 
-        Each PackedTensor is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedTensor.
+        Each PackedTensor is first flattened by packing along the PackedTensor's `dim_to_pack` dimension. Then, the resulting flattened tensors are used to create a new PackedTensor.
 
-        This is different from concat which simply extends the underlying list of tensors. This is important because the `slice` and `__len__` methods operate on the underlying list of tensors. Note, however, that calling `as_tensor` on the resulting PackedTensor will result in the same tensor as `concat`.
+        This is different from `PackedTensor.concat` which simply extends the underlying list of tensors. This is important because the `slice` and `__len__` methods operate on the underlying list of tensors. Note, however, that calling `as_tensor` on the resulting PackedTensor will result in the same tensor as `concat`.
 
         Each batch must have the same dim_to_pack.
 
@@ -90,7 +90,7 @@ class PackedTensor:
         >>> from nemo_rl.data.multimodal_utils import PackedTensor
         >>> p1 = PackedTensor([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
         >>> p2 = PackedTensor([torch.tensor([7, 8, 9])], dim_to_pack=0)
-        >>> p3 = PackedTensor.from_list([p1, p2])
+        >>> p3 = PackedTensor.flattened_concat([p1, p2])
         >>> p3.tensors
         [tensor([1, 2, 3, 4, 5, 6]), tensor([7, 8, 9])]
         >>> p3.as_tensor()
