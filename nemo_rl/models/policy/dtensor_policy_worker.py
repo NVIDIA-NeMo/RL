@@ -21,8 +21,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
-from accelerate import init_empty_weights
 import torch
+from accelerate import init_empty_weights
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -38,13 +38,12 @@ from torch.distributed.tensor.experimental._attention import (
 )
 from transformers import (
     AutoConfig,
-    AutoProcessor,
     AutoModelForSequenceClassification,
+    AutoProcessor,
     AutoTokenizer,
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-from nemo_rl.models.policy.utils import resolve_model_class
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -72,6 +71,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     is_vllm_v1_engine_enabled,
+    resolve_model_class,
     sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (

@@ -15,8 +15,8 @@
 
 import pytest
 import torch
-from transformers import AutoTokenizer, AutoProcessor
 from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
 
 from nemo_rl.data.hf_datasets import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec

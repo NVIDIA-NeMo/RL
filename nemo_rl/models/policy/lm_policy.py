@@ -18,8 +18,8 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import ray
-from transformers import PreTrainedTokenizerBase, AutoProcessor
 from ray.util.queue import Queue as RayQueue
+from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (

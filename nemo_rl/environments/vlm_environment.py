@@ -14,11 +14,11 @@
 import contextlib
 import io
 import logging
-from typing import Any, Optional, TypedDict, Callable, List
+from functools import partial
+from typing import Any, Callable, List, Optional, TypedDict
 
 import ray
 import torch
-from functools import partial
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
@@ -29,14 +29,14 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.metrics import (
     calculate_pass_rate_per_prompt,
 )
-from nemo_rl.environments.utils import chunk_list_to_workers
 from nemo_rl.environments.rewards import (
-    format_reward,
-    exact_answer_alphanumeric_reward,
     bbox_giou_reward,
     combine_reward_functions,
+    exact_answer_alphanumeric_reward,
+    format_reward,
     math_expression_reward,
 )
+from nemo_rl.environments.utils import chunk_list_to_workers
 
 
 class VLMEnvConfig(TypedDict):

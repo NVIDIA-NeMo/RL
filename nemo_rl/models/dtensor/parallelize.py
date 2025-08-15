@@ -42,14 +42,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLForConditionalGeneration,
-)
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLForConditionalGeneration,
-)
+from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
 from transformers.models.llava_next.modeling_llava_next import (
     LlavaNextForConditionalGeneration,
@@ -63,7 +56,14 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration,
 )
-from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
+from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
+)
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs

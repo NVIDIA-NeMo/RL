@@ -13,12 +13,13 @@
 # limitations under the License.
 
 from numpy.testing import assert_allclose
+
 from nemo_rl.environments.rewards import (
-    math_expression_reward,
-    format_reward,
-    exact_answer_alphanumeric_reward,
     bbox_giou_reward,
     combine_reward_functions,
+    exact_answer_alphanumeric_reward,
+    format_reward,
+    math_expression_reward,
 )
 
 

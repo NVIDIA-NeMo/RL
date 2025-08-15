@@ -15,14 +15,13 @@ import pytest
 import torch
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
     SequencePackingArgs,
-)
-from nemo_rl.data.multimodal_utils import (
-    PackedTensor,
 )
 
 

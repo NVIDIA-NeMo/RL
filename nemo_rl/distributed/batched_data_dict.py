@@ -29,14 +29,13 @@ from typing import (
 import torch
 from typing_extensions import Self
 
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+)
 from nemo_rl.data.packing import get_packer
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
-)
-
-from nemo_rl.data.multimodal_utils import (
-    PackedTensor,
 )
 
 DictT = TypeVar("DictT", bound=Mapping[str, Any])

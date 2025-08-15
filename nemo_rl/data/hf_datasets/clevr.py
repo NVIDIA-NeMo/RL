@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import io
 from typing import Any, Optional
 
 from datasets import load_dataset
+from PIL import Image
 
 from nemo_rl.data.interfaces import TaskDataSpec
-from PIL import Image
-import io
-import base64
 
 
 def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:

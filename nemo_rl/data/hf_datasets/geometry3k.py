@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Any, Optional
+
 from datasets import load_dataset
 
-from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.hf_datasets.clevr import pil_to_base64
+from nemo_rl.data.interfaces import TaskDataSpec
 
 
 def format_geometry3k_dataset(

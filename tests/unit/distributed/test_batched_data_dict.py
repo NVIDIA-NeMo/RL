@@ -14,12 +14,12 @@
 import pytest
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
     SequencePackingArgs,
 )
-from nemo_rl.data.multimodal_utils import PackedTensor
 
 
 def test_shard_by_batch_size_basic():

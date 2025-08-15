@@ -18,10 +18,15 @@ from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase, AutoProcessor
 
 # hotfix for PixtralImageProcessor
-from transformers import PixtralImageProcessor, PixtralImageProcessorFast
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PixtralImageProcessor,
+    PixtralImageProcessorFast,
+    PreTrainedTokenizerBase,
+)
 
 PixtralImageProcessorFast.model_input_names.append("image_sizes")
 PixtralImageProcessor.model_input_names.append("image_sizes")

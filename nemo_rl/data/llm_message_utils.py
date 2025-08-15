@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Any, Optional, cast, Union
+from typing import Any, Optional, Union, cast
 
 import torch
 from datasets import Dataset
@@ -23,11 +23,11 @@ from nemo_rl.data.interfaces import (
     LLMMessageLogType,
     TaskDataSpec,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     get_multimodal_keys_from_processor,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase

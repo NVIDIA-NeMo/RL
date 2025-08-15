@@ -14,19 +14,19 @@
 
 import importlib
 import os
-from typing import Any
 from collections import defaultdict
+from typing import Any
 
 import torch
 from torch import nn
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForTextToWaveform,
 )
+
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 # an automodel factory for loading the huggingface models from correct class
 AUTOMODEL_FACTORY = defaultdict(lambda: AutoModelForCausalLM)

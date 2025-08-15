@@ -15,7 +15,7 @@ from typing import Any, Optional, Union
 
 import torch
 from datasets import Dataset
-from transformers import PreTrainedTokenizerBase, AutoProcessor
+from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
     DatumSpec,

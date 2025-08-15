@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Union
-from datasets import load_dataset
-from pathlib import Path
-
-from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.hf_datasets.clevr import pil_to_base64
-from PIL import Image
-import random
-
 import os
-import requests
+import random
 import zipfile
+from pathlib import Path
+from typing import Any, Optional, Union
+
+import requests
+from datasets import load_dataset
+from PIL import Image
 from tqdm import tqdm  # Using tqdm for progress bar, install with: pip install tqdm
+
+from nemo_rl.data.hf_datasets.clevr import pil_to_base64
+from nemo_rl.data.interfaces import TaskDataSpec
 
 
 def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
