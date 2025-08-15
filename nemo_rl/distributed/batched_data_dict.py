@@ -93,10 +93,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         '''
         multimodal_dict = {}
         for k, v in self.data.items():
-            if isinstance(v, PackedMultimodalData):
-                multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
-            elif isinstance(v, list) and isinstance(v[0], PackedMultimodalData):
-                assert len(v) > 0, "PackedMultimodalData list cannot be empty"
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedMultimodalData):
                 multimodal_dict[k] = PackedMultimodalData.concat(v).as_tensor(device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v
