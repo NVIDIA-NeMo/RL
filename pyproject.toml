@@ -59,6 +59,7 @@ automodel = [
     "causal-conv1d",
 ]
 nemo_gym = [
+    # TODO: @bxyu get some feedback from NeMo RL folks on how to improve this setup. Perhaps submodule?
     # Currently, this is for internal exploration. Eventually it will be released publicly and we will update this reference.
     # Also, right now, the user needs to individually install this repository with their Gitlab PAT
     # e.g. uv pip install "nemo_gym @ git+https://{gitlab username}:{gitlab PAT}@gitlab-master.nvidia.com/bxyu/nemo-gym.git@bxyu/nemo-rl-integration"
