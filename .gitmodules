@@ -1,7 +1,7 @@
 [submodule "3rdparty/NeMo"]
 	path = 3rdparty/NeMo-workspace/NeMo
 	url = https://github.com/NVIDIA/NeMo.git
-	branch = https://github.com/NVIDIA/NeMo/tree/ashors/rl-qwen3-export
+	branch = pjin/ashors/rl-qwen3-export
 	shallow = true
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
