@@ -11,7 +11,7 @@ class PackedMultimodalData:
     The multimodal data can be returned as a single packed tensor by calling `as_tensor` which will concatenate the tensors along the `dim_to_pack` dimension.
     """
 
-    def __init__(self, tensors: Union[torch.Tensor, list[torch.Tensor]], dim_to_pack: int = None) -> None:
+    def __init__(self, tensors: Union[torch.Tensor, list[torch.Tensor]], dim_to_pack: int) -> None:
         assert tensors is not None, "Input tensors to PackedMultimodalData cannot be None"
 
         if isinstance(tensors, torch.Tensor):
