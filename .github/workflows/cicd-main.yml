@@ -114,6 +114,17 @@ jobs:
       pr_number: ${{ github.event.number }}
       head_sha: ${{ github.event.pull_request.head.sha }}
 
+  automodel-integration-check:
+    name: Check if changes in nemo-automodel are in sync with nemo-rl and vice versa
+    needs: [pre-flight]
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/_automodel_integration_check.yml
+    with:
+      base_ref: ${{ github.base_ref }}
+      head_ref: ${{ github.head_ref }}
+      pr_number: ${{ github.event.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+
   lint-check:
     name: Lint check
     needs: [pre-flight]
