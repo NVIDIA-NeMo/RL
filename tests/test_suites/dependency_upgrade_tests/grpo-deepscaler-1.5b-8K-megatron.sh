@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-source $SCRIPT_DIR/common.env
+source $SCRIPT_DIR/../llm/common.env
 
 # ===== BEGIN CONFIG =====
 MODEL_NAME=${MODEL_NAME:-"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"}
@@ -29,7 +29,7 @@ uv run examples/run_grpo_math.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
-    logger.wandb.name=$EXP_NAME-$MODEL_NAME \
+    logger.wandb.name=upgrade-$EXP_NAME-$MODEL_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \

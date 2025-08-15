@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-source $SCRIPT_DIR/common.env
+source $SCRIPT_DIR/../llm/common.env
 
 # ===== BEGIN CONFIG =====
 MODEL_NAME=${MODEL_NAME:-"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"}
@@ -22,7 +22,7 @@ uv run examples/run_grpo_math.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
-    logger.wandb.name=$EXP_NAME-$MODEL_NAME \
+    logger.wandb.name=upgrade-$EXP_NAME-$MODEL_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
@@ -41,5 +41,5 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/token_mult_prob_error"], exclude_outliers=5) < 1.05'
+        'mean(data["train/token_mult_prob_error"], exclude_outliers=3) < 1.05'
 fi
