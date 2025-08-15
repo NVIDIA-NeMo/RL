@@ -60,6 +60,10 @@ automodel = [
 ]
 nemo_gym = [
     # Currently, this is for internal exploration. Eventually it will be released publicly and we will update this reference.
+    # Also, right now, the user needs to individually install this repository with their Gitlab PAT
+    # e.g. uv pip install "nemo_gym @ git+https://{gitlab username}:{gitlab PAT}@gitlab-master.nvidia.com/bxyu/nemo-gym.git@bxyu/nemo-rl-integration"
+    # and source venvs/nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker/bin/activate
+    # and run the same uv pip install command after the first training fail.
     "nemo_gym @ git+https://gitlab-master.nvidia.com/bxyu/nemo-gym.git@bxyu/nemo-rl-integration",
 ]
 vllm = [
