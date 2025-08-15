@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TypedDict
+from typing import List, TypedDict
+
+from pathlib import Path
+
+import subprocess
 
 import ray
 
@@ -19,23 +23,37 @@ from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
 
-class MathEnvConfig(TypedDict):
+class NeMoGymConfig(TypedDict):
+    config_paths: List[str]
     num_workers: int
 
 
+@ray.remote
+def start_nemo_gym(cfg: NeMoGymConfig):
+    from nemo_gym.cli import run
+
+    RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
+    assert __file__.endswith(RELATIVE_PATH)
+
+    run(
+        dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute(),
+        config_paths=cfg["config_paths"],
+    )
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class NeMoGymEnvironment(EnvironmentInterface):
+class NeMoGym(EnvironmentInterface):
     """
     This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo Gym that hooks into the existing NeMo RL resource management via ray.
     So there is still one source of truth for resource management in NeMo RL.
     """
-    def __init__(self, cfg: MathEnvConfig):
+    def __init__(self, cfg: NeMoGymConfig):
         self.cfg = cfg
 
         self.workers = [
-            worker_cls.options(  # type: ignore # (decorated with @ray.remote)
+            start_nemo_gym.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.NEMO_GYM}
-            ).remote()
+            ).remote(self.cfg)
             for _ in range(self.cfg["num_workers"])
         ]
 
