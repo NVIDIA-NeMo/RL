@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, TypedDict
+from typing import Any, Dict, List, TypedDict
 
 from pathlib import Path
 
-import subprocess
+from omegaconf import OmegaConf, open_dict
 
 import ray
 
@@ -24,20 +24,26 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 
 
 class NeMoGymConfig(TypedDict):
-    config_paths: List[str]
-    num_workers: int
+    model_name: str
+    base_urls: List[str]
+    initial_global_config_dict: Dict[str, Any]
 
 
 @ray.remote
-def start_nemo_gym(cfg: NeMoGymConfig):
+def start_nemo_gym(cfg: NeMoGymConfig, nemo_rl_openai_base_url: str):
     from nemo_gym.cli import run
 
     RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
     assert __file__.endswith(RELATIVE_PATH)
 
+    initial_global_config_dict = cfg["initial_global_config_dict"]
+    with open_dict(initial_global_config_dict):
+        initial_global_config_dict["nemo_rl_openai_model_name"] = cfg["model_name"]
+        initial_global_config_dict["nemo_rl_openai_base_url"] = nemo_rl_openai_base_url
+
     run(
         dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute(),
-        config_paths=cfg["config_paths"],
+        initial_global_config_dict=initial_global_config_dict,
     )
 
 
@@ -54,7 +60,7 @@ class NeMoGym(EnvironmentInterface):
             start_nemo_gym.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.NEMO_GYM}
             ).remote(self.cfg)
-            for _ in range(self.cfg["num_workers"])
+            for _ in range(self.cfg["base_urls"])
         ]
 
     def shutdown(self) -> None:

@@ -1,0 +1,14 @@
+simple_agent_chat_completions:
+  responses_api_agents:
+    simple_agent_chat_completions:
+      entrypoint: app.py
+      model_server:
+        type: responses_api_models
+        name: openai_model
+openai_model:
+  responses_api_models:
+    openai_model:
+      entrypoint: app.py
+      openai_base_url: ${nemo_rl_openai_base_url}
+      openai_api_key: dummy_key
+      openai_model_name: ${nemo_rl_openai_model_name}
