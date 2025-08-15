@@ -254,6 +254,22 @@ def test_multimodal_specific_functionality():
     if torch.cuda.is_available():
         mm_data = mm_data.to("cuda")
         assert mm_data.tensors[0].device.type == "cuda"
+
+    # images differ along a different dimension
+    image_tensors = [torch.randn(3, 128, 128 + i) for i in range(2)]
+
+    mm_batch = PackedTensor(image_tensors, dim_to_pack=0)
+    with pytest.raises(RuntimeError):
+        batch_tensor = mm_batch.as_tensor()
+
+    # check for packing on correct dimension
+    image_tensors = [torch.randn(3 + 10**i, 128, 128) for i in range(2)]
+    mm_batch = PackedTensor(image_tensors, dim_to_pack=0)
+    mm_tensor = mm_batch.as_tensor()
+
+    expected_dim = sum([3 + 10**i for i in range(2)])
+    assert mm_tensor.shape == (expected_dim, 128, 128)
+
     
 def test_get_multimodal_dict():
     """Test the get_multimodal_dict functionality."""
