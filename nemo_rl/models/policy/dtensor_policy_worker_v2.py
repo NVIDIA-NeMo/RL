@@ -12,34 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import gc
 import itertools
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional, Set, Union, cast
+from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
 import torch
 from accelerate import init_empty_weights
+from nemo_automodel import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForSequenceClassification,
+)
+from nemo_automodel.components._transformers.utils import sliding_window_overwrite
+from nemo_automodel.components.distributed.cp_utils import (
+    create_context_parallel_ctx,
+    get_train_context,
+)
+from nemo_automodel.components.distributed.grad_utils import (
+    clip_grad_by_total_norm_,
+    get_grad_norm,
+)
+from nemo_automodel.components.distributed.parallelizer import (
+    fsdp2_strategy_parallelize,
+    unshard_fsdp2_model,
+)
+from nemo_automodel.components.distributed.tensor_utils import (
+    get_cpu_state_dict,
+    to_local_if_dtensor,
+)
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
 from torch.distributed.fsdp import (
-    FSDPModule,
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
-from torch.distributed.tensor.experimental import context_parallel
-from torch.distributed.tensor.experimental._attention import (
-    set_rotate_method,
-)
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
     AutoTokenizer,
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
@@ -48,12 +64,6 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
-from nemo_rl.models.dtensor.parallelize import (
-    _parallelize_model,
-    clip_grad_by_total_norm_,
-    get_grad_norm,
-    to_local_if_dtensor,
-)
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -71,7 +81,6 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     is_vllm_v1_engine_enabled,
-    sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -80,58 +89,10 @@ from nemo_rl.utils.native_checkpoint import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
-@contextmanager
-def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
-    """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
-    try:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.unshard()
-        yield
-    finally:
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.reshard()
-
-
-@torch.no_grad()
-def get_cpu_state_dict(
-    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
-    pin_memory: bool = False,
-) -> dict[str, torch.Tensor]:
-    """Copy the state dict generator to CPU memory.
-
-    Args:
-        state_generator (Iterable[tuple[str, Union[torch.Tensor, DTensor]]]):
-            An iterable that yields (key, tensor) pairs from a model state.
-        pin_memory (bool, optional):
-            Whether to allocate the CPU tensors in pinned memory for faster GPU transfer.
-            Defaults to False.
-
-    Returns:
-        dict[str, torch.Tensor]: A dictionary mapping parameter names to CPU tensors.
-    """
-    new_state_dict = {}
-    for k, v in state_generator:
-        val = to_local_if_dtensor(v)
-
-        if len(val.shape) == 0:
-            new_state_dict[k] = val.cpu()
-        else:
-            cpu_tensor = torch.empty(
-                *val.shape, device="cpu", pin_memory=pin_memory, dtype=val.dtype
-            )
-            cpu_tensor.copy_(val, non_blocking=True)
-            new_state_dict[k] = cpu_tensor
-
-    torch.cuda.synchronize()
-    return new_state_dict
-
-
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
-class DTensorPolicyWorker:
+class DTensorPolicyWorkerV2:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -221,7 +182,7 @@ class DTensorPolicyWorker:
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
-                model_class = AutoModelForSequenceClassification
+                model_class = NeMoAutoModelForSequenceClassification
                 if model_config.num_labels != 1:
                     # For Bradley-Terry reward models, the linear head has a single output.
                     # In the transformers library, the default setting for model_config.num_labels is 2
@@ -239,7 +200,7 @@ class DTensorPolicyWorker:
             else:
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
-            model_class = AutoModelForCausalLM
+            model_class = NeMoAutoModelForCausalLM
 
         full_state_dict = None
         if self.rank == 0:
@@ -250,6 +211,7 @@ class DTensorPolicyWorker:
                 trust_remote_code=True,
                 config=model_config,
             )
+
             full_state_dict = model.state_dict()
             del model
 
@@ -260,6 +222,9 @@ class DTensorPolicyWorker:
         with init_empty_weights():
             self.model = model_class.from_config(
                 model_config,
+                attn_implementation="flash_attention_2"
+                if self.enable_seq_packing
+                else None,
                 trust_remote_code=True,
             )
 
@@ -319,17 +284,25 @@ class DTensorPolicyWorker:
         self.cp_size = cp_size
         self.device_mesh = device_mesh
 
-        self.model = _parallelize_model(
+        self.model = fsdp2_strategy_parallelize(
             self.model,
-            self.dp_cp_mesh,
-            self.tp_mesh,
-            param_dtype=self.dtype,
+            device_mesh=self.device_mesh,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=self.dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+            ),
+            offload_policy=CPUOffloadPolicy(pin_memory=False)
+            if self.cpu_offload
+            else OffloadPolicy(),
             sequence_parallel=sequence_parallel_enabled,
-            cpu_offload=self.cpu_offload,
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
             ],
-            custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            dp_replicate_mesh_name="dp",
+            dp_shard_cp_mesh_name="cp",
+            tp_mesh_name="tp",
         )
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
@@ -430,38 +403,6 @@ class DTensorPolicyWorker:
         )
         self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
-    @staticmethod
-    def create_context_parallel_ctx(
-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
-        cp_buffers: list[torch.Tensor],
-        cp_seq_dims: list[int],
-        cp_no_restore_buffers: Set[torch.Tensor],
-        cp_rotate_method: Optional[str] = None,
-    ):
-        """Create a context parallel context.
-
-        Args:
-            cp_mesh (DeviceMesh): The device mesh for context parallel.
-            cp_buffers (list[torch.Tensor]): The buffers for context parallel.
-            cp_seq_dims (list[int]): The sequence dimensions for context parallel.
-            cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
-            cp_rotate_method (str): The rotation method for context parallel, such as "allgather" or "addtoall".
-        """
-        if cp_rotate_method is not None:
-            set_rotate_method(cp_rotate_method)
-
-        return context_parallel(
-            cp_mesh,
-            buffers=cp_buffers,
-            buffer_seq_dims=cp_seq_dims,
-            no_restore_buffers=cp_no_restore_buffers,
-        )
-
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
-
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         # Apply temperature scaling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
@@ -471,27 +412,6 @@ class DTensorPolicyWorker:
             if not is_vllm_v1_engine_enabled():
                 logits.div_(self.cfg["generation"]["temperature"])
         return logits
-
-    @staticmethod
-    @contextlib.contextmanager
-    def train_context(cp_context: Optional[Generator[None, None, None]] = None):
-        with contextlib.ExitStack() as stack:
-            if cp_context is not None:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-                # TODO (xilunwu): support cuDNN backend
-
-                stack.enter_context(
-                    sdpa_kernel(
-                        [
-                            SDPBackend.FLASH_ATTENTION,
-                            SDPBackend.EFFICIENT_ATTENTION,
-                        ]
-                    )
-                )
-
-                stack.enter_context(cp_context)
-
-            yield
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
@@ -677,14 +597,14 @@ class DTensorPolicyWorker:
                         )
 
                         # Create context parallel context
-                        context_parallel_ctx = self.create_context_parallel_ctx(
+                        context_parallel_ctx = create_context_parallel_ctx(
                             cp_mesh=self.cp_mesh,
                             cp_buffers=cp_buffers,
                             cp_seq_dims=[sequence_dim] * len(cp_buffers),
                             cp_no_restore_buffers=set(cp_buffers),
                         )
 
-                    with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with get_train_context(False, False, context_parallel_ctx)():
                         with torch.autocast(device_type="cuda", dtype=self.dtype):
                             model_args = dict(
                                 input_ids=input_ids,
@@ -879,7 +799,6 @@ class DTensorPolicyWorker:
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
-        logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
@@ -977,14 +896,14 @@ class DTensorPolicyWorker:
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
-                    context_parallel_ctx = self.create_context_parallel_ctx(
+                    context_parallel_ctx = create_context_parallel_ctx(
                         cp_mesh=self.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
 
-                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                with get_train_context(False, False, context_parallel_ctx)():
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         outputs = self.model(
                             input_ids=input_ids,
@@ -1036,48 +955,21 @@ class DTensorPolicyWorker:
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
 
+                        logits = logits.to(torch.float32)
                         token_logprobs = get_logprobs_from_vocab_parallel_logits(
                             logits,
                             input_ids_dtensor,
                             seq_index_tensor,
-                            chunk_size=logprob_chunk_size,
                         )
 
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
+                            logits = logits.to(torch.float32)
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                                logits,
-                                input_ids,
-                                chunk_size=logprob_chunk_size,
+                                logits, input_ids
                             )
                         else:
-                            if logprob_chunk_size is not None:
-                                logits_seq_len = int(logits.shape[1])
-                                num_chunks = (
-                                    logits_seq_len + logprob_chunk_size - 1
-                                ) // logprob_chunk_size
-                                chunked_log_probs = []
-                                for chunk_idx in range(num_chunks):
-                                    chunk_start = chunk_idx * logprob_chunk_size
-                                    chunk_end = min(
-                                        logits_seq_len,
-                                        (chunk_idx + 1) * logprob_chunk_size,
-                                    )
-                                    chunk_logits = logits[
-                                        :, chunk_start:chunk_end, :
-                                    ].to(torch.float32)
-                                    log_probs = torch.nn.functional.log_softmax(
-                                        chunk_logits, dim=-1
-                                    )
-                                    chunked_log_probs.append(log_probs)
-                                log_probs = torch.cat(chunked_log_probs, dim=1)
-                                del chunked_log_probs
-                            else:
-                                logits = logits.to(torch.float32)
-                                log_probs = torch.nn.functional.log_softmax(
-                                    logits, dim=-1
-                                )
                             # Extract logprobs for each token in the sequence by gathering the logprob
                             # corresponding to the next token at each position
                             # Input shapes:
@@ -1085,12 +977,13 @@ class DTensorPolicyWorker:
                             #   token_ids: [batch_size, sequence_length] - actual tokens
                             # Output shape: [batch_size, sequence_length] - logprob of each token given previous
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
+                            logits = outputs.logits.to(torch.float32)
+                            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]
                             token_logprobs = log_probs.gather(
                                 dim=-1, index=next_tokens.unsqueeze(-1)
                             ).squeeze(-1)
-                            del log_probs
 
                 del outputs, logits
 

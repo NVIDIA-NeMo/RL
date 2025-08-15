@@ -21,8 +21,8 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
-from nemo_rl.models.dtensor.parallelize import (
+from nemo_rl.distributed.model_utils import (
+    from_parallel_logits_to_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
 
