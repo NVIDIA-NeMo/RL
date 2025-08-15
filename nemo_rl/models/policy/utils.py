@@ -160,6 +160,9 @@ def configure_expandable_segments() -> None:
         # Add expandable_segments to existing configuration
         if existing_conf:
             # Append to existing configuration
+
+            # max_split_size_mb:64 reduces fragmentation, enables 12B models
+            # with 12K context to fit on a single node
             new_conf = f"{existing_conf},expandable_segments:True"
         else:
             # Set new configuration
