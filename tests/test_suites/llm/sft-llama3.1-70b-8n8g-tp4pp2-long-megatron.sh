@@ -3,11 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
-STEPS_PER_RUN=500
-MAX_STEPS=500
+NUM_NODES=8
+STEPS_PER_RUN=300
+MAX_STEPS=300
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=15
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -31,11 +31,12 @@ uv run examples/run_sft.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# TODO: the memory check is known to OOM. see https://github.com/NVIDIA-NeMo/RL/issues/263
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 2.4' \
-        'data["train/loss"]["500"] < 0.5' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 25'
+        'data["train/loss"]["1"] < 0.55' \
+        'data["train/loss"]["300"] < 0.285' \
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 70' \
+        'mean(data["timing/train/total_step_time"], 2) < 20'
 fi
-

@@ -1,50 +1,40 @@
-dpo:
+sft:
   max_num_epochs: 1
-  max_num_steps: 20
-  val_period: 50
-  val_batches: 16
+  max_num_steps: 250
+  val_period: 500
+  val_batches: 8
   val_global_batch_size: 32
   val_micro_batch_size: 1
-  val_at_start: false
+  val_at_start: true
   seed: 42
-
-  reference_policy_kl_penalty: 0.05
-  preference_average_log_probs: False
-  sft_average_log_probs: ${.preference_average_log_probs}
-  preference_loss_weight: 1
-  sft_loss_weight: 0.01
-
 checkpointing:
-  enabled: false #true
-  checkpoint_dir: "results/dpo"
-  metric_name: "val_loss"
+  enabled: true
+  checkpoint_dir: results/sft-llama3.1-8b-instruct-1n8g-megatron
+  metric_name: val_loss
   higher_is_better: false
   keep_top_k: 3
-  save_period: 10000
+  save_period: 100
   checkpoint_must_save_by: null
-
 policy:
-  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  model_name: meta-llama/Llama-3.1-8B
   tokenizer:
-    name: ${policy.model_name}
-  train_global_batch_size: 256
-  train_micro_batch_size: 1
-  max_total_sequence_length: 2048
-  precision: "bfloat16"
+    name: meta-llama/Llama-3.1-8B-Instruct
+  train_global_batch_size: 512
+  train_micro_batch_size: 2
+  max_total_sequence_length: 4096
+  precision: bfloat16
   dtensor_cfg:
     enabled: false
-
   dynamic_batching:
     enabled: false
-
   sequence_packing:
     enabled: false
-
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
-  max_grad_norm: 1.0
-
+  max_grad_norm: 1
   optimizer: null
-
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
@@ -57,9 +47,9 @@ policy:
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    sequence_parallel: true
+    sequence_parallel: false
     freeze_moe_router: false
-    moe_router_dtype: "fp64"
+    moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
     #gives ~20% training perf speedup with sequence packing 
@@ -67,9 +57,9 @@ policy:
     
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6 #4.0e-5
-      min_lr: 5.0e-6 #4.0e-5
-      weight_decay: 0.1
+      lr: 2.0e-5
+      min_lr: 1.99999e-5
+      weight_decay: 0.01
       bf16: true
       fp16: false
       params_dtype: "float32"
@@ -77,7 +67,7 @@ policy:
       #adam
       adam_beta1: 0.9
       adam_beta2: 0.98
-      adam_eps: 1e-8
+      adam_eps: 1e-5
 
       #sgd
       sgd_momentum: 0.9
@@ -92,10 +82,10 @@ policy:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
-      lr_decay_style: "linear"
-      lr_decay_iters: 1000000000
-      lr_warmup_iters: 2
-      lr_warmup_init: 0.00000001
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 50
+      lr_warmup_init: 1.9999e-65
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -104,25 +94,32 @@ policy:
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
 
-data:
-  dataset_name: "HelpSteer3"
-  max_input_seq_length: ${policy.max_total_sequence_length}
-  shuffle: true
 
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "openmathinstruct2"
+  prompt_file: examples/prompts/math.txt
+  split: "train_1M"
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: true
+  output_key: 'generated_solution'
+  shuffle: true
+  seed: 42
 logger:
-  log_dir: "logs"
+  log_dir: logs/sft-llama3.1-8b-1n8g-megatron
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl
-    name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1
-  tensorboard: {}
+    name: sft-llama3.1-8b-1n8g-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-dev-openmathinstruct2
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
-
 cluster:
   gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 1

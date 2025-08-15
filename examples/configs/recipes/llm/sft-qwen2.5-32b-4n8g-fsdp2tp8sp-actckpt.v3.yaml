@@ -13,7 +13,7 @@ checkpointing:
   metric_name: val_loss
   higher_is_better: false
   keep_top_k: 3
-  save_period: 10
+  save_period: 100
   checkpoint_must_save_by: null
 policy:
   model_name: Qwen/Qwen2.5-32B
@@ -53,11 +53,14 @@ policy:
       foreach: false
       fused: false
 data:
-  max_input_seq_length: 16000
-  dataset_name: squad
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "openmathinstruct2"
+  prompt_file: examples/prompts/math.txt
+  split: "train_1M"
   add_bos: true
   add_eos: true
-  add_generation_prompt: false
+  add_generation_prompt: true
+  output_key: 'generated_solution'
   shuffle: true
 logger:
   log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
@@ -65,12 +68,11 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
-  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
     name: sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
   tensorboard:
-    log_dir: tb_logs-sft-dev-squad
+    log_dir: tb_logs-sft-dev-openmathinstruct2
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
