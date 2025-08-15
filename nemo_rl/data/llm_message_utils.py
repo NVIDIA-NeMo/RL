@@ -98,7 +98,6 @@ def message_log_to_flat_messages(
                 raise
         elif result[key] and isinstance(result[key][0], PackedMultimodalData):
             try:
-                # returning as item because we are probably not going to shard this batch into individual items
                 concat[key] = PackedMultimodalData.concat(result[key])  
             except Exception as e:
                 import traceback

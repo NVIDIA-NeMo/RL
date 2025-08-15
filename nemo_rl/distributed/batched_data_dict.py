@@ -94,7 +94,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedMultimodalData):
-                multimodal_dict[k] = PackedMultimodalData.from_list_as_tensor(v, device=device) if as_tensors else v
+                multimodal_dict[k] = PackedMultimodalData.concat_as_tensor(v, device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v
         
@@ -127,8 +127,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list: list[Any] | torch.Tensor = [
                     item for sublist in list_of_tensors for item in sublist
                 ]
-            elif isinstance(list_of_tensors[0], PackedMultimodalData):
-                tensor_or_list = PackedMultimodalData.concat(list_of_tensors)
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
@@ -801,8 +799,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.data.items():
             if torch.is_tensor(v):
                 selected_batch[k] = v[indices]
-            elif isinstance(v, PackedMultimodalData):
-                selected_batch[k] = v.slice(indices)
             elif isinstance(v, list):
                 selected_batch[k] = [v[i] for i in indices]
             else:

@@ -1,9 +1,6 @@
 from transformers import PreTrainedTokenizerBase
-from typing import Union, Optional, overload
+from typing import Union, Optional
 import torch
-import numpy as np
-from collections import defaultdict
-import re
 
 
 class PackedMultimodalData:
@@ -60,7 +57,7 @@ class PackedMultimodalData:
         return cls(tensors, dim_to_pack)
 
     @classmethod
-    def from_list_as_tensor(cls, packed_datas: list["PackedMultimodalData"], device: Optional[torch.device] = None) -> torch.Tensor:
+    def concat_as_tensor(cls, packed_datas: list["PackedMultimodalData"], device: Optional[torch.device] = None) -> torch.Tensor:
         return cls.concat(packed_datas).as_tensor(device)
 
 

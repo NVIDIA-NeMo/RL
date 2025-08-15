@@ -70,14 +70,14 @@ def test_shard_by_batch_size_with_packed_data():
     assert torch.equal(shards[0]["text_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
     assert isinstance(shards[0]["image_features"], list)
     assert len(shards[0]["image_features"]) == 2
-    assert PackedMultimodalData.from_list_as_tensor(shards[0]["image_features"]).shape == (2 + 5, 3, 128, 128)
+    assert PackedMultimodalData.concat_as_tensor(shards[0]["image_features"]).shape == (2 + 5, 3, 128, 128)
     assert shards[0]["labels"] == [1, 2]
     
     # Verify second shard
     assert torch.equal(shards[1]["text_ids"], torch.tensor([[7, 8, 9], [10, 11, 12]]))
     assert isinstance(shards[1]["image_features"], list)
     assert len(shards[1]["image_features"]) == 2
-    assert PackedMultimodalData.from_list_as_tensor(shards[1]["image_features"]).shape == (8 + 11, 3, 128, 128)
+    assert PackedMultimodalData.concat_as_tensor(shards[1]["image_features"]).shape == (8 + 11, 3, 128, 128)
     assert shards[1]["labels"] == [3, 4]
 
 def test_truncate_tensors_with_packed_data():
