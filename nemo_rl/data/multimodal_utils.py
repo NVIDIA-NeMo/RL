@@ -6,7 +6,7 @@ from collections import defaultdict
 import re
 
 
-class PackedMultimodalData:
+class PackedTensor:
     """Wrapper around a list of torch tensors that contains multimodal data.
 
     This class is used to wrap a list of tensors containing multimodal data along with a `dim_to_pack` parameter.
@@ -15,15 +15,15 @@ class PackedMultimodalData:
     """
 
     def __init__(self, tensors: Union[torch.Tensor, list[torch.Tensor]], dim_to_pack: int = None) -> None:
-        assert tensors is not None, "Input tensors to PackedMultimodalData cannot be None"
+        assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
         if isinstance(tensors, torch.Tensor):
             self.tensors: list[torch.Tensor] = [tensors]
         elif isinstance(tensors, list):
-            assert len(tensors) > 0, "Input tensors to PackedMultimodalData must be a non-empty list"
+            assert len(tensors) > 0, "Input tensors to PackedTensor must be a non-empty list"
             self.tensors: list[torch.Tensor] = tensors
         else:
-            raise ValueError(f"Unsupported type for input tensors to PackedMultimodalData: {type(tensors)}")
+            raise ValueError(f"Unsupported type for input tensors to PackedTensor: {type(tensors)}")
         self.dim_to_pack = dim_to_pack 
 
     def as_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -35,48 +35,48 @@ class PackedMultimodalData:
         # this is the number of multimodal tensors in this data wrapper
         return len(self.tensors)
     
-    def to(self, device: str | torch.device) -> "PackedMultimodalData":
+    def to(self, device: str | torch.device) -> "PackedTensor":
         self.tensors = [item.to(device) for item in self.tensors]
         return self
 
-    def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedMultimodalData":
+    def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
         tensors = [self.tensors[i] for i in idx]
-        return PackedMultimodalData(tensors, self.dim_to_pack)
+        return PackedTensor(tensors, self.dim_to_pack)
     
     @classmethod
-    def concat(cls, packed_batches: list["PackedMultimodalData"]) -> "PackedMultimodalData":
-        """Concatenate a list of PackedMultimodalData objects into a single PackedMultimodalData.
+    def concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
+        """Concatenate a list of PackedTensor objects into a single PackedTensor.
 
         Each batch must have the same dim_to_pack.
 
         Example:
         ```{doctest}
         >>> import torch
-        >>> from nemo_rl.data.multimodal_utils import PackedMultimodalData
-        >>> p1 = PackedMultimodalData([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
-        >>> p2 = PackedMultimodalData([torch.tensor([7, 8, 9])], dim_to_pack=0)
-        >>> p3 = PackedMultimodalData.concat([p1, p2])
+        >>> from nemo_rl.data.multimodal_utils import PackedTensor
+        >>> p1 = PackedTensor([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
+        >>> p2 = PackedTensor([torch.tensor([7, 8, 9])], dim_to_pack=0)
+        >>> p3 = PackedTensor.concat([p1, p2])
         >>> p3.tensors
         [tensor([1, 2, 3]), tensor([4, 5, 6]), tensor([7, 8, 9])]
         >>> p3.as_tensor()
         tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
         ```
         """
-        dim_to_packs = [batch.dim_to_pack for batch in packed_batches]
+        dim_to_packs = [batch.dim_to_pack for batch in from_packed_tensors]
         assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
         # concatenate the tensors
         tensors = []
-        for batch in packed_batches:
-            tensors.extend(batch.tensors)
+        for packed_tensor in from_packed_tensors:
+            tensors.extend(packed_tensor.tensors)
         dim_to_pack = dim_to_packs[0]
         return cls(tensors, dim_to_pack)
 
     @classmethod
-    def from_list(cls, packed_batches: list["PackedMultimodalData"]) -> "PackedMultimodalData":
-        """Creates a PackedMultimodalData from a list of PackedMultimodalData objects.
+    def from_list(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
+        """Creates a PackedTensor from a list of PackedTensor objects.
 
-        Each PackedMultimodalData is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedMultimodalData.
+        Each PackedTensor is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedTensor.
 
         This is different from concat which simply extends the underlying list of tensors
 
@@ -85,20 +85,20 @@ class PackedMultimodalData:
         Example:
         ```{doctest}
         >>> import torch
-        >>> from nemo_rl.data.multimodal_utils import PackedMultimodalData
-        >>> p1 = PackedMultimodalData([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
-        >>> p2 = PackedMultimodalData([torch.tensor([7, 8, 9])], dim_to_pack=0)
-        >>> p3 = PackedMultimodalData.from_list([p1, p2])
+        >>> from nemo_rl.data.multimodal_utils import PackedTensor
+        >>> p1 = PackedTensor([torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6])], dim_to_pack=0)
+        >>> p2 = PackedTensor([torch.tensor([7, 8, 9])], dim_to_pack=0)
+        >>> p3 = PackedTensor.from_list([p1, p2])
         >>> p3.tensors
         [tensor([1, 2, 3, 4, 5, 6]), tensor([7, 8, 9])]
         >>> p3.as_tensor()
         tensor([1, 2, 3, 4, 5, 6, 7, 8, 9])
         ```
         """
-        dim_to_packs = [batch.dim_to_pack for batch in packed_batches]
+        dim_to_packs = [batch.dim_to_pack for batch in from_packed_tensors]
         assert len(set(dim_to_packs)) == 1, "All packed multimodal data must have the same dim_to_pack"
-        tensors = [p.as_tensor() for p in packed_batches]
-        return cls(tensors, packed_batches[0].dim_to_pack)
+        tensors = [p.as_tensor() for p in from_packed_tensors]
+        return cls(tensors, from_packed_tensors[0].dim_to_pack)
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:

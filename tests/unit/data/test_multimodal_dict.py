@@ -22,24 +22,24 @@ from nemo_rl.distributed.batched_data_dict import (
     SequencePackingArgs,
 )
 from nemo_rl.data.multimodal_utils import (
-    PackedMultimodalData,
+    PackedTensor,
 )
 
 def test_packed_data_basic():
-    """Test basic functionality of PackedMultimodalData."""
+    """Test basic functionality of PackedTensor."""
     # Create sample packed items
     tensor1 = torch.randn(16, 3)
     tensor2 = torch.randn(45, 3)
     
-    item1 = PackedMultimodalData(tensor1, dim_to_pack=0)
-    item2 = PackedMultimodalData(tensor2, dim_to_pack=0)
+    item1 = PackedTensor(tensor1, dim_to_pack=0)
+    item2 = PackedTensor(tensor2, dim_to_pack=0)
     
     # Test item functionality
     assert torch.equal(item1.as_tensor(), tensor1)
     assert item1.dim_to_pack == 0
     
     # Test batch creation and concatenation
-    batch = PackedMultimodalData([item1.as_tensor(), item2.as_tensor()], dim_to_pack=0)
+    batch = PackedTensor([item1.as_tensor(), item2.as_tensor()], dim_to_pack=0)
     assert len(batch) == 2
     
     # Test as_tensor
@@ -53,7 +53,7 @@ def test_shard_by_batch_size_with_packed_data():
     image_tensors = [torch.randn(3*i + 2, 3, 128, 128) for i in range(4)]
     
     # Create packed image data
-    packed_batch = PackedMultimodalData(image_tensors, dim_to_pack=0)
+    packed_batch = PackedTensor(image_tensors, dim_to_pack=0)
     
     # Create BatchedDataDict
     batch = BatchedDataDict({
@@ -68,14 +68,14 @@ def test_shard_by_batch_size_with_packed_data():
     
     # Verify first shard
     assert torch.equal(shards[0]["text_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
-    assert isinstance(shards[0]["image_features"], PackedMultimodalData)
+    assert isinstance(shards[0]["image_features"], PackedTensor)
     assert len(shards[0]["image_features"]) == 2
     assert shards[0]["image_features"].as_tensor().shape == (2 + 5, 3, 128, 128)
     assert shards[0]["labels"] == [1, 2]
     
     # Verify second shard
     assert torch.equal(shards[1]["text_ids"], torch.tensor([[7, 8, 9], [10, 11, 12]]))
-    assert isinstance(shards[1]["image_features"], PackedMultimodalData)
+    assert isinstance(shards[1]["image_features"], PackedTensor)
     assert len(shards[1]["image_features"]) == 2
     assert shards[1]["image_features"].as_tensor().shape == (8 + 11, 3, 128, 128)
     assert shards[1]["labels"] == [3, 4]
@@ -87,7 +87,7 @@ def test_truncate_tensors_with_packed_data():
     image_tensors = [torch.randn(5, 3, 128, 4, 2, 2) for i in range(2)]  # also check a different dim_to_pack
     
     # Create packed image data
-    packed_batch = PackedMultimodalData(image_tensors, dim_to_pack=1)
+    packed_batch = PackedTensor(image_tensors, dim_to_pack=1)
     
     # Create BatchedDataDict
     batch = BatchedDataDict({
@@ -101,7 +101,7 @@ def test_truncate_tensors_with_packed_data():
     # Verify text was truncated
     assert torch.equal(batch["text_ids"], torch.tensor([[1, 2], [5, 6]]))
     # Verify image features were not affected (assumed safe as per comment in truncate_tensors)
-    assert isinstance(batch["image_features"], PackedMultimodalData)
+    assert isinstance(batch["image_features"], PackedTensor)
     assert batch["image_features"].as_tensor().shape == (5, 6, 128, 4, 2, 2)
 
 def test_multiturn_rollout_with_packed_data():
@@ -112,7 +112,7 @@ def test_multiturn_rollout_with_packed_data():
         {
             'role': 'user',
             'token_ids': torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
-            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+            'images': PackedTensor(torch.randn(3, 128, 128), dim_to_pack=0)
         },
         {
             'role': 'assistant',
@@ -121,14 +121,14 @@ def test_multiturn_rollout_with_packed_data():
         {
             'role': 'user',
             'token_ids': torch.tensor([17, 18, 19, 20, 21, 22, 23, 24]),
-            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+            'images': PackedTensor(torch.randn(3, 128, 128), dim_to_pack=0)
         }
     ]
     message_log_2 = [
         {
             'role': 'user',
             'token_ids': torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
-            'images': PackedMultimodalData(torch.randn(3, 128, 128), dim_to_pack=0)
+            'images': PackedTensor(torch.randn(3, 128, 128), dim_to_pack=0)
         },
         {
             'role': 'assistant',
@@ -159,7 +159,7 @@ def test_sequence_packing_with_packed_data():
     image_tensors = [torch.randn(2**i, 1176) for i in range(4)]
     
     # Create packed image data
-    packed_batch = PackedMultimodalData(image_tensors, dim_to_pack=0)
+    packed_batch = PackedTensor(image_tensors, dim_to_pack=0)
     
     # Create BatchedDataDict
     batch = BatchedDataDict({
@@ -191,7 +191,7 @@ def test_sequence_packing_with_packed_data():
     for shard in sharded_batches:
         assert hasattr(shard, "micro_batch_indices")
         assert hasattr(shard, "micro_batch_lengths")
-        assert isinstance(shard["image_features"], PackedMultimodalData)
+        assert isinstance(shard["image_features"], PackedTensor)
 
 
 def test_dynamic_batching_with_packed_data():
@@ -201,7 +201,7 @@ def test_dynamic_batching_with_packed_data():
     image_tensors = [torch.randn(2**i, 1176) for i in range(4)]
     
     # Create packed image data
-    packed_batch = PackedMultimodalData(image_tensors, dim_to_pack=0)
+    packed_batch = PackedTensor(image_tensors, dim_to_pack=0)
     
     # Create BatchedDataDict
     batch = BatchedDataDict({
@@ -232,7 +232,7 @@ def test_dynamic_batching_with_packed_data():
     for shard in sharded_batches:
         assert hasattr(shard, "micro_batch_indices")
         assert hasattr(shard, "micro_batch_lengths")
-        assert isinstance(shard["image_features"], PackedMultimodalData)
+        assert isinstance(shard["image_features"], PackedTensor)
 
 
 def test_multimodal_specific_functionality():
@@ -241,9 +241,9 @@ def test_multimodal_specific_functionality():
     text_tensor = torch.tensor([[1, 2, 3], [4, 5, 6]])
     image_tensor = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
     
-    # Test PackedMultimodalDataItem
-    mm_data = PackedMultimodalData(image_tensor, dim_to_pack=0)
-    assert isinstance(mm_data, PackedMultimodalData)
+    # Test PackedTensorItem
+    mm_data = PackedTensor(image_tensor, dim_to_pack=0)
+    assert isinstance(mm_data, PackedTensor)
     assert torch.equal(mm_data.as_tensor(), image_tensor)
     assert len(mm_data) == 1
     
@@ -260,7 +260,7 @@ def test_get_multimodal_dict():
     token_type_ids = torch.tensor([[1, 1, 1], [1, 1, 1]])
     
     # Create packed image data
-    packed_image = PackedMultimodalData(image_tensor, dim_to_pack=0)
+    packed_image = PackedTensor(image_tensor, dim_to_pack=0)
     
     # Create BatchedDataDict
     batch = BatchedDataDict({
@@ -281,5 +281,5 @@ def test_get_multimodal_dict():
     mm_dict = batch.get_multimodal_dict(as_tensors=False)
     assert "image_features" in mm_dict
     assert "token_type_ids" in mm_dict
-    assert isinstance(mm_dict["image_features"], PackedMultimodalData)
+    assert isinstance(mm_dict["image_features"], PackedTensor)
     assert torch.is_tensor(mm_dict["token_type_ids"])

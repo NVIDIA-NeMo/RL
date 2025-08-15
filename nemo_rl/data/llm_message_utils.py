@@ -25,7 +25,7 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.data.multimodal_utils import PackedMultimodalData, get_multimodal_keys_from_processor
+from nemo_rl.data.multimodal_utils import PackedTensor, get_multimodal_keys_from_processor
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
@@ -96,10 +96,10 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-        elif result[key] and isinstance(result[key][0], PackedMultimodalData):
+        elif result[key] and isinstance(result[key][0], PackedTensor):
             try:
                 # returning as item because we are probably not going to shard this batch into individual items
-                concat[key] = PackedMultimodalData.concat(result[key])  
+                concat[key] = PackedTensor.concat(result[key])
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -327,8 +327,8 @@ def batched_message_log_to_flat_message(
         values = [seq.get(key) for seq in sequenced_lists]
 
         # if the values are packed multimodal data, then concatenate them
-        if values and isinstance(values[0], PackedMultimodalData):
-            result[key] = PackedMultimodalData.from_list(values)
+        if values and isinstance(values[0], PackedTensor):
+            result[key] = PackedTensor.from_list(values)
             continue
         # if not a tensor or DNE, then return the list of values
         if not values or not isinstance(values[0], Tensor):
@@ -528,7 +528,7 @@ def get_formatted_message_log(
             # add all vlm keys to the message
             for key in multimodal_keys:
                 if key in processed_chunk:
-                    new_message[key] = PackedMultimodalData(processed_chunk[key], dim_to_pack=0)
+                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
