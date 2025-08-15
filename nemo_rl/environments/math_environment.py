@@ -199,32 +199,34 @@ class MathEnvironment(EnvironmentInterface):
         Every rank will run this function, so you're free to use distributed
         calculations if you'd prefer for heavy metrics.
         """
-        batch["rewards"] = (
-            batch["rewards"] * batch["is_end"]
-        )  # set a reward of 0 for any incorrectly ended sequences
-        if (batch["rewards"] == 1).float().sum() > 0:
-            correct_solution_generation_lengths = (
-                (batch["generation_lengths"] - batch["prompt_lengths"])[
-                    batch["rewards"] == 1
-                ]
-                .float()
-                .mean()
-                .item()
-            )
-        else:
-            correct_solution_generation_lengths = 0
+        batch["rewards"] = batch["total_reward"]
+        # batch["total_reward"] = (
+        #     batch["rewards"] * batch["is_end"]
+        # )  # set a reward of 0 for any incorrectly ended sequences
+
+        # if (batch["rewards"] == 1).float().sum() > 0:
+        #     correct_solution_generation_lengths = (
+        #         (batch["generation_lengths"] - batch["prompt_lengths"])[
+        #             batch["rewards"] == 1
+        #         ]
+        #         .float()
+        #         .mean()
+        #         .item()
+        #     )
+        # else:
+        #     correct_solution_generation_lengths = 0
 
         metrics = {
             # "table": table, TODO @sahilj WIP
             "accuracy": batch["rewards"].mean().item(),
-            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
-                batch["text"], batch["rewards"]
-            ),
-            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
-            "num_problems_in_batch": batch["is_end"].shape[0],
-            "generation_lengths": batch["generation_lengths"].float().mean().item(),
-            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
-            "correct_solution_generation_lengths": correct_solution_generation_lengths,
+            # "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
+            #     batch["text"], batch["rewards"]
+            # ),
+            # "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
+            # "num_problems_in_batch": batch["is_end"].shape[0],
+            # "generation_lengths": batch["generation_lengths"].float().mean().item(),
+            # "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
+            # "correct_solution_generation_lengths": correct_solution_generation_lengths,
         }
 
         return batch, metrics
