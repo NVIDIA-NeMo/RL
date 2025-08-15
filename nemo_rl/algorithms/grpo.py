@@ -515,7 +515,6 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
-    is_vlm = processor is not None
 
     # Run validation at the start if configured
     if val_at_start and step == 0:
@@ -578,7 +577,6 @@ def grpo_train(
 
             with timer.time("generation"):
                 # Use async rollouts if vLLM async engine is enabled
-
                 if _should_use_async_rollouts(master_config):
                     (
                         repeated_batch,

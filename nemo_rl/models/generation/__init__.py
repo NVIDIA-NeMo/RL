@@ -13,7 +13,7 @@
 # limitations under the License.
 from typing import cast
 
-from transformers import PreTrainedTokenizerBase, AutoProcessor
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmConfig

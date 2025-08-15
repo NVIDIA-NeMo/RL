@@ -105,9 +105,7 @@ def test_truncate_tensors_with_packed_data():
     assert batch["image_features"].as_tensor().shape == (5, 6, 128, 4, 2, 2)
 
 def test_multiturn_rollout_with_packed_data():
-    '''
-    test multiturn conversations
-    '''
+    """Test multiturn conversations with packed multimodal data."""
     message_log_1 = [
         {
             'role': 'user',

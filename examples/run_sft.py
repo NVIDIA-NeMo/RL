@@ -19,7 +19,7 @@ from functools import partial
 from typing import Any, Optional, Callable
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -62,7 +62,6 @@ def sft_preprocessor(
     datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
-
     # optional preprocessor  
     if datum_preprocessor is not None:
         datum_dict = datum_preprocessor(datum_dict)
@@ -212,9 +211,6 @@ def main():
     init_ray()
 
     # setup tokenizer (or processor)
-    # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
-    # However, the dataloader needs the processor for multimodal data preprocessing, so the processor is needed for the dataloader (only tokenizer is NOT enough).
-    # Inheriting special keys from the tokenizer is a minimal change that doesn't disturb the rest of the SFT pipeline 
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     # setup data
     (
@@ -234,7 +230,6 @@ def main():
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
-
     sft_train(
         policy,
         train_dataloader,

@@ -450,8 +450,7 @@ class VllmGenerationWorker:
         )
     
     def _format_prompt_for_vllm_generation(self, data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None) -> list[dict[str, Any]]:
-        """
-        Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method)
+        """Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method).
 
         See https://docs.vllm.ai/en/v0.9.1/features/multimodal_inputs.html for prompt format for multimodal inputs.
         """
@@ -679,9 +678,7 @@ class VllmGenerationWorker:
         # Create tasks for each sample in the batch
         async def process_single_sample(sample_idx):
             """Process a single sample and return the result."""
-
             current_input_actual_length = input_lengths_batch[sample_idx].item()
-
             prompt = self._format_prompt_for_vllm_generation(data, sample_idx)
 
             per_sample_stop_strings = None

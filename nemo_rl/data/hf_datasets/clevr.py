@@ -13,9 +13,8 @@
 # limitations under the License.
 
 from typing import Any, Optional
-import json
 
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
 from PIL import Image
@@ -23,8 +22,7 @@ import io
 import base64
 
 def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
-    """
-    Converts a PIL Image object to a base64 encoded string.
+    """Converts a PIL Image object to a base64 encoded string.
 
     Args:
         image: The PIL Image object to convert.
@@ -39,9 +37,7 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:image/png;base64,{img_str}"
 
 def format_answer_fromtags(answer: str) -> str:
-    """
-    Extract content between <answer> tags and strip whitespace
-    """
+    """Extract content between <answer> tags and strip whitespace."""
     import re
     pattern = r"<answer>(.*?)</answer>"
     match = re.search(pattern, answer)
@@ -49,9 +45,7 @@ def format_answer_fromtags(answer: str) -> str:
     return ret
 
 def format_clevr_cogent_dataset(example: dict[str, Any], return_pil: bool = False) -> dict[str, Any]:
-    """
-    Format the CLEVR-CoGenT dataset into an OpenAI-API-like message log.
-    """
+    """Format the CLEVR-CoGenT dataset into an OpenAI-API-like message log."""
     user_content = [
         {
             "type": "image",
@@ -111,8 +105,7 @@ def prepare_clevr_cogent_dataset(split: str = "trainA", seed: int = 42, task_nam
 
 class CLEVRCoGenTDataset:
     def __init__(self, split: str = "trainA", seed: int = 42, prompt_file: Optional[str] = None, task_name: str = "clevr-cogent"):
-        """
-        Simple wrapper around the CLEVR-CoGenT dataset.
+        """Simple wrapper around the CLEVR-CoGenT dataset.
 
         Args:
             split: The split of the dataset to use.

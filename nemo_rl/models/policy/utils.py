@@ -14,9 +14,7 @@
 
 import importlib
 import os
-import re
-from typing import Any, Optional
-from accelerate import init_empty_weights
+from typing import Any
 from collections import defaultdict
 
 import torch

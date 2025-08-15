@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from typing import Any, Optional, cast, Union
-from nemo_rl.data.interfaces import DatumSpec
 
 import torch
 from datasets import Dataset
@@ -100,8 +99,6 @@ def message_log_to_flat_messages(
             try:
                 concat[key] = PackedTensor.concat(result[key])
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 raise RuntimeError(f"Error concatenating packed multimodal data for {key=}") from e
 
     output: FlatMessagesType = {**result, **concat}
@@ -324,8 +321,6 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
-
-        # if not a tensor or DNE, then return the list of values
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
@@ -347,9 +342,7 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-
         padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
-
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
@@ -428,9 +421,9 @@ def get_formatted_message_log(
     multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
 
     def _format_content_helper(content: Union[str, list[dict[str, Any]]]) -> Union[str, list[dict[str, Any]]]:
-        '''
-        This function formats the text portion of the first user message with the task prompt.
-        The `content` argument could either be a string (user text prompt) or a dict (user text prompt + multimodal data)
+        """This function formats the text portion of the first user message with the task prompt.
+
+        The `content` argument could either be a string (user text prompt) or a dict (user text prompt + multimodal data).
 
         Examples of `content` argument include strings or dicts from the following conversation turns:
         - {"role": "user", "content": "What is the capital of France?"}
@@ -449,7 +442,7 @@ def get_formatted_message_log(
         >>> 
 
         which assumes that the first message is a string (not true for multimodal data). This helper function correctly handles all cases.
-        '''
+        """
         if isinstance(content, str):
             return task_data_spec.prompt.format(content)
         # this is a list of dicts, format only the text ones

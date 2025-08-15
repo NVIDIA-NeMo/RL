@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import random
-import token
 import warnings
 from functools import wraps
 from typing import Optional
@@ -150,7 +149,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig, ) -> PreTrainedTokenizerBase:
+def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -234,7 +233,9 @@ def get_tokenizer(tokenizer_config: TokenizerConfig, ) -> PreTrainedTokenizerBas
     else:
         print("No chat template provided, using tokenizer's default")
     
-    # inherit pad and eos tokens from the tokenizer
+    # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
+    # However, the dataloader needs the processor for multimodal data preprocessing, so the processor is needed for the dataloader (only tokenizer is NOT enough).
+    # Inheriting special keys from the tokenizer is a minimal change that doesn't disturb the rest of the SFT pipeline 
     if processor is not None:
         processor.pad_token = tokenizer.pad_token
         processor.eos_token = tokenizer.eos_token

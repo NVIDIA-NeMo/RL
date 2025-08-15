@@ -62,11 +62,10 @@ class PackedTensor:
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
-    '''
-    Get keys of the multimodal data that can be used as model inputs.
+    """Get keys of the multimodal data that can be used as model inputs.
 
     This will be used in the data_processor function to determine which keys to use as model inputs.
-    '''
+    """
     if isinstance(processor, PreTrainedTokenizerBase):
         return []
     
@@ -83,11 +82,10 @@ def get_multimodal_keys_from_processor(processor) -> list[str]:
 
         
 def get_dim_to_pack_along(processor, key: str) -> int:
-    '''
-    Special considerations for packing certain keys from certain processors
+    """Special considerations for packing certain keys from certain processors.
 
     In most cases, the packed items are along dim 0
-    '''
+    """
     if processor.__class__.__name__ == "SmolVLMProcessor":
         return 1
     # return zero by default

@@ -14,7 +14,7 @@
 import contextlib
 import io
 import logging
-from typing import Any, Optional, TypedDict, Callable, List, Tuple
+from typing import Any, Optional, TypedDict, Callable, List
 
 import ray
 import torch

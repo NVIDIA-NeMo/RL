@@ -18,7 +18,6 @@ import pprint
 from collections import defaultdict
 from typing import Any, Optional
 
-import torch
 from omegaconf import OmegaConf
 from transformers import AutoProcessor
 from PIL import Image
@@ -70,8 +69,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 # ===============================================================================
 
 def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
-    """ Resolve the image path to a PIL.Image object. 
-    
+    """Resolve the image path to a PIL.Image object.
+
     image_path can be either:
     - path to local file
     - url to image
@@ -103,7 +102,6 @@ def hf_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/<dataset_name>.py) into a DatumSpec for the VLM Environment."""
-
     # depending on the task, format the data differently
     if task_data_spec.task_name == "clevr-cogent":
         datum_dict = format_clevr_cogent_dataset(datum_dict)
@@ -227,12 +225,10 @@ def setup_data(
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
-    '''
-    This function will create a TaskSpec, DatumSpec, and connect the two 
+    """This function will create a TaskSpec, DatumSpec, and connect the two.
     
     task_spec contains the task name as well as prompt and system prompt modifiers that can be used by data processor
-
-    '''
+    """
     print("\n▶ Setting up data...")
     # define task name and use it (make it as generic as possible)
     task_name = data_config['task_name']

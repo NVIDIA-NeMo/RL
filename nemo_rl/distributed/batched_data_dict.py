@@ -88,9 +88,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.elem_counts_per_gb = None
     
     def get_multimodal_dict(self, as_tensors: bool = False, device: Optional[torch.device] = None) -> dict[str, Any]:
-        '''
-        Return a regular dict of tensors or packed multimodal data items
-        '''
+        """Return a regular dict of tensors or packed multimodal data items."""
         multimodal_dict = {}
         for k, v in self.data.items():
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedTensor):
@@ -702,7 +700,6 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         for k, v in self.items():
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
                 self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
-            # assumed this is safe to do (no image / multimodal tokens are truncated)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,

@@ -155,6 +155,9 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        self.is_vlm = processor is not None
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
+
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
@@ -252,8 +255,11 @@ class DTensorPolicyWorker:
             else:
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
-            # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            if self.is_vlm:
+                # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
+                model_class = resolve_model_class(model_config.model_type)
+            else:
+                model_class = AutoModelForCausalLM
 
         full_state_dict = None
         if self.rank == 0:
@@ -282,8 +288,6 @@ class DTensorPolicyWorker:
         # caching since this property is not always preserved after FSDP
         self.tokenizer = tokenizer
         self.processor = processor
-        self.is_vlm = processor is not None
-        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
@@ -548,7 +552,6 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
-
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
@@ -639,7 +642,6 @@ class DTensorPolicyWorker:
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()
                             input_ids, position_ids, _ = pack_sequences(
@@ -902,7 +904,6 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
-
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
@@ -980,7 +981,7 @@ class DTensorPolicyWorker:
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
-                
+
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     # DTensor requires the casual attention kernel to hit,
                     # yet our attention mask above is not always all 1s
@@ -990,7 +991,6 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
 
-                # only add flash_attn_kwargs if there are no multimodal kwargs
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:
                     position_ids = None
@@ -1448,11 +1448,9 @@ class DTensorPolicyWorker:
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
-            # optimizer and scheduler
             optimizer=self.optimizer if optimizer_path else None,
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
-            # tokenizer and processor
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
         )

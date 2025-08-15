@@ -37,7 +37,6 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
     parallelize_module,
 )
-
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gemma3.modeling_gemma3 import (
@@ -47,10 +46,6 @@ from transformers.models.gemma3.modeling_gemma3 import (
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-
-from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
-from nemo_rl.models.policy.utils import import_class_from_path
-
 from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
@@ -60,6 +55,10 @@ from transformers.models.llava_onevision.modeling_llava_onevision import LlavaOn
 from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration  
+
+from nemo_rl.distributed.model_utils import dtensor_from_parallel_logits_to_logprobs
+from nemo_rl.models.policy.utils import import_class_from_path
+
 
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
@@ -584,7 +583,6 @@ def _parallelize_model(
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
 
-
     if tp_mesh.size() > 1:
         assert num_key_value_heads % tp_mesh.size() == 0, (
             f"num_key_value_heads ({num_key_value_heads}) must be divisible by TP size ({tp_mesh.size()})"
@@ -621,8 +619,6 @@ def _parallelize_model(
                 print("Using optimized parallel plan.")
             # fall back to the HF tp plan
             except Exception as e:
-                import traceback
-                traceback.print_exc()
                 print(
                     f"Optimized parallel plan is not available: {e}. Falling back to the HF tp plan."
                 )

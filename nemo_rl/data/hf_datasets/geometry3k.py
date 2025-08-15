@@ -18,9 +18,7 @@ from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.hf_datasets.clevr import pil_to_base64
 
 def format_geometry3k_dataset(example: dict[str, Any], return_pil: bool = False) -> dict[str, Any]:
-    """
-    Format the Geometry3K dataset into an OpenAI-API-like message log.
-    """
+    """Format the Geometry3K dataset into an OpenAI-API-like message log."""
     # isolate single image
     example['image'] = example['images'][0] if isinstance(example['images'], list) else example['images']
 
@@ -72,8 +70,7 @@ def prepare_geometry3k_dataset(split: str = "train", task_name: str = "geometry3
 
 class Geometry3KDataset:
     def __init__(self, split: str = "train", seed: int = 42, prompt_file: Optional[str] = None, task_name: str = "geometry3k"):
-        """
-        Simple wrapper around the Geometry3K dataset.
+        """Simple wrapper around the Geometry3K dataset.
 
         Args:
             split: The split of the dataset to use.

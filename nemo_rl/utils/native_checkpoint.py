@@ -27,7 +27,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
-from transformers import AutoConfig, AutoTokenizer, AutoProcessor
+from transformers import AutoConfig, AutoTokenizer
 
 
 ## modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html

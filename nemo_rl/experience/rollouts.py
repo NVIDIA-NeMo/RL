@@ -17,7 +17,7 @@
 
 import asyncio
 import copy
-from typing import Any, Optional
+from typing import Any
 
 import ray
 import torch

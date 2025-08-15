@@ -13,15 +13,12 @@
 # limitations under the License.
 
 from typing import Any, Optional, Union
-import json
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from pathlib import Path
 
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.hf_datasets.clevr import pil_to_base64
 from PIL import Image
-import io
-import base64
 import random
 
 import os
@@ -30,9 +27,7 @@ import zipfile
 from tqdm import tqdm # Using tqdm for progress bar, install with: pip install tqdm
 
 def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
-    """
-    Downloads a zip file from a given URL to a target directory and unzips it
-    into a specified subdirectory within the target directory, showing download progress.
+    """Downloads a zip file from a given URL to a target directory and unzips it into a specified subdirectory within the target directory, showing download progress.
 
     Args:
         url (str): The URL of the zip file to download.
@@ -98,8 +93,7 @@ def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
         pass
 
 def format_refcoco_dataset(example: dict[str, Any], width: int = 448 , height: int = 448, caption_type: str = 'random', prompt_file: Optional[str] = None) -> dict[str, Any]:
-    """
-    Format the RefCOCO dataset from huggingface.
+    """Format the RefCOCO dataset from huggingface.
 
     This should be replaced with our own curated RefCOCO/+/g dataset soon
 
@@ -109,7 +103,6 @@ def format_refcoco_dataset(example: dict[str, Any], width: int = 448 , height: i
         height: The height of the resized image.
         caption_type: The type of caption to use.
     """
-
     split = example['split']
     if 'val' in split:
         caption_type = 'descriptive'
@@ -214,8 +207,7 @@ def prepare_refcoco_dataset(split: str = "default", seed: int = 42, task_name: O
 
 class RefCOCODataset:
     def __init__(self, split: str = "default", seed: int = 42, prompt_file: Optional[str] = None, task_name: str = "refcoco", path_to_coco_images: Optional[str] = None):
-        """
-        Simple wrapper around the RefCOCO dataset
+        """Simple wrapper around the RefCOCO dataset.
 
         Args:
             split: The split of the dataset to use (currently only 'default' is supported)

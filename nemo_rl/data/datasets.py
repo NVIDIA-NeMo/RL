@@ -76,7 +76,6 @@ class AllTaskProcessedDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
-    # TODO @rohitkumarj: not used anywhere
     def encode_single(
         self, text: Union[str, list[str]]
     ) -> tuple[list[int] | torch.Tensor, int]:
@@ -100,7 +99,7 @@ class AllTaskProcessedDataset:
         entry = self.dataset[idx]
 
         if isinstance(self.task_data_processors, dict):
-            task_name = entry["task_name"]   
+            task_name = entry["task_name"]
 
             assert task_name in self.task_data_processors, (
                 f"task processor not provided for {task_name}. Provided processors: {self.task_data_processors.keys()}"
@@ -172,7 +171,6 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         stop_strings=stop_strings,
         **extra_args,
     )
-
     return output
 
 
