@@ -36,7 +36,7 @@ from nemo_rl.distributed.collectives import (
 )
 
 from nemo_rl.data.multimodal_utils import (
-    PackedMultimodalData,
+    PackedTensor,
 )
 
 DictT = TypeVar("DictT", bound=Mapping[str, Any])
@@ -75,7 +75,7 @@ class DynamicBatchingArgs(TypedDict):
 
 class BatchedDataDict(UserDict, Generic[DictT]):
 
-    # keys that are model specific, but not part of the PackedMultimodalData
+    # keys that are model specific, but not part of the PackedTensor
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         'token_type_ids',   # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
     ]
@@ -93,8 +93,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         '''
         multimodal_dict = {}
         for k, v in self.data.items():
-            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedMultimodalData):
-                multimodal_dict[k] = PackedMultimodalData.concat_as_tensor(v, device=device) if as_tensors else v
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], PackedTensor):
+                multimodal_dict[k] = PackedTensor.concat_as_tensor(v, device=device) if as_tensors else v
             elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
                 multimodal_dict[k] = v
         
@@ -782,7 +782,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if torch.is_tensor(v):
                 self.data[k] = v.to(device)
             elif isinstance(v, list):
-                if len(v) > 0 and isinstance(v[0], PackedMultimodalData):
+                if len(v) > 0 and isinstance(v[0], PackedTensor):
                     self.data[k] = [item.to(device) for item in v]
         return self
 
