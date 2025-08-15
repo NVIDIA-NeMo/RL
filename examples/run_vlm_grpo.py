@@ -29,8 +29,14 @@ from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.environments.vlm_environment import VLMEnvironment
-from nemo_rl.data.hf_datasets.clevr import CLEVRCoGenTDataset, format_clevr_cogent_dataset
-from nemo_rl.data.hf_datasets.geometry3k import Geometry3KDataset, format_geometry3k_dataset
+from nemo_rl.data.hf_datasets.clevr import (
+    CLEVRCoGenTDataset,
+    format_clevr_cogent_dataset,
+)
+from nemo_rl.data.hf_datasets.geometry3k import (
+    Geometry3KDataset,
+    format_geometry3k_dataset,
+)
 from nemo_rl.data.hf_datasets.refcoco import RefCOCODataset, format_refcoco_dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -46,12 +52,15 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
-from nemo_rl.data.multimodal_utils import PackedTensor, \
-    get_multimodal_keys_from_processor,  \
-    get_dim_to_pack_along
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    get_multimodal_keys_from_processor,
+    get_dim_to_pack_along,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
@@ -67,6 +76,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 # ===============================================================================
 #                             VLM Data Processor
 # ===============================================================================
+
 
 def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
     """Resolve the image path to a PIL.Image object.
@@ -94,6 +104,7 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
 
+
 def hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -118,11 +129,8 @@ def hf_data_processor(
 
     message_log: LLMMessageLogType = []
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
-    user_message = {
-        "role": "user",
-        "content": []
-    }
-    # 
+    user_message = {"role": "user", "content": []}
+    #
     images = []
     if isinstance(problem, list):
         for content in problem:
@@ -135,19 +143,25 @@ def hf_data_processor(
                 else:
                     raise ValueError(f"Unsupported content type: {content['type']}")
             elif content["type"] == "text":
-                user_message["content"].append({
-                    "type": "text",
-                    "text": task_data_spec.prompt.format(content["text"]) if task_data_spec.prompt else content["text"],
-                })
+                user_message["content"].append(
+                    {
+                        "type": "text",
+                        "text": task_data_spec.prompt.format(content["text"])
+                        if task_data_spec.prompt
+                        else content["text"],
+                    }
+                )
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
-    
+
     images = [resolve_to_image(image) for image in images]
 
     # get formatted user message
-    if hasattr(processor, 'conversation_preprocessor'):
-        user_message_for_chat_template = processor.conversation_preprocessor(user_message)
+    if hasattr(processor, "conversation_preprocessor"):
+        user_message_for_chat_template = processor.conversation_preprocessor(
+            user_message
+        )
     else:
         user_message_for_chat_template = user_message
 
@@ -157,7 +171,7 @@ def hf_data_processor(
         tokenize=False,
         add_generation_prompt=True,
     )
-    
+
     # this is the id-tokenized and image processed conversation template for the policy
     message: dict = processor.apply_chat_template(
         [user_message],
@@ -168,17 +182,19 @@ def hf_data_processor(
     )
 
     # add this for backward compatibility
-    user_message['token_ids'] = message['input_ids'][0]
+    user_message["token_ids"] = message["input_ids"][0]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = get_multimodal_keys_from_processor(processor)
     for key in multimodal_keys:
         if key in message:
-            user_message[key] = PackedTensor(message[key], dim_to_pack=get_dim_to_pack_along(processor, key))
+            user_message[key] = PackedTensor(
+                message[key], dim_to_pack=get_dim_to_pack_along(processor, key)
+            )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value
-    if 'token_type_ids' in message:
-        user_message['token_type_ids'] = message['token_type_ids'][0]
-    
+    if "token_type_ids" in message:
+        user_message["token_type_ids"] = message["token_type_ids"][0]
+
     ### append to user message
     message_log.append(user_message)
 
@@ -191,8 +207,9 @@ def hf_data_processor(
                 : min(4, max_seq_length // len(message_log))
             ]
         loss_multiplier = 0.0
-        raise NotImplementedError("Sequence length is too long, please use a shorter sequence length")
-        
+        raise NotImplementedError(
+            "Sequence length is too long, please use a shorter sequence length"
+        )
 
     output: DatumSpec = {
         "message_log": message_log,
@@ -203,8 +220,8 @@ def hf_data_processor(
         "task_name": task_data_spec.task_name,
         # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
         # add images for vllm serving
-        'vllm_content': string_formatted_dialog,
-        'vllm_images': images,
+        "vllm_content": string_formatted_dialog,
+        "vllm_images": images,
     }
     return output
 
@@ -220,12 +237,12 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     """This function will create a TaskSpec, DatumSpec, and connect the two.
-    
+
     task_spec contains the task name as well as prompt and system prompt modifiers that can be used by data processor
     """
     print("\n▶ Setting up data...")
     # define task name and use it (make it as generic as possible)
-    task_name = data_config['task_name']
+    task_name = data_config["task_name"]
     vlm_task_spec = TaskDataSpec(
         task_name=task_name,
         prompt_file=data_config["prompt_file"],
@@ -234,13 +251,23 @@ def setup_data(
 
     # Load CLEVR-CoGenT dataset using nemo rl datasets
     # other VLM datasets can be added here
-    if data_config['dataset_name'] == 'clevr-cogent':
-        data: Any = CLEVRCoGenTDataset(split=data_config['split'], 
-                                       seed=data_config['seed'], task_name=data_config['task_name'])
-    elif data_config['dataset_name'] == 'refcoco':
-        data: Any = RefCOCODataset(split=data_config['split'], seed=data_config['seed'], task_name=data_config['task_name'], path_to_coco_images=data_config.get('path_to_coco_images', None))
-    elif data_config['dataset_name'] == 'geometry3k':
-        data: Any = Geometry3KDataset(split=data_config['split'], task_name=data_config['task_name'])
+    if data_config["dataset_name"] == "clevr-cogent":
+        data: Any = CLEVRCoGenTDataset(
+            split=data_config["split"],
+            seed=data_config["seed"],
+            task_name=data_config["task_name"],
+        )
+    elif data_config["dataset_name"] == "refcoco":
+        data: Any = RefCOCODataset(
+            split=data_config["split"],
+            seed=data_config["seed"],
+            task_name=data_config["task_name"],
+            path_to_coco_images=data_config.get("path_to_coco_images", None),
+        )
+    elif data_config["dataset_name"] == "geometry3k":
+        data: Any = Geometry3KDataset(
+            split=data_config["split"], task_name=data_config["task_name"]
+        )
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 

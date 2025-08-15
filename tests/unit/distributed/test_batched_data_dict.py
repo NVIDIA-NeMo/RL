@@ -473,13 +473,20 @@ def test_sequence_packing_with_dynamic_batching_conflict():
 def test_shard_by_batch_size_with_packed_multimodal():
     """Sharding should slice PackedTensor items correctly and preserve types."""
     text = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
-    images = [torch.randn(2, 3, 8, 8), torch.randn(3, 3, 8, 8), torch.randn(1, 3, 8, 8), torch.randn(5, 3, 8, 8)]
+    images = [
+        torch.randn(2, 3, 8, 8),
+        torch.randn(3, 3, 8, 8),
+        torch.randn(1, 3, 8, 8),
+        torch.randn(5, 3, 8, 8),
+    ]
     packed = PackedTensor(images, dim_to_pack=0)
-    batch = BatchedDataDict({
-        "input_ids": text,
-        "pixel_values": packed,
-        "labels": [0, 1, 2, 3],
-    })
+    batch = BatchedDataDict(
+        {
+            "input_ids": text,
+            "pixel_values": packed,
+            "labels": [0, 1, 2, 3],
+        }
+    )
 
     shards = batch.shard_by_batch_size(shards=2)
     assert len(shards) == 2
@@ -506,18 +513,25 @@ def test_get_multimodal_dict_mixed_content_and_device_move():
     token_type_ids = torch.ones(2, 4, dtype=torch.long)
     regular = torch.arange(2)
 
-    batch = BatchedDataDict({
-        "pixel_values": packed,
-        "token_type_ids": token_type_ids,
-        "regular_tensor": regular,
-        "labels": [0, 1],
-    })
+    batch = BatchedDataDict(
+        {
+            "pixel_values": packed,
+            "token_type_ids": token_type_ids,
+            "regular_tensor": regular,
+            "labels": [0, 1],
+        }
+    )
 
     # as tensors
     mm_dict_t = batch.get_multimodal_dict(as_tensors=True)
     assert set(mm_dict_t.keys()) == {"pixel_values", "token_type_ids"}
-    assert torch.is_tensor(mm_dict_t["pixel_values"]) and mm_dict_t["pixel_values"].shape[0] == 3
-    assert torch.is_tensor(mm_dict_t["token_type_ids"]) and tuple(mm_dict_t["token_type_ids"].shape) == (2, 4)
+    assert (
+        torch.is_tensor(mm_dict_t["pixel_values"])
+        and mm_dict_t["pixel_values"].shape[0] == 3
+    )
+    assert torch.is_tensor(mm_dict_t["token_type_ids"]) and tuple(
+        mm_dict_t["token_type_ids"].shape
+    ) == (2, 4)
 
     # as packed
     mm_dict_p = batch.get_multimodal_dict(as_tensors=False)
@@ -527,7 +541,9 @@ def test_get_multimodal_dict_mixed_content_and_device_move():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     moved = BatchedDataDict({"pixel_values": packed}).to(device)
     mm_after_move = moved.get_multimodal_dict(as_tensors=True)
-    assert torch.is_tensor(mm_after_move["pixel_values"]) and mm_after_move["pixel_values"].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
+    assert torch.is_tensor(mm_after_move["pixel_values"]) and mm_after_move[
+        "pixel_values"
+    ].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])

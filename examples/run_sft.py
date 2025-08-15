@@ -16,7 +16,7 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any, Optional, Callable
+from typing import Any, Callable, Optional
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -62,7 +62,7 @@ def sft_preprocessor(
     datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
-    # optional preprocessor  
+    # optional preprocessor
     if datum_preprocessor is not None:
         datum_dict = datum_preprocessor(datum_dict)
 
@@ -131,6 +131,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         )
     elif data_cls == "clevr_cogent":
         from nemo_rl.data.hf_datasets.clevr import format_clevr_cogent_dataset
+
         data = hf_datasets.CLEVRCoGenTDataset(
             split=data_config["split"],
             seed=data_config["seed"],
