@@ -48,6 +48,8 @@ class PackedTensor:
     def concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
         """Concatenate a list of PackedTensor objects into a single PackedTensor.
 
+        The underlying tensors from the PackedTensors are combined into a single list of tensors and used to create a new PackedTensor.
+
         Each batch must have the same dim_to_pack.
 
         Example:
@@ -78,7 +80,7 @@ class PackedTensor:
 
         Each PackedTensor is first packed along the dim_to_pack dimension and the resulting tensors are used to create a new PackedTensor.
 
-        This is different from concat which simply extends the underlying list of tensors
+        This is different from concat which simply extends the underlying list of tensors. This is important because the `slice` and `__len__` methods operate on the underlying list of tensors. Note, however, that calling `as_tensor` on the resulting PackedTensor will result in the same tensor as `concat`.
 
         Each batch must have the same dim_to_pack.
 
