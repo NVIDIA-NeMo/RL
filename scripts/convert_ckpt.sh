@@ -5,6 +5,7 @@ summary_files=(
     "logs/${model_family}_greedy_summary.txt"
     "logs/${model_family}_recommended_summary.txt"
     "logs/${model_family}_high_summary.txt"
+    "logs/${model_family}_temp0.6_summary.txt"
 )
 
 set -e

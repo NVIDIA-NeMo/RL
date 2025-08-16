@@ -1,3 +1,5 @@
+#!/bin/bash
+
 if [ -z "$MODEL_NAME" ] && [ -z "$CHECKPOINT_DIR" ]; then
     echo "Neither MODEL_NAME nor CHECKPOINT_DIR is specified."
     exit 1

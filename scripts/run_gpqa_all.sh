@@ -1,3 +1,5 @@
+#!/bin/bash
+
 export CHECKPOINT_DIR=/home/zhaochengz/lustre/reinforcer/results/Qwen2.5-3B-sft-xxx
 export MAX_MODEL_LEN=32768
 export JOB_ID=1

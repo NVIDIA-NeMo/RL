@@ -1,3 +1,5 @@
+#!/bin/bash
+
 if [ -z "$CHECKPOINT_DIR" ]; then
     echo "CHECKPOINT_DIR is required but not specified."
     exit 1

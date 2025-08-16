@@ -1,3 +1,5 @@
+#!/bin/bash
+
 uv run python scripts/compute_statistics.py --tokenizer Qwen/Qwen3-14B logs/Qwen3-*-Base_high.txt \
     > logs/Qwen3-Base_high_statistics.txt &
 uv run python scripts/compute_statistics.py --tokenizer Qwen/Qwen3-14B logs/Qwen3-14B-Base-sft-scp-16k-0.2x_step_*_high.txt \
