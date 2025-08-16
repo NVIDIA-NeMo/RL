@@ -71,6 +71,188 @@ y11_1 = [58.33, 59.97, 59.97, 59.72, 59.34, 55.43, 56.19, 54.80, 55.05, 55.05, 5
 w11 = [99.24, 98.36, 98.74, 98.86, 99.12, 99.37, 99.62, 99.49, 99.24, 99.49, 99.75, 99.75, 99.49, 99.75, 99.62, 99.62]
 z11 = [26336.1, 26333.4, 24104.5, 23564.8, 23737.1, 25608.9, 25630.4, 26437.3, 27025.8, 27308.9, 27097.2, 27252.6, 27303.2, 27495.6, 28547.2, 28721.9]
 
+# ========================= by samples =========================
+x1 = rescale(x1_steps, 0, x1_steps[-1] * 128)
+x1_1 = x1
+x2 = rescale(x2_steps, 0, x2_steps[-1] * 4096)
+x2_1 = x2
+x3 = rescale(x3_steps, 10 * 128, 10 * 128 + x3_steps[-1] * 4096)
+x3_1 = x3
+x4 = rescale(x4_steps, 20 * 128, 20 * 128 + x4_steps[-1] * 4096)
+x4_1 = x4
+x5 = rescale(x5_steps, 50 * 128, 50 * 128 + x5_steps[-1] * 4096)
+x5_1 = x5
+x6 = rescale(x6_steps, 100 * 128, 100 * 128 + x6_steps[-1] * 4096)
+x6_1 = x6
+x7 = rescale(x7_steps, 200 * 128, 200 * 128 + x7_steps[-1] * 4096)
+x7_1 = x7
+x8 = rescale(x8_steps, 400 * 128, 400 * 128 + x8_steps[-1] * 4096)
+x8_1 = x8
+x9 = rescale(x9_steps, 800 * 128, 800 * 128 + x9_steps[-1] * 4096)
+x9_1 = x9
+x10 = rescale(x10_steps, 1600 * 128, 1600 * 128 + x10_steps[-1] * 4096)
+x10_1 = x10
+x11 = rescale(x11_steps, 3200 * 128, 3200 * 128 + x11_steps[-1] * 4096)
+x11_1 = x11
+x_max = 0
+for x in [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11]:
+    x_max = max(x_max, x.max())
+
+
+# Plot high + recommended with generation time (steps: 10-100)
+plt.figure(figsize=(14, 8))
+
+def plot_pair(x, y, x1, y1, label1, color, label2=None):
+    plt.plot(x, y, label=label1, linewidth=3, color=color)
+    plt.plot(x1, y1, label=label2,linestyle='--', linewidth=2.5, color=color)
+
+plot_pair(x1, y1, x1_1, y1_1, "SFT (high)", 'blue', label2="SFT (recommended)")
+plot_pair(x2, y2, x2_1, y2_1, "GRPO (128x32, lr: 1e-6, high)", 'green')
+plot_pair(x3, y3, x3_1, y3_1, "10 step SFT + GRPO (128x32, lr: 1e-6, high)", 'red')
+plot_pair(x4, y4, x4_1, y4_1, "20 step SFT + GRPO (128x32, lr: 1e-6, high)", 'orange')
+plot_pair(x5, y5, x5_1, y5_1, "50 step SFT + GRPO (128x32, lr: 1e-6, high)", 'gold')
+plot_pair(x6, y6, x6_1, y6_1, "100 step SFT + GRPO (128x32, lr: 1e-6, high)", 'greenyellow')
+
+# Horizontal baselines
+for y_val, label in [
+    (64.77, "Qwen 3 14B (Reproduced)"),
+    (42.93, "Qwen 3 14B Base (Reproduced)"),
+    (64.0, "Qwen 3 14B (Official)"),
+    (39.9, "Qwen 3 14B Base (Official)")
+]:
+    plt.axhline(y=y_val, color='gray', linestyle='--', linewidth=1.5)
+    plt.text(x_max + 0.5, y_val, label, va='center', ha='left', fontsize=14, color='gray')
+
+# Axes and labels
+plt.xlabel("#samples in SFT (#rollouts in GRPO)", fontsize=20)
+plt.ylabel("GPQA pass@1", fontsize=20)
+plt.title("Qwen 3 14B Base\npost-trained on SCP_v2", fontsize=24)
+plt.xlim(0, x_max)
+plt.ylim(25, 65)
+plt.legend(loc='lower right', fontsize=16)
+plt.grid(True)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.gca().spines['top'].set_visible(False)
+plt.gca().spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig("plots/grpo_vs_sft_qwen3_14b_high+recommended_first_half_by_samples.png")
+print("Saving plots to plots/grpo_vs_sft_qwen3_14b_high+recommended_first_half_by_samples.png")
+
+
+# Plot high + recommended with generation time (steps: 200-3200)
+plt.figure(figsize=(14, 8))
+
+plot_pair(x1, y1, x1_1, y1_1, "SFT (high)", 'blue', label2="SFT (recommended)")
+plot_pair(x2, y2, x2_1, y2_1, "GRPO (128x32, lr: 1e-6, high)", 'green')
+plot_pair(x7, y7, x7_1, y7_1, "200 step SFT + GRPO (128x32, lr: 1e-6, high)", 'lightseagreen')
+plot_pair(x8, y8, x8_1, y8_1, "400 step SFT + GRPO (128x32, lr: 1e-6, high)", 'deepskyblue')
+plot_pair(x9, y9, x9_1, y9_1, "800 step SFT + GRPO (128x32, lr: 1e-6, high)", 'navy')
+plot_pair(x10, y10, x10_1, y10_1, "1600 step SFT + GRPO (128x32, lr: 1e-6, high)", 'purple')
+plot_pair(x11, y11, x11_1, y11_1, "3200 step SFT + GRPO (128x32, lr: 1e-6, high)", 'pink')
+
+# Horizontal baselines
+for y_val, label in [
+    (64.77, "Qwen 3 14B (Reproduced)"),
+    (42.93, "Qwen 3 14B Base (Reproduced)"),
+    (64.0, "Qwen 3 14B (Official)"),
+    (39.9, "Qwen 3 14B Base (Official)")
+]:
+    plt.axhline(y=y_val, color='gray', linestyle='--', linewidth=1.5)
+    plt.text(x_max + 0.5, y_val, label, va='center', ha='left', fontsize=14, color='gray')
+
+# Axes and labels
+plt.xlabel("#samples in SFT (#rollouts in GRPO)", fontsize=20)
+plt.ylabel("GPQA pass@1", fontsize=20)
+plt.title("Qwen 3 14B Base\npost-trained on SCP_v2", fontsize=24)
+plt.xlim(0, x_max)
+plt.ylim(25, 65)
+plt.legend(loc='lower right', fontsize=16)
+plt.grid(True)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.gca().spines['top'].set_visible(False)
+plt.gca().spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig("plots/grpo_vs_sft_qwen3_14b_high+recommended_second_half_by_samples.png")
+print("Saving plots to plots/grpo_vs_sft_qwen3_14b_high+recommended_second_half_by_samples.png")
+
+
+# Plot high with generation time (steps: 10-100)
+plt.figure(figsize=(14, 8))
+
+plt.plot(x1, y1, label="SFT (high)", linewidth=3, color='blue')
+plt.plot(x2, y2, label="GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='green')
+plt.plot(x3, y3, label="10 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='red')
+plt.plot(x4, y4, label="20 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='orange')
+plt.plot(x5, y5, label="50 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='gold')
+plt.plot(x6, y6, label="100 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='greenyellow')
+
+# Horizontal baselines
+for y_val, label in [
+    (64.77, "Qwen 3 14B (Reproduced)"),
+    (42.93, "Qwen 3 14B Base (Reproduced)"),
+    (64.0, "Qwen 3 14B (Official)"),
+    (39.9, "Qwen 3 14B Base (Official)")
+]:
+    plt.axhline(y=y_val, color='gray', linestyle='--', linewidth=1.5)
+    plt.text(x_max + 0.5, y_val, label, va='center', ha='left', fontsize=14, color='gray')
+
+# Axes and labels
+plt.xlabel("#samples in SFT (#rollouts in GRPO)", fontsize=20)
+plt.ylabel("GPQA pass@1", fontsize=20)
+plt.title("Qwen 3 14B Base\npost-trained on SCP_v2", fontsize=24)
+plt.xlim(0, x_max)
+plt.ylim(25, 65)
+plt.legend(loc='lower right', fontsize=16)
+plt.grid(True)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.gca().spines['top'].set_visible(False)
+plt.gca().spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig("plots/grpo_vs_sft_qwen3_14b_high_first_half_by_samples.png")
+print("Saving plots to plots/grpo_vs_sft_qwen3_14b_high_first_half_by_samples.png")
+
+
+# Plot high with generation time (steps: 200-3200)
+plt.figure(figsize=(14, 8))
+
+plt.plot(x1, y1, label="SFT (high)", linewidth=3, color='blue')
+plt.plot(x2, y2, label="GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='green')
+plt.plot(x7, y7, label="200 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='lightseagreen')
+plt.plot(x8, y8, label="400 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='deepskyblue')
+plt.plot(x9, y9, label="800 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='navy')
+plt.plot(x10, y10, label="1600 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='purple')
+plt.plot(x11, y11, label="3200 step SFT + GRPO (128x32, lr: 1e-6, high)", linewidth=3, color='pink')
+
+# Horizontal baselines
+for y_val, label in [
+    (64.77, "Qwen 3 14B (Reproduced)"),
+    (42.93, "Qwen 3 14B Base (Reproduced)"),
+    (64.0, "Qwen 3 14B (Official)"),
+    (39.9, "Qwen 3 14B Base (Official)")
+]:
+    plt.axhline(y=y_val, color='gray', linestyle='--', linewidth=1.5)
+    plt.text(x_max + 0.5, y_val, label, va='center', ha='left', fontsize=14, color='gray')
+
+# Axes and labels
+plt.xlabel("#samples in SFT (#rollouts in GRPO)", fontsize=20)
+plt.ylabel("GPQA pass@1", fontsize=20)
+plt.title("Qwen 3 14B Base\npost-trained on SCP_v2", fontsize=24)
+plt.xlim(0, x_max)
+plt.ylim(25, 65)
+plt.legend(loc='lower right', fontsize=16)
+plt.grid(True)
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.gca().spines['top'].set_visible(False)
+plt.gca().spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig("plots/grpo_vs_sft_qwen3_14b_high_second_half_by_samples.png")
+print("Saving plots to plots/grpo_vs_sft_qwen3_14b_high_second_half_by_samples.png")
+
+
 # ========================= w/ generation time =========================
 # Rescale x-values to new time ranges
 x1 = rescale(x1_steps, 0, x1_steps[-1] / 1000 * 4)
@@ -95,7 +277,6 @@ x10 = rescale(x10_steps, 6.4, 6.4 + x10_steps[-1] / 3 * 4)
 x10_1 = x10
 x11 = rescale(x11_steps, 12.8, 12.8 + x11_steps[-1] / 3 * 4)
 x11_1 = x11
-x_max = 0
 x_max = 0
 for x in [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11]:
     x_max = max(x_max, x.max())
