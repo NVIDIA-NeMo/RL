@@ -19,17 +19,11 @@ from typing import Optional
 import numpy as np
 import torch
 
-# hotfix for PixtralImageProcessor
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
-    PixtralImageProcessor,
-    PixtralImageProcessorFast,
     PreTrainedTokenizerBase,
 )
-
-PixtralImageProcessorFast.model_input_names.append("image_sizes")
-PixtralImageProcessor.model_input_names.append("image_sizes")
 
 from nemo_rl.data import hf_datasets
 from nemo_rl.models.policy import TokenizerConfig
