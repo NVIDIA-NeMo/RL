@@ -56,7 +56,9 @@ def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
                 block_size = 8192  # 8 Kibibytes
 
                 # Initialize tqdm progress bar
-                progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
+                progress_bar = tqdm(
+                    total=total_size_in_bytes, unit="iB", unit_scale=True
+                )
 
                 with open(filepath, "wb") as f:
                     for chunk in r.iter_content(chunk_size=block_size):
