@@ -1,0 +1,128 @@
+# This Dockerfile is used to build a Docker image for NeMo RL with the NGC PyTorch base image.
+# However, it is still a work in progress and is not yet ready for production use.
+#
+# Usage:
+# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
+# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
+#
+# If installing new dependencies in the container, then use "uv pip install new-dependency"
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo:25.06-py3
+FROM scratch AS nemo-rl
+ARG NRL_GIT_REF=main
+ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+FROM ${BASE_IMAGE} AS base
+
+# It is more convenient for users to run as root
+USER root
+
+RUN <<"EOF" bash -exu -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+export TZ=America/Los_Angeles
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    jq \
+    curl \
+    git \
+    rsync \
+    wget \
+    less \
+    vim \
+
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOF
+
+# Install uv at /usr/local/bin in case the root home directory is bind mounted
+ARG UV_VERSION=0.7.2
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
+
+# Disable usage stats by default for users who are sensitive to sharing usage.
+# Users are encouraged to enable if they wish.
+ENV RAY_USAGE_STATS_ENABLED=0
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# Build vLLM from source to use with the NVIDIA PyTorch base image
+FROM base AS build_vllm
+
+ARG MAX_JOBS=32
+WORKDIR /opt
+COPY --from=nemo-rl uv.lock /tmp/uv.lock
+
+RUN <<"EOF" bash -exu
+echo "Building vLLM from source for PyTorch base image"
+VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
+echo "Building vLLM version: $VLLM_VERSION"
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout v$VLLM_VERSION
+python use_existing_torch.py
+pip install -r requirements/build.txt
+pip wheel --no-deps --no-build-isolation -v .
+EOF
+
+FROM base AS hermetic
+
+WORKDIR /opt/nemo-rl
+
+# Variables to control the build of TE. If there are issues with parallelization, consider
+# setting these to 1.
+ARG MAX_JOBS
+ARG NVTE_BUILD_THREADS_PER_JOB
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
+ENV UV_CACHE_DIR=/opt/uv_cache
+ENV UV_LINK_MODE=copy
+
+# Define the no-install-package arguments for PyTorch base images
+ARG BASE_IMAGE
+ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas-cu12 --no-install-package nvidia-cuda-cupti-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 --no-install-package nvidia-cuda-runtime-cu12 --no-install-package nvidia-cudnn-cu12 --no-install-package nvidia-cufft-cu12 --no-install-package nvidia-cufile-cu12 --no-install-package nvidia-curand-cu12 --no-install-package nvidia-cusolver-cu12 --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-nccl-cu12 --no-install-package vllm --no-install-package flash-attn --no-install-package transformer-engine --no-install-package transformer-engine-cu12 --no-install-package transformer-engine-torch --no-install-package numpy"
+ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
+ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
+
+# First copy only the dependency files
+COPY --from=nemo-rl pyproject.toml uv.lock ./
+COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
+
+
+RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
+
+# uv sync has a more reliable resolver than simple uv pip install which can fail
+# The venv is symlinked to avoid bloating the layer size
+uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
+uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+EOF
+
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+WORKDIR /opt/nemo-rl
+
+FROM hermetic AS release
+
+ARG NEMO_RL_COMMIT
+ARG NVIDIA_BUILD_ID
+ARG NVIDIA_BUILD_REF
+ENV UV_NO_SYNC=1
+ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
+ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
+ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
+ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+# The 25.06 Pytorch container is not compatible with vllm standalone compile so we disable it
+ENV VLLM_USE_STANDALONE_COMPILE=0
+LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
+LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
+
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# Copy in source from build context (defaults to cloned repo, can be overridden)
+COPY --from=nemo-rl . /opt/nemo-rl
+# Unshallow the repo to get the full history (in the case it was from the scratch layer).
+# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
+# so do a quick check before trying to unshallow.
+RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES

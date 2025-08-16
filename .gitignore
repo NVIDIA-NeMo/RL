@@ -34,6 +34,7 @@ hf_datasets_cache/
 datasets/
 docker/*
 !docker/Dockerfile
+!docker/Dockerfile.ngc_pytorch
 !docker/README.md
 wandb/
 checkpoints/
