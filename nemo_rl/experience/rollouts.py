@@ -377,6 +377,13 @@ def run_multi_turn_rollout(
             )
         )
 
+        # On the first turn, record prompt-related fields for the whole batch
+        if turn == 0:
+            # Prompt lengths correspond to the pre-generation input lengths
+            current_batch["prompt_lengths"] = active_input_lengths
+            # Store the prompt token ids for pass@prompt metrics
+            current_batch["text"] = active_flat_messages["token_ids"]
+
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
 
@@ -485,6 +492,23 @@ def run_multi_turn_rollout(
 
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
+
+    # Expose additional fields used by environment post-processing hooks
+    # Proper end means naturally terminated without truncation
+    current_batch["is_end"] = (~sample_truncated) & sample_terminated
+    # Generation lengths = prompt lengths + assistant-generated tokens
+    if "prompt_lengths" in current_batch:
+        # Ensure integer dtype alignment
+        prompt_lengths_tensor = current_batch["prompt_lengths"].to(
+            dtype=sample_assistant_token_counts.dtype
+        )
+        current_batch["generation_lengths"] = (
+            prompt_lengths_tensor + sample_assistant_token_counts
+        )
+    else:
+        current_batch["generation_lengths"] = sample_assistant_token_counts
+    # Alias for rewards expected by some env hooks
+    current_batch["rewards"] = current_batch["total_reward"]
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -768,6 +792,14 @@ def run_async_multi_turn_rollout(
         """Internal async implementation."""
         batch_size = len(input_batch["message_log"])
 
+        # Pre-compute prompt fields from the initial message logs
+        flat_prompts, prompt_input_lengths = batched_message_log_to_flat_message(
+            input_batch["message_log"],
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        )
+        input_batch["prompt_lengths"] = prompt_input_lengths
+        input_batch["text"] = flat_prompts["token_ids"]
+
         # Prepare initial states for each sample
         sample_initial_states = []
         for i in range(batch_size):
@@ -837,6 +869,29 @@ def run_async_multi_turn_rollout(
         for key in input_batch.keys():
             if key not in final_batch:
                 final_batch[key] = input_batch[key]
+
+        # Expose additional fields used by environment post-processing hooks
+        # Proper end means naturally terminated without truncation
+        is_end_list = [
+            bool(m["terminated"]) and not bool(m["truncated"])
+            for m in all_sample_metrics
+        ]
+        final_batch["is_end"] = torch.tensor(is_end_list, dtype=torch.bool)
+        # Generation lengths = prompt lengths + assistant-generated tokens
+        assistant_tokens = torch.tensor(
+            [int(m["assistant_tokens"]) for m in all_sample_metrics],
+            dtype=final_batch["prompt_lengths"].dtype
+            if "prompt_lengths" in final_batch
+            else torch.int32,
+        )
+        if "prompt_lengths" in final_batch:
+            final_batch["generation_lengths"] = (
+                final_batch["prompt_lengths"] + assistant_tokens
+            )
+        else:
+            final_batch["generation_lengths"] = assistant_tokens
+        # Alias for rewards expected by some env hooks
+        final_batch["rewards"] = final_batch["total_reward"]
 
         # Aggregate metrics across all samples
         rollout_metrics = {
