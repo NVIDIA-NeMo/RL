@@ -68,7 +68,14 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
 
     ```yaml
     tokenizer:
-    custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
+      chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
+    ```
+
+    Alternatively, use a path to a local jinja template and load directly from file:
+
+    ```yaml
+    tokenizer:
+      chat_template: /path/to/template.jinja
     ```
 
 
