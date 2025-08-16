@@ -47,26 +47,28 @@ def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
     filepath = os.path.join(target_directory, filename)
 
     # Download the file with progress
-    print(f"Downloading {filename} from {url} to {filepath}...")
-    try:
-        with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            total_size_in_bytes = int(r.headers.get("content-length", 0))
-            block_size = 8192  # 8 Kibibytes
+    if not os.path.exists(filepath):
+        print(f"Downloading {filename} from {url} to {filepath}...")
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                total_size_in_bytes = int(r.headers.get("content-length", 0))
+                block_size = 8192  # 8 Kibibytes
 
-            # Initialize tqdm progress bar
-            progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
+                # Initialize tqdm progress bar
+                progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
 
-            with open(filepath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=block_size):
-                    progress_bar.update(len(chunk))
-                    f.write(chunk)
-            progress_bar.close()  # Close the progress bar
+                with open(filepath, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=block_size):
+                        progress_bar.update(len(chunk))
+                        f.write(chunk)
+                progress_bar.close()  # Close the progress bar
 
-        print(f"Download complete: {filepath}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading file: {e}")
-        return
+            print(f"Download complete: {filepath}")
+        except requests.exceptions.RequestException as e:
+            raise requests.exceptions.RequestException(f"Error downloading file: {e}")
+    else:
+        print(f"File {filepath} already exists, skipping download.")
 
     # Define the unzipping directory
     unzip_dir = os.path.join(target_directory, subdir_name)
@@ -84,14 +86,9 @@ def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
             zip_ref.extractall(unzip_dir)
         print("Unzipping complete.")
     except zipfile.BadZipFile:
-        print(f"Error: {filepath} is not a valid zip file.")
+        raise zipfile.BadZipFile(f"Error: {filepath} is not a valid zip file.")
     except Exception as e:
-        print(f"Error unzipping file: {e}")
-    finally:
-        # Optionally, remove the downloaded zip file after unzipping
-        # os.remove(filepath)
-        # print(f"Removed downloaded zip file: {filepath}")
-        pass
+        raise Exception(f"Error unzipping file: {e}")
 
 
 def format_refcoco_dataset(
