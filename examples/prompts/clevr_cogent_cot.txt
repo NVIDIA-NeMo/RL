@@ -1,0 +1,5 @@
+Think step-by-step to solve the following problem, and answer in the following format: <think> step-by-step thought process </think> <answer> final answer </answer>
+Note that your final answer must only contain a single numerical output (e.g. 2, 12, 45) for numerical solutions, and only the strings "yes" or "no" for yes/no type questions.
+
+Let's think step-by-step: 
+{}

@@ -14,12 +14,37 @@
 
 import importlib
 import os
+from collections import defaultdict
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+from torch import nn
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForTextToWaveform,
+)
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+# an automodel factory for loading the huggingface models from correct class
+AUTOMODEL_FACTORY = defaultdict(lambda: AutoModelForCausalLM)
+AUTOMODEL_FACTORY["qwen2_5_vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2_vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2_5_omni"] = AutoModelForTextToWaveform
+AUTOMODEL_FACTORY["llava"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["internvl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["gemma3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["smolvlm"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["mistral3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["llama4"] = AutoModelForImageTextToText
+
+
+def resolve_model_class(model_name: str) -> nn.Module:
+    if model_name.lower() in AUTOMODEL_FACTORY.keys():
+        return AUTOMODEL_FACTORY[model_name.lower()]
+    return AutoModelForCausalLM
 
 
 def is_vllm_v1_engine_enabled() -> bool:

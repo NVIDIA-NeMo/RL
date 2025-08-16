@@ -1,0 +1,4 @@
+Think step-by-step to solve the following math problem, and answer in the following format: <think> step-by-step thought process </think> <answer> only answer here </answer>.
+
+Let's think step-by-step: 
+{}

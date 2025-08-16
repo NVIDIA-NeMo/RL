@@ -27,6 +27,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
@@ -99,12 +100,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         async def process_single_sample(sample_idx):
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
-            prompt_token_ids_list = (
-                input_ids_batch[sample_idx, :current_input_actual_length].tolist()
-                if current_input_actual_length > 0
-                else []
-            )
-            prompt = {"prompt_token_ids": prompt_token_ids_list}
+            prompt = format_prompt_for_vllm_generation(data, sample_idx)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(
