@@ -498,13 +498,21 @@ def get_formatted_message_log(
                 item["text"] = task_data_spec.prompt.format(item["text"])
         return content
 
+
+    # ignore any system prompts
+    first_user_msg_id = 0
+    for i, msg in enumerate(message_log_strs):
+        if msg["role"] == "user":
+            first_user_msg_id = i
+            break
+
     if task_data_spec.prompt:
-        message_log_strs = [
+        message_log_strs = message_log_strs[:first_user_msg_id] + [
             {
                 "role": "user",
-                "content": _format_content_helper(message_log_strs[0]["content"]),
+                "content": _format_content_helper(message_log_strs[first_user_msg_id]["content"]),
             }
-        ] + message_log_strs[1:]
+        ] + message_log_strs[first_user_msg_id+1:]
 
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
