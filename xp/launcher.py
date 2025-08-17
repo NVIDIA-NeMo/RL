@@ -128,6 +128,72 @@ def verify_with_sweep(sweep_config: Dict[str, Any], script_path: Optional[str], 
     return final_script_path, final_config_path
 
 
+def identify_varying_parameters(sweep_config: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Identify which parameters are varying (multiple values) vs constant (single values).
+    
+    Returns:
+        Dict mapping parameter names to True if varying, False if constant.
+    """
+    sweep_params = {k: v for k, v in sweep_config.items() if k not in ["script_path", "config_path"]}
+    varying_params = {}
+    
+    for param_name, param_values in sweep_params.items():
+        # Consider a parameter varying if it has more than one value
+        varying_params[param_name] = len(param_values) > 1
+    
+    return varying_params
+
+
+def generate_job_name_from_params(base_name: str, params: Dict[str, Any], varying_params: Dict[str, bool]) -> str:
+    """
+    Generate a meaningful job name based on varying parameter values.
+    
+    Args:
+        base_name: Base job name (e.g., script name or user-provided name)
+        params: Dictionary of parameter values for this specific combination
+        varying_params: Dictionary indicating which parameters are varying
+    
+    Returns:
+        Generated job name including varying parameter values
+    """
+    varying_parts = []
+    
+    for param_name, param_value in params.items():
+        if varying_params.get(param_name, False):  # Only include varying parameters
+            # Simplify parameter names for readability
+            # Extract the last part after dots (e.g., "grpo.kl_penalty" -> "kl_penalty")
+            short_name = param_name.split('.')[-1]
+            
+            # Simplify common parameter values
+            if isinstance(param_value, float):
+                if param_value < 1e-3:
+                    # Use scientific notation for very small values
+                    value_str = f"{param_value:.0e}"
+                else:
+                    # Use regular decimal notation, removing trailing zeros
+                    value_str = f"{param_value:g}"
+            elif isinstance(param_value, str):
+                # For model names, extract just the model part
+                if "/" in param_value:
+                    value_str = param_value.split("/")[-1]
+                else:
+                    value_str = param_value
+                # Replace common characters that might cause issues
+                value_str = value_str.replace("-", "").replace("_", "").replace(" ", "")
+            else:
+                value_str = str(param_value)
+            
+            varying_parts.append(f"{short_name}_{value_str}")
+    
+    # If no varying parameters, just return base name
+    if not varying_parts:
+        return base_name
+    
+    # Combine base name with varying parameter values
+    return f"{base_name}_{'_'.join(varying_parts)}"
+
+
 def generate_parameter_combinations(sweep_config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Generate all combinations of parameters from the sweep config."""
     # Remove script_name from the parameters to sweep over
@@ -325,10 +391,12 @@ def main():
     
     # Load sweep config if provided
     param_combinations = [{}]  # Default to no parameters
+    varying_params = {}  # Track which parameters are varying
     if args.sweep:
         sweep_config = load_yaml(args.sweep)
         script_path, config_path = verify_with_sweep(sweep_config, script_path, config_path)
         param_combinations = generate_parameter_combinations(sweep_config)
+        varying_params = identify_varying_parameters(sweep_config)
     elif not script_path:
          raise ValueError("Script path must be provided via --script or sweep config")
 
@@ -361,7 +429,8 @@ def main():
         
         # Create shared job name for all jobs in this chain
         if len(param_combinations) > 1:
-            shared_job_name = f"{base_job_name}_sweep{i+1}"
+            # Use varying parameters to generate meaningful job names
+            shared_job_name = generate_job_name_from_params(base_job_name, params, varying_params)
         else:
             shared_job_name = base_job_name
         
