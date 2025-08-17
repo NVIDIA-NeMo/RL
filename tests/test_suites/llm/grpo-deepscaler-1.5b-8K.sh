@@ -38,10 +38,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.05"
 fi
 
-MAX_STEPS=240
-CKPT_DIR=$(realpath ./code_snapshots_backup/grpo-deepscaler-1.5b-8K/tests/test_suites/llm/grpo-deepscaler-1.5b-8K/ckpts/)
-RUN_LOG=/lustre/fs1/portfolios/coreai/users/terryk/rewrite-aligner/nrl-deepscaler/code_snapshots_backup/grpo-deepscaler-1.5b-8K/tests/test_suites/llm/grpo-deepscaler-1.5b-8K/run.log  
-
 # Convert 8k checkpoint
 uv run examples/converters/convert_dcp_to_hf.py \
   --config=$CKPT_DIR/step_${MAX_STEPS}/config.yaml \
@@ -55,7 +51,7 @@ NRL_FORCE_REBUILD_VENVS=true uv run examples/run_eval.py \
     generation.vllm_cfg.max_model_len=32768 \
     generation.vllm_cfg.enforce_eager=True \
     generation.temperature=1.0 \
-    eval.num_tests_per_prompt=5 \
+    eval.num_tests_per_prompt=16 \
     2>&1 | tee ${RUN_LOG}.aime-8k
 
 cat ${RUN_LOG}.aime-8k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > ${RUN_LOG}-8k-metric.json

@@ -4,8 +4,8 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=20
-MAX_STEPS=20
+STEPS_PER_RUN=15
+MAX_STEPS=15
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -58,7 +58,7 @@ uv run examples/run_eval.py \
     generation.vllm_cfg.max_model_len=32768 \
     generation.vllm_cfg.enforce_eager=True \
     generation.temperature=1.0 \
-    eval.num_tests_per_prompt=5 \
+    eval.num_tests_per_prompt=16 \
     2>&1 | tee ${RUN_LOG}.aime-24k
 
 cat ${RUN_LOG}.aime-24k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > ${RUN_LOG}-24k-metric.json
