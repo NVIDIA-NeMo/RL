@@ -680,7 +680,7 @@ def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
     message_log: LLMMessageLogType = [
         {
             "role": "system",
-            "content": "",   # to prevent Qwen's default system prompt taking over
+            "content": "",  # to prevent Qwen's default system prompt taking over
         },
         {
             "role": "user",
@@ -698,16 +698,17 @@ def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
     # First message text should be formatted by prompt
     assert isinstance(out[1]["content"], list)
     assert any(
-        item["type"] == "text" and item["text"].startswith("<|im_start|>user\nQuestion: ")
+        item["type"] == "text"
+        and item["text"].startswith("<|im_start|>user\nQuestion: ")
         for item in out[1]["content"]
     )  # type: ignore[index]
     # pixel_values should be added as PackedTensor for the first message
     from nemo_rl.data.multimodal_utils import PackedTensor
 
     assert isinstance(out[1]["pixel_values"], PackedTensor)
-    assert isinstance(out[1]['image_grid_thw'], PackedTensor)
+    assert isinstance(out[1]["image_grid_thw"], PackedTensor)
     pv = out[1]["pixel_values"].as_tensor()
-    grid_thw = out[1]['image_grid_thw'].as_tensor()
+    grid_thw = out[1]["image_grid_thw"].as_tensor()
     assert pv.ndim == 2 and pv.shape[1] == 1176
     assert grid_thw.ndim == 2 and grid_thw.shape == torch.Size([1, 3])
     # token_ids should be non-empty tensors
@@ -739,16 +740,19 @@ def test_get_formatted_message_log_multimodal_prompt_formatting() -> None:
     # First message text should be formatted by prompt
     assert isinstance(out[0]["content"], list)
     assert any(
-        item["type"] == "text" and item["text"].startswith("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nQuestion: ")
+        item["type"] == "text"
+        and item["text"].startswith(
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nQuestion: "
+        )
         for item in out[0]["content"]
     )  # type: ignore[index]
     # pixel_values should be added as PackedTensor for the first message
     from nemo_rl.data.multimodal_utils import PackedTensor
 
     assert isinstance(out[0]["pixel_values"], PackedTensor)
-    assert isinstance(out[0]['image_grid_thw'], PackedTensor)
+    assert isinstance(out[0]["image_grid_thw"], PackedTensor)
     pv = out[0]["pixel_values"].as_tensor()
-    grid_thw = out[0]['image_grid_thw'].as_tensor()
+    grid_thw = out[0]["image_grid_thw"].as_tensor()
     assert pv.ndim == 2 and pv.shape[1] == 1176
     assert grid_thw.ndim == 2 and grid_thw.shape == torch.Size([1, 3])
     # token_ids should be non-empty tensors
