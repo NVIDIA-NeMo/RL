@@ -51,6 +51,7 @@ env:
     max_tokens: 512  # Max tokens for the judge's evaluation
     stop: null # Stop strings for the judge's evaluation
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
+    log_path: ${save_dir}
 
 cluster:
   gpus_per_node: 1
