@@ -205,7 +205,7 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         ```
     """
     processor = None
-    is_tokenizer_processor = tokenizer_config.get("is_tokenizer_processor", False)
+    is_tokenizer_processor = tokenizer_config["is_tokenizer_processor"]
 
     if is_tokenizer_processor:
         processor = AutoProcessor.from_pretrained(
