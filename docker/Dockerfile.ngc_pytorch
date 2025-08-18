@@ -8,7 +8,7 @@
 # Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
 #
 # If installing new dependencies in the container, then use "uv pip install new-dependency"
-ARG BASE_IMAGE=nvcr.io/nvidia/nemo:25.06-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
