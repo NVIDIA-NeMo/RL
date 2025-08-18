@@ -18,13 +18,17 @@ import ray
 import torch
 from typing import Dict, Any, List, Tuple, Optional
 from transformers import AutoTokenizer
-
+import ray
+from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.utils.venvs import create_local_venv
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES,RayVirtualCluster
-
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    get_actor_python_env,
+)
+from nemo_rl.models.policy.lm_policy import Policy
 
 @ray.remote
 class RewardModelEnvironment(EnvironmentInterface):
@@ -44,7 +48,13 @@ class RewardModelEnvironment(EnvironmentInterface):
         
         self.config = config
         self.reward_model_worker = None
-        self.virtual_cluster = None
+        self.virtual_cluster = RayVirtualCluster(
+            name="grpo_reward_model_cluster",
+            bundle_ct_per_node_list=[self.config["resources"]["gpus_per_node"]] * self.config["resources"]["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=self.config["resources"]["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
         
         # Initialize reward model worker with proper resource management
         print("🔧 Setting up reward model worker...")
@@ -55,29 +65,18 @@ class RewardModelEnvironment(EnvironmentInterface):
     def _setup_reward_model_worker(self):
         """Setup the reward model worker with proper resource management."""
         # Import the reward model worker class
-        from nemo_rl.models.policy.dtensor_reward_model_worker import DTensorRewardModelWorker
-        from nemo_rl.models.policy import PolicyConfig
         
-        # Get tensor parallel size
-        tensor_parallel_size = self.config.get("tensor_parallel_size", 2)  # Default to 2 instead of 4
-        
+
         print(f"🔧 Reward model configuration:")
         print(f"   - Model: {self.config['model_name']}")
-        print(f"   - Tensor Parallel Size: {tensor_parallel_size}")
+        print(f"   - Tensor Parallel Size: {self.config['dtensor_cfg']['tensor_parallel_size']}")
         print(f"   - Dtype: {self.config.get('dtype', 'bfloat16')}")
         print(f"   - GPU Memory Utilization: {self.config.get('gpu_memory_utilization', 0.8)}")
         print(f"   - Max Model Length: {self.config.get('max_model_len', 4096)}")
         print(f"   - Full config: {self.config}")
-        
-        # Setup virtual cluster for proper resource allocation (following LLM judge pattern exactly)
-        # NOTE: When running with GRPO, the policy already creates a virtual cluster
-        # So we should NOT create another virtual cluster to avoid placement group conflicts
-        # Instead, let Ray's default scheduler handle GPU allocation
-        self.virtual_cluster = None
-        placement_groups = []
-        
-        print(f"🔧 Using Ray's default scheduler (no virtual cluster) to avoid placement group conflicts with policy")
-        
+
+        weights_path = self.config.get("checkpoint_path", None)
+        tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
         # Pass down critical environment variables (similar to LLM judge)
         env_vars_to_pass = {}
         for key in [
@@ -94,44 +93,18 @@ class RewardModelEnvironment(EnvironmentInterface):
         # Ensure xet is disabled and CUDA memory management is set
         env_vars_to_pass.setdefault("HUGGINGFACE_HUB_DISABLE_XET", "1")
         env_vars_to_pass.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        
-        # Create worker configuration compatible with PolicyConfig
-        worker_config = PolicyConfig({
-            "reward_model_name": self.config["model_name"],
-            "precision": self.config.get("dtype", "bfloat16"),
-            "reward_batch_size": self.config.get("batch_size", 2),
-            "dtensor_cfg": {
-                "cpu_offload": False,
-                "tensor_parallel_size": tensor_parallel_size,
-                "sequence_parallel": False,
-                "activation_checkpointing": True,
-            }
-        })
-        
-        # Setup worker options with proper runtime environment
-        worker_options = {
-            "runtime_env": {
-                "py_executable": self.DEFAULT_PY_EXECUTABLE,
-                "env_vars": env_vars_to_pass,
-            },
-        }
-        
-        # Setup scheduling strategy - always use default Ray scheduler
-        # For reward model, request all GPUs on the node (like LLM judge does)
-        # This ensures proper node alignment for distributed setup
-        gpus_per_node = 8  # Standard node configuration
-        worker_options["num_gpus"] = gpus_per_node
-        scheduling_kwargs = {}  # No placement group - use Ray's default scheduler
-        
-        print(f"🔧 Requesting {gpus_per_node} GPUs (full node) via Ray's default scheduler for tensor_parallel_size={tensor_parallel_size}")
-        
-        # Initialize the reward model worker as a Ray remote actor
-        self.reward_model_worker = DTensorRewardModelWorker.options(
-            **worker_options,
-            **scheduling_kwargs,
-        ).remote(worker_config)
-        
-        print(f"✓ Reward model worker initialized with {self.config['model_name']} using {tensor_parallel_size} GPUs")
+        self.config["env_vars"] = env_vars_to_pass
+        self.reward_model_policy = Policy(
+            cluster=self.virtual_cluster,
+            config=self.config,
+            tokenizer=tokenizer,
+            name_prefix="reward_model_policy",
+            init_optimizer=False,
+            init_reference_model=False,
+            weights_path=weights_path,
+        )
+
+        print(f"✓ Reward model worker initialized with {self.config['model_name']} using {self.config['resources']['num_nodes']} Nodes")
 
     def get_rewards(
         self, reward_data: BatchedDataDict, micro_batch_size: int = None
@@ -145,8 +118,15 @@ class RewardModelEnvironment(EnvironmentInterface):
         Returns:
             BatchedDataDict with rewards
         """
-        return self.reward_model_worker.get_rewards.remote(
-            reward_data, micro_batch_size
+        dp_size = self.reward_model_policy.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = reward_data.shard_by_batch_size(dp_size, batch_size=None)
+        return self.reward_model_policy.worker_group.run_all_workers_sharded_data(
+            "get_rewards",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
     def step(
@@ -174,6 +154,10 @@ class RewardModelEnvironment(EnvironmentInterface):
         # Get rewards from the reward model worker using Ray remote call
         results_future = self.reward_model_worker.get_rewards.remote(reward_data_copy)
         results = ray.get(results_future)
+        results = BatchedDataDict.from_batches(
+            self.reward_model_policy.worker_group.get_all_worker_results(results_future),
+
+        )
         
         # Extract rewards from the results
         rewards_tensor = results["rewards"]
