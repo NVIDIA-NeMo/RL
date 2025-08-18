@@ -103,7 +103,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     datum_preprocessor = None
     if data_cls == "open_assistant":
         data = hf_datasets.OasstDataset(
-            output_dir="/tmp/open_assistant", seed=seed,
+            output_dir="/tmp/open_assistant",
+            seed=seed,
         )
     elif data_cls == "squad":
         data = hf_datasets.SquadDataset()

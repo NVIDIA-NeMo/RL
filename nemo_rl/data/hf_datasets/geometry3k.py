@@ -92,7 +92,9 @@ class Geometry3KDataset:
         )
         self.task_name = "geometry3k"
 
-        self.formatted_ds = prepare_geometry3k_dataset(split=split, task_name=self.task_name)
+        self.formatted_ds = prepare_geometry3k_dataset(
+            split=split, task_name=self.task_name
+        )
         self.task_spec = TaskDataSpec(
             task_name="Geometry3K",
             prompt_file=prompt_file,
