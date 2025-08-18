@@ -16,10 +16,131 @@ import os
 import unittest.mock
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from nemo_rl.models.policy.utils import (
+    apply_top_k_top_p,
     configure_expandable_segments,
     get_megatron_checkpoint_dir,
 )
+
+
+class TestSamplingUtils(unittest.TestCase):
+    """Test cases for sampling utility functions."""
+
+    def setUp(self):
+        """Set up deterministic test data"""
+        # Create a deterministic logits tensor of shape [2, 2, 4]
+        self.logits = torch.tensor(
+            [
+                [
+                    [10.0, 5.0, 2.0, 1.0],
+                    [8.0, 7.0, 3.0, 0.5],
+                ],
+                [
+                    [6.0, 9.0, 1.5, 4.0],
+                    [2.5, 1.0, 8.5, 7.5],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+
+    def test_top_k_only(self):
+        """Test top-k only sampling"""
+        k = 2
+        result = apply_top_k_top_p(self.logits.clone(), top_k=k)
+
+        # Expected result: keep top 2 values, mask others
+        expected = torch.tensor(
+            [
+                [
+                    [10.0, 5.0, -float("inf"), -float("inf")],
+                    [8.0, 7.0, -float("inf"), -float("inf")],
+                ],
+                [
+                    [6.0, 9.0, -float("inf"), -float("inf")],
+                    [-float("inf"), -float("inf"), 8.5, 7.5],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(torch.allclose(result, expected, equal_nan=True))
+
+    def test_top_p_only(self):
+        """Test top-p only sampling with specific probability threshold"""
+        p = 0.8
+        result = apply_top_k_top_p(self.logits.clone(), top_p=p)
+
+        expected = torch.tensor(
+            [
+                [
+                    [10.0, -float("inf"), -float("inf"), -float("inf")],
+                    [8.0, 7.0, -float("inf"), -float("inf")],
+                ],
+                [
+                    [-float("inf"), 9.0, -float("inf"), -float("inf")],
+                    [-float("inf"), -float("inf"), 8.5, 7.5],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(torch.allclose(result, expected, equal_nan=True))
+
+    def test_top_k_and_top_p_combined(self):
+        """Test both top-k and top-p sampling together"""
+        k = 3
+        p = 0.8
+        result = apply_top_k_top_p(self.logits.clone(), top_k=k, top_p=p)
+
+        # Expected: apply top-k=3 first, then top-p=0.8
+        # For our data, top-k=3 keeps top 3 values, then top-p further filters
+        expected = torch.tensor(
+            [
+                [
+                    [10.0, -float("inf"), -float("inf"), -float("inf")],
+                    [8.0, 7.0, -float("inf"), -float("inf")],
+                ],
+                [
+                    [-float("inf"), 9.0, -float("inf"), -float("inf")],
+                    [-float("inf"), -float("inf"), 8.5, 7.5],
+                ],
+            ],
+            dtype=torch.float32,
+        )
+
+        self.assertTrue(torch.allclose(result, expected, equal_nan=True))
+
+    def test_no_sampling(self):
+        """Test no sampling (should return original logits)"""
+        result = apply_top_k_top_p(self.logits.clone())
+        self.assertTrue(torch.allclose(result, self.logits, equal_nan=True))
+
+    def test_edge_cases(self):
+        """Test edge cases for sampling parameters"""
+        # k >= vocab size (should return original logits)
+        result = apply_top_k_top_p(self.logits.clone(), top_k=4)
+        self.assertTrue(torch.allclose(result, self.logits))
+
+        result = apply_top_k_top_p(self.logits.clone(), top_k=10)
+        self.assertTrue(torch.allclose(result, self.logits))
+
+        # p = 1.0 (should return original logits)
+        result = apply_top_k_top_p(self.logits.clone(), top_p=1.0)
+        self.assertTrue(torch.allclose(result, self.logits))
+
+    def test_gradient_flow(self):
+        """Test that gradients flow through the sampling operations"""
+        logits_with_grad = self.logits.clone().requires_grad_(True)
+        result = apply_top_k_top_p(logits_with_grad, top_k=2, top_p=0.7)
+        loss = result.sum()
+        loss.backward()
+
+        # Check that gradients exist and are non-zero for at least some elements
+        self.assertIsNotNone(logits_with_grad.grad)
+        self.assertEqual(logits_with_grad.grad.shape, logits_with_grad.shape)
+        self.assertTrue(torch.any(logits_with_grad.grad != 0))
 
 
 class TestConfigureExpandableSegments(unittest.TestCase):

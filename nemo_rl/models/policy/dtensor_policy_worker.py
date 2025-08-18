@@ -64,6 +64,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    apply_top_k_top_p,
     configure_dynamo_cache,
     configure_expandable_segments,
     get_gpu_info,
@@ -459,19 +460,40 @@ class DTensorPolicyWorker:
             no_restore_buffers=cp_no_restore_buffers,
         )
 
-    # Refer to nemo impl. Below is original comment.
-    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
-
-    def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        # Apply temperature scaling to logits if configured and not using V1 engine.
+    def _post_processing_logits_with_sampling_params(
+        self, logits: torch.Tensor
+    ) -> torch.Tensor:
+        # Apply temperature scaling and top-k/top-p sampling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             # The V1 engine returns raw logits before temperature scaling.
             # The V0 engine returns scaled logits.
             # Therefore, we only divide if we are not using the V1 engine.
             if not is_vllm_v1_engine_enabled():
+                # Convert to float32 to mimic vllm's behavior.
+                logits = logits.to(torch.float32)
+
+                # Apply temperature scaling.
                 logits.div_(self.cfg["generation"]["temperature"])
+
+                # Apply top-k and top-p sampling
+                top_k = self.cfg["generation"]["top_k"]
+                top_p = self.cfg["generation"]["top_p"]
+                # Skip if no sampling is configured
+                if (top_k is None or top_k == -1) and (top_p is None or top_p == 1.0):
+                    return logits
+
+                if self.tp_size == 1:
+                    logits = apply_top_k_top_p(logits, top_k=top_k, top_p=top_p)
+                else:
+                    raise ValueError(
+                        "Top-k and top-p sampling is not supported for tensor_parallel_size > 1 for vLLM v0 engine. "
+                        "Please use vLLM v1 engine instead."
+                    )
+
         return logits
 
+    # Refer to nemo impl. Below is original comment.
+    # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
     @staticmethod
     @contextlib.contextmanager
     def train_context(cp_context: Optional[Generator[None, None, None]] = None):
@@ -710,8 +732,10 @@ class DTensorPolicyWorker:
                             logits = outputs.logits
                         del outputs
 
-                        # Apply temperature scaling
-                        logits = self._apply_temperature_scaling(logits)
+                        # Apply temperature scaling and sampling parameters
+                        logits = self._post_processing_logits_with_sampling_params(
+                            logits
+                        )
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (
@@ -996,8 +1020,8 @@ class DTensorPolicyWorker:
 
                     logits = outputs.logits
 
-                    # Apply temperature scaling
-                    logits = self._apply_temperature_scaling(logits)
+                    # Apply temperature scaling and sampling parameters
+                    logits = self._post_processing_logits_with_sampling_params(logits)
 
                     if self.cp_size > 1:
                         seq_index_tensor = (
