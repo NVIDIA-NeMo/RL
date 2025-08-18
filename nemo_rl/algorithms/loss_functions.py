@@ -433,11 +433,8 @@ class MDLMCrossEntropyLoss(LossFunction):
                 dim=-1, index=target_ids.cuda().unsqueeze(-1)
             ).squeeze(-1)
 
-        answer_lengths = token_mask.sum(dim=-1)[:, None]
-        _token_logprobs = token_logprobs / answer_lengths
-        token_loss = -_token_logprobs[mask] / p_mask[mask]  # cross entropy loss
-        # loss = torch.sum(token_loss) / global_valid_seqs
-        loss = torch.sum(token_loss)    # normalization done by answer_lengths
+        # cross entropy loss
+        loss = -masked_mean(token_logprobs, mask, global_normalization_factor=global_valid_toks * p_mask)
 
         return loss, {
             "loss": loss.item() if loss.ndim == 0 else loss,
