@@ -152,7 +152,7 @@ env:
       - name: bbox_giou
         weight: 0.9
         kwargs: 
-          giou_penalty_thres: 0  # (apply giou penalty if iou < giou_penalty_thres; anything less than 0 means use iou only (since the condition iou < 0 is not possible))
+          giou_penalty_thres: 1.0  # (apply giou penalty if iou < giou_penalty_thres; anything less than 0 means use iou only (since the condition iou < 0 is not possible))
 
 logger:
   log_dir: "logs"  # Base directory for all logs

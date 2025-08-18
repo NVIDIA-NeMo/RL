@@ -18,14 +18,19 @@ checkpointing:
 policy:
   train_global_batch_size: 32
   logprob_batch_size: 2
-  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  model_name: "Qwen/Qwen2-VL-7B-Instruct"
 
   scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: []
+    - milestones: [20]
 
   max_total_sequence_length: 2048
   generation:
