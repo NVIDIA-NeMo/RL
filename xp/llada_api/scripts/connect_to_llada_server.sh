@@ -262,12 +262,8 @@ main() {
     echo "   ${YELLOW}python xp/llada_api/examples/llada_api_client.py${NC}"
     echo ""
     
-    print_info "💡 The job logs also show connection instructions when the server starts:"
-    if [[ -n "$JOB_ID" ]]; then
-        echo "   ${YELLOW}tail -f logs/llada_server/llada_server_${JOB_ID}.log${NC}"
-    else
-        echo "   ${YELLOW}tail -f logs/llada_server/llada_server_JOBID.log${NC}"
-    fi
+    print_info "💡 Connection instructions appear in the server output when it starts."
+    print_info "The server outputs everything to stdout in real-time."
     echo ""
     
     # Offer to wait and test

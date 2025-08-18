@@ -120,8 +120,7 @@ start_server() {
     # Show how to access logs for connection info
     echo ""
     print_info "📋 The server will display connection instructions when it starts."
-    print_info "Watch the job logs:"
-    echo "   tail -f logs/llada_server/llada_server_$JOB_ID.log"
+    print_info "All output is shown directly in the terminal - no log files to monitor."
     echo ""
 }
 
@@ -130,7 +129,7 @@ get_connection_info() {
     print_step "Getting connection information..."
     
     print_info "The server automatically displays connection instructions when it starts."
-    print_info "You should see SSH tunnel commands in the job logs."
+    print_info "You should see SSH tunnel commands in the terminal output below."
     echo ""
     
     # Also use the connection helper as backup
@@ -145,11 +144,11 @@ wait_for_tunnel() {
     echo ""
     echo "=================================================="
     echo "NEXT STEPS:"
-    echo "1. Check the job logs for server startup and connection info:"
-    echo "   tail -f logs/llada_server/llada_server_$JOB_ID.log"
+    echo "1. Watch the terminal output for server startup and connection info"
+    echo "   (Connection commands will appear when the server starts)"
     echo ""
     echo "2. Open a NEW terminal on your LOCAL machine"
-    echo "3. Run the SSH tunnel command from the logs (or above)"
+    echo "3. Run the SSH tunnel command shown in the output above"
     echo "4. Come back here and press Enter to continue testing"
     echo "=================================================="
     echo ""

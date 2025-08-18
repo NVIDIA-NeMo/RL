@@ -187,14 +187,8 @@ if [[ "$LOCAL_MODE" == false ]]; then
         exit 1
     fi
     
-    # Set up logging directory
-    if [[ -n "$LOG" ]]; then
-        LOG_DIR="$LOG/llada_server"
-    else
-        LOG_DIR="$(pwd)/logs/llada_server"
-    fi
-    mkdir -p "$LOG_DIR"
-    print_status "Logs will be written to: $LOG_DIR"
+    # Note: Logs will be output to stdout instead of files
+    print_status "Logs will be output directly to stdout for real-time viewing"
 fi
 
 # Get the absolute path to the Python script
@@ -320,7 +314,7 @@ run_slurm() {
     echo "  • Partition: $PARTITION"
     echo "  • Account: $ACCOUNT"
     echo "  • Container: $CONTAINER_IMAGE"
-    echo "  • Logs: $LOG_DIR"
+    echo "  • Logs: stdout (real-time)"
 
     # Show server info
     print_status "Server configuration:"
@@ -331,8 +325,8 @@ run_slurm() {
     
     print_status "Connection setup:"
     echo "  • The server will display SSH tunnel commands when it starts"
-    echo "  • Watch the job logs for connection instructions"
-    echo "  • Use: tail -f $LOG_DIR/llada_server_*.log"
+    echo "  • Connection instructions will appear in the terminal output"
+    echo "  • Server logs will be shown directly in stdout"
 
     # Create the command block that will run inside the container
     COMMAND_BLOCK=$(cat <<EOF
@@ -436,7 +430,6 @@ EOF
          --container-image="$CONTAINER_IMAGE" \
          --container-workdir="$PROJECT_DIR" \
          --container-mounts="$PROJECT_DIR:$PROJECT_DIR" \
-         --output="$LOG_DIR/llada_server_%j.log" \
          bash -c "$COMMAND_BLOCK"
 }
 

@@ -83,14 +83,14 @@ When running on SLURM, the server runs on a compute node and automatically displ
 export ACCOUNT=your_account
 ./start_llada_server.sh --model-path GSAI-ML/LLaDA-8B-Instruct
 
-# Watch the job logs - connection instructions appear when server starts
-tail -f logs/llada_server/llada_server_JOBID.log
+# Connection instructions appear automatically in the terminal output when server starts
+# All logs are shown in real-time - no need to monitor separate log files
 
 # Or use the helper script for manual connection setup
 ./connect_to_llada_server.sh --job-id $JOB_ID
 ```
 
-**Connection Instructions Appear Automatically**: The server logs will show SSH tunnel commands and local URLs when the server starts up, similar to the Jupyter notebook pattern.
+**Connection Instructions Appear Automatically**: The server output will show SSH tunnel commands and local URLs when the server starts up, directly in your terminal in real-time.
 
 ### Basic Usage
 
@@ -404,14 +404,11 @@ python llada_openai_server.py --model-path /path/to/model --log-level DEBUG
 ```
 
 #### SLURM Mode Logs
-For SLURM jobs, logs are automatically saved:
+For SLURM jobs, all output appears in real-time in your terminal:
 
 ```bash
-# View job logs (replace JOB_ID with your actual job ID)
-tail -f logs/llada_server/llada_server_12345.log
-
-# Or if using custom LOG directory:
-tail -f $LOG/llada_server/llada_server_12345.log
+# All server output is shown directly - no log files needed!
+# Connection instructions appear automatically when the server starts
 
 # Check job status
 squeue -j JOB_ID
