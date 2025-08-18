@@ -29,6 +29,7 @@ from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.envvars import set_envvars
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
@@ -191,6 +192,9 @@ def main():
         )
 
     init_ray()
+
+    if "env" in config["policy"]:
+        set_envvars(config["policy"]["env"])
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])

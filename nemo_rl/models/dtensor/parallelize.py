@@ -544,16 +544,15 @@ def _parallelize_model(
 
             need to find a better solution for checkpointing
             """
-            if "self_attn" in layers[i].__dict__:
+            if hasattr(layers[i], "self_attn"):
                 layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
-            if (
-                "input_layernorm" in layers[i].__dict__
-                and "post_attention_layernorm" in layers[i].__dict__
-            ):
+            if hasattr(layers[i], "input_layernorm"):
                 layers[i].input_layernorm = checkpoint_wrapper(
                     layers[i].input_layernorm  # type: ignore
                 )
+
+            if hasattr(layers[i], "post_attention_layernorm"):
                 layers[i].post_attention_layernorm = checkpoint_wrapper(
                     layers[i].post_attention_layernorm  # type: ignore
                 )

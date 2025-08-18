@@ -29,6 +29,7 @@ from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.envvars import set_envvars
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
@@ -235,6 +236,9 @@ def main():
         )
 
     init_ray()
+
+    if "env" in config["policy"]:
+        set_envvars(config["policy"]["env"])
 
     # setup data
     train_dataset, val_dataset, tokenizer, dpo_task_spec = setup_data(

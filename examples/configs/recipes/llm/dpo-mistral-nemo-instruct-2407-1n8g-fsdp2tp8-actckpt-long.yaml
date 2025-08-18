@@ -18,11 +18,12 @@ dpo:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/dpo"
+  checkpoint_dir: "results/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long"
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: null
   save_period: 50
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "mistralai/Mistral-Nemo-Instruct-2407"
@@ -35,6 +36,8 @@ policy:
   train_global_batch_size: 8
   train_micro_batch_size: 1
 
+  env:
+    PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 
   #logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 12288
@@ -82,16 +85,18 @@ policy:
 
 data:
   dataset_name: "HelpSteer3"
+  shuffle: False
   max_input_seq_length: ${policy.max_total_sequence_length}
+
 logger:
-  log_dir: "logs"  # Base directory for all logs
-  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  log_dir: "logs/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long"  # Base directory for all logs
+  wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: false
   mlflow_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "ybgao-aug7-dpo-oom-test"
-    name: "baseline"
+    project: "nemo-rl"
+    name: "dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
