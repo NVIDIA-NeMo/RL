@@ -95,8 +95,8 @@ def download_and_unzip(url: str, target_directory: str, subdir_name: str = "."):
 
 def format_refcoco_dataset(
     example: dict[str, Any],
-    width: int = 448,
-    height: int = 448,
+    width: int = 256,
+    height: int = 256,
     caption_type: str = "random",
     prompt_file: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -117,8 +117,7 @@ def format_refcoco_dataset(
     # resize image for easy image processing across batches
     image = Image.open(example["image_path"])
     orig_width, orig_height = image.size
-    # resized_image = image.resize((width, height))
-    resized_image = image
+    resized_image = image.resize((width, height))
 
     # get caption from many types
     if caption_type == "random":

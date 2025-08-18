@@ -3,19 +3,23 @@
 defaults:
   - grpo-qwen2.5-vl-3b-instruct-clevr-1n2g-dtensor2tp1.v1.yaml
 
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/refcoco_grpo_${policy.model_name}"
+  checkpoint_dir: "results/geometry3k_grpo_${policy.model_name}" 
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
 
 policy:
-  generation:
-    backend: "vllm"
-    max_new_tokens: 1024
-  
+  train_global_batch_size: 32
+  logprob_batch_size: 2
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+
   scheduler:
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
@@ -23,12 +27,17 @@ policy:
         total_iters: 10000000000
     - milestones: []
 
+  max_total_sequence_length: 2048
+  generation:
+    backend: "vllm"
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+
 data:
-  prompt_file: "examples/prompts/refcoco.txt"
-  system_prompt_file: null
-  download_dir: "/data/coco/"
-  dataset_name: "refcoco"
-  split: "default"
+  prompt_file: "examples/prompts/geo3k.txt"
+  dataset_name: "geometry3k"
+  split: "train"
 
 cluster:
   gpus_per_node: 8
