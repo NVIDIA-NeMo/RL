@@ -164,7 +164,9 @@ def setup_data(
 
     reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
-            "py_executable": RewardModelEnvironment.DEFAULT_PY_EXECUTABLE,
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+            ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
     ).remote(env_configs["reward_model"])
