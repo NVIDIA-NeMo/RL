@@ -436,7 +436,8 @@ class MDLMCrossEntropyLoss(LossFunction):
         answer_lengths = token_mask.sum(dim=-1)[:, None]
         _token_logprobs = token_logprobs / answer_lengths
         token_loss = -_token_logprobs[mask] / p_mask[mask]  # cross entropy loss
-        loss = torch.sum(token_loss) / global_valid_seqs
+        # loss = torch.sum(token_loss) / global_valid_seqs
+        loss = torch.sum(token_loss)    # normalization done by answer_lengths
 
         return loss, {
             "loss": loss.item() if loss.ndim == 0 else loss,
