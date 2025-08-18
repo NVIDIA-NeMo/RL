@@ -45,7 +45,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.05"
 fi
 
-# TODO: enable in subsequent PR to do a quick accuracy check
 # Convert 16k checkpoint
 uv run examples/converters/convert_dcp_to_hf.py \
   --config=$CKPT_DIR/step_${MAX_STEPS}/config.yaml \
