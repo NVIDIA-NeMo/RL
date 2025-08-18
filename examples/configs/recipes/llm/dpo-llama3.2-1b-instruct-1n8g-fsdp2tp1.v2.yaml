@@ -27,6 +27,7 @@ policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
   tokenizer:
     name: ${policy.model_name}
+    is_tokenizer_processor: false
 
   train_global_batch_size: 128
   train_micro_batch_size: 2

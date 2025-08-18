@@ -38,11 +38,9 @@ policy:
 data:
   prompt_file: "examples/prompts/refcoco.txt"
   system_prompt_file: null
-  path_to_coco_images: "/data/coco/"
+  download_dir: "/data/coco/"
   dataset_name: "refcoco"
   split: "default"
-  task_name: "refcoco"   # must match the task_name in the dataset
-  seed: 42
 
 cluster:
   gpus_per_node: 8

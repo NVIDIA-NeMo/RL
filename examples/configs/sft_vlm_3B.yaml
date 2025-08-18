@@ -10,8 +10,6 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
 
   sequence_packing:
     enabled: False
@@ -31,8 +29,6 @@ data:
   add_eos: true
   add_generation_prompt: false
   split: trainA
-  seed: 42
-  task_name: "clevr-cogent"
   prompt_file: null
 
 logger:

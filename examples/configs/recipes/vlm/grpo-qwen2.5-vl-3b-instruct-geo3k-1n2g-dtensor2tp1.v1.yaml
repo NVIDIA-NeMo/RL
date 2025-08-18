@@ -49,4 +49,3 @@ data:
   prompt_file: "examples/prompts/geo3k.txt"
   dataset_name: "geometry3k"
   split: "train"
-  task_name: "geometry3k"   # must match the task_name in the dataset

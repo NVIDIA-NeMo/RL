@@ -172,7 +172,6 @@ def format_refcoco_dataset(
 # contain different variants of the CLEVR dataset
 def prepare_refcoco_dataset(
     split: str = "default",
-    seed: int = 42,
     task_name: Optional[str] = None,
     path_to_coco_images: Optional[Union[str, Path]] = None,
 ):
@@ -237,30 +236,26 @@ class RefCOCODataset:
     def __init__(
         self,
         split: str = "default",
-        seed: int = 42,
         prompt_file: Optional[str] = None,
-        task_name: str = "refcoco",
-        path_to_coco_images: Optional[str] = None,
+        download_dir: Optional[str] = None,
     ):
         """Simple wrapper around the RefCOCO dataset.
 
         Args:
             split: The split of the dataset to use (currently only 'default' is supported)
-            seed: The seed for the dataset.
             prompt_file: The file containing the prompt for the dataset.
-            task_name: The name of the task.
         """
         VALID_SPLITS = ["default"]
         if split not in VALID_SPLITS:
             raise ValueError(
                 f"Invalid split: {split}. Please use one of {VALID_SPLITS}."
             )
+        self.task_name = "refcoco"
 
         self.formatted_ds = prepare_refcoco_dataset(
             split=split,
-            seed=seed,
-            task_name=task_name,
-            path_to_coco_images=path_to_coco_images,
+            task_name=self.task_name,
+            path_to_coco_images=download_dir,
         )
         self.task_spec = TaskDataSpec(
             task_name="RefCOCO",

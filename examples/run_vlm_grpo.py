@@ -241,35 +241,30 @@ def setup_data(
     task_spec contains the task name as well as prompt and system prompt modifiers that can be used by data processor
     """
     print("\n▶ Setting up data...")
-    # define task name and use it (make it as generic as possible)
-    task_name = data_config["task_name"]
-    vlm_task_spec = TaskDataSpec(
-        task_name=task_name,
-        prompt_file=data_config["prompt_file"],
-        system_prompt_file=data_config["system_prompt_file"],
-    )
-
     # Load CLEVR-CoGenT dataset using nemo rl datasets
     # other VLM datasets can be added here
     if data_config["dataset_name"] == "clevr-cogent":
         data: Any = CLEVRCoGenTDataset(
             split=data_config["split"],
-            seed=data_config["seed"],
-            task_name=data_config["task_name"],
         )
     elif data_config["dataset_name"] == "refcoco":
         data: Any = RefCOCODataset(
             split=data_config["split"],
-            seed=data_config["seed"],
-            task_name=data_config["task_name"],
-            path_to_coco_images=data_config.get("path_to_coco_images", None),
+            download_dir=data_config["download_dir"],
         )
     elif data_config["dataset_name"] == "geometry3k":
         data: Any = Geometry3KDataset(
-            split=data_config["split"], task_name=data_config["task_name"]
+            split=data_config["split"],
         )
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
+
+    task_name = data.task_name
+    vlm_task_spec = TaskDataSpec(
+        task_name=task_name,
+        prompt_file=data_config["prompt_file"],
+        system_prompt_file=data_config["system_prompt_file"],
+    )
 
     # add data processor for different tasks
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (

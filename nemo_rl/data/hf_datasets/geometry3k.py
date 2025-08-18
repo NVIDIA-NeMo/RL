@@ -53,7 +53,7 @@ def format_geometry3k_dataset(
                 "content": assistant_content,
             },
         ],
-        "task_name": "clevr-cogent",
+        "task_name": "geometry3k",
     }
     return ret
 
@@ -79,23 +79,20 @@ class Geometry3KDataset:
     def __init__(
         self,
         split: str = "train",
-        seed: int = 42,
         prompt_file: Optional[str] = None,
-        task_name: str = "geometry3k",
     ):
         """Simple wrapper around the Geometry3K dataset.
 
         Args:
             split: The split of the dataset to use.
-            seed: The seed for the dataset.
             prompt_file: The file containing the prompt for the dataset.
-            task_name: The name of the task.
         """
         assert split in ["train", "validation", "test"], (
             f"Invalid split: {split}. Please use 'train' or 'validation' or 'test'."
         )
+        self.task_name = "geometry3k"
 
-        self.formatted_ds = prepare_geometry3k_dataset(split=split, task_name=task_name)
+        self.formatted_ds = prepare_geometry3k_dataset(split=split, task_name=self.task_name)
         self.task_spec = TaskDataSpec(
             task_name="Geometry3K",
             prompt_file=prompt_file,

@@ -43,16 +43,6 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 2048
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
-
-  # dont freeze anything by default
-  freeze_language_model: false
-  freeze_visual_model: false
-
-  freeze_param_regex: null  # provide a regex to freeze parameters
-  # examples: "visual" or "visual\.patch_embed|language_model\.embed_tokens"
-  # note: dots must be escaped by the user
 
   dtensor_cfg:
     enabled: true
@@ -138,8 +128,6 @@ data:
   system_prompt_file: null
   dataset_name: "clevr-cogent"
   split: "trainA"
-  task_name: "clevr-cogent"   # must match the task_name in the dataset
-  seed: 42
   shuffle: true
 
 env:

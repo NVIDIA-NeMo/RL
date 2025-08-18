@@ -82,7 +82,7 @@ def format_clevr_cogent_dataset(
 
 # contain different variants of the CLEVR dataset
 def prepare_clevr_cogent_dataset(
-    split: str = "trainA", seed: int = 42, task_name: Optional[str] = None
+    split: str = "trainA", task_name: Optional[str] = None
 ):
     if task_name is None:
         task_name = "clevr-cogent"
@@ -118,25 +118,22 @@ class CLEVRCoGenTDataset:
     def __init__(
         self,
         split: str = "trainA",
-        seed: int = 42,
         prompt_file: Optional[str] = None,
-        task_name: str = "clevr-cogent",
     ):
         """Simple wrapper around the CLEVR-CoGenT dataset.
 
         Args:
             split: The split of the dataset to use.
-            seed: The seed for the dataset.
             prompt_file: The file containing the prompt for the dataset.
-            task_name: The name of the task.
         """
         if split not in ["trainA", "trainB", "valA", "valB"]:
             raise ValueError(
                 f"Invalid split: {split}. Please use 'trainA', 'trainB', 'valA', or 'valB'."
             )
+        self.task_name = "clevr-cogent"
 
         self.formatted_ds = prepare_clevr_cogent_dataset(
-            split=split, seed=seed, task_name=task_name
+            split=split, task_name=self.task_name
         )
         self.task_spec = TaskDataSpec(
             task_name="CLEVR",

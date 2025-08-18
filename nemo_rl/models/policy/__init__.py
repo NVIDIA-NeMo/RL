@@ -103,6 +103,7 @@ class MegatronConfig(TypedDict):
 class TokenizerConfig(TypedDict):
     name: str
     chat_template: NotRequired[str]
+    is_tokenizer_processor: bool
 
 
 class PytorchOptimizerConfig(TypedDict):

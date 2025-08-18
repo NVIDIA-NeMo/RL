@@ -96,14 +96,14 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
 
     datum_preprocessor = None
     if data_cls == "open_assistant":
         data = hf_datasets.OasstDataset(
-            output_dir="/tmp/open_assistant", seed=data_config["seed"]
+            output_dir="/tmp/open_assistant", seed=seed,
         )
     elif data_cls == "squad":
         data = hf_datasets.SquadDataset()
@@ -119,7 +119,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             split=data_config["split"],
             output_key=data_config["output_key"],
             prompt_file=data_config["prompt_file"],
-            seed=data_config["seed"],
+            seed=seed,
         )
     elif data_cls == "openai_format":
         data = hf_datasets.OpenAIFormatDataset(
@@ -134,9 +134,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
         data = hf_datasets.CLEVRCoGenTDataset(
             split=data_config["split"],
-            seed=data_config["seed"],
             prompt_file=data_config["prompt_file"],
-            task_name=data_config["task_name"],
         )
         datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
     else:
@@ -218,7 +216,7 @@ def main():
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
 
     (
         policy,
