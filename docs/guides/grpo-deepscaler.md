@@ -37,7 +37,7 @@ uv run examples/run_eval.py \
     data.prompt_file=examples/prompts/cot.txt \
     generation.vllm_cfg.max_model_len=32768 \
     generation.vllm_cfg.enforce_eager=True \
-    generation.temperature=1.0 \
+    generation.temperature=1.0
 ```
 
 Use `generation.model_name` to specify the path to the Hugging Face checkpoint. In addition, we use AIME24 as the validation dataset and calculate pass@1 on it throughout training.
