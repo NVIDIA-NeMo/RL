@@ -64,5 +64,5 @@ uv run examples/run_eval.py \
 cat ${RUN_LOG}.aime-24k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > ${RUN_LOG}-24k-metric.json
  
 uv run tests/check_metrics.py ${RUN_LOG}-24k-metric.json \
-  'data["score"] >= 0.2396' \
+  'data["score"] >= 0.2396'
 
