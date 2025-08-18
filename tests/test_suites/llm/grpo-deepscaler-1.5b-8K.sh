@@ -45,7 +45,7 @@ uv run examples/converters/convert_dcp_to_hf.py \
   --hf-ckpt-path=$CKPT_DIR/grpo-deepscaler-8k-${MAX_STEPS}-hf
 
 # Run eval
-NRL_FORCE_REBUILD_VENVS=true uv run examples/run_eval.py \
+uv run examples/run_eval.py \
     generation.model_name=$CKPT_DIR/grpo-deepscaler-8k-${MAX_STEPS}-hf \
     data.prompt_file=examples/prompts/cot.txt \
     generation.vllm_cfg.max_model_len=32768 \
