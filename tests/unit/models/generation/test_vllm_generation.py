@@ -836,10 +836,16 @@ async def test_vllm_generation_with_hf_training_colocated(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
-    policy_cluster_separate, tokenizer, async_engine, cpu_offload
+    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
@@ -848,6 +854,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config["colocated"]["enabled"] = False
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
@@ -874,7 +881,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
 
     # Test
     await run_hf_train_process(
-        lm_policy, vllm_policy, tokenizer, async_engine, False, "bfloat16"
+        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
     )
 
 
