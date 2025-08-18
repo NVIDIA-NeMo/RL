@@ -329,12 +329,13 @@ def test_batch_pad_message_log_custom_pad_value(
 
 
 @pytest.mark.hf_gated
+@pytest.mark.parametrize("add_generation_prompt", [False, True])
 def test_get_formatted_message_log_llama(
-    raw_chat_message_log: LLMMessageLogType,
+    raw_chat_message_log: LLMMessageLogType, add_generation_prompt: bool
 ) -> None:
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
 
-    ## get expected result
+    # Expected system and user
     formatted_system_message = tokenizer.apply_chat_template(
         [raw_chat_message_log[0]],
         tokenize=False,
@@ -344,15 +345,23 @@ def test_get_formatted_message_log_llama(
     formatted_user_message = tokenizer.apply_chat_template(
         [raw_chat_message_log[1]],
         tokenize=False,
-        add_generation_prompt=False,
+        add_generation_prompt=add_generation_prompt,
         add_special_tokens=False,
     )
-    formatted_assistant_message = tokenizer.apply_chat_template(
-        [raw_chat_message_log[2]],
-        tokenize=False,
-        add_generation_prompt=False,
-        add_special_tokens=False,
-    )
+
+    # Expected assistant
+    if add_generation_prompt:
+        # Unlike qwen, llama does not add <eos>\n, just <eos>
+        formatted_assistant_message = (
+            raw_chat_message_log[2]["content"] + tokenizer.eos_token
+        )
+    else:
+        formatted_assistant_message = tokenizer.apply_chat_template(
+            [raw_chat_message_log[2]],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
 
     ## text should be equivalent to if we apply chat template
     ## to each turn separately and manually remove the bot string
@@ -361,134 +370,72 @@ def test_get_formatted_message_log_llama(
     expected_text = [
         formatted_system_message,
         formatted_user_message[len(bot_str) :],
-        formatted_assistant_message[len(bot_str) :],
+        formatted_assistant_message
+        if add_generation_prompt
+        else formatted_assistant_message[len(bot_str) :],
     ]
 
-    task_data_spec = TaskDataSpec(
-        task_name="test",
-    )
-    result = get_formatted_message_log(raw_chat_message_log, tokenizer, task_data_spec)
-    actual_text = [m["content"] for m in result]
-
-    assert actual_text == expected_text
-
-
-@pytest.mark.hf_gated
-def test_get_formatted_message_log_add_generation_prompt_llama(
-    raw_chat_message_log: LLMMessageLogType,
-) -> None:
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-
-    ## get expected result
-    formatted_system_message = tokenizer.apply_chat_template(
-        [raw_chat_message_log[0]],
-        tokenize=False,
-        add_generation_prompt=False,
-        add_special_tokens=False,
-    )
-    formatted_user_message = tokenizer.apply_chat_template(
-        [raw_chat_message_log[1]],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    formatted_assistant_message = (
-        raw_chat_message_log[2]["content"] + tokenizer.eos_token
-    )
-
-    ## text should be equivalent to if we apply chat template
-    ## to each turn separately and manually remove the bot string
-    ## from the intermediate turns
-    bot_str = "<|begin_of_text|>"
-    expected_text = [
-        formatted_system_message,
-        formatted_user_message[len(bot_str) :],
-        formatted_assistant_message,
-    ]
-
-    task_data_spec = TaskDataSpec(
-        task_name="test",
-    )
+    task_data_spec = TaskDataSpec(task_name="test")
     result = get_formatted_message_log(
         raw_chat_message_log,
         tokenizer,
         task_data_spec,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
     )
     actual_text = [m["content"] for m in result]
 
     assert actual_text == expected_text
 
 
+@pytest.mark.parametrize("add_generation_prompt", [False, True])
 def test_get_formatted_message_log_qwen(
-    raw_chat_message_log: LLMMessageLogType,
+    raw_chat_message_log: LLMMessageLogType, add_generation_prompt: bool
 ) -> None:
     ## test using a tokenizer that does not have a bos token
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-32B-Instruct")
     assert tokenizer.bos_token is None
 
-    ## get expected result
-    ## result is equivalent to if we apply chat template to the full message log,
-    ## and then partition by the delimiter
-    expected_text_string = tokenizer.apply_chat_template(
-        [raw_chat_message_log],
-        tokenize=False,
-        add_generation_prompt=False,
-        add_special_tokens=False,
-    )[0]
-
     delimiter = "<|im_end|>\n"
-    split_text = expected_text_string.split(delimiter)
-    expected_text = []
-    for i in range(len(split_text)):
-        if i == len(split_text) - 1:
-            assert split_text[i] == "", (
-                f"Splitting on <|im_end|>\\n means that the last message should be empty but found: {split_text[i]}"
-            )
-        else:
-            expected_text.append(split_text[i] + delimiter)
 
-    task_data_spec = TaskDataSpec(
-        task_name="test",
-    )
-    result = get_formatted_message_log(raw_chat_message_log, tokenizer, task_data_spec)
-    actual_text = [m["content"] for m in result]
+    if not add_generation_prompt:
+        ## apply template to full log and split by delimiter
+        expected_text_string = tokenizer.apply_chat_template(
+            [raw_chat_message_log],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )[0]
 
-    assert actual_text == expected_text
+        split_text = expected_text_string.split(delimiter)
+        expected_text = []
+        for i in range(len(split_text)):
+            if i == len(split_text) - 1:
+                assert split_text[i] == "", (
+                    f"Splitting on <|im_end|>\\n means that the last message should be empty but found: {split_text[i]}"
+                )
+            else:
+                expected_text.append(split_text[i] + delimiter)
+    else:
+        ## apply template to first two turns with generation prompt
+        expected_text_string = tokenizer.apply_chat_template(
+            [raw_chat_message_log[:2]],
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )[0]
+        split_text = expected_text_string.split(delimiter, 1)
+        expected_text = []
+        for i in range(len(split_text)):
+            if i == len(split_text) - 1:
+                expected_text.append(split_text[i])
+            else:
+                expected_text.append(split_text[i] + delimiter)
 
-
-def test_get_formatted_message_log_add_generation_prompt_qwen(
-    raw_chat_message_log: LLMMessageLogType,
-) -> None:
-    ## test using a tokenizer that does not have a bos token
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-32B-Instruct")
-    assert tokenizer.bos_token is None
-
-    ## get expected result
-    ## result is equivalent to if we apply chat template to the full message log,
-    ## and then partition by the delimiter
-    ## Separately handle the last message because of the generation prompt
-    expected_text_string = tokenizer.apply_chat_template(
-        [raw_chat_message_log[:2]],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )[0]
-
-    delimiter = "<|im_end|>\n"
-    split_text = expected_text_string.split(delimiter, 1)
-    expected_text = []
-    for i in range(len(split_text)):
-        if i == len(split_text) - 1:
-            expected_text.append(split_text[i])
-        else:
-            expected_text.append(split_text[i] + delimiter)
-
-    # This trailing <eos_token>\n is very specific to qwen
-    formatted_assistant_message = (
-        raw_chat_message_log[2]["content"] + tokenizer.eos_token + "\n"
-    )
-    expected_text.append(formatted_assistant_message)
+        # This trailing <eos_token>\n is very specific to qwen
+        formatted_assistant_message = (
+            raw_chat_message_log[2]["content"] + tokenizer.eos_token + "\n"
+        )
+        expected_text.append(formatted_assistant_message)
 
     task_data_spec = TaskDataSpec(
         task_name="test",
@@ -497,7 +444,7 @@ def test_get_formatted_message_log_add_generation_prompt_qwen(
         raw_chat_message_log,
         tokenizer,
         task_data_spec,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
     )
     actual_text = [m["content"] for m in result]
 
