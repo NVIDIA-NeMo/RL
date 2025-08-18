@@ -429,20 +429,22 @@ def test_get_formatted_message_log_qwen(
 
     ## get expected result
     ## result is equivalent to if we apply chat template to the full message log,
-    ## remove the trailing newline, and then partition by the delimiter
+    ## and then partition by the delimiter
     expected_text_string = tokenizer.apply_chat_template(
         [raw_chat_message_log],
         tokenize=False,
         add_generation_prompt=False,
         add_special_tokens=False,
-    )[0].rstrip("\n")  ## remove trailing newline
+    )[0]
 
     delimiter = "<|im_end|>\n"
     split_text = expected_text_string.split(delimiter)
     expected_text = []
     for i in range(len(split_text)):
-        if i == len(raw_chat_message_log) - 1:
-            expected_text.append(split_text[i])
+        if i == len(split_text) - 1:
+            assert split_text[i] == "", (
+                f"Splitting on <|im_end|>\\n means that the last message should be empty but found: {split_text[i]}"
+            )
         else:
             expected_text.append(split_text[i] + delimiter)
 
@@ -464,7 +466,7 @@ def test_get_formatted_message_log_add_generation_prompt_qwen(
 
     ## get expected result
     ## result is equivalent to if we apply chat template to the full message log,
-    ## remove the trailing newline, and then partition by the delimiter
+    ## and then partition by the delimiter
     ## Separately handle the last message because of the generation prompt
     expected_text_string = tokenizer.apply_chat_template(
         [raw_chat_message_log[:2]],
@@ -482,8 +484,9 @@ def test_get_formatted_message_log_add_generation_prompt_qwen(
         else:
             expected_text.append(split_text[i] + delimiter)
 
+    # This trailing <eos_token>\n is very specific to qwen
     formatted_assistant_message = (
-        raw_chat_message_log[2]["content"] + tokenizer.eos_token
+        raw_chat_message_log[2]["content"] + tokenizer.eos_token + "\n"
     )
     expected_text.append(formatted_assistant_message)
 
