@@ -687,6 +687,7 @@ def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
     seq_index: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -700,6 +701,7 @@ def get_logprobs_from_vocab_parallel_logits(
             with shape [batch_size, seq_len].
         seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
             with shape [sequence_length].
+        chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs.
@@ -727,4 +729,5 @@ def get_logprobs_from_vocab_parallel_logits(
         tp_group,
         inference_only=not torch.is_grad_enabled(),
         seq_index=seq_index,
+        chunk_size=chunk_size,
     )

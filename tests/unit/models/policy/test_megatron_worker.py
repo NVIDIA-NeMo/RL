@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import tempfile
+from typing import Optional
 
 import pytest
 import torch
@@ -40,6 +41,8 @@ def create_megatron_test_config(
     generation_backend: str = "megatron",
     sequence_parallel: bool = False,
     converter_type: str = "LlamaForCausalLM",
+    logprob_chunk_size: Optional[int] = None,
+    defer_fp32_logits: Optional[bool] = None,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     return {
@@ -50,6 +53,7 @@ def create_megatron_test_config(
         "train_micro_batch_size": 2,
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
+        "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
         "generation": {
             "backend": generation_backend,
@@ -95,6 +99,7 @@ def create_megatron_test_config(
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "apply_rope_fusion": True,
+            "defer_fp32_logits": defer_fp32_logits,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -554,9 +559,23 @@ def logprob_setup(request):
     """Setup and teardown specifically for logprob tests."""
     # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
     if hasattr(request, "param") and request.param is not None:
-        num_gpus, tp, pp, model_fixture_name = request.param
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = request.param
     else:
-        num_gpus, tp, pp, model_fixture_name = 2, 1, 1, "tiny_llama_model_path"
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
 
     # Get the actual model path from the requested fixture
     model_name = request.getfixturevalue(model_fixture_name)
@@ -591,6 +610,8 @@ def logprob_setup(request):
             tp=tp,
             pp=pp,
             converter_type=converter_type,
+            logprob_chunk_size=logprob_chunk_size,
+            defer_fp32_logits=defer_fp32_logits,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -639,14 +660,35 @@ def logprob_setup(request):
 @pytest.mark.parametrize(
     "logprob_setup",
     [
-        # (num_gpus, tp, pp, model_fixture_name)
-        (2, 1, 1, "tiny_llama_model_path"),
-        (2, 2, 1, "tiny_llama_model_path"),
-        (2, 1, 1, "tiny_qwen2_model_path"),
-        (2, 2, 1, "tiny_qwen2_model_path"),
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        (2, 1, 1, None, None, "tiny_llama_model_path"),
+        (2, 2, 1, None, None, "tiny_llama_model_path"),
+        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 1, 1, None, True, "tiny_llama_model_path"),
+        (2, 2, 1, None, True, "tiny_llama_model_path"),
+        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, True, "tiny_llama_model_path"),
+        (2, 2, 1, 16, True, "tiny_llama_model_path"),
+        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
     ],
     indirect=True,
-    ids=["2gpu_dp2_llama", "2gpu_tp2_llama", "2gpu_dp2_qwen2", "2gpu_tp2_qwen2"],
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
 )
 def test_megatron_policy_logprobs(logprob_setup):
     """Test Megatron policy logprob computation."""
@@ -663,6 +705,7 @@ def test_megatron_policy_logprobs(logprob_setup):
 
     # Basic validation
     assert isinstance(policy_logprobs, torch.Tensor), "Logprobs should be a tensor"
+    assert policy_logprobs.dtype == torch.float32
     assert policy_logprobs.shape == data.get("input_ids").shape, (
         f"Logprobs shape {policy_logprobs.shape} should match input shape {data.get('input_ids').shape}"
     )
