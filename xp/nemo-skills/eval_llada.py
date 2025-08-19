@@ -5,6 +5,12 @@ Benchmark evaluation script using NeMo-Skills with LLaDA model via OpenAI API.
 This script evaluates a LLaDA model running on localhost:8000 (OpenAI-compatible API)
 on various benchmarks using the NeMo-Skills evaluation framework.
 
+IMPORTANT: Parameter Mapping Notes:
+- tokens_to_generate → max_tokens (automatically mapped by NeMo-Skills)
+- top_k is forced to -1 for OpenAI API compatibility
+- LLaDA-specific parameters (steps, block_length, cfg_scale, remasking) are passed 
+  via NeMo-Skills extra_body mechanism to the OpenAI API
+
 Usage:
     # Default GSM8K evaluation
     python eval_llada.py
@@ -20,6 +26,9 @@ Usage:
     
     # Different server/model
     python eval_llada.py --server-address http://my-server:8080/v1 --model my-model
+    
+    # Custom LLaDA settings
+    python eval_llada.py --steps 128 --cfg-scale 1.5 --remasking random
 """
 
 import os
@@ -86,13 +95,39 @@ def create_parser():
         "--top-k", 
         type=int,
         default=-1,
-        help="Top-k sampling parameter (-1 to disable)"
+        help="Top-k sampling parameter (will be forced to -1 for OpenAI API compatibility)"
     )
     parser.add_argument(
         "--tokens-to-generate",
         type=int,
         default=512,
         help="Maximum number of tokens to generate"
+    )
+    
+    # LLaDA-specific parameters
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=64,
+        help="LLaDA diffusion steps (1-512, higher = better quality but slower)"
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=64,
+        help="LLaDA block length for semi-autoregressive generation"
+    )
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=0.0,
+        help="LLaDA classifier-free guidance scale (0.0-3.0)"
+    )
+    parser.add_argument(
+        "--remasking",
+        default="low_confidence",
+        choices=["low_confidence", "random"],
+        help="LLaDA remasking strategy"
     )
     
     # Execution settings
@@ -140,6 +175,12 @@ def main():
         "tokens_to_generate": args.tokens_to_generate,
         "max_samples": args.max_samples,
         "quick_test": args.quick_test,
+        
+        # LLaDA-specific settings
+        "steps": args.steps,
+        "block_length": args.block_length,
+        "cfg_scale": args.cfg_scale,
+        "remasking": args.remasking,
     }
     
     # Set default experiment name if not provided
@@ -163,8 +204,10 @@ def main():
     print(f"Benchmark: {config['benchmarks']}")
     print(f"Output: {config['output_dir']}")
     print(f"Experiment: {config['expname']}")
-    print(f"Temperature: {config['temperature']} | Top-p: {config['top_p']} | Top-k: {config['top_k']}")
+    print(f"Temperature: {config['temperature']} | Top-p: {config['top_p']} | Top-k: {config['top_k']} (will be set to -1)")
     print(f"Max tokens: {config['tokens_to_generate']}")
+    print(f"LLaDA Steps: {config['steps']} | Block length: {config['block_length']}")
+    print(f"CFG scale: {config['cfg_scale']} | Remasking: {config['remasking']}")
     if config["max_samples"]:
         print(f"Max samples: {config['max_samples']} (for testing)")
     print("=" * 60)
@@ -182,9 +225,21 @@ def main():
         generation_args = [
             f"++inference.temperature={config['temperature']}",
             f"++inference.top_p={config['top_p']}", 
-            f"++inference.top_k={config['top_k']}",
+            f"++inference.top_k=-1",  # Must be -1 for OpenAI API compatibility
             f"++inference.tokens_to_generate={config['tokens_to_generate']}",
+            # Pass LLaDA-specific parameters via extra_body (NeMo-Skills will include these in the OpenAI API request)
+            f"++inference.extra_body.steps={config['steps']}",
+            f"++inference.extra_body.block_length={config['block_length']}",
+            f"++inference.extra_body.cfg_scale={config['cfg_scale']}",
+            f"++inference.extra_body.remasking={config['remasking']}",
         ]
+        
+        print(f"\n🔧 LLaDA-specific parameters (via extra_body):")
+        print(f"  steps={config['steps']}")
+        print(f"  block_length={config['block_length']}")
+        print(f"  cfg_scale={config['cfg_scale']}")
+        print(f"  remasking={config['remasking']}")
+        print("   (Passed via NeMo-Skills extra_body to OpenAI API)")
         
         # Add max_samples if specified
         if config["max_samples"]:

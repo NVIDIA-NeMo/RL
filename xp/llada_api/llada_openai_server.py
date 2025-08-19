@@ -60,12 +60,17 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}  # Allow extra fields for LLaDA-specific parameters
+    
     model: str = Field(default="llada-8b-instruct")
     messages: List[ChatMessage] = Field(..., description="List of messages")
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(default=128, gt=0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)  # Match eval_llada.py default
+    max_tokens: Optional[int] = Field(default=512, gt=0)  # Match eval_llada.py tokens_to_generate default
     stream: bool = Field(default=False)
-    # LLaDA specific parameters
+    # Standard OpenAI parameters that were missing
+    top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Top-p (nucleus) sampling")
+    top_k: int = Field(default=-1, description="Top-k sampling (-1 to disable)")
+    # LLaDA specific parameters (with defaults, can be overridden via extra_body)
     steps: int = Field(default=64, ge=1, le=512, description="Diffusion steps")
     block_length: int = Field(default=64, ge=1, description="Block length for generation")
     cfg_scale: float = Field(default=0.0, ge=0.0, description="Classifier-free guidance scale")
@@ -311,6 +316,23 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/ll
 
 async def generate_chat_completion(request: ChatCompletionRequest) -> Union[ChatCompletionResponse, AsyncGenerator]:
     """Generate chat completion using LLaDA model."""
+    
+    # Log generation parameters for verification
+    logger.info(f"Generation request received:")
+    logger.info(f"  Model: {request.model}")
+    logger.info(f"  Temperature: {request.temperature}")
+    logger.info(f"  Max tokens: {request.max_tokens}")
+    logger.info(f"  Top-p: {request.top_p} (NOTE: Not used in LLaDA diffusion generation)")
+    logger.info(f"  Top-k: {request.top_k} (NOTE: Not used in LLaDA diffusion generation)")
+    logger.info(f"  LLaDA steps: {request.steps}")
+    logger.info(f"  Block length: {request.block_length}")
+    logger.info(f"  CFG scale: {request.cfg_scale}")
+    logger.info(f"  Remasking: {request.remasking}")
+    
+    # Log any extra parameters received via NeMo-Skills extra_body
+    extra_fields = {k: v for k, v in request.__dict__.items() if k not in request.model_fields}
+    if extra_fields:
+        logger.info(f"  Extra parameters received: {extra_fields}")
     
     # Format messages into prompt
     if not request.messages:
