@@ -393,27 +393,39 @@ def test_get_formatted_message_log_gemma(
     raw_chat_message_log: LLMMessageLogType,
     add_generation_prompt: bool,
 ) -> None:
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-27b-it")
     # Gemma template raises on system role; test on user + assistant only
     gemma_chat_log = [raw_chat_message_log[1], raw_chat_message_log[2]]
 
-    # Derive expected chunks via cumulative template diffs
+    # Expected user turn
     formatted_user = tokenizer.apply_chat_template(
         [gemma_chat_log[0]],
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
         add_special_tokens=False,
     )
+
+    # Build assistant turn by splitting the full two-turn template
     formatted_both = tokenizer.apply_chat_template(
         gemma_chat_log,
         tokenize=False,
         add_generation_prompt=False,
         add_special_tokens=False,
     )
-    split_idx = get_first_index_that_differs(formatted_user, formatted_both)
-    assistant_chunk = formatted_both[split_idx:]
+    delimiter = "<end_of_turn>\n"
+    parts = formatted_both.split(delimiter)
+    assert parts[-1] == "", (
+        f"Splitting on <end_of_turn>\\n means the last part should be empty but got: {parts[-1]!r}"
+    )
+    user_segment = parts[0] + delimiter
+    assistant_segment = parts[1] + delimiter
+    if add_generation_prompt:
+        model_header = "<start_of_turn>model\n"
+        if assistant_segment.startswith(model_header):
+            assistant_segment = assistant_segment[len(model_header) :]
 
-    expected_text = [formatted_user, assistant_chunk]
+    # For no-gen, formatted_user should equal user_segment; with gen, formatted_user includes the gen prompt
+    expected_text = [formatted_user, assistant_segment]
 
     # Remove BOS from non-initial turn if present
     bos_token = tokenizer.bos_token or ""
