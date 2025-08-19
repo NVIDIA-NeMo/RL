@@ -55,17 +55,19 @@ automodel = [
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.7.4.post1",
-    "mamba-ssm",
-    "causal-conv1d",
+    # DISABLING MAMBA FOR DEMONSTRATIVE PURPOSES
+    #"mamba-ssm",
+    #"causal-conv1d",
 ]
 vllm = [
     "vllm==0.10.0",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
+    # DISABLING MAMBA FOR DEMONSTRATIVE PURPOSES
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "mamba-ssm",
+    #"mamba-ssm",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "causal-conv1d",
+    #"causal-conv1d",
 ]
 mcore = [
     # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
