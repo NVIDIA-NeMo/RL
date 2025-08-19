@@ -41,7 +41,6 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
-from nemo_rl.utils.envvars import set_envvars
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
@@ -222,9 +221,6 @@ def main() -> None:
         )
 
     init_ray()
-
-    if "env_vars" in config["policy"]:
-        set_envvars(config["policy"]["env_vars"])
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])

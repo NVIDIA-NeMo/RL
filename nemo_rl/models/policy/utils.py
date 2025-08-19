@@ -146,13 +146,18 @@ def configure_expandable_segments() -> None:
     This helps with memory allocation but causes crashes on Ampere GPUs, so we only enable it
     on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
     """
-    conf = {
-        k: v
-        for k, v in (
-            item.split(":")
-            for item in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").split(",")
-        )
-    }
+    conf = (
+        {
+            k: v
+            for k, v in (
+                item.split(":")
+                for item in os.environ.get("PYTORCH_CUDA_ALLOC_CONF").split(",")
+            )
+        }
+        if os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None)
+        else {}
+    )
+
     compute_capability = torch.cuda.get_device_properties(0).major
     if compute_capability >= 9:
         conf["expandable_segments"] = conf.get("expandable_segments", "True")
@@ -163,8 +168,10 @@ def configure_expandable_segments() -> None:
                 "but this is not supported on architectures older than Hopper (compute capability < 9). "
                 "Please set expandable_segments to False."
             )
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(
-        f"{k}:{v}" for k, v in conf.items()
+    
+    # don't write back to the environment variable since torch is already loaded
+    torch.cuda.memory._set_allocator_settings(
+        ",".join(f"{k}:{v}" for k, v in conf.items())
     )
 
 

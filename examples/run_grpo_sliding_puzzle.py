@@ -35,7 +35,6 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
-from nemo_rl.utils.envvars import set_envvars
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
@@ -223,9 +222,6 @@ def main():
         )
 
     init_ray()
-
-    if "env_vars" in config["policy"]:
-        set_envvars(config["policy"]["env_vars"])
 
     set_seed(config["grpo"]["seed"])
 

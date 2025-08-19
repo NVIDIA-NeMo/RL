@@ -36,8 +36,6 @@ policy:
   train_global_batch_size: 8
   train_micro_batch_size: 1
 
-  env_vars:
-    PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 
   #logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 12288
@@ -52,6 +50,8 @@ policy:
     tensor_parallel_size: 8
     context_parallel_size: 1
     custom_parallel_plan: null
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 
   dynamic_batching:
     enabled: false
