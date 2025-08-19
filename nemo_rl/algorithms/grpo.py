@@ -558,9 +558,10 @@ def grpo_train(
             # Apply environment post-processing for training
             print("▶ Applying environment post-processing...")
             with timer.time("env_post_processing"):
-                repeated_batch, env_metrics = apply_environment_post_processing(
-                    repeated_batch, task_to_env
-                )
+                # repeated_batch, env_metrics = apply_environment_post_processing(
+                #     repeated_batch, task_to_env
+                # )
+                env_metrics = {}
                 rollout_metrics.update(env_metrics)
 
             # get dataset specific pass at k
@@ -928,9 +929,10 @@ def validate(
         )
 
         # Apply environment post-processing for validation
-        val_batch, val_env_metrics = apply_environment_post_processing(
-            val_batch, val_task_to_env, prefix="val_"
-        )
+        # val_batch, val_env_metrics = apply_environment_post_processing(
+        #     val_batch, val_task_to_env, prefix="val_"
+        # )
+        val_env_metrics = {}
         gen_metrics.update(val_env_metrics)
 
         # Collect message logs for later display
