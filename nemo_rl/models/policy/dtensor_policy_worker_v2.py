@@ -268,17 +268,34 @@ class DTensorPolicyWorkerV2:
                 "See https://github.com/NVIDIA-NeMo/RL/issues/659 for more details."
             )
 
+        # For FSDP2 compatibility, we need to support HSDP structure
+        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
+        dp_replicate_size = 1
+        dp_shard_size = dp_size
+
+        # Create device mesh with HSDP structure for FSDP2 compatibility
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
+            "cuda",
+            (dp_replicate_size, dp_shard_size, cp_size, tp_size),
+            mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
         )
 
-        self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        # Create flattened submeshes for different use cases
+        # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
+        device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
 
-        self.dp_mesh, self.tp_mesh, self.cp_mesh = (
-            device_mesh["dp"],
-            device_mesh["tp"],
-            device_mesh["cp"],
-        )
+        # Flatten dp_shard + cp for FSDP2 sharding
+        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
+
+        # Flatten dp_replicate + dp_shard + cp for gradient operations
+        device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
+
+        # Store mesh references for backward compatibility
+        self.dp_cp_mesh = device_mesh["dp_cp"]
+        self.dp_mesh = device_mesh["dp"]
+        self.tp_mesh = device_mesh["tp"]
+        self.cp_mesh = device_mesh["cp"]
+
         self.dp_size = dp_size
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -300,8 +317,8 @@ class DTensorPolicyWorkerV2:
                 "activation_checkpointing"
             ],
             tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
-            dp_replicate_mesh_name="dp",
-            dp_shard_cp_mesh_name="cp",
+            dp_replicate_mesh_name="dp_replicate",
+            dp_shard_cp_mesh_name="dp_shard_cp",
             tp_mesh_name="tp",
         )
 
@@ -435,7 +452,7 @@ class DTensorPolicyWorkerV2:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/train")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -778,7 +795,7 @@ class DTensorPolicyWorkerV2:
 
             return metrics
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -1088,7 +1105,7 @@ class DTensorPolicyWorkerV2:
                     val = to_local_if_dtensor(v)
                     val.copy_(curr_state_dict[k])
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_reference_policy_logprobs")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
@@ -1194,7 +1211,7 @@ class DTensorPolicyWorkerV2:
         return self.refit_param_info, total_available_bytes
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_weights_ipc_handles")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_weights_ipc_handles")
     def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
         assert self._held_sharded_state_dict_reference is not None, (
             "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
@@ -1257,7 +1274,7 @@ class DTensorPolicyWorkerV2:
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1267,7 +1284,7 @@ class DTensorPolicyWorkerV2:
         self.model.eval()
         self.offload_before_refit()
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1292,7 +1309,7 @@ class DTensorPolicyWorkerV2:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1306,7 +1323,7 @@ class DTensorPolicyWorkerV2:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
         # Offload as much as possible on the CPU
         self.model = self.move_to_cpu(self.model)
