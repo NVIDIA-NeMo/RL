@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -1072,7 +1072,7 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.7.4.post1"
-source = { registry = "https://pypi.org/simple" }
+source = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
@@ -1080,7 +1080,18 @@ dependencies = [
     { name = "setuptools" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/11/34/9bf60e736ed7bbe15055ac2dab48ec67d9dbd088d2b4ae318fd77190ab4e/flash_attn-2.7.4.post1.tar.gz", hash = "sha256:f03485c9a49a4d68d0733acdcad80ab0e72afa025a777fdc2966ceccf9d51765", size = 5986610, upload-time = "2025-01-30T06:39:51.93Z" }
+wheels = [
+    { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl", hash = "sha256:9b7ad6180c48403b792b2d8cb73ce3848bdaac9e4a2b6079e1c1df9435070073" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "psutil" },
+    { name = "setuptools" },
+    { name = "torch" },
+]
 
 [[package]]
 name = "flask"
@@ -2626,9 +2637,9 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
-    { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
-    { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", marker = "extra == 'automodel'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'mcore'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'vllm'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
     { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
