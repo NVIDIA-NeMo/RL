@@ -44,10 +44,7 @@ def create_test_config(
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
-        "tokenizer": {
-            "name": model_name,
-            "is_tokenizer_processor": False,
-        },
+        "tokenizer": {"name": model_name},
         "generation_batch_size": 1,  # Small batch size for testing
         "train_global_batch_size": 4,
         "train_micro_batch_size": 1,

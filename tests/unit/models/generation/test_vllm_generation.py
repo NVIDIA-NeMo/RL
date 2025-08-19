@@ -36,7 +36,6 @@ basic_vllm_test_config: VllmConfig = {
     "model_name": model_name,
     "tokenizer": {
         "name": model_name,
-        "is_tokenizer_processor": False,
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
@@ -70,7 +69,6 @@ basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
     "tokenizer": {
         "name": basic_vllm_test_config["tokenizer"]["name"],
-        "is_tokenizer_processor": False,
     },
     # Required training parameters
     "train_global_batch_size": 1,
@@ -126,10 +124,7 @@ def get_basic_megatron_test_config(
 
     return {
         "model_name": model_name,
-        "tokenizer": {
-            "name": model_name,
-            "is_tokenizer_processor": False,
-        },
+        "tokenizer": {"name": model_name},
         "generation_batch_size": 2,  # Small batch size for testing
         "train_global_batch_size": 4,
         "train_micro_batch_size": 2,

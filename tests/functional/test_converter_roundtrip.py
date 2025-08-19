@@ -64,10 +64,7 @@ def create_test_config() -> Dict[str, Any]:
         },
         "policy": {
             "model_name": "Qwen/Qwen2-0.5B",
-            "tokenizer": {
-                "name": "Qwen/Qwen2-0.5B",
-                "is_tokenizer_processor": False,
-            },
+            "tokenizer": {"name": "Qwen/Qwen2-0.5B"},
             "train_global_batch_size": 4,
             "train_micro_batch_size": 2,
             "max_total_sequence_length": 128,
