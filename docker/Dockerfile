@@ -78,6 +78,8 @@ EOF
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
+RUN cat pyproject.toml
+
 RUN <<"EOF" bash -exu
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
