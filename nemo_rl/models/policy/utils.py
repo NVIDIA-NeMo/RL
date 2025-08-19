@@ -168,7 +168,7 @@ def configure_expandable_segments() -> None:
                 "but this is not supported on architectures older than Hopper (compute capability < 9). "
                 "Please set expandable_segments to False."
             )
-    
+
     # don't write back to the environment variable since torch is already loaded
     torch.cuda.memory._set_allocator_settings(
         ",".join(f"{k}:{v}" for k, v in conf.items())

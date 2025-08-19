@@ -481,9 +481,10 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   2. Make the change more permanently by adding this flag in the training configuration:
   ```yaml
   policy:
-    # set GLOBAL environment variables
-    env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
+    # ...
+    dtensor_cfg:
+      env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
   ```
 
 ## Citation
