@@ -18,6 +18,7 @@ dist/
 release_run*
 ckpts/
 3rdparty/vllm
+3rdparty/flash-attention
 
 # Test
 coverage.json
