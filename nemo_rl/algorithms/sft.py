@@ -171,7 +171,6 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    ## TODO: check this. Might be wrong because of the scaling by gbs in scheduler.step
     ## TODO: does the same need to be done for dtensor path?
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = min(
