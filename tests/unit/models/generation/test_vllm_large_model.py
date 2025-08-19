@@ -32,6 +32,7 @@ large_model_vllm_config: VllmConfig = {
     "model_name": model_name,
     "tokenizer": {
         "name": model_name,
+        "is_tokenizer_processor": False,
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,

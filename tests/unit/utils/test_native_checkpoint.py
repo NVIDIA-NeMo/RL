@@ -36,6 +36,7 @@ simple_policy_config = {
     "model_name": "Qwen/Qwen3-0.6B",  # "hf-internal-testing/tiny-random-Gemma3ForCausalLM",
     "tokenizer": {
         "name": "Qwen/Qwen3-0.6B",
+        "is_tokenizer_processor": False,
     },
     "train_global_batch_size": 4,
     "train_micro_batch_size": 1,

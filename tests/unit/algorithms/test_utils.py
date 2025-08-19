@@ -80,7 +80,10 @@ def get_format_with_simple_role_header(messages):
 @pytest.mark.hf_gated
 def test_get_tokenizer_no_chat_template(conversation_messages):
     """Test get_tokenizer when no chat template is specified in config"""
-    config = {"name": "meta-llama/Llama-3.2-1B-Instruct"}
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "is_tokenizer_processor": False,
+    }
     tokenizer = get_tokenizer(config)
 
     # Verify that the tokenizer's default template is used
@@ -93,7 +96,11 @@ def test_get_tokenizer_no_chat_template(conversation_messages):
 @pytest.mark.hf_gated
 def test_get_tokenizer_default_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is 'default' in config"""
-    config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": "default"}
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "chat_template": "default",
+        "is_tokenizer_processor": False,
+    }
     tokenizer = get_tokenizer(config)
 
     # Verify that the tokenizer's default template is used
@@ -105,7 +112,11 @@ def test_get_tokenizer_default_chat_template(conversation_messages):
 @pytest.mark.hf_gated
 def test_get_tokenizer_null_chat_template(conversation_messages):
     """Test get_tokenizer when chat_template is None in config"""
-    config = {"name": "meta-llama/Llama-3.2-1B-Instruct", "chat_template": None}
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "chat_template": None,
+        "is_tokenizer_processor": False,
+    }
     tokenizer = get_tokenizer(config)
 
     # Verify that the passthrough template is used
@@ -123,6 +134,7 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     config = {
         "name": "meta-llama/Llama-3.2-1B-Instruct",
         "chat_template": custom_template,
+        "is_tokenizer_processor": False,
     }
     tokenizer = get_tokenizer(config)
 

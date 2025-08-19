@@ -47,7 +47,10 @@ def create_megatron_test_config(
     """Create a test config for Megatron policy worker."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": {
+            "name": model_name,
+            "is_tokenizer_processor": False,
+        },
         "generation_batch_size": 2,  # Small batch size for testing
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
