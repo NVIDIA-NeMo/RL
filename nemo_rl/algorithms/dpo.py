@@ -215,6 +215,14 @@ def setup(
         init_reference_model=True,
     )
     loss_fn = DPOLossFn(master_config["dpo"])
+
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            dpo_config["max_num_steps"],
+            dpo_config["max_num_epochs"] * len(train_dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

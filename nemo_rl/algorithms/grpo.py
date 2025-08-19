@@ -361,6 +361,11 @@ def setup(
 
     loss_fn = ClippedPGLossFn(loss_config)
 
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        ## NOTE: this is equal to the total number of scheduler steps
+        total_train_iters = min(grpo_config["max_num_steps"], len(dataloader))
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n")

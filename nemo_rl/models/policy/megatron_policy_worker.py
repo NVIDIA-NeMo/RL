@@ -579,7 +579,9 @@ class MegatronPolicyWorker:
             train_config=TrainingConfig(
                 micro_batch_size=1,  # ignored
                 global_batch_size=self.cfg["train_global_batch_size"],  # ignored
-                train_iters=1000,  # Default value for inference
+                train_iters=self.cfg["megatron_cfg"].get(
+                    "train_iters", 1000
+                ),  # Set by algorithm setup
             ),
             optimizer_config=OptimizerConfig(
                 **self.cfg["megatron_cfg"]["optimizer"],
