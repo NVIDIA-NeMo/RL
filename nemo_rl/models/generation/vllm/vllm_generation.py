@@ -55,6 +55,30 @@ class VllmGeneration(GenerationInterface):
                 "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
             )
 
+        # Validate sampling parameters early to avoid resource allocation with unsupported configs.
+        # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
+        top_k: int | None = self.cfg.get("top_k")
+        if top_k is not None and top_k != -1:
+            raise ValueError(
+                (
+                    "top_k sampling is not supported because the vLLM V1 engine does not return logprobs after top_k. "
+                    "If you understand the implications and still want to use top_k, please manually comment out "
+                    f"this check. Expected top_k=None or top_k=-1, got top_k={top_k}. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
+                )
+            )
+
+        top_p: float = self.cfg.get("top_p", 1.0)
+        if top_p != 1.0:
+            raise ValueError(
+                (
+                    "top_p sampling is not supported because the vLLM V1 engine does not return logprobs after top_p. "
+                    "If you understand the implications and still want to use top_p, please manually comment out "
+                    f"this check. Expected top_p=1.0, got top_p={top_p}. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
+                )
+            )
+
         # Ensure all required VllmConfig fields are present
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
