@@ -45,4 +45,4 @@ code_snapshots/
 !default_runtime_env.yaml
 
 # Eval results
-eval_results/
+eval-results/
