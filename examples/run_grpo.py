@@ -149,7 +149,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
                 "env_vars": dict(os.environ),
             },
         ).remote(env_configs["principle_genrm_for_rlhf"])
-        task_to_env["principle_genrm_rlhf"] = principle_genrm_for_rlhf_env
+        task_to_env["principle_genrm_for_rlhf"] = principle_genrm_for_rlhf_env
 
     return train_ds, val_ds, task_to_env, task_to_env
 

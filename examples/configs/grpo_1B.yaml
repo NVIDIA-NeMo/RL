@@ -188,7 +188,7 @@ env:
     model_name: "path/to/trained/principle_genrm_model" # The trained principle GenRM model to use
     tensor_parallel_size: 4 # TP size for the principle GenRM model
     gpu_memory_utilization: 0.85 # GPU memory utilization
-    max_model_len: 8192 # Max sequence length for the model
+    max_model_len: 32768 # Max sequence length for the model
     temperature: 1.0 # Temperature for generation (0.0 for greedy)
     max_tokens: 8192 # Max tokens to generate (enough for reasoning + judgment)
     stop: null # Stop strings for generation
