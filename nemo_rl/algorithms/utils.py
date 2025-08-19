@@ -148,7 +148,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig, get_processor: bool = False) -> PreTrainedTokenizerBase:
+def get_tokenizer(
+    tokenizer_config: TokenizerConfig, get_processor: bool = False
+) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
