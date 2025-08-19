@@ -199,16 +199,6 @@ class DTensorPolicyWorker:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
         print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
-        if self.enable_seq_packing:
-            assert not self.is_vlm, (
-                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
-            )
-            print(
-                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
-            )
-            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
-
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -287,10 +277,15 @@ class DTensorPolicyWorker:
         self.is_vlm = processor is not None
         print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
 
-        # ------------------------------------------------
-        # 3) Move to GPU + Composable FSDP
-        #    (Initialize device mesh, shard submodules, then shard entire model)
-        # ------------------------------------------------
+        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        if self.enable_seq_packing:
+            assert not self.is_vlm, (
+                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
+            )
+            print(
+                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
+            )
+            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
@@ -341,6 +336,10 @@ class DTensorPolicyWorker:
         self.cp_size = cp_size
         self.device_mesh = device_mesh
 
+        # ------------------------------------------------
+        # 3) Move to GPU + Composable FSDP
+        #    (Initialize device mesh, shard submodules, then shard entire model)
+        # ------------------------------------------------
         self.model = _parallelize_model(
             self.model,
             self.dp_cp_mesh,
