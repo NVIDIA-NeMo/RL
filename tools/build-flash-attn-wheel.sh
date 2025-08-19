@@ -57,7 +57,7 @@ uv pip install torch==2.7.0 --torch-backend=cu128
 # Build the wheel
 echo "Building flash-attn wheel..."
 FLASH_ATTENTION_FORCE_CXX11_ABI=${FORCE_ABI:-TRUE} \
-	MAX_JOBS=$(nproc) \
+	MAX_JOBS=$(($(nproc)/2)) \
 	FLASH_ATTENTION_FORCE_BUILD="TRUE" \
 	uv run python setup.py bdist_wheel --dist-dir=dist
 
