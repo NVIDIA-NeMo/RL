@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+import re
+import argparse
 
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -19,16 +21,27 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.utils.venvs import create_local_venv
 
 
-def prefetch_venvs():
+def prefetch_venvs(pattern: str):
     """Prefetch all virtual environments that will be used by workers."""
-    print("Prefetching virtual environments...")
+    print(f"Prefetching virtual environments (pattern = {pattern!r})...")
+
+    regex = re.compile(pattern)
+    results = {}  # actor_fqn -> "CACHED" or "SKIPPED"
 
     # Group venvs by py_executable to avoid duplicating work
     venv_configs = {}
     for actor_fqn, py_executable in ACTOR_ENVIRONMENT_REGISTRY.items():
+        if regex.search(actor_fqn):
+            print(f"[MATCH] {actor_fqn}")
+        else:
+            print(f"[SKIP ] {actor_fqn} (does not match pattern)")
+            results[actor_fqn] = "SKIPPED"
+            continue
+
         # Skip system python as it doesn't need a venv
         if py_executable == "python" or py_executable == sys.executable:
-            print(f"Skipping {actor_fqn} (uses system Python)")
+            print(f"  Skipping {actor_fqn} (uses system Python)")
+            results[actor_fqn] = "SKIPPED"
             continue
 
         # Only create venvs for uv-based executables
@@ -45,13 +58,29 @@ def prefetch_venvs():
             try:
                 python_path = create_local_venv(py_executable, actor_fqn)
                 print(f"    Success: {python_path}")
+                results[actor_fqn] = "CACHED"
             except Exception as e:
                 print(f"    Error: {e}")
-                # Continue with other venvs even if one fails
+                results[actor_fqn] = "SKIPPED"
                 continue
 
-    print("\nVenv prefetching complete!")
+    print("\nVenv prefetching complete!\n")
+
+    # Final summary
+    for actor_fqn, status in results.items():
+        print(f"[{status}] {actor_fqn}")
 
 
 if __name__ == "__main__":
-    prefetch_venvs()
+    parser = argparse.ArgumentParser(
+        description="Prefetch virtual environments for selected actors."
+    )
+    parser.add_argument(
+        "pattern",
+        default=".*",
+        type=str,
+        help="Regex pattern to match actor FQNs in ACTOR_ENVIRONMENT_REGISTRY",
+    )
+    args = parser.parse_args()
+
+    prefetch_venvs(args.pattern)
