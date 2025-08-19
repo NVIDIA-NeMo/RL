@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible API server for LLaDA models with DCP checkpoint support.
+OpenAI-compatible API server for LLaDA models with Fast-dLLM acceleration.
 
 This server provides OpenAI API compatibility for LLaDA diffusion language models,
-supporting both direct HuggingFace model loading and DCP checkpoint conversion.
+supporting Fast-dLLM optimizations including KV cache and parallel decoding.
 
 Usage:
     python llada_openai_server.py --model-path /path/to/checkpoint
@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,6 +30,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+# Add Fast-dLLM to Python path
+FAST_DLLM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../3rdparty/Fast-dLLM/llada')
+if os.path.exists(FAST_DLLM_PATH):
+    sys.path.insert(0, FAST_DLLM_PATH)
+    # Import Fast-dLLM generation functions
+    try:
+        from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+        from model.modeling_llada import LLaDAModelLM
+        FAST_DLLM_AVAILABLE = True
+    except ImportError as e:
+        logging.warning(f"Failed to import Fast-dLLM: {e}")
+        FAST_DLLM_AVAILABLE = False
+        generate = None
+        generate_with_prefix_cache = None
+        generate_with_dual_cache = None
+        LLaDAModelLM = None
+else:
+    logging.warning(f"Fast-dLLM path not found: {FAST_DLLM_PATH}")
+    FAST_DLLM_AVAILABLE = False
+    generate = None
+    generate_with_prefix_cache = None
+    generate_with_dual_cache = None
+    LLaDAModelLM = None
 
 # Import NeMo-RL utilities for DCP handling (optional for local mode)
 try:
@@ -64,17 +89,22 @@ class ChatCompletionRequest(BaseModel):
     
     model: str = Field(default="llada-8b-instruct")
     messages: List[ChatMessage] = Field(..., description="List of messages")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)  # Match eval_llada.py default
-    max_tokens: Optional[int] = Field(default=512, gt=0)  # Match eval_llada.py tokens_to_generate default
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)  # Fast-dLLM default
+    max_tokens: Optional[int] = Field(default=128, gt=0)  # Fast-dLLM default
     stream: bool = Field(default=False)
-    # Standard OpenAI parameters that were missing
+    # Standard OpenAI parameters
     top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Top-p (nucleus) sampling")
     top_k: int = Field(default=-1, description="Top-k sampling (-1 to disable)")
-    # LLaDA specific parameters (with defaults, can be overridden via extra_body)
-    steps: int = Field(default=64, ge=1, le=512, description="Diffusion steps")
-    block_length: int = Field(default=64, ge=1, description="Block length for generation")
+    # Fast-dLLM specific parameters
+    steps: int = Field(default=128, ge=1, le=512, description="Diffusion steps")
+    block_length: int = Field(default=32, ge=1, description="Block length for generation")
     cfg_scale: float = Field(default=0.0, ge=0.0, description="Classifier-free guidance scale")
     remasking: str = Field(default="low_confidence", description="Remasking strategy")
+    # Fast-dLLM cache optimization parameters
+    use_cache: bool = Field(default=True, description="Enable KV caching")
+    use_dual_cache: bool = Field(default=True, description="Enable dual cache (both prefix and suffix)")
+    threshold: Optional[float] = Field(default=None, description="Confidence threshold for parallel decoding")
+    factor: Optional[float] = Field(default=None, description="Factor for dynamic parallel decoding")
 
 
 class ChatCompletionChoice(BaseModel):
@@ -118,125 +148,85 @@ class ModelList(BaseModel):
     data: List[ModelInfo]
 
 
-# LLaDA Generation Functions
-def add_gumbel_noise(logits, temperature):
-    """
-    The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves 
-    perplexity score but reduces generation quality. Thus, we use float64.
-    """
-    if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand_like(logits, dtype=torch.float64)
-    gumbel_noise = (- torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-
-def get_num_transfer_tokens(mask_index, steps):
-    """
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule, the expected number of 
-    tokens transitioned at each step should be consistent.
-    """
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = torch.zeros(
-        mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64
-    ) + base
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, :remainder[i]] += 1
-
-    return num_transfer_tokens
-
-
+# Fast-dLLM Generation Functions
 @torch.no_grad()
-def generate_llada(
-    model, prompt, steps=64, gen_length=128, block_length=64, 
-    temperature=0.0, cfg_scale=0.0, remasking='low_confidence', mask_id=MASK_ID
+def generate_fast_dllm(
+    model, prompt, steps=128, gen_length=128, block_length=32,
+    temperature=0.0, remasking='low_confidence', mask_id=MASK_ID,
+    use_cache=True, use_dual_cache=True, threshold=None, factor=None
 ):
     """
-    LLaDA diffusion generation function.
+    Fast-dLLM accelerated generation function.
     
     Args:
-        model: Mask predictor model
+        model: LLaDA model
         prompt: Input tensor of shape (1, L)
         steps: Sampling steps
         gen_length: Generated answer length
-        block_length: Block length for semi-autoregressive generation
+        block_length: Block length for generation
         temperature: Categorical distribution sampling temperature
-        cfg_scale: Classifier-free guidance scale
         remasking: Remasking strategy ('low_confidence' or 'random')
         mask_id: The token id of [MASK]
+        use_cache: Enable KV caching
+        use_dual_cache: Enable dual cache (both prefix and suffix)
+        threshold: Confidence threshold for parallel decoding
+        factor: Factor for dynamic parallel decoding
     """
-    x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-    x[:, :prompt.shape[1]] = prompt.clone()
-
-    prompt_index = (x != mask_id)
-
-    # Ensure block_length divides gen_length evenly
-    if gen_length % block_length != 0:
-        gen_length = ((gen_length // block_length) + 1) * block_length
-        x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-        x[:, :prompt.shape[1]] = prompt.clone()
-
-    num_blocks = gen_length // block_length
-    if steps % num_blocks != 0:
-        steps = ((steps // num_blocks) + 1) * num_blocks
+    if not FAST_DLLM_AVAILABLE:
+        raise RuntimeError("Fast-dLLM is not available. Please check the installation.")
     
-    steps_per_block = steps // num_blocks
-
-    for num_block in range(num_blocks):
-        block_start = prompt.shape[1] + num_block * block_length
-        block_end = prompt.shape[1] + (num_block + 1) * block_length
-        
-        block_mask_index = (x[:, block_start:block_end] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
-        
-        for i in range(steps_per_block):
-            mask_index = (x == mask_id)
-            
-            if cfg_scale > 0.0:
-                un_x = x.clone()
-                un_x[prompt_index] = mask_id
-                x_ = torch.cat([x, un_x], dim=0)
-                logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x).logits
-
-            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-            x0 = torch.argmax(logits_with_noise, dim=-1)
-
-            if remasking == 'low_confidence':
-                import torch.nn.functional as F
-                p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(
-                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
+    try:
+        # Choose the appropriate generation function based on cache settings
+        if use_cache:
+            if use_dual_cache:
+                logger.info("Using Fast-dLLM dual cache generation")
+                output, nfe = generate_with_dual_cache(
+                    model=model,
+                    prompt=prompt,
+                    steps=steps,
+                    gen_length=gen_length,
+                    block_length=block_length,
+                    temperature=temperature,
+                    remasking=remasking,
+                    mask_id=mask_id,
+                    threshold=threshold,
+                    factor=factor
                 )
-            elif remasking == 'random':
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
             else:
-                raise NotImplementedError(f"Remasking strategy '{remasking}' not implemented")
-
-            x0_p[:, block_end:] = float('-inf')
-
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, float('-inf'))
-
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(confidence.shape[0]):
-                if num_transfer_tokens[j, i] > 0:
-                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                    transfer_index[j, select_index] = True
-            x[transfer_index] = x0[transfer_index]
-
-    return x
+                logger.info("Using Fast-dLLM prefix cache generation")
+                output, nfe = generate_with_prefix_cache(
+                    model=model,
+                    prompt=prompt,
+                    steps=steps,
+                    gen_length=gen_length,
+                    block_length=block_length,
+                    temperature=temperature,
+                    remasking=remasking,
+                    mask_id=mask_id,
+                    threshold=threshold,
+                    factor=factor
+                )
+        else:
+            logger.info("Using Fast-dLLM basic generation (no cache)")
+            output, nfe = generate(
+                model=model,
+                prompt=prompt,
+                steps=steps,
+                gen_length=gen_length,
+                block_length=block_length,
+                temperature=temperature,
+                remasking=remasking,
+                mask_id=mask_id,
+                threshold=threshold,
+                factor=factor
+            )
+        
+        logger.info(f"Generation completed with {nfe} forward passes")
+        return output
+        
+    except Exception as e:
+        logger.error(f"Fast-dLLM generation failed: {e}")
+        raise
 
 
 def load_model_from_hf(model_path: str):
@@ -257,13 +247,23 @@ def load_model_from_hf(model_path: str):
         logger.info("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
-        # Load model (works with both local paths and HF model names)
+        # Load model using Fast-dLLM optimized model if available
         logger.info("Loading model...")
-        model = AutoModel.from_pretrained(
-            model_path, 
-            trust_remote_code=True, 
-            torch_dtype=torch.bfloat16
-        )
+        if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
+            logger.info("Using Fast-dLLM optimized model class")
+            model = LLaDAModelLM.from_pretrained(
+                model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            )
+        else:
+            logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+            model = AutoModel.from_pretrained(
+                model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            )
+        
         model = model.to(device).eval()
         
         # Load config (works with both local paths and HF model names)
@@ -271,6 +271,7 @@ def load_model_from_hf(model_path: str):
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
         logger.info(f"Model loaded successfully from {model_type}!")
+        logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
         return True
     except Exception as e:
         logger.error(f"Failed to load model from {model_type} '{model_path}': {e}")
@@ -328,6 +329,10 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     logger.info(f"  Block length: {request.block_length}")
     logger.info(f"  CFG scale: {request.cfg_scale}")
     logger.info(f"  Remasking: {request.remasking}")
+    logger.info(f"  Fast-dLLM use_cache: {request.use_cache}")
+    logger.info(f"  Fast-dLLM use_dual_cache: {request.use_dual_cache}")
+    logger.info(f"  Fast-dLLM threshold: {request.threshold}")
+    logger.info(f"  Fast-dLLM factor: {request.factor}")
     
     # Log any extra parameters received via NeMo-Skills extra_body
     extra_fields = {k: v for k, v in request.__dict__.items() if k not in request.model_fields}
@@ -354,18 +359,29 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to tokenize input: {e}")
     
-    # Generate with LLaDA
+    # Generate with Fast-dLLM
     try:
         gen_length = request.max_tokens or 128
-        output = generate_llada(
+        
+        # Ensure block_length compatibility
+        block_length = min(request.block_length, gen_length)
+        if gen_length % block_length != 0:
+            # Adjust gen_length to be divisible by block_length
+            gen_length = ((gen_length // block_length) + 1) * block_length
+            logger.info(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
+        
+        output = generate_fast_dllm(
             model=model,
             prompt=input_ids,
             steps=request.steps,
             gen_length=gen_length,
-            block_length=min(request.block_length, gen_length),
+            block_length=block_length,
             temperature=request.temperature,
-            cfg_scale=request.cfg_scale,
             remasking=request.remasking,
+            use_cache=request.use_cache,
+            use_dual_cache=request.use_dual_cache,
+            threshold=request.threshold,
+            factor=request.factor
         )
         
         # Decode generated text (excluding the input prompt)

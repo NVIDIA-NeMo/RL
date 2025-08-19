@@ -1,6 +1,6 @@
 # LLaDA OpenAI API Server
 
-This repository provides an OpenAI-compatible API server for LLaDA (Large Language Diffusion Models) with support for DCP (Distributed Checkpoint) format checkpoints.
+This repository provides an OpenAI-compatible API server for LLaDA (Large Language Diffusion Models) with Fast-dLLM acceleration and support for DCP (Distributed Checkpoint) format checkpoints.
 
 ## What is LLaDA?
 
@@ -11,6 +11,7 @@ LLaDA (Large Language Diffusion Models) is a state-of-the-art approach that appl
 - **Parallel generation**: Can generate multiple tokens simultaneously within blocks
 - **Quality control**: More diffusion steps generally lead to higher quality output
 - **Flexible parameters**: Control creativity, guidance, and generation strategy
+- **Fast-dLLM acceleration**: Up to 11x speedup with KV caching and parallel decoding
 
 ## Quick Start
 
@@ -103,8 +104,10 @@ response = requests.post("http://localhost:8000/v1/chat/completions", json={
     "model": "llada-8b-instruct",
     "messages": [{"role": "user", "content": "What is artificial intelligence?"}],
     "temperature": 0.0,
-    "max_tokens": 100,
-    "steps": 64  # LLaDA-specific: number of diffusion steps
+    "max_tokens": 128,
+    "steps": 128,  # LLaDA: diffusion steps
+    "use_cache": True,  # Fast-dLLM: enable acceleration
+    "use_dual_cache": True
 })
 
 print(response.json()["choices"][0]["message"]["content"])
@@ -124,10 +127,10 @@ Standard OpenAI parameters:
 - `stream`: Enable streaming responses (default: false)
 
 **LLaDA-specific parameters:**
-- `steps`: Number of diffusion steps (1-512, default: 64)
+- `steps`: Number of diffusion steps (1-512, default: 128)
   - More steps = higher quality but slower generation
-  - Recommended: 32-128 for most use cases
-- `block_length`: Semi-autoregressive block size (default: 64)
+  - Recommended: 64-256 for most use cases
+- `block_length`: Semi-autoregressive block size (default: 32)
   - Smaller blocks = more parallel generation
   - Must divide evenly into `max_tokens`
 - `cfg_scale`: Classifier-free guidance scale (≥0.0, default: 0.0)
@@ -136,6 +139,18 @@ Standard OpenAI parameters:
 - `remasking`: Token selection strategy (default: "low_confidence")
   - `"low_confidence"`: Select tokens with lowest confidence
   - `"random"`: Random token selection
+
+**Fast-dLLM acceleration parameters:**
+- `use_cache`: Enable KV caching (default: true)
+  - Provides 2-3x speedup with minimal quality impact
+- `use_dual_cache`: Enable dual cache for prefix and suffix (default: true)
+  - Maximum acceleration when combined with KV cache
+- `threshold`: Confidence threshold for parallel decoding (optional)
+  - Range: 0.0-1.0, recommended: 0.7-0.9
+  - Higher values = more conservative parallel decoding
+- `factor`: Dynamic parallel decoding factor (optional)
+  - Range: 1.0-4.0, recommended: 1.5-2.5
+  - Controls aggressiveness of parallel token generation
 
 ### GET `/v1/models`
 
@@ -157,7 +172,9 @@ def basic_chat():
         "messages": [{"role": "user", "content": "Explain quantum computing"}],
         "temperature": 0.0,
         "max_tokens": 100,
-        "steps": 32  # Fast generation
+        "steps": 64,  # Fast generation
+        "use_cache": True,  # Enable acceleration
+        "use_dual_cache": True
     })
     
     return response.json()["choices"][0]["message"]["content"]
@@ -175,7 +192,9 @@ def streaming_chat():
             "stream": True,
             "temperature": 0.5,
             "max_tokens": 200,
-            "steps": 64
+            "steps": 128,
+            "use_cache": True,
+            "use_dual_cache": True
         },
         stream=True
     )
@@ -192,34 +211,43 @@ def streaming_chat():
 ### 3. Quality vs Speed Trade-offs
 
 ```python
-# Fast generation (lower quality)
+# Fast generation with maximum acceleration
 fast_params = {
-    "steps": 16,
+    "steps": 32,
     "temperature": 0.0,
-    "max_tokens": 80
+    "max_tokens": 80,
+    "use_cache": True,
+    "use_dual_cache": True
 }
 
-# High quality generation (slower)
+# High quality generation
 quality_params = {
-    "steps": 128,
+    "steps": 256,
     "temperature": 0.0,
-    "max_tokens": 80
+    "max_tokens": 80,
+    "use_cache": True,
+    "use_dual_cache": True
 }
 
-# Creative generation
+# Creative generation with parallel decoding
 creative_params = {
     "steps": 64,
     "temperature": 0.8,
     "cfg_scale": 0.0,
-    "max_tokens": 80
+    "max_tokens": 80,
+    "use_cache": True,
+    "use_dual_cache": True,
+    "threshold": 0.7
 }
 
-# Guided generation
-guided_params = {
-    "steps": 64,
-    "temperature": 0.2,
-    "cfg_scale": 1.5,
-    "max_tokens": 80
+# Conservative parallel generation
+conservative_params = {
+    "steps": 128,
+    "temperature": 0.0,
+    "max_tokens": 80,
+    "use_cache": True,
+    "use_dual_cache": True,
+    "threshold": 0.9
 }
 ```
 
@@ -281,9 +309,10 @@ export LOG=/path/to/your/log/directory     # Optional, defaults to ./logs
 - Adjust `block_length` to balance memory and parallelism
 
 #### Generation Speed vs Quality
-- **Fast generation**: `steps=16-32`, `temperature=0.0`
-- **Balanced**: `steps=64`, `temperature=0.0-0.3`
-- **High quality**: `steps=128+`, `temperature=0.0`
+- **Maximum speed**: `steps=32-64`, `use_cache=true`, `use_dual_cache=true`
+- **Balanced quality**: `steps=128`, `use_cache=true`, `threshold=0.8`
+- **High quality**: `steps=256+`, `use_cache=true`, conservative settings
+- **Disable acceleration**: `use_cache=false` (for quality comparison)
 
 #### Batch Processing
 - Server handles one request at a time (suitable for single-user scenarios)
@@ -329,14 +358,16 @@ python examples/llada_api_client.py
 # Test server health
 curl http://localhost:8000/health
 
-# Test basic completion
+# Test basic completion with Fast-dLLM acceleration
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "Hello!"}],
     "temperature": 0.0,
-    "max_tokens": 50,
-    "steps": 32
+    "max_tokens": 64,
+    "steps": 64,
+    "use_cache": true,
+    "use_dual_cache": true
   }'
 ```
 
@@ -461,11 +492,14 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
     temperature=0.0,
     max_tokens=100,
-    extra_body={  # LLaDA-specific parameters
-        "steps": 64,
-        "block_length": 64,
+    extra_body={  # LLaDA + Fast-dLLM parameters
+        "steps": 128,
+        "block_length": 32,
         "cfg_scale": 0.0,
-        "remasking": "low_confidence"
+        "remasking": "low_confidence",
+        "use_cache": True,
+        "use_dual_cache": True,
+        "threshold": 0.8
     }
 )
 
@@ -481,14 +515,18 @@ import requests
 class LLaDALLM(LLM):
     base_url: str = "http://localhost:8000"
     temperature: float = 0.0
-    steps: int = 64
+    steps: int = 128
+    use_cache: bool = True
+    use_dual_cache: bool = True
     
     def _call(self, prompt: str, stop=None) -> str:
         response = requests.post(f"{self.base_url}/v1/chat/completions", json={
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
             "max_tokens": 200,
-            "steps": self.steps
+            "steps": self.steps,
+            "use_cache": self.use_cache,
+            "use_dual_cache": self.use_dual_cache
         })
         return response.json()["choices"][0]["message"]["content"]
     
