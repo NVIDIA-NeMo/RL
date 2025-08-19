@@ -182,6 +182,17 @@ env:
     enable: false
     num_workers: 8 # Number of parallel principle verification workers
     stop_strings: null # Default stop strings for this environment
+  principle_genrm_for_rlhf: # Configuration for serving a principle GenRM model as a verifier for RLHF
+    enable: false
+    num_workers: 2 # Number of parallel principle GenRM workers
+    model_name: "path/to/trained/principle_genrm_model" # The trained principle GenRM model to use
+    tensor_parallel_size: 4 # TP size for the principle GenRM model
+    gpu_memory_utilization: 0.85 # GPU memory utilization
+    max_model_len: 8192 # Max sequence length for the model
+    temperature: 1.0 # Temperature for generation (0.0 for greedy)
+    max_tokens: 8192 # Max tokens to generate (enough for reasoning + judgment)
+    stop: null # Stop strings for generation
+    max_concurrency: 16 # Maximum concurrent step calls for the environment actor
   ifeval:
     num_workers: 8
     enable: false
