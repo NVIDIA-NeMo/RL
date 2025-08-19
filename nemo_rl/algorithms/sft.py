@@ -171,6 +171,14 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
+    ## TODO: check this. Might be wrong because of the scaling by gbs in scheduler.step
+    ## TODO: does the same need to be done for dtensor path?
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            sft_config["max_num_steps"],
+            sft_config["max_num_epochs"] * len(train_dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
     policy = Policy(
         cluster=cluster,
         config=policy_config,
@@ -185,15 +193,6 @@ def setup(
         init_reference_model=False,
     )
     loss_fn = NLLLoss()
-
-    ## TODO: check this. Might be wrong because of the scaling by gbs in scheduler.step
-    ## TODO: does the same need to be done for dtensor path?
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = min(
-            sft_config["max_num_steps"],
-            sft_config["max_num_epochs"] * len(train_dataloader),
-        )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     print("  ✓ Model initialized")
 

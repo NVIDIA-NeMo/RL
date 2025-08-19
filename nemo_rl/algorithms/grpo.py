@@ -334,6 +334,11 @@ def setup(
         weights_path = None
         optimizer_path = None
 
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        ## NOTE: this is equal to the total number of scheduler steps
+        total_train_iters = min(grpo_config["max_num_steps"], len(dataloader))
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
     policy = Policy(
         cluster=train_cluster,
         config=policy_config,
@@ -360,11 +365,6 @@ def setup(
     policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
-
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(grpo_config["max_num_steps"], len(dataloader))
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
