@@ -224,8 +224,8 @@ def main():
 
     init_ray()
 
-    if "env" in config["policy"]:
-        set_envvars(config["policy"]["env"])
+    if "env_vars" in config["policy"]:
+        set_envvars(config["policy"]["env_vars"])
 
     set_seed(config["grpo"]["seed"])
 

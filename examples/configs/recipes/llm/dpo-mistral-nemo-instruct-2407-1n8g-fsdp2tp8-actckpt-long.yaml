@@ -36,7 +36,7 @@ policy:
   train_global_batch_size: 8
   train_micro_batch_size: 1
 
-  env:
+  env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 
   #logprob_batch_size: ${policy.train_micro_batch_size}

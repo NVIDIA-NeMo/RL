@@ -176,8 +176,8 @@ def main():
 
     init_ray()
 
-    if "env" in config["policy"]:
-        set_envvars(config["policy"]["env"])
+    if "env_vars" in config["policy"]:
+        set_envvars(config["policy"]["env_vars"])
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])

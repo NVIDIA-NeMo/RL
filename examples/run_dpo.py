@@ -237,8 +237,8 @@ def main():
 
     init_ray()
 
-    if "env" in config["policy"]:
-        set_envvars(config["policy"]["env"])
+    if "env_vars" in config["policy"]:
+        set_envvars(config["policy"]["env_vars"])
 
     # setup data
     train_dataset, val_dataset, tokenizer, dpo_task_spec = setup_data(
