@@ -1,6 +1,11 @@
+## setup
+Starting from your container, run these to prepare your environment. On my dev machine took about a minute to prepare
 ```
+# Wiping uv cache clean and removing venvs just to get accurate timings
 uv cache clean
 rm -rf .venv venvs
+
+# cache the venvs, notably exclude mcore
 time uv run nemo_rl/utils/prefetch_venvs.py 'Vllm|DTensor'
 
 ...
@@ -16,12 +21,14 @@ time uv run nemo_rl/utils/prefetch_venvs.py 'Vllm|DTensor'
 #sys     0m52.296s
 ```
 
-Run a full e2e example:
-```
-uv run examples/run_grpo_math.py
-```
+## examples
 
 Run a simple example that just shows how a weight update is done with 1 GPU (should work with A6000) - written for just dtensor, can be generalized for mcore
 ```
 uv run single_update.py
+```
+
+Run a full e2e GRPO example:
+```
+uv run examples/run_grpo_math.py
 ```
