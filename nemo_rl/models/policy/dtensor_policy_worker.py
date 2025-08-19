@@ -218,11 +218,6 @@ class DTensorPolicyWorker:
             "enabled", False
         )
         if self._is_reward_model:
-            # Ensure sequence packing is disabled.
-            if self.enable_seq_packing:
-                raise NotImplementedError(
-                    "Sequence packing is not supported for reward models"
-                )
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
@@ -279,6 +274,9 @@ class DTensorPolicyWorker:
 
         self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
         if self.enable_seq_packing:
+            assert not self._is_reward_model, (
+                "Sequence packing is not supported for reward models."
+            )
             assert not self.is_vlm, (
                 "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
             )
