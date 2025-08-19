@@ -154,6 +154,12 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.is_vlm = processor is not None
+
+        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
+
         self.is_generation_colocated = None
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
@@ -199,6 +205,16 @@ class DTensorPolicyWorker:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
         print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        if self.enable_seq_packing:
+            assert not self.is_vlm, (
+                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
+            )
+            print(
+                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
+            )
+            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -218,6 +234,11 @@ class DTensorPolicyWorker:
             "enabled", False
         )
         if self._is_reward_model:
+            # Ensure sequence packing is disabled.
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sequence packing is not supported for reward models"
+                )
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
@@ -265,25 +286,6 @@ class DTensorPolicyWorker:
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
-
-        # caching since this property is not always preserved after FSDP
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.is_vlm = processor is not None
-        print(f"Initializing DTensorPolicyWorker with is_vlm={self.is_vlm}")
-
-        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
-        if self.enable_seq_packing:
-            assert not self._is_reward_model, (
-                "Sequence packing is not supported for reward models."
-            )
-            assert not self.is_vlm, (
-                "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
-            )
-            print(
-                f"[Rank {self.rank}] Sequence packing is enabled for model {model_name}"
-            )
-            print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
