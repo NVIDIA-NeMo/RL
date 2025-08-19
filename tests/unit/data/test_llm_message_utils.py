@@ -387,6 +387,56 @@ def test_get_formatted_message_log_llama(
     assert actual_text == expected_text
 
 
+@pytest.mark.hf_gated
+@pytest.mark.parametrize("add_generation_prompt", [False, True])
+def test_get_formatted_message_log_gemma(
+    raw_chat_message_log: LLMMessageLogType,
+    add_generation_prompt: bool,
+) -> None:
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
+    # Gemma template raises on system role; test on user + assistant only
+    gemma_chat_log = [raw_chat_message_log[1], raw_chat_message_log[2]]
+
+    # Derive expected chunks via cumulative template diffs
+    formatted_user = tokenizer.apply_chat_template(
+        [gemma_chat_log[0]],
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        add_special_tokens=False,
+    )
+    formatted_both = tokenizer.apply_chat_template(
+        gemma_chat_log,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+    split_idx = get_first_index_that_differs(formatted_user, formatted_both)
+    assistant_chunk = formatted_both[split_idx:]
+
+    expected_text = [formatted_user, assistant_chunk]
+
+    # Remove BOS from non-initial turn if present
+    bos_token = tokenizer.bos_token or ""
+    if bos_token and expected_text[1].startswith(bos_token):
+        expected_text[1] = expected_text[1][len(bos_token) :]
+
+    # Ensure EOS is present on the final assistant turn (Gemma chat templates we've seen omit it)
+    eos_token = tokenizer.eos_token
+    if eos_token is not None and not expected_text[-1].endswith(eos_token):
+        expected_text[-1] += eos_token
+
+    task_data_spec = TaskDataSpec(task_name="test")
+    result = get_formatted_message_log(
+        gemma_chat_log,
+        tokenizer,
+        task_data_spec,
+        add_generation_prompt=add_generation_prompt,
+    )
+    actual_text = [m["content"] for m in result]
+
+    assert actual_text == expected_text
+
+
 @pytest.mark.parametrize("add_generation_prompt", [False, True])
 def test_get_formatted_message_log_qwen(
     raw_chat_message_log: LLMMessageLogType, add_generation_prompt: bool
