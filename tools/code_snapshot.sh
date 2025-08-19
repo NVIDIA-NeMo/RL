@@ -32,8 +32,14 @@ else
   exit
 fi
 
-echo2 "Copying git-tracked files..."
-rsync -a --files-from=<(git ls-files) ./ $SNAPSHOT_DIR/
+echo2 "Copying git-tracked files and submodules..."
+rsync -a --files-from=<(
+  {
+    git ls-files
+    echo .gitmodules
+    git submodule foreach --recursive --quiet 'git ls-files | sed "s|^|$path/|"'
+  }
+) ./ $SNAPSHOT_DIR/
 
 
 # Echo the snapshot directory so the caller can use it to `cd` into it
