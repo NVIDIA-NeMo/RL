@@ -8,3 +8,6 @@
 	url = https://github.com/terrykong/Megatron-LM.git
 	branch = sahilj/megatron-external-loss-norm
 	shallow = true
+[submodule "3rdparty/Fast-dLLM"]
+	path = 3rdparty/Fast-dLLM
+	url = https://github.com/NVlabs/Fast-dLLM.git
