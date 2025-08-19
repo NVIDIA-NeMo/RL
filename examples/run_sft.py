@@ -179,7 +179,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     return train_dataset, val_dataset, sft_task_spec
 
 
-def main():
+def main(is_vlm: bool = False):
     """Main entry point."""
     # Parse arguments
     args, overrides = parse_args()
@@ -211,7 +211,7 @@ def main():
     init_ray()
 
     # setup tokenizer (or processor)
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
     # setup data
     (
         dataset,

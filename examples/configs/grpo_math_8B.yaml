@@ -9,7 +9,6 @@ policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-    is_tokenizer_processor: false
   train_global_batch_size: 512
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend

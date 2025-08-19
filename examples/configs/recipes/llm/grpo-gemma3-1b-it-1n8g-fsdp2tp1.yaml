@@ -30,7 +30,6 @@ policy:
   model_name: google/gemma-3-1b-it
   tokenizer:
     name: google/gemma-3-1b-it
-    is_tokenizer_processor: false
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32

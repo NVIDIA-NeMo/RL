@@ -340,7 +340,7 @@ def main() -> None:
     init_ray()
 
     # init processor
-    processor = get_tokenizer(config["policy"]["tokenizer"])
+    processor = get_tokenizer(config["policy"]["tokenizer"], get_processor=True)
     tokenizer = processor.tokenizer
 
     assert config["policy"]["generation"] is not None, (

@@ -30,7 +30,6 @@ policy:
   model_name: Qwen/Qwen2.5-7B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-7B-Instruct
-    is_tokenizer_processor: false
   train_global_batch_size: 512
   train_micro_batch_size: 1
   generation_batch_size: 32

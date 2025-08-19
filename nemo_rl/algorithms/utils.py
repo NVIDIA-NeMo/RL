@@ -148,7 +148,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
+def get_tokenizer(tokenizer_config: TokenizerConfig, get_processor: bool = False) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -164,6 +164,7 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+        get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
         PreTrainedTokenizerBase: The configured tokenizer instance
@@ -202,12 +203,26 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         Using custom chat template
         >>> formatted = tokenizer.apply_chat_template(messages, tokenize=False)
         >>> assert formatted == " START: You are a helpful AI assistant. END. START: Hello! END."
+
+        >>> # Requesting a processor (for multimodal models like Qwen-VL)
+        >>> config = {"name": "Qwen/Qwen2.5-VL-3B-Instruct"}
+        >>> processor = get_tokenizer(config, get_processor=True)
+        No chat template provided, using tokenizer's default
+        >>> messages = [
+        ...     {"role": "system", "content": "You are a helpful AI assistant."},
+        ...     {"role": "user", "content": "Hello!"}
+        ... ]
+        >>> formatted = processor.tokenizer.apply_chat_template(messages, tokenize=False)
+        >>> assert formatted == AutoTokenizer.from_pretrained(
+        ...     "Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True
+        ... ).apply_chat_template(messages, tokenize=False)
+        >>> assert processor.pad_token_id == processor.tokenizer.pad_token_id
+        >>>
         ```
     """
     processor = None
-    is_tokenizer_processor = tokenizer_config["is_tokenizer_processor"]
 
-    if is_tokenizer_processor:
+    if get_processor:
         processor = AutoProcessor.from_pretrained(
             tokenizer_config["name"], trust_remote_code=True, use_fast=True
         )
