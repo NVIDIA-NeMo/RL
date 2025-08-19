@@ -16,7 +16,12 @@ time uv run nemo_rl/utils/prefetch_venvs.py 'Vllm|DTensor'
 #sys     0m52.296s
 ```
 
-Run an example
+Run a full e2e example:
 ```
 uv run examples/run_grpo_math.py
+```
+
+Run a simple example that just shows how a weight update is done with 1 GPU (should work with A6000) - written for just dtensor, can be generalized for mcore
+```
+uv run single_update.py
 ```
