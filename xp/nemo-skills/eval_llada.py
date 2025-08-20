@@ -186,7 +186,7 @@ def create_parser():
     parser.add_argument(
         "--quick-test",
         action="store_true", 
-        help="Run quick test mode (50 problems, single sample)"
+        help="Run quick test mode (10 problems, single sample, overrides some settings)"
     )
     
     return parser
@@ -293,6 +293,7 @@ def main():
             # Pass Fast-dLLM acceleration parameters via extra_body
             f"++inference.extra_body.use_cache={config['use_cache']}",
             f"++inference.extra_body.use_dual_cache={config['use_dual_cache']}",
+            f"++num_chunks=2"
         ]
         
         # Add optional Fast-dLLM parameters if specified
