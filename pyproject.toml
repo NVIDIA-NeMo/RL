@@ -59,7 +59,7 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "vllm==0.10.0",
+    "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.7.4.post1",
     "mamba-ssm",
     "causal-conv1d",
