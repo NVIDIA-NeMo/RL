@@ -70,7 +70,7 @@ DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 # (not including the other ports set by this script). So this range is chosen to be
 # somewhere in the middle
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54257}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
