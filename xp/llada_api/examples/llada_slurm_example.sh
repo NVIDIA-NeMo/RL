@@ -59,11 +59,11 @@ check_prerequisites() {
     
     # Check if scripts exist
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    START_SCRIPT="$SCRIPT_DIR/../scripts/start_llada_server.sh"
+    START_SCRIPT="$SCRIPT_DIR/../scripts/start_llada_batch_server.sh"
     CONNECT_SCRIPT="$SCRIPT_DIR/../scripts/connect_to_llada_server.sh"
     
     if [[ ! -f "$START_SCRIPT" ]]; then
-        print_error "start_llada_server.sh not found at $START_SCRIPT"
+        print_error "start_llada_batch_server.sh not found at $START_SCRIPT"
         exit 1
     fi
     

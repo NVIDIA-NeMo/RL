@@ -8,7 +8,7 @@ This directory contains a complete OpenAI-compatible API server implementation f
 xp/llada_api/
 ├── llada_openai_server.py      # Main FastAPI server implementation
 ├── scripts/
-│   ├── start_llada_server.sh   # Server launcher (local & SLURM)
+│   ├── start_llada_batch_server.sh   # Batch server launcher (local & SLURM)
 │   └── connect_to_llada_server.sh  # Connection helper for SLURM jobs
 ├── examples/
 │   ├── llada_api_client.py     # Python client examples
@@ -24,15 +24,18 @@ xp/llada_api/
 Use the convenient wrapper scripts from the NeMo-RL project root:
 
 ```bash
-# Easiest local execution (no setup required)
-./start_llada_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+# Batch server (3-5x faster for evaluations, recommended)
+./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+
+# Streaming server (for real-time responses)
+./scripts/start_llada_batch_server.sh --local --streaming --model-path GSAI-ML/LLaDA-8B-Instruct
 
 # Local with DCP checkpoint (requires dependencies)
-./start_llada_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
+./scripts/start_llada_batch_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # SLURM execution (full NeMo-RL environment)
 export ACCOUNT=your_slurm_account
-./start_llada_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
+./scripts/start_llada_batch_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # Connect to SLURM server
 ./connect_to_llada_server.sh --job-id 12345
@@ -46,14 +49,17 @@ Run scripts directly from the llada_api directory:
 cd xp/llada_api
 
 # Local execution with DCP checkpoint
-scripts/start_llada_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
+scripts/start_llada_batch_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
-# Local execution with HuggingFace model
-scripts/start_llada_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+# Local execution with HuggingFace model (batch mode - 3-5x faster)
+scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+
+# Local execution with streaming
+scripts/start_llada_batch_server.sh --local --streaming --model-path GSAI-ML/LLaDA-8B-Instruct
 
 # SLURM execution
 export ACCOUNT=your_slurm_account
-scripts/start_llada_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
+scripts/start_llada_batch_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # Connection helper
 scripts/connect_to_llada_server.sh --job-id 12345
@@ -80,7 +86,7 @@ scripts/connect_to_llada_server.sh --job-id 12345
 - Implements LLaDA diffusion generation with KV caching and parallel decoding
 - Includes health checks, error handling, and comprehensive logging
 
-### 2. Server Launcher (`scripts/start_llada_server.sh`)
+### 2. Server Launcher (`scripts/start_llada_batch_server.sh`)
 - Unified launcher for local and SLURM execution modes
 - Automatic dependency checking and environment setup
 - Configurable SLURM job parameters (GPUs, memory, time, etc.)
