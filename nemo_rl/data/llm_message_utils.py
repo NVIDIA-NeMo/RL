@@ -436,8 +436,6 @@ def get_formatted_message_log(
                     message_chunk = tokenizer.bos_token + message_chunk
 
         if i == len(message_log_strs) - 1:
-            # do a loose check if the message ends with a ${eos_token}\n, which is the case for chat templates from qwen. Otherwise append eos_token
-            # This is an attempt to robustly append the eos token
             r"""
             This is an attempt to robustly append the eos token. The origin is Qwen
             chat templates always append <eos>\n and some models like gemma do not
