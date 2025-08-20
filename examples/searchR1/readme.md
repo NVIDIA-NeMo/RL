@@ -44,11 +44,7 @@ cd ../../
 ### Download Dataset
 
 ```
-local_dir=./data/searchR1
-uv run --active python searchr1_download.py --local_dir $local_dir
-cat $local_dir/part_* > $local_dir/e5_Flat.index
-gzip -d $local_dir/wiki-18.jsonl.gz
-uv run --active python searchr1_dataset.py --local_dir $local_dir
+uv run --active bash prepare.sh
 ```
 
 ### Launch Retrieval Server

@@ -58,7 +58,7 @@ class SearchWorkerResult(TypedDict):
     answer: Optional[str]
 
 
-def call_search_api(
+def _call_search_api(
     retrieval_service_url: str,
     query: str,
     topk: int = 3,
@@ -187,7 +187,7 @@ class SearchWorker:
         self.max_turns = cfg["max_turns"]
 
     def search(self, query: str):
-        api_response, error_msg = call_search_api(self.url, query)
+        api_response, error_msg = _call_search_api(self.url, query)
         result_text = json.dumps(
             {"result": "Search request failed or timed out after retries."}
         )

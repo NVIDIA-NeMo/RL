@@ -16,7 +16,6 @@
 import argparse
 import json
 import warnings
-from typing import List, Optional
 
 import datasets
 import faiss
@@ -91,7 +90,7 @@ class Encoder:
         self.model.eval()
 
     @torch.no_grad()
-    def encode(self, query_list: List[str], is_query=True) -> np.ndarray:
+    def encode(self, query_list: list[str], is_query=True) -> np.ndarray:
         # processing query for different encoders
         if isinstance(query_list, str):
             query_list = [query_list]
@@ -156,14 +155,14 @@ class BaseRetriever:
     def _search(self, query: str, num: int, return_score: bool):
         raise NotImplementedError
 
-    def _batch_search(self, query_list: List[str], num: int, return_score: bool):
+    def _batch_search(self, query_list: list[str], num: int, return_score: bool):
         raise NotImplementedError
 
     def search(self, query: str, num: int = None, return_score: bool = False):
         return self._search(query, num, return_score)
 
     def batch_search(
-        self, query_list: List[str], num: int = None, return_score: bool = False
+        self, query_list: list[str], num: int = None, return_score: bool = False
     ):
         return self._batch_search(query_list, num, return_score)
 
@@ -219,7 +218,7 @@ class BM25Retriever(BaseRetriever):
             return results
 
     def _batch_search(
-        self, query_list: List[str], num: int = None, return_score: bool = False
+        self, query_list: list[str], num: int = None, return_score: bool = False
     ):
         results = []
         scores = []
@@ -268,7 +267,7 @@ class DenseRetriever(BaseRetriever):
             return results
 
     def _batch_search(
-        self, query_list: List[str], num: int = None, return_score: bool = False
+        self, query_list: list[str], num: int = None, return_score: bool = False
     ):
         if isinstance(query_list, str):
             query_list = [query_list]
@@ -350,7 +349,7 @@ class Config:
 
 class QueryRequest(BaseModel):
     query: str
-    topk: Optional[int] = None
+    topk: int | None = None
     return_scores: bool = False
 
 
