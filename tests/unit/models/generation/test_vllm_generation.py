@@ -805,6 +805,15 @@ async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -847,6 +856,14 @@ async def test_vllm_generation_with_hf_training_colocated(
 async def test_vllm_generation_with_hf_training_non_colocated(
     policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
 
