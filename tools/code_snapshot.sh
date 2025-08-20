@@ -16,12 +16,14 @@ if [[ ! -e "$PROJECT_ROOT/.git" ]]; then
 elif [[ $# -lt 1 ]]; then
   echo2 "[Error]: This script requires one argument: the name of the experiment to be used as the snapshot directory name"
   echo2 "Usage: bash tools/code_snapshot.sh <experiment_name>"
+  echo2 "Usage: CODE_SNAPSHOT_DIRNAME=code_snapshots_dbg bash tools/code_snapshot.sh <experiment_name>"
   exit 1
 fi
 
 EXP_NAME=$1
+CODE_SNAPSHOT_DIRNAME=${CODE_SNAPSHOT_DIRNAME:-code_snapshots}
 
-SNAPSHOT_DIR="$PROJECT_ROOT/code_snapshots/${EXP_NAME}"
+SNAPSHOT_DIR="$PROJECT_ROOT/${CODE_SNAPSHOT_DIRNAME}/${EXP_NAME}"
 if [[ ! -d "$SNAPSHOT_DIR" ]]; then
   echo2 "Creating new code snapshot in $SNAPSHOT_DIR"
   mkdir -p $SNAPSHOT_DIR
