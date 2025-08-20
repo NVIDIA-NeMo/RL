@@ -30,6 +30,7 @@ class DataConfig(TypedDict):
     split: NotRequired[str]
     shuffle: NotRequired[bool]
     seed: NotRequired[int]
+    download_dir: NotRequired[str]
 
 
 class MathDataConfig(DataConfig):

@@ -45,6 +45,10 @@ dependencies = [
     "nvtx",
     "matplotlib",
     "plotly",
+    "sympy>=1.14.0",
+    "pillow>=11.3.0",
+    "torchvision>=0.22.0",
+    "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
 ]
 
@@ -60,6 +64,7 @@ automodel = [
 ]
 vllm = [
     "vllm==0.10.0",
+    "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved

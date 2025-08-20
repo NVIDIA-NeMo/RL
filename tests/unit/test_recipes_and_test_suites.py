@@ -37,6 +37,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "sft": "examples/configs/sft.yaml",
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",
+    "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
 }
 
 

@@ -79,7 +79,7 @@ When you complete the evaluation, you will receive a summary similar to the foll
 ```
 ============================================================
 model_name='Qwen2.5-Math-1.5B-Instruct' dataset_name='aime2024'
-max_new_tokens=2048 temperature=0.0 top_p=1.0 top_k=-1
+max_new_tokens=2048 temperature=0.0 top_p=1.0 top_k=-1 seed=42
 
 metric=pass@1 num_tests_per_prompt=1
 

@@ -41,6 +41,7 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 512
   precision: "bfloat16"
+  logprob_chunk_size: null
 
   dtensor_cfg:
     enabled: true
@@ -53,6 +54,65 @@ policy:
   
   megatron_cfg:
     enabled: false
+    empty_unused_memory_level: 0
+    activation_checkpointing: false
+    converter_type: "Qwen2ForCausalLM"
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
+    defer_fp32_logits: null
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6
+      min_lr: 5.0e-7
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 13
+      lr_warmup_init: 5.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
