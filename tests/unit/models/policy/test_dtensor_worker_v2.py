@@ -148,7 +148,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     config_v2_dict.pop("pad_token_id", None)
 
     discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
-
+    breakpoint()
     assert not discrepancies, (
         f"Model configurations differ between v1 and v2 approaches for {model_name}"
     )
