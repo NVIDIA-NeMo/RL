@@ -202,9 +202,14 @@ class BaseVllmGenerationWorker:
             logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
 
             def _patch_vllm_init_workers_ray():
-                # Patch the vLLM ray_distributed_executor.py file to pass custom runtime_env in _init_workers_ray call.
-                # This allows passing custom env_vars and py_executable to worker initialization.
+                """Patch the vLLM ray_distributed_executor.py file.
 
+                1. Pass custom runtime_env in _init_workers_ray call.
+                    - This allows passing custom py_executable to worker initialization.
+                2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
+                    - This is a workaround to fix async vllm in some scenarios.
+                    - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+                """
                 try:
                     import vllm.executor.ray_distributed_executor as ray_executor_module
 
