@@ -479,7 +479,8 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   at **either** one of the following places:
   1. Launch training with:
   ```sh
-    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
+  # This will globally apply to all ray actors
+  PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
   ```
   2. Make the change more permanently by adding this flag in the training configuration:
   ```yaml
