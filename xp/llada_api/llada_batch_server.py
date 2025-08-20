@@ -54,7 +54,7 @@ else:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llada_openai_server import (
     ChatMessage, ChatCompletionRequest, ChatCompletionChoice, ChatCompletionResponse,
-    load_model_from_hf, load_model_from_dcp, MASK_ID
+    MASK_ID
 )
 
 # Configure logging
@@ -66,6 +66,99 @@ model = None
 tokenizer = None
 device = None
 model_config = None
+
+
+def load_model_from_hf(model_path: str):
+    """Load LLaDA model from HuggingFace format (local path or HuggingFace model name)."""
+    global model, tokenizer, device, model_config
+    
+    # Determine if this is a local path or HuggingFace model name
+    is_local_path = os.path.exists(model_path)
+    model_type = "local path" if is_local_path else "HuggingFace model name"
+    
+    logger.info(f"Loading LLaDA model from {model_type}: {model_path}")
+    
+    try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"Using device: {device}")
+        
+        # Load tokenizer (works with both local paths and HF model names)
+        logger.info("Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        # Load model using Fast-dLLM optimized model if available
+        logger.info("Loading model...")
+        if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
+            logger.info("Using Fast-dLLM optimized model class")
+            model = LLaDAModelLM.from_pretrained(
+                model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            )
+        else:
+            logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+            model = AutoModel.from_pretrained(
+                model_path, 
+                trust_remote_code=True, 
+                torch_dtype=torch.bfloat16
+            )
+        
+        model = model.to(device).eval()
+        
+        # Load config (works with both local paths and HF model names)
+        logger.info("Loading model config...")
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info(f"Model loaded successfully from {model_type}!")
+        logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load model from {model_type} '{model_path}': {e}")
+        return False
+
+
+def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/llada_hf_converted"):
+    """Load LLaDA model from DCP checkpoint by converting to HF format first.""" 
+    global model, tokenizer, device, model_config
+    
+    try:
+        from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, load_checkpoint
+        NEMO_RL_AVAILABLE = True
+    except ImportError:
+        NEMO_RL_AVAILABLE = False
+    
+    if not NEMO_RL_AVAILABLE:
+        logger.error("NeMo-RL is not available. DCP checkpoint loading requires nemo_rl.utils.native_checkpoint.")
+        logger.error("For local execution, please:")
+        logger.error("1. Set PYTHONPATH to include NeMo-RL: export PYTHONPATH=/path/to/NeMo-RL:$PYTHONPATH")
+        logger.error("2. Install NeMo-RL dependencies: uv sync --locked --no-install-project") 
+        logger.error("3. Or use a HuggingFace model instead: --model-path GSAI-ML/LLaDA-8B-Instruct")
+        return False
+    
+    logger.info(f"Converting DCP checkpoint to HuggingFace format...")
+    logger.info(f"DCP path: {dcp_path}")
+    logger.info(f"Base model: {base_model}")
+    logger.info(f"Temp HF path: {temp_dir}")
+    
+    try:
+        # Convert DCP to HF format
+        hf_path = convert_dcp_to_hf(
+            dcp_ckpt_path=dcp_path,
+            hf_ckpt_path=temp_dir,
+            model_name_or_path=base_model,
+            tokenizer_name_or_path=base_model,
+            overwrite=True
+        )
+        
+        logger.info(f"Conversion completed. Loading from: {hf_path}")
+        
+        # Now load from HF format
+        return load_model_from_hf(hf_path)
+        
+    except Exception as e:
+        logger.error(f"Failed to convert or load DCP checkpoint: {e}")
+        return False
+
 
 @dataclass
 class BatchRequest:
