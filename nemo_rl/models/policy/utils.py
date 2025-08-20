@@ -165,41 +165,6 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
-def configure_expandable_segments() -> None:
-    """Configure expandable_segments on Hopper and newer architectures (compute capability 9.x+).
-
-    This helps with memory allocation but causes crashes on Ampere GPUs, so we only enable it
-    on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
-    """
-    conf = (
-        {
-            k: v
-            for k, v in (
-                item.split(":")
-                for item in os.environ.get("PYTORCH_CUDA_ALLOC_CONF").split(",")
-            )
-        }
-        if os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None)
-        else {}
-    )
-
-    compute_capability = torch.cuda.get_device_properties(0).major
-    if compute_capability >= 9:
-        conf["expandable_segments"] = conf.get("expandable_segments", "True")
-    else:
-        if conf.get("expandable_segments", "").lower() == "true":
-            raise RuntimeError(
-                "expandable_segments is enabled in PYTORCH_CUDA_ALLOC_CONF, "
-                "but this is not supported on architectures older than Hopper (compute capability < 9). "
-                "Please set expandable_segments to False."
-            )
-
-    # don't write back to the environment variable since torch is already loaded
-    torch.cuda.memory._set_allocator_settings(
-        ",".join(f"{k}:{v}" for k, v in conf.items())
-    )
-
-
 def configure_dynamo_cache() -> None:
     """Disable dynamo autotune_local_cache.
 

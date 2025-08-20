@@ -118,7 +118,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
     get_megatron_checkpoint_dir,
@@ -409,9 +408,6 @@ class MegatronPolicyWorker:
         # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
         # with different order of node_bundles
         configure_dynamo_cache()
-
-        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-        configure_expandable_segments()
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
