@@ -192,6 +192,7 @@ env:
     temperature: 1.0 # Temperature for generation (0.0 for greedy)
     max_tokens: 8192 # Max tokens to generate (enough for reasoning + judgment)
     stop: null # Stop strings for generation
+    reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor
   ifeval:
     num_workers: 8

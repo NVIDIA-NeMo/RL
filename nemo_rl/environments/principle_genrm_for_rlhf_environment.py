@@ -39,6 +39,7 @@ class PrincipleGenrmForRLHFConfig(TypedDict):
     max_tokens: Optional[int]
     stop: Optional[List[str]]
     max_concurrency: Optional[int]  # Maximum concurrent step calls
+    reasoning_split_word: Optional[str]  # Configurable split word for response processing (default: "</think>")
 
 
 class PrincipleGenrmForRLHFMetadata(TypedDict):
@@ -394,6 +395,10 @@ class PrincipleGenrmForRLHFEnvironment(EnvironmentInterface):
             assert conversation_history is not None, "Conversation history is required"
             # Extract the last assistant response
             assistant_response = message_log[-1]["content"]
+            
+            # Only split if reasoning_split_word is provided
+            if self.cfg.get("reasoning_split_word"):
+                assistant_response = assistant_response.split(self.cfg["reasoning_split_word"])[-1].lstrip()
             
             # Build the full conversation: history + new assistant response(s)
             full_conversation = conversation_history.copy()
