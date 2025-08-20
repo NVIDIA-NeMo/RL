@@ -444,7 +444,7 @@ def get_formatted_message_log(
             have <eos>\n we'll check for that case.
 
             This makes the logic slightly more robust to the model family's chat template
-            so users don't nede to know whether they need to add add_eos or not.
+            so users don't need to know whether they need to add add_eos or not.
             """
             stripped_message_chunk = message_chunk.rstrip("\n")
             if add_eos_token:
