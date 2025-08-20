@@ -343,6 +343,11 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     if not request.messages:
         raise HTTPException(status_code=400, detail="Messages cannot be empty")
     
+    # Log user messages
+    logger.info("User messages:")
+    for i, msg in enumerate(request.messages):
+        logger.info(f"  [{i}] {msg.role}: {msg.content}")
+    
     # Apply chat template
     try:
         formatted_prompt = tokenizer.apply_chat_template(
@@ -389,6 +394,9 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
             output[:, input_ids.shape[1]:], 
             skip_special_tokens=True
         )[0].strip()
+        
+        # Log model response
+        logger.info(f"Model response: {generated_text}")
         
     except Exception as e:
         logger.error(f"Generation failed: {e}")
