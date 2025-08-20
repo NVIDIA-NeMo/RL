@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -485,23 +486,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
 
-        # Convert inputs to vLLM format
-        batch_size = input_ids.shape[0]
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Prepare prompts for vLLM (removing padding)
-        prompts = []
-
-        for i in range(batch_size):
-            # Use input_lengths to get only valid tokens (not padding)
-            valid_length = input_lengths[i].item()
-            valid_ids = (
-                input_ids[i, :valid_length] if valid_length > 0 else input_ids[i, :0]
-            )
-            token_ids = valid_ids.tolist()
-
-            prompts.append({"prompt_token_ids": token_ids})
+        # Convert inputs to vLLM format
+        prompts = format_prompt_for_vllm_generation(data)
 
         # Generate outputs
         assert self.llm is not None, (
