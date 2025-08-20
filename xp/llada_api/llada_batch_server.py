@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""
+Batch-enabled OpenAI-compatible API server for LLaDA models with Fast-dLLM acceleration.
+
+This server provides batching capabilities by accumulating incoming requests
+and processing them together using Fast-dLLM's native batch processing.
+
+Usage:
+    python llada_batch_server.py --model-path /path/to/checkpoint --batch-size 8
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from dataclasses import dataclass
+from collections import deque
+import threading
+
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+# Add Fast-dLLM to Python path
+FAST_DLLM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../3rdparty/Fast-dLLM/llada')
+if os.path.exists(FAST_DLLM_PATH):
+    sys.path.insert(0, FAST_DLLM_PATH)
+    try:
+        from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+        from model.modeling_llada import LLaDAModelLM
+        FAST_DLLM_AVAILABLE = True
+    except ImportError as e:
+        logging.warning(f"Failed to import Fast-dLLM: {e}")
+        FAST_DLLM_AVAILABLE = False
+        generate = None
+        generate_with_prefix_cache = None
+        generate_with_dual_cache = None
+        LLaDAModelLM = None
+else:
+    logging.warning(f"Fast-dLLM path not found: {FAST_DLLM_PATH}")
+    FAST_DLLM_AVAILABLE = False
+
+# Import original server components
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from llada_openai_server import (
+    ChatMessage, ChatCompletionRequest, ChatCompletionChoice, ChatCompletionResponse,
+    load_model_from_hf, load_model_from_dcp, MASK_ID
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global variables
+model = None
+tokenizer = None
+device = None
+model_config = None
+
+@dataclass
+class BatchRequest:
+    """Represents a single request in a batch."""
+    request_id: str
+    request: ChatCompletionRequest
+    future: asyncio.Future
+    timestamp: float
+
+class BatchProcessor:
+    """Handles batching of requests and processing them together."""
+    
+    def __init__(self, max_batch_size: int = 8, max_wait_time: float = 0.1):
+        self.max_batch_size = max_batch_size
+        self.max_wait_time = max_wait_time
+        self.pending_requests: deque = deque()
+        self.processing = False
+        self.lock = asyncio.Lock()
+        
+        # Start the batch processing loop
+        asyncio.create_task(self._batch_processing_loop())
+    
+    async def add_request(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        """Add a request to the batch and wait for its result."""
+        request_id = str(uuid.uuid4())
+        future = asyncio.Future()
+        batch_request = BatchRequest(
+            request_id=request_id,
+            request=request,
+            future=future,
+            timestamp=time.time()
+        )
+        
+        async with self.lock:
+            self.pending_requests.append(batch_request)
+            logger.debug(f"Added request {request_id} to batch queue. Queue size: {len(self.pending_requests)}")
+        
+        # Wait for the result
+        try:
+            return await future
+        except Exception as e:
+            logger.error(f"Request {request_id} failed: {e}")
+            raise
+    
+    async def _batch_processing_loop(self):
+        """Continuously process batches of requests."""
+        while True:
+            try:
+                await asyncio.sleep(0.01)  # Small delay to prevent busy waiting
+                
+                if not self.pending_requests or self.processing:
+                    continue
+                
+                # Check if we should process a batch
+                should_process = False
+                async with self.lock:
+                    if len(self.pending_requests) >= self.max_batch_size:
+                        should_process = True
+                    elif self.pending_requests:
+                        oldest_request_time = self.pending_requests[0].timestamp
+                        if time.time() - oldest_request_time >= self.max_wait_time:
+                            should_process = True
+                
+                if should_process:
+                    await self._process_batch()
+                    
+            except Exception as e:
+                logger.error(f"Error in batch processing loop: {e}")
+    
+    async def _process_batch(self):
+        """Process a batch of requests."""
+        if self.processing:
+            return
+        
+        self.processing = True
+        batch_requests = []
+        
+        try:
+            # Extract requests from the queue
+            async with self.lock:
+                while self.pending_requests and len(batch_requests) < self.max_batch_size:
+                    batch_requests.append(self.pending_requests.popleft())
+            
+            if not batch_requests:
+                return
+            
+            logger.info(f"Processing batch of {len(batch_requests)} requests")
+            batch_start_time = time.time()
+            
+            # Process the batch
+            results = await self._process_batch_requests(batch_requests)
+            
+            batch_time = time.time() - batch_start_time
+            logger.info(f"Batch of {len(batch_requests)} completed in {batch_time:.3f}s ({len(batch_requests)/batch_time:.1f} req/s)")
+            
+            # Return results to waiting futures
+            for batch_request, result in zip(batch_requests, results):
+                if isinstance(result, Exception):
+                    batch_request.future.set_exception(result)
+                else:
+                    batch_request.future.set_result(result)
+                    
+        except Exception as e:
+            logger.error(f"Batch processing failed: {e}")
+            # Set exception for all pending requests
+            for batch_request in batch_requests:
+                if not batch_request.future.done():
+                    batch_request.future.set_exception(e)
+        finally:
+            self.processing = False
+    
+    async def _process_batch_requests(self, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
+        """Process a batch of requests using Fast-dLLM batch capabilities."""
+        try:
+            # Prepare batch data
+            batch_prompts = []
+            batch_configs = []
+            
+            for batch_req in batch_requests:
+                request = batch_req.request
+                
+                # Format messages into prompt
+                try:
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                        add_generation_prompt=True,
+                        tokenize=False
+                    )
+                    batch_prompts.append(formatted_prompt)
+                    
+                    # Store configuration for each request
+                    batch_configs.append({
+                        'steps': request.steps,
+                        'gen_length': request.max_tokens or 128,
+                        'block_length': request.block_length,
+                        'temperature': request.temperature,
+                        'remasking': request.remasking,
+                        'use_cache': request.use_cache,
+                        'use_dual_cache': request.use_dual_cache,
+                        'threshold': request.threshold,
+                        'factor': request.factor
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to format prompt for request {batch_req.request_id}: {e}")
+                    return [HTTPException(status_code=400, detail=f"Failed to format chat template: {e}") for _ in batch_requests]
+            
+            # Tokenize batch prompts
+            try:
+                # Find max length and pad all prompts
+                tokenized_prompts = [tokenizer(prompt, return_tensors="pt")['input_ids'] for prompt in batch_prompts]
+                max_prompt_length = max(p.shape[1] for p in tokenized_prompts)
+                
+                # Pad prompts to same length
+                padded_prompts = []
+                for prompt_ids in tokenized_prompts:
+                    if prompt_ids.shape[1] < max_prompt_length:
+                        padding = torch.full(
+                            (1, max_prompt_length - prompt_ids.shape[1]), 
+                            tokenizer.pad_token_id, 
+                            dtype=torch.long, 
+                            device=device
+                        )
+                        prompt_ids = torch.cat([padding, prompt_ids], dim=1)
+                    padded_prompts.append(prompt_ids)
+                
+                # Stack into batch tensor
+                batch_input_ids = torch.cat(padded_prompts, dim=0).to(device)
+                logger.debug(f"Batch input shape: {batch_input_ids.shape}")
+                
+            except Exception as e:
+                logger.error(f"Failed to tokenize batch: {e}")
+                return [HTTPException(status_code=500, detail=f"Failed to tokenize input: {e}") for _ in batch_requests]
+            
+            # Use the first request's config for the entire batch (assumes similar configs)
+            # TODO: Handle heterogeneous batch configurations
+            config = batch_configs[0]
+            gen_length = config['gen_length']
+            block_length = min(config['block_length'], gen_length)
+            
+            # Adjust gen_length to be divisible by block_length
+            if gen_length % block_length != 0:
+                gen_length = ((gen_length // block_length) + 1) * block_length
+                logger.debug(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
+            
+            # Generate with Fast-dLLM (batch processing)
+            try:
+                if config['use_cache']:
+                    if config['use_dual_cache']:
+                        logger.info(f"Using Fast-dLLM dual cache batch generation for {batch_input_ids.shape[0]} requests")
+                        output, nfe = generate_with_dual_cache(
+                            model=model,
+                            prompt=batch_input_ids,
+                            steps=config['steps'],
+                            gen_length=gen_length,
+                            block_length=block_length,
+                            temperature=config['temperature'],
+                            remasking=config['remasking'],
+                            threshold=config['threshold'],
+                            factor=config['factor']
+                        )
+                    else:
+                        logger.info(f"Using Fast-dLLM prefix cache batch generation for {batch_input_ids.shape[0]} requests")
+                        output, nfe = generate_with_prefix_cache(
+                            model=model,
+                            prompt=batch_input_ids,
+                            steps=config['steps'],
+                            gen_length=gen_length,
+                            block_length=block_length,
+                            temperature=config['temperature'],
+                            remasking=config['remasking'],
+                            threshold=config['threshold'],
+                            factor=config['factor']
+                        )
+                else:
+                    logger.info(f"Using Fast-dLLM basic batch generation for {batch_input_ids.shape[0]} requests")
+                    output, nfe = generate(
+                        model=model,
+                        prompt=batch_input_ids,
+                        steps=config['steps'],
+                        gen_length=gen_length,
+                        block_length=block_length,
+                        temperature=config['temperature'],
+                        remasking=config['remasking'],
+                        threshold=config['threshold'],
+                        factor=config['factor']
+                    )
+                
+                logger.info(f"Batch generation completed with {nfe} forward passes")
+                
+            except Exception as e:
+                logger.error(f"Fast-dLLM batch generation failed: {e}")
+                return [HTTPException(status_code=500, detail=f"Generation failed: {e}") for _ in batch_requests]
+            
+            # Decode and format responses
+            results = []
+            for i, (batch_req, prompt_ids) in enumerate(zip(batch_requests, padded_prompts)):
+                try:
+                    # Extract generated tokens for this request
+                    generated_tokens = output[i:i+1, prompt_ids.shape[1]:]
+                    generated_text = tokenizer.batch_decode(
+                        generated_tokens, 
+                        skip_special_tokens=True
+                    )[0].strip()
+                    
+                    # Create response
+                    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                    created = int(time.time())
+                    
+                    # Calculate token usage
+                    input_tokens = prompt_ids.shape[1]
+                    output_tokens = generated_tokens.shape[1]
+                    total_tokens = input_tokens + output_tokens
+                    
+                    response = ChatCompletionResponse(
+                        id=completion_id,
+                        created=created,
+                        model=batch_req.request.model,
+                        choices=[
+                            ChatCompletionChoice(
+                                index=0,
+                                message=ChatMessage(role="assistant", content=generated_text),
+                                finish_reason="stop"
+                            )
+                        ],
+                        usage={
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": total_tokens
+                        }
+                    )
+                    results.append(response)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to decode response for request {batch_req.request_id}: {e}")
+                    results.append(HTTPException(status_code=500, detail=f"Failed to decode response: {e}"))
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Batch processing failed: {e}")
+            return [HTTPException(status_code=500, detail=f"Batch processing failed: {e}") for _ in batch_requests]
+
+# Global batch processor
+batch_processor = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan context manager for model loading."""
+    global batch_processor
+    logger.info("Starting LLaDA Batch OpenAI API Server...")
+    
+    if model is None:
+        logger.error("Model not loaded! Server will not work properly.")
+    
+    # Initialize batch processor
+    batch_processor = BatchProcessor(
+        max_batch_size=app.state.batch_size,
+        max_wait_time=app.state.max_wait_time
+    )
+    
+    yield
+    
+    logger.info("Shutting down LLaDA Batch OpenAI API Server...")
+
+# Create FastAPI app
+app = FastAPI(
+    title="LLaDA Batch OpenAI API",
+    description="Batch-enabled OpenAI-compatible API for LLaDA diffusion language models",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models."""
+    from llada_openai_server import ModelList, ModelInfo
+    return ModelList(
+        object="list",
+        data=[
+            ModelInfo(
+                id="llada-8b-instruct",
+                created=int(time.time()),
+                owned_by="llada"
+            )
+        ]
+    )
+
+@app.post("/v1/chat/completions")
+async def create_chat_completion(request: ChatCompletionRequest):
+    """Create chat completion using batched LLaDA model processing."""
+    
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    if request.stream:
+        raise HTTPException(status_code=400, detail="Streaming is not supported in batch mode")
+    
+    try:
+        # Add request to batch processor
+        result = await batch_processor.add_request(request)
+        return result
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "device": device,
+        "batch_processor_active": batch_processor is not None,
+        "pending_requests": len(batch_processor.pending_requests) if batch_processor else 0
+    }
+
+@app.get("/batch/stats")
+async def batch_stats():
+    """Get batch processing statistics."""
+    if not batch_processor:
+        raise HTTPException(status_code=503, detail="Batch processor not initialized")
+    
+    return {
+        "max_batch_size": batch_processor.max_batch_size,
+        "max_wait_time": batch_processor.max_wait_time,
+        "pending_requests": len(batch_processor.pending_requests),
+        "currently_processing": batch_processor.processing
+    }
+
+def main():
+    global model, tokenizer, device, model_config
+    
+    parser = argparse.ArgumentParser(description="LLaDA Batch OpenAI API Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
+    parser.add_argument("--model-path", help="Path to HuggingFace model")
+    parser.add_argument("--dcp-path", help="Path to DCP checkpoint")
+    parser.add_argument("--base-model", default="GSAI-ML/LLaDA-8B-Instruct", 
+                       help="Base model name for DCP conversion")
+    parser.add_argument("--temp-dir", default="/tmp/llada_hf_converted",
+                       help="Temporary directory for DCP conversion")
+    parser.add_argument("--batch-size", type=int, default=8, 
+                       help="Maximum batch size for processing requests")
+    parser.add_argument("--max-wait-time", type=float, default=0.1,
+                       help="Maximum time to wait for batch to fill (seconds)")
+    
+    args = parser.parse_args()
+    
+    # Load model
+    if args.model_path:
+        success = load_model_from_hf(args.model_path)
+    elif args.dcp_path:
+        success = load_model_from_dcp(args.dcp_path, args.base_model, args.temp_dir)
+    else:
+        logger.error("Either --model-path or --dcp-path must be provided")
+        return
+    
+    if not success:
+        logger.error("Failed to load model. Exiting.")
+        return
+    
+    # Store batch configuration in app state
+    app.state.batch_size = args.batch_size
+    app.state.max_wait_time = args.max_wait_time
+    
+    logger.info(f"Starting batch server on {args.host}:{args.port}")
+    logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
+    uvicorn.run(app, host=args.host, port=args.port)
+
+if __name__ == "__main__":
+    main()
