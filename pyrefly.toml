@@ -62,6 +62,7 @@ project-includes = [
     "nemo_rl/data/hf_datasets/openmathinstruct2.py",
     "nemo_rl/data/hf_datasets/prompt_response_dataset.py",
     "nemo_rl/data/hf_datasets/squad.py",
+    "nemo_rl/data/hf_datasets/tulu3.py",
     "nemo_rl/data/multimodal_utils.py",
     "nemo_rl/data/interfaces.py",
     "nemo_rl/data/packing/__init__.py",
