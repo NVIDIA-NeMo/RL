@@ -18,7 +18,7 @@ Common issues and solutions for the LLaDA OpenAI API server.
 2. **For DCP support**: Install NeMo-RL dependencies:
    ```bash
    # Make sure you're in the NeMo-RL project root
-   uv sync --locked --extra vllm --no-install-project
+   uv sync --locked --no-install-project
    uv pip install fastapi uvicorn
    
    # Now DCP checkpoints will work
@@ -61,7 +61,7 @@ Common issues and solutions for the LLaDA OpenAI API server.
 **Solutions**:
 ```bash
 # Using uv (recommended)
-uv sync --locked --extra vllm --no-install-project
+uv sync --locked --no-install-project
 uv pip install fastapi uvicorn
 
 # Using pip

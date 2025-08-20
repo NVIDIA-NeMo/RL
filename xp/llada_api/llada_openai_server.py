@@ -286,7 +286,7 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/ll
         logger.error("NeMo-RL is not available. DCP checkpoint loading requires nemo_rl.utils.native_checkpoint.")
         logger.error("For local execution, please:")
         logger.error("1. Set PYTHONPATH to include NeMo-RL: export PYTHONPATH=/path/to/NeMo-RL:$PYTHONPATH")
-        logger.error("2. Install NeMo-RL dependencies: uv sync --locked --extra vllm --no-install-project") 
+        logger.error("2. Install NeMo-RL dependencies: uv sync --locked --no-install-project") 
         logger.error("3. Or use a HuggingFace model instead: --model-path GSAI-ML/LLaDA-8B-Instruct")
         return False
     

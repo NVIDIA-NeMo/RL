@@ -230,7 +230,7 @@ elif [[ -n "$DCP_PATH" ]]; then
         fi
         
         print_warning "DCP checkpoints in local mode require NeMo-RL dependencies"
-        print_warning "Make sure you have run: uv sync --locked --extra vllm --no-install-project"
+        print_warning "Make sure you have run: uv sync --locked --no-install-project"
         print_warning "For easier local testing, consider using: --model-path GSAI-ML/LLaDA-8B-Instruct"
     fi
     
@@ -247,7 +247,7 @@ run_local() {
     
     python3 -c "import fastapi, uvicorn, torch, transformers" 2>/dev/null || {
         print_error "Missing required Python packages. Please install using uv:"
-        echo "  uv sync --locked --extra vllm --no-install-project  # Sync from uv.lock"
+        echo "  uv sync --locked --no-install-project  # Sync from uv.lock"
         echo "  uv pip install fastapi uvicorn                     # Install additional deps"
         echo ""
         echo "  # Alternative with traditional pip:"
@@ -352,9 +352,9 @@ else
     echo "Proceeding with container's default Python environment..."
 fi
 
-# Step 2: Prepare environment from uv.lock (+ vllm extra)
-echo "[2/3] Syncing dependencies to container environment from uv.lock (+ vllm extra)..."
-uv sync --locked --extra vllm --no-install-project
+# Step 2: Prepare environment from uv.lock
+echo "[2/3] Syncing dependencies to container environment from uv.lock..."
+uv sync --locked --no-install-project
 if [ \$? -ne 0 ]; then
     echo "Error: Failed to sync dependencies from uv.lock. Exiting."
     exit 1

@@ -324,7 +324,7 @@ def main():
             if not config["max_samples"]:
                 benchmark_name = config["benchmarks"].split(":")[0]
                 config["benchmarks"] = f"{benchmark_name}:1"  # Single sample
-                generation_args.append("++max_samples=50")  # Only 50 problems
+                generation_args.append("++max_samples=10")  # Only 10 problems
             print(f"\n🚀 QUICK TEST MODE: Running with {config['benchmarks']} and limited samples")
         
         # Call the evaluation function with direct parameters

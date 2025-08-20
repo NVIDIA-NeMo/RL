@@ -62,9 +62,9 @@ else
 fi
 echo
 
-# Step 2: Prepare environment from uv.lock (+ vllm extra)
-echo "[2/3] Syncing dependencies to container environment from uv.lock (+ vllm extra)..."
-uv sync --locked --extra vllm --no-install-project
+# Step 2: Prepare environment from uv.lock
+echo "[2/3] Syncing dependencies to container environment from uv.lock..."
+uv sync --locked --no-install-project
 if [ $? -ne 0 ]; then
     echo "Error: Failed to sync dependencies from uv.lock. Exiting."
     exit 1

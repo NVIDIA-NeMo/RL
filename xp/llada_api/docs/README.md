@@ -20,7 +20,7 @@ LLaDA (Large Language Diffusion Models) is a state-of-the-art approach that appl
 For local execution:
 ```bash
 # Recommended: Use uv to sync from project dependencies (for DCP support)
-uv sync --locked --extra vllm --no-install-project
+uv sync --locked --no-install-project
 uv pip install fastapi uvicorn aiohttp requests
 
 # Minimal for HuggingFace model testing only
@@ -48,7 +48,7 @@ Run the server locally on your machine:
 ./start_llada_server.sh --local --model-path /path/to/llada-model
 
 # DCP checkpoint (requires NeMo-RL dependencies)
-uv sync --locked --extra vllm --no-install-project  # First install dependencies
+uv sync --locked --no-install-project  # First install dependencies
 ./start_llada_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 ```
 
@@ -427,7 +427,7 @@ The server provides detailed logging for debugging:
 ```bash
 # Enable debug logging (local mode)
 # Make sure dependencies are installed with uv first
-uv sync --locked --extra vllm --no-install-project
+uv sync --locked --no-install-project
 uv pip install fastapi uvicorn
 
 export PYTHONPATH=/path/to/NeMo-RL:$PYTHONPATH
