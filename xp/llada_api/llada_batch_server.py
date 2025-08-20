@@ -321,7 +321,12 @@ class BatchProcessor:
                             dtype=torch.long, 
                             device=device
                         )
+                        # Move prompt_ids to same device as padding before concatenation
+                        prompt_ids = prompt_ids.to(device)
                         prompt_ids = torch.cat([padding, prompt_ids], dim=1)
+                    else:
+                        # Move to device even if no padding needed
+                        prompt_ids = prompt_ids.to(device)
                     padded_prompts.append(prompt_ids)
                 
                 # Stack into batch tensor
