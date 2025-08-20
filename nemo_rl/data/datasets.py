@@ -15,7 +15,7 @@ from typing import Any, Optional, Union
 
 import torch
 from datasets import Dataset
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -29,7 +29,7 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-TokenizerType = PreTrainedTokenizerBase
+TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
 
 
 # TODO @sahilj handle too-long prompts and masking them out throughout the whole process and renormalizing on loss
@@ -63,6 +63,7 @@ class AllTaskProcessedDataset:
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
         self.max_seq_length = max_seq_length
+        self._bos_checked = False
 
         if isinstance(task_data_processors, dict):
             # apply defaults to all task data specs
@@ -111,6 +112,22 @@ class AllTaskProcessedDataset:
         datum_spec = task_data_processor(
             entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
         )
+
+        # Check the first processed item for BOS token assertion
+        if (
+            not self._bos_checked
+            and "message_log" in datum_spec
+            and datum_spec["message_log"]
+        ):
+            first_message = datum_spec["message_log"][0]
+            if "token_ids" in first_message:
+                token_ids = first_message["token_ids"]
+                assert isinstance(token_ids, torch.Tensor), (
+                    f"token_ids must be a torch.Tensor, got {type(token_ids)}"
+                )
+                assert_no_double_bos(token_ids, self.tokenizer)
+            self._bos_checked = True
+
         return datum_spec
 
 
@@ -133,6 +150,20 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
+    # check if any of the data batch has vllm content and images
+    extra_args = {}
+    if any(
+        [datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch]
+    ):
+        vllm_content = [
+            datum_spec.get("vllm_content", None) for datum_spec in data_batch
+        ]
+        vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
+        vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
+        extra_args["vllm_content"] = vllm_content
+        extra_args["vllm_images"] = vllm_images
+        extra_args["vllm_videos"] = vllm_videos
+
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,
@@ -142,6 +173,7 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
+        **extra_args,
     )
     return output
 
@@ -282,3 +314,24 @@ def dpo_collate_fn(
     )
 
     return train_data
+
+
+def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
+    """Assert that there are no double starting BOS tokens in the message.
+
+    Args:
+        token_ids: List of token IDs
+        tokenizer: Tokenizer
+    """
+    if tokenizer.bos_token_id is not None:
+        token_ids_list = token_ids.tolist()
+        if len(token_ids_list) > 1:
+            assert not (
+                token_ids_list[0] == tokenizer.bos_token_id
+                and token_ids_list[1] == tokenizer.bos_token_id
+            ), "Found double BOS token in the first two positions of the message."
+    else:
+        # `name_or_path` is not available for AutoProcessor, temp fix in get_tokenizer
+        print(
+            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
+        )

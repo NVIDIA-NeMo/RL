@@ -264,15 +264,23 @@ def calculate_rewards(
     all_next_stop_strings = []
     all_metadata = []  # Store extracted metadata
     all_indices_order = []
+    all_answers = []
 
     for future, result in zip(futures, results):
         indices = future_to_indices[future]
         # Environment step returns: EnvironmentReturn
-        env_observations, metadata, next_stop_strings, task_rewards, terminateds = (
-            result
-        )
+        (
+            env_observations,
+            metadata,
+            next_stop_strings,
+            task_rewards,
+            terminateds,
+            answers,
+        ) = result
         if next_stop_strings is None:
             next_stop_strings = [None] * len(task_rewards)
+        if answers is None:
+            answers = [None] * len(task_rewards)
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
@@ -282,6 +290,7 @@ def calculate_rewards(
             all_terminateds.append(terminateds[i])
             all_next_stop_strings.append(next_stop_strings[i])
             all_metadata.append(metadata[i])
+            all_answers.append(answers[i])
 
     # Sort results by original index to maintain order
     sorted_indices = sorted(
@@ -292,6 +301,7 @@ def calculate_rewards(
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
     next_stop_strings = [all_next_stop_strings[i] for i in sorted_indices]
     metadata = [all_metadata[i] for i in sorted_indices]  # Sort metadata
+    answers = [all_answers[i] for i in sorted_indices]
 
     return EnvironmentReturn(
         observations=env_observations,
@@ -299,6 +309,7 @@ def calculate_rewards(
         next_stop_strings=next_stop_strings,
         rewards=rewards,
         terminateds=terminateds,
+        answers=answers,
     )
 
 
@@ -369,6 +380,7 @@ def run_multi_turn_rollout(
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
 
+        # Prepare generation input data
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": active_input_ids,
@@ -376,6 +388,17 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        # add the multimodal data to the generation input data
+        multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
+        generation_input_data.update(multimodal_data)
+
+        # keep message log for generation
+        if "vllm_content" in active_batch:
+            generation_input_data["vllm_content"] = active_batch["vllm_content"]
+        if "vllm_images" in active_batch:
+            generation_input_data["vllm_images"] = active_batch["vllm_images"]
+        if "vllm_videos" in active_batch:
+            generation_input_data["vllm_videos"] = active_batch["vllm_videos"]
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(

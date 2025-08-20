@@ -107,7 +107,7 @@ This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_gro
 
 ## Fast Generation
 
-We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm.py) class right now.
+We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class right now.
 
 The function [grpo_train](../../nemo_rl/algorithms/grpo.py) contains the core GRPO training loop.
 

@@ -18,7 +18,8 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run $PROJECT_ROOT/examples/run_grpo_math.py \
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_grpo_math.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
@@ -37,5 +38,5 @@ uv run $PROJECT_ROOT/examples/run_grpo_math.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'max(data["train/token_mult_prob_error"]) < 1.05'
 

@@ -14,12 +14,37 @@
 
 import importlib
 import os
+from collections import defaultdict
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+from torch import nn
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForTextToWaveform,
+)
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+# an automodel factory for loading the huggingface models from correct class
+AUTOMODEL_FACTORY = defaultdict(lambda: AutoModelForCausalLM)
+AUTOMODEL_FACTORY["qwen2_5_vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2_vl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["qwen2_5_omni"] = AutoModelForTextToWaveform
+AUTOMODEL_FACTORY["llava"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["internvl"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["gemma3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["smolvlm"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["mistral3"] = AutoModelForImageTextToText
+AUTOMODEL_FACTORY["llama4"] = AutoModelForImageTextToText
+
+
+def resolve_model_class(model_name: str) -> nn.Module:
+    if model_name.lower() in AUTOMODEL_FACTORY.keys():
+        return AUTOMODEL_FACTORY[model_name.lower()]
+    return AutoModelForCausalLM
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -183,6 +208,16 @@ def configure_expandable_segments() -> None:
                         )
 
 
+def configure_dynamo_cache() -> None:
+    """Disable dynamo autotune_local_cache.
+
+    Dynamo may fail at cached_autotune when there's already a cache with different order of node_bundles.
+    Disable autotune_local_cache as a workaround.
+    See https://github.com/pytorch/pytorch/issues/153791 for more details.
+    """
+    torch._inductor.config.autotune_local_cache = False
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
@@ -220,3 +255,11 @@ def get_megatron_checkpoint_dir() -> str:
             )
     print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
     return checkpoint_dir
+
+
+def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
+    """Get IPC handle from a tensor."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    # skip serializing the function for better refit performance
+    return reduce_tensor(tensor.detach())[1:]
