@@ -343,10 +343,21 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     if not request.messages:
         raise HTTPException(status_code=400, detail="Messages cannot be empty")
     
-    # Log user messages
-    logger.info("User messages:")
+    # Log user messages with better formatting
+    logger.info("=" * 80)
+    logger.info("📝 USER MESSAGES:")
+    logger.info("=" * 80)
     for i, msg in enumerate(request.messages):
-        logger.info(f"  [{i}] {msg.role}: {msg.content}")
+        logger.info(f"[{i+1}] {msg.role.upper()}:")
+        # Handle multi-line content better
+        content_lines = msg.content.strip().split('\n')
+        if len(content_lines) == 1:
+            logger.info(f"    {content_lines[0]}")
+        else:
+            for line in content_lines:
+                logger.info(f"    {line}")
+        if i < len(request.messages) - 1:  # Add separator between messages
+            logger.info("    " + "-" * 60)
     
     # Apply chat template
     try:
@@ -395,8 +406,18 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
             skip_special_tokens=True
         )[0].strip()
         
-        # Log model response
-        logger.info(f"Model response: {generated_text}")
+        # Log model response with better formatting
+        logger.info("=" * 80)
+        logger.info("🤖 MODEL RESPONSE:")
+        logger.info("=" * 80)
+        # Handle multi-line responses better
+        response_lines = generated_text.strip().split('\n')
+        if len(response_lines) == 1:
+            logger.info(f"    {response_lines[0]}")
+        else:
+            for line in response_lines:
+                logger.info(f"    {line}")
+        logger.info("=" * 80)
         
     except Exception as e:
         logger.error(f"Generation failed: {e}")
