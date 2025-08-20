@@ -280,14 +280,17 @@ def compute_token_level_entropy(
 def compute_token_logprobs(
     logits: Union[torch.Tensor, torch.distributed.tensor.DTensor],
     input_ids: torch.Tensor,
+    chunk_size: int = 1024,
 ):
     """Computes token-level logprobs from logits and input ids."""
     if isinstance(logits, torch.distributed.tensor.DTensor):
         curr_logprobs = get_logprobs_from_vocab_parallel_logits(
             vocab_parallel_logits=logits,
             input_ids=input_ids,
+            chunk_size=chunk_size,
         )
     else:
+        logits = logits.to(torch.float32)
         next_token_logits_wo_last = logits[:, :-1]  # Remove last position's logits
         next_token_logprobs = torch.nn.functional.log_softmax(
             next_token_logits_wo_last, dim=-1
