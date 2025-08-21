@@ -799,6 +799,7 @@ class MegatronPolicyWorker:
         self.refit_conversion_tasks = (
             None  # Meta data for conversion params from megatron bridge
         )
+        self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
         self.refit_param_info_hf = None
 
@@ -1567,7 +1568,7 @@ class MegatronPolicyWorker:
         ## default to 20% to get some more speedup than 10%, OOM if set to 30%
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
-
+        self.refit_conversion_tasks_current_index = 0
         return self.refit_param_info_mcore, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
@@ -1586,8 +1587,10 @@ class MegatronPolicyWorker:
             self._held_gather_buffer = None
 
         # extract the conversion tasks in this pack
-        conversion_tasks = self.refit_conversion_tasks[: len(keys)]
-        self.refit_conversion_tasks = self.refit_conversion_tasks[len(keys) :]
+        conversion_tasks = self.refit_conversion_tasks[
+            self.refit_conversion_tasks_current_index: self.refit_conversion_tasks_current_index + len(keys)
+        ]
+        self.refit_conversion_tasks_current_index += len(keys)
 
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
