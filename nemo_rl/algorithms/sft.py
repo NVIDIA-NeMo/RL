@@ -171,6 +171,12 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            sft_config["max_num_steps"],
+            sft_config["max_num_epochs"] * len(train_dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
     # check if tokenizer is a processor (e.g. for VLMs)
     processor = None
     if not isinstance(tokenizer, PreTrainedTokenizerBase):
