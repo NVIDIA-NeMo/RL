@@ -25,6 +25,9 @@ tests/test_suites/llm/grpo-deepscaler-1.5b-8K.sh
 # GRPO math test run (32K context mcore)
 tests/test_suites/llm/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
 
+# FP8
+tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8.sh
+
 #######
 # SFT #
 #######

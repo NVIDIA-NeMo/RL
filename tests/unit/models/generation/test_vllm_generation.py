@@ -1001,6 +1001,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
+
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     from nemo_rl.models.policy.lm_policy import Policy
 
     # Create configs
@@ -1385,6 +1393,14 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
