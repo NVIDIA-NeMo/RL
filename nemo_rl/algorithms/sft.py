@@ -171,7 +171,6 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    ## TODO: does the same need to be done for dtensor path?
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = min(
             sft_config["max_num_steps"],
