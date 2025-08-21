@@ -182,10 +182,18 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
-    ## TODO: does the same need to be done for dtensor path?
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = min(rm_config["max_num_steps"], len(train_dataloader))
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        total_train_iters = min(
+            rm_config["max_num_steps"],
+            rm_config["max_num_epochs"] * len(train_dataloader),
+        )
+        ## NOTE: we double the train_iters because effective batch size is doubled
+        ## for (chosen, rejected) pairs
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters * 2
+        if "scheduler" in policy_config["megatron_cfg"]:
+            for k in policy_config["megatron_cfg"]["scheduler"]:
+                if "iters" in k:
+                    policy_config["megatron_cfg"]["scheduler"][k] *= 2
     policy = Policy(
         cluster=cluster,
         config=policy_config,
