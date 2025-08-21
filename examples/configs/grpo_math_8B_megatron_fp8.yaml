@@ -9,5 +9,5 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
-      num_last_layers_in_bf16: 3
-      num_first_layers_in_bf16: 1
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
