@@ -250,7 +250,7 @@ class BaseVllmGenerationWorker:
                         content = f.read()
 
                     old_line = "raw_logprobs = self.compute_logprobs(logits)"
-                    new_lines = "raw_logprobs = self.compute_logprobs(self.apply_temperature(logits.to(torch.float32), sampling_metadata.temperature))"
+                    new_lines = "raw_logprobs = self.compute_logprobs(self.apply_temperature(logits.to(torch.float32), sampling_metadata.temperature) if sampling_metadata.temperature is not None else logits)"
 
                     if new_lines in content:
                         return
