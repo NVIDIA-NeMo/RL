@@ -377,7 +377,9 @@ def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="c
 
 
 # Helper to create logits that yield specific target log probs after log_softmax
-def _create_exact_logits(target_curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device):
+def _create_exact_logits(
+    target_curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+):
     """Constructs logits such that log_softmax results in target_curr_lp_masked."""
     dummy_logits = torch.full(
         (batch_size, seq_len, vocab_size), -100.0, device=device
@@ -1128,7 +1130,7 @@ def test_clipped_pg_loss_gspo():
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
-        "use_sequence_level_importance_ratios": True,
+        "sequence_level_importance_ratios": True,
         "token_level_loss": False,
     }
     loss_fn = ClippedPGLossFn(cfg)
@@ -1149,38 +1151,37 @@ def test_clipped_pg_loss_gspo():
 
     # --- Hand Calculation ---
     log_ratios = curr_lp_masked - prev_lp_masked
-    ratios = torch.exp(log_ratios)  # approx [0.5, 1.0, 1.5]
+    seq_log_ratios_mean = torch.mean(log_ratios, dim=-1).unsqueeze(-1)
+    ratios = seq_log_ratios_mean.exp().repeat(1, 3)
     assert torch.allclose(
-        ratios, torch.tensor([[0.5, 1.0, 1.5]], device=device), rtol=1e-3
+        ratios, torch.tensor([[0.9086, 0.9086, 0.9086]], device=device), rtol=1e-3
     )
 
-    ratios_clamped = torch.clamp(
-        ratios, 1.0 - ratio_clip, 1.0 + ratio_clip
-    )  # [0.8, 1.0, 1.2]
+    ratios_clamped = torch.clamp(ratios, 1.0 - ratio_clip, 1.0 + ratio_clip)
     assert torch.allclose(
-        ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
+        ratios_clamped,
+        torch.tensor([[0.9086, 0.9086, 0.9086]], device=device),
+        rtol=1e-3,
     )
 
-    loss1 = -adv_masked * ratios  # approx -[1*0.5, -1*1.0, 2*1.5] = [-0.5, 1.0, -3.0]
+    loss1 = -adv_masked * ratios
     assert torch.allclose(
-        loss1, torch.tensor([[-0.5, 1.0, -3.0]], device=device), rtol=1e-3
+        loss1, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    loss2 = -adv_masked * ratios_clamped  # -[1*0.8, -1*1.0, 2*1.2] = [-0.8, 1.0, -2.4]
+    loss2 = -adv_masked * ratios_clamped
     assert torch.allclose(
-        loss2, torch.tensor([[-0.8, 1.0, -2.4]], device=device), rtol=1e-3
+        loss2, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    max_loss = torch.maximum(loss1, loss2)  # approx [-0.5, 1.0, -2.4]
+    max_loss = torch.maximum(loss1, loss2)
     assert torch.allclose(
-        max_loss, torch.tensor([[-0.5, 1.0, -2.4]], device=device), rtol=1e-3
+        max_loss, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    expected_loss = torch.mean(
-        max_loss
-    )  # approx (-0.5 + 1.0 - 2.4) / 3 = -1.9 / 3 = -0.6333
+    expected_loss = torch.mean(max_loss)
     assert torch.allclose(
-        expected_loss, torch.tensor(-0.6333, device=device), rtol=1e-3
+        expected_loss, torch.tensor(-0.6057, device=device), rtol=1e-3
     )
 
     input_ids = data["input_ids"]
@@ -1197,13 +1198,15 @@ def test_clipped_pg_loss_gspo():
     torch.testing.assert_close(actual_loss, expected_loss)
 
 
-def test_clipped_pg_loss_gspo_bsz_2():
-    """Tests GSPO path in ClippedPGLossFn."""
+def test_clipped_pg_loss_gspo_batch_size_2():
+    """Tests non-unit batch size GSPO path in ClippedPGLossFn."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
     device = "cuda"
-    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(batch_size=2, device=device)
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(
+        batch_size=2, device=device
+    )
 
     ratio_clip = 0.2
     cfg = {
@@ -1214,14 +1217,16 @@ def test_clipped_pg_loss_gspo_bsz_2():
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": False,
-        "use_sequence_level_importance_ratios": True,
+        "sequence_level_importance_ratios": True,
         "token_level_loss": False,
     }
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0], [1.0, -1.0, 2.0]], device=device)
     # Use non-zero prev_lp to allow ratios > 1 with valid curr_lp <= 0
-    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]], device=device)
+    prev_lp_masked = torch.tensor(
+        [[-1.0, -1.0, -1.0], [-2.0, -2.0, -2.0]], device=device
+    )
     # Target Curr logprobs (masked pos 1, 2, 3) - design for clipping
     # Target ratios: 0.5 (<0.8), 1.0 (in [0.8, 1.2]), 1.5 (>1.2)
     # Curr = log(Ratio) + Prev
@@ -1235,38 +1240,53 @@ def test_clipped_pg_loss_gspo_bsz_2():
 
     # --- Hand Calculation ---
     log_ratios = curr_lp_masked - prev_lp_masked
-    ratios = torch.exp(log_ratios)  # approx [0.5, 1.0, 1.5]
+    seq_log_ratios_mean = torch.mean(log_ratios, dim=-1).unsqueeze(-1)
+    ratios = seq_log_ratios_mean.exp().repeat(1, 3)
     assert torch.allclose(
-        ratios, torch.tensor([[0.5, 1.0, 1.5], [0.5, 1.0, 1.5]], device=device), rtol=1e-3
+        ratios,
+        torch.tensor(
+            [[0.9086, 0.9086, 0.9086], [2.4697, 2.4697, 2.4697]], device=device
+        ),
+        rtol=1e-3,
     )
 
-    ratios_clamped = torch.clamp(
-        ratios, 1.0 - ratio_clip, 1.0 + ratio_clip
-    )  # [0.8, 1.0, 1.2]
+    ratios_clamped = torch.clamp(ratios, 1.0 - ratio_clip, 1.0 + ratio_clip)
     assert torch.allclose(
-        ratios_clamped, torch.tensor([[0.8, 1.0, 1.2], [0.8, 1.0, 1.2]], device=device), rtol=1e-3
+        ratios_clamped,
+        torch.tensor([[0.9086, 0.9086, 0.9086], [1.2, 1.2, 1.2]], device=device),
+        rtol=1e-3,
     )
 
-    loss1 = -adv_masked * ratios  # approx -[1*0.5, -1*1.0, 2*1.5] = [-0.5, 1.0, -3.0]
+    loss1 = -adv_masked * ratios
     assert torch.allclose(
-        loss1, torch.tensor([[-0.5, 1.0, -3.0], [-0.5, 1.0, -3.0]], device=device), rtol=1e-3
+        loss1,
+        torch.tensor(
+            [[-0.9086, 0.9086, -1.8171], [-2.4697, 2.4697, -4.9394]], device=device
+        ),
+        rtol=1e-3,
     )
 
-    loss2 = -adv_masked * ratios_clamped  # -[1*0.8, -1*1.0, 2*1.2] = [-0.8, 1.0, -2.4]
+    loss2 = -adv_masked * ratios_clamped
     assert torch.allclose(
-        loss2, torch.tensor([[-0.8, 1.0, -2.4], [-0.8, 1.0, -2.4]], device=device), rtol=1e-3
+        loss2,
+        torch.tensor(
+            [[-0.9086, 0.9086, -1.8171], [-1.2000, 1.2000, -2.4000]], device=device
+        ),
+        rtol=1e-3,
     )
 
-    max_loss = torch.maximum(loss1, loss2)  # approx [-0.5, 1.0, -2.4]
+    max_loss = torch.maximum(loss1, loss2)
     assert torch.allclose(
-        max_loss, torch.tensor([[-0.5, 1.0, -2.4], [-0.5, 1.0, -2.4]], device=device), rtol=1e-3
+        max_loss,
+        torch.tensor(
+            [[-0.9086, 0.9086, -1.8171], [-1.2000, 2.4697, -2.4000]], device=device
+        ),
+        rtol=1e-3,
     )
 
-    expected_loss = torch.mean(
-        max_loss
-    )  # approx (-0.5 + 1.0 - 2.4) / 3 = -1.9 / 3 = -0.6333
+    expected_loss = torch.mean(max_loss)
     assert torch.allclose(
-        expected_loss, torch.tensor(-0.6333, device=device), rtol=1e-3
+        expected_loss, torch.tensor(-0.4912, device=device), rtol=1e-3
     )
 
     input_ids = data["input_ids"]
@@ -1278,7 +1298,9 @@ def test_clipped_pg_loss_gspo_bsz_2():
         dummy_logits,
         data,
         global_valid_seqs=torch.sum(data["sample_mask"]),
-        global_valid_toks=torch.sum(data["sample_mask"].unsqueeze(1) * data["token_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(1) * data["token_mask"]
+        ),
     )
     torch.testing.assert_close(actual_loss, expected_loss)
 
@@ -1300,7 +1322,7 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
         "disable_ppo_ratio": False,
         "use_on_policy_kl_approximation": False,
         "use_importance_sampling_correction": True,
-        "use_sequence_level_importance_ratios": True,
+        "sequence_level_importance_ratios": True,
         "token_level_loss": False,
     }
     loss_fn = ClippedPGLossFn(cfg)
@@ -1325,53 +1347,53 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
     # --- Hand Calculation ---
     # Actor Loss Calculation
     actor_importance_weights = torch.exp(
-        prev_lp_masked - gen_lp_masked
+        (prev_lp_masked - gen_lp_masked).sum(dim=-1).unsqueeze(-1)
     )  # exp([-1 - (-0.5), -1 - (-1.5), -1 - (-0.8)]) = [0.6065, 1.6487, 0.8187]
     assert torch.allclose(
         actor_importance_weights,
-        torch.tensor([[0.6065, 1.6487, 0.8187]], device=device),
+        torch.tensor([[0.8187]], device=device),
         rtol=1e-3,
     )
 
-    ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # [0.5, 1.0, 1.5]
+    log_ratios = curr_lp_masked - prev_lp_masked
+    seq_log_ratios_mean = torch.mean(log_ratios, dim=-1).unsqueeze(-1)
+    ratios = seq_log_ratios_mean.exp().repeat(1, 3)
     assert torch.allclose(
-        ratios, torch.tensor([[0.5, 1.0, 1.5]], device=device), rtol=1e-3
+        ratios, torch.tensor([[0.9086, 0.9086, 0.9086]], device=device), rtol=1e-3
     )
 
-    ratios_clamped = torch.clamp(
-        ratios, 1.0 - ratio_clip, 1.0 + ratio_clip
-    )  # [0.8, 1.0, 1.2]
+    ratios_clamped = torch.clamp(ratios, 1.0 - ratio_clip, 1.0 + ratio_clip)
     assert torch.allclose(
-        ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
+        ratios_clamped,
+        torch.tensor([[0.9086, 0.9086, 0.9086]], device=device),
+        rtol=1e-3,
     )
 
-    loss1 = -adv_masked * ratios  # [-0.5, 1.0, -3.0]
+    loss1 = -adv_masked * ratios
     assert torch.allclose(
-        loss1, torch.tensor([[-0.5, 1.0, -3.0]], device=device), rtol=1e-3
+        loss1, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    loss2 = -adv_masked * ratios_clamped  # [-0.8, 1.0, -2.4]
+    loss2 = -adv_masked * ratios_clamped
     assert torch.allclose(
-        loss2, torch.tensor([[-0.8, 1.0, -2.4]], device=device), rtol=1e-3
+        loss2, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    max_loss = torch.maximum(loss1, loss2)  # [-0.5, 1.0, -2.4]
+    max_loss = torch.maximum(loss1, loss2)
     assert torch.allclose(
-        max_loss, torch.tensor([[-0.5, 1.0, -2.4]], device=device), rtol=1e-3
+        max_loss, torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device), rtol=1e-3
     )
 
-    importance_weighted_max_loss = (
-        actor_importance_weights * max_loss
-    )  # [0.6065*(-0.5), 1.6487*1.0, 0.8187*(-2.4)] = [-0.30325, 1.6487, -1.96488]
+    importance_weighted_max_loss = actor_importance_weights * max_loss
     assert torch.allclose(
         importance_weighted_max_loss,
-        torch.tensor([[-0.30325, 1.6487, -1.96488]], device=device),
+        torch.tensor([[-0.7439, 0.7439, -1.4877]], device=device),
         rtol=1e-3,
     )
 
-    expected_actor_loss = torch.mean(importance_weighted_max_loss)  # -0.2065
+    expected_actor_loss = torch.mean(importance_weighted_max_loss)
     assert torch.allclose(
-        expected_actor_loss, torch.tensor(-0.2065, device=device), rtol=1e-3
+        expected_actor_loss, torch.tensor(-0.4959, device=device), rtol=1e-3
     )
 
     input_ids = data["input_ids"]

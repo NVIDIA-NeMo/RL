@@ -224,7 +224,7 @@ class ClippedPGLossFn(LossFunction):
                     log_ratios,
                     token_mask,
                     dim=-1,
-                )
+                ).unsqueeze(-1)
                 seq_ratio = seq_log_ratio_mean.exp()
                 ratios = seq_ratio.repeat(1, advantages.shape[1])
             else:
