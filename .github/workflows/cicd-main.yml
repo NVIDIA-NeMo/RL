@@ -170,7 +170,7 @@ jobs:
       image-label: nemo-rl
       target: hermetic
       build-contexts: |
-        nemo-rl=.
+        nemo-rl=${{ github.run_id }}/
       build-args: |
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}

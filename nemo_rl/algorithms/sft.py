@@ -19,7 +19,7 @@ from typing import NotRequired, Optional, TypedDict, cast
 import numpy as np
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss_functions import (
     NLLLoss,
@@ -177,10 +177,17 @@ def setup(
             sft_config["max_num_epochs"] * len(train_dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+    # check if tokenizer is a processor (e.g. for VLMs)
+    processor = None
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        processor = tokenizer
+        tokenizer = processor.tokenizer
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=Path(last_checkpoint_path) / "policy" / "weights"
         if last_checkpoint_path
         else None,
@@ -265,6 +272,9 @@ def validate(
                     "sample_mask": val_batch["loss_multiplier"],
                 }
             )
+
+            # update multimodal data
+            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
 
             ## just run model fwd
             val_results = policy.train(
@@ -413,6 +423,9 @@ def sft_train(
                             "token_mask": cat_and_padded["token_loss_mask"],
                             "sample_mask": batch["loss_multiplier"],
                         }
+                    )
+                    train_data.update(
+                        cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
 
                 print("▶ Taking a training step...")

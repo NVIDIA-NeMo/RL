@@ -29,6 +29,7 @@ class DataConfig(TypedDict):
     add_system_prompt: NotRequired[bool]
     split: NotRequired[str]
     shuffle: NotRequired[bool]
+    download_dir: NotRequired[str]
 
 
 class MathDataConfig(DataConfig):
