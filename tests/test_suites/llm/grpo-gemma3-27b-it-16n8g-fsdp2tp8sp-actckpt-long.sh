@@ -37,4 +37,3 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'mean(data["train/token_mult_prob_error"]) < 1.1' \
         'data["train/token_mult_prob_error"]["20"] < 1.1'
 fi
-

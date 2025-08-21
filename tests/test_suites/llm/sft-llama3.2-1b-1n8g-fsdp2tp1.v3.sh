@@ -39,4 +39,3 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 25' \
         'mean(data["timing/train/total_step_time"], -6, -1) < 0.6'
 fi
-
