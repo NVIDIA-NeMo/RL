@@ -20,7 +20,7 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-long
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-noncolocated-asyncvllm
   metric_name: val_reward
   higher_is_better: true
   keep_top_k: 3
@@ -90,7 +90,7 @@ policy:
       - 128009
     stop_strings: null
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
@@ -98,10 +98,10 @@ policy:
       max_model_len: 4096
       enforce_eager: False
     colocated:
-      enabled: true
+      enabled: false
       resources:
         gpus_per_node: null
-        num_nodes: null
+        num_nodes: 1
 data:
   max_input_seq_length: 4096
   prompt_file: examples/prompts/cot.txt
@@ -112,7 +112,7 @@ env:
   math:
     num_workers: 8
 logger:
-  log_dir: logs/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-long
+  log_dir: logs/grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-noncolocated-asyncvllm
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
@@ -120,11 +120,11 @@ logger:
   monitor_gpus: true
   wandb:
     project: nemo-rl
-    name: grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-long
+    name: grpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-noncolocated-asyncvllm
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 5
