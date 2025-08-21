@@ -389,27 +389,29 @@ def _create_exact_logits(
     # We need to set logits for indices i=0..S-2 of the sliced logits tensor.
     # These correspond to target logprobs at indices 0..S-2 of target_curr_lp_masked.
     num_effective_pos = target_curr_lp_masked.shape[1]
-    for k, i in itertools.product(range(batch_size), range(num_effective_pos)):
+    for batch_idx, i in itertools.product(range(batch_size), range(num_effective_pos)):
         logit_idx = i  # Index in the sliced logits tensor (dummy_logits[:, 0:S-1, :])
         data_idx = i + 1  # Index in the original input_ids to find the target token
 
-        target_token_id = input_ids[k, data_idx].item()
+        target_token_id = input_ids[batch_idx, data_idx].item()
         # Keep target_lp as a 0-dim tensor for torch ops
-        target_lp = target_curr_lp_masked[k, i]
+        target_lp = target_curr_lp_masked[batch_idx, i]
 
         # Handle target_lp = 0 case separately
         if torch.isclose(target_lp, torch.tensor(0.0, device=device)):
-            dummy_logits[k, logit_idx, target_token_id] = 100.0  # Large positive logit
+            dummy_logits[batch_idx, logit_idx, target_token_id] = (
+                100.0  # Large positive logit
+            )
         elif target_lp < 0:
             # Set target token logit to 0
-            dummy_logits[k, logit_idx, target_token_id] = 0.0
+            dummy_logits[batch_idx, logit_idx, target_token_id] = 0.0
             # Set one distractor token logit using the formula
             distractor_token_id = (target_token_id + 1) % vocab_size
             # Ensure distractor isn't same as target if vocab_size=1 (edge case)
             if distractor_token_id == target_token_id:
                 distractor_token_id = (target_token_id + 2) % vocab_size
             distractor_logit = torch.log(torch.exp(-target_lp) - 1.0)
-            dummy_logits[k, logit_idx, distractor_token_id] = distractor_logit
+            dummy_logits[batch_idx, logit_idx, distractor_token_id] = distractor_logit
         else:  # target_lp > 0 is not supported by this method
             raise ValueError(
                 "Target log probability must be negative or zero for this construction"
