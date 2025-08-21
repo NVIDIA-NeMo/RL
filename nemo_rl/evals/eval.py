@@ -324,7 +324,13 @@ async def _run_env_eval_impl(
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
+        # outputs = await _generate_texts(vllm_generation, inputs, use_async)
+        import time
+
+        s = time.time()
         outputs = await _generate_texts(vllm_generation, inputs, use_async)
+        e = time.time()
+        print(f"Generation time: {e - s} seconds")
 
         # append to message_log
         for idx, output in enumerate(outputs):
