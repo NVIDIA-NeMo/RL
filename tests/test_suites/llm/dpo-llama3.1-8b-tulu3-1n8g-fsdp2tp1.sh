@@ -40,4 +40,3 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/preference_loss"]["1"] < 0.6932' \
         'data["train/preference_loss"]["150"] < 0.68'
 fi
-
