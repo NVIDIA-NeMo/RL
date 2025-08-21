@@ -28,6 +28,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.hf_datasets.rl_jsonl import JsonlDataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -148,6 +149,9 @@ def setup_data(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         data: Any = DeepScalerDataset(seed=seed)
+    elif data_config["dataset_name"] == "jsonl":
+        print("Loading jsonl dataset for training and validation")
+        data: Any = JsonlDataset(data_config["train_path"])
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
