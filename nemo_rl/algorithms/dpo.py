@@ -209,6 +209,10 @@ def setup(
         ## NOTE: we double the train_iters because effective batch size is doubled
         ## for (chosen, rejected) pairs
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters * 2
+        if "scheduler" in policy_config["megatron_cfg"]:
+            for k in policy_config["megatron_cfg"]["scheduler"]:
+                if "iters" in k:
+                    policy_config["megatron_cfg"]["scheduler"][k] *= 2
     policy = Policy(
         cluster=cluster,
         config=policy_config,
