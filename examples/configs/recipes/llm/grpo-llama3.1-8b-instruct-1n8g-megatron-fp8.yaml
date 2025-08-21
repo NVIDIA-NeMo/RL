@@ -120,6 +120,7 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: 'fp8'
+      use_deep_gemm: true
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
