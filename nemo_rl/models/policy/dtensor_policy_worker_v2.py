@@ -220,6 +220,9 @@ class DTensorPolicyWorkerV2:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
+            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
+            # so we need to set it to None if sequence packing is disabled
+            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
                 attn_implementation="flash_attention_2"

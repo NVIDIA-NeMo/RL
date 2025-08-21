@@ -15,7 +15,100 @@
 import pytest
 import ray
 
-from tests.unit.models.policy.test_dtensor_worker import create_test_config
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.policy import PolicyConfig
+
+
+def create_test_config(
+    model_name: str,
+    tp: int = 1,
+    cp: int = 1,
+    sequence_parallel: bool = False,
+    cpu_offload: bool = False,
+    activation_checkpointing: bool = False,
+    custom_parallel_plan: str | None = None,
+    dtensor_v2: bool = False,
+) -> PolicyConfig:
+    return {
+        "model_name": model_name,
+        "tokenizer": {"name": model_name},
+        "generation_batch_size": 1,  # Small batch size for testing
+        "train_global_batch_size": 4,
+        "train_micro_batch_size": 1,
+        "learning_rate": 5e-6,
+        "logprob_batch_size": 1,
+        "precision": "float32",
+        "generation": {
+            "backend": "hf",
+            "temperature": 1.0,
+            "max_new_tokens": 16,  # Small number of tokens for testing
+            "top_p": 1.0,
+            "top_k": None,
+            "stop_token_ids": None,
+            "stop_strings": None,
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
+        },
+        "dtensor_cfg": {
+            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "enabled": True,
+            "cpu_offload": cpu_offload,
+            "sequence_parallel": sequence_parallel,
+            "activation_checkpointing": activation_checkpointing,
+            "tensor_parallel_size": tp,
+            "context_parallel_size": cp,
+            "custom_parallel_plan": custom_parallel_plan,
+        },
+        "dynamic_batching": {
+            "enabled": True,
+            "train_mb_tokens": 128,
+            "logprob_mb_tokens": 128,
+            "sequence_length_round": 4,
+        },
+        "sequence_packing": {
+            "enabled": False,
+        },
+        "optimizer": {
+            "name": "torch.optim.AdamW",
+            "kwargs": {
+                "lr": 5e-6,
+                "weight_decay": 0.01,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "foreach": False,
+                "fused": False,
+            },
+        },
+        "scheduler": {
+            "name": "torch.optim.lr_scheduler.CosineAnnealingLR",
+            "kwargs": {
+                "T_max": 100,
+            },
+        },
+        "max_grad_norm": 1.0,
+    }
+
+
+@pytest.fixture(scope="module")
+def two_gpu_virtual_cluster():
+    cluster_name = "test"
+    print(f"Creating virtual cluster '{cluster_name}'...")
+    cluster = RayVirtualCluster(
+        name=cluster_name,
+        bundle_ct_per_node_list=[2],  # Use tp bundles, one per GPU
+        use_gpus=True,
+        num_gpus_per_node=2,  # Using tp GPUs
+        max_colocated_worker_groups=1,  # Only one worker group
+    )
+    yield cluster
+    print("Shutting down virtual cluster...")
+    cluster.shutdown()
+
 
 # Define a custom marker for model configuration tests
 pytestmark = pytest.mark.modelconfig
@@ -79,7 +172,7 @@ def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
 )
 def test_dtensor_worker_v1_v2_model_config_equivalence(
     request,
-    two_gpu_virtual_cluster,
+    two_gpu_virtual_cluster,  # noqa: F811
     model_fixture_name,
     tp,
     cp,
@@ -148,7 +241,6 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     config_v2_dict.pop("pad_token_id", None)
 
     discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
-    breakpoint()
     assert not discrepancies, (
         f"Model configurations differ between v1 and v2 approaches for {model_name}"
     )
