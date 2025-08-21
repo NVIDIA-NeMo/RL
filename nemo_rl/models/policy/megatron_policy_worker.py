@@ -167,6 +167,7 @@ def broadcast_object_across_pp_ranks(obj):
     for rank, flag in enumerate(obj_flags):
         if flag:
             src_rank = rank
+            break
 
     if src_rank is None:
         raise ValueError("Object must exist on at least one PP rank")
