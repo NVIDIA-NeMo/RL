@@ -23,7 +23,7 @@ def create_test_config(
     model_name: str,
     tp: int = 1,
     cp: int = 1,
-    sequence_parallel: bool = False,
+    sp: bool = False,
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
@@ -58,7 +58,7 @@ def create_test_config(
             **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
             "cpu_offload": cpu_offload,
-            "sequence_parallel": sequence_parallel,
+            "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
@@ -157,7 +157,7 @@ def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
 
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
-    "model_fixture_name,tp,cp,sequence_parallel,cpu_offload,activation_checkpointing",
+    "model_fixture_name,tp,cp,sp,cpu_offload,activation_checkpointing",
     [
         # TP=2, CP=1
         ("tiny_qwen2_model_path", 2, 1, False, False, False),
@@ -176,7 +176,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
     model_fixture_name,
     tp,
     cp,
-    sequence_parallel,
+    sp,
     cpu_offload,
     activation_checkpointing,
 ):
@@ -188,7 +188,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
         model_name=model_name,
         tp=tp,
         cp=cp,
-        sequence_parallel=sequence_parallel,
+        sp=sp,
         cpu_offload=cpu_offload,
         activation_checkpointing=activation_checkpointing,
         dtensor_v2=False,  # Use v1 worker
@@ -214,7 +214,7 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
         model_name=model_name,
         tp=tp,
         cp=cp,
-        sequence_parallel=sequence_parallel,
+        sp=sp,
         cpu_offload=cpu_offload,
         activation_checkpointing=activation_checkpointing,
         dtensor_v2=True,  # Use v2 worker

@@ -37,7 +37,7 @@ def create_test_config(
     model_name: str,
     tp: int = 1,
     cp: int = 1,
-    sequence_parallel: bool = False,
+    sp: bool = False,
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
@@ -72,7 +72,7 @@ def create_test_config(
             **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
             "cpu_offload": cpu_offload,
-            "sequence_parallel": sequence_parallel,
+            "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
@@ -255,7 +255,7 @@ def training_setup(request, two_gpu_virtual_cluster):
         model_fixture_name,
         tp,
         cp,
-        sequence_parallel,
+        sp,
         cpu_offload,
         activation_checkpointing,
     ) = request.param
@@ -271,14 +271,14 @@ def training_setup(request, two_gpu_virtual_cluster):
             model_name,
             tp,
             cp,
-            sequence_parallel,
+            sp,
             cpu_offload,
             activation_checkpointing,
             dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
         )
         policy = Policy(
             cluster=two_gpu_virtual_cluster,
@@ -438,7 +438,7 @@ def logprob_setup(request, two_gpu_virtual_cluster):
         model_fixture_name,
         tp,
         cp,
-        sequence_parallel,
+        sp,
         cpu_offload,
         activation_checkpointing,
     ) = request.param
@@ -453,14 +453,14 @@ def logprob_setup(request, two_gpu_virtual_cluster):
             model_name,
             tp,
             cp,
-            sequence_parallel,
+            sp,
             cpu_offload,
             activation_checkpointing,
             dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
         )
         policy = Policy(
             cluster=two_gpu_virtual_cluster,
@@ -586,7 +586,7 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
         model_name=tiny_llama_tied_model_path,
         tp=2,
         cp=1,
-        sequence_parallel=False,
+        sp=False,
         cpu_offload=False,
         activation_checkpointing=False,
         custom_parallel_plan=custom_parallel_plan,
