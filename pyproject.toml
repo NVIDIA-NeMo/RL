@@ -24,10 +24,11 @@ dependencies = [
     "torch==2.7.1",
     "triton",
     "colored==2.2.3",
-    "ray[default]==2.46.0",
+    "ray[default]==2.48.0",
     # transformers==4.54.0/4.54.1 both fail on rm models
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
-    "transformers>=4.51.0,<4.54.0",
+    #"transformers>=4.51.0<4.54.0",
+    "transformers>=4.51.0", # remove upper bound which may be an issue for VLM, but doesn't matter for gpt-oss
     "wandb",
     "numpy",
     "datasets>=4.0.0",
@@ -59,7 +60,7 @@ automodel = [
     "causal-conv1d",
 ]
 vllm = [
-    "vllm==0.10.0",
+    "vllm==0.10.1.1",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -81,7 +82,7 @@ mcore = [
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "vllm==0.10.0",
+    "vllm==0.10.1.1",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
