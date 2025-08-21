@@ -4,9 +4,15 @@ This guide outlines how to test NeMo RL using unit and functional tests, detaili
 
 ## Unit Tests
 
-:::{important}
-Unit tests require 2 GPUs to test the full suite.
-:::
+> [!IMPORTANT]
+> Unit tests require 2 GPUs to test the full suite.
+
+> [!TIP]
+> Some unit tests require setting up test assets which you can download with 
+> ```sh
+> uv run tests/unit/prepare_unit_test_assets.py
+> ```
+
 
 ```sh
 # Run the unit tests using local GPUs

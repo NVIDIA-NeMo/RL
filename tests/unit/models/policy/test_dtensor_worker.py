@@ -328,6 +328,13 @@ def training_setup(request, two_gpu_virtual_cluster):
         ("tiny_gemma3_model_path", 1, 1, False, True, True),
         ("tiny_gemma3_model_path", 1, 1, True, True, True),
         # CP doesn't support gemma3 due to spda input has attent_mask != None.
+        # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+        # nemotron5_h doesn't support cp
     ],
     indirect=True,
 )
