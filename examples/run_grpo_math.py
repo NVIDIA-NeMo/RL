@@ -22,6 +22,7 @@ from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.dapo import dapo_train
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -252,20 +253,36 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    )
+    if config["grpo"].get("use_dapo", False):
+        dapo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        )
+    else:       
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":
