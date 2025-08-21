@@ -208,7 +208,6 @@ def setup(
         init_reference_model=False,
     )
     loss_fn = PreferenceLoss()
-
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

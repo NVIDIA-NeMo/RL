@@ -227,7 +227,6 @@ def setup(
         init_reference_model=True,
     )
     loss_fn = DPOLossFn(master_config["dpo"])
-
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

@@ -191,7 +191,6 @@ def setup(
         init_reference_model=False,
     )
     loss_fn = NLLLoss()
-
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
