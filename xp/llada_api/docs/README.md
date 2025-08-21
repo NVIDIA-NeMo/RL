@@ -11,7 +11,7 @@ LLaDA (Large Language Diffusion Models) is a state-of-the-art approach that appl
 - **Parallel generation**: Can generate multiple tokens simultaneously within blocks
 - **Quality control**: More diffusion steps generally lead to higher quality output
 - **Flexible parameters**: Control creativity, guidance, and generation strategy
-- **Fast-dLLM acceleration**: Up to 11x speedup with KV caching and parallel decoding
+- **Fast-dLLM acceleration**: Enhanced performance with KV caching and parallel decoding
 
 ## Quick Start
 

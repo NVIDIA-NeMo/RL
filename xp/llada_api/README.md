@@ -24,7 +24,7 @@ xp/llada_api/
 Use the convenient wrapper scripts from the NeMo-RL project root:
 
 ```bash
-# Batch server (3-5x faster for evaluations, recommended)
+# Batch server (recommended for evaluations)
 ./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
 
 # Streaming server (for real-time responses)
@@ -51,7 +51,7 @@ cd xp/llada_api
 # Local execution with DCP checkpoint
 scripts/start_llada_batch_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
-# Local execution with HuggingFace model (batch mode - 3-5x faster)
+# Local execution with HuggingFace model (batch mode)
 scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
 
 # Local execution with streaming
@@ -68,7 +68,7 @@ scripts/connect_to_llada_server.sh --job-id 12345
 ## Features
 
 - **OpenAI API Compatibility**: Drop-in replacement for OpenAI API endpoints
-- **Fast-dLLM Acceleration**: Up to 11x speedup with KV caching and parallel decoding
+- **Fast-dLLM Acceleration**: Enhanced performance with KV caching and parallel decoding
 - **DCP Checkpoint Support**: Automatic conversion from DCP to HuggingFace format
 - **SLURM Integration**: Run as containerized SLURM jobs with GPU resources
 - **Local Execution**: Run directly on your local machine

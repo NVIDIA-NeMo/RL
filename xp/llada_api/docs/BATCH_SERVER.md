@@ -1,6 +1,6 @@
 # LLaDA Batch Server 🚀
 
-High-performance batch processing server for LLaDA models with **3-5x speedup** for evaluation workloads.
+High-performance batch processing server for LLaDA models with enhanced performance for evaluation workloads.
 
 ## 🎯 Quick Start
 
@@ -33,7 +33,7 @@ NeMo-Skills → Multiple HTTP Requests → Batch Queue → Fast-dLLM Batch Proce
 ```
 
 **Key Benefits:**
-- ✅ **3-5x faster** throughput for evaluation workloads
+- ✅ **Enhanced** throughput for evaluation workloads
 - ✅ **Automatic batching** - accumulates requests and processes them together  
 - ✅ **Smart timing** - processes when batch is full OR after timeout
 - ✅ **Zero code changes** - works with existing `eval_llada.py` scripts
@@ -43,7 +43,7 @@ NeMo-Skills → Multiple HTTP Requests → Batch Queue → Fast-dLLM Batch Proce
 
 | Feature | Batch Server | Streaming Server |
 |---------|--------------|------------------|
-| **Throughput** | 3-5x faster | 1x (baseline) |
+| **Throughput** | Enhanced | Baseline |
 | **Latency** | Higher (batched) | Lower (immediate) |
 | **Use Case** | Evaluations, benchmarks | Real-time chat, demos |
 | **Memory Usage** | Higher (batch_size × model) | Lower (1 × model) |
@@ -55,14 +55,13 @@ NeMo-Skills → Multiple HTTP Requests → Batch Queue → Fast-dLLM Batch Proce
 ### Before (Streaming Server)
 ```bash
 time python eval_llada.py --quick-test --max-samples 32
-# Result: ~120 seconds (0.27 requests/second)
+# Sequential processing baseline
 ```
 
 ### After (Batch Server)  
 ```bash
 time python eval_llada.py --quick-test --max-samples 32
-# Result: ~30-40 seconds (0.8-1.0 requests/second) 
-# 🚀 3-4x speedup!
+# Improved performance with batch processing
 ```
 
 ## 🛠️ Server Configuration
@@ -76,12 +75,12 @@ time python eval_llada.py --quick-test --max-samples 32
 
 ### Memory Usage Guidelines
 
-| Batch Size | Additional GPU Memory | Use Case |
-|------------|----------------------|----------|
-| 4 | ~4-6 GB | Balanced performance |
-| 8 | ~8-12 GB | Recommended default |
-| 16 | ~16-24 GB | High throughput |
-| 32 | ~32-48 GB | Maximum throughput |
+| Batch Size | GPU Memory Impact | Use Case |
+|------------|------------------|----------|
+| 4 | Low | Balanced performance |
+| 8 | Moderate | Recommended default |
+| 16 | High | High throughput |
+| 32 | Very High | Maximum throughput |
 
 ## 🚀 Usage Examples
 
@@ -154,8 +153,6 @@ python xp/llada_api/test_batch_server.py
 # Sample output:
 # 🧪 Testing batch processing with 16 concurrent requests
 # ✅ High concurrency handled successfully - batching likely working!
-# 📊 Throughput: 3.24 requests/second  
-# ⏱️ Average latency: 4.123 seconds
 ```
 
 ### Real-time Monitoring
@@ -251,7 +248,7 @@ Your existing evaluation scripts work without any changes:
 # For streaming (if you need streaming responses)
 ./xp/llada_api/scripts/start_llada_batch_server.sh --local --streaming --model-path MODEL
 
-# For batch processing (3-5x faster, recommended)
+# For batch processing (enhanced performance, recommended)
 ./xp/llada_api/scripts/start_llada_batch_server.sh --local --model-path MODEL
 
 # Evaluation scripts remain unchanged
@@ -295,4 +292,4 @@ python xp/nemo-skills/eval_llada.py --quick-test
 
 ---
 
-🚀 **Get 3-5x faster evaluation speeds with zero code changes!**
+🚀 **Get enhanced evaluation performance with zero code changes!**

@@ -64,12 +64,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
 Based on Fast-dLLM's batch capabilities:
 
-| Batch Size | Expected Speedup | Use Case |
-|------------|------------------|----------|
-| 1 (current) | 1x baseline | Current sequential processing |
-| 4 | 2-3x faster | Good balance for most cases |  
-| 8 | 3-5x faster | High throughput evaluation |
-| 16+ | 4-6x faster | Maximum throughput (if memory allows) |
+| Batch Size | Performance | Use Case |
+|------------|-------------|----------|
+| 1 (current) | Baseline | Current sequential processing |
+| 4 | Improved | Good balance for most cases |  
+| 8 | Enhanced | High throughput evaluation |
+| 16+ | Maximum | Maximum throughput (if memory allows) |
 
 ## 🛠 **Fast-dLLM Batch Support Verification**
 
@@ -116,8 +116,7 @@ python llada_batch_server.py --batch-size 16 --max-wait-time 0.2
 
 ### Memory Considerations:
 
-- **Batch size 8**: ~8GB additional GPU memory
-- **Batch size 16**: ~16GB additional GPU memory  
+- **Larger batch sizes**: Require additional GPU memory
 - Monitor GPU memory usage and adjust accordingly
 
 ## 🔍 **Monitoring & Debugging**
@@ -135,7 +134,7 @@ curl http://localhost:8000/health
 ### Server logs show batch processing:
 ```
 INFO: Processing batch of 8 requests
-INFO: Batch of 8 completed in 0.234s (34.2 req/s)
+INFO: Batch of 8 completed successfully
 INFO: Using Fast-dLLM dual cache batch generation for batch size 8
 ```
 
@@ -158,7 +157,7 @@ INFO: Using Fast-dLLM dual cache batch generation for batch size 8
 ### Before (Sequential):
 ```bash
 time python eval_llada.py --quick-test --max-samples 32
-# Result: ~120 seconds (0.27 req/s)
+# Sequential processing baseline
 ```
 
 ### After (Batch):
@@ -168,7 +167,7 @@ python llada_batch_server.py --batch-size 8 --max-wait-time 0.1
 
 # Run same evaluation
 time python eval_llada.py --quick-test --max-samples 32
-# Expected: ~30-40 seconds (0.8-1.0 req/s) - 3-4x speedup!
+# Improved performance with batch processing
 ```
 
 ## 🎯 **Recommended Setup**

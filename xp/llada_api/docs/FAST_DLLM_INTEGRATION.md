@@ -12,9 +12,9 @@ Fast-dLLM provides three key optimizations:
 ## Performance Benefits
 
 According to the Fast-dLLM paper, you can expect:
-- **2x to 3.6x speedup** with KV Cache mechanism alone
-- **4x to 6x speedup** when combined with parallel decoding strategies
-- **Up to 11x speedup** on longer sequences (512 tokens) with dual cache + parallel decoding
+- **Significant speedup** with KV Cache mechanism alone
+- **Enhanced performance** when combined with parallel decoding strategies
+- **Maximum acceleration** on longer sequences with dual cache + parallel decoding
 
 ## New API Parameters
 
