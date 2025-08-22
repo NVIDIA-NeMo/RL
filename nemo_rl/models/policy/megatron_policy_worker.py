@@ -442,7 +442,6 @@ class MegatronPolicyWorker:
             node_rank = int(os.getenv("NODE_RANK", "0"))
             sync_queue = node_pre_init_queues[node_rank]
             is_leader = get_local_rank_preinit() == 0
-            print(f"self.rank={self.rank} NODE_RANK={node_rank} is leader: {is_leader}")
         else:
             sync_queue = pre_init_communication_queue
             is_leader = self.rank == 0
