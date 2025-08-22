@@ -1,0 +1,17 @@
+# BFCL evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "/raid/slikhite/results/grpo/hf"
+  vllm_cfg:
+    max_model_len: 8192    
+
+data:
+  prompt_file: "examples/prompts/bfcl_multiturn.txt"
+  dataset_name: "bfcl_multiturn"
+  dataset_path: "/workspace/datasets/bfcl_multiturn_filtered.jsonl"
+
+env:
+  bfcl_multiturn:
+    enable: true
+    max_turns: 4

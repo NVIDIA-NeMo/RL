@@ -46,6 +46,7 @@ data:
 
 env:
   math:
+    enable: false
     num_workers: 8
 
 cluster:

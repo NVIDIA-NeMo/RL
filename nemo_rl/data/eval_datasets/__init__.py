@@ -19,7 +19,7 @@ from nemo_rl.data.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.eval_datasets.math import MathDataset
 from nemo_rl.data.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.eval_datasets.mmlu_pro import MMLUProDataset
-
+from nemo_rl.data.eval_datasets.bfclv3 import BFCLDataset
 
 def load_eval_dataset(data_config):
     """Loads evaluation dataset."""
@@ -87,6 +87,10 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    elif dataset_name == "bfcl_multiturn":
+        base_dataset = BFCLDataset(
+            data_path=data_config["dataset_path"],
+        )
     else:
         raise ValueError(f"Unknown dataset {dataset_name}.")
     return base_dataset
@@ -100,4 +104,5 @@ __all__ = [
     "MathDataset",
     "MMLUDataset",
     "MMLUProDataset",
+    "BFCLDataset",
 ]

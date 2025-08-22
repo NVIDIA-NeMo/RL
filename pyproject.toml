@@ -50,6 +50,7 @@ dependencies = [
     "torchvision>=0.22.0",
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
+    "jsonlines>=4.0.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,82 @@
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_rollout_turns: 4 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+
+  num_epochs: 1
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 5
+  val_at_start: false
+  max_val_samples: 128
+  val_batch_size: 128
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 5
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: 2
+  max_total_sequence_length: 16384
+  precision: "bfloat16"
+  fsdp_offload_enabled: false
+  activation_checkpointing_enabled: false
+  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
+  
+  dtensor_cfg:
+    enabled: True
+    tensor_parallel_size: 8
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+data:
+  train:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: '/workspace/datasets/bfcl_multiturn_train.jsonl'
+
+    # checks if it's too long on init
+    filter_long_samples: false
+    drop_last: True
+
+  val:
+    shuffle: False
+    seed: 420 # unused if shuffle is False
+    jsonl_path: '/workspace/datasets/bfcl_multiturn_val.jsonl'
+    drop_last: False
+
+    # checks if it's too long on init
+    filter_long_samples: false
+
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+
+env:
+  bfcl_multiturn:
+    enable: true
+    num_workers: 8
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

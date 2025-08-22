@@ -30,6 +30,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.multi_turn_tool_environment import MultiTurnToolEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
@@ -58,8 +59,29 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
-    rekeyed_ds = base_dataset.rekeyed_ds
+    if hasattr(base_dataset, "rekeyed_ds"):
+        rekeyed_ds = base_dataset.rekeyed_ds
+    else:
+        rekeyed_ds = base_dataset.data
+    #print(rekeyed_ds)
 
+    if env_configs["math"]["enable"]:
+        env = MathEnvironment.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.math_environment.MathEnvironment"
+                )
+            }
+        ).remote(env_configs["math"])
+    elif env_configs["bfcl_multiturn"]["enable"]:
+        env = MultiTurnToolEnvironment.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.multi_turn_tool_environment.MultiTurnToolEnvironment"
+                )
+            }
+        ).remote(env_configs["bfcl_multiturn"])
+        
     env = MathEnvironment.options(
         runtime_env={
             "py_executable": get_actor_python_env(
