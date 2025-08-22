@@ -18,8 +18,10 @@ from megatron.bridge import AutoBridge
 
 
 def import_model_from_hf_name(hf_model_name: str, output_path: str):
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name)
-    megatron_model = bridge.to_megatron_model(wrap_with_ddp=False)
+    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
+    megatron_model = bridge.to_megatron_model(
+        wrap_with_ddp=False, use_cpu_initialization=True
+    )
     bridge.save_megatron_model(megatron_model, output_path)
 
     # resetting mcore state
@@ -40,7 +42,7 @@ def export_model_from_megatron(
             f"HF checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
         )
 
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name)
+    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
     megatron_model = bridge.load_megatron_model(input_path)
     bridge.save_hf_pretrained(megatron_model, output_path)
 

@@ -783,7 +783,9 @@ class MegatronPolicyWorker:
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-        self.megatron_bridge = AutoBridge.from_hf_pretrained(hf_model_name)
+        self.megatron_bridge = AutoBridge.from_hf_pretrained(
+            hf_model_name, trust_remote_code=True
+        )
 
         self.should_disable_forward_pre_hook = (
             self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
