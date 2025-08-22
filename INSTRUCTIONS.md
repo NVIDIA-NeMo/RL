@@ -5,8 +5,8 @@ Starting from your container, run these to prepare your environment. On my dev m
 uv cache clean
 rm -rf .venv venvs
 
-# cache the venvs, notably exclude mcore
-time uv run nemo_rl/utils/prefetch_venvs.py 'Vllm|DTensor'
+# cache the venvs
+time uv run nemo_rl/utils/prefetch_venvs.py 'Vllm|DTensor|Megatron'
 
 ...
 #[SKIPPED] nemo_rl.environments.code_environment.CodeEnvironment
@@ -28,7 +28,12 @@ Run a simple example that just shows how a weight update is done with 1 GPU (sho
 uv run single_update.py
 ```
 
-Run a full e2e GRPO example:
+Run a full e2e GRPO example (dtensor):
 ```
 uv run examples/run_grpo_math.py
+```
+
+Run a full e2e GRPO example (dtensor):
+```
+uv run examples/run_grpo_math.py --config=examples/configs/grpo_math_1B_megatron.yaml
 ```
