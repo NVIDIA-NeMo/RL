@@ -53,6 +53,8 @@ What you can expect:
 
 ✅ _Available now_ | 🔜 _Coming in v0.4_
 
+- 🔜 **Async RL** - Support Async rollouts and replay buffer for off-policy training as well as making the whole GPRO loop async.
+- 🔜 **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path.
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron-core training performance and generation performance.
 - 🔜 **End-to-end FP8 Low Precision training** - Support for Megatron-core FP8 training and FP8 VLLM generation.
@@ -60,6 +62,7 @@ What you can expect:
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path for day-0 support of new Huggingface models.
 - 🔜 **New Models** - gpt-oss.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
+- 🔜 **Expand Algorithms** - DAPO, GSPO.
 - 🔜 **GB200** - Add container support for GB200.
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
