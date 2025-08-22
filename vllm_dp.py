@@ -49,6 +49,9 @@ def parse_args():
     parser.add_argument("--dp-size", type=int, default=2, help="Data parallel size")
     parser.add_argument("--tp-size", type=int, default=2, help="Tensor parallel size")
     parser.add_argument(
+        "--enable-expert-parallel", action="store_true", help="Enable expert parallel."
+    )
+    parser.add_argument(
         "--node-size", type=int, default=1, help="Total number of nodes"
     )
     parser.add_argument(
@@ -73,6 +76,7 @@ def parse_args():
     parser.add_argument(
         "--max-model-len",
         type=int,
+        default=1024,
         help=("Maximum number of tokens to be processed in a single iteration."),
     )
     parser.add_argument(
@@ -97,6 +101,7 @@ def parse_args():
 def main(
     model,
     dp_size,
+    enable_expert_parallel,
     local_dp_rank,
     global_dp_rank,
     dp_master_ip,
@@ -147,34 +152,38 @@ def main(
     # since we are doing data parallel, every rank can have different
     # sampling params. here we set different max_tokens for different
     # ranks for demonstration.
-    sampling_params = SamplingParams(
-        temperature=0.8, top_p=0.95, max_tokens=[16, 20][global_dp_rank % 2]
-    )
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=max_model_len-20)
 
     # Create an LLM.
     llm = LLM(
         model=model,
         tensor_parallel_size=GPUs_per_dp_rank,
         enforce_eager=enforce_eager,
-        enable_expert_parallel=True,
+        enable_expert_parallel=enable_expert_parallel,
         trust_remote_code=trust_remote_code,
-        max_num_seqs=max_num_seqs,
+        # max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         quantization=quantization,
     )
+    print(f"Starting inference for DP rank {global_dp_rank}")
+    import time
+    start_time = time.time()
     outputs = llm.generate(prompts, sampling_params)
-    # Print the outputs.
-    for i, output in enumerate(outputs):
-        if i >= 5:
-            # print only 5 outputs
-            break
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(
-            f"DP rank {global_dp_rank}, Prompt: {prompt!r}, "
-            f"Generated text: {generated_text!r}"
-        )
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
+
+    # # Print the outputs.
+    # for i, output in enumerate(outputs):
+    #     if i >= 5:
+    #         # print only 5 outputs
+    #         break
+    #     prompt = output.prompt
+    #     generated_text = output.outputs[0].text
+    #     print(
+    #         f"DP rank {global_dp_rank}, Prompt: {prompt!r}, "
+    #         f"Generated text: {generated_text!r}"
+    #     )
 
     # Give engines time to pause their processing loops before exiting.
     sleep(1)
@@ -185,6 +194,7 @@ if __name__ == "__main__":
 
     dp_size = args.dp_size
     tp_size = args.tp_size
+    enable_expert_parallel = args.enable_expert_parallel
     node_size = args.node_size
     node_rank = args.node_rank
 
@@ -209,6 +219,7 @@ if __name__ == "__main__":
             args=(
                 args.model,
                 dp_size,
+                enable_expert_parallel,
                 local_dp_rank,
                 global_dp_rank,
                 dp_master_ip,
