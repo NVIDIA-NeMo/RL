@@ -77,6 +77,9 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.models.generation.interfaces import (
+    GenerationOutputSpec,
+)
 
 
 @contextmanager
@@ -786,7 +789,8 @@ class DTensorPolicyWorker:
                             )
                         else:
                             loss_fn_ = loss_fn
-
+                        print("logits shape: ", logits.shape)
+                        print("logits: ", logits)
                         loss, loss_metrics = loss_fn_(
                             logits,
                             mb,
@@ -1034,7 +1038,7 @@ class DTensorPolicyWorker:
 
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
-
+                   
                     if self.cp_size > 1:
                         seq_index_tensor = (
                             DTensor.from_local(
@@ -1174,6 +1178,166 @@ class DTensorPolicyWorker:
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
 
         return return_data
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/generate")
+    def generate(
+        self, data: BatchedDataDict, greedy: bool = False, micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+
+        generate_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["batch_size"]
+        )
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+        self.model.eval()
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(generate_batch_size)
+                iterator_len = data.size // generate_batch_size
+                
+            step = 0
+            all_next_tokens_logits = []
+            for batch_idx, generate_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                step += 1
+                input_ids = generate_batch.get("input_ids").cuda()
+                input_lengths = generate_batch.get("input_lengths")
+
+                batch_size, seq_len = input_ids.shape
+                if self.enable_seq_packing:
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Create attention mask for right-padded data
+                    attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        # For right-padded sequence, set 1s at the beginning of the sequence
+                        attention_mask[i, :length] = 1
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+                    flash_attn_kwargs = {}
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                        )
+
+                    logits = outputs.logits
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+
+                if isinstance(logits, DTensor):
+                    logits = logits.to(torch.float32)
+                else:
+                    logits = outputs.logits.to(torch.float32)
+                
+
+                # seq_indices = (input_lengths - 1).to(torch.int64)
+                # gather_index = seq_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, logits.shape[2])
+                logits = to_local_if_dtensor(logits)
+                # gather_index = to_local_if_dtensor(gather_index)
+                # next_token_logits = logits.gather(dim=1, index=gather_index).squeeze(1)
+                batch_size = logits.shape[0]
+                seq_indices = input_lengths - 1
+                next_token_logits = logits[torch.arange(batch_size), seq_indices, :]
+                all_next_tokens_logits.append(next_token_logits)
+        del logits, outputs, seq_indices
+
+        all_next_tokens_logits = torch.cat(all_next_tokens_logits, dim=0)
+        log_probs = torch.nn.functional.log_softmax(all_next_tokens_logits, dim=-1)
+        
+        if greedy:
+            _, next_tokens = torch.topk(all_next_tokens_logits, 1, dim=-1)
+        else:
+            next_tokens = torch.multinomial(all_next_tokens_logits, 1)
+        
+        next_tokens = next_tokens.squeeze(-1)
+        print("🔍 next_tokens: ", next_tokens)
+        print("🔍 next_tokens type: ", next_tokens.dtype)
+        print("🔍 next_tokens shape: ", next_tokens.shape)
+        print("🔍 log_probs: ", log_probs)
+        print("🔍 log_probs type: ", log_probs.dtype)
+        print("🔍 log_probs shape: ", log_probs.shape)
+        generation_lengths = torch.ones(batch_size, dtype=torch.long, device=next_tokens.device)
+        unpadded_sequence_lengths = input_lengths + generation_lengths
+        return_data = BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": next_tokens,
+                "generation_lengths": generation_lengths,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths,
+                "logprobs": log_probs,
+            }
+        )
+        return return_data
+
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
