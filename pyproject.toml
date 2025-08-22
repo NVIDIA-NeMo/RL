@@ -75,7 +75,8 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.3.0",
+    "transformer-engine==2.3.0",  # take off [pytorch] extra since i'm hacking it and using a pre-built bdist wheel for the pytorch extension
+    "transformer-engine-torch==2.3.0",
     "megatron-core",
     "nemo-tron",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -142,7 +143,9 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
-flash-attn = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
+#flash-attn = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
+flash-attn = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+transformer-engine-torch = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/transformer_engine_torch-2.3.0-cp312-cp312-linux_x86_64.whl" }
 
 [tool.uv.workspace]
 members = [
@@ -156,6 +159,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
+verify-hashes = false # set this to false so we can lock; better to provide hashes, but this is just a stop gap
 no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd

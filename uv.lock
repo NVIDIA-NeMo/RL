@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -19,10 +19,6 @@ members = [
     "nemo-rl",
     "nemo-tron",
 ]
-
-[[manifest.dependency-metadata]]
-name = "flash-attn"
-requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[package]]
 name = "absl-py"
@@ -1062,24 +1058,18 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.7.4.post1"
-source = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
-    { name = "ninja" },
-    { name = "psutil" },
-    { name = "setuptools" },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl", hash = "sha256:9b7ad6180c48403b792b2d8cb73ce3848bdaac9e4a2b6079e1c1df9435070073" },
+    { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl", hash = "sha256:248113448ade44e727935b8fa947b2db11de3a323004335dfd69f2474c594703" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "einops" },
-    { name = "ninja" },
-    { name = "psutil" },
-    { name = "setuptools" },
     { name = "torch" },
 ]
 
@@ -2559,7 +2549,8 @@ mcore = [
     { name = "flash-attn" },
     { name = "megatron-core" },
     { name = "nemo-tron" },
-    { name = "transformer-engine", extra = ["pytorch"] },
+    { name = "transformer-engine" },
+    { name = "transformer-engine-torch" },
     { name = "vllm" },
 ]
 vllm = [
@@ -2606,9 +2597,9 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "extra == 'automodel'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "extra == 'mcore'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "extra == 'vllm'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'automodel'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'mcore'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'vllm'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -2628,7 +2619,8 @@ requires-dist = [
     { name = "tiktoken" },
     { name = "torch", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchdata" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.3.0" },
+    { name = "transformer-engine", marker = "extra == 'mcore'", specifier = "==2.3.0" },
+    { name = "transformer-engine-torch", marker = "extra == 'mcore'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/transformer_engine_torch-2.3.0-cp312-cp312-linux_x86_64.whl" },
     { name = "transformers", specifier = ">=4.51.0,<4.54.0" },
     { name = "triton", index = "https://download.pytorch.org/whl/cu128" },
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.10.0" },
@@ -5180,11 +5172,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5a/5a/60b25ecc3396fc73b07bf9eb2fbf6a3e186efe1e3e86070017ba9d34a4a0/transformer_engine-2.3.0-py3-none-any.whl", hash = "sha256:2a02c2ac29b9781d09975d4cc373df66ed5f0326ff079a2908c3c26d35ac9ee9", size = 486192, upload-time = "2025-05-19T22:08:25.342Z" },
 ]
 
-[package.optional-dependencies]
-pytorch = [
-    { name = "transformer-engine-torch" },
-]
-
 [[package]]
 name = "transformer-engine-cu12"
 version = "2.3.0"
@@ -5202,11 +5189,16 @@ wheels = [
 [[package]]
 name = "transformer-engine-torch"
 version = "2.3.0"
-source = { registry = "https://pypi.org/simple" }
+source = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/transformer_engine_torch-2.3.0-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/8f/d8b39a34cebb91528f118591e622d9ba1d9e52e4ea40cca1252ec335d07c/transformer_engine_torch-2.3.0.tar.gz", hash = "sha256:2b0adb75d7a5bf590cc5452276db6badb0963de99e6c50c7fde6a3a8a7c504e9", size = 165832, upload-time = "2025-05-15T23:10:38.909Z" }
+wheels = [
+    { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/transformer_engine_torch-2.3.0-cp312-cp312-linux_x86_64.whl", hash = "sha256:6a388855b1c4e9584718df5c7e7c4753efd108b501c982cdd321460505c49399" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "torch" }]
 
 [[package]]
 name = "transformers"
