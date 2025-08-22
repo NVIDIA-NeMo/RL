@@ -433,7 +433,10 @@ class MegatronPolicyWorker:
         self.rank = get_rank_safe()
         # Option to import megatron model on local rank 0 on all nodes.
         # This is needed when the megatron checkpoint dir isn't shared across nodes.
-        convert_on_all_local_rank0 = os.environ.get("NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0", "false").lower() == "true"
+        convert_on_all_local_rank0 = (
+            os.environ.get("NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0", "false").lower()
+            == "true"
+        )
 
         if convert_on_all_local_rank0:
             node_rank = int(os.getenv("NODE_RANK", "0"))
