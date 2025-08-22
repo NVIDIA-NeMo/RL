@@ -138,6 +138,9 @@ def setup_data(
         system_prompt_file=data_config["system_prompt_file"],
     )
 
+    datasets: dict[str, AllTaskProcessedDataset] = {}
+    val_datasets: dict[str, Optional[AllTaskProcessedDataset]] = {}
+
     # Load OpenMathInstruct2Dataset using nemo rl datasets
     if data_config["dataset_name"] == "OpenMathInstruct-2":
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
