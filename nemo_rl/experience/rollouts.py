@@ -253,11 +253,13 @@ def calculate_rewards(
         env_info = [batch["extra_env_info"][i] for i in indices]
 
         # Submit task to environment and store future
-        future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
+        # future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
+        future = task_to_env[task_name].step(messages, env_info)
         futures.append(future)
         future_to_indices[future] = indices
 
-    results = ray.get(futures)
+    # results = ray.get(futures)
+    results = futures
     all_rewards = []
     all_env_observations = []
     all_terminateds = []
