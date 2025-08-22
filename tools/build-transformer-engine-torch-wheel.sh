@@ -57,7 +57,7 @@ uv pip install torch==2.7.1 --torch-backend=cu128
 # Build the wheel
 echo "Building transformer-engine-torch wheel..."
 cd transformer_engine/pytorch
-MAX_JOBS=$(($(nproc)/2)) \
+NVTE_RELEASE_BUILD=1 MAX_JOBS=$(($(nproc)/2)) \
 	uv run python setup.py bdist_wheel --dist-dir=dist
 
 echo "Build completed successfully!"
