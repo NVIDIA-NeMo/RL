@@ -14,6 +14,7 @@
   - [📣 News](#-news)
   - [Table of Contents](#table-of-contents)
   - [Features](#features)
+  - [Quick Start](#quick-start)
   - [Prerequisites](#prerequisites)
   - [Training Backends](#training-backends)
   - [GRPO](#grpo)
@@ -53,7 +54,7 @@ What you can expect:
 
 ✅ _Available now_ | 🔜 _Coming in v0.4_
 
-- 🔜 **Async RL** - Support Async rollouts and replay buffer for off-policy training as well as making the whole GPRO loop async.
+- 🔜 **Async RL** - Add support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO loop.
 - 🔜 **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path.
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron-core training performance and generation performance.
