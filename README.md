@@ -121,7 +121,7 @@ uv venv</code></pre>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
         <strong>Run GRPO (Megatron)</strong>
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo_math.py \
---config examples/configs/grpo_math_1B_megatron.yaml</codec></pre>
+--config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
       </td>
     </tr>
   </tbody>
