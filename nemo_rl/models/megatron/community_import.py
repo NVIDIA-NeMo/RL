@@ -18,8 +18,19 @@ from megatron.bridge import AutoBridge
 
 
 def import_model_from_hf_name(hf_model_name: str, output_path: str):
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name)
-    megatron_model = bridge.to_megatron_model(wrap_with_ddp=False)
+    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
+    model_provider = bridge.to_megatron_provider(load_weights=True)
+    # TODO: use config to set these
+    model_provider.tensor_model_parallel_size = 1
+    model_provider.pipeline_model_parallel_size = 16
+    model_provider.expert_model_parallel_size = 16
+    model_provider.expert_tensor_parallel_size = 1
+    model_provider.num_layers_in_first_pipeline_stage = 3
+    model_provider.num_layers_in_last_pipeline_stage = 2
+    model_provider.pipeline_dtype = "bfloat16"
+    model_provider.initialize_model_parallel(seed=0)
+    megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+
     bridge.save_megatron_model(megatron_model, output_path)
 
     # resetting mcore state
@@ -40,7 +51,7 @@ def export_model_from_megatron(
             f"HF checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
         )
 
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name)
+    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
     megatron_model = bridge.load_megatron_model(input_path)
     bridge.save_hf_pretrained(megatron_model, output_path)
 
