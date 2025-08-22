@@ -122,12 +122,12 @@ def hf_data_processor(
 
 def setup_data(
     tokenizer: TokenizerType,
-    data_config: DataConfig,
+    data_configs: dict[str, DataConfig],
     env_configs: dict[str, Any],
     seed: int,
 ) -> tuple[
-    AllTaskProcessedDataset,
-    Optional[AllTaskProcessedDataset],
+    dict[str, AllTaskProcessedDataset],
+    dict[str, Optional[AllTaskProcessedDataset]],
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
