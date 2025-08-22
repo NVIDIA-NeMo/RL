@@ -27,6 +27,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -162,14 +164,16 @@ def setup_data(
     )
     task_data_processors["reward_model"] = (reward_model_task_spec, hf_data_processor)
 
-    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["reward_model"])
+    # reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+    #     runtime_env={
+    #         "py_executable": get_actor_python_env(
+    #             "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+    #         ),
+    #         "env_vars": dict(os.environ),  # Pass thru all user environment variables  
+    #     }
+    # ).remote(env_configs["reward_model"])
+    reward_model_env = RewardModelEnvironment(env_configs["reward_model"])
+
 
     # Add sleep to let reward model load before policy starts
     print("⏳ Waiting 120 seconds for reward model to load...")

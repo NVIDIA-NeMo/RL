@@ -16,21 +16,34 @@ import copy
 import os
 import ray
 import torch
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, cast
 from transformers import AutoTokenizer
 import ray
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
-from nemo_rl.data.interfaces import LLMMessageLogType
-from nemo_rl.utils.venvs import create_local_venv
+from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec, DatumSpec
+from nemo_rl.data.llm_message_utils import (
+    get_formatted_message_log,
+    batched_message_log_to_flat_message,
+)
+from nemo_rl.algorithms.loss_functions import (
+    PreferenceLoss,
+)
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES,RayVirtualCluster
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.experience.rollouts import generate_responses
 
-@ray.remote
+# 设置PyTorch显示选项，显示完整的tensor内容
+torch.set_printoptions(profile="full", precision=4, linewidth=200, threshold=torch.inf)
+
+
+
+
+# @ray.remote
 class RewardModelEnvironment(EnvironmentInterface):
     """Environment that uses a reward model to score conversations."""
     
@@ -55,79 +68,126 @@ class RewardModelEnvironment(EnvironmentInterface):
             num_gpus_per_node=self.config["resources"]["gpus_per_node"],
             max_colocated_worker_groups=1,
         )
-        
+        print(f"🔧 Virtual cluster created with {self.virtual_cluster.get_placement_groups()} ")
+        self.reward_model_policy = None
+
         # Initialize reward model worker with proper resource management
         print("🔧 Setting up reward model worker...")
-        self._setup_reward_model_worker()
+        weights_path = self.config.get("checkpoint_path", None)
+        # Initialize tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
+        self.config["generation"]["pad_token_id"] = self.tokenizer.pad_token_id
+        
+        # Ensure tokenizer has pad_token_id
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = 0  # Use 0 as default pad token
+            print(f"⚠️  Tokenizer pad_token_id was None, set to {self.tokenizer.pad_token_id}")
+        
+        print(f"✅ Tokenizer initialized with pad_token_id: {self.tokenizer.pad_token_id}")
+
+        # ===========================================Dtensor===========================================
+        # self.reward_model_policy = Policy(
+        #     cluster=self.virtual_cluster,
+        #     config=self.config,
+        #     tokenizer=self.tokenizer,
+        #     name_prefix="reward_model_policy",
+        #     init_optimizer=False,
+        #     init_reference_model=False,
+        #     weights_path=weights_path,
+        # )
+        # ===========================================Dtensor===========================================
+
+
+        # ===========================================VLLM===========================================
+        generation_config = self.config["generation"]
+        generation_config["model_name"] = self.config["model_name"]
+        # Fix the path - it should be vllm_cfg, not generation.vllm_cfg
+        max_model_len = generation_config["vllm_cfg"]["max_model_len"]
+        generation_config["vllm_cfg"]["max_model_len"] = max_model_len * 64
+        generation_config = configure_generation_config(generation_config, self.tokenizer)
+        generation_config = cast(VllmConfig, generation_config)
+        self.reward_model_policy = VllmGeneration(
+            cluster=self.virtual_cluster,
+            config=generation_config,
+            name_prefix="reward_model_policy",
+        )
+        self.reward_model_policy.finish_generation()
+        # ===========================================VLLM===========================================
+
         print("✅ REWARD MODEL ENVIRONMENT INITIALIZATION COMPLETE")
 
 
-    def _setup_reward_model_worker(self):
-        """Setup the reward model worker with proper resource management."""
-        # Import the reward model worker class
+    def data_preprocess(self, message_logs: List[LLMMessageLogType]) -> BatchedDataDict[GenerationDatumSpec]:
+        """Preprocess the message logs for the reward model.
         
-
-        print(f"🔧 Reward model configuration:")
-        print(f"   - Model: {self.config['model_name']}")
-        print(f"   - Tensor Parallel Size: {self.config['dtensor_cfg']['tensor_parallel_size']}")
-        print(f"   - Dtype: {self.config.get('dtype', 'bfloat16')}")
-        print(f"   - GPU Memory Utilization: {self.config.get('gpu_memory_utilization', 0.8)}")
-        print(f"   - Max Model Length: {self.config.get('max_model_len', 4096)}")
-        print(f"   - Full config: {self.config}")
-
-        weights_path = self.config.get("checkpoint_path", None)
-        tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
-        # Pass down critical environment variables (similar to LLM judge)
-        env_vars_to_pass = {}
-        for key in [
-            "HF_HOME",
-            "TRANSFORMERS_CACHE", 
-            "WANDB_API_KEY",
-            "HUGGINGFACE_HUB_DISABLE_XET",
-            "HF_TOKEN",
-            "PYTORCH_CUDA_ALLOC_CONF",
-        ]:
-            if key in os.environ:
-                env_vars_to_pass[key] = os.environ[key]
-        
-        # Ensure xet is disabled and CUDA memory management is set
-        env_vars_to_pass.setdefault("HUGGINGFACE_HUB_DISABLE_XET", "1")
-        env_vars_to_pass.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        self.config["env_vars"] = env_vars_to_pass
-        self.reward_model_policy = Policy(
-            cluster=self.virtual_cluster,
-            config=self.config,
-            tokenizer=tokenizer,
-            name_prefix="reward_model_policy",
-            init_optimizer=False,
-            init_reference_model=False,
-            weights_path=weights_path,
-        )
-
-        print(f"✓ Reward model worker initialized with {self.config['model_name']} using {self.config['resources']['num_nodes']} Nodes")
-
-    def get_rewards(
-        self, reward_data: BatchedDataDict, micro_batch_size: int = None
-    ) -> BatchedDataDict:
-        """Get rewards for the given data.
-
         Args:
-            reward_data: BatchedDataDict containing conversation data
-            micro_batch_size: Optional micro batch size for processing
-
-        Returns:
-            BatchedDataDict with rewards
+            message_logs: List of conversation message logs
+            
         """
-        dp_size = self.reward_model_policy.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data = reward_data.shard_by_batch_size(dp_size, batch_size=None)
-        return self.reward_model_policy.worker_group.run_all_workers_sharded_data(
-            "get_rewards",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
-            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"micro_batch_size": micro_batch_size},
+        task_data_spec = TaskDataSpec(
+            task_name="reward_model_env",
         )
+        print(f"🔍 Message logs: {message_logs[0]}")
+        
+        # Tokenize each message_log
+        tokenized_message_logs = []
+        for message_log in message_logs:
+            tokenized_log = get_formatted_message_log(
+                message_log,
+                tokenizer=self.tokenizer,
+                task_data_spec=task_data_spec,
+                add_bos_token=True,
+                add_eos_token=True,
+                add_generation_prompt=False,
+            )
+            tokenized_message_logs.append(tokenized_log)
+    
+        
+        # Convert message logs to flat representation and pad for batching
+        # Use pad_token_id if available, otherwise use 0 as default
+        # pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+            tokenized_message_logs,
+            # pad_value_dict={"token_ids": pad_token_id},
+        )
+        
+        # Get max_model_len from generation config
+        max_model_len = self.config["generation"]["vllm_cfg"]["max_model_len"] * 64
+        print(f"🔍 Max model length: {max_model_len}")
+        print(f"🔍 Input length: {input_lengths}")
+        print(f"🔍 Max input length before truncation: {input_lengths.max().item()}")
+        
+        # Truncate sequences that exceed max_model_len
+        # if input_lengths.max().item() > max_model_len:
+        #     print(f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}")
+        #     # Truncate input_ids
+        #     cat_and_padded["token_ids"] = cat_and_padded["token_ids"][:, :max_model_len]
+        #     # Update input_lengths
+        #     input_lengths = torch.clamp(input_lengths, max=max_model_len)
+        #     print(f"✅ After truncation - Max input length: {input_lengths.max().item()}")
+        for i in range(len(input_lengths)):
+            if input_lengths[i] > 2048:
+                print("long sequence index", i)
+                print("long sequence length", input_lengths[i])
+                print("long sequence content", message_logs[i])
+                print("long sequence token_ids", cat_and_padded["token_ids"][i])
+                print("long sequence token_ids shape", cat_and_padded["token_ids"][i].shape)
+                break
+        
+        # Create data in the format expected by DTensorRewardModelWorker
+        reward_data = BatchedDataDict(
+            {
+                "input_ids": cat_and_padded["token_ids"],
+                "input_lengths": input_lengths,
+                # For inference, we can use all ones as token_mask since we're not computing loss
+                "token_mask": torch.ones_like(cat_and_padded["token_ids"]),
+                # "token_mask": cat_and_padded["token_loss_mask"],
+            }
+        )
+        print("🔍 Reward data: ", reward_data["input_ids"].shape)
+        print("🔍 Reward data lengths: ", reward_data["input_lengths"])
+        return reward_data
+
 
     def step(
         self,
@@ -143,30 +203,51 @@ class RewardModelEnvironment(EnvironmentInterface):
         Returns:
             EnvironmentReturn with rewards and termination info
         """
-        
-        # Create data in the format expected by DTensorRewardModelWorker
-        reward_data = BatchedDataDict()
-        reward_data["messages"] = message_logs
-        
-        # Deepcopy the reward_data to ensure complete isolation
-        reward_data_copy = copy.deepcopy(reward_data)
-        
-        # Get rewards from the reward model worker using Ray remote call
-        results_future = self.reward_model_worker.get_rewards.remote(reward_data_copy)
-        results = ray.get(results_future)
-        results = BatchedDataDict.from_batches(
-            self.reward_model_policy.worker_group.get_all_worker_results(results_future),
 
+        reward_data = self.data_preprocess(message_logs)
+        
+        # ===========================================VLLM===========================================
+        input_lengths = reward_data["input_lengths"]
+        generation_outputs = self.reward_model_policy.generate(
+            reward_data, greedy=True
         )
+        print("🔍 Generation outputs: ", generation_outputs )
         
-        # Extract rewards from the results
-        rewards_tensor = results["rewards"]
-        if isinstance(rewards_tensor, torch.Tensor):
-            rewards = rewards_tensor.cpu().numpy().tolist()
-        else:
-            rewards = rewards_tensor
+        # Decode text from generation_outputs
+        output_ids = generation_outputs["output_ids"]
+        unpadded_lengths = generation_outputs["unpadded_sequence_lengths"]
+        generation_lengths = generation_outputs["generation_lengths"]
+        
+        # Decode only generated parts
+        generated_ids = []
+        for i in range(len(output_ids)):
+            input_length = input_lengths[i].item()
+            # Extract generated token IDs
+            generate_length = unpadded_lengths[i].item() - input_length
+            generated_tokens = output_ids[i][input_length:unpadded_lengths[i]]
+            # Decode generated part
+            generated_ids.append(generated_tokens)
+            # generated_ids.append(output_ids[i])
+            print(f"🔍 Index: {i} Generate length: {generate_length} Generated tokens: {generated_tokens}")
+        
+        rewards=self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        print("🔍 Rewards: ", rewards)
+        # ===========================================VLLM===========================================
 
+
+        # ===========================================DTensor===========================================
+        # rewards = self.reward_model_policy.get_logprobs(reward_data)
+
+        # generation_outputs = self.reward_model_policy.generate(reward_data, greedy=True)
+        # rewards_ids = generation_outputs["output_ids"]
+        # rewards = self.tokenizer.batch_decode(rewards_ids, skip_special_tokens=True)
+        # print("🔍 Rewards ids: ", rewards_ids)
+        # print("🔍 Rewards: ", rewards)
+        # print("🔍 Rewards tensor type: ", type(rewards))
         
+        
+        # ===========================================DTensor===========================================
+
         # Create observations with meaningful content based on rewards (like math environment)
         observations = []
         for i, reward in enumerate(rewards):
