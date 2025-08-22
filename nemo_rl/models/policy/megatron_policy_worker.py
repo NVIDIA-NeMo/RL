@@ -79,7 +79,7 @@ from nemo.tron.setup import (
 from nemo.tron.state import GlobalState
 from nemo.tron.tokenizers.tokenizer import build_tokenizer
 from nemo.tron.utils.async_utils import maybe_finalize_async_save
-from nemo.tron.utils.common_utils import get_rank_safe
+from nemo.tron.utils.common_utils import get_local_rank_preinit, get_rank_safe
 from nemo.tron.utils.train_utils import (
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -380,6 +380,7 @@ class MegatronPolicyWorker:
         *,
         worker_sharding_annotations: NamedSharding,
         pre_init_communication_queue: Queue,
+        node_pre_init_queues: list[Queue],
         **kwargs: Any,
     ):
         self.is_generation_colocated = None
@@ -430,7 +431,20 @@ class MegatronPolicyWorker:
         destroy_parallel_state()
 
         self.rank = get_rank_safe()
-        if self.rank == 0:
+        # Option to import megatron model on local rank 0 on all nodes.
+        # This is needed when the megatron checkpoint dir isn't shared across nodes.
+        convert_on_all_local_rank0 = os.environ.get("NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0", "false").lower() == "true"
+
+        if convert_on_all_local_rank0:
+            node_rank = int(os.getenv("NODE_RANK", "0"))
+            sync_queue = node_pre_init_queues[node_rank]
+            is_leader = get_local_rank_preinit() == 0
+            print(f"self.rank={self.rank} NODE_RANK={node_rank} is leader: {is_leader}")
+        else:
+            sync_queue = pre_init_communication_queue
+            is_leader = self.rank == 0
+
+        if is_leader:
             if pt_checkpoint_exists:
                 print(
                     f"Checkpoint already exists at {pretrained_path}. Skipping import."
@@ -462,10 +476,10 @@ class MegatronPolicyWorker:
                 finally:
                     # Force cleanup after import
                     destroy_parallel_state()
-            pre_init_communication_queue.put(True)
+            sync_queue.put(True)
         else:
-            pre_init_communication_queue.get()
-            pre_init_communication_queue.put(True)
+            sync_queue.get()
+            sync_queue.put(True)
         destroy_parallel_state()
 
         pretrained_run_config = os.path.join(
@@ -478,7 +492,7 @@ class MegatronPolicyWorker:
 
         if not os.path.exists(pretrained_run_config):
             raise FileNotFoundError(
-                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. Please check "
+                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. To run the conversion on all nodes, set the environment variable NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0=true."
             )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config)
