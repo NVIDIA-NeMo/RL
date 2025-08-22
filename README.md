@@ -55,11 +55,12 @@ What you can expect:
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron-core training performance and generation performance.
-- 🔜 **End-to-end FP8 Low Precision training** - Improve training time for Native Pytorch Models.
+- 🔜 **End-to-end FP8 Low Precision training** - Support for Megatron-core FP8 training and FP8 VLLM generation.
 - 🔜 **Megatron-Bridge Integration** - Integrate Megatron-Bridge to enable training Huggingface models with all powerful features from Megatron-Core.
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path for day-0 support of new Huggingface models.
 - 🔜 **New Models** - gpt-oss.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
+- 🔜 **GB200** - Add container support for GB200.
 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
 - ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
