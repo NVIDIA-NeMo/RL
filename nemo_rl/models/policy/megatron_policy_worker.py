@@ -494,7 +494,7 @@ class MegatronPolicyWorker:
 
         if not os.path.exists(pretrained_run_config):
             raise FileNotFoundError(
-                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. To run the conversion on all nodes, set the environment variable NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0=true."
+                f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}.\n\nThis usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. To run the conversion on all nodes, set the environment variable NRL_CONVERT_MEGATRON_ON_ALL_LOCAL_RANK_0=true.\n\nThis may also occur if you have multiple simultaneous runs using the same megatron checkpoint directory because of a known race condition during the HF->mcore conversion: https://github.com/NVIDIA-NeMo/RL/issues/969."
             )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config)
