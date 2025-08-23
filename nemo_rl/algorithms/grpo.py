@@ -239,11 +239,12 @@ def setup(
             "policy_nodes must be > 0, but got "
             f"policy_nodes:{policy_nodes} + reward_model_nodes:{reward_model_nodes} = total_nodes:{total_nodes}"
         )
-    
 
     if colocated_inference:
         if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - reward_model_gpus_per_node
+            policy_gpus_per_node = (
+                cluster_config["gpus_per_node"] - reward_model_gpus_per_node
+            )
             assert policy_gpus_per_node > 0, (
                 "policy.generation.colocated.resources.gpus_per_node must be > 0 "
                 "when cluster.num_nodes = 1, "
@@ -254,8 +255,7 @@ def setup(
 
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
-            bundle_ct_per_node_list=[policy_gpus_per_node]
-            * policy_nodes,
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
@@ -278,7 +278,6 @@ def setup(
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
         train_nodes = policy_nodes
-        
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
@@ -300,12 +299,20 @@ def setup(
 
             inference_nodes = 1
             # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
-            reward_gpus_to_subtract = reward_model_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
+            reward_gpus_to_subtract = (
+                reward_model_gpus_per_node
+                if total_nodes == 1 and reward_model_enabled
+                else 0
+            )
             train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
             assert train_gpus_per_node > 0, (
                 "No enough GPUs for training, "
                 f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
-                + (f" - reward_model_gpus_per_node:{reward_model_gpus_per_node}" if total_nodes == 1 and reward_model_enabled else "")
+                + (
+                    f" - reward_model_gpus_per_node:{reward_model_gpus_per_node}"
+                    if total_nodes == 1 and reward_model_enabled
+                    else ""
+                )
             )
         else:
             # train, inference, and reward model are all on different nodes
