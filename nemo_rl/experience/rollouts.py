@@ -19,7 +19,6 @@ import asyncio
 import copy
 from typing import Any
 
-import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
@@ -256,7 +255,7 @@ def calculate_rewards(
         # future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
         future = task_to_env[task_name].step(messages, env_info)
         futures.append(future)
-        future_to_indices[future] = indices
+        # future_to_indices[future] = indices
 
     # results = ray.get(futures)
     results = futures
@@ -269,7 +268,7 @@ def calculate_rewards(
     all_answers = []
 
     for future, result in zip(futures, results):
-        indices = future_to_indices[future]
+        # indices = future_to_indices[future]
         # Environment step returns: EnvironmentReturn
         (
             env_observations,
@@ -286,7 +285,7 @@ def calculate_rewards(
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
-            all_indices_order.append(idx)
+            # all_indices_order.append(idx)
             all_rewards.append(task_rewards[i])
             all_env_observations.append(env_observations[i])
             all_terminateds.append(terminateds[i])
@@ -295,9 +294,10 @@ def calculate_rewards(
             all_answers.append(answers[i])
 
     # Sort results by original index to maintain order
-    sorted_indices = sorted(
-        range(len(all_indices_order)), key=lambda k: all_indices_order[k]
-    )
+    # sorted_indices = sorted(
+    #     range(len(all_indices_order)), key=lambda k: all_indices_order[k]
+    # )
+    sorted_indices = range(len(all_rewards))
     rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
