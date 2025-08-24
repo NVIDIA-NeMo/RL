@@ -18,6 +18,7 @@ on:
     branches:
       - "main"
       - "r**"
+      - ko3n1g/tk/prebuilt-wheels
     types: [labeled, opened, synchronize, reopened]
   merge_group:
     types: [checks_requested]
@@ -122,7 +123,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -282,6 +283,7 @@ jobs:
                 )
               )
             }}
+
           CI_SKIP: ${{ github.event.label.name == 'Skip CICD' }}
           TEST_LEVEL: ${{ needs.pre-flight.outputs.test_level }}
         run: |
