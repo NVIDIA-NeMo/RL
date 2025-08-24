@@ -1058,13 +1058,13 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.7.4.post1"
-source = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+source = { url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl", hash = "sha256:248113448ade44e727935b8fa947b2db11de3a323004335dfd69f2474c594703" },
+    { url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl", hash = "sha256:248113448ade44e727935b8fa947b2db11de3a323004335dfd69f2474c594703" },
 ]
 
 [package.metadata]
@@ -2597,9 +2597,9 @@ requires-dist = [
     { name = "colored", specifier = "==2.2.3" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
-    { name = "flash-attn", marker = "extra == 'automodel'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "extra == 'mcore'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
-    { name = "flash-attn", marker = "extra == 'vllm'", url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'automodel'", url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'mcore'", url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "extra == 'vllm'", url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
     { name = "hydra-core" },
     { name = "math-verify" },
     { name = "matplotlib" },

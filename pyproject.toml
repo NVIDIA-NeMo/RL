@@ -6,21 +6,18 @@ build-backend = "setuptools.build_meta"
 packages = ["nemo_rl"]
 
 [tool.setuptools.dynamic]
-version = {attr = "nemo_rl.__version__"}  # any module attribute compatible with ast.literal_eval
-readme = {file = "README.md", content-type = "text/markdown"}
+version = { attr = "nemo_rl.__version__" }                      # any module attribute compatible with ast.literal_eval
+readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]
 name = "nemo-rl"
-dynamic = [
-    "version",
-    "readme",
-]
+dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
 requires-python = ">=3.12"
-license = {text = "Apache 2.0"}
+license = { text = "Apache 2.0" }
 dependencies = [
     "setuptools",
-    "ninja",  # for flash-attn parallel build
+    "ninja",                # for flash-attn parallel build
     "torch==2.7.1",
     "triton",
     "colored==2.2.3",
@@ -75,7 +72,7 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine==2.3.0",  # take off [pytorch] extra since i'm hacking it and using a pre-built bdist wheel for the pytorch extension
+    "transformer-engine==2.3.0",       # take off [pytorch] extra since i'm hacking it and using a pre-built bdist wheel for the pytorch extension
     "transformer-engine-torch==2.3.0",
     "megatron-core",
     "nemo-tron",
@@ -106,11 +103,11 @@ build = [
 ]
 docs = [
     "sphinx",
-    "sphinx-autobuild",  # For live doc serving while editing docs
-    "sphinx-autodoc2",  # For documenting Python API
-    "sphinx-copybutton",  # Adds a copy button for code blocks
-    "myst_parser",  # For our markdown docs
-    "nvidia-sphinx-theme",  # Our NVIDIA theme
+    "sphinx-autobuild",    # For live doc serving while editing docs
+    "sphinx-autodoc2",     # For documenting Python API
+    "sphinx-copybutton",   # Adds a copy button for code blocks
+    "myst_parser",         # For our markdown docs
+    "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 dev = [
     "pre-commit==3.6.0",
@@ -119,12 +116,7 @@ dev = [
     "types-requests",
     "pyrefly==0.24.2",
 ]
-test = [
-    "pytest>=7.0.0",
-    "pytest-timeout",
-    "pytest-cov",
-    "pytest-asyncio",
-]
+test = ["pytest>=7.0.0", "pytest-timeout", "pytest-cov", "pytest-asyncio"]
 
 [tool.uv.sources]
 megatron-core = { workspace = true }
@@ -132,26 +124,17 @@ nemo-tron = { workspace = true }
 # The NeMo Run source to be used by nemo-tron
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
-torch = [
-  { index = "pytorch-cu128" },
-]
-torchvision = [
-  { index = "pytorch-cu128" },
-]
-triton = [
-  { index = "pytorch-cu128" },
-]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+triton = [{ index = "pytorch-cu128" }]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
 #flash-attn = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
-flash-attn = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+flash-attn = { url = "https://github.com/ko3n1g/RL/releases/download/v0.0.0/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 transformer-engine-torch = { url = "https://github.com/terrykong/RL/releases/download/v0.0.0/transformer_engine_torch-2.3.0-cp312-cp312-linux_x86_64.whl" }
 
 [tool.uv.workspace]
-members = [
-    "3rdparty/Megatron-LM-workspace",
-    "3rdparty/NeMo-workspace",
-]
+members = ["3rdparty/Megatron-LM-workspace", "3rdparty/NeMo-workspace"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -159,7 +142,13 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d"]
+no-build-isolation-package = [
+    "transformer-engine-torch",
+    "transformer-engine",
+    "flash-attn",
+    "mamba-ssm",
+    "causal-conv1d",
+]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -170,10 +159,10 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 
-# Needed when building from source
-[[tool.uv.dependency-metadata]]
-name = "flash-attn"
-requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+# # Needed when building from source
+# [[tool.uv.dependency-metadata]]
+# name = "flash-attn"
+# requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [tool.black]
 line-length = 120
@@ -228,4 +217,3 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
-
