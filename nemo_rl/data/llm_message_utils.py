@@ -548,13 +548,23 @@ def get_formatted_message_log(
                     message_chunk = tokenizer.bos_token + message_chunk
 
         if i == len(message_log_strs) - 1:
-            message_chunk = message_chunk.rstrip("\n")
+            r"""
+            This is an attempt to robustly append the eos token. The origin is Qwen
+            chat templates always append <eos>\n and some models like gemma do not
+            use the <eos> at all in the chat template. Adding a <eos> if the <eos> is
+            already at the end, is likely a user error, and since we know Qwen likes to
+            have <eos>\n we'll check for that case.
+
+            This makes the logic slightly more robust to the model family's chat template
+            so users don't need to know whether they need to add add_eos or not.
+            """
+            stripped_message_chunk = message_chunk.rstrip("\n")
             if add_eos_token:
                 if tokenizer.eos_token is None:
                     warnings.warn(
                         "add_eos_token is True but the tokenizer does not have an EOS token. Skipping EOS token addition."
                     )
-                elif not message_chunk.endswith(tokenizer.eos_token):
+                elif not stripped_message_chunk.endswith(tokenizer.eos_token):
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)

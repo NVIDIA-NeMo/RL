@@ -1,0 +1,13 @@
+# GRPO Algorithm Configuration
+defaults: "grpo_math_8B_megatron.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: 'fp8'
+      use_deep_gemm: true
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0

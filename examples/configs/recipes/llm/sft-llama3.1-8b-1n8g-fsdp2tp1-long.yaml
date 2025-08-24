@@ -1,11 +1,11 @@
 sft:
   max_num_epochs: 1
-  max_num_steps: 2730
-  val_period: 10
-  val_batches: 8
-  val_global_batch_size: 32
-  val_micro_batch_size: 1
-  val_at_start: true
+  max_num_steps: 10000
+  val_period: 500
+  val_batches: 4
+  val_global_batch_size: 128
+  val_micro_batch_size: 2
+  val_at_start: false
   seed: 42
 checkpointing:
   enabled: true
@@ -13,16 +13,15 @@ checkpointing:
   metric_name: val_loss
   higher_is_better: false
   keep_top_k: 3
-  save_period: 10
+  save_period: 100
   checkpoint_must_save_by: null
 policy:
-  model_name: meta-llama/Llama-3.1-8B-Instruct
+  model_name: meta-llama/Llama-3.1-8B
   tokenizer:
     name: meta-llama/Llama-3.1-8B-Instruct
-    chat_template: '{% for message in messages %}{%- if message[''role''] == ''system''  %}{{''Context: '' + message[''content''].strip()}}{%- elif message[''role''] == ''user''  %}{{'' Question: '' + message[''content''].strip() + '' Answer:''}}{%- elif message[''role''] == ''assistant''  %}{{'' '' + message[''content''].strip()}}{%- endif %}{% endfor %}'
-  train_global_batch_size: 32
-  train_micro_batch_size: 1
-  max_total_sequence_length: 1024
+  train_global_batch_size: 512
+  train_micro_batch_size: 2
+  max_total_sequence_length: 4096
   precision: bfloat16
   dtensor_cfg:
     enabled: true
@@ -34,6 +33,8 @@ policy:
     custom_parallel_plan: null
   dynamic_batching:
     enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
   sequence_packing:
     enabled: false
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
@@ -44,28 +45,31 @@ policy:
   optimizer:
     name: torch.optim.AdamW
     kwargs:
-      lr: 5e-06
-      weight_decay: 0.1
+      lr: 2e-5
+      weight_decay: 0.01
       betas:
         - 0.9
         - 0.98
-      eps: 1e-05
+      eps: 1e-08
       foreach: false
       fused: false
 data:
-  max_input_seq_length: 1024
-  dataset_name: squad
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "openmathinstruct2"
+  prompt_file: examples/prompts/math.txt
+  split: "train_1M"
   add_bos: true
   add_eos: true
-  add_generation_prompt: false
+  add_generation_prompt: true
+  output_key: 'generated_solution'
   shuffle: true
+  seed: 42
 logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
-  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: nemo-rl
     name: sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long

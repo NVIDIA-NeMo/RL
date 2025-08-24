@@ -39,7 +39,7 @@ docker/*
 wandb/
 checkpoints/
 results/
-code_snapshots/
+code_snapshots*/
 
 # Runtime env
 *runtime_env.yaml

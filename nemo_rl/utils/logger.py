@@ -76,7 +76,6 @@ class LoggerConfig(TypedDict):
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
-    num_val_samples_to_print: int
 
 
 class LoggerInterface(ABC):

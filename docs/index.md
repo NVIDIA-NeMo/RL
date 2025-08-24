@@ -49,6 +49,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+fp8.md
 guides/use-custom-vllm.md
 apidocs/index.rst
 ```
