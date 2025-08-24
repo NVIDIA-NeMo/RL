@@ -133,7 +133,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
-            env_vars=env_vars,
+            env_vars=env_vars or {},
         )
 
         if config["dynamic_batching"]["enabled"]:
