@@ -1,6 +1,6 @@
 checkpointing:
   enabled: True
-  checkpoint_dir: results/grpo-math-qwen3-32b-megatron-128k-4n8g
+  checkpoint_dir: results/grpo-math-qwen3-30ba3b-megatron-tp4-32k
   save_period: 3
   keep_top_k: 1
   metric_name: val_reward
@@ -10,11 +10,11 @@ checkpointing:
 grpo:
   normalize_rewards: True
   use_leave_one_out_baseline: True
-  max_num_steps: 500
-  num_prompts_per_step: 8
-  num_generations_per_prompt: 8
+  max_num_steps: 3
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
   max_rollout_turns: 1
-  val_period: 10
+  val_period: 3
   val_at_start: False
   max_val_samples: 256
   val_batch_size: 256
@@ -31,21 +31,16 @@ loss_fn:
   ratio_clip_c: null
 
 policy:
-  model_name: "Qwen/Qwen3-32B"
-  model_kwargs:
-    rope_scaling:
-      type: "yarn"
-      factor: 4.0
-      original_max_position_embeddings: 32768
+  model_name: "Qwen/Qwen3-30B-A3B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: 16
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 1
-  max_total_sequence_length: 131072
+  max_total_sequence_length: 32768
   precision: "bfloat16"
-  logprob_chunk_size: 512
+  logprob_chunk_size: 2048
 
   dtensor_cfg:
     enabled: False
@@ -54,11 +49,7 @@ policy:
     enabled: False
 
   sequence_packing:
-    enabled: True
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
+    enabled: False
 
   max_grad_norm: 1.0
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -71,11 +62,11 @@ policy:
     enabled: True
     empty_unused_memory_level: 1
     converter_type: "LlamaForCausalLM"
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
-    context_parallel_size: 4
+    context_parallel_size: 1
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
+    expert_model_parallel_size: 8
     sequence_parallel: True
     pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
@@ -134,13 +125,12 @@ policy:
     vllm_cfg:
       async_engine: False
       precision: ${policy.precision}
-      tensor_parallel_size: 8
+      tensor_parallel_size: 4
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       # NB(pjin): https://github.com/NVIDIA-NeMo/RL/pull/857
       enforce_eager: True
-    vllm_kwargs: ${policy.model_kwargs}
     colocated:
       enabled: true
       resources:
@@ -159,7 +149,7 @@ env:
     num_workers: 8
 
 logger:
-  log_dir: logs/grpo-math-qwen3-32b-megatron-tp8cp4-128k
+  log_dir: logs/grpo-math-qwen3-30ba3b-megatron-tp4-32k
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: True
   tensorboard_enabled: True
@@ -167,7 +157,7 @@ logger:
   monitor_gpus: False  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: nemo-rl
-    name: "grpo-math-qwen3-32b-megatron-tp8cp4-128k"
+    name: "grpo-math-qwen3-30ba3b-megatron-tp4-32k"
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
