@@ -473,6 +473,24 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
   ```
 
+- Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
+  If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  at **either** one of the following places:
+  1. Launch training with:
+  ```sh
+  # This will globally apply to all ray actors
+  PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
+  ```
+  2. Make the change more permanently by adding this flag in the training configuration:
+  ```yaml
+  policy:
+    # ...
+    dtensor_cfg:
+      env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
+  ```
+
 ## Citation
 
 If you use NeMo RL in your research, please cite it using the following BibTeX entry:

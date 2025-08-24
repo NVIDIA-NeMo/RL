@@ -45,6 +45,8 @@ policy:
   precision: "bfloat16"
 
   dtensor_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
     enabled: true
     cpu_offload: False
     sequence_parallel: false
