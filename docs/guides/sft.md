@@ -34,7 +34,7 @@ SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is e
   1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
   2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
-SFT datasets are expected to follow the Hugging Face chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [data/hf_datasets/squad.py](../../nemo_rl/data/hf_datasets/squad.py) has an example:
+SFT datasets are expected to follow the Hugging Face chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
 
 ```python
 def format_squad(data):

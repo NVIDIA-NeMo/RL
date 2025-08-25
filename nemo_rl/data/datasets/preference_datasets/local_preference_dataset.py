@@ -19,20 +19,22 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class LocalPreferenceDataset:
-    """Dataset class for local preference data, used for Direct Preference Optimization (DPO) and Reward Model (RM) training.
+    """Dataset class for local preference data.
 
-    This class handles loading of preference data for local preference data.
+    This class handles loading of preference data for DPO and RM training.
     The input JSON files should contain examples with the following structure:
     {
-        "prompt": str,           # The input prompt/context
-        "chosen_response": str,  # The preferred/winning response
-        "rejected_response": str # The non-preferred/losing response
+        prompt_key: str,    # The input prompt/context
+        chosen_key: str,    # The preferred/winning response
+        rejected_key: str,  # The non-preferred/losing response
     }
 
     Args:
-        train_data_path (str): Path to the JSON file containing training data
-        val_data_path (str): Path to the JSON file containing validation data
-
+        train_data_path: Path to the JSON file containing training data
+        val_data_path: Path to the JSON file containing validation data
+        prompt_key: Key for the input prompt/context
+        chosen_key: Key for the preferred/winning response
+        rejected_key: Key for the non-preferred/losing response
     """
 
     def __init__(

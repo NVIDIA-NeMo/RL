@@ -71,7 +71,7 @@ def hf_data_processor(
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Math Environment."""
+    """Process a datum dictionary (directly loaded from response_datasets/<dataset_name>.py) into a DatumSpec for the Math Environment."""
     user_message = datum_dict["messages"]
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}

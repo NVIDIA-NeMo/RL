@@ -106,7 +106,7 @@ def hf_data_processor(
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from data/hf_datasets/<dataset_name>.py) into a DatumSpec for the VLM Environment."""
+    """Process a datum dictionary (directly loaded from response_datasets/<dataset_name>.py) into a DatumSpec for the VLM Environment."""
     # depending on the task, format the data differently
     if task_data_spec.task_name == "clevr-cogent":
         datum_dict = format_clevr_cogent_dataset(datum_dict)
