@@ -291,7 +291,13 @@ elif [[ -n "$DCP_PATH" ]]; then
         print_warning "For easier local testing, consider using: --model-path GSAI-ML/LLaDA-8B-Instruct"
     fi
     
-    LLADA_ARGS="$LLADA_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL' --temp-dir '$TEMP_DIR'"
+    # Use absolute path for DCP to match the mounted path in container
+    if [[ -d "$DCP_PATH" ]]; then
+        DCP_ABS_PATH_FOR_ARGS=$(realpath "$DCP_PATH")
+        LLADA_ARGS="$LLADA_ARGS --dcp-path '$DCP_ABS_PATH_FOR_ARGS' --base-model '$BASE_MODEL' --temp-dir '$TEMP_DIR'"
+    else
+        LLADA_ARGS="$LLADA_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL' --temp-dir '$TEMP_DIR'"
+    fi
 fi
 
 # Add batch-specific arguments
