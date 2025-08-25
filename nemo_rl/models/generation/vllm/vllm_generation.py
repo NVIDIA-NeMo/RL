@@ -37,6 +37,12 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 
+# Global thresholds for top_k and top_p validation.
+# While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
+# See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
+TOP_K_THRESHOLD = 10000  # Allow top_k >= 10000 (effectively no filtering)
+TOP_P_THRESHOLD = 0.999  # Allow top_p >= 0.999 (close to 1.0)
+
 
 class VllmGeneration(GenerationInterface):
     def __init__(
@@ -57,24 +63,27 @@ class VllmGeneration(GenerationInterface):
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
+        # However, we allow values above certain thresholds for token filtering purposes.
         top_k: int | None = self.cfg.get("top_k")
-        if top_k is not None and top_k != -1:
+        if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
             raise ValueError(
                 (
-                    "top_k sampling is not supported because the vLLM V1 engine does not return logprobs after top_k. "
-                    "If you understand the implications and still want to use top_k, please manually comment out "
-                    f"this check. Expected top_k=None or top_k=-1, got top_k={top_k}. "
+                    f"top_k sampling with values < {TOP_K_THRESHOLD} is not supported because the vLLM V1 engine "
+                    "does not return logprobs after top_k filtering. Values >= {TOP_K_THRESHOLD} are allowed "
+                    "for token filtering purposes. If you understand the implications and still want to use "
+                    f"a lower top_k value, please manually comment out this check. Got top_k={top_k}. "
                     "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
                 )
             )
 
         top_p: float = self.cfg.get("top_p", 1.0)
-        if top_p != 1.0:
+        if top_p < TOP_P_THRESHOLD:
             raise ValueError(
                 (
-                    "top_p sampling is not supported because the vLLM V1 engine does not return logprobs after top_p. "
-                    "If you understand the implications and still want to use top_p, please manually comment out "
-                    f"this check. Expected top_p=1.0, got top_p={top_p}. "
+                    f"top_p sampling with values < {TOP_P_THRESHOLD} is not supported because the vLLM V1 engine "
+                    "does not return logprobs after top_p filtering. Values >= {TOP_P_THRESHOLD} are allowed "
+                    "for token filtering purposes. If you understand the implications and still want to use "
+                    f"a lower top_p value, please manually comment out this check. Got top_p={top_p}. "
                     "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
                 )
             )
