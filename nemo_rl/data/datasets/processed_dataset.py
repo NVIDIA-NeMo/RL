@@ -17,20 +17,12 @@ import torch
 from datasets import Dataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.collate_fn import (
-    dpo_collate_fn,
-    eval_collate_fn,
-    preference_collate_fn,
-    rl_collate_fn,
-)
-from nemo_rl.data.eval_datasets import load_eval_dataset
+from nemo_rl.data.datasets.utils import assert_no_double_bos
 from nemo_rl.data.interfaces import (
     DatumSpec,
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.data.preference_datasets import load_preference_dataset
-from nemo_rl.data.sft_datasets import load_sft_dataset
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
 
@@ -132,36 +124,3 @@ class AllTaskProcessedDataset:
             self._bos_checked = True
 
         return datum_spec
-
-
-def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
-    """Assert that there are no double starting BOS tokens in the message.
-
-    Args:
-        token_ids: List of token IDs
-        tokenizer: Tokenizer
-    """
-    if tokenizer.bos_token_id is not None:
-        token_ids_list = token_ids.tolist()
-        if len(token_ids_list) > 1:
-            assert not (
-                token_ids_list[0] == tokenizer.bos_token_id
-                and token_ids_list[1] == tokenizer.bos_token_id
-            ), "Found double BOS token in the first two positions of the message."
-    else:
-        # `name_or_path` is not available for AutoProcessor, temp fix in get_tokenizer
-        print(
-            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
-        )
-
-
-__all__ = [
-    "AllTaskProcessedDataset",
-    "dpo_collate_fn",
-    "eval_collate_fn",
-    "preference_collate_fn",
-    "rl_collate_fn",
-    "load_eval_dataset",
-    "load_preference_dataset",
-    "load_sft_dataset",
-]
