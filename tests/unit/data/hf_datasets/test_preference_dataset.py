@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 
-from nemo_rl.data.hf_datasets.dpo import DPODataset
+from nemo_rl.data.preference_datasets import LocalPreferenceDataset
 
 
 @pytest.fixture
@@ -65,10 +65,10 @@ def mock_dpo_data():
 
 
 def test_dpo_dataset_initialization(mock_dpo_data):
-    """Test that DPODataset initializes correctly with valid data files."""
+    """Test that LocalPreferenceDataset initializes correctly with valid data files."""
     train_path, val_path = mock_dpo_data
 
-    dataset = DPODataset(train_data_path=train_path, val_data_path=val_path)
+    dataset = LocalPreferenceDataset(train_data_path=train_path, val_data_path=val_path)
 
     # Verify dataset initialization
     assert dataset.task_spec.task_name == "DPO"
@@ -82,15 +82,17 @@ def test_dpo_dataset_initialization(mock_dpo_data):
 
 
 def test_dpo_dataset_invalid_files():
-    """Test that DPODataset raises appropriate errors with invalid files."""
+    """Test that LocalPreferenceDataset raises appropriate errors with invalid files."""
     with pytest.raises(FileNotFoundError):
-        DPODataset(train_data_path="nonexistent.json", val_data_path="nonexistent.json")
+        LocalPreferenceDataset(
+            train_data_path="nonexistent.json", val_data_path="nonexistent.json"
+        )
 
 
 def test_dpo_dataset_data_format(mock_dpo_data):
-    """Test that DPODataset correctly formats the data."""
+    """Test that LocalPreferenceDataset correctly formats the data."""
     train_path, val_path = mock_dpo_data
-    dataset = DPODataset(train_data_path=train_path, val_data_path=val_path)
+    dataset = LocalPreferenceDataset(train_data_path=train_path, val_data_path=val_path)
 
     # Verify data format
     train_sample = dataset.formatted_ds["train"][0]
