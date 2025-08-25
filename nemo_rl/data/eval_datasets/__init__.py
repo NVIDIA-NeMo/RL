@@ -24,6 +24,8 @@ from nemo_rl.data.eval_datasets.mmlu_pro import MMLUProDataset
 def load_eval_dataset(data_config):
     """Loads evaluation dataset."""
     dataset_name = data_config["dataset_name"]
+
+    # mmlu
     if dataset_name.startswith("mmlu") and dataset_name != "mmlu_pro":
         if dataset_name == "mmlu":
             base_dataset = MMLUDataset(
@@ -37,6 +39,12 @@ def load_eval_dataset(data_config):
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
             )
+    elif dataset_name == "mmlu_pro":
+        base_dataset = MMLUProDataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    # aime
     elif dataset_name == "aime2024":
         base_dataset = AIME2024Dataset(
             prompt_file=data_config["prompt_file"],
@@ -47,6 +55,7 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    # gpqa
     elif dataset_name == "gpqa":
         base_dataset = GPQADataset(
             variant="main",
@@ -59,11 +68,7 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    elif dataset_name == "mmlu_pro":
-        base_dataset = MMLUProDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
+    # math
     elif dataset_name == "math":
         base_dataset = MathDataset(
             variant="math_test",
@@ -76,6 +81,7 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    # fall back to local dataset
     else:
         print(f"Loading dataset from {dataset_name}...")
         base_dataset = LocalMathDataset(
@@ -87,6 +93,7 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+
     return base_dataset
 
 
