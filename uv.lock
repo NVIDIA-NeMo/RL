@@ -3141,7 +3141,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchdata" },
     { name = "torchvision", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu128" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.3.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.5.0" },
     { name = "transformers", specifier = ">=4.51.0,<4.54.0" },
     { name = "triton", index = "https://download.pytorch.org/whl/cu128" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.10.0" },
@@ -5942,13 +5942,13 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.3.0"
+version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "transformer-engine-cu12" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/5a/60b25ecc3396fc73b07bf9eb2fbf6a3e186efe1e3e86070017ba9d34a4a0/transformer_engine-2.3.0-py3-none-any.whl", hash = "sha256:2a02c2ac29b9781d09975d4cc373df66ed5f0326ff079a2908c3c26d35ac9ee9", size = 486192, upload-time = "2025-05-19T22:08:25.342Z" },
+    { url = "https://files.pythonhosted.org/packages/13/e7/b1af90c00f6c63abfada141f25c2ef7ed620d01aa62d8c3a8f74644b2396/transformer_engine-2.5.0-py3-none-any.whl", hash = "sha256:a78a2ad01b1f97bccd740f701287fa43cf6ba37ba5a9b2d8c401d35ecdd0898e", size = 535575, upload-time = "2025-07-15T20:48:28.119Z" },
 ]
 
 [package.optional-dependencies]
@@ -5958,7 +5958,7 @@ pytorch = [
 
 [[package]]
 name = "transformer-engine-cu12"
-version = "2.3.0"
+version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -5966,18 +5966,19 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/6a/b94e7bb1c61db83beb89f5500cffb6205ea3c27a343bd29b35e3e5e55bbf/transformer_engine_cu12-2.3.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:3b3632ef9e4ea94ba2a373e45aa98c2ff4aaa929e5418610d1397c59d0fbc3b8", size = 266059296, upload-time = "2025-05-20T00:53:27.635Z" },
-    { url = "https://files.pythonhosted.org/packages/95/30/b4c0741fbe0402aa60f24db81ee50ee213cf068f1b79e2f447543e95f194/transformer_engine_cu12-2.3.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:f4b48957de2318b7009c54bb9442b717a383f6b254a9fc26fac0c67d2d658d52", size = 266398998, upload-time = "2025-05-20T00:54:24.308Z" },
+    { url = "https://files.pythonhosted.org/packages/17/ca/c2594e92fa63366947b2e34f21e7b2c29f5aa7c8ed3648356623af6fc580/transformer_engine_cu12-2.5.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:06676d92ee87e207c91d27a1947a880c4da502667f7b5dacabc1413dc5c5a795", size = 274123550, upload-time = "2025-07-15T21:15:27.622Z" },
+    { url = "https://files.pythonhosted.org/packages/74/84/ee88068473ff38a7d304c7861ff61290eadf1139dfd2fda56804b34724d3/transformer_engine_cu12-2.5.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:d4a63985115bbc399b44a70ef7a8e028cbd53aee6f2a621c11f7c12bd4632095", size = 274534430, upload-time = "2025-07-15T21:16:23.638Z" },
 ]
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.3.0"
+version = "2.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "einops" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/8f/d8b39a34cebb91528f118591e622d9ba1d9e52e4ea40cca1252ec335d07c/transformer_engine_torch-2.3.0.tar.gz", hash = "sha256:2b0adb75d7a5bf590cc5452276db6badb0963de99e6c50c7fde6a3a8a7c504e9", size = 165832, upload-time = "2025-05-15T23:10:38.909Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/1d/73ec467d20d96e0bb12c3047d0567d41955ab2e18ce3c26cb53451773605/transformer_engine_torch-2.5.0.tar.gz", hash = "sha256:f56e65287a1f082ac5f44b8edd3c024131f51414f44ecffcdd1372e2781cb113", size = 159599, upload-time = "2025-07-17T15:37:07.939Z" }
 
 [[package]]
 name = "transformers"

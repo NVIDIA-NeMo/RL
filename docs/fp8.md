@@ -1,6 +1,9 @@
 # FP8 for NeMo-RL
 
-This module provides a suite of tools to enable FP8 quantization for large language models. This module is still in developement. Currently we support FP8 generation, using Deepseek style FP8 (sub channel scaling).
+This module provides a suite of tools to enable FP8 quantization for large language models. This module is still in developement. Currently we support 
+
+* FP8 generation, using Deepseek style FP8 (sub channel scaling)
+* FP8 training, using TransformerEngine as linear layer implementation, supporting Deepseek style FP8 (sub channel scaling) and per-tensor scaling
 
 NeMo-RL monkey patches several vLLM functions to enable FP8 generations for reinforcement learning. The `init_fp8` function patches key `vLLM` components when initialized:
 1.  **`RayDistributedExecutor`**: For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches before model initialization.
@@ -33,6 +36,30 @@ FP8 generations are recommended to be configured with the following settings:
                 use_weight_pow2_scale: False
                 use_activation_pow2_scale: False
 ```
+
+FP8 training requires megatron path, and is recommented to be configured with the following settings:
+
+```
+    policy:
+        megatron_cfg:
+            fp8: "hybrid"               # choices: [hybrid, e4m3]
+            fp8_recipe: "tensorwise"    # choicse: [tensorwise, blockwise]
+```
+
+### Special note with using FP8 training with Deepseek-style FP8 (sub channel scaling)*
+
+The TransformerEngine implementation of this recipe requires cublas version >= 12.9; however, nemo-rl currently depends on torch 2.7.1 which depends on cuda 12.8; therefore, using the default way will cause the following error 
+```
+File "/opt/ray_venvs/nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 646, in fp8_autocast
+FP8GlobalStateManager.fp8_autocast_enter(
+File "/opt/ray_venvs/nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 465, in fp8_autocast_enter
+assert fp8_block_available, reason_for_no_fp8_block
+           ^^^^^^^^^^^^^^^^^^^
+AssertionError: FP8 block scaled GEMM requires Hopper and CUDA >= 12.9.
+```
+The issue will be resolved when we bump torch version to >=2.8.0 in the future. For now, the following temporal solutions can be used to try Deepseek style FP8 training:
+* Build the NGC pytorch based container from `docker/Dockerfile.ngc_pytorch`. In this way you will use the torch in system python environment, which has cuda version 12.9 or higher.
+
 
 ## Accuracy
 

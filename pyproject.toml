@@ -82,7 +82,7 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.3.0",
+    "transformer-engine[pytorch]==2.5.0",
     "megatron-core",
     "nemo-tron",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
