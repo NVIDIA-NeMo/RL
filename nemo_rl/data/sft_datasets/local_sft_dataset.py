@@ -42,7 +42,7 @@ class LocalSFTDataset:
         }
 
         self.task_spec = TaskDataSpec(
-            "json_dataset",
+            task_name="SFT",
         )
 
     def add_messages_key(

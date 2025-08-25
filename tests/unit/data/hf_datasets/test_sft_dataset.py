@@ -19,7 +19,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.sft_datasets.local_sft_dataset import LocalSFTDataset
+from nemo_rl.data.sft_datasets import LocalSFTDataset
 
 
 @pytest.fixture

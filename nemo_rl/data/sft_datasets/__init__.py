@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import partial
-
 from nemo_rl.data.sft_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.sft_datasets.local_sft_dataset import LocalSFTDataset
 from nemo_rl.data.sft_datasets.oai_format_dataset import OpenAIFormatDataset

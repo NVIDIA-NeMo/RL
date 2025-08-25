@@ -61,6 +61,8 @@ class Tulu3PreferenceDataset:
             trust_remote_code=True,
         )
         self.formatted_ds = ds.map(format_tulu3_preference)
+        # Tulu3 preference dataset has no validation set
+        self.formatted_ds["validation"] = None
 
         self.task_spec = TaskDataSpec(
             task_name="Tulu3Preference",

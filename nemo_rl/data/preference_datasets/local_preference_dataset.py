@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any
+
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class DPODataset:
-    """Dataset class for Direct Preference Optimization (DPO) training.
+class LocalPreferenceDataset:
+    """Dataset class for local preference data, used for Direct Preference Optimization (DPO) and Reward Model (RM) training.
 
-    This class handles loading of preference data for DPO training.
+    This class handles loading of preference data for local preference data.
     The input JSON files should contain examples with the following structure:
     {
         "prompt": str,           # The input prompt/context
@@ -33,12 +35,38 @@ class DPODataset:
 
     """
 
-    def __init__(self, train_data_path: str, val_data_path: str):
+    def __init__(
+        self,
+        train_data_path: str,
+        val_data_path: str,
+        prompt_key: str = "prompt",
+        chosen_key: str = "chosen",
+        rejected_key: str = "rejected",
+    ):
+        train_original_dataset = load_dataset("json", data_files=train_data_path)[
+            "train"
+        ]
+        val_original_dataset = load_dataset("json", data_files=val_data_path)["train"]
+
+        self.prompt_key = prompt_key
+        self.chosen_key = chosen_key
+        self.rejected_key = rejected_key
+
+        formatted_train_dataset = train_original_dataset.map(self._rekey)
+        formatted_val_dataset = val_original_dataset.map(self._rekey)
+
         self.formatted_ds = {
-            "train": load_dataset("json", data_files=train_data_path, split="train"),
-            "validation": load_dataset("json", data_files=val_data_path, split="train"),
+            "train": formatted_train_dataset,
+            "validation": formatted_val_dataset,
         }
 
         self.task_spec = TaskDataSpec(
             task_name="DPO",
         )
+
+    def _rekey(self, data: dict[str, Any]):
+        return {
+            "prompt": data[self.prompt_key],
+            "chosen_response": data[self.chosen_key],
+            "rejected_response": data[self.rejected_key],
+        }

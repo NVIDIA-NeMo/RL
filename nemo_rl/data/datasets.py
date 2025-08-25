@@ -29,6 +29,7 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
+from nemo_rl.data.preference_datasets import load_preference_dataset
 from nemo_rl.data.sft_datasets import load_sft_dataset
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
@@ -161,5 +162,6 @@ __all__ = [
     "preference_collate_fn",
     "rl_collate_fn",
     "load_eval_dataset",
+    "load_preference_dataset",
     "load_sft_dataset",
 ]

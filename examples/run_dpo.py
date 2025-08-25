@@ -22,8 +22,8 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.dpo import MasterConfig, dpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig, hf_datasets
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -174,23 +174,16 @@ def dpo_preprocessor(
 def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
     print("\n▶ Setting up data...")
 
-    if data_config["dataset_name"] == "HelpSteer3":
-        data = hf_datasets.HelpSteer3Dataset()
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = data.formatted_ds["validation"]
-    elif data_config["dataset_name"] == "Tulu3Preference":
-        data = hf_datasets.Tulu3PreferenceDataset()
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = None
-    else:
-        data = hf_datasets.DPODataset(
-            train_data_path=data_config["train_data_path"],
-            val_data_path=data_config["val_data_path"],
-        )
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = data.formatted_ds["validation"]
-
+    # load dataset
+    data = load_preference_dataset(data_config)
+    train_dataset = data.formatted_ds["train"]
+    val_dataset = data.formatted_ds["validation"]
     dpo_task_spec = data.task_spec
+
+    len_val_dataset = len(val_dataset) if val_dataset else 0
+    print(
+        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len_val_dataset} samples, respectively."
+    )
 
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     train_dataset = AllTaskProcessedDataset(
