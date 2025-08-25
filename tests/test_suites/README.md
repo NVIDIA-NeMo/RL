@@ -50,6 +50,10 @@ DRYRUN=1 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama
 
 # Prints Estimated GPUhrs, creates code snapshot, then exits
 DRYRUN=2 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
+
+# Launch but set extra env vars
+EXTRA_ENV="NRL_FORCE_REBUILD_VENVS=true NRL_DEEPSCALER_8K_CKPT=/8k-ckpt NRL_DEEPSCALER_16K_CKPT=/16k-ckpt" \
+CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/sft-llama3.2-1b-1n8g-fsdp2tp1.sh
 ```
 
 After this completes, you can find the result under

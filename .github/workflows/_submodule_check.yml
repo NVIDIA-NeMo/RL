@@ -86,8 +86,9 @@ jobs:
             target_commit=$(git ls-tree origin/${{ inputs.base_ref }} "$submodule_path" | awk '{print $3}')
             
             if [[ -z "$target_commit" ]]; then
-              echo "❌ Could not find $submodule_name in ${{ inputs.base_ref }} branch"
-              failed=1
+              echo "✅ $submodule_name: New submodule being added (not present in ${{ inputs.base_ref }} branch)"
+              changed=1
+              success_body+="$submodule_name: ✅ New submodule being added"$'\n'
               continue
             fi
             

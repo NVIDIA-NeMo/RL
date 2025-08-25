@@ -1,0 +1,51 @@
+defaults: "../../dpo.yaml"
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+policy:
+  model_name: "allenai/Llama-3.1-Tulu-3-8B-SFT"
+  tokenizer:
+    name: "allenai/Llama-3.1-Tulu-3-8B-SFT"
+  train_micro_batch_size: 1
+  train_global_batch_size: 128
+  max_total_sequence_length: 2048
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-7
+      weight_decay: 0.0
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 1.0e-6
+        end_factor: 1.0
+        total_iters: 211
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 1.0
+        end_factor: 0.0
+        total_iters: 1899
+    - milestones: [211]
+
+data:
+  dataset_name: "Tulu3Preference"
+
+dpo:
+  max_num_steps: 2110
+  val_period: -1
+  val_at_start: false
+  preference_average_log_probs: True
+  reference_policy_kl_penalty: 5
+  val_micro_batch_size: ${policy.train_micro_batch_size}
+  val_global_batch_size: ${policy.train_global_batch_size}
+
+checkpointing:
+  metric_name: null
+  save_period: 250
+
+logger:
+  wandb_enabled: True
+  wandb:
+    name: "dpo-tulu3-8b"

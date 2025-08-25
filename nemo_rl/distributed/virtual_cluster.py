@@ -45,14 +45,14 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies.
     BASE = "uv run --locked"
 
-    # Use NeMo-RL direct dependencies.
-    AUTOMODEL = "uv run --locked --extra automodel"
-
     # Use NeMo-RL direct dependencies and NeMo Gym.
     NEMO_GYM = "uv run --locked --extra nemo_gym"
 
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
+
+    # Use NeMo-RL direct dependencies and nemo-automodel.
+    AUTOMODEL = "uv run --locked --extra automodel"
 
     # Megatron-core (and nemo dependencies)
     # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
