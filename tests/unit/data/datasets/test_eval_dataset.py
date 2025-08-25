@@ -21,7 +21,6 @@ from nemo_rl.data.datasets.eval_datasets import (
 )
 
 
-@pytest.mark.skip(reason="dataset download is flaky")
 def test_gpqa_dataset():
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
     gpqa_dataset = GPQADataset()
@@ -46,7 +45,6 @@ def test_gpqa_dataset():
         )
 
 
-@pytest.mark.skip(reason="dataset download is flaky")
 def test_math_dataset():
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
     math_dataset = MathDataset()
@@ -70,7 +68,6 @@ def test_math_dataset():
         )
 
 
-@pytest.mark.skip(reason="dataset download is flaky")
 def test_mmlu_dataset():
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
     mmlu_dataset = MMLUDataset()
