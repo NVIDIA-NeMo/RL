@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_sft_dataset
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -100,7 +100,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
 
     # load dataset
-    data = load_sft_dataset(data_config, seed)
+    data = load_response_dataset(data_config, seed)
     train_dataset = data.formatted_ds["train"]
     val_dataset = data.formatted_ds["validation"]
     sft_task_spec = data.task_spec
