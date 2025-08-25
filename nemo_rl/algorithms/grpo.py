@@ -487,6 +487,74 @@ def refit_policy_generation(
 # ===============================================================================
 
 
+def grpo_data_preprocessing(
+    master_config: MasterConfig,
+    batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+) -> tuple[BatchedDataDict[DatumSpec], torch.Tensor, torch.Tensor]:
+    # Repeat batch items
+    repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
+        master_config["grpo"]["num_generations_per_prompt"]
+    )
+    # Convert LLMMessageLogType to FlatMessagesType for generation
+    batched_flat, input_lengths = batched_message_log_to_flat_message(
+        repeated_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    input_ids = batched_flat["token_ids"]
+
+    return repeated_batch, input_ids, input_lengths
+
+
+def grpo_train_data_preprocessing(
+    master_config: MasterConfig,
+    repeated_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    advantages: torch.Tensor,
+) -> BatchedDataDict[ClippedPGLossDataDict]:
+    # Add loss mask and advantages to each message in LLMMessageLogType
+    for i, message_log in enumerate(repeated_batch["message_log"]):
+        for j, message in enumerate(message_log):
+            if message["role"] == "assistant":
+                message["token_loss_mask"] = torch.ones_like(
+                    message["token_ids"]
+                )
+            else:
+                message["token_loss_mask"] = torch.zeros_like(
+                    message["token_ids"]
+                )
+            if "generation_logprobs" not in message:
+                message["generation_logprobs"] = torch.zeros_like(
+                    message["token_ids"], dtype=torch.float32
+                )
+            message["advantages"] = advantages[i].expand(
+                message["token_ids"].shape
+            )
+
+    # Convert updated LLMMessageLogType to FlatMessagesType for training
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        repeated_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=master_config["policy"][
+            "make_sequence_length_divisible_by"
+        ],
+    )
+
+    # Create training data from flattened messages
+    train_data = BatchedDataDict[ClippedPGLossDataDict](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "advantages": flat_messages["advantages"],
+            "generation_logprobs": flat_messages["generation_logprobs"],
+            "token_mask": flat_messages["token_loss_mask"],
+            "sample_mask": repeated_batch["loss_multiplier"],
+        }
+    )
+
+    return train_data
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -546,6 +614,8 @@ def grpo_train(
         logger.log_metrics(val_metrics, step, prefix="validation")
         logger.log_metrics(validation_timings, step, prefix="timing/validation")
 
+    should_use_nemo_gym = _should_use_nemo_gym(master_config)
+
     # Run grpo training (single-turn)
     batch: BatchedDataDict[DatumSpec]
     for batch in dataloader:
@@ -561,16 +631,14 @@ def grpo_train(
             # Prepare batch
             print("▶ Preparing batch...")
             with timer.time("data_processing"):
-                # Repeat batch items
-                repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
-                    master_config["grpo"]["num_generations_per_prompt"]
-                )
-                # Convert LLMMessageLogType to FlatMessagesType for generation
-                batched_flat, input_lengths = batched_message_log_to_flat_message(
-                    repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                )
-                input_ids = batched_flat["token_ids"]
+                if should_use_nemo_gym:
+                    pass
+                else:
+                    repeated_batch, input_ids, input_lengths = grpo_data_preprocessing(
+                        master_config=master_config,
+                        batch=batch,
+                        tokenizer=tokenizer,
+                    )
 
             # Generate responses - this updates the LLMMessageLogType in repeated_batch
             print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
@@ -600,13 +668,14 @@ def grpo_train(
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
-                elif _should_use_nemo_gym(master_config):
+                elif should_use_nemo_gym:
                     # input_ids is a tensor of shape (batch_size * num_generations, max_seq_len)
                     # input_lengths is a tensor of shape (batch_size * num_generations,)
-                    # repeated_batch 
+                    # repeated_batch has a single key `total_reward`, a tensor of shape (batch_size * num_generations,)
                     (
                         input_ids,
                         input_lengths,
+                        train_data,
                         repeated_batch,
                         rollout_metrics,
                     ) = run_async_nemo_gym_rollout(
@@ -656,46 +725,15 @@ def grpo_train(
                     )
 
             with timer.time("data_processing"):
-                # Add loss mask and advantages to each message in LLMMessageLogType
-                for i, message_log in enumerate(repeated_batch["message_log"]):
-                    for j, message in enumerate(message_log):
-                        if message["role"] == "assistant":
-                            message["token_loss_mask"] = torch.ones_like(
-                                message["token_ids"]
-                            )
-                        else:
-                            message["token_loss_mask"] = torch.zeros_like(
-                                message["token_ids"]
-                            )
-                        if "generation_logprobs" not in message:
-                            message["generation_logprobs"] = torch.zeros_like(
-                                message["token_ids"], dtype=torch.float32
-                            )
-                        message["advantages"] = advantages[i].expand(
-                            message["token_ids"].shape
-                        )
-
-                # Convert updated LLMMessageLogType to FlatMessagesType for training
-                flat_messages, input_lengths = batched_message_log_to_flat_message(
-                    repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    make_sequence_length_divisible_by=master_config["policy"][
-                        "make_sequence_length_divisible_by"
-                    ],
-                )
-
-                # Create training data from flattened messages
-                train_data = BatchedDataDict[ClippedPGLossDataDict](
-                    {
-                        "input_ids": flat_messages["token_ids"],
-                        "input_lengths": input_lengths,
-                        "advantages": flat_messages["advantages"],
-                        "generation_logprobs": flat_messages["generation_logprobs"],
-                        "token_mask": flat_messages["token_loss_mask"],
-                        "sample_mask": repeated_batch["loss_multiplier"],
-                    }
-                )
-                train_data.to("cpu")
+                if should_use_nemo_gym:
+                    pass
+                else:
+                    train_data = grpo_train_data_preprocessing(
+                        master_config=master_config,
+                        repeated_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        advantages=advantages,
+                    )
 
             print("▶ Preparing for logprob inference...")
             with timer.time("logprob_inference_prep"):
