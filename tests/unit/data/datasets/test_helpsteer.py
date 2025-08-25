@@ -15,7 +15,7 @@
 
 import pytest
 
-from nemo_rl.data.hf_datasets.helpsteer3 import (
+from nemo_rl.data.datasets.preference_datasets.helpsteer3 import (
     HelpSteer3Dataset,
     format_helpsteer3,
 )
