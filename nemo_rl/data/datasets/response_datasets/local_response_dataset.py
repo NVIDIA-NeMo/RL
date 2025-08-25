@@ -20,6 +20,21 @@ from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class LocalResponseDataset:
+    """Dataset class for local response data.
+
+    This class handles loading of response data for SFT and RL training.
+    The input JSON files should contain examples with the following structure:
+    {
+        input_key: str,     # The input prompt/context
+        output_key: str,    # The output response/answer
+    }
+
+    Args:
+        train_ds_path: Path to the JSON file containing training data
+        val_ds_path: Path to the JSON file containing validation data
+        input_key: Key for the input text
+        output_key: Key for the output text
+    """
     def __init__(
         self,
         train_ds_path: str,
