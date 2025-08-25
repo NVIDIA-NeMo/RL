@@ -65,4 +65,3 @@ cat ${RUN_LOG}.aime-24k       | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"sco
  
 uv run tests/check_metrics.py ${RUN_LOG}-24k-metric.json \
   'data["score"] >= 0.2396'
-

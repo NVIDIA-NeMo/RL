@@ -40,4 +40,4 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["1"] < 0.37' \
         'data["train/loss"]["20"] < 0.3' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 35'
-fi 
+fi
