@@ -39,7 +39,13 @@ basic_vllm_test_config: VllmConfig = {
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
-    "temperature": 0.8,
+    # Set temperature=1.0 to ensure consistent probability scaling when comparing vLLM and HF policy outputs.
+    # Note: greedy=True is only used in tests for deterministic behavior and not used in the real training.
+    # In vLLM, enabling greedy=True disables temperature scaling (temperature is overridden to None).
+    # The HF policy worker does not currently support greedy=True for get_logprobs.
+    # Using temperature=1.0 allows us to meaningfully test the average probability multiplicative error between the two implementations,
+    # while still maintaining the deterministic behavior.
+    "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
     "stop_token_ids": None,
