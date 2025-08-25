@@ -66,6 +66,16 @@ def sft_preprocessor(
     if datum_preprocessor is not None:
         datum_dict = datum_preprocessor(datum_dict)
 
+    # Debug: Show first sample with tools
+    if idx == 0 and datum_dict.get("tools"):
+        print("\n" + "="*80)
+        print("DEBUG: First sample with tools from data:")
+        print("-"*80)
+        print(f"Tools: {datum_dict['tools']}")
+        print("-"*80)
+        print(f"Messages: {datum_dict['messages']}")
+        print("="*80 + "\n")
+    
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,

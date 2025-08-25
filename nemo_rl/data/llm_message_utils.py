@@ -531,6 +531,19 @@ def get_formatted_message_log(
             add_special_tokens=False,
             tools=tools if tools is not None else task_data_spec.tools,
         )
+        
+        # Debug: Print formatted message with tools for the last message (complete conversation)
+        _tools = tools if tools is not None else task_data_spec.tools
+        if i == len(message_log_strs) - 1 and _tools and not hasattr(get_formatted_message_log, '_debug_printed'):
+            get_formatted_message_log._debug_printed = True
+            print("\n" + "="*80)
+            print("DEBUG: First complete conversation after apply_chat_template with tools:")
+            print("-"*80)
+            print(f"Number of tools provided: {len(_tools)}")
+            print(f"Tool names: {[t.get('function', {}).get('name', 'unknown') for t in _tools]}")
+            print("-"*80)
+            print(formatted_message)
+            print("="*80 + "\n")
 
         ## get the length of the previous message, excluding the eos token (if present)
         prev_message_len_no_eos: int = get_first_index_that_differs(
