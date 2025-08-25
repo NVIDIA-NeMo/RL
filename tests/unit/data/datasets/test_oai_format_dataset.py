@@ -19,7 +19,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.sft_datasets import OpenAIFormatDataset
+from nemo_rl.data.datasets.response_datasets import OpenAIFormatDataset
 
 
 @pytest.fixture
