@@ -23,8 +23,8 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.rm import MasterConfig, rm_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig, hf_datasets
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -109,19 +109,15 @@ def rm_preprocessor(
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
-    data_cls = data_config["dataset_name"]
 
-    if data_cls == "HelpSteer3":
-        data = hf_datasets.HelpSteer3Dataset()
-    else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
-    )
-
+    # load dataset
+    data = load_preference_dataset(data_config)
     train_dataset = data.formatted_ds["train"]
     val_dataset = data.formatted_ds["validation"]
     rm_task_spec = data.task_spec
+    print(
+        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+    )
 
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
