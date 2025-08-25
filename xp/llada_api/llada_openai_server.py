@@ -55,11 +55,6 @@ else:
     generate_with_dual_cache = None
     LLaDAModelLM = None
 
-# Add NeMo-RL to Python path
-NEMO_RL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../..')
-if os.path.exists(NEMO_RL_PATH):
-    sys.path.insert(0, NEMO_RL_PATH)
-
 # Import NeMo-RL utilities for DCP handling (optional for local mode)
 try:
     from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, load_checkpoint
