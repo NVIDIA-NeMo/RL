@@ -443,6 +443,7 @@ unset UV_CACHE_DIR
 
 # Environment setup
 export PATH="/root/.local/bin:\$PATH"
+export PYTHONPATH="$PROJECT_DIR:\${PYTHONPATH:-}"
 VENV_DIR="/opt/nemo_rl_venv"
 
 echo "===================================================================="
