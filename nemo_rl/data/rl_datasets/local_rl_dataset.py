@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
 
-__all__ = [
-    "COMMON_CHAT_TEMPLATES",
-]
+class LocalRLDataset:
+    pass
