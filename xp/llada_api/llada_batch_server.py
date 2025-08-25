@@ -348,6 +348,24 @@ class BatchProcessor:
                 gen_length = ((gen_length // block_length) + 1) * block_length
                 logger.debug(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
             
+            # Pretty print sample messages from the first request in the batch
+            sample_request = batch_requests[0]
+            sample_request_id = sample_request.request_id
+            logger.info("=" * 80)
+            logger.info(f"📝 BATCH SAMPLE INPUT ({len(batch_requests)} requests total) [Request ID: {sample_request_id}]:")
+            logger.info("=" * 80)
+            for i, msg in enumerate(sample_request.request.messages):
+                logger.info(f"[{i+1}] {msg.role.upper()}:")
+                # Handle multi-line content better
+                content_lines = msg.content.strip().split('\n')
+                if len(content_lines) == 1:
+                    logger.info(f"    {content_lines[0]}")
+                else:
+                    for line in content_lines:
+                        logger.info(f"    {line}")
+                if i < len(sample_request.request.messages) - 1:  # Add separator between messages
+                    logger.info("    " + "-" * 60)
+            
             # Generate with Fast-dLLM (batch processing)
             try:
                 if config['use_cache']:
@@ -399,6 +417,9 @@ class BatchProcessor:
             
             # Decode and format responses
             results = []
+            sample_response_text = None  # Store sample response for pretty printing
+            sample_output_request_id = None  # Store the request ID of the sample output
+            
             for i, (batch_req, prompt_ids) in enumerate(zip(batch_requests, padded_prompts)):
                 try:
                     # Extract generated tokens for this request
@@ -407,6 +428,11 @@ class BatchProcessor:
                         generated_tokens, 
                         skip_special_tokens=True
                     )[0].strip()
+                    
+                    # Store response from the same request we printed input for
+                    if batch_req.request_id == sample_request_id:
+                        sample_response_text = generated_text
+                        sample_output_request_id = batch_req.request_id
                     
                     # Create response
                     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -439,6 +465,20 @@ class BatchProcessor:
                 except Exception as e:
                     logger.error(f"Failed to decode response for request {batch_req.request_id}: {e}")
                     results.append(HTTPException(status_code=500, detail=f"Failed to decode response: {e}"))
+            
+            # Pretty print sample response from the same request we printed input for
+            if sample_response_text is not None and sample_output_request_id == sample_request_id:
+                logger.info("=" * 80)
+                logger.info(f"🤖 BATCH SAMPLE OUTPUT [Request ID: {sample_output_request_id}]:")
+                logger.info("=" * 80)
+                # Handle multi-line responses better
+                response_lines = sample_response_text.strip().split('\n')
+                if len(response_lines) == 1:
+                    logger.info(f"    {response_lines[0]}")
+                else:
+                    for line in response_lines:
+                        logger.info(f"    {line}")
+                logger.info("=" * 80)
             
             return results
             
