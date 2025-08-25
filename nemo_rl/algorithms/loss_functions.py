@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, TypedDict, TypeVar, NotRequired
+from typing import Any, Optional, TypedDict, TypeVar
 
 import torch
-import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import (
@@ -138,8 +137,6 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        next_token_logits = next_token_logits.to(torch.float32)
-
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
                 "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
@@ -160,6 +157,7 @@ class ClippedPGLossFn(LossFunction):
                 next_token_logits, data["input_ids"], seq_index=seq_index
             )
         else:
+            next_token_logits = next_token_logits.to(torch.float32)
             next_token_logits_wo_last = next_token_logits[
                 :, :-1
             ]  # Remove last position's logits
@@ -328,8 +326,6 @@ class NLLLoss(LossFunction):
         mask = token_mask * sample_mask.unsqueeze(-1)
         seq_index = data.get("seq_index", None)
 
-        next_token_logits = next_token_logits.to(torch.float32)
-
         # Gather the logprobs for the actual next tokens
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
@@ -352,6 +348,7 @@ class NLLLoss(LossFunction):
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            next_token_logits = next_token_logits.to(torch.float32)
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )
@@ -584,7 +581,6 @@ class DPOLossFn(PreferenceLoss):
         sample_mask = data["sample_mask"]
         seq_index = data.get("seq_index", None)
 
-        next_token_logits = next_token_logits.to(torch.float32)
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
                 "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
@@ -606,6 +602,7 @@ class DPOLossFn(PreferenceLoss):
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            next_token_logits = next_token_logits.to(torch.float32)
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )
@@ -784,7 +781,7 @@ class DistillationLossDataDict(TypedDict):
     input_lengths: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    teacher_logprobs: NotRequired[torch.Tensor]
+    teacher_logprobs: torch.Tensor
 
 
 class DistillationLossFn(LossFunction):
