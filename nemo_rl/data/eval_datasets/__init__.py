@@ -76,10 +76,10 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    elif dataset_name == "local":
+    else:
+        print(f"Loading dataset from {dataset_name}...")
         base_dataset = LocalMathDataset(
-            name=dataset_name,
-            data_paths=data_config["data_paths"],
+            data_path=dataset_name,
             problem_key=data_config["problem_key"],
             solution_key=data_config["solution_key"],
             file_format=data_config["file_format"],
@@ -87,8 +87,6 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    else:
-        raise ValueError(f"Unknown dataset {dataset_name}.")
     return base_dataset
 
 
