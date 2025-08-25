@@ -237,8 +237,8 @@ jobs:
           script: |
             const needsAttention = ${{ toJSON(needs.check.outputs.needs_attention) }} === '1';
             const title = needsAttention ? 
-              '## ⚠️  File Synchronization Check' : 
-              '## ℹ️  File Synchronization Check';
+              '## ⚠️  File Consistency Check' : 
+              '## ℹ️  File Consistency Check';
             
             const headSha = ${{ toJSON(inputs.head_sha) }};
             const prNumber = ${{ toJSON(inputs.pr_number) }};
