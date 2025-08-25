@@ -86,6 +86,7 @@ class GRPOConfig(TypedDict):
     val_at_start: bool
     max_val_samples: int
     seed: int
+    overlong_filtering: NotRequired[bool]
 
 
 class GRPOSaveState(TypedDict):
@@ -635,6 +636,16 @@ def grpo_train(
                     )
 
             with timer.time("data_processing"):
+                use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                if use_overlong_filtering:
+                    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                    truncated = repeated_batch["truncated"]
+
+                    if isinstance(truncated, list):
+                        truncated = torch.tensor(truncated, dtype=torch.bool)
+
+                    loss_multiplier[truncated] = 0
+                    repeated_batch["loss_multiplier"] = loss_multiplier
                 # Add loss mask and advantages to each message in LLMMessageLogType
                 for i, message_log in enumerate(repeated_batch["message_log"]):
                     for j, message in enumerate(message_log):
