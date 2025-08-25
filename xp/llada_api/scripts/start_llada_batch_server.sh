@@ -26,7 +26,7 @@ JOB_NAME="llada-batch-server"
 TIME="4:00:00"
 GPUS_PER_NODE=1
 CPUS_PER_TASK=16
-MEM="64G"
+MEM="128G"
 PARTITION="interactive"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/mfathi/containers/nemo_rl_base.sqsh"
 
