@@ -88,7 +88,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     Examples:
     ```{doctest}
     >>> import torch
-    >>> from nemo_rl.data.datasets import eval_collate_fn
+    >>> from nemo_rl.data.collate_fn import eval_collate_fn
     >>> from nemo_rl.data.interfaces import DatumSpec
     >>> data_batch = [
     ...     DatumSpec(

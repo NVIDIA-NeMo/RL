@@ -11,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo_rl.data.preference_datasets.helpsteer3 import HelpSteer3Dataset
-from nemo_rl.data.preference_datasets.local_preference_dataset import (
-    LocalPreferenceDataset,
-)
-from nemo_rl.data.preference_datasets.tulu3 import Tulu3PreferenceDataset
+from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.preference_datasets.local_preference_dataset import LocalPreferenceDataset
+from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
 
 
 def load_preference_dataset(data_config):
