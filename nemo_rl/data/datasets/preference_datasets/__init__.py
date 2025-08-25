@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
-from nemo_rl.data.datasets.preference_datasets.local_preference_dataset import LocalPreferenceDataset
+from nemo_rl.data.datasets.preference_datasets.local_preference_dataset import (
+    LocalPreferenceDataset,
+)
 from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
 
 
