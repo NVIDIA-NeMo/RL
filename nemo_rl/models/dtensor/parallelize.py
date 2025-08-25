@@ -472,7 +472,6 @@ def _parallelize_nm5_h(
 
 
 def _parallelize_model(
-    # TESTING CI alert
     model: Union[
         Qwen2ForCausalLM,
         Qwen3ForCausalLM,

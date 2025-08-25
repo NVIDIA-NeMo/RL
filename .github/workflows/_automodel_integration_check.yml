@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: "Automodel Integration Synchronization Check"
+name: "Automodel Integration Files Consistency Check"
 
 on:
   workflow_call:
@@ -116,9 +116,9 @@ jobs:
             comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
             comment_body+="**Action required:**"$'\n'
             comment_body+="- Please review if the changes in \`${PARALLELIZE_FILE}\` should also be applied to \`${OPTIMIZED_TP_PLANS_FILE}\` or \`${PARALLELIZER_FILE}\`"$'\n'
-            comment_body+="- Update the appropriate related file(s) if necessary to maintain synchronization"$'\n'
+            comment_body+="- Update the appropriate related file(s) if necessary to maintain functional consistency"$'\n'
             comment_body+="- Request access to the [NVIDIA-NeMo/Automodel](https://github.com/NVIDIA-NeMo/Automodel/) repository, create a PR against the \`nemo-rl-submodule\` branch, and update the Automodel submodule in the nemo-rl index"$'\n'
-            comment_body+="- Add @ffrujeri as a reviewer of this PR if you have any questions about the synchronization requirements"$'\n'
+            comment_body+="- Add @ffrujeri as a reviewer of this PR if you have any questions about the consistency requirements"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${PARALLELIZE_FILE}\`"$'\n'
@@ -126,7 +126,7 @@ jobs:
             comment_body+="- Not modified: \`${PARALLELIZER_FILE}\`"$'\n\n'
             
           else
-            echo "ℹ️  No synchronization issues detected for parallel plan files"
+            echo "ℹ️  No consistency issues detected for parallel plan files"
             # Don't set comment_body in this case to avoid unnecessary comments
           fi
           
@@ -174,7 +174,7 @@ jobs:
             comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
             comment_body+="**Action required:**"$'\n'
             comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
-            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_V2_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_V2_FILE}\` if necessary to maintain consistency"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
@@ -189,7 +189,7 @@ jobs:
             comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
             comment_body+="**Action required:**"$'\n'
             comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_V2_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
-            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_FILE}\` if necessary to maintain consistency"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
@@ -218,11 +218,11 @@ jobs:
           
           if [[ $needs_attention -eq 1 ]]; then
             echo ""
-            echo "⚠️  File synchronization needs attention"
+            echo "⚠️  Files consistency needs attention"
             echo "Please review the changes and ensure related files are properly synchronized"
           else
             echo ""
-            echo "✅ File synchronization check completed"
+            echo "✅ File consistency check completed"
           fi
 
   comment:
