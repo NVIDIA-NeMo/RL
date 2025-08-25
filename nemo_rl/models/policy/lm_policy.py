@@ -90,9 +90,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
                 "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
             )
-            worker_builder_cls = (
-                "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-            )
+
+            # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
+            use_v2 = config["dtensor_cfg"].get("_v2", False)
+            if use_v2:
+                worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+            else:
+                worker_builder_cls = (
+                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+                )
+
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
@@ -133,7 +140,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             name_prefix=name_prefix,
             workers_per_node=workers_per_node,
             sharding_annotations=self.sharding_annotations,
-            env_vars=env_vars,
+            env_vars=env_vars or {},
         )
 
         if config["dynamic_batching"]["enabled"]:

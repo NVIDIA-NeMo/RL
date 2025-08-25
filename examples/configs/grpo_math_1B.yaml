@@ -44,6 +44,7 @@ policy:
   logprob_chunk_size: null
 
   dtensor_cfg:
+    _v2: true
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -114,6 +115,8 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    env_vars: null
+
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
@@ -174,6 +177,9 @@ policy:
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

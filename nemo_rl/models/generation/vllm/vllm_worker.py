@@ -135,6 +135,7 @@ class BaseVllmGenerationWorker:
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -202,9 +203,14 @@ class BaseVllmGenerationWorker:
             logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
 
             def _patch_vllm_init_workers_ray():
-                # Patch the vLLM ray_distributed_executor.py file to pass custom runtime_env in _init_workers_ray call.
-                # This allows passing custom py_executable to worker initialization.
+                """Patch the vLLM ray_distributed_executor.py file.
 
+                1. Pass custom runtime_env in _init_workers_ray call.
+                    - This allows passing custom py_executable to worker initialization.
+                2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
+                    - This is a workaround to fix async vllm in some scenarios.
+                    - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+                """
                 try:
                     import vllm.executor.ray_distributed_executor as ray_executor_module
 
@@ -213,26 +219,36 @@ class BaseVllmGenerationWorker:
                     with open(file_to_patch, "r") as f:
                         content = f.read()
 
-                    old_line = "self._init_workers_ray(placement_group)"
-                    new_line = f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})'
+                    old_lines = [
+                        "self._init_workers_ray(placement_group)",
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+                    ]
 
-                    if new_line in content:
+                    new_lines = [
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                    ]
+
+                    need_replace = False
+                    for old_line, new_line in zip(old_lines, new_lines):
+                        if new_line in content or old_line not in content:
+                            continue
+                        content = content.replace(old_line, new_line)
+                        need_replace = True
+
+                    if not need_replace:
                         return
-
-                    if old_line not in content:
-                        return
-
-                    patched_content = content.replace(old_line, new_line)
 
                     # Write back the patched content
                     with open(file_to_patch, "w") as f:
-                        f.write(patched_content)
+                        f.write(content)
 
                 except (ImportError, FileNotFoundError, PermissionError):
                     # Allow failures gracefully
                     pass
 
             _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
 
             # Patch the vLLM sampler.py file to modify logprobs computation wrt temperature.
             # This replaces raw_logprobs = self.compute_logprobs(logits) with custom temperature-applied logprobs.
@@ -332,6 +348,16 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
+        if self.cfg["vllm_cfg"]["precision"] == "fp8":
+            from nemo_rl.models.generation.fp8 import init_fp8
+
+            fp8_kwargs = init_fp8(
+                self.cfg["vllm_cfg"], self.model_name, model_parallel_size
+            )
+            vllm_kwargs.update(fp8_kwargs)
+            # overriden by quant config, however vllm complains if this not passed
+            self.precision = "bfloat16"
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -342,7 +368,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            dtype=self.cfg["vllm_cfg"]["precision"],
+            dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
