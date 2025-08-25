@@ -68,7 +68,13 @@ def test_dpo_dataset_initialization(mock_dpo_data):
     """Test that LocalPreferenceDataset initializes correctly with valid data files."""
     train_path, val_path = mock_dpo_data
 
-    dataset = LocalPreferenceDataset(train_data_path=train_path, val_data_path=val_path)
+    dataset = LocalPreferenceDataset(
+        train_data_path=train_path,
+        val_data_path=val_path,
+        prompt_key="prompt",
+        chosen_key="chosen_response",
+        rejected_key="rejected_response",
+    )
 
     # Verify dataset initialization
     assert dataset.task_spec.task_name == "DPO"
@@ -92,7 +98,13 @@ def test_dpo_dataset_invalid_files():
 def test_dpo_dataset_data_format(mock_dpo_data):
     """Test that LocalPreferenceDataset correctly formats the data."""
     train_path, val_path = mock_dpo_data
-    dataset = LocalPreferenceDataset(train_data_path=train_path, val_data_path=val_path)
+    dataset = LocalPreferenceDataset(
+        train_data_path=train_path,
+        val_data_path=val_path,
+        prompt_key="prompt",
+        chosen_key="chosen_response",
+        rejected_key="rejected_response",
+    )
 
     # Verify data format
     train_sample = dataset.formatted_ds["train"][0]
