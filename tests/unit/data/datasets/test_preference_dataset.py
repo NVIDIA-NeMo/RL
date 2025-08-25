@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 
-from nemo_rl.data.preference_datasets import LocalPreferenceDataset
+from nemo_rl.data.datasets.preference_datasets import LocalPreferenceDataset
 
 
 @pytest.fixture
