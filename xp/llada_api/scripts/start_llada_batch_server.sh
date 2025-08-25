@@ -535,8 +535,38 @@ done
 EOF
 )
 
+    # Build container mounts - start with project directory
+    CONTAINER_MOUNTS="$PROJECT_DIR:$PROJECT_DIR"
+    
+    # Auto-mount model path if it's a local directory
+    if [[ -n "$MODEL_PATH" ]] && [[ -d "$MODEL_PATH" || -f "$MODEL_PATH" ]]; then
+        # Get absolute path to ensure proper mounting
+        MODEL_ABS_PATH=$(realpath "$MODEL_PATH")
+        CONTAINER_MOUNTS="$CONTAINER_MOUNTS,$MODEL_ABS_PATH:$MODEL_ABS_PATH"
+        print_status "Auto-mounting model path: $MODEL_ABS_PATH"
+    fi
+    
+    # Auto-mount DCP path if it's a local directory
+    if [[ -n "$DCP_PATH" ]] && [[ -d "$DCP_PATH" ]]; then
+        # Get absolute path to ensure proper mounting
+        DCP_ABS_PATH=$(realpath "$DCP_PATH")
+        CONTAINER_MOUNTS="$CONTAINER_MOUNTS,$DCP_ABS_PATH:$DCP_ABS_PATH"
+        print_status "Auto-mounting DCP path: $DCP_ABS_PATH"
+    fi
+    
+    # Auto-mount temp directory if using DCP (in case it's outside project dir)
+    if [[ -n "$DCP_PATH" ]] && [[ "$TEMP_DIR" != "/tmp/"* ]]; then
+        # Only mount if temp dir is not in /tmp (which is usually available in containers)
+        TEMP_ABS_PATH=$(realpath -m "$TEMP_DIR")  # -m creates path if it doesn't exist
+        if [[ "$TEMP_ABS_PATH" != "$PROJECT_DIR"* ]]; then
+            CONTAINER_MOUNTS="$CONTAINER_MOUNTS,$TEMP_ABS_PATH:$TEMP_ABS_PATH"
+            print_status "Auto-mounting temp directory: $TEMP_ABS_PATH"
+        fi
+    fi
+
     # Submit the SLURM job
     print_status "Submitting SLURM job..."
+    print_status "Container mounts: $CONTAINER_MOUNTS"
     
     srun --job-name="$JOB_NAME" \
          --time="$TIME" \
@@ -548,7 +578,7 @@ EOF
          --no-container-mount-home \
          --container-image="$CONTAINER_IMAGE" \
          --container-workdir="$PROJECT_DIR" \
-         --container-mounts="$PROJECT_DIR:$PROJECT_DIR" \
+         --container-mounts="$CONTAINER_MOUNTS" \
          bash -c "$COMMAND_BLOCK"
 }
 
