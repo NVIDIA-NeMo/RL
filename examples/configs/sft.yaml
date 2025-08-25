@@ -142,6 +142,14 @@ data:
   split: null
   output_key: null
   seed: null
+  
+  ## OpenAI format specific configs
+  # train_data_path: "/path/to/train.jsonl"  # Path to training data
+  # val_data_path: "/path/to/val.jsonl"      # Path to validation data
+  # chat_key: "messages"                     # Key for messages in the data
+  # system_key: null                         # Key for system message (optional)
+  # system_prompt: null                      # Default system prompt (optional)
+  # tool_key: null                           # Key for tools in the data (optional, defaults to "tools" if not specified)
 
 logger:
   log_dir: "logs"  # Base directory for all logs

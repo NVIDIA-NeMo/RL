@@ -443,6 +443,7 @@ def get_formatted_message_log(
     add_bos_token: bool = True,
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
+    tools: Optional[list[dict[str, Any]]] = None,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -453,6 +454,7 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
+        tools: Optional list of tool/function definitions to pass to the chat template. Default: None
 
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
@@ -527,6 +529,7 @@ def get_formatted_message_log(
             add_generation_prompt=add_generation_prompt and message["role"] == "user",
             tokenize=False,
             add_special_tokens=False,
+            tools=tools if tools is not None else task_data_spec.tools,
         )
 
         ## get the length of the previous message, excluding the eos token (if present)

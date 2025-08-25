@@ -44,10 +44,12 @@ class OpenAIFormatDataset:
         chat_key: str = "messages",
         system_key: str | None = None,
         system_prompt: str | None = None,
+        tool_key: str | None = "tools",
     ):
         self.chat_key = chat_key
         self.system_key = system_key
         self.system_prompt = system_prompt
+        self.tool_key = tool_key
         train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
         val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
 
@@ -75,4 +77,10 @@ class OpenAIFormatDataset:
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
         assert messages[-1]["role"] == "assistant"
-        return {"messages": messages}
+        
+        # Preserve tools if they exist in the data
+        result = {"messages": messages}
+        if self.tool_key and self.tool_key in example:
+            result["tools"] = example[self.tool_key]
+        
+        return result
