@@ -267,6 +267,7 @@ jobs:
       - pre-flight
       - lint-check
       - sphinx-build
+      - build-container
       - cicd-doc-tests
       - cicd-unit-tests
       - cicd-functional-tests
@@ -283,6 +284,7 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
+                  needs.build-container.result == 'success' &&
                   (
                     (
                       (needs.cicd-doc-tests.result == 'skipped' || needs.cicd-doc-tests.result == 'success') &&
