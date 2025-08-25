@@ -41,7 +41,7 @@ class LocalMathDataset:
         self._solution_key = solution_key
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
-            task_name=os.path.basename(data_path).split('.')[0],
+            task_name=os.path.basename(data_path).split(".")[0],
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
