@@ -443,11 +443,13 @@ unset UV_CACHE_DIR
 
 # Environment setup
 export PATH="/root/.local/bin:\$PATH"
+export PYTHONPATH="$PROJECT_DIR:\${PYTHONPATH:-}"
 VENV_DIR="/opt/nemo_rl_venv"
 
 echo "===================================================================="
 echo "LLaDA $SERVER_TYPE_DISPLAY OpenAI API Server starting on compute node: \$(hostname)"
 echo "Using container's Python environment: \${VENV_DIR}"
+echo "PYTHONPATH set to include NeMo-RL project: $PROJECT_DIR"
 echo "===================================================================="
 
 # Activate the container's existing Python environment
