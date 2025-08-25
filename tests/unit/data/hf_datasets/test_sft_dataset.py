@@ -19,9 +19,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.hf_datasets.prompt_response_dataset import (
-    PromptResponseDataset,
-)
+from nemo_rl.data.sft_datasets.local_sft_dataset import LocalSFTDataset
 
 
 @pytest.fixture
@@ -57,7 +55,7 @@ def sample_data(request):
 @pytest.mark.parametrize("sample_data", [("input", "output")], indirect=True)
 def test_dataset_initialization(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(train_path, val_path)
+    dataset = LocalSFTDataset(train_path, val_path)
 
     assert dataset.input_key == "input"
     assert dataset.output_key == "output"
@@ -68,7 +66,7 @@ def test_dataset_initialization(sample_data):
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_custom_keys(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(
+    dataset = LocalSFTDataset(
         train_path, val_path, input_key="question", output_key="answer"
     )
 
@@ -80,7 +78,7 @@ def test_custom_keys(sample_data):
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_message_formatting(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(
+    dataset = LocalSFTDataset(
         train_path, val_path, input_key="question", output_key="answer"
     )
 

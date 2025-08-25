@@ -19,7 +19,7 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class PromptResponseDataset:
+class LocalSFTDataset:
     def __init__(
         self,
         train_ds_path: str,

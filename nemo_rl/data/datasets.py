@@ -17,6 +17,8 @@ import torch
 from datasets import Dataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
+from nemo_rl.data.eval_datasets import load_eval_dataset
+from nemo_rl.data.sft_datasets import load_sft_dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     DPODatumSpec,
@@ -335,3 +337,13 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
         print(
             f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
         )
+
+__all__ = [
+    "AllTaskProcessedDataset",
+    "rl_collate_fn",
+    "eval_collate_fn",
+    "preference_collate_fn",
+    "dpo_collate_fn",
+    "load_eval_dataset",
+    "load_sft_dataset",
+]
