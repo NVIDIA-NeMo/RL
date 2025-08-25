@@ -47,11 +47,11 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
     get_grad_norm,
-    get_logprobs_from_vocab_parallel_logits,
     to_local_if_dtensor,
 )
 from nemo_rl.models.huggingface.common import (
@@ -1241,6 +1241,14 @@ class DTensorPolicyWorker:
 
     def return_state_dict(self):
         return self.model.state_dict()
+
+    def return_model_config(self) -> dict[str, Any]:
+        """Return the model configuration as a dictionary.
+
+        Returns:
+            dict: Model configuration dictionary
+        """
+        return self.model.config
 
     def report_device_id(self) -> str:
         """Report the UUID of the current CUDA device using NVML.

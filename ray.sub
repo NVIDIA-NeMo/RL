@@ -59,7 +59,7 @@ DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
 METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 
 # Ports for the head node
-PORT=${PORT:-54258}
+PORT=${PORT:-54514}
 RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}
@@ -70,7 +70,7 @@ DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 # (not including the other ports set by this script). So this range is chosen to be
 # somewhere in the middle
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54257}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
