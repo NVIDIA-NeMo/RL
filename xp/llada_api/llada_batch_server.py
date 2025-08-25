@@ -50,6 +50,11 @@ else:
     logging.warning(f"Fast-dLLM path not found: {FAST_DLLM_PATH}")
     FAST_DLLM_AVAILABLE = False
 
+# Add NeMo-RL to Python path
+NEMO_RL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../..')
+if os.path.exists(NEMO_RL_PATH):
+    sys.path.insert(0, NEMO_RL_PATH)
+
 # Import original server components
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llada_openai_server import (
