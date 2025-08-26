@@ -123,6 +123,16 @@ class Penguin(EnvironmentInterface):
         results = tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
         return [r.json() for r in results]
 
+    def responses_to_message_logs(self, batch_responses: list[dict]) -> list[dict]:
+        """
+        A message looks like this:
+        {
+            "role": "assistant",  # or "user"
+            "content": text,
+            "token_ids": output_ids[i, input_length:total_length],
+        }
+        """
+
     def shutdown(self) -> None:
         for start_task in self.start_tasks:
             ray.cancel(start_task)

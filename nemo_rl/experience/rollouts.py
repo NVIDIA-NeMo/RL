@@ -904,10 +904,64 @@ def run_async_penguin_rollout(
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
+    from nemo_rl.environments.penguin import Penguin
+
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     penguin_rows = input_batch["extra_env_info"]
 
-    penguin_environment = task_to_env["penguin"]
+    penguin_environment: Penguin = task_to_env["penguin"]
     results = asyncio.run(penguin_environment.run_rollouts(penguin_rows))
 
-    pass    
+    message_logs = penguin_environment.responses_to_message_logs([r["response"] for r in results])
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": message_logs,
+            "total_reward": torch.stack([r["reward"] for r in results]),
+        }
+    )
+
+    batch_size = len(penguin_rows)
+    all_sample_metrics = [
+        {
+            "total_reward": r["reward"]
+        }
+        for r in results
+    ]
+
+    # Aggregate metrics across all samples
+    rollout_metrics = {
+        # TODO: support these metrics.
+        # # Overall metrics
+        # "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
+        # "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
+        # / batch_size,
+        # "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+        # "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+        # / batch_size,
+        # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
+        # / batch_size,
+        # "max_turns_reached_rate": sum(
+        #     m["max_turns_reached"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # # Token usage metrics
+        # "mean_total_tokens_per_sample": sum(
+        #     m["total_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # "mean_gen_tokens_per_sample": sum(
+        #     m["assistant_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # "mean_env_tokens_per_sample": sum(
+        #     m["env_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # Reward metrics
+        "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
+        / batch_size,
+        "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+        "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+    }
+
+    return final_batch, rollout_metrics
