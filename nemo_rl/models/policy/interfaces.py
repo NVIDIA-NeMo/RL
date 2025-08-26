@@ -34,6 +34,12 @@ class ReferenceLogprobOutputSpec(TypedDict):
     reference_logprobs: torch.Tensor
 
 
+class ScoreOutputSpec(TypedDict):
+    """scores: Tensor of scores."""
+
+    scores: torch.Tensor
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
