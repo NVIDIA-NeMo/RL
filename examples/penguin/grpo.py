@@ -371,13 +371,13 @@ def setup(
 # ===============================================================================
 
 
-def run_async_nemo_gym_rollout(
+def run_async_penguin_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     max_seq_len: int,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
-    """Run rollouts with NeMo Gym
+    """Run rollouts with Penguin
     Async generation is used internally when available but the function is synchronous.
     Args:
         policy_generation: The generation interface (policy)
@@ -638,34 +638,61 @@ def grpo_train(
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
-                # Use async rollouts if vLLM async engine is enabled
-                if _should_use_async_rollouts(master_config):
-                    (
-                        repeated_batch,
-                        rollout_metrics,
-                    ) = run_async_multi_turn_rollout(
-                        policy_generation=policy_generation,
-                        input_batch=repeated_batch,
-                        tokenizer=tokenizer,
-                        task_to_env=task_to_env,
-                        max_seq_len=master_config["policy"][
-                            "max_total_sequence_length"
-                        ],
-                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                        greedy=False,
-                    )
-                else:
-                    repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                        policy_generation=policy_generation,
-                        input_batch=repeated_batch,
-                        tokenizer=tokenizer,
-                        task_to_env=task_to_env,
-                        max_seq_len=master_config["policy"][
-                            "max_total_sequence_length"
-                        ],
-                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                        greedy=False,
-                    )
+
+                ########################################
+                # Original code
+                ########################################
+
+                # # Use async rollouts if vLLM async engine is enabled
+                # if _should_use_async_rollouts(master_config):
+                #     (
+                #         repeated_batch,
+                #         rollout_metrics,
+                #     ) = run_async_multi_turn_rollout(
+                #         policy_generation=policy_generation,
+                #         input_batch=repeated_batch,
+                #         tokenizer=tokenizer,
+                #         task_to_env=task_to_env,
+                #         max_seq_len=master_config["policy"][
+                #             "max_total_sequence_length"
+                #         ],
+                #         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                #         greedy=False,
+                #     )
+                # else:
+                #     repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                #         policy_generation=policy_generation,
+                #         input_batch=repeated_batch,
+                #         tokenizer=tokenizer,
+                #         task_to_env=task_to_env,
+                #         max_seq_len=master_config["policy"][
+                #             "max_total_sequence_length"
+                #         ],
+                #         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                #         greedy=False,
+                #     )
+
+                ########################################
+                # Updated code
+                ########################################
+
+                # input_ids is a tensor of shape (batch_size * num_generations, max_seq_len)
+                # input_lengths is a tensor of shape (batch_size * num_generations,)
+                # repeated_batch has a single key `total_reward`, a tensor of shape (batch_size * num_generations,)
+                (
+                    input_ids,
+                    input_lengths,
+                    train_data,
+                    repeated_batch,
+                    rollout_metrics,
+                ) = run_async_penguin_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=repeated_batch,
+                    tokenizer=tokenizer,
+                    max_seq_len=master_config["policy"][
+                        "max_total_sequence_length"
+                    ],
+                )
                 policy_generation.finish_generation()
 
             # Calculate rewards & advantages
