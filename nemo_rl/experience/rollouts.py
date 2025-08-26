@@ -36,6 +36,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -252,10 +253,12 @@ def calculate_rewards(
         env_info = [batch["extra_env_info"][i] for i in indices]
 
         # Submit task to environment and store future
-        # future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
-        future = task_to_env[task_name].step(messages, env_info)
+        if isinstance(task_to_env[task_name], RewardModelEnvironment):
+            future = task_to_env[task_name].step(messages, env_info)
+        else:
+            future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
+            future_to_indices[future] = indices
         futures.append(future)
-        # future_to_indices[future] = indices
 
     # results = ray.get(futures)
     results = futures
@@ -377,6 +380,13 @@ def run_multi_turn_rollout(
                 active_batch["message_log"],
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
             )
+        )
+        torch.set_printoptions(
+            profile="full", precision=4, linewidth=200, threshold=torch.inf
+        )
+        print(f"active_input_lengths: {active_input_lengths}")
+        torch.set_printoptions(
+            profile="default", precision=4, linewidth=200, threshold=torch.inf
         )
 
         # Extract input_ids and lengths from the flat messages
