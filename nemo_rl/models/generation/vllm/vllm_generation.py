@@ -406,43 +406,6 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
-    def score(
-        self, data: BatchedDataDict[GenerationDatumSpec]
-    ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Score a batch of data using vLLM scoring."""
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "user_contents" in data and "assistant_contents" in data, (
-            "user_contents and assistant_contents are required in data for vLLM scoring"
-        )
-
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
-            dp_size, allow_uneven_shards=True
-        )
-        future_bundle = self.worker_group.run_all_workers_sharded_data(
-            "score",
-            data=sharded_data,
-            in_sharded_axes=["data_parallel"],
-            replicate_on_axes=None,  # just run on tp rank 0
-            output_is_replicated=None,
-        )
-
-        results = self.worker_group.get_all_worker_results(future_bundle)
-
-        combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"scores": 0.0}
-        )
-        required_keys = ["scores"]
-        missing_keys = [key for key in required_keys if key not in combined]
-        if missing_keys:
-            raise ValueError(
-                f"Missing required keys for GenerationOutputSpec: {missing_keys}"
-            )
-
-        return combined
-
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
