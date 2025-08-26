@@ -72,6 +72,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOLoggerConfig,
     MasterConfig as _MasterConfig,
     _default_grpo_save_state,
+    _should_use_async_rollouts,
     refit_policy_generation,
 )
 
@@ -363,28 +364,6 @@ def setup(
         grpo_save_state,
         master_config,
     )
-
-
-# ===============================================================================
-# Core Algorithm Functions
-# ===============================================================================
-
-
-def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
-    """Determine if async rollouts should be used based on the configuration.
-
-    Returns True if vLLM backend is used with async_engine enabled.
-    """
-    generation_config = master_config["policy"]["generation"]
-    if generation_config is None:
-        return False
-
-    backend = generation_config.get("backend", "")
-    if backend != "vllm":
-        return False
-
-    vllm_cfg = generation_config.get("vllm_cfg", {})
-    return vllm_cfg.get("async_engine", False)
 
 
 # ===============================================================================
