@@ -68,18 +68,18 @@ class FIFOSampler:
         return selected
         
 
+
 class MixedSampler:
-    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, target_weight_versions: list[int]) -> list[int]:
+    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: int,target_weight_versions: list[int]) -> list[int]:
 
 
-        #! We select a total of num_prompt_groups trajectories
-        
+        #! We select a total of num_prompt_groups trajectories        
         #! Mixed sampler works by first finding out for how many trajectories is this is the last chance to be selected. Adds those into the selected list
 
         intended_indices = [
                 i
-                for i in valid_indices
-                if target_weight_versions[i] == current_weight_version
+                for i, v in enumerate(self.trajectory_versions)
+                if i == min_valid_version
         ]
 
         #! These indices have to be selected because its their last chance. Now we have remaining num_prompt_groups - len(intended_indices) left to sample from the remaining valid_indices of trajectories those we sample randomly from the remaining
@@ -89,7 +89,7 @@ class MixedSampler:
         # If enough intended are available, just take those (FIFO within intended)
         if len(intended_indices) >= num_prompt_groups:
 
-            #! If this happens its an indidicated that something went wrong somewhere else
+            #! If this happens its an indidication that something went wrong somewhere else
 
             selected: list[int] = intended_indices[:num_prompt_groups]
             print(f"🔴 Selected {len(selected)} trajectories all intended for step {current_weight_version}")
@@ -98,9 +98,10 @@ class MixedSampler:
         selected: list[int] = list(intended_indices)
         remaining_slots = num_prompt_groups - len(selected)
         
+        #! Find the remaining indices not in selected. This can be faster but this is not the blocker anyways so doesn't matter either way (?)
         remaining_pool = [
             i for i in valid_indices
-            if target_weight_versions[i] != current_weight_version
+            if i not in selected
         ]
 
         print(f"Filling remaining {remaining_slots} from {len(remaining_pool)} non-intended valid trajectories (random)")
@@ -114,6 +115,7 @@ class MixedSampler:
         print(f"   ✅ Mixed selection done: {len(selected)} total (intended={len(intended_indices)}, mixed_in={len(selected) - len(intended_indices)})")
 
         return selected
+
 
 
 
