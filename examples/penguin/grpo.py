@@ -478,7 +478,12 @@ def grpo_train(
     master_config: MasterConfig,
     processor: Optional[AutoProcessor] = None,
 ) -> None:
-    """Run GRPO training algorithm."""
+    """
+    Run GRPO training algorithm.
+
+    This is an exact copy of the grpo_train function, with delimited modifications for Penguin integration
+    based on this commit https://github.com/NVIDIA-NeMo/RL/tree/faad02113c3c502437ccb339cb848796334aedd9
+    """
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
