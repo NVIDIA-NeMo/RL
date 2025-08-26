@@ -33,6 +33,7 @@ hf_datasets_cache/
 *logs/
 datasets/
 docker/*
+!docker/patches/
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch
 !docker/README.md
