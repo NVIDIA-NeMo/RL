@@ -153,6 +153,7 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: True
   tensorboard_enabled: True
+  swanlab_enabled: false # Disable SwanLab logging
   mlflow_enabled: False  # Disable MLflow logging
   monitor_gpus: False  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
