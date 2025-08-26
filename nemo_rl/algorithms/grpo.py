@@ -51,6 +51,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_async_penguin_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
