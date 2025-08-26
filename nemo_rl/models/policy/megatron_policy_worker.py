@@ -488,44 +488,14 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
-        self.rank = get_rank_safe()
-        if self.rank == 0:
-            if pt_checkpoint_exists:
-                print(
-                    f"Checkpoint already exists at {pretrained_path}. Skipping import."
-                )
-            else:
-                try:
-                    # Clean environment to prevent conflicts
-                    env_backup = {}
-                    env_vars_to_clean = [
-                        "MASTER_ADDR",
-                        "MASTER_PORT",
-                        "WORLD_SIZE",
-                        "LOCAL_RANK",
-                    ]
-                    for var in env_vars_to_clean:
-                        if var in os.environ:
-                            env_backup[var] = os.environ[var]
-                            del os.environ[var]
-
-                    import_model_from_hf_name(hf_model_name, pretrained_path)
-
-                    # Restore environment
-                    for var, val in env_backup.items():
-                        os.environ[var] = val
-
-                except Exception as e:
-                    print(f"Error importing model: {e}")
-                    raise
-                finally:
-                    # Force cleanup after import
-                    destroy_parallel_state()
-            pre_init_communication_queue.put(True)
+        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
+        torch.distributed.init_process_group("nccl")
+        if pt_checkpoint_exists:
+            print(
+                f"Checkpoint already exists at {pretrained_path}. Skipping import."
+            )
         else:
-            pre_init_communication_queue.get()
-            pre_init_communication_queue.put(True)
-        destroy_parallel_state()
+            import_model_from_hf_name(hf_model_name, pretrained_path, self.cfg["megatron_cfg"])
 
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
@@ -784,7 +754,9 @@ class MegatronPolicyWorker:
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-        self.megatron_bridge = AutoBridge.from_hf_pretrained(hf_model_name)
+        self.megatron_bridge = AutoBridge.from_hf_pretrained(
+            hf_model_name, trust_remote_code=True
+        )
 
         self.should_disable_forward_pre_hook = (
             self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
