@@ -62,56 +62,35 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
-    LoggerConfig,
     print_message_log_samples,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
+from nemo_rl.algorithms.grpo import (
+    TokenizerType,
+    GRPOConfig,
+    GRPOSaveState,
+    GRPOLoggerConfig,
+    MasterConfig as _MasterConfig,
+    _default_grpo_save_state,
+)
+
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
-TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class GRPOConfig(TypedDict):
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_num_steps: int
-    max_rollout_turns: int
-    normalize_rewards: bool
-    use_leave_one_out_baseline: bool
-    val_period: int
-    val_batch_size: int
-    val_at_start: bool
-    max_val_samples: int
-    seed: int
+class PenguinConfig(TypedDict):
+    dotenv_path: NotRequired[str]
+    initial_global_config_dict: NotRequired[dict[str, Any]]
 
 
-class GRPOSaveState(TypedDict):
-    step: int
-    val_reward: NotRequired[
-        float
-    ]  # Optional field - may not be present during training
-    consumed_samples: int
-
-
-def _default_grpo_save_state() -> GRPOSaveState:
-    return {
-        "step": 0,
-        "val_reward": -99999999.0,
-        "consumed_samples": 0,
-    }
-
-
-class GRPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
-class MasterConfig(TypedDict):
+class MasterConfig(_MasterConfig):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
-    env: dict[str, Any]
+    env: PenguinConfig  # usually just untyped dict[str, Any], but we treat this as PenguinConfig
     data: DataConfig
     grpo: GRPOConfig
     logger: GRPOLoggerConfig
