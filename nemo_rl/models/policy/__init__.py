@@ -19,6 +19,7 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class DTensorConfig(TypedDict):
     enabled: bool
+    env_vars: NotRequired[dict[str, str]]
     _v2: NotRequired[bool]
     cpu_offload: NotRequired[bool]
     sequence_parallel: NotRequired[bool]
