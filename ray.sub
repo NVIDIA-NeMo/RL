@@ -66,6 +66,11 @@ DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 
+# Setting ulimit is recommended by ray best practices page
+# @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
+# It's session based and won't affect the system outside the script
+ulimit -Sn 65535
+
 # On our clusters, the largest port range on an idle worker appeared between 52369-64607
 # (not including the other ports set by this script). So this range is chosen to be
 # somewhere in the middle
