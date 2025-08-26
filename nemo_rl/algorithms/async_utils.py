@@ -70,7 +70,7 @@ class FIFOSampler:
 
 
 class MixedSampler:
-    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: int,target_weight_versions: list[int]) -> list[int]:
+    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: int) -> list[int]:
 
 
         #! We select a total of num_prompt_groups trajectories        
