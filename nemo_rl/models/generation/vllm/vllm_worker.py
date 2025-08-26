@@ -395,7 +395,6 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             disable_log_stats=True,
             logprobs_mode="raw_logprobs",
-            task=self.cfg["vllm_cfg"].get("task", "generate"),
             **vllm_kwargs,
         )
 
