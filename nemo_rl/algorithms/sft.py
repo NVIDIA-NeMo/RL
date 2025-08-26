@@ -418,12 +418,13 @@ def sft_train(
                         roles_to_train_on=["assistant"],
                     )
 
-                    if is_mdlm:
-                        # TODO(mfathi): here we assume single turn instruction tuning, make this more general.
-                        # we train on padding tokens as well similar to LLaDA and SMDM
-                        pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 1}
-                    else:
-                        pad_value_dict = {"token_ids": tokenizer.pad_token_id}
+                    # if is_mdlm:
+                    #     # TODO(mfathi): here we assume single turn instruction tuning, make this more general.
+                    #     # we train on padding tokens as well similar to LLaDA and SMDM
+                    #     pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 1}
+                    # else:
+                    #     pad_value_dict = {"token_ids": tokenizer.pad_token_id}
+                    pad_value_dict = {"token_ids": tokenizer.pad_token_id}
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
