@@ -13,16 +13,14 @@
 # limitations under the License.
 import os
 import warnings
-from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -74,6 +72,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOLoggerConfig,
     MasterConfig as _MasterConfig,
     _default_grpo_save_state,
+    refit_policy_generation,
 )
 
 
@@ -386,76 +385,6 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
     return vllm_cfg.get("async_engine", False)
-
-
-def refit_policy_generation(
-    policy: ColocatablePolicyInterface,
-    policy_generation: GenerationInterface,
-    colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
-    timer: Optional[Timer] = None,
-) -> None:
-    """Refit the policy generation interface with the latest policy weights.
-
-    Args:
-        policy: The policy to provide weights to the inference engine.
-        policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
-    """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        # update weights
-        update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
-            grouped_param_keys = policy.prepare_weights_for_ipc(
-                _refit_buffer_size_gb=_refit_buffer_size_gb
-            )
-            total_num_keys = sum(len(k) for k in grouped_param_keys)
-            print(
-                f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
-            )
-            # do update
-            for keys in grouped_param_keys:
-                ipc_handles = policy.get_weights_ipc_handles(keys)
-                update_success = policy_generation.update_weights_from_ipc_handles(
-                    ipc_handles
-                )
-                if not update_success:
-                    break
-        else:
-            # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective()
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-        # check if update is successful
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-
-    if colocated_inference:
-        policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 # ===============================================================================
