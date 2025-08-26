@@ -19,6 +19,8 @@ from omegaconf import open_dict
 
 import ray
 
+from tqdm.auto import tqdm
+
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
@@ -85,13 +87,41 @@ class Penguin(EnvironmentInterface):
             for _ in range(self.cfg["base_urls"])
         ]
 
-        self.head_server_configs = []
+        from nemo_gym.server_utils import BaseServerConfig
+
+        self.head_server_configs: list[BaseServerConfig] = []
         self.start_tasks = []
         for worker in self.workers:
             node_ip, head_server_port = ray.get(worker.get_node_ip_header_server_port.remote())
-            self.head_server_configs.append({"host": node_ip, "port": head_server_port})
+            self.head_server_configs.append(BaseServerConfig(host=node_ip, port=head_server_port))
 
             self.start_tasks.append(worker.start.remote())
+
+    async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
+        from nemo_gym.server_utils import ServerClient
+
+        # For now, we enforce that the total number of examples in the batch is divisible by the number of workers.
+        # This just makes the batching logic below easier.
+        assert len(penguin_examples) % len(self.workers) == 0
+
+        batch_size = len(penguin_examples) // len(self.workers)
+
+        tasks = []
+        for start_idx, head_server_config in zip(range(0, len(penguin_examples), batch_size), self.head_server_configs):
+            this_batch_penguin_examples = penguin_examples[start_idx: start_idx + batch_size]
+
+            this_batch_server_client = ServerClient.load_from_global_config(head_server_config)
+
+            this_batch_tasks = [
+                this_batch_server_client.post(
+                    server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
+                )
+                for row in this_batch_penguin_examples
+            ]
+            tasks.extend(this_batch_tasks)
+
+        results = tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
+        return [r.json() for r in results]
 
     def shutdown(self) -> None:
         for start_task in self.start_tasks:

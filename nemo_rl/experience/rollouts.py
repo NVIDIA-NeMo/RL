@@ -904,22 +904,10 @@ def run_async_penguin_rollout(
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
-    from nemo_gym.server_utils import ServerClient
-
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     penguin_rows = input_batch["extra_env_info"]
-    agent_names = [row.pop("agent_ref")["name"] for row in penguin_rows]
 
-    server_client = ServerClient.load_from_global_config()
+    penguin_environment = task_to_env["penguin"]
+    results = asyncio.run(penguin_environment.run_rollouts(penguin_rows))
 
-    async def _collect_rollouts():
-        tasks = [
-            server_client.post(server_name=agent_name, url_path="/run", json=row)
-            for agent_name, row in zip(agent_names, penguin_rows)
-        ]
-        results = tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
-        return [r.json() for r in results]
-
-    results = asyncio.run(_collect_rollouts())
-
-    
+    pass    
