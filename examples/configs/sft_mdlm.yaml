@@ -136,7 +136,7 @@ data:
   output_key: "answer"
   add_bos: true
   add_eos: true
-  add_generation_prompt: false
+  add_generation_prompt: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
