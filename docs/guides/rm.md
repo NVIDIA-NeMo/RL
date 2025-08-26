@@ -22,3 +22,13 @@ The default YAML config shares the same base template as the SFT config but incl
 ## Datasets
 
 By default, NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+We also provide a [LocalPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/local_preference_dataset.py) class that is compatible with jsonl-formatted preference datasets. You can use `prompt_key`, `chosen_key`, `rejected_key` to specify which fields in your data correspond to the prompt, chosen response, and rejected response respectively. Here's an example configuration:
+```
+data:
+    train_data_path: "/path/to/train/data/path"
+    val_data_path: "/path/to/val/data/path"
+    prompt_key: "prompt"
+    chosen_key: "chosen"
+    rejected_key: "rejected"
+```

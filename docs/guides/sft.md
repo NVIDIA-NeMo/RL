@@ -74,6 +74,15 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
 
 By default, NeMo RL has support for `Squad` and `OpenAssistant` datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
+We also provide a [LocalResponseDataset](../../nemo_rl/data/datasets/response_datasets/local_response_dataset.py) class that is compatible with jsonl-formatted response datasets. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+```
+data:
+    train_data_path: "/path/to/train/data/path"
+    val_data_path: "/path/to/val/data/path"
+    input_key: "question"
+    output_key: "answer"
+```
+
 Adding a new dataset is a straightforward process.
 As long as your custom dataset has the `formatted_ds` and `task_spec` attributes described above, it can serve as a drop-in replacement for Squad and OpenAssistant.
 
