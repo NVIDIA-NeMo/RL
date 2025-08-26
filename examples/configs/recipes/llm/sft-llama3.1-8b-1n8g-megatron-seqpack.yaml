@@ -110,6 +110,7 @@ logger:
   log_dir: logs/sft-llama3.1-8b-1n8g-megatron
   wandb_enabled: true
   tensorboard_enabled: true
+  swanlab_enabled: false # Disable SwanLab logging
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
