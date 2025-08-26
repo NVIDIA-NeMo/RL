@@ -55,9 +55,6 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
-from nemo_rl.models.generation.interfaces import (
-    GenerationOutputSpec,
-)
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -66,6 +63,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -241,6 +239,7 @@ class DTensorPolicyWorker:
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
+                print("🔍 Loading reward model...")
                 model_class = AutoModelForSequenceClassification
                 if model_config.num_labels != 1:
                     # For Bradley-Terry reward models, the linear head has a single output.
@@ -1189,11 +1188,9 @@ class DTensorPolicyWorker:
 
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/generate")
-    def generate(
-        self, data: BatchedDataDict, greedy: bool = False
-    ) -> BatchedDataDict[GenerationOutputSpec]:
-        generate_batch_size = self.cfg["batch_size"]
+    @wrap_with_nvtx_name("dtensor_policy_worker/score")
+    def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        global_batch_size = min(self.cfg["batch_size"], data.size)
 
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
@@ -1203,6 +1200,7 @@ class DTensorPolicyWorker:
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
         self.model.eval()
+        print("Begin to batch datas")
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
@@ -1224,18 +1222,16 @@ class DTensorPolicyWorker:
                     itertools.cycle(dummy_iterator), dummy_batch_ct
                 )
             else:
-                mb_iterator = data.make_microbatch_iterator(generate_batch_size)
-                iterator_len = data.size // generate_batch_size
-
+                mb_iterator = data.make_microbatch_iterator(global_batch_size)
+                iterator_len = data.size // global_batch_size
             step = 0
-            all_next_tokens_logits = []
+            all_rm_scores = []
             for batch_idx, generate_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
                 step += 1
                 input_ids = generate_batch.get("input_ids").cuda()
                 input_lengths = generate_batch.get("input_lengths")
-
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
                     input_ids, position_ids, _ = pack_sequences(
@@ -1263,12 +1259,11 @@ class DTensorPolicyWorker:
                     position_ids = torch.arange(
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
-                    flash_attn_kwargs = {}
+
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
                     attention_mask_input_all_ones = torch.ones(
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
-
                 context_parallel_ctx = None
                 if self.cp_size > 1:
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
@@ -1283,7 +1278,6 @@ class DTensorPolicyWorker:
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
                         cp_no_restore_buffers=set(cp_buffers),
                     )
-
                 with DTensorPolicyWorker.train_context(context_parallel_ctx):
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
@@ -1292,7 +1286,7 @@ class DTensorPolicyWorker:
                             position_ids=position_ids,
                             use_cache=False,
                         )
-                        outputs = self.molldel(**model_args)
+                        outputs = self.model(**model_args)
 
                     if not hasattr(outputs, "logits"):
                         logits = self.model.lm_head(outputs.last_hidden_state)
@@ -1300,55 +1294,20 @@ class DTensorPolicyWorker:
                         logits = outputs.logits
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
-
                 if isinstance(logits, DTensor):
                     logits = logits.to(torch.float32)
                 else:
                     logits = outputs.logits.to(torch.float32)
 
-                # seq_indices = (input_lengths - 1).to(torch.int64)
-                # gather_index = seq_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, logits.shape[2])
-                logits = to_local_if_dtensor(logits)
-                # gather_index = to_local_if_dtensor(gather_index)
-                # next_token_logits = logits.gather(dim=1, index=gather_index).squeeze(1)
-                batch_size = logits.shape[0]
-                seq_indices = input_lengths - 1
-                next_token_logits = logits[torch.arange(batch_size), seq_indices, :]
-                all_next_tokens_logits.append(next_token_logits)
-        del logits, outputs, seq_indices
+                rm_scores = to_local_if_dtensor(logits)
+                rm_scores = rm_scores.squeeze(-1)
+                all_rm_scores.append(rm_scores)
 
-        all_next_tokens_logits = torch.cat(all_next_tokens_logits, dim=0)
-        log_probs = torch.nn.functional.log_softmax(all_next_tokens_logits, dim=-1)
-
-        if greedy:
-            _, next_tokens = torch.topk(all_next_tokens_logits, 1, dim=-1)
-        else:
-            next_tokens = torch.multinomial(all_next_tokens_logits, 1)
-
-        next_tokens = next_tokens.squeeze(-1)
-        if self.rank == 0:
-            torch.set_printoptions(
-                profile="full", precision=4, linewidth=200, threshold=torch.inf
-            )
-            print("🔍 next_tokens: ", next_tokens)
-            print("🔍 next_tokens type: ", next_tokens.dtype)
-            print("🔍 next_tokens shape: ", next_tokens.shape)
-            print("🔍 log_probs: ", log_probs)
-            print("🔍 log_probs type: ", log_probs.dtype)
-            print("🔍 log_probs shape: ", log_probs.shape)
-            torch.set_printoptions(
-                profile="default", precision=4, linewidth=200, threshold=torch.inf
-            )
-        generation_lengths = torch.ones(
-            batch_size, dtype=torch.long, device=next_tokens.device
-        )
-        unpadded_sequence_lengths = input_lengths + generation_lengths
-        return_data = BatchedDataDict[GenerationOutputSpec](
+        all_rm_scores = torch.cat(all_rm_scores, dim=0)
+        all_rm_scores = all_rm_scores.squeeze(-1).cpu()
+        return_data = BatchedDataDict[ScoreOutputSpec](
             {
-                "output_ids": next_tokens,
-                "generation_lengths": generation_lengths,
-                "unpadded_sequence_lengths": unpadded_sequence_lengths,
-                "logprobs": log_probs,
+                "scores": all_rm_scores,
             }
         )
         return return_data

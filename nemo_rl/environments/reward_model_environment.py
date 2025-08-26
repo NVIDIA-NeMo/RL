@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, cast
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
-import ray
 import torch
 
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -26,12 +25,9 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
-from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-
-# 设置PyTorch显示选项，显示完整的tensor内容
-torch.set_printoptions(profile="full", precision=4, linewidth=200, threshold=torch.inf)
+from nemo_rl.models.generation.vllm import VllmConfig
+from nemo_rl.models.policy.lm_policy import Policy
 
 
 class RewardModelEnvironmentConfig(TypedDict):
@@ -84,48 +80,29 @@ class RewardModelEnvironment(EnvironmentInterface):
         print("🔧 Setting up reward model worker...")
         weights_path = self.config.get("checkpoint_path", None)
         # Initialize tokenizer
-        self.config["tokenizer"] = {"name": self.config["model_name"]}
         self.tokenizer = get_tokenizer(self.config["tokenizer"])
 
         # Ensure tokenizer has pad_token_id
+        # self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
         # if self.tokenizer.pad_token_id is None:
-        #     self.tokenizer.pad_token_id = 0  # Use 0 as default pad token
-        #     print(f"⚠️  Tokenizer pad_token_id was None, set to {self.tokenizer.pad_token_id}")
+        #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        #     print(
+        #         f"⚠️  Tokenizer pad_token_id was None, set to {self.tokenizer.pad_token_id}"
+        #     )
 
-        self.config["generation"]["pad_token_id"] = self.tokenizer.pad_token_id
         print(
             f"✅ Tokenizer initialized with pad_token_id: {self.tokenizer.pad_token_id}"
         )
 
-        # ===========================================Dtensor===========================================
-        # self.reward_model_policy = Policy(
-        #     cluster=self.virtual_cluster,
-        #     config=self.config,
-        #     tokenizer=self.tokenizer,
-        #     name_prefix="reward_model_policy",
-        #     init_optimizer=False,
-        #     init_reference_model=False,
-        #     weights_path=weights_path,
-        # )
-        # ===========================================Dtensor===========================================
-
-        # ===========================================VLLM===========================================
-        generation_config = self.config["generation"]
-        generation_config["model_name"] = self.config["model_name"]
-        # Fix the path - it should be vllm_cfg, not generation.vllm_cfg
-        max_model_len = generation_config["vllm_cfg"]["max_model_len"]
-        generation_config["vllm_cfg"]["max_model_len"] = max_model_len * 64
-        generation_config = configure_generation_config(
-            generation_config, self.tokenizer
-        )
-        generation_config = cast(VllmConfig, generation_config)
-        self.reward_model_policy = VllmGeneration(
+        self.reward_model_policy = Policy(
             cluster=self.virtual_cluster,
-            config=generation_config,
+            config=self.config,
+            tokenizer=self.tokenizer,
             name_prefix="reward_model_policy",
+            init_optimizer=False,
+            init_reference_model=False,
+            weights_path=weights_path,
         )
-        self.reward_model_policy.finish_generation()
-        # ===========================================VLLM===========================================
 
         print("✅ REWARD MODEL ENVIRONMENT INITIALIZATION COMPLETE")
 
@@ -141,7 +118,6 @@ class RewardModelEnvironment(EnvironmentInterface):
         task_data_spec = TaskDataSpec(
             task_name="reward_model_env",
         )
-        print(f"🔍 Message logs: {message_logs[0]}")
 
         # Tokenize each message_log
         tokenized_message_logs = []
@@ -155,18 +131,6 @@ class RewardModelEnvironment(EnvironmentInterface):
                 add_generation_prompt=False,
             )
             tokenized_message_logs.append(tokenized_log)
-        # print("🔍 Tokenized message logs: ", tokenized_message_logs)
-
-        user_contents = []
-        assistant_contents = []
-        for message in message_logs:
-            for role_content in message:
-                role = role_content.get("role", "").lower()
-                content = role_content.get("content", "")
-                if role == "user":
-                    user_contents.append(content)
-                elif role == "assistant":
-                    assistant_contents.append([content])
 
         # Convert message logs to flat representation and pad for batching
         cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -174,15 +138,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        # Get max_model_len from generation config
-        max_model_len = self.config["generation"]["vllm_cfg"]["max_model_len"] * 64
-
-        # print(f"🔍 Max model length: {max_model_len}")
-        # print(f"🔍 Input length: {input_lengths}")
-        # print(f"🔍 Cat and padded: {cat_and_padded}")
-        # print(f"🔍 Max input length before truncation: {input_lengths.max().item()}")
-
-        # Truncate sequences that exceed max_model_len
+        # max_model_len = self.config["max_model_len"] * 64
         # if input_lengths.max().item() > max_model_len:
         #     print(f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}")
         #     # Truncate input_ids
@@ -190,25 +146,12 @@ class RewardModelEnvironment(EnvironmentInterface):
         #     # Update input_lengths
         #     input_lengths = torch.clamp(input_lengths, max=max_model_len)
         #     print(f"✅ After truncation - Max input length: {input_lengths.max().item()}")
-        for i in range(len(input_lengths)):
-            if input_lengths[i] > 2048:
-                print("long sequence index", i)
-                print("long sequence length", input_lengths[i])
-                print("long sequence content", message_logs[i])
-                print("long sequence token_ids", cat_and_padded["token_ids"][i])
-                print(
-                    "long sequence token_ids shape",
-                    cat_and_padded["token_ids"][i].shape,
-                )
-                break
 
         # Create data in the format expected by DTensorRewardModelWorker
         reward_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": cat_and_padded["token_ids"],
                 "input_lengths": input_lengths,
-                "user_contents": user_contents,
-                "assistant_contents": assistant_contents,
             }
         )
         return reward_data
@@ -227,30 +170,16 @@ class RewardModelEnvironment(EnvironmentInterface):
         Returns:
             EnvironmentReturn with rewards and termination info
         """
+        # Preprocess the message logs
         reward_data = self.data_preprocess(message_logs)
 
-        # ===========================================VLLM===========================================
-        output_scores = self.reward_model_policy.score(reward_data)
-        rewards = output_scores["scores"]
-        # ===========================================VLLM===========================================
-
-        # ===========================================DTensor===========================================
-        # # rewards = self.reward_model_policy.get_logprobs(reward_data)
-
-        # generation_outputs = self.reward_model_policy.generate(reward_data, greedy=True)
-        # rewards_ids = generation_outputs["output_ids"]
-        # rewards = self.tokenizer.batch_decode(rewards_ids, skip_special_tokens=True)
-        # print("🔍 Rewards ids: ", rewards_ids)
-        # print("🔍 Rewards: ", rewards)
-        # print("🔍 Rewards tensor type: ", type(rewards))
-
-        # ===========================================DTensor===========================================
+        # Score the message logs
+        rewards = self.reward_model_policy.score(reward_data)["scores"]
 
         # Create observations with meaningful content based on rewards (like math environment)
         observations = []
         for i, reward in enumerate(rewards):
-            content = "Environment: filler content"
-
+            content = "Environment: " + str(reward)
             observations.append({"role": "environment", "content": content})
 
         # All episodes terminate after one step in reward model environment
@@ -307,12 +236,12 @@ class RewardModelEnvironment(EnvironmentInterface):
 
     def shutdown(self):
         """Shutdown the reward model worker and virtual cluster."""
-        if self.reward_model_worker is not None:
+        if self.reward_model_policy is not None:
             try:
-                ray.kill(self.reward_model_worker)
+                self.reward_model_policy.shutdown()
             except Exception as e:
-                print(f"Warning: Error shutting down reward model worker: {e}")
-            self.reward_model_worker = None
+                print(f"Warning: Error shutting down reward model policy: {e}")
+            self.reward_model_policy = None
 
         if self.virtual_cluster is not None:
             try:
@@ -320,3 +249,12 @@ class RewardModelEnvironment(EnvironmentInterface):
             except Exception as e:
                 print(f"Warning: Error shutting down virtual cluster: {e}")
             self.virtual_cluster = None
+
+    def __del__(self):
+        """Shuts down the worker groups when the object is deleted or is garbage collected.
+
+        This is an extra safety net in case the user forgets to call shutdown() and the pointer to
+        the object is lost due to leaving a function scope. It's always recommended that the
+        user calls shutdown().
+        """
+        self.shutdown()

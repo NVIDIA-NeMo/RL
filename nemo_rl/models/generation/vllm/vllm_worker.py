@@ -617,31 +617,6 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         return return_data
 
-    @wrap_with_nvtx_name("vllm_genertion_worker/score")
-    def score(
-        self, data: BatchedDataDict[GenerationDatumSpec]
-    ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Score a batch of data using vLLM scoring."""
-        if len(data["input_ids"]) == 0:
-            # Return empty BatchedDataDict with all required fields
-            return BatchedDataDict[GenerationOutputSpec](
-                {
-                    "scores": torch.zeros((0, 0), dtype=torch.float),
-                }
-            )
-        scores = []
-        for user_content, assistant_content in zip(
-            data["user_contents"], data["assistant_contents"]
-        ):
-            output = self.llm.score(user_content, assistant_content)
-            scores.append(output[0].outputs.score)
-
-        return BatchedDataDict[GenerationOutputSpec](
-            {
-                "scores": torch.tensor(scores, dtype=torch.float),
-            }
-        )
-
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
