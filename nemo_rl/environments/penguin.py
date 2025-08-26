@@ -44,7 +44,7 @@ def start_penguin(cfg: PenguinConfig, nemo_rl_openai_base_url: str):
         initial_global_config_dict["policy_base_url"] = nemo_rl_openai_base_url
 
     run(
-        dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute(),
+        dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
         initial_global_config_dict=initial_global_config_dict,
     )
 
