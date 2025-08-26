@@ -7,6 +7,8 @@ import json
 import requests
 import sys
 import time
+import asyncio
+import aiohttp
 
 
 def test_fast_dllm_integration():
@@ -19,8 +21,7 @@ def test_fast_dllm_integration():
         {
             "name": "Basic generation (no cache)",
             "config": {
-                "use_cache": False,
-                "use_dual_cache": False,
+                "generation_algorithm": "basic",
                 "steps": 64,
                 "block_length": 32,
                 "max_tokens": 64
@@ -29,8 +30,7 @@ def test_fast_dllm_integration():
         {
             "name": "Prefix cache",
             "config": {
-                "use_cache": True,
-                "use_dual_cache": False,
+                "generation_algorithm": "prefix_cache",
                 "steps": 64,
                 "block_length": 32,
                 "max_tokens": 64
@@ -39,8 +39,7 @@ def test_fast_dllm_integration():
         {
             "name": "Dual cache (optimized)",
             "config": {
-                "use_cache": True,
-                "use_dual_cache": True,
+                "generation_algorithm": "dual_cache",
                 "steps": 64,
                 "block_length": 32,
                 "max_tokens": 64
@@ -49,8 +48,7 @@ def test_fast_dllm_integration():
         {
             "name": "Parallel decoding with threshold",
             "config": {
-                "use_cache": True,
-                "use_dual_cache": True,
+                "generation_algorithm": "dual_cache",
                 "threshold": 0.8,
                 "steps": 64,
                 "block_length": 32,
@@ -60,8 +58,7 @@ def test_fast_dllm_integration():
         {
             "name": "Dynamic parallel with factor",
             "config": {
-                "use_cache": True,
-                "use_dual_cache": True,
+                "generation_algorithm": "dual_cache",
                 "factor": 2.0,
                 "steps": 64,
                 "block_length": 32,
@@ -186,6 +183,62 @@ def test_fast_dllm_integration():
     return len(failed_tests) == 0
 
 
-if __name__ == "__main__":
+async def test_algorithm_endpoints():
+    """Test the algorithm information endpoints."""
+    base_url = "http://localhost:8000"
+    
+    print("Testing algorithm endpoints...")
+    print("=" * 50)
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Test health endpoint
+            async with session.get(f"{base_url}/health") as response:
+                if response.status == 200:
+                    health = await response.json()
+                    print("✅ Health endpoint working")
+                    print(f"   Available algorithms: {health.get('available_generation_algorithms', [])}")
+                else:
+                    print(f"❌ Health endpoint error: {response.status}")
+            
+            # Test algorithms endpoint  
+            async with session.get(f"{base_url}/generation/algorithms") as response:
+                if response.status == 200:
+                    algorithms = await response.json()
+                    print("✅ Algorithms endpoint working")
+                    print(f"   Registered algorithms: {len(algorithms.get('algorithms', []))}")
+                    for algo in algorithms.get('algorithms', []):
+                        status = "✅" if algo.get('available') else "❌"
+                        print(f"     {status} {algo['name']}: {algo['description']}")
+                else:
+                    print(f"❌ Algorithms endpoint error: {response.status}")
+                    
+    except Exception as e:
+        print(f"❌ Error testing endpoints: {e}")
+
+
+async def main():
+    """Main test function that runs both sync and async tests."""
+    print("🚀 **LLADA FAST-dLLM INTEGRATION TEST**")
+    print("=" * 80)
+    
+    # Test algorithm endpoints first
+    await test_algorithm_endpoints()
+    print()
+    
+    # Run the main integration test
     success = test_fast_dllm_integration()
+    
+    print("=" * 80)
+    if success:
+        print("🎉 All Fast-dLLM integration tests passed!")
+    else:
+        print("⚠️  Some tests failed. Check the output above for details.")
+    print("=" * 80)
+    
+    return success
+
+
+if __name__ == "__main__":
+    success = asyncio.run(main())
     sys.exit(0 if success else 1)

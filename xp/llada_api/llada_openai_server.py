@@ -64,6 +64,13 @@ except ImportError:
     convert_dcp_to_hf = None
     load_checkpoint = None
 
+# Import generation registry
+from llada_generate import (
+    get_algorithm, 
+    list_available_algorithms,
+    GenerationAlgorithm
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -100,9 +107,9 @@ class ChatCompletionRequest(BaseModel):
     block_length: int = Field(default=32, ge=1, description="Block length for generation")
     cfg_scale: float = Field(default=0.0, ge=0.0, description="Classifier-free guidance scale")
     remasking: str = Field(default="low_confidence", description="Remasking strategy")
-    # Fast-dLLM cache optimization parameters
-    use_cache: bool = Field(default=True, description="Enable KV caching")
-    use_dual_cache: bool = Field(default=True, description="Enable dual cache (both prefix and suffix)")
+    # Generation algorithm selection
+    generation_algorithm: Optional[str] = Field(default="dual_cache", description="Generation algorithm to use (basic, prefix_cache, dual_cache)")
+    # Fast-dLLM parameters
     threshold: Optional[float] = Field(default=None, description="Confidence threshold for parallel decoding")
     factor: Optional[float] = Field(default=None, description="Factor for dynamic parallel decoding")
 
@@ -148,84 +155,55 @@ class ModelList(BaseModel):
     data: List[ModelInfo]
 
 
-# Fast-dLLM Generation Functions
+# Registry-based generation function
 @torch.no_grad()
-def generate_fast_dllm(
-    model, prompt, steps=128, gen_length=128, block_length=32,
-    temperature=0.0, remasking='low_confidence', mask_id=MASK_ID,
-    use_cache=True, use_dual_cache=True, threshold=None, factor=None
+def generate_with_algorithm(
+    model, prompt, algorithm_name="dual_cache",
+    steps=128, gen_length=128, block_length=32, temperature=0.0, 
+    remasking='low_confidence', threshold=None, factor=None
 ):
     """
-    Fast-dLLM accelerated generation function.
+    Generate using the specified algorithm from the registry.
     
     Args:
         model: LLaDA model
         prompt: Input tensor of shape (1, L)
+        algorithm_name: Name of the generation algorithm to use
         steps: Sampling steps
         gen_length: Generated answer length
         block_length: Block length for generation
         temperature: Categorical distribution sampling temperature
         remasking: Remasking strategy ('low_confidence' or 'random')
-        mask_id: The token id of [MASK]
-        use_cache: Enable KV caching
-        use_dual_cache: Enable dual cache (both prefix and suffix)
         threshold: Confidence threshold for parallel decoding
         factor: Factor for dynamic parallel decoding
     """
-    if not FAST_DLLM_AVAILABLE:
-        raise RuntimeError("Fast-dLLM is not available. Please check the installation.")
+    algorithm = get_algorithm(algorithm_name)
+    if algorithm is None:
+        raise RuntimeError(f"Unknown generation algorithm: {algorithm_name}")
+    
+    if not algorithm.is_available():
+        raise RuntimeError(f"Generation algorithm '{algorithm.name}' is not available")
+    
+    logger.info(f"Using {algorithm.name} generation: {algorithm.description}")
     
     try:
-        # Choose the appropriate generation function based on cache settings
-        if use_cache:
-            if use_dual_cache:
-                logger.info("Using Fast-dLLM dual cache generation")
-                output, nfe = generate_with_dual_cache(
-                    model=model,
-                    prompt=prompt,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    temperature=temperature,
-                    remasking=remasking,
-                    mask_id=mask_id,
-                    threshold=threshold,
-                    factor=factor
-                )
-            else:
-                logger.info("Using Fast-dLLM prefix cache generation")
-                output, nfe = generate_with_prefix_cache(
-                    model=model,
-                    prompt=prompt,
-                    steps=steps,
-                    gen_length=gen_length,
-                    block_length=block_length,
-                    temperature=temperature,
-                    remasking=remasking,
-                    mask_id=mask_id,
-                    threshold=threshold,
-                    factor=factor
-                )
-        else:
-            logger.info("Using Fast-dLLM basic generation (no cache)")
-            output, nfe = generate(
-                model=model,
-                prompt=prompt,
-                steps=steps,
-                gen_length=gen_length,
-                block_length=block_length,
-                temperature=temperature,
-                remasking=remasking,
-                mask_id=mask_id,
-                threshold=threshold,
-                factor=factor
-            )
+        output, nfe = algorithm.generate(
+            model=model,
+            prompt=prompt,
+            steps=steps,
+            gen_length=gen_length,
+            block_length=block_length,
+            temperature=temperature,
+            remasking=remasking,
+            threshold=threshold,
+            factor=factor
+        )
         
         logger.info(f"Generation completed with {nfe} forward passes")
         return output
         
     except Exception as e:
-        logger.error(f"Fast-dLLM generation failed: {e}")
+        logger.error(f"Generation failed with {algorithm.name}: {e}")
         raise
 
 
@@ -329,8 +307,7 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     logger.info(f"  Block length: {request.block_length}")
     logger.info(f"  CFG scale: {request.cfg_scale}")
     logger.info(f"  Remasking: {request.remasking}")
-    logger.info(f"  Fast-dLLM use_cache: {request.use_cache}")
-    logger.info(f"  Fast-dLLM use_dual_cache: {request.use_dual_cache}")
+    logger.info(f"  Generation algorithm: {request.generation_algorithm}")
     logger.info(f"  Fast-dLLM threshold: {request.threshold}")
     logger.info(f"  Fast-dLLM factor: {request.factor}")
     
@@ -386,16 +363,15 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
             gen_length = ((gen_length // block_length) + 1) * block_length
             logger.info(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
         
-        output = generate_fast_dllm(
+        output = generate_with_algorithm(
             model=model,
             prompt=input_ids,
+            algorithm_name=request.generation_algorithm,
             steps=request.steps,
             gen_length=gen_length,
             block_length=block_length,
             temperature=request.temperature,
             remasking=request.remasking,
-            use_cache=request.use_cache,
-            use_dual_cache=request.use_dual_cache,
             threshold=request.threshold,
             factor=request.factor
         )
@@ -571,10 +547,30 @@ async def create_chat_completion(request: ChatCompletionRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    available_algorithms = list_available_algorithms()
     return {
         "status": "healthy",
         "model_loaded": model is not None,
-        "device": device
+        "device": device,
+        "available_generation_algorithms": available_algorithms,
+        "note": "Use 'generation_algorithm' parameter in requests to specify algorithm"
+    }
+
+
+@app.get("/generation/algorithms")
+async def list_generation_algorithms():
+    """List all available generation algorithms."""
+    from llada_generate import registry
+    
+    algorithms = []
+    for name in registry.list_algorithms():
+        algorithm_info = registry.get_algorithm_info(name)
+        if algorithm_info:
+            algorithms.append(algorithm_info)
+    
+    return {
+        "algorithms": algorithms,
+        "note": "Generation algorithm is specified per request using the 'generation_algorithm' parameter"
     }
 
 
@@ -603,6 +599,12 @@ def main():
     if not success:
         logger.error("Failed to load model. Exiting.")
         return
+    
+    # Log available generation algorithms
+    available_algorithms = list_available_algorithms()
+    logger.info(f"Available generation algorithms: {available_algorithms}")
+    if not available_algorithms:
+        logger.warning("No generation algorithms are available. Check Fast-dLLM installation.")
     
     logger.info(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)

@@ -10,7 +10,7 @@ IMPORTANT: Parameter Mapping Notes:
 - top_k is forced to -1 for OpenAI API compatibility
 - LLaDA-specific parameters (steps, block_length, cfg_scale, remasking) are passed 
   via NeMo-Skills extra_body mechanism to the OpenAI API
-- Fast-dLLM acceleration parameters (use_cache, use_dual_cache, threshold, factor) 
+- Generation algorithm selection (generation_algorithm, threshold, factor) 
   are passed via NeMo-Skills extra_body mechanism for optimized generation
 
 Usage:
@@ -32,14 +32,13 @@ Usage:
     # Custom LLaDA settings
     python eval_llada.py --steps 128 --cfg-scale 1.5 --remasking random
     
-    # Fast-dLLM acceleration settings
-    python eval_llada.py --use-cache --use-dual-cache --threshold 0.8
+    # Different generation algorithms
+    python eval_llada.py --generation-algorithm basic           # No caching
+    python eval_llada.py --generation-algorithm prefix_cache    # Prefix caching
+    python eval_llada.py --generation-algorithm dual_cache      # Dual caching (default)
     
-    # Disable caching for comparison
-    python eval_llada.py --no-cache
-    
-    # Dynamic parallel decoding
-    python eval_llada.py --factor 2.0 --steps 256
+    # Advanced Fast-dLLM settings
+    python eval_llada.py --generation-algorithm dual_cache --threshold 0.8 --factor 2.0
 """
 
 import os
@@ -141,28 +140,12 @@ def create_parser():
         help="LLaDA remasking strategy"
     )
     
-    # Fast-dLLM acceleration parameters
+    # Generation algorithm selection
     parser.add_argument(
-        "--use-cache",
-        action="store_true",
-        default=True,
-        help="Enable KV caching for acceleration"
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Disable KV caching (overrides --use-cache)"
-    )
-    parser.add_argument(
-        "--use-dual-cache",
-        action="store_true", 
-        default=True,
-        help="Enable dual cache (both prefix and suffix caching) for maximum acceleration"
-    )
-    parser.add_argument(
-        "--no-dual-cache",
-        action="store_true",
-        help="Disable dual cache, use only prefix cache (overrides --use-dual-cache)"
+        "--generation-algorithm",
+        default="dual_cache",
+        choices=["basic", "prefix_cache", "dual_cache"],
+        help="Generation algorithm to use (basic=no cache, prefix_cache=prefix caching, dual_cache=dual caching)"
     )
     parser.add_argument(
         "--threshold",
@@ -229,9 +212,8 @@ def main():
         "cfg_scale": args.cfg_scale,
         "remasking": args.remasking,
         
-        # Fast-dLLM acceleration settings
-        "use_cache": not args.no_cache if args.no_cache else args.use_cache,
-        "use_dual_cache": not args.no_dual_cache if args.no_dual_cache else args.use_dual_cache,
+        # Generation algorithm selection
+        "generation_algorithm": getattr(args, 'generation_algorithm', 'dual_cache'),
         "threshold": args.threshold,
         "factor": args.factor,
     }
@@ -261,7 +243,7 @@ def main():
     print(f"Max tokens: {config['tokens_to_generate']}")
     print(f"LLaDA Steps: {config['steps']} | Block length: {config['block_length']}")
     print(f"CFG scale: {config['cfg_scale']} | Remasking: {config['remasking']}")
-    print(f"Fast-dLLM Cache: {config['use_cache']} | Dual cache: {config['use_dual_cache']}")
+    print(f"Generation Algorithm: {config['generation_algorithm']}")
     if config['threshold'] is not None:
         print(f"Fast-dLLM Threshold: {config['threshold']}")
     if config['factor'] is not None:
@@ -290,9 +272,8 @@ def main():
             f"++inference.extra_body.block_length={config['block_length']}",
             f"++inference.extra_body.cfg_scale={config['cfg_scale']}",
             f"++inference.extra_body.remasking={config['remasking']}",
-            # Pass Fast-dLLM acceleration parameters via extra_body
-            f"++inference.extra_body.use_cache={config['use_cache']}",
-            f"++inference.extra_body.use_dual_cache={config['use_dual_cache']}",
+            # Pass generation algorithm selection via extra_body
+            f"++inference.extra_body.generation_algorithm={config['generation_algorithm']}",
             f"++num_chunks=2"
         ]
         
@@ -302,13 +283,12 @@ def main():
         if config['factor'] is not None:
             generation_args.append(f"++inference.extra_body.factor={config['factor']}")
         
-        print(f"\n🔧 LLaDA + Fast-dLLM parameters (via extra_body):")
+        print(f"\n🔧 LLaDA generation parameters (via extra_body):")
         print(f"  steps={config['steps']}")
         print(f"  block_length={config['block_length']}")
         print(f"  cfg_scale={config['cfg_scale']}")
         print(f"  remasking={config['remasking']}")
-        print(f"  use_cache={config['use_cache']}")
-        print(f"  use_dual_cache={config['use_dual_cache']}")
+        print(f"  generation_algorithm={config['generation_algorithm']}")
         if config['threshold'] is not None:
             print(f"  threshold={config['threshold']}")
         if config['factor'] is not None:

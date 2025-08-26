@@ -57,6 +57,14 @@ from llada_openai_server import (
     MASK_ID
 )
 
+# Import generation registry
+from llada_generate import (
+    get_algorithm, 
+    list_available_algorithms,
+    list_algorithms,
+    GenerationAlgorithm
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -273,6 +281,64 @@ class BatchProcessor:
     async def _process_batch_requests(self, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
         """Process a batch of requests using Fast-dLLM batch capabilities."""
         try:
+            # Group requests by generation algorithm for efficient batching
+            algorithm_groups = {}
+            request_to_group = {}
+            
+            for i, batch_req in enumerate(batch_requests):
+                request = batch_req.request
+                
+                # Determine generation algorithm for this request
+                algorithm_name = request.generation_algorithm or "dual_cache"
+                
+                # Group by algorithm
+                if algorithm_name not in algorithm_groups:
+                    algorithm_groups[algorithm_name] = []
+                algorithm_groups[algorithm_name].append((i, batch_req))
+                request_to_group[i] = algorithm_name
+            
+            logger.info(f"Processing batch with {len(algorithm_groups)} algorithm groups: {list(algorithm_groups.keys())}")
+            
+            # Process each algorithm group separately and collect results
+            all_results = [None] * len(batch_requests)  # Maintain original order
+            
+            for algorithm_name, group_requests in algorithm_groups.items():
+                group_indices = [idx for idx, _ in group_requests]
+                group_batch_requests = [req for _, req in group_requests]
+                
+                logger.info(f"Processing {len(group_batch_requests)} requests with {algorithm_name} algorithm")
+                
+                try:
+                    group_results = await self._process_algorithm_group(algorithm_name, group_batch_requests)
+                    
+                    # Place results back in original order
+                    for result_idx, original_idx in enumerate(group_indices):
+                        all_results[original_idx] = group_results[result_idx]
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process {algorithm_name} group: {e}")
+                    # Set error for all requests in this group
+                    error = HTTPException(status_code=500, detail=f"Algorithm {algorithm_name} failed: {e}")
+                    for _, original_idx in enumerate(group_indices):
+                        all_results[original_idx] = error
+            
+            return all_results
+            
+        except Exception as e:
+            logger.error(f"Batch processing failed: {e}")
+            return [HTTPException(status_code=500, detail=f"Batch processing failed: {e}") for _ in batch_requests]
+    
+    async def _process_algorithm_group(self, algorithm_name: str, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
+        """Process a group of requests that all use the same algorithm."""
+        try:
+            # Get the generation algorithm
+            algorithm = get_algorithm(algorithm_name)
+            if algorithm is None:
+                raise RuntimeError(f"Unknown generation algorithm: {algorithm_name}")
+            
+            if not algorithm.is_available():
+                raise RuntimeError(f"Generation algorithm '{algorithm_name}' is not available")
+            
             # Prepare batch data
             batch_prompts = []
             batch_configs = []
@@ -296,8 +362,6 @@ class BatchProcessor:
                         'block_length': request.block_length,
                         'temperature': request.temperature,
                         'remasking': request.remasking,
-                        'use_cache': request.use_cache,
-                        'use_dual_cache': request.use_dual_cache,
                         'threshold': request.threshold,
                         'factor': request.factor
                     })
@@ -366,48 +430,21 @@ class BatchProcessor:
                 if i < len(sample_request.request.messages) - 1:  # Add separator between messages
                     logger.info("    " + "-" * 60)
             
-            # Generate with Fast-dLLM (batch processing)
+            # Generate with selected algorithm (batch processing)
             try:
-                if config['use_cache']:
-                    if config['use_dual_cache']:
-                        logger.info(f"Using Fast-dLLM dual cache batch generation for {batch_input_ids.shape[0]} requests")
-                        output, nfe = generate_with_dual_cache(
-                            model=model,
-                            prompt=batch_input_ids,
-                            steps=config['steps'],
-                            gen_length=gen_length,
-                            block_length=block_length,
-                            temperature=config['temperature'],
-                            remasking=config['remasking'],
-                            threshold=config['threshold'],
-                            factor=config['factor']
-                        )
-                    else:
-                        logger.info(f"Using Fast-dLLM prefix cache batch generation for {batch_input_ids.shape[0]} requests")
-                        output, nfe = generate_with_prefix_cache(
-                            model=model,
-                            prompt=batch_input_ids,
-                            steps=config['steps'],
-                            gen_length=gen_length,
-                            block_length=block_length,
-                            temperature=config['temperature'],
-                            remasking=config['remasking'],
-                            threshold=config['threshold'],
-                            factor=config['factor']
-                        )
-                else:
-                    logger.info(f"Using Fast-dLLM basic batch generation for {batch_input_ids.shape[0]} requests")
-                    output, nfe = generate(
-                        model=model,
-                        prompt=batch_input_ids,
-                        steps=config['steps'],
-                        gen_length=gen_length,
-                        block_length=block_length,
-                        temperature=config['temperature'],
-                        remasking=config['remasking'],
-                        threshold=config['threshold'],
-                        factor=config['factor']
-                    )
+                logger.info(f"Using {algorithm.name} generation for {batch_input_ids.shape[0]} requests: {algorithm.description}")
+                
+                output, nfe = algorithm.generate(
+                    model=model,
+                    prompt=batch_input_ids,
+                    steps=config['steps'],
+                    gen_length=gen_length,
+                    block_length=block_length,
+                    temperature=config['temperature'],
+                    remasking=config['remasking'],
+                    threshold=config['threshold'],
+                    factor=config['factor']
+                )
                 
                 logger.info(f"Batch generation completed with {nfe} forward passes")
                 
@@ -564,12 +601,15 @@ async def create_chat_completion(request: ChatCompletionRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    available_algorithms = list_available_algorithms()
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "device": device,
         "batch_processor_active": batch_processor is not None,
-        "pending_requests": len(batch_processor.pending_requests) if batch_processor else 0
+        "pending_requests": len(batch_processor.pending_requests) if batch_processor else 0,
+        "available_generation_algorithms": available_algorithms,
+        "total_generation_algorithms": len(list_algorithms())
     }
 
 @app.get("/batch/stats")
@@ -583,6 +623,22 @@ async def batch_stats():
         "max_wait_time": batch_processor.max_wait_time,
         "pending_requests": len(batch_processor.pending_requests),
         "currently_processing": batch_processor.processing
+    }
+
+@app.get("/generation/algorithms")
+async def list_generation_algorithms():
+    """List all available generation algorithms."""
+    from llada_generate import registry
+    
+    algorithms = []
+    for name in registry.list_algorithms():
+        algorithm_info = registry.get_algorithm_info(name)
+        if algorithm_info:
+            algorithms.append(algorithm_info)
+    
+    return {
+        "algorithms": algorithms,
+        "note": "Generation algorithm is now specified per request using the 'generation_algorithm' parameter"
     }
 
 def main():
@@ -616,6 +672,12 @@ def main():
     if not success:
         logger.error("Failed to load model. Exiting.")
         return
+    
+    # Log available generation algorithms
+    available_algorithms = list_available_algorithms()
+    logger.info(f"Available generation algorithms: {available_algorithms}")
+    if not available_algorithms:
+        logger.warning("No generation algorithms are available. Check Fast-dLLM installation.")
     
     # Store batch configuration in app state
     app.state.batch_size = args.batch_size

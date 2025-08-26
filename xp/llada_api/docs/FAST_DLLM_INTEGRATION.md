@@ -18,15 +18,19 @@ According to the Fast-dLLM paper, you can expect:
 
 ## New API Parameters
 
-The server now supports additional Fast-dLLM specific parameters:
+The server now supports generation algorithm selection and Fast-dLLM specific parameters:
 
-### Cache Optimization Parameters
-- `use_cache` (bool, default: `true`): Enable KV caching
-- `use_dual_cache` (bool, default: `true`): Enable dual cache (both prefix and suffix)
+### Generation Algorithm Selection
+- `generation_algorithm` (string): Choose generation algorithm:
+  - `"basic"`: No caching (fastest startup, slower generation)
+  - `"prefix_cache"`: Prefix caching only
+  - `"dual_cache"`: Dual cache - both prefix and suffix (recommended, default)
 
 ### Parallel Decoding Parameters  
 - `threshold` (float, optional): Confidence threshold for parallel decoding
 - `factor` (float, optional): Factor for dynamic parallel decoding strategy
+
+
 
 ### Updated Defaults
 - `temperature`: `0.0` (optimized for Fast-dLLM)
@@ -36,14 +40,13 @@ The server now supports additional Fast-dLLM specific parameters:
 
 ## Usage Examples
 
-### Basic Request (Dual Cache Enabled)
+### Basic Request (Dual Cache Algorithm)
 ```json
 {
   "model": "llada-8b-instruct",
   "messages": [{"role": "user", "content": "What is 2+2?"}],
   "max_tokens": 128,
-  "use_cache": true,
-  "use_dual_cache": true
+  "generation_algorithm": "dual_cache"
 }
 ```
 
@@ -53,8 +56,7 @@ The server now supports additional Fast-dLLM specific parameters:
   "model": "llada-8b-instruct", 
   "messages": [{"role": "user", "content": "Solve this math problem step by step."}],
   "max_tokens": 256,
-  "use_cache": true,
-  "use_dual_cache": true,
+  "generation_algorithm": "dual_cache",
   "threshold": 0.8,
   "steps": 128,
   "block_length": 32
@@ -67,21 +69,48 @@ The server now supports additional Fast-dLLM specific parameters:
   "model": "llada-8b-instruct",
   "messages": [{"role": "user", "content": "Write a short story."}], 
   "max_tokens": 512,
-  "use_cache": true,
-  "use_dual_cache": true,
+  "generation_algorithm": "dual_cache",
   "factor": 2.0,
   "steps": 256,
   "block_length": 64
 }
 ```
 
-## Cache Strategies
+### Different Generation Algorithms
+```json
+// Basic generation (no caching)
+{
+  "model": "llada-8b-instruct",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "generation_algorithm": "basic"
+}
 
-The server automatically selects the optimal generation strategy based on your parameters:
+// Prefix caching only
+{
+  "model": "llada-8b-instruct",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "generation_algorithm": "prefix_cache"
+}
 
-1. **No Cache** (`use_cache: false`): Uses basic generation without any caching
-2. **Prefix Cache** (`use_cache: true, use_dual_cache: false`): Caches prefix activations only  
-3. **Dual Cache** (`use_cache: true, use_dual_cache: true`): Caches both prefix and suffix (fastest)
+// Dual caching (recommended)
+{
+  "model": "llada-8b-instruct",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "generation_algorithm": "dual_cache"
+}
+```
+
+
+
+## Generation Algorithm Strategies
+
+The server provides three generation algorithms optimized for different scenarios:
+
+1. **Basic** (`generation_algorithm: "basic"`): No caching - fastest startup, slower generation
+2. **Prefix Cache** (`generation_algorithm: "prefix_cache"`): Caches prefix activations only - good balance
+3. **Dual Cache** (`generation_algorithm: "dual_cache"`): Caches both prefix and suffix - maximum performance (recommended)
+
+Each request can specify its own algorithm, allowing you to optimize different requests for different scenarios. The server intelligently batches requests with the same algorithm together for efficient processing.
 
 ## Testing
 
@@ -100,19 +129,22 @@ The test script will benchmark different cache configurations and show performan
 
 ### Evaluation with NeMo-Skills
 
-The `eval_llada.py` script now supports Fast-dLLM parameters for comprehensive benchmarking:
+The `eval_llada.py` script now supports generation algorithm selection for comprehensive benchmarking:
 
 ```bash
-# Default evaluation with Fast-dLLM acceleration
+# Default evaluation with dual cache algorithm (recommended)
 python xp/nemo-skills/eval_llada.py
 
-# Compare different acceleration strategies
-python xp/nemo-skills/eval_llada.py --use-cache --use-dual-cache --threshold 0.8
-python xp/nemo-skills/eval_llada.py --no-cache  # Baseline comparison
-python xp/nemo-skills/eval_llada.py --factor 2.0 --steps 256  # Dynamic parallel decoding
+# Compare different generation algorithms
+python xp/nemo-skills/eval_llada.py --generation-algorithm basic        # No caching baseline
+python xp/nemo-skills/eval_llada.py --generation-algorithm prefix_cache # Prefix caching
+python xp/nemo-skills/eval_llada.py --generation-algorithm dual_cache   # Maximum performance
+
+# Advanced Fast-dLLM parameters
+python xp/nemo-skills/eval_llada.py --generation-algorithm dual_cache --threshold 0.8 --factor 2.0
 
 # Quick test mode for development
-python xp/nemo-skills/eval_llada.py --quick-test --use-dual-cache
+python xp/nemo-skills/eval_llada.py --quick-test --generation-algorithm dual_cache
 ```
 
 ### Automated Benchmarking

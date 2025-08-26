@@ -78,7 +78,8 @@ async def test_batch_performance(server_url: str = "http://localhost:8000", num_
             "max_tokens": 64,
             "temperature": 0.0,
             "steps": 64,
-            "block_length": 32
+            "block_length": 32,
+            "generation_algorithm": "dual_cache"
         }
         requests.append((request_data, i))
     
@@ -156,6 +157,70 @@ async def test_batch_stats(server_url: str = "http://localhost:8000"):
     except Exception as e:
         print(f"❌ Error getting batch stats: {e}")
 
+async def test_generation_algorithms(server_url: str = "http://localhost:8000"):
+    """Test the generation algorithms endpoint."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{server_url}/generation/algorithms") as response:
+                if response.status == 200:
+                    algorithms = await response.json()
+                    print("🔧 **GENERATION ALGORITHMS**")
+                    for algo in algorithms.get('algorithms', []):
+                        status = "✅" if algo.get('available') else "❌"
+                        print(f"{status} {algo['name']}: {algo['description']}")
+                else:
+                    print(f"❌ Failed to get algorithms: {response.status}")
+    except Exception as e:
+        print(f"❌ Error getting algorithms: {e}")
+
+async def test_mixed_algorithms(server_url: str = "http://localhost:8000"):
+    """Test batch processing with mixed generation algorithms."""
+    print("🧪 Testing mixed algorithm batching...")
+    
+    test_requests = [
+        {
+            "model": "llada-8b-instruct",
+            "messages": [{"role": "user", "content": "What is 5 + 3?"}],
+            "max_tokens": 50,
+            "generation_algorithm": "basic"
+        },
+        {
+            "model": "llada-8b-instruct",
+            "messages": [{"role": "user", "content": "What is 7 * 4?"}],
+            "max_tokens": 50,
+            "generation_algorithm": "prefix_cache"
+        },
+        {
+            "model": "llada-8b-instruct",
+            "messages": [{"role": "user", "content": "What is 12 / 3?"}],
+            "max_tokens": 50,
+            "generation_algorithm": "dual_cache"
+        },
+        {
+            "model": "llada-8b-instruct",
+            "messages": [{"role": "user", "content": "What is 9 - 2?"}],
+            "max_tokens": 50,
+            "generation_algorithm": "dual_cache"
+        }
+    ]
+    
+    start_time = time.time()
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            send_request(session, f"{server_url}/v1/chat/completions", req, i)
+            for i, req in enumerate(test_requests)
+        ]
+        results = await asyncio.gather(*tasks)
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    successful = [r for r in results if r['success']]
+    print(f"Mixed algorithm test: {len(successful)}/{len(test_requests)} successful in {total_time:.3f}s")
+    
+    return results
+
 async def main():
     """Main test function."""
     server_url = "http://localhost:8000"
@@ -184,8 +249,16 @@ async def main():
     
     print()
     
+    # Test generation algorithms endpoint
+    await test_generation_algorithms(server_url)
+    print()
+    
     # Test batch stats
     await test_batch_stats(server_url)
+    print()
+    
+    # Test mixed algorithm processing
+    await test_mixed_algorithms(server_url)
     print()
     
     # Test batch performance
