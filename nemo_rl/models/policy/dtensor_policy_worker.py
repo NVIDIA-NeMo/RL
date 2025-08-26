@@ -238,7 +238,6 @@ class DTensorPolicyWorker:
             # Load model as a Reward Model.
             rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
             if rm_type == "bradley_terry":
-                print("🔍 Loading reward model...")
                 model_class = AutoModelForSequenceClassification
                 if model_config.num_labels != 1:
                     # For Bradley-Terry reward models, the linear head has a single output.
