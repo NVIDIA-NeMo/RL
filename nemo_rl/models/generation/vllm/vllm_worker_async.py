@@ -39,10 +39,80 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
 
-        self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+
+        self.server_thread, self.base_url = None, None
+        if self.cfg.get("expose_http_server"):
+            self.server_thread, self.base_url = self._setup_vllm_server()
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        return self.base_url
+
+    def _setup_vllm_server(self) -> None:
+        import threading
+
+        from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse, StreamingResponse
+
+        import uvicorn
+
+        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
+        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
+
+        node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
+
+        app = FastAPI()
+
+        engine_client = self.llm
+        model_config = self.llm_async_engine_args.create_model_config()
+        base_model_paths = [BaseModelPath(name=model_config.model, model_path=model_config.model)]
+
+        openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,
+            model_config=model_config,
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
+        openai_serving_chat = OpenAIServingChat(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+            return_tokens_as_token_ids=True,
+        )
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+            generator = await openai_serving_chat.create_chat_completion(request, raw_request)
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(),
+                                    status_code=generator.code)
+
+            elif isinstance(generator, ChatCompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=free_port,
+        )
+        server = uvicorn.Server(config=config)
+
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        return thread, base_url
 
     async def init_collective_async(
         self, rank_prefix: int, ip: str, port: int, world_size: int
