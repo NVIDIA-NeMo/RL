@@ -111,7 +111,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     # add preprocessor if needed
     datum_preprocessor = None
     if data_config["dataset_name"] == "clevr_cogent":
-        from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
+        from nemo_rl.data.datasets.response_datasets.clevr import (
+            format_clevr_cogent_dataset,
+        )
 
         datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
 

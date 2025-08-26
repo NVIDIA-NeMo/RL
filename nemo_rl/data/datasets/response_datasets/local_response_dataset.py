@@ -35,6 +35,7 @@ class LocalResponseDataset:
         input_key: Key for the input text
         output_key: Key for the output text
     """
+
     def __init__(
         self,
         train_ds_path: str,
