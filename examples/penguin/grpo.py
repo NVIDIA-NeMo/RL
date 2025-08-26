@@ -392,6 +392,23 @@ def grpo_train(
     This is an exact copy of the grpo_train function, with delimited modifications for Penguin integration
     based on this commit https://github.com/NVIDIA-NeMo/RL/tree/faad02113c3c502437ccb339cb848796334aedd9
     """
+    ########################################
+    # Original code
+    ########################################
+
+    # Nothing here
+
+    ########################################
+    # Updated code
+    ########################################
+
+    # Validate the setup for training with Penguin
+    assert _should_use_async_rollouts(master_config), f"In order to use Penguin, you must use vllm generation backend with `async_engine: true`!"
+    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
+    should_expose_http_server = master_config["policy"]["generation"]["vllm_cfg"].get("expose_http_server")
+    assert should_expose_http_server, f"In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
+    assert master_config.get("env"), f"Expected a Penguin config at `env`!"
+
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
