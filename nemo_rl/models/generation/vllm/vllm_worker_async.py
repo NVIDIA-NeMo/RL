@@ -42,9 +42,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
 
-        self.server_thread, self.base_url = None, None
+        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg.get("expose_http_server"):
-            self.server_thread, self.base_url = self._setup_vllm_server()
+            self.server_thread, self.base_url, self.http_server = self._setup_vllm_server()
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
@@ -112,7 +112,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
-        return thread, base_url
+        return thread, base_url, server
 
     async def init_collective_async(
         self, rank_prefix: int, ip: str, port: int, world_size: int
@@ -624,6 +624,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
+
+            if self.server_thread is not None:
+                from uvicorn import Server
+                from threading import Thread
+
+                self.http_server: Server
+                self.server_thread: Thread
+
+                self.http_server.should_exit = True
+                self.server_thread.join()
 
             return True
         except Exception as e:
