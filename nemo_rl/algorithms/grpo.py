@@ -1062,8 +1062,11 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
+    sampler_type = master_config["async_grpo"]["sampler_type"]
+
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        sampler_type=sampler_type,
     )
 
     _tc_py_exec = get_actor_python_env(

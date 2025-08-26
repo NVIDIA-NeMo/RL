@@ -14,6 +14,7 @@
 
 import threading as _threading
 import time
+import random
 from typing import Any, Optional
 
 import ray
@@ -32,6 +33,97 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
 
+#! Potentitally define a base class for all samplers
+
+
+class FIFOSampler:
+    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, target_weight_versions: list[int]) -> list[int]:
+
+        intended_indices = [
+                i
+                for i in valid_indices
+                if target_weight_versions[i] == current_weight_version
+            ]
+
+        print(
+            f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
+        )
+
+        # Stall training if we don't have enough trajectories intended for this step
+        if len(intended_indices) < num_prompt_groups:
+            print(
+                f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step {current_weight_version}, but only {len(intended_indices)} are ready"
+            )
+            print(
+                f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} trajectories to be generated"
+            )
+            return None
+
+        # Select exactly the trajectories intended for this step (FIFO within same target)
+        selected: list[int] = intended_indices[:num_prompt_groups]
+        print(
+            f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+        )
+
+        return selected
+        
+
+class MixedSampler:
+    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, target_weight_versions: list[int]) -> list[int]:
+
+
+        #! We select a total of num_prompt_groups trajectories
+        
+        #! Mixed sampler works by first finding out for how many trajectories is this is the last chance to be selected. Adds those into the selected list
+
+        intended_indices = [
+                i
+                for i in valid_indices
+                if target_weight_versions[i] == current_weight_version
+        ]
+
+        #! These indices have to be selected because its their last chance. Now we have remaining num_prompt_groups - len(intended_indices) left to sample from the remaining valid_indices of trajectories those we sample randomly from the remaining
+
+        print(f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}")
+
+        # If enough intended are available, just take those (FIFO within intended)
+        if len(intended_indices) >= num_prompt_groups:
+
+            #! If this happens its an indidicated that something went wrong somewhere else
+
+            selected: list[int] = intended_indices[:num_prompt_groups]
+            print(f"🔴 Selected {len(selected)} trajectories all intended for step {current_weight_version}")
+            return selected
+
+        selected: list[int] = list(intended_indices)
+        remaining_slots = num_prompt_groups - len(selected)
+        
+        remaining_pool = [
+            i for i in valid_indices
+            if target_weight_versions[i] != current_weight_version
+        ]
+
+        print(f"Filling remaining {remaining_slots} from {len(remaining_pool)} non-intended valid trajectories (random)")
+
+        if remaining_slots > 0:
+            if len(remaining_pool) <= remaining_slots:
+                selected.extend(remaining_pool)
+            else:
+                selected.extend(random.sample(remaining_pool, remaining_slots))
+
+        print(f"   ✅ Mixed selection done: {len(selected)} total (intended={len(intended_indices)}, mixed_in={len(selected) - len(intended_indices)})")
+
+        return selected
+
+
+
+
+
+
+
+
+        
+
 
 @ray.remote
 class ReplayBuffer:
@@ -41,13 +133,19 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, sampler_type: str = "fifo"):
         self.max_size = max_size
         self.trajectories = []
         self.trajectory_versions = []  # weight-version used for generation
         self.target_weight_versions = []  # weight-version this trajectory is targeted for
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+        if sampler_type == "fifo":
+            self.sampler = FIFOSampler()
+        elif sampler_type == "mixed":
+            self.sampler = MixedSampler()
+        
 
     def push_with_wait_signal(
         self,
@@ -165,31 +263,8 @@ class ReplayBuffer:
 
             # Only select trajectories intended for the current training step
             # This ensures no trajectory loses its "last chance" to be used for its intended step
-            intended_indices = [
-                i
-                for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
-            ]
 
-            print(
-                f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
-            )
-
-            # Stall training if we don't have enough trajectories intended for this step
-            if len(intended_indices) < num_prompt_groups:
-                print(
-                    f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories for step {current_weight_version}, but only {len(intended_indices)} are ready"
-                )
-                print(
-                    f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} trajectories to be generated"
-                )
-                return None
-
-            # Select exactly the trajectories intended for this step (FIFO within same target)
-            selected: list[int] = intended_indices[:num_prompt_groups]
-            print(
-                f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
-            )
+            selected = self.sampler.select(valid_indices, num_prompt_groups, current_weight_version, self.target_weight_versions)
 
             from collections import Counter
 
