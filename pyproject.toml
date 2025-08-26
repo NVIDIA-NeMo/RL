@@ -92,6 +92,10 @@ mcore = [
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.7.4.post1",
 ]
+penguin = [
+    # TODO we should somehow rename this to penguin...
+    "nemo_gym @ https://github.com/NVIDIA-NeMo/Gym",
+]
 
 [dependency-groups]
 
