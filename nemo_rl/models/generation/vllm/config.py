@@ -29,7 +29,6 @@ class VllmSpecificArgs(TypedDict):
     load_format: NotRequired[str]
     precision: NotRequired[str]
     enforce_eager: NotRequired[bool]
-    task: NotRequired[str]
 
 
 class VllmConfig(GenerationConfig):
