@@ -23,6 +23,8 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
+from tqdm.auto import tqdm
+
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
@@ -899,135 +901,25 @@ def run_async_penguin_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
-    """Run multi-turn rollouts with sample-level processing.
-
-    Each sample in the batch proceeds through its interaction independently.
-    Async generation is used internally when available but the function is synchronous.
-
-    Args:
-        policy_generation: The generation interface (policy)
-        input_batch: The starting batch containing initial message logs
-        tokenizer: The tokenizer
-        task_to_env: Dictionary mapping task names to environment instances
-        max_seq_len: Maximum sequence length allowed
-        max_rollout_turns: Maximum number of agent-environment interaction turns
-        greedy: Whether to use greedy decoding
-
-    Returns:
-        Tuple containing:
-            - BatchedDataDict with the full interaction history and accumulated rewards
-            - Dictionary of rollout metrics
+    """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
-    async def _async_rollout_implementation():
-        """Internal async implementation."""
-        batch_size = len(input_batch["message_log"])
+    from nemo_gym.server_utils import ServerClient
 
-        # Prepare initial states for each sample
-        sample_initial_states = []
-        for i in range(batch_size):
-            sample_state = {
-                "message_log": input_batch["message_log"][i],
-                "extra_env_info": input_batch["extra_env_info"][i],
-                "task_name": input_batch["task_name"][i],
-                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
-                "idx": input_batch.get("idx", list(range(batch_size)))[i],
-            }
-            sample_initial_states.append(sample_state)
+    # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
+    penguin_rows = input_batch["extra_env_info"]
+    agent_names = [row.pop("agent_ref")["name"] for row in penguin_rows]
 
-        # Run all samples concurrently
-        async def run_single_sample_with_error_handling(i, sample_state):
-            """Wrapper to handle errors for individual sample rollouts."""
-            try:
-                result = await run_sample_multi_turn_rollout(
-                    sample_idx=i,
-                    initial_sample_state=sample_state,
-                    policy_generation=policy_generation,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=max_seq_len,
-                    max_rollout_turns=max_rollout_turns,
-                    greedy=greedy,
-                )
-                return result
-            except Exception as e:
-                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
+    server_client = ServerClient.load_from_global_config()
 
-        # Create tasks for all samples and run them concurrently
-        sample_tasks = [
-            run_single_sample_with_error_handling(i, sample_state)
-            for i, sample_state in enumerate(sample_initial_states)
+    async def _collect_rollouts():
+        tasks = [
+            server_client.post(server_name=agent_name, url_path="/run", json=row)
+            for agent_name, row in zip(agent_names, penguin_rows)
         ]
+        results = tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
+        return [r.json() for r in results]
 
-        # Execute all sample rollouts concurrently
-        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
+    results = asyncio.run(_collect_rollouts())
 
-        # Process results
-        final_sample_states = []
-        all_sample_metrics = []
-
-        for final_state, sample_metrics in sample_results:
-            final_sample_states.append(final_state)
-            all_sample_metrics.append(sample_metrics)
-
-        # Reconstruct batch from sample results
-        batch_size = len(final_sample_states)
-        final_batch = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [state["message_log"] for state in final_sample_states],
-                "extra_env_info": [
-                    state["extra_env_info"] for state in final_sample_states
-                ],
-                "task_name": [state["task_name"] for state in final_sample_states],
-                "total_reward": torch.stack(
-                    [state["total_reward"] for state in final_sample_states]
-                ),
-                "idx": [
-                    state.get("idx", i) for i, state in enumerate(final_sample_states)
-                ],
-            }
-        )
-
-        # Preserve additional fields from the original input_batch
-        for key in input_batch.keys():
-            if key not in final_batch:
-                final_batch[key] = input_batch[key]
-
-        # Aggregate metrics across all samples
-        rollout_metrics = {
-            # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
-            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-            / batch_size,
-            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_reached_rate": sum(
-                m["max_turns_reached"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Token usage metrics
-            "mean_total_tokens_per_sample": sum(
-                m["total_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "mean_gen_tokens_per_sample": sum(
-                m["assistant_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "mean_env_tokens_per_sample": sum(
-                m["env_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Reward metrics
-            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
-            / batch_size,
-            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
-            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
-        }
-
-        return final_batch, rollout_metrics
-
-    return asyncio.run(_async_rollout_implementation())
+    
