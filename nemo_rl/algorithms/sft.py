@@ -150,7 +150,7 @@ def setup(
         batch_size=sft_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=rl_collate_fn,
-        drop_last=True,
+        drop_last=False,
     )
 
     # ==========================
@@ -240,7 +240,7 @@ def validate(
         # val_total = len(val_dataloader)
 
         val_metrics = {"val_loss": 0.0}
-        num_valid_batches = 0
+        num_valid_tokens = 0
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
@@ -269,6 +269,43 @@ def validate(
 
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+            if val_data.size < val_batch_size:
+                val_data_size = val_data.size
+                print(
+                    f"Padding last batch with {val_batch_size - val_data_size} padding samples"
+                )
+                val_data["input_ids"] = torch.cat(
+                    [
+                        val_data["input_ids"],
+                        val_data["input_ids"][-1]
+                        .unsqueeze(0)
+                        .repeat(val_batch_size - val_data_size, 1),
+                    ]
+                )
+                val_data["input_lengths"] = torch.cat(
+                    [
+                        val_data["input_lengths"],
+                        val_data["input_lengths"][-1]
+                        .unsqueeze(0)
+                        .repeat(val_batch_size - val_data_size),
+                    ]
+                )
+                val_data["token_mask"] = torch.cat(
+                    [
+                        val_data["token_mask"],
+                        val_data["token_mask"][-1]
+                        .unsqueeze(0)
+                        .repeat(val_batch_size - val_data_size, 1),
+                    ]
+                )
+                val_data["sample_mask"] = torch.cat(
+                    [
+                        val_data["sample_mask"],
+                        torch.zeros_like(val_data["sample_mask"][-1])
+                        .unsqueeze(0)
+                        .repeat(val_batch_size - val_data_size),
+                    ]
+                )
 
             ## just run model fwd
             val_results = policy.train(
@@ -285,14 +322,17 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                val_metrics["val_loss"] += float(val_results["loss"])
-                num_valid_batches += 1
+                num_tokens = (
+                    val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
+                ).sum()
+                val_metrics["val_loss"] += float(val_results["loss"]) * num_tokens
+                num_valid_tokens += num_tokens
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
-        if num_valid_batches > 0:
-            val_metrics["val_loss"] /= num_valid_batches
+        if num_valid_tokens > 0:
+            val_metrics["val_loss"] /= num_valid_tokens
         else:
             warnings.warn(
                 "No validation metrics were collected."
@@ -306,7 +346,7 @@ def validate(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if num_valid_batches > 0:
+    if num_valid_tokens > 0:
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
