@@ -490,7 +490,6 @@ class MegatronPolicyWorker:
 
         # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
         torch.distributed.init_process_group("nccl")
-        torch.distributed.barrier()
         if pt_checkpoint_exists:
             print(
                 f"Checkpoint already exists at {pretrained_path}. Skipping import."
