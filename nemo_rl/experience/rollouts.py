@@ -381,13 +381,6 @@ def run_multi_turn_rollout(
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
             )
         )
-        torch.set_printoptions(
-            profile="full", precision=4, linewidth=200, threshold=torch.inf
-        )
-        print(f"active_input_lengths: {active_input_lengths}")
-        torch.set_printoptions(
-            profile="default", precision=4, linewidth=200, threshold=torch.inf
-        )
 
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
