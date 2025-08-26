@@ -488,12 +488,15 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
+        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
         torch.distributed.init_process_group("nccl")
-        torch.cuda.set_device(0)
-        import_model_from_hf_name(hf_model_name, pretrained_path)
-
-        # TODO: for some reason, need to comment this out
-        # destroy_parallel_state()
+        torch.distributed.barrier()
+        if pt_checkpoint_exists:
+            print(
+                f"Checkpoint already exists at {pretrained_path}. Skipping import."
+            )
+        else:
+            import_model_from_hf_name(hf_model_name, pretrained_path, self.cfg["megatron_cfg"])
 
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"

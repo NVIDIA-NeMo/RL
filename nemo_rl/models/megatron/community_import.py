@@ -13,21 +13,48 @@
 # limitations under the License.
 
 import os
+from typing import Optional
 
 from megatron.bridge import AutoBridge
+from nemo_rl.models.policy import MegatronConfig
 
 
-def import_model_from_hf_name(hf_model_name: str, output_path: str):
+def import_model_from_hf_name(
+    hf_model_name: str,
+    output_path: str,
+    megatron_config: Optional[MegatronConfig] = None,
+):
+    """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
+
+    Args:
+        hf_model_name: Hugging Face model ID or local path (e.g., 'meta-llama/Llama-3.1-8B-Instruct').
+        output_path: Directory to write the Megatron checkpoint (e.g., /tmp/megatron_ckpt).
+        megatron_config: Optional megatron config with paralellism settings for distributed megatron model import.
+    """
     bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
+
     model_provider = bridge.to_megatron_provider(load_weights=True)
-    # TODO: use config to set these
-    model_provider.tensor_model_parallel_size = 1
-    model_provider.pipeline_model_parallel_size = 16
-    model_provider.expert_model_parallel_size = 16
-    model_provider.expert_tensor_parallel_size = 1
-    model_provider.num_layers_in_first_pipeline_stage = 3
-    model_provider.num_layers_in_last_pipeline_stage = 2
-    model_provider.pipeline_dtype = "bfloat16"
+
+    if megatron_config is not None:
+        model_provider.tensor_model_parallel_size = megatron_config[
+            "tensor_model_parallel_size"
+        ]
+        model_provider.pipeline_model_parallel_size = megatron_config[
+            "pipeline_model_parallel_size"
+        ]
+        model_provider.expert_model_parallel_size = megatron_config[
+            "expert_model_parallel_size"
+        ]
+        model_provider.expert_tensor_parallel_size = megatron_config[
+            "expert_tensor_parallel_size"
+        ]
+        model_provider.num_layers_in_first_pipeline_stage = megatron_config[
+            "num_layers_in_first_pipeline_stage"
+        ]
+        model_provider.num_layers_in_last_pipeline_stage = megatron_config[
+            "num_layers_in_last_pipeline_stage"
+        ]
+        model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
