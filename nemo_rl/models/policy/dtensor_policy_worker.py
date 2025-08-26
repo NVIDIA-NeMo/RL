@@ -69,7 +69,6 @@ from nemo_rl.models.policy.utils import (
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    is_vllm_v1_engine_enabled,
     resolve_model_class,
     sliding_window_overwrite,
 )
@@ -471,13 +470,8 @@ class DTensorPolicyWorker:
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        # Apply temperature scaling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
-            # The V1 engine returns raw logits before temperature scaling.
-            # The V0 engine returns scaled logits.
-            # Therefore, we only divide if we are not using the V1 engine.
-            if not is_vllm_v1_engine_enabled():
-                logits.div_(self.cfg["generation"]["temperature"])
+            logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
     @staticmethod

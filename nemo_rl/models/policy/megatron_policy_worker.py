@@ -820,7 +820,9 @@ class MegatronPolicyWorker:
                         f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                     )
 
-            forward_step = partial(forward_step_arbitrary_loss, loss_fn=loss_fn)
+            forward_step = partial(
+                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+            )
             all_mb_metrics = []
             losses = []
             for gb_idx in range(num_global_batches):
@@ -1110,6 +1112,11 @@ class MegatronPolicyWorker:
                 attention_mask,
                 packed_seq_params=packed_seq_params,
             )
+
+            # Apply temperature scaling to logits for training
+            # This matches the dtensor worker's _apply_temperature_scaling in the train method
+            if "generation" in self.cfg and self.cfg["generation"] is not None:
+                output_tensor.div_(self.cfg["generation"]["temperature"])
 
             def collection_fn(output_tensor):
                 stc = time.time()

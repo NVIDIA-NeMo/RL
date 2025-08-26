@@ -79,7 +79,6 @@ from nemo_rl.models.policy.utils import (
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    is_vllm_v1_engine_enabled,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -420,13 +419,8 @@ class DTensorPolicyWorkerV2:
         self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        # Apply temperature scaling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
-            # The V1 engine returns raw logits before temperature scaling.
-            # The V0 engine returns scaled logits.
-            # Therefore, we only divide if we are not using the V1 engine.
-            if not is_vllm_v1_engine_enabled():
-                logits.div_(self.cfg["generation"]["temperature"])
+            logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
