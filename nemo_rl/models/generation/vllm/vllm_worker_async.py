@@ -22,6 +22,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -60,8 +61,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
         from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
-
-        from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
 
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
         base_url = f"http://{node_ip}:{free_port}/v1"
