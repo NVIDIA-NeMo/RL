@@ -409,6 +409,13 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
+def _should_use_penguin(master_config: MasterConfig) -> bool:
+    """Determine if Penguin should be used for rollouts and validation based on the configuration.
+    """
+    env_config = master_config["env"]
+    return bool(env_config.get("should_use_penguin"))
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -580,8 +587,24 @@ def grpo_train(
                     policy_generation.prepare_for_generation()
 
             with timer.time("generation"):
+                # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
+                if _should_use_penguin(master_config):
+                    (
+                        repeated_batch,
+                        rollout_metrics,
+                    ) = run_async_penguin_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        max_seq_len=master_config["policy"][
+                            "max_total_sequence_length"
+                        ],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
                 # Use async rollouts if vLLM async engine is enabled
-                if _should_use_async_rollouts(master_config):
+                elif _should_use_async_rollouts(master_config):
                     (
                         repeated_batch,
                         rollout_metrics,
@@ -917,7 +940,18 @@ def validate(
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
+            # We cascade penguin first since penguin also uses async rollouts.
+            if _should_use_penguin(master_config):
+                val_batch, gen_metrics = run_async_penguin_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
+            elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
