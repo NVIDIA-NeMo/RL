@@ -470,12 +470,23 @@ def grpo_train(
                 repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
                     master_config["grpo"]["num_generations_per_prompt"]
                 )
-                # Convert LLMMessageLogType to FlatMessagesType for generation
-                batched_flat, input_lengths = batched_message_log_to_flat_message(
-                    repeated_batch["message_log"],
-                    pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                )
-                input_ids = batched_flat["token_ids"]
+
+                ########################################
+                # Original code
+                ########################################
+
+                # # Convert LLMMessageLogType to FlatMessagesType for generation
+                # batched_flat, input_lengths = batched_message_log_to_flat_message(
+                #     repeated_batch["message_log"],
+                #     pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                # )
+                # input_ids = batched_flat["token_ids"]
+
+                ########################################
+                # Updated code
+                ########################################
+
+                # Nothing here after getting repeated batch
 
             # Generate responses - this updates the LLMMessageLogType in repeated_batch
             print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
