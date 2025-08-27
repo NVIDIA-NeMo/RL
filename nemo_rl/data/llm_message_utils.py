@@ -524,6 +524,42 @@ def get_formatted_message_log(
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
+        
+        # Debug: Check tools before apply_chat_template
+        _debug_tools = tools if tools is not None else task_data_spec.tools
+        if i == 0:  # Only print once on first iteration
+            print("\n" + "="*80)
+            print("DEBUG: Before apply_chat_template")
+            print(f"Tools type: {type(_debug_tools)}")
+            print(f"Tools is None: {_debug_tools is None}")
+            print(f"Tools length: {len(_debug_tools) if _debug_tools else 'N/A'}")
+            if _debug_tools:
+                print(f"Tools value: {_debug_tools}")
+                print(f"First tool structure: {_debug_tools[0] if _debug_tools else 'N/A'}")
+            print(f"Tokenizer type: {type(tokenizer)}")
+            print(f"Tokenizer has chat_template: {hasattr(tokenizer, 'chat_template')}")
+            if hasattr(tokenizer, 'chat_template'):
+                print(f"Chat template type: {type(tokenizer.chat_template)}")
+                # Check if template contains tool handling
+                template_str = str(tokenizer.chat_template) if tokenizer.chat_template else ""
+                print(f"Template contains 'if tools': {'if tools' in template_str}")
+                print(f"Template contains '<tools>': {'<tools>' in template_str}")
+                print(f"\nActual chat template being used:")
+                print("-" * 80)
+                print(tokenizer.chat_template)
+                print("-" * 80)
+            
+            # Check what parameters apply_chat_template accepts
+            try:
+                import inspect
+                sig = inspect.signature(tokenizer.apply_chat_template)
+                print(f"apply_chat_template signature: {sig}")
+                print(f"apply_chat_template parameters: {list(sig.parameters.keys())}")
+            except Exception as e:
+                print(f"Could not inspect apply_chat_template: {e}")
+            
+            print("="*80 + "\n")
+        
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
             message_log_strs[: i + 1],
             add_generation_prompt=add_generation_prompt and message["role"] == "user",
@@ -531,6 +567,24 @@ def get_formatted_message_log(
             add_special_tokens=False,
             tools=tools if tools is not None else task_data_spec.tools,
         )
+        
+        # Debug: Check if tools appear in formatted message
+        if i == 0 and _debug_tools:
+            print("\n" + "="*80)
+            print("DEBUG: After apply_chat_template (first message)")
+            print(f"Formatted message length: {len(formatted_message)}")
+            print(f"Contains '<tools>': {'<tools>' in formatted_message}")
+            print(f"Contains '# Tools': {'# Tools' in formatted_message}")
+            print(f"First 500 chars of formatted message:")
+            print(formatted_message[:500])
+            if '<tools>' in formatted_message:
+                # Extract and show the tools section
+                tools_start = formatted_message.find('<tools>')
+                tools_end = formatted_message.find('</tools>') + len('</tools>')
+                if tools_end > tools_start:
+                    print(f"\nTools section found:")
+                    print(formatted_message[tools_start:tools_end])
+            print("="*80 + "\n")
         
         # Debug: Print formatted message with tools for the last message (complete conversation)
         _tools = tools if tools is not None else task_data_spec.tools
