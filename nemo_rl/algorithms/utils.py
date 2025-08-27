@@ -18,7 +18,11 @@ from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 
 from nemo_rl.data import hf_datasets
 from nemo_rl.models.policy import TokenizerConfig
@@ -144,7 +148,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
+def get_tokenizer(
+    tokenizer_config: TokenizerConfig, get_processor: bool = False
+) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -160,6 +166,7 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+        get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
         PreTrainedTokenizerBase: The configured tokenizer instance
@@ -198,13 +205,38 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         Using custom chat template
         >>> formatted = tokenizer.apply_chat_template(messages, tokenize=False)
         >>> assert formatted == " START: You are a helpful AI assistant. END. START: Hello! END."
+
+        >>> # Requesting a processor (for multimodal models like Qwen-VL)
+        >>> config = {"name": "Qwen/Qwen2.5-VL-3B-Instruct"}
+        >>> processor = get_tokenizer(config, get_processor=True)
+        No chat template provided, using tokenizer's default
+        >>> messages = [
+        ...     {"role": "system", "content": "You are a helpful AI assistant."},
+        ...     {"role": "user", "content": "Hello!"}
+        ... ]
+        >>> formatted = processor.tokenizer.apply_chat_template(messages, tokenize=False)
+        >>> assert formatted == AutoTokenizer.from_pretrained(
+        ...     "Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True
+        ... ).apply_chat_template(messages, tokenize=False)
+        >>> assert processor.pad_token_id == processor.tokenizer.pad_token_id
+        >>>
         ```
     """
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_config["name"], trust_remote_code=True
-    )
+    processor = None
+
+    if get_processor:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
@@ -219,4 +251,17 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
     else:
         print("No chat template provided, using tokenizer's default")
 
-    return tokenizer
+    # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
+    # However, the dataloader needs the processor for multimodal data preprocessing, so the processor is needed for the dataloader (only tokenizer is NOT enough).
+    # Inheriting special keys from the tokenizer is a minimal change that doesn't disturb the rest of the SFT pipeline
+    if processor is not None:
+        processor.pad_token = tokenizer.pad_token
+        processor.eos_token = tokenizer.eos_token
+        processor.bos_token = tokenizer.bos_token
+        processor.pad_token_id = tokenizer.pad_token_id
+        processor.eos_token_id = tokenizer.eos_token_id
+        processor.bos_token_id = tokenizer.bos_token_id
+        # copy name_or_path from tokenizer to processor for logging
+        processor.name_or_path = tokenizer.name_or_path
+
+    return tokenizer if processor is None else processor
