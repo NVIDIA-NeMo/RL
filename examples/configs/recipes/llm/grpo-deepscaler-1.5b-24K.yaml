@@ -42,6 +42,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.8
       enforce_eager: True
       max_model_len: ${policy.max_total_sequence_length}
