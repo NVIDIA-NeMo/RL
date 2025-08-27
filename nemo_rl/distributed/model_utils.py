@@ -18,7 +18,6 @@ import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 
-@torch.no_grad()
 def _compute_distributed_log_softmax(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -36,26 +35,29 @@ def _compute_distributed_log_softmax(
             log probabilities normalized across the full vocabulary dimension.
     """
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
-    torch.distributed.all_reduce(
-        logits_max,
-        op=torch.distributed.ReduceOp.MAX,
-        group=group,
-    )
+
+    if group is not None:
+        torch.distributed.all_reduce(
+            logits_max,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
 
     # Subtract the maximum value.
     vocab_parallel_logits = vocab_parallel_logits - logits_max
 
     sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
 
-    torch.distributed.all_reduce(
-        sum_exp_logits,
-        op=torch.distributed.ReduceOp.SUM,
-        group=group,
-    )
+    if group is not None:
+        torch.distributed.all_reduce(
+            sum_exp_logits,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
 
     return vocab_parallel_logits - sum_exp_logits.log_().to(vocab_parallel_logits.dtype)
 
-@torch.compile
+@torch.compile(fullgraph=True)
 def distributed_logprob_forward(vocab_parallel_logits, target, vocab_start_index, vocab_end_index, tp_group):
     # Create a mask of valid vocab ids (1 means it needs to be masked).
     target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -70,46 +72,30 @@ def distributed_logprob_forward(vocab_parallel_logits, target, vocab_start_index
     log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
     log_probs[target_mask] = 0.0
 
-    torch.distributed.all_reduce(
-        log_probs,
-        op=torch.distributed.ReduceOp.SUM,
-        group=tp_group,
-    )
+    if tp_group is not None:
+        torch.distributed.all_reduce(
+            log_probs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_group,
+        )
     return log_probs, softmax_output
 
-
-@torch.compile
-def distributed_logprob_backward(softmax, target, grad_output, vocab_start_index, vocab_end_index):
-    B, S, V = softmax.shape
+@torch.compile(fullgraph=True)
+def distributed_logprob_backward(grad_output, target, softmax, vocab_start_index, vocab_end_index):
+    V = softmax.size(-1)
 
     target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
     masked_target = target - vocab_start_index
     masked_target[target_mask] = 0
-
-    # skip `torch.nn.functional.one_hot`
-    row = (
-        torch.arange(B, device=softmax.device)
-        .view(-1, 1)
-        .expand(-1, S)
-        .reshape(-1)
+    
+    is_chosen = (~target_mask).unsqueeze(-1) * torch.nn.functional.one_hot(
+        masked_target, num_classes=V
     )
-    col = torch.arange(S, device=softmax.device).expand(B, -1).reshape(-1)
-    flat_idx = (row * S + col) * V
 
-    flat_chosen = flat_idx.masked_select(
-        ~target_mask.reshape(-1)
-    ) + masked_target.masked_select(~target_mask)
-
-    # `neg` is zero-copy
-    grad_input = softmax.neg()
-    grad_input = grad_input.mul_(grad_output.unsqueeze(-1))
-
-    grad_output_selected = grad_output.masked_select(~target_mask)
-    grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+    grad_input = is_chosen.float().sub_(softmax)
+    grad_input.mul_(grad_output.unsqueeze(-1))
 
     return grad_input
- 
-
 
 class DistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
@@ -128,12 +114,12 @@ class DistributedLogprob(torch.autograd.Function):
         inference_only: bool = False,
     ) -> torch.Tensor:
         
-        log_probs, softmax_output = distributed_logprob_forward(
+        log_probs, softmax = distributed_logprob_forward(
             vocab_parallel_logits, target, vocab_start_index, vocab_end_index, group
         )
         if not inference_only:
             # only save for backward when we have inference only=False
-            ctx.save_for_backward(softmax_output, target)
+            ctx.save_for_backward(softmax, target)
             ctx.vocab_start_index = vocab_start_index
             ctx.vocab_end_index = vocab_end_index
         
@@ -150,15 +136,14 @@ class DistributedLogprob(torch.autograd.Function):
         vocab_start_index = ctx.vocab_start_index
         vocab_end_index = ctx.vocab_end_index
 
-        assert softmax.ndim == 3
         grad_input = distributed_logprob_backward(
-            softmax, 
+            grad_output, 
             target,
-            grad_output,
+            softmax,
             vocab_start_index,
             vocab_end_index,
         )
-        # if you add an argument to the forward method, then you must add a corresponding None here
+
         return grad_input, None, None, None, None, None, None
 
 
