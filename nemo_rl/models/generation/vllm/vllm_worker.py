@@ -333,6 +333,15 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        # Use vllm DP
+        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
+        global_dp_rank = int(os.environ["RANK"]) // model_parallel_size
+        local_dp_rank = (int(os.environ["RANK"]) % 8) // model_parallel_size
+        os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
+        os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
+        os.environ["VLLM_DP_MASTER_IP"] = os.environ["MASTER_ADDR"]
+        os.environ["VLLM_DP_MASTER_PORT"] = os.environ["MASTER_PORT"]
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
