@@ -171,6 +171,7 @@ def test_reward_model_environment_performance(reward_model_env):
         num_total = len(subset_dataset["results"])
         print(f"{subset}: {num_correct}/{num_total} ({num_correct / num_total})")
         results_grouped[subset] = num_correct / num_total
+    print(results_grouped)
 
 
 def test_reward_model_environment_generate_responses(reward_model_env):
