@@ -22,17 +22,6 @@ dpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/dpo"
-
-  # If you are using multiple validation sets, `metric_name` should reflect the metric and validation set to be tracked. For example:
-  # checkpointing:
-  #   metric_name: "val-<NameOfValidationDataset1>_loss"
-  # ...
-  # data:
-  #   dataset_name: PreferenceDataset
-  #   train_data_path: <LocalPathToTrainingDataset>
-  #   val_data_paths:
-  #     <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
-  #     ...
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: 3
@@ -163,12 +152,24 @@ policy:
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: HelpSteer3
-  # You can use the following to configure a custom preference dataset for training and validation
-  # dataset_name: PreferenceDataset
-  # train_data_path: <LocalPathToTrainingDataset>
-  # val_data_path: <LocalPathToValidationDataset>
   shuffle: true
+
+  dataset_name: HelpSteer3
+  # You can use a custom preference dataset for training and validation. For example:
+  #   dataset_name: PreferenceDataset
+  #   train_data_path: <LocalPathToTrainingDataset>
+  #   val_data_path: <LocalPathToValidationDataset>
+  #
+  # If you are using multiple validation sets, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "val-<NameOfValidationDataset1>_loss"
+  #   ...
+  #   data:
+  #     dataset_name: PreferenceDataset
+  #     train_data_path: <LocalPathToTrainingDataset>
+  #     val_data_paths:
+  #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #       ...
 
 logger:
   log_dir: "logs"  # Base directory for all logs
