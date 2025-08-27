@@ -71,7 +71,7 @@ policy:
         start_factor: 0.1
         end_factor: 1.0
         total_iters: 100
-    - name: "torch.optim.lr_scheduler.CosineLR"
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
         T_max: ${policy.max_num_steps}
     - milestones: [100]
