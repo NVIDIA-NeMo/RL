@@ -1645,10 +1645,9 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
-        gathered_hf_params = {name: tensor for name, tensor in hf_params_generator}
         # broadcast from train rank0 worker to inference workers
-        if self.rank == 0:
-            for _, tensor in gathered_hf_params.items():
+        for _, tensor in hf_params_generator:
+            if self.rank == 0:
                 self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
