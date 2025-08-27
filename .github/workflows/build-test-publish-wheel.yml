@@ -30,7 +30,7 @@ defaults:
 
 jobs:
   build-test-publish-wheel:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@9fd09e86e5d34d3095afc7b334bd2bfbafc3f607
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.55.0
     with:
       dry-run: true
       python-package: nemo_rl
