@@ -16,6 +16,13 @@ name: Build, test, and publish a PyPi wheel (to testpypi).
 
 on:
   push:
+    branches:
+      - main
+      - "r**"
+  pull_request:
+    branches:
+      - main
+      - r**
 
 defaults:
   run:
@@ -23,7 +30,7 @@ defaults:
 
 jobs:
   build-test-publish-wheel:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@8f0565506c82de5fb5a3254dd8b64f110e424dd2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@9fd09e86e5d34d3095afc7b334bd2bfbafc3f607
     with:
       dry-run: true
       python-package: nemo_rl
