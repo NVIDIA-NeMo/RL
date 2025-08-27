@@ -165,8 +165,8 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
-        self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
-            "enabled", False
+        self._is_reward_model = (
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
         )
         if self._is_reward_model:
             # Ensure sequence packing is disabled.
