@@ -66,7 +66,7 @@ automodel = [
 ]
 vllm = [
     "cuda-python",
-    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+    "deep_gemm",
     "vllm==0.10.0",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -150,6 +150,7 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" }
 
 [tool.uv.workspace]
 members = [
