@@ -36,12 +36,17 @@ Each DPO dataset class is expected to have the following attributes:
 1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
 ```jsonc
 {
-    "context": list of dicts, # The prompt message (including previous turns, if any)
-    "completions": list of dicts, # The list of completions
-        {
-            "rank": int, # The rank of the completion (lower rank is preferred)
-            "completion": list of dicts, # The completion message(s)
-        }
+  "context": [], // list of dicts - The prompt message (including previous turns, if any)
+  "completions": [ // list of dicts — The list of completions
+    {
+      "rank": 0, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    },
+    {
+      "rank": 1, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    }
+  ]
 }
 ```
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
