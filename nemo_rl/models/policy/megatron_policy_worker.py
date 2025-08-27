@@ -399,7 +399,7 @@ class MegatronPolicyWorker:
         self.dtype = dtype_map[self.cfg["precision"]]
 
         # Reward models are not yet supported with Megatron.
-        if self.cfg.get("reward_model_cfg", {}).get("enabled", False):
+        if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
             raise NotImplementedError(
                 "Reward models are not yet supported with the Megatron backend, this issue is "
                 "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"

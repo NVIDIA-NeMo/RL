@@ -16,10 +16,6 @@ import pprint
 import pytest
 import ray
 import torch
-
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
-
 from transformers import AutoModelForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction

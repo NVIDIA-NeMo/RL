@@ -110,9 +110,6 @@ def two_gpu_virtual_cluster():
     cluster.shutdown()
 
 
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
-
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.models.policy.lm_policy import Policy
 
