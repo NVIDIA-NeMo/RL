@@ -41,12 +41,8 @@ class PenguinWorker:
         self.nemo_rl_openai_base_url = nemo_rl_openai_base_url
         self.node_ip, self.head_server_port = _get_node_ip_and_free_port()
 
-    def get_node_ip_header_server_port(self) -> tuple[str, int]:
-        return self.node_ip, self.head_server_port
-
-    def start(self) -> None:
         # TODO we should probably rename this somehow to penguin. But that is a lot of work...
-        from nemo_gym.cli import run
+        from nemo_gym.cli import RunHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
@@ -65,10 +61,30 @@ class PenguinWorker:
                 "port": self.head_server_port,
             }
 
-        run(
+        self.rh = RunHelper()
+        self.rh.start(
             dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
             initial_global_config_dict=initial_global_config_dict,
         )
+
+    async def run_rollouts(self, examples: list[dict]) -> list[dict]:
+        from nemo_gym.server_utils import ServerClient, BaseServerConfig
+
+        head_server_config = BaseServerConfig(
+            host=self.node_ip,
+            port=self.head_server_port,
+        )
+        server_client = ServerClient.load_from_global_config(head_server_config)
+
+        tasks = [
+            server_client.post(
+                server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
+            )
+            for row in examples
+        ]
+
+        results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
+        return [r.json() for r in results]
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -81,57 +97,30 @@ class Penguin(EnvironmentInterface):
         self.cfg = cfg
 
         self.workers = [
-            start_penguin.options(  # type: ignore # (decorated with @ray.remote)
+            PenguinWorker.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.PENGUIN}
             ).remote(self.cfg)
             for _ in range(self.cfg["base_urls"])
         ]
 
-        from nemo_gym.server_utils import BaseServerConfig
-
-        self.head_server_configs: list[BaseServerConfig] = []
-        self.start_tasks = []
-        for worker in self.workers:
-            node_ip, head_server_port = ray.get(worker.get_node_ip_header_server_port.remote())
-            self.head_server_configs.append(BaseServerConfig(host=node_ip, port=head_server_port))
-
-            self.start_tasks.append(worker.start.remote())
-
     async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        from nemo_gym.server_utils import ServerClient
-
         # For now, we enforce that the total number of examples in the batch is divisible by the number of workers.
         # This just makes the batching logic below easier.
         assert len(penguin_examples) % len(self.workers) == 0
 
         batch_size = len(penguin_examples) // len(self.workers)
 
-        tasks = []
-        for start_idx, head_server_config in zip(range(0, len(penguin_examples), batch_size), self.head_server_configs):
+        futures = []
+        for start_idx, worker in zip(range(0, len(penguin_examples), batch_size), self.workers):
             this_batch_penguin_examples = penguin_examples[start_idx: start_idx + batch_size]
+            future = worker.run_rollouts.remote(this_batch_penguin_examples)
+            futures.append(future)
 
-            this_batch_server_client = ServerClient.load_from_global_config(head_server_config)
+        results = []
+        for result in ray.get(futures):
+            results.extend(result)
 
-            this_batch_tasks = [
-                this_batch_server_client.post(
-                    server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
-                )
-                for row in this_batch_penguin_examples
-            ]
-            tasks.extend(this_batch_tasks)
-
-        results = tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
-        return [r.json() for r in results]
-
-    def responses_to_message_logs(self, batch_responses: list[dict]) -> list[dict]:
-        """
-        A message looks like this:
-        {
-            "role": "assistant",  # or "user"
-            "content": text,
-            "token_ids": output_ids[i, input_length:total_length],
-        }
-        """
+        return results
 
     def shutdown(self) -> None:
         for start_task in self.start_tasks:
