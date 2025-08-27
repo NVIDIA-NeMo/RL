@@ -27,7 +27,6 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
-from nemo_rl.data.hf_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -72,7 +71,7 @@ def hf_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
-    problem = datum_dict["prompt"]
+    problem = datum_dict["messages"]
     extra_env_info = {}
 
     message_log: LLMMessageLogType = []
@@ -129,24 +128,15 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
+    task_name = "math"
     reward_model_task_spec = TaskDataSpec(
-        task_name="reward_model",
+        task_name=task_name,
         prompt_file=data_config["prompt_file"],
         system_prompt_file=data_config["system_prompt_file"],
     )
 
-    # Load OpenMathInstruct2Dataset using nemo rl datasets
-    if data_config["dataset_name"] == "HelpSteer3":
-        print("Loading nvidia/HelpSteer3 for training and validation")
-        data: Any = HelpSteer3Dataset()
-        # Ensure raw entries have 'task_name' so dict-based processors work
-        for split in ("train", "validation"):
-            if split in data.formatted_ds and data.formatted_ds[split] is not None:
-                data.formatted_ds[split] = data.formatted_ds[split].map(
-                    lambda _: {"task_name": "reward_model"},
-                    batched=False,
-                )
-    elif data_config["dataset_name"] == "DeepScaler":
+    # Load DeepScaler using nemo rl datasets
+    if data_config["dataset_name"] == "DeepScaler":
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
@@ -157,7 +147,7 @@ def setup_data(
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (reward_model_task_spec, hf_data_processor))
     )
-    task_data_processors["reward_model"] = (reward_model_task_spec, hf_data_processor)
+    task_data_processors[task_name] = (reward_model_task_spec, hf_data_processor)
 
     # reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
     #     runtime_env={
@@ -195,7 +185,7 @@ def setup_data(
         val_dataset = None
 
     task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: reward_model_env)
-    task_to_env["reward_model"] = reward_model_env
+    task_to_env[task_name] = reward_model_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 

@@ -1,6 +1,12 @@
+from typing import List
+
+import numpy as np
 import pytest
 import torch
+from datasets import load_dataset
+from tqdm import tqdm
 
+from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
@@ -102,9 +108,69 @@ def cluster():
             cluster_instance.shutdown()
 
 
-def test_reward_model_environment(reward_model_env, cluster):
+EVAL_SET = "allenai/reward-bench"
+
+
+# EVAL_SET = "THU-KEG/RM-Bench"
+def test_reward_model_environment_performance(reward_model_env):
     """Test the reward model environment."""
-    pass
+    raw_dataset = load_dataset(EVAL_SET, split="filtered")
+    subsets = raw_dataset["subset"]
+    batch_size = 32
+    dataloader = torch.utils.data.DataLoader(
+        raw_dataset,
+        batch_size=batch_size,
+        collate_fn=None,
+        shuffle=False,
+        drop_last=False,
+    )
+    reward_data_chosen = []
+    reward_data_rejected = []
+    for idx, batch in enumerate(tqdm(dataloader, desc="Processing dataset")):
+        message_log_batch_chosen: List[LLMMessageLogType] = []
+        message_log_batch_rejected: List[LLMMessageLogType] = []
+        for example in batch:
+            message_log_chosen = [
+                {"role": "user", "content": example["prompt"]},
+                {"role": "assistant", "content": example["chosen"]},
+            ]
+            message_log_rejected = [
+                {"role": "user", "content": example["prompt"]},
+                {"role": "assistant", "content": example["rejected"]},
+            ]
+            message_log_batch_chosen.append(message_log_chosen)
+            message_log_batch_rejected.append(message_log_rejected)
+        reward_data_chosen_batch = reward_model_env.preprocess_data(
+            message_log_batch_chosen
+        )
+        reward_data_rejected_batch = reward_model_env.preprocess_data(
+            message_log_batch_rejected
+        )
+        reward_data_chosen_scores = reward_model_env.reward_model_policy.score(
+            reward_data_chosen_batch
+        )["scores"]
+        reward_data_rejected_scores = reward_model_env.reward_model_policy.score(
+            reward_data_rejected_batch
+        )["scores"]
+        reward_data_chosen.extend(reward_data_chosen_scores)
+        reward_data_rejected.extend(reward_data_rejected_scores)
+    results = []
+    for chosen, rejected in zip(reward_data_chosen, reward_data_rejected):
+        results.append(1) if chosen > rejected else results.append(0)
+    print(results)
+    print(len(results))
+    out_dataset = raw_dataset.add_column("results", results)
+
+    # add subsets back (removed so it's not handled by cuda)
+    out_dataset = out_dataset.add_column("subset", subsets)
+    present_subsets = np.unique(subsets)
+    results_grouped = {}
+    for subset in present_subsets:
+        subset_dataset = out_dataset.filter(lambda example: example["subset"] == subset)
+        num_correct = sum(subset_dataset["results"])
+        num_total = len(subset_dataset["results"])
+        print(f"{subset}: {num_correct}/{num_total} ({num_correct / num_total})")
+        results_grouped[subset] = num_correct / num_total
 
 
 def test_reward_model_environment_generate_responses(reward_model_env):
