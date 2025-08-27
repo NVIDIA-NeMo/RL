@@ -23,7 +23,6 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 import ray
 import torch
 from accelerate import init_empty_weights
-from nemo_automodel.components._transformers.utils import resolve_model_class
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
