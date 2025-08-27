@@ -121,6 +121,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         pre_init_queue = RayQueue()
+        node_pre_init_queues: list[RayQueue] = [
+            RayQueue() for _ in range(len(cluster.get_placement_groups()))
+        ]
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
             config,
@@ -132,6 +135,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             init_reference_model=init_reference_model,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
+            node_pre_init_queues=node_pre_init_queues,
         )
 
         self.worker_group = RayWorkerGroup(
