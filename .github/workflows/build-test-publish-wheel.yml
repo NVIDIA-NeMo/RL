@@ -36,6 +36,7 @@ jobs:
       python-package: nemo_rl
       packaging: uv
       submodules: recursive
+      no-publish: ${{ github.event_name == 'pull_request' }}
     secrets:
       TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
