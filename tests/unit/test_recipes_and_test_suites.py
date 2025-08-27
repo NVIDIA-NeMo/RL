@@ -17,6 +17,9 @@ import subprocess
 
 import pytest
 
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
 dir_path = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(dir_path, "..", ".."))
 configs_dir = os.path.join(project_root, "examples", "configs")
@@ -37,6 +40,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "sft": "examples/configs/sft.yaml",
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",
+    "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
 }
 
 
@@ -182,7 +186,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1024_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1030_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -214,8 +218,8 @@ def test_nightly_compute_stays_below_1024_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1024, (
-        f"Total GPU hours exceeded 1024: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1030, (
+        f"Total GPU hours exceeded 1030: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
@@ -283,6 +287,8 @@ def test_all_recipes_can_merge_configs_with_base_config(
 ):
     from omegaconf import OmegaConf
 
+    from nemo_rl.utils.config import load_config
+
     base_yaml = os.path.join(project_root, algo_base_yaml)
     base_config = OmegaConf.load(base_yaml)
     # Would result in an error if we couldn't merge our config with the recipe's config
@@ -293,7 +299,7 @@ def test_all_recipes_can_merge_configs_with_base_config(
             #  test_all_recipes_start_with_algo_hyphen()
             continue
         recipe_yaml_path = os.path.join(recipes_dir, recipe_yaml)
-        recipe_config = OmegaConf.load(recipe_yaml_path)
+        recipe_config = load_config(recipe_yaml_path)
         OmegaConf.set_struct(recipe_config, True)
         # This will raise a error if the config can't be merged
         print(f"Merging {recipe_yaml} with {base_yaml}")

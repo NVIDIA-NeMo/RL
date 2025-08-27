@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.hf_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.hf_datasets.dpo import DPODataset
 from nemo_rl.data.hf_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.hf_datasets.oai_format_dataset import OpenAIFormatDataset
@@ -23,6 +24,7 @@ from nemo_rl.data.hf_datasets.prompt_response_dataset import (
     PromptResponseDataset,
 )
 from nemo_rl.data.hf_datasets.squad import SquadDataset
+from nemo_rl.data.hf_datasets.tulu3 import Tulu3PreferenceDataset
 
 __all__ = [
     "DPODataset",
@@ -33,5 +35,7 @@ __all__ = [
     "PreferenceDataset",
     "PromptResponseDataset",
     "SquadDataset",
+    "Tulu3PreferenceDataset",
     "COMMON_CHAT_TEMPLATES",
+    "CLEVRCoGenTDataset",
 ]

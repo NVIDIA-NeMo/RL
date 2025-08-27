@@ -21,6 +21,7 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -29,7 +30,7 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
 from nemo_rl.data.interfaces import (
@@ -65,7 +66,7 @@ from nemo_rl.utils.logger import (
     print_message_log_samples,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 # ===============================================================================
 # Configuration
@@ -84,6 +85,7 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
+    seed: int
 
 
 class GRPOSaveState(TypedDict):
@@ -127,6 +129,7 @@ def setup(
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -149,12 +152,16 @@ def setup(
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
     grpo_config = master_config["grpo"]
+    data_config = master_config["data"]
     logger_config = master_config["logger"]
     cluster_config = master_config["cluster"]
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+
+    # Set seed for all random number generators
+    set_seed(grpo_config["seed"])
 
     # ==========================
     #         Logger
@@ -179,7 +186,7 @@ def setup(
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
-        shuffle=False,
+        shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
@@ -312,6 +319,11 @@ def setup(
         )
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            assert loss_config["use_importance_sampling_correction"] is True, (
+                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+
         policy_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
         )
@@ -333,6 +345,7 @@ def setup(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
@@ -484,9 +497,16 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
@@ -654,6 +674,8 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+                # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")
@@ -707,10 +729,19 @@ def grpo_train(
 
             ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
-            if master_config["checkpointing"]["enabled"] and (
+            timeout.mark_iteration()
+
+            should_save_by_step = (
                 is_last_step
                 or (step + 1) % master_config["checkpointing"]["save_period"] == 0
-            ):  # +1 because step is 0-indexed
+            )
+            # +1 because step is 0-indexed
+            # Check if timeout-based checkpointing is enabled in config.
+            should_save_by_timeout = timeout.check_save()
+
+            if master_config["checkpointing"]["enabled"] and (
+                should_save_by_step or should_save_by_timeout
+            ):
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1
@@ -750,7 +781,6 @@ def grpo_train(
                         os.path.join(checkpoint_path, "train_dataloader.pt"),
                     )
                     checkpointer.finalize_checkpoint(checkpoint_path)
-                policy.offload_after_refit()
 
         # Logging
         # Log training data
@@ -806,6 +836,20 @@ def grpo_train(
         print(
             f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
         )
+        if "total_flops" in train_results:
+            total_tflops = (
+                train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+            )
+            num_ranks = train_results["num_ranks"]
+            print(
+                f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+            )
+            if "theoretical_tflops" in train_results:
+                theoretical_tflops = train_results["theoretical_tflops"]
+                print(
+                    f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                )
+                metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
 
         print("\n⏱️  Timing:")
         # Display total time first, separately

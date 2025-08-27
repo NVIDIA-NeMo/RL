@@ -16,7 +16,7 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any
+from typing import Any, Callable, Optional
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -59,8 +59,13 @@ def sft_preprocessor(
     add_bos: bool = True,
     add_eos: bool = True,
     add_generation_prompt: bool = False,
+    datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
+    # optional preprocessor
+    if datum_preprocessor is not None:
+        datum_dict = datum_preprocessor(datum_dict)
+
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,
@@ -91,11 +96,16 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
+
+    datum_preprocessor = None
     if data_cls == "open_assistant":
-        data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
+        data = hf_datasets.OasstDataset(
+            output_dir="/tmp/open_assistant",
+            seed=seed,
+        )
     elif data_cls == "squad":
         data = hf_datasets.SquadDataset()
     elif data_cls == "prompt_response_dataset":
@@ -110,6 +120,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             split=data_config["split"],
             output_key=data_config["output_key"],
             prompt_file=data_config["prompt_file"],
+            seed=seed,
         )
     elif data_cls == "openai_format":
         data = hf_datasets.OpenAIFormatDataset(
@@ -119,6 +130,14 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             data_config["system_key"],
             data_config["system_prompt"],
         )
+    elif data_cls == "clevr_cogent":
+        from nemo_rl.data.hf_datasets.clevr import format_clevr_cogent_dataset
+
+        data = hf_datasets.CLEVRCoGenTDataset(
+            split=data_config["split"],
+            prompt_file=data_config["prompt_file"],
+        )
+        datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
     else:
         raise ValueError(f"Unknown dataset class: {data_cls}")
     print(
@@ -138,6 +157,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -151,6 +171,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -158,7 +179,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     return train_dataset, val_dataset, sft_task_spec
 
 
-def main():
+def main(is_vlm: bool = False):
     """Main entry point."""
     # Parse arguments
     args, overrides = parse_args()
@@ -189,15 +210,14 @@ def main():
 
     init_ray()
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-
+    # setup tokenizer (or processor)
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
     # setup data
     (
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
 
     (
         policy,

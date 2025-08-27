@@ -16,6 +16,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B"
@@ -35,11 +36,17 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  megatron_cfg:
+    enabled: false
+
   dynamic_batching:
     enabled: false
 
   sequence_packing:
     enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
@@ -67,6 +74,7 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  shuffle: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -74,7 +82,6 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
-  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"

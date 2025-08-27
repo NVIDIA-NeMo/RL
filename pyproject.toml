@@ -45,21 +45,36 @@ dependencies = [
     "nvtx",
     "matplotlib",
     "plotly",
+    "sympy>=1.14.0",
+    "pillow>=11.3.0",
+    "torchvision>=0.22.0",
+    "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
 ]
 
 [project.optional-dependencies]
 # Currently unused, but after https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved, we should use this for the "BASE" PYEXECUTABLE
 automodel = [
+    "nemo-automodel",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
+    "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.7.4.post1",
+    "mamba-ssm",
+    "causal-conv1d",
 ]
 vllm = [
+    "cuda-python",
+    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
     "vllm==0.10.0",
+    "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
+    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+    "mamba-ssm",
+    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+    "causal-conv1d",
 ]
 mcore = [
     # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -70,6 +85,8 @@ mcore = [
     "transformer-engine[pytorch]==2.3.0",
     "megatron-core",
     "nemo-tron",
+    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+    "vllm==0.10.0",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -102,7 +119,7 @@ docs = [
     "nvidia-sphinx-theme",  # Our NVIDIA theme
 ]
 dev = [
-    "pre-commit==3.6.0",
+    "pre-commit>=4.2.0",
     "ruff==0.9.9",
     "types-PyYAML",
     "types-requests",
@@ -118,6 +135,7 @@ test = [
 [tool.uv.sources]
 megatron-core = { workspace = true }
 nemo-tron = { workspace = true }
+nemo-automodel = { workspace = true }
 # The NeMo Run source to be used by nemo-tron
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
@@ -130,11 +148,14 @@ torchvision = [
 triton = [
   { index = "pytorch-cu128" },
 ]
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
 
 [tool.uv.workspace]
 members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/NeMo-workspace",
+    "3rdparty/Automodel-workspace/Automodel",
 ]
 
 [[tool.uv.index]]
@@ -143,7 +164,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -175,6 +196,7 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
+    "run_first: marks tests that should run before others",
     "mcore: marks tests that require the mcore extra",
     "hf_gated: marks tests that require HuggingFace token access for gated models",
 ]
@@ -212,4 +234,3 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
-

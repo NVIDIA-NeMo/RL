@@ -1,0 +1,168 @@
+checkpointing:
+  enabled: True
+  checkpoint_dir: results/grpo-math-qwen3-30ba3b-megatron-tp4-32k
+  save_period: 3
+  keep_top_k: 1
+  metric_name: val_reward
+  higher_is_better: True
+  checkpoint_must_save_by: null
+
+grpo:
+  normalize_rewards: True
+  use_leave_one_out_baseline: True
+  max_num_steps: 3
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  val_period: 3
+  val_at_start: False
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: False
+  use_importance_sampling_correction: False
+  token_level_loss: True
+  ratio_clip_c: null
+
+policy:
+  model_name: "Qwen/Qwen3-30B-A3B"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+
+  dtensor_cfg:
+    enabled: False
+
+  dynamic_batching:
+    enabled: False
+
+  sequence_packing:
+    enabled: False
+
+  max_grad_norm: 1.0
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  optimizer: null # remove default FSDP optimizer
+
+  scheduler: null # remove default FSDP scheduler
+
+  megatron_cfg:
+    enabled: True
+    empty_unused_memory_level: 1
+    converter_type: "LlamaForCausalLM"
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: True
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    freeze_moe_router: True
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    apply_rope_fusion: True
+    activation_checkpointing: True
+    defer_fp32_logits: True
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-7
+      min_lr: 5.0e-8
+      weight_decay: 0.0
+      bf16: True
+      fp16: False
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      use_distributed_optimizer: True
+      use_precision_aware_optimizer: True
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-8
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: False
+      overlap_grad_reduce: True
+      overlap_param_gather: True
+      average_in_collective: True
+      use_custom_fsdp: False
+      data_parallel_sharding_strategy: "optim_grads_params"
+    
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: False
+      precision: ${policy.precision}
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      # NB(pjin): https://github.com/NVIDIA-NeMo/RL/pull/857
+      enforce_eager: True
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  dataset_name: "OpenMathInstruct-2"
+  shuffle: true
+  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  prompt_file: "examples/prompts/cot.txt"
+  system_prompt_file: null
+
+env:
+  math:
+    num_workers: 8
+
+logger:
+  log_dir: logs/grpo-math-qwen3-30ba3b-megatron-tp4-32k
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: True
+  tensorboard_enabled: True
+  mlflow_enabled: False  # Disable MLflow logging
+  monitor_gpus: False  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: nemo-rl
+    name: "grpo-math-qwen3-30ba3b-megatron-tp4-32k"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

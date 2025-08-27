@@ -27,4 +27,4 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 cat $RUN_LOG | grep "score=" | sed 's/.*score=\([^ ]*\).*/{"score": \1}/' > $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["score"] == 0.1' \
+  'data["score"] == 0.1'

@@ -176,6 +176,13 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         print(
             f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
         )
+    elif data_config["dataset_name"] == "Tulu3Preference":
+        data = hf_datasets.Tulu3PreferenceDataset()
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = None
+        print(
+            f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples."
+        )
     elif data_cls == "DPODataset":
         data = hf_datasets.DPODataset(
             train_data_path=data_config["train_data_path"],

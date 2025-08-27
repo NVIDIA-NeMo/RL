@@ -19,6 +19,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -41,6 +42,8 @@ policy:
 
   dynamic_batching:
     enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
 
   sequence_packing:
     enabled: False
@@ -124,7 +127,7 @@ policy:
       overlap_param_gather: true
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
-
+      use_custom_fsdp: false
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -132,6 +135,13 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+  shuffle: true
+
+  ## unused with squad dataset
+  prompt_file: null
+  split: null
+  output_key: null
+  seed: null
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -139,7 +149,6 @@ logger:
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
-  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.dataset_name}"

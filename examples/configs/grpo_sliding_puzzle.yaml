@@ -14,6 +14,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
@@ -44,6 +45,7 @@ policy:
 
 data:
   add_system_prompt: false
+  shuffle: false  # disable dataloader shuffle, shuffle is handled within the dataset
 
 env:
   sliding_puzzle_game:

@@ -114,6 +114,17 @@ jobs:
       pr_number: ${{ github.event.number }}
       head_sha: ${{ github.event.pull_request.head.sha }}
 
+  automodel-integration-check:
+    name: Check if changes in nemo-automodel are in sync with nemo-rl and vice versa
+    needs: [pre-flight]
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/_automodel_integration_check.yml
+    with:
+      base_ref: ${{ github.base_ref }}
+      head_ref: ${{ github.head_ref }}
+      pr_number: ${{ github.event.number }}
+      head_sha: ${{ github.event.pull_request.head.sha }}
+
   lint-check:
     name: Lint check
     needs: [pre-flight]
@@ -162,13 +173,15 @@ jobs:
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.30.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
     with:
       build-ref: ${{ github.sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
       target: hermetic
+      build-contexts: |
+        nemo-rl=${{ github.run_id }}/
       build-args: |
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}
@@ -254,6 +267,7 @@ jobs:
       - pre-flight
       - lint-check
       - sphinx-build
+      - build-container
       - cicd-doc-tests
       - cicd-unit-tests
       - cicd-functional-tests
@@ -270,6 +284,7 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
+                  needs.build-container.result == 'success' &&
                   (
                     (
                       (needs.cicd-doc-tests.result == 'skipped' || needs.cicd-doc-tests.result == 'success') &&
