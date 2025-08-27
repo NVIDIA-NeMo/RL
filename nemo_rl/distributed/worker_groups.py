@@ -478,6 +478,11 @@ class RayWorkerGroup:
                         "MASTER_ADDR": self.master_address,
                         "MASTER_PORT": str(self.master_port),
                         "NODE_RANK": str(pg_idx),
+                        "VLLM_DP_RANK": str(global_rank // 4),
+                        "VLLM_DP_RANK_LOCAL": str(global_rank // 4),
+                        "VLLM_DP_SIZE": "2",
+                        "VLLM_DP_MASTER_IP": self.master_address,
+                        "VLLM_DP_MASTER_PORT": str(self.master_port),
                     }
                 )
                 worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)

@@ -242,7 +242,6 @@ class VllmGeneration(GenerationInterface):
                 )
 
                 total = sum(counts)
-                model_parallel_size = tp_size * pp_size
                 num_groups = total // model_parallel_size
                 if num_groups == 0:
                     raise ValueError(
