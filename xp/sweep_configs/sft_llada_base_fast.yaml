@@ -1,0 +1,32 @@
+# Sample sweep configuration for GRPO math experiments
+# Each parameter can have a list of values to sweep over
+# The launcher will generate all possible combinations
+
+# Required parameter that must match the target script name
+script_path: "examples/run_sft.py"
+
+# Optional: Path to the base YAML config file
+# Can be overridden by the --config command-line argument
+# If null and --config is not provided, no base config will be used
+config_path: "examples/configs/sft_mdlm_gsm8k.yaml" 
+
+
+# Model configuration
+policy.is_mdlm: [true]
+policy.model_name: ["GSAI-ML/LLaDA-8B-Base"]
+
+# Data configuration
+data.dataset_name: ["prompt_response_dataset"]
+data.input_key: ["question"]
+data.output_key: ["answer"]
+data.train_data_path: ["/workspace/data/gsm8k/train.jsonl"]
+data.val_data_path: ["/workspace/data/gsm8k/test.jsonl"]
+
+# Resources
+cluster.num_nodes: [1]
+cluster.gpus_per_node: [8]
+
+# Training configuration
+policy.train_global_batch_size: [128]
+policy.train_micro_batch_size: [4]
+policy.max_total_sequence_length: [256]
