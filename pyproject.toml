@@ -66,7 +66,6 @@ automodel = [
 ]
 vllm = [
     "cuda-python",
-    "deep_gemm",
     "vllm==0.10.0",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -130,6 +129,9 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "pytest-asyncio",
+]
+vllm = [
+    "deep_gemm"
 ]
 
 [tool.uv.sources]
