@@ -17,13 +17,11 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-
-from tqdm.auto import tqdm
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -43,7 +41,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GenerationConfig,
 )
+
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -898,28 +898,48 @@ def run_async_penguin_rollout(
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     max_seq_len: int,
-    max_rollout_turns: int = 999999,
+    generation_config: GenerationConfig,
+    max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
-    from nemo_rl.environments.penguin import Penguin
-
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     penguin_rows = input_batch["extra_env_info"]
 
-    penguin_environment: Penguin = task_to_env["penguin"]
+    # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
+    # Penguin policy is "What you see is what you get".
+    assert not greedy, f"`greedy` is not supported in Penguin path!"
+    assert max_rollout_turns is None, f"`max_rollout_turns` is not supported in Penguin path!"
+    # We don't use these stop criteria
+    assert not generation_config["stop_strings"], f"Stop strings is not supported in the generation config in Penguin path!"
+    assert not generation_config["stop_token_ids"], f"Stop strings is not supported in the generation config in Penguin path!"
+    # Top k is not OpenAI compatible, so Penguin does not guarantee support over it.
+    assert not generation_config["top_k"], f"Top k is not supported in the generation config in Penguin path!"
+
+    for row in penguin_rows:
+        # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
+        # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
+        # row["max_tokens"] = max_seq_len
+
+        row["temperature"] = generation_config["temperature"]
+        row["top_p"] = generation_config["top_p"]
+
+        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
+        # generation_config["max_new_tokens"]
+
+    penguin_environment = task_to_env["penguin"]
     results = asyncio.run(penguin_environment.run_rollouts(penguin_rows))
 
-    message_logs = penguin_environment.responses_to_message_logs([r["response"] for r in results])
     final_batch = BatchedDataDict[DatumSpec](
         {
-            "message_log": message_logs,
+            "message_log": [r["message_log"] for r in results],
             "total_reward": torch.stack([r["reward"] for r in results]),
         }
     )
 
+    # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
     all_sample_metrics = [
         {
@@ -964,4 +984,16 @@ def run_async_penguin_rollout(
         "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
     }
 
-    return final_batch, rollout_metrics
+    # Convert LLMMessageLogType to FlatMessagesType for generation
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["input_message_log"] for r in results],
+        }
+    )
+    batched_flat, _ = batched_message_log_to_flat_message(
+        input_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    input_ids = batched_flat["token_ids"]
+
+    return input_ids, final_batch, rollout_metrics

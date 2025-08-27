@@ -600,7 +600,9 @@ def grpo_train(
             with timer.time("generation"):
                 # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                 if _should_use_penguin(master_config):
+                    generation_config = master_config["policy"]["generation"]
                     (
+                        input_ids,
                         repeated_batch,
                         rollout_metrics,
                     ) = run_async_penguin_rollout(
@@ -611,6 +613,7 @@ def grpo_train(
                         max_seq_len=master_config["policy"][
                             "max_total_sequence_length"
                         ],
+                        generation_config=generation_config,
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
@@ -953,11 +956,13 @@ def validate(
             # Use async rollouts if vLLM async engine is enabled
             # We cascade penguin first since penguin also uses async rollouts.
             if _should_use_penguin(master_config):
+                generation_config = master_config["policy"]["generation"]
                 val_batch, gen_metrics = run_async_penguin_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
                     val_task_to_env,
+                    generation_config=generation_config,
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,

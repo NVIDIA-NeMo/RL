@@ -109,6 +109,7 @@ def main() -> None:
     )
     val_dataset = None
 
+    # TODO move this after the setup and call .remote properly (need the base urls)
     assert _should_use_penguin(config)
     penguin = Penguin.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
