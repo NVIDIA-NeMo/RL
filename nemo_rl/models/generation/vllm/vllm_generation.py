@@ -142,7 +142,7 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
-        # Set VLLM_DP_SIZE to use vllm DP
+        # Use vllm DP
         env_vars["VLLM_DP_SIZE"] = str(self.dp_size)
 
         # Check if we need parallelism-aware worker group creation
