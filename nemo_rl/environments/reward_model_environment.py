@@ -106,7 +106,7 @@ class RewardModelEnvironment(EnvironmentInterface):
 
         print("✅ REWARD MODEL ENVIRONMENT INITIALIZATION COMPLETE")
 
-    def data_preprocess(
+    def preprocess_data(
         self, message_logs: List[LLMMessageLogType]
     ) -> BatchedDataDict[GenerationDatumSpec]:
         """Preprocess the message logs for the reward model.
@@ -138,14 +138,11 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        # max_model_len = self.config["max_model_len"] * 64
-        # if input_lengths.max().item() > max_model_len:
-        #     print(f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}")
-        #     # Truncate input_ids
-        #     cat_and_padded["token_ids"] = cat_and_padded["token_ids"][:, :max_model_len]
-        #     # Update input_lengths
-        #     input_lengths = torch.clamp(input_lengths, max=max_model_len)
-        #     print(f"✅ After truncation - Max input length: {input_lengths.max().item()}")
+        max_model_len = self.config["max_model_len"]
+        if input_lengths.max().item() > max_model_len:
+            print(
+                f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}"
+            )
 
         # Create data in the format expected by DTensorRewardModelWorker
         reward_data = BatchedDataDict[GenerationDatumSpec](
@@ -171,7 +168,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             EnvironmentReturn with rewards and termination info
         """
         # Preprocess the message logs
-        reward_data = self.data_preprocess(message_logs)
+        reward_data = self.preprocess_data(message_logs)
 
         # Score the message logs
         rewards = self.reward_model_policy.score(reward_data)["scores"]
