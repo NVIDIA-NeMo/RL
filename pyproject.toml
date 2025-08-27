@@ -158,6 +158,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc30
 members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/Automodel-workspace/Automodel",
+    "3rdparty/Megatron-Bridge-workspace",
 ]
 
 [[tool.uv.index]]
