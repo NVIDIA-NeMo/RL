@@ -93,12 +93,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset,
+    val_dataset: dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader,
+    dict[str, StatefulDataLoader],
     DPOLossFn,
     Logger,
     CheckpointManager,
@@ -159,6 +159,7 @@ def setup(
             make_sequence_length_divisible_by=policy_config[
                 "make_sequence_length_divisible_by"
             ],
+            add_loss_mask=True,
         ),
         drop_last=True,
     )
@@ -183,9 +184,11 @@ def setup(
                 make_sequence_length_divisible_by=policy_config[
                     "make_sequence_length_divisible_by"
                 ],
+                add_loss_mask=True,
             ),
             drop_last=True,
-        ) for k, v in val_dataset.items()
+        )
+        for k, v in val_dataset.items()
     }
 
     # ==========================
@@ -239,7 +242,7 @@ def setup(
     )
 
 
-def add_ref_logprobs_to_data(dataloader, policy, master_config, tokenizer, is_val=False):
+def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
     dataloader_iter = iter(dataloader)
     while True:
         try:
@@ -271,7 +274,7 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, tokenizer, is_va
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: StatefulDataLoader | dict[str, StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
@@ -283,18 +286,31 @@ def validate(
 ):
     val_metrics, validation_timings = {}, {}
     for k, v in val_dataloader.items():
-        k_val_metrics, k_validation_timings = validate_one_dataset(policy, v, tokenizer, loss_fn, step, master_config, val_batches, val_batch_size, val_mbs, k)
+        k_val_metrics, k_validation_timings = validate_one_dataset(
+            policy,
+            v,
+            tokenizer,
+            loss_fn,
+            step,
+            master_config,
+            val_batches,
+            val_batch_size,
+            val_mbs,
+            k,
+        )
         if k == "validation":
             prefix = "val"
         else:
-            prefix = f"{k}-val"
+            prefix = f"val-{k}"
 
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        val_metrics[prefix+"_loss"] = k_val_metrics["val_loss"]
-        val_metrics[prefix+"_accuracy"] = k_val_metrics["accuracy"]
-        validation_timings[prefix+"_total_validation_time"] = k_validation_timings["total_validation_time"]
+        val_metrics[prefix + "_loss"] = k_val_metrics["val_loss"]
+        val_metrics[prefix + "_accuracy"] = k_val_metrics["accuracy"]
+        validation_timings[prefix + "_total_val_time"] = k_validation_timings[
+            "total_val_time"
+        ]
 
     return val_metrics, validation_timings
 
@@ -318,13 +334,13 @@ def validate_one_dataset(
 
     timer = Timer()
 
-    with timer.time("total_validation_time"):
+    with timer.time("total_val_time"):
         print(f"▶ Starting validation at step {step}...")
 
         val_metrics = defaultdict(lambda: 0.0)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(
-            add_ref_logprobs_to_data(val_dataloader, policy, master_config, tokenizer, is_val=True)
+            add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
             ## just run model fwd
             val_results = policy.train(
@@ -362,7 +378,7 @@ def validate_one_dataset(
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-    validation_time = timing_metrics.get("total_validation_time", 0)
+    validation_time = timing_metrics.get("total_val_time", 0)
 
     if len(val_metrics) == 0:
         warnings.warn(
@@ -378,7 +394,7 @@ def validate_one_dataset(
 
         # Print timing information
         print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
-        validation_time = timing_metrics.get("total_validation_time", 0)
+        validation_time = timing_metrics.get("total_val_time", 0)
         print(f"    • Total validation time: {validation_time:.2f}s")
 
     # Make sure to reset the timer after validation
@@ -450,7 +466,7 @@ def dpo_train(
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
-        for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config, tokenizer):
+        for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config):
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
             )
@@ -517,10 +533,16 @@ def dpo_train(
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     dpo_save_state["total_steps"] = total_steps + 1
                     dpo_save_state["epoch"] = current_epoch
+                    # Remove outdated validation metrics
+                    for key in list(dpo_save_state):
+                        if (
+                            key.startswith("val")
+                            and (key.endswith("_loss") or key.endswith("_accuracy"))
+                            and (val_metrics is None or key not in val_metrics)
+                        ):
+                            del dpo_save_state[key]
                     if val_metrics is not None:
                         dpo_save_state.update(val_metrics)
-                    elif "val_loss" in dpo_save_state:
-                        del dpo_save_state["val_loss"]
 
                     if master_config["checkpointing"]["metric_name"] is not None:
                         if (

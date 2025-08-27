@@ -207,38 +207,43 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = {
-        "validation": AllTaskProcessedDataset(
-            val_dataset,
-            tokenizer,
-            dpo_task_spec,
-            dpo_preprocessor,
-            max_seq_length=data_config["max_input_seq_length"],
-        )
-    } if val_dataset else {}
+    val_dataset = (
+        {
+            "validation": AllTaskProcessedDataset(
+                val_dataset,
+                tokenizer,
+                dpo_task_spec,
+                dpo_preprocessor,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+        }
+        if val_dataset
+        else {}
+    )
 
     if data_cls == "PreferenceDataset":
         if data_config.get("val_data_path"):
-            assert data_config.get("val_data_paths") is None, "val_data_path and val_data_paths cannot be used together"
-            val_data_paths = [{"validation": data_config.get("val_data_path")}]
+            assert data_config.get("val_data_paths") is None, (
+                "val_data_path and val_data_paths cannot be used together"
+            )
+            val_data_paths = {"validation": data_config.get("val_data_path")}
 
         elif data_config.get("val_data_paths"):
-            assert isinstance(data_config["val_data_paths"], list), f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
+            assert isinstance(data_config["val_data_paths"], dict), (
+                f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
+            )
             val_data_paths = data_config.get("val_data_paths")
 
         else:
             raise ValueError("Either val_data_path or val_data_paths must be provided")
 
-        for d in val_data_paths:
-            assert len(d) == 1, "val_data_paths must be a list of <val_dataset_name: val_dataset_path> pairs."
-            val_dataset_name = list(d.keys())[0]
-            val_dataset_path = list(d.values())[0]
-            assert val_dataset_name not in val_dataset or val_dataset_name == "validation" # Users can override the default "validation" set
-            if val_dataset_name == "validation" and "validation" in val_dataset:
-                print(f"  ✓ Overriding the default validation dataset")
-            val_data = hf_datasets.PreferenceDataset(val_dataset_path, split="validation")
+        for val_dataset_name, val_dataset_path in val_data_paths.items():
+            assert val_dataset_name not in val_dataset
+            val_data = hf_datasets.PreferenceDataset(
+                val_dataset_path, split="validation"
+            )
             print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds["validation"])} samples."
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['validation'])} samples."
             )
             val_dataset[val_dataset_name] = AllTaskProcessedDataset(
                 val_data.formatted_ds["validation"],
@@ -249,6 +254,7 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
             )
 
     return train_dataset, val_dataset, tokenizer, dpo_task_spec
+
 
 def main():
     """Main entry point."""

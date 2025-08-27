@@ -19,7 +19,11 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def to_preference_data_format(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
+def to_preference_data_format(
+    data: dict[str, Any],
+) -> dict[
+    str, list[dict[str, int | list[dict[str, str | Any]]]] | list[dict[str, str]]
+]:
     response_1 = data["response1"]
     response_2 = data["response2"]
     overall_preference = data["overall_preference"]
@@ -40,7 +44,9 @@ def to_preference_data_format(data: dict[str, Any]) -> dict[str, str | dict[str,
         rejected = response_1
 
     return {
-        "context": [{"role": "user", "content": data["context"]}] if isinstance(data["context"], str) else data["context"],
+        "context": [{"role": "user", "content": data["context"]}]
+        if isinstance(data["context"], str)
+        else data["context"],
         "completions": [
             {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
             {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},

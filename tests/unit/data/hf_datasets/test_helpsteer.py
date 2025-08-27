@@ -43,9 +43,12 @@ def test_to_preference_data_format():
     result1 = to_preference_data_format(data1)
     assert result1["context"] == [{"content": "What is 2+2?", "role": "user"}]
     assert result1["completions"] == [
-        {"rank": 0, "completion": [{"role": "assistant", "content": "The answer is 4."}]},
-        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]
-    }]
+        {
+            "rank": 0,
+            "completion": [{"role": "assistant", "content": "The answer is 4."}],
+        },
+        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]},
+    ]
 
     # Test case 2: response2 is preferred (overall_preference > 0)
     data2 = {
@@ -55,10 +58,22 @@ def test_to_preference_data_format():
         "overall_preference": 1,
     }
     result2 = to_preference_data_format(data2)
-    assert result2["context"] == [{"content": "What is the capital of France?", "role": "user"}]
+    assert result2["context"] == [
+        {"content": "What is the capital of France?", "role": "user"}
+    ]
     assert result2["completions"] == [
-        {"rank": 0, "completion": [{"role": "assistant", "content": "The capital of France is Paris."}]},
-        {"rank": 1, "completion": [{"role": "assistant", "content": "The capital of France is London."}]}
+        {
+            "rank": 0,
+            "completion": [
+                {"role": "assistant", "content": "The capital of France is Paris."}
+            ],
+        },
+        {
+            "rank": 1,
+            "completion": [
+                {"role": "assistant", "content": "The capital of France is London."}
+            ],
+        },
     ]
 
     # Test case 3: no preference (overall_preference = 0)
@@ -69,12 +84,20 @@ def test_to_preference_data_format():
         "overall_preference": 0,
     }
     result3 = to_preference_data_format(data3)
-    assert result3["context"] == [{"content": "What is the weather like?", "role": "user"}]
+    assert result3["context"] == [
+        {"content": "What is the weather like?", "role": "user"}
+    ]
     # When preference is 0, neither response is preferred, so
     # response 1 is used for both chosen and rejected
     assert result3["completions"] == [
-        {"rank": 0, "completion": [{"role": "assistant", "content": "It's sunny today."}]},
-        {"rank": 1, "completion": [{"role": "assistant", "content": "It's sunny today."}]}
+        {
+            "rank": 0,
+            "completion": [{"role": "assistant", "content": "It's sunny today."}],
+        },
+        {
+            "rank": 1,
+            "completion": [{"role": "assistant", "content": "It's sunny today."}],
+        },
     ]
 
     # Test case 4: context is a list of dicts
@@ -82,7 +105,7 @@ def test_to_preference_data_format():
         "context": [
             {"role": "user", "content": "Can I ask you a question?"},
             {"role": "assistant", "content": "Sure, what do you want to know?"},
-            {"role": "user", "content": "What is 2+2?"}
+            {"role": "user", "content": "What is 2+2?"},
         ],
         "response1": "4.",
         "response2": "I don't know.",
@@ -92,12 +115,13 @@ def test_to_preference_data_format():
     assert result1["context"] == [
         {"role": "user", "content": "Can I ask you a question?"},
         {"role": "assistant", "content": "Sure, what do you want to know?"},
-        {"role": "user", "content": "What is 2+2?"}
+        {"role": "user", "content": "What is 2+2?"},
     ]
     assert result1["completions"] == [
         {"rank": 0, "completion": [{"role": "assistant", "content": "4."}]},
-        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]
-    }]
+        {"rank": 1, "completion": [{"role": "assistant", "content": "I don't know."}]},
+    ]
+
 
 def test_helpsteer3_dataset_initialization(helpsteer3_dataset):
     """Test that HelpSteer3Dataset initializes correctly."""

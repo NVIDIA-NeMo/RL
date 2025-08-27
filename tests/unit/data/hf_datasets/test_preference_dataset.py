@@ -26,43 +26,43 @@ def mock_preference_data():
     """Create temporary preference dataset files with sample data."""
     preference_data = [
         {
-            "context": [
-                {"role": "user", "content": "What is 2+2?"}
-            ],
+            "context": [{"role": "user", "content": "What is 2+2?"}],
             "completions": [
                 {
                     "rank": 1,
                     "completion": [
                         {"role": "assistant", "content": "The answer is 4."}
-                    ]
+                    ],
                 },
                 {
                     "rank": 2,
-                    "completion": [
-                        {"role": "assistant", "content": "I don't know."}
-                    ]
-                }
-            ]
+                    "completion": [{"role": "assistant", "content": "I don't know."}],
+                },
+            ],
         },
         {
-            "context": [
-                {"role": "user", "content": "What is the capital of France?"}
-            ],
+            "context": [{"role": "user", "content": "What is the capital of France?"}],
             "completions": [
                 {
                     "rank": 1,
                     "completion": [
-                        {"role": "assistant", "content": "The capital of France is Paris."}
-                    ]
+                        {
+                            "role": "assistant",
+                            "content": "The capital of France is Paris.",
+                        }
+                    ],
                 },
                 {
                     "rank": 2,
                     "completion": [
-                        {"role": "assistant", "content": "The capital of France is London."}
-                    ]
+                        {
+                            "role": "assistant",
+                            "content": "The capital of France is London.",
+                        }
+                    ],
                 },
-            ]
-        }
+            ],
+        },
     ]
 
     with tempfile.NamedTemporaryFile(
@@ -70,7 +70,7 @@ def mock_preference_data():
     ) as preference_file:
         json.dump(preference_data, preference_file)
         preference_path = preference_file.name
-    
+
     try:
         yield preference_path
     finally:

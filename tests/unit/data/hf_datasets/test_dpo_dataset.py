@@ -99,8 +99,11 @@ def test_dpo_dataset_data_format(mock_dpo_data):
 
     # Verify data content
     print(train_sample["completions"])
-    assert train_sample["context"] == [{'content': 'What is 2+2?', 'role': 'user'}]
+    assert train_sample["context"] == [{"content": "What is 2+2?", "role": "user"}]
     assert train_sample["completions"] == [
-        {'completion': [{'content': 'The answer is 4.', 'role': 'assistant'}], 'rank': 0},
-        {'completion': [{'content': "I don't know.", 'role': 'assistant'}], 'rank': 1}
+        {
+            "completion": [{"content": "The answer is 4.", "role": "assistant"}],
+            "rank": 0,
+        },
+        {"completion": [{"content": "I don't know.", "role": "assistant"}], "rank": 1},
     ]

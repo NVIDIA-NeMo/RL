@@ -22,6 +22,17 @@ dpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/dpo"
+
+  # If you are using multiple validation sets, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  # checkpointing:
+  #   metric_name: "val-<NameOfValidationDataset1>_loss"
+  # ...
+  # data:
+  #   dataset_name: PreferenceDataset
+  #   train_data_path: <LocalPathToTrainingDataset>
+  #   val_data_paths:
+  #     <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #     ...
   metric_name: "val_loss"
   higher_is_better: false
   keep_top_k: 3
@@ -45,8 +56,6 @@ policy:
   precision: "bfloat16"
 
   dtensor_cfg:
-    env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -162,11 +171,9 @@ data:
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
-
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
-  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb:
     project: "dpo-dev"
     name: "dpo"

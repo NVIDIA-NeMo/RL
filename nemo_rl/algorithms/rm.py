@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections import defaultdict
 import os
 import warnings
+from collections import defaultdict
+from functools import partial
 from pathlib import Path
 from typing import Optional, TypedDict
-from functools import partial
 
 import numpy as np
 import torch
@@ -95,12 +95,12 @@ def setup(
     master_config: MasterConfig,
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
-    val_dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
+    val_dataset: dict[str, AllTaskProcessedDataset],
 ) -> tuple[
     Policy,
     RayVirtualCluster,
     StatefulDataLoader,
-    StatefulDataLoader | dict[str, StatefulDataLoader],
+    dict[str, StatefulDataLoader],
     PreferenceLoss,
     MasterConfig,
     Logger,
@@ -149,6 +149,7 @@ def setup(
             make_sequence_length_divisible_by=policy_config[
                 "make_sequence_length_divisible_by"
             ],
+            add_loss_mask=False,
         ),
         drop_last=True,
     )
@@ -173,9 +174,11 @@ def setup(
                 make_sequence_length_divisible_by=policy_config[
                     "make_sequence_length_divisible_by"
                 ],
+                add_loss_mask=False,
             ),
             drop_last=True,
-        ) for k, v in val_dataset.items()
+        )
+        for k, v in val_dataset.items()
     }
 
     # ==========================
@@ -234,7 +237,7 @@ def setup(
 # =======================================================
 def validate(
     policy: PolicyInterface,
-    val_dataloader: StatefulDataLoader | dict[str, StatefulDataLoader],
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer,
     loss_fn,
     step: int,
@@ -246,18 +249,31 @@ def validate(
 ):
     val_metrics, validation_timings = {}, {}
     for k, v in val_dataloader.items():
-        k_val_metrics, k_validation_timings = validate_one_dataset(policy, v, tokenizer, loss_fn, step, master_config, val_batches, val_batch_size, val_mbs, k)
+        k_val_metrics, k_validation_timings = validate_one_dataset(
+            policy,
+            v,
+            tokenizer,
+            loss_fn,
+            step,
+            master_config,
+            val_batches,
+            val_batch_size,
+            val_mbs,
+            k,
+        )
         if k == "validation":
             prefix = "val"
         else:
-            prefix = f"{k}-val"
+            prefix = f"val-{k}"
 
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        val_metrics[prefix+"_loss"] = k_val_metrics["val_loss"]
-        val_metrics[prefix+"_accuracy"] = k_val_metrics["accuracy"]
-        validation_timings[prefix+"_total_validation_time"] = k_validation_timings["total_validation_time"]
+        val_metrics[prefix + "_loss"] = k_val_metrics["val_loss"]
+        val_metrics[prefix + "_accuracy"] = k_val_metrics["accuracy"]
+        validation_timings[prefix + "_total_val_time"] = k_validation_timings[
+            "total_val_time"
+        ]
 
     return val_metrics, validation_timings
 
@@ -281,7 +297,7 @@ def validate_one_dataset(
 
     timer = Timer()
 
-    with timer.time("total_validation_time"):
+    with timer.time("total_val_time"):
         print(f"▶ Starting validation at step {step}...")
 
         # Show a progress indicator for validation
@@ -310,12 +326,22 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                sum_num_valid_samples = sum(val_results["all_mb_metrics"]["num_valid_samples"])
-                for k in ["loss", "accuracy", "rewards_chosen_mean", "rewards_rejected_mean"]:
+                sum_num_valid_samples = sum(
+                    val_results["all_mb_metrics"]["num_valid_samples"]
+                )
+                for k in [
+                    "loss",
+                    "accuracy",
+                    "rewards_chosen_mean",
+                    "rewards_rejected_mean",
+                ]:
                     dict_val_metrics[k if k != "loss" else "val_loss"] += [
-                        value * sum_num_valid_samples for value in val_results["all_mb_metrics"][k]
+                        value * sum_num_valid_samples
+                        for value in val_results["all_mb_metrics"][k]
                     ]
-                dict_val_metrics["num_valid_samples"] += val_results["all_mb_metrics"]["num_valid_samples"]
+                dict_val_metrics["num_valid_samples"] += val_results["all_mb_metrics"][
+                    "num_valid_samples"
+                ]
 
                 num_valid_batches += 1
 
@@ -323,18 +349,35 @@ def validate_one_dataset(
                 break
 
         if num_valid_batches > 0:
-            assert len(dict_val_metrics["val_loss"]) == len(dict_val_metrics["accuracy"]) \
-            == len(dict_val_metrics["rewards_chosen_mean"]) == len(dict_val_metrics["rewards_rejected_mean"]) \
-            == len(dict_val_metrics["num_valid_samples"])
+            assert (
+                len(dict_val_metrics["val_loss"])
+                == len(dict_val_metrics["accuracy"])
+                == len(dict_val_metrics["rewards_chosen_mean"])
+                == len(dict_val_metrics["rewards_rejected_mean"])
+                == len(dict_val_metrics["num_valid_samples"])
+            )
 
             sum_num_valid_samples = sum(dict_val_metrics["num_valid_samples"])
             val_metrics = RMValMetrics(
                 num_valid_samples=sum_num_valid_samples,
                 **{
-                    k: sum([value * weight for value, weight in zip(dict_val_metrics[k], dict_val_metrics["num_valid_samples"])])
+                    k: sum(
+                        [
+                            value * weight
+                            for value, weight in zip(
+                                dict_val_metrics[k],
+                                dict_val_metrics["num_valid_samples"],
+                            )
+                        ]
+                    )
                     / sum_num_valid_samples
-                    for k in ["val_loss", "accuracy", "rewards_chosen_mean", "rewards_rejected_mean"]
-                }
+                    for k in [
+                        "val_loss",
+                        "accuracy",
+                        "rewards_chosen_mean",
+                        "rewards_rejected_mean",
+                    ]
+                },
             )
         else:
             warnings.warn(
@@ -354,7 +397,7 @@ def validate_one_dataset(
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-    validation_time = timing_metrics.get("total_validation_time", 0)
+    validation_time = timing_metrics.get("total_val_time", 0)
 
     if num_valid_batches > 0:
         # Print summary of validation results
@@ -373,7 +416,7 @@ def validate_one_dataset(
 
         # Print timing information
         print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
-        validation_time = timing_metrics.get("total_validation_time", 0)
+        validation_time = timing_metrics.get("total_val_time", 0)
         print(f"    • Total validation time: {validation_time:.2f}s")
 
     # Make sure to reset the timer after validation
@@ -494,10 +537,16 @@ def rm_train(
                     rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     rm_save_state["total_steps"] = total_steps + 1
                     rm_save_state["epoch"] = current_epoch
+                    # Remove outdated validation metrics
+                    for key in list(rm_save_state):
+                        if (
+                            key.startswith("val")
+                            and (key.endswith("_loss") or key.endswith("_accuracy"))
+                            and (val_metrics is None or key not in val_metrics)
+                        ):
+                            del rm_save_state[key]
                     if val_metrics is not None:
                         rm_save_state.update(val_metrics)
-                    elif "val_loss" in rm_save_state:
-                        del rm_save_state["val_loss"]
 
                     if master_config["checkpointing"]["metric_name"] is not None:
                         if (

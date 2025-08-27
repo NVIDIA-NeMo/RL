@@ -75,7 +75,7 @@ Currently, RM training supports only two completions (where the lowest rank is p
 }
 ```
 
-NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+NeMo RL provides a RM-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
 ```
@@ -90,7 +90,9 @@ data:
   dataset_name: PreferenceDataset
   train_data_path: <LocalPathToTrainingDataset>
   val_data_paths:
-      <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
-      <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+    <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
 ```
-If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`.
+If using multiple validation sets, please note:
+- If you are using a logger, the prefix used for each validation set will be `val-<NameOfValidationDataset>`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val-<NameOfValidationDataset1>_loss`.
