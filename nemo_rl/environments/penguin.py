@@ -67,7 +67,7 @@ class PenguinWorker:
             initial_global_config_dict=initial_global_config_dict,
         )
 
-    async def run_rollouts(self, examples: list[dict]) -> list[dict]:
+    async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
         from nemo_gym.server_utils import ServerClient, BaseServerConfig
 
         head_server_config = BaseServerConfig(
@@ -85,6 +85,28 @@ class PenguinWorker:
 
         results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
         return [r.json() for r in results]
+
+    def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
+        from nemo_gym.openai_utils import NeMoGymResponse
+
+        response = NeMoGymResponse.model_validate(penguin_result["response"])
+        nemo_rl_message_log = []
+        for output_item in response.output:
+            
+            nemo_rl_message = {
+                # "role": 
+            }
+            nemo_rl_message_log.append(nemo_rl_message)
+
+        return {
+            "message_log": nemo_rl_message_log,
+        }
+
+    async def run_rollouts(self, examples: list[dict]) -> list[dict]:
+        penguin_results = await self._call_penguin_for_rollouts(examples)
+
+        nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
+        return nemo_rl_results
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
