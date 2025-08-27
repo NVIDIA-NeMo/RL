@@ -53,8 +53,9 @@ def pytest_collection_modifyitems(config, items):
     run_mcore_only = config.getoption("--mcore-only")
     marker_expr = config.getoption("-m", default="")
 
-    # If user specified -m marker expressions, let pytest handle everything normally
+    # If user specified -m marker expressions, still prioritize run_first tests
     if marker_expr:
+        items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
         return
 
     # Filter tests based on the desired configurations
@@ -82,6 +83,9 @@ def pytest_collection_modifyitems(config, items):
             if not item.get_closest_marker("hf_gated")
             and not item.get_closest_marker("mcore")
         ]
+
+    # Ensure run_first tests are prioritized
+    new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
 
     # Update the items list in-place
     items[:] = new_items
