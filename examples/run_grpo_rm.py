@@ -27,6 +27,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -71,8 +72,9 @@ def hf_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
-    problem = datum_dict["messages"]
-    extra_env_info = {}
+    user_message = datum_dict["messages"]
+    problem = user_message[0]["content"]
+    extra_env_info = {"ground_truth": user_message[1]["content"]}
 
     message_log: LLMMessageLogType = []
     user_message = {
@@ -111,7 +113,7 @@ def hf_data_processor(
         "extra_env_info": extra_env_info,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
-        "task_name": task_data_spec.task_name,
+        "task_name": datum_dict["task_name"],
     }
     return output
 
@@ -135,8 +137,11 @@ def setup_data(
         system_prompt_file=data_config["system_prompt_file"],
     )
 
-    # Load DeepScaler using nemo rl datasets
-    if data_config["dataset_name"] == "DeepScaler":
+    # Load OpenMathInstruct2Dataset using nemo rl datasets
+    if data_config["dataset_name"] == "OpenMathInstruct-2":
+        print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
+        data: Any = OpenMathInstruct2Dataset(seed=seed)
+    elif data_config["dataset_name"] == "DeepScaler":
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
