@@ -82,6 +82,7 @@ class MegatronDDPConfig(TypedDict):
 
 class MegatronConfig(TypedDict):
     enabled: bool
+    env_vars: NotRequired[dict[str, str]]
     empty_unused_memory_level: int
     activation_checkpointing: bool
     converter_type: str
