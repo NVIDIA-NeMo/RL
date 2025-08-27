@@ -23,7 +23,7 @@ The default YAML config shares the same base template as the SFT config but incl
 
 Each RM dataset class is expected to have the following attributes:
 1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
-```
+```jsonc
 {
     "context": list of dicts, # The prompt message (including previous turns, if any)
     "completions": list of dicts, # The list of completions
@@ -36,7 +36,7 @@ Each RM dataset class is expected to have the following attributes:
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
 Currently, RM training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
-```
+```json
 {
     "context": [
         {
@@ -78,14 +78,14 @@ Currently, RM training supports only two completions (where the lowest rank is p
 NeMo RL provides a RM-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
-```
+```yaml
 data:
   dataset_name: PreferenceDataset
   train_data_path: <LocalPathToTrainingDataset>
   val_data_path: <LocalPathToValidationDataset>
 ```
 with support for multiple validation sets achieved with:
-```
+```yaml
 data:
   dataset_name: PreferenceDataset
   train_data_path: <LocalPathToTrainingDataset>

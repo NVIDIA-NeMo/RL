@@ -166,23 +166,14 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         data = hf_datasets.PreferenceDataset(data_path, split="train")
         train_dataset = data.formatted_ds["train"]
         val_dataset = None
-        print(
-            f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples."
-        )
     elif data_cls == "HelpSteer3":
         data = hf_datasets.HelpSteer3Dataset()
         train_dataset = data.formatted_ds["train"]
         val_dataset = data.formatted_ds["validation"]
-        print(
-            f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
-        )
-    elif data_config["dataset_name"] == "Tulu3Preference":
+    elif data_cls == "Tulu3Preference":
         data = hf_datasets.Tulu3PreferenceDataset()
         train_dataset = data.formatted_ds["train"]
         val_dataset = None
-        print(
-            f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples."
-        )
     elif data_cls == "DPODataset":
         data = hf_datasets.DPODataset(
             train_data_path=data_config["train_data_path"],
@@ -190,11 +181,17 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         )
         train_dataset = data.formatted_ds["train"]
         val_dataset = data.formatted_ds["validation"]
-        print(
-            f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
-        )
     else:
         raise ValueError(f"Unknown dataset class: {data_cls}")
+
+    if train_dataset:
+        print(
+            f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples."
+        )
+    if val_dataset:
+        print(
+            f"  ✓ Validation dataset loaded with {len(data.formatted_ds['validation'])} samples."
+        )
 
     dpo_task_spec = data.task_spec
 

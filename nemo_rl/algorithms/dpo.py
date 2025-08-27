@@ -285,23 +285,22 @@ def validate(
     logger: Logger,
 ):
     val_metrics, validation_timings = {}, {}
-    for k, v in val_dataloader.items():
+    for val_dataset_name, v in val_dataloader.items():
         k_val_metrics, k_validation_timings = validate_one_dataset(
-            policy,
-            v,
-            tokenizer,
-            loss_fn,
-            step,
-            master_config,
-            val_batches,
-            val_batch_size,
-            val_mbs,
-            k,
+            policy=policy,
+            val_dataloader=v,
+            loss_fn=loss_fn,
+            step=step,
+            master_config=master_config,
+            val_batches=val_batches,
+            val_batch_size=val_batch_size,
+            val_mbs=val_mbs,
+            dataset_name=val_dataset_name,
         )
-        if k == "validation":
+        if val_dataset_name == "validation":
             prefix = "val"
         else:
-            prefix = f"val-{k}"
+            prefix = f"val-{val_dataset_name}"
 
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
@@ -318,7 +317,6 @@ def validate(
 def validate_one_dataset(
     policy: PolicyInterface,
     val_dataloader: StatefulDataLoader,
-    tokenizer,
     loss_fn,
     step: int,
     master_config: MasterConfig,
@@ -335,7 +333,7 @@ def validate_one_dataset(
     timer = Timer()
 
     with timer.time("total_val_time"):
-        print(f"▶ Starting validation at step {step}...")
+        print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         val_metrics = defaultdict(lambda: 0.0)
         num_valid_batches = 0
