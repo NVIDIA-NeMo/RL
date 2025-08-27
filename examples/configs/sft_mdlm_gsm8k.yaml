@@ -73,7 +73,7 @@ policy:
         total_iters: 100
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: ${policy.max_num_steps}
+        T_max: ${sft.max_num_steps}
     - milestones: [100]
     
   ## ignored since enabled=false, but needed for testing purposes
