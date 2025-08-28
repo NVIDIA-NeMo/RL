@@ -113,9 +113,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         @app.post("/tokenize")
         async def tokenize(request: TokenizeRequest, raw_request: Request):
-            handler = openai_serving_tokenization(raw_request)
-
-            generator = await handler.create_tokenize(request, raw_request)
+            generator = await openai_serving_tokenization.create_tokenize(request, raw_request)
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(content=generator.model_dump(),
