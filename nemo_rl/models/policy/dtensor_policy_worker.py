@@ -586,8 +586,6 @@ class DTensorPolicyWorker:
                 torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
                 global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
 
-                print("global_valid_seqs", global_valid_seqs)
-
                 if (
                     hasattr(loss_fn, "loss_type")
                     and loss_fn.loss_type == LossType.TOKEN_LEVEL
