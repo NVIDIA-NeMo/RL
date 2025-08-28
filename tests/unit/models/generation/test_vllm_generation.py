@@ -1045,6 +1045,7 @@ def test_vllm_http_server(cluster, tokenizer):
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
 
     # Set here to true for http server
+    vllm_config["vllm_cfg"]["async_engine"] = True
     vllm_config["vllm_cfg"]["expose_http_server"] = True
 
     # Ensure we can get same output
