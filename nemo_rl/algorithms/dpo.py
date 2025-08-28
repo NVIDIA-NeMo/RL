@@ -311,6 +311,10 @@ def validate(
             "total_val_time"
         ]
 
+    total_validation_time = sum(validation_timings.values())
+    logger.log_metrics({"total_val_time": total_validation_time}, step, prefix=f"timing/validation")
+    validation_timings["total_val_time"] = total_validation_time
+
     return val_metrics, validation_timings
 
 
@@ -325,7 +329,7 @@ def validate_one_dataset(
     val_mbs: int,
     dataset_name: str,
 ):
-    """Run validation on the validation dataset."""
+    """Run validation on one validation dataset."""
     if val_dataloader is None:
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
