@@ -19,7 +19,8 @@ loss_fn:
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: true  # 更新为true
+  use_importance_sampling_correction: false 
+  sequence_level_importance_ratios: false
   token_level_loss: true
 
 checkpointing:
@@ -35,7 +36,7 @@ policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: 32
+  train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 4
@@ -43,6 +44,7 @@ policy:
   precision: "bfloat16"
 
   dtensor_cfg:
+    _v2: true
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -114,6 +116,9 @@ policy:
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources
@@ -127,7 +132,7 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
-  dataset_name: "DeepScaler" 
+  dataset_name: "OpenMathInstruct-2" 
   shuffle: true
 
 env:
