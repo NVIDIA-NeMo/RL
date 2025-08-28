@@ -75,7 +75,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
+        megatron_enable = "megatron_cfg" in config and config["megatron_cfg"]["enabled"]
         if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
@@ -175,9 +175,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = True
             self.sequence_packing_args: SequencePackingArgs = {
                 "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
-                "logprob_mb_tokens": config["sequence_packing"].get(
-                    "logprob_mb_tokens", None
-                ),
+                "logprob_mb_tokens": config["sequence_packing"]["logprob_mb_tokens"],
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",

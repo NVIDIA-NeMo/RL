@@ -17,6 +17,9 @@ import subprocess
 
 import pytest
 
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
 dir_path = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(dir_path, "..", ".."))
 configs_dir = os.path.join(project_root, "examples", "configs")
