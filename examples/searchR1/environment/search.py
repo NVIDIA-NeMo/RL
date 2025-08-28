@@ -22,11 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import ray
 import requests
 import torch
-from utils import compute_score, extract_solution
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
+
+from .utils import compute_score, extract_solution
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
