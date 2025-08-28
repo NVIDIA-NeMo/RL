@@ -62,7 +62,6 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(f"📋 Received config: {config}")
 
         self.config = config
-        self.reward_model_worker = None
         self.virtual_cluster = RayVirtualCluster(
             name="grpo_reward_model_cluster",
             bundle_ct_per_node_list=[self.config["resources"]["gpus_per_node"]]
