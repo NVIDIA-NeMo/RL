@@ -56,6 +56,7 @@ def parquet_data_processor(
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
+    """Read from a dictionary and convert to a DatumSpec."""
     message_logs = list(datum_dict["prompt"])
     message_logs = message_logs[1:]  # neglect the system prompt
     for idx, message in enumerate(message_logs):
@@ -100,6 +101,7 @@ def setup_data(
     valid_data_path: str,
     task_name: str = "searchR1",
 ):
+    """Setup the dataloader, which reads from parquet files."""
     task_spec = TaskDataSpec(task_name=task_name)
 
     train_dataset = load_dataset("parquet", data_files=train_data_path)["train"]

@@ -15,7 +15,9 @@
 # Adapted from https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl-train/examples/search/retriever/retrieval_server.py
 import argparse
 import json
+import os
 import warnings
+from typing import Iterable
 
 import datasets
 import faiss
@@ -24,17 +26,61 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoModel, AutoTokenizer
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 
-def load_corpus(corpus_path: str):
+class Config:
+    """Minimal config class (simulating your argparse).
+
+    Replace this with your real arguments or load them dynamically.
+    """
+
+    def __init__(
+        self,
+        retrieval_method: str = "bm25",
+        retrieval_topk: int = 10,
+        index_path: str = "./index/bm25",
+        corpus_path: str = "./data/corpus.jsonl",
+        dataset_path: str = "./data",
+        data_split: str = "train",
+        faiss_gpu: bool = True,
+        num_gpus: int = 1,
+        retrieval_model_path: str = "./model",
+        retrieval_pooling_method: str = "mean",
+        retrieval_query_max_length: int = 256,
+        retrieval_use_fp16: bool = False,
+        retrieval_batch_size: int = 128,
+    ):
+        self.retrieval_method = retrieval_method
+        self.retrieval_topk = retrieval_topk
+        self.index_path = index_path
+        self.corpus_path = corpus_path
+        self.dataset_path = dataset_path
+        self.data_split = data_split
+        self.faiss_gpu = faiss_gpu
+        self.num_gpus = num_gpus
+        self.retrieval_model_path = retrieval_model_path
+        self.retrieval_pooling_method = retrieval_pooling_method
+        self.retrieval_query_max_length = retrieval_query_max_length
+        self.retrieval_use_fp16 = retrieval_use_fp16
+        self.retrieval_batch_size = retrieval_batch_size
+
+
+def load_corpus(corpus_path: str) -> datasets.Dataset:
+    """Load the corpus from the given path."""
     corpus = datasets.load_dataset(
         "json", data_files=corpus_path, split="train", num_proc=4
     )
     return corpus
 
 
-def read_jsonl(file_path):
+def read_jsonl(file_path: os.PathLike) -> list[dict]:
+    """Read a jsonl file."""
     data = []
     with open(file_path, "r") as f:
         for line in f:
@@ -42,13 +88,16 @@ def read_jsonl(file_path):
     return data
 
 
-def load_docs(corpus, doc_idxs):
+def load_docs(corpus: list, doc_idxs: Iterable[int]) -> list:
+    """Load the documents from the given corpus and indices."""
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
 
-def load_model(model_path: str, use_fp16: bool = False):
-    # model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+def load_model(
+    model_path: os.PathLike, use_fp16: bool = False
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load the model from the given path."""
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
     model.cuda()
@@ -61,8 +110,12 @@ def load_model(model_path: str, use_fp16: bool = False):
 
 
 def pooling(
-    pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"
-):
+    pooler_output: torch.Tensor,
+    last_hidden_state: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    pooling_method: str = "mean",
+) -> torch.Tensor:
+    """Pool operation according to the pooling method."""
     if pooling_method == "mean":
         last_hidden = last_hidden_state.masked_fill(
             ~attention_mask[..., None].bool(), 0.0
@@ -77,7 +130,14 @@ def pooling(
 
 
 class Encoder:
-    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+    def __init__(
+        self,
+        model_name: str,
+        model_path: os.PathLike,
+        pooling_method: str,
+        max_length: int,
+        use_fp16: bool,
+    ):
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
@@ -90,8 +150,9 @@ class Encoder:
         self.model.eval()
 
     @torch.no_grad()
-    def encode(self, query_list: list[str], is_query=True) -> np.ndarray:
+    def encode(self, query_list: list[str], is_query: bool = True) -> np.ndarray:
         # processing query for different encoders
+
         if isinstance(query_list, str):
             query_list = [query_list]
 
@@ -144,7 +205,9 @@ class Encoder:
 
 
 class BaseRetriever:
-    def __init__(self, config):
+    """Base class for all retrievers."""
+
+    def __init__(self, config: Config):
         self.config = config
         self.retrieval_method = config.retrieval_method
         self.topk = config.retrieval_topk
@@ -168,7 +231,7 @@ class BaseRetriever:
 
 
 class BM25Retriever(BaseRetriever):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__(config)
         from pyserini.search.lucene import LuceneSearcher
 
@@ -178,10 +241,12 @@ class BM25Retriever(BaseRetriever):
             self.corpus = load_corpus(self.corpus_path)
         self.max_process_num = 8
 
-    def _check_contain_doc(self):
+    def _check_contain_doc(self) -> bool:
         return self.searcher.doc(0).raw() is not None
 
-    def _search(self, query: str, num: int = None, return_score: bool = False):
+    def _search(
+        self, query: str, num: int | None = None, return_score: bool = False
+    ) -> list[dict] | tuple[list[dict], list[float]]:
         if num is None:
             num = self.topk
         hits = self.searcher.search(query, num)
@@ -218,8 +283,8 @@ class BM25Retriever(BaseRetriever):
             return results
 
     def _batch_search(
-        self, query_list: list[str], num: int = None, return_score: bool = False
-    ):
+        self, query_list: list[str], num: int | None = None, return_score: bool = False
+    ) -> list[list[dict]] | tuple[list[list[dict]], list[list[float]]]:
         results = []
         scores = []
         for query in query_list:
@@ -233,7 +298,7 @@ class BM25Retriever(BaseRetriever):
 
 
 class DenseRetriever(BaseRetriever):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
@@ -253,7 +318,9 @@ class DenseRetriever(BaseRetriever):
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
 
-    def _search(self, query: str, num: int = None, return_score: bool = False):
+    def _search(
+        self, query: str, num: int | None = None, return_score: bool = False
+    ) -> list[dict] | tuple[list[dict], list[float]]:
         if num is None:
             num = self.topk
         query_emb = self.encoder.encode(query)
@@ -267,8 +334,9 @@ class DenseRetriever(BaseRetriever):
             return results
 
     def _batch_search(
-        self, query_list: list[str], num: int = None, return_score: bool = False
-    ):
+        self, query_list: list[str], num: int | None = None, return_score: bool = False
+    ) -> list[list[dict]] | tuple[list[list[dict]], list[list[float]]]:
+        """Batch search the given query list."""
         if isinstance(query_list, str):
             query_list = [query_list]
         if num is None:
@@ -298,7 +366,8 @@ class DenseRetriever(BaseRetriever):
             return results
 
 
-def get_retriever(config):
+def get_retriever(config: Config) -> BaseRetriever:
+    """Get the retriever based on the retrieval method."""
     if config.retrieval_method == "bm25":
         return BM25Retriever(config)
     else:
@@ -308,43 +377,6 @@ def get_retriever(config):
 #####################################
 # FastAPI server below
 #####################################
-
-
-class Config:
-    """Minimal config class (simulating your argparse).
-
-    Replace this with your real arguments or load them dynamically.
-    """
-
-    def __init__(
-        self,
-        retrieval_method: str = "bm25",
-        retrieval_topk: int = 10,
-        index_path: str = "./index/bm25",
-        corpus_path: str = "./data/corpus.jsonl",
-        dataset_path: str = "./data",
-        data_split: str = "train",
-        faiss_gpu: bool = True,
-        num_gpus: int = 1,
-        retrieval_model_path: str = "./model",
-        retrieval_pooling_method: str = "mean",
-        retrieval_query_max_length: int = 256,
-        retrieval_use_fp16: bool = False,
-        retrieval_batch_size: int = 128,
-    ):
-        self.retrieval_method = retrieval_method
-        self.retrieval_topk = retrieval_topk
-        self.index_path = index_path
-        self.corpus_path = corpus_path
-        self.dataset_path = dataset_path
-        self.data_split = data_split
-        self.faiss_gpu = faiss_gpu
-        self.num_gpus = num_gpus
-        self.retrieval_model_path = retrieval_model_path
-        self.retrieval_pooling_method = retrieval_pooling_method
-        self.retrieval_query_max_length = retrieval_query_max_length
-        self.retrieval_use_fp16 = retrieval_use_fp16
-        self.retrieval_batch_size = retrieval_batch_size
 
 
 class QueryRequest(BaseModel):
@@ -400,13 +432,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--index_path",
         type=str,
-        default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index",
+        default="./data/searchR1/e5_Flat.index",
         help="Corpus indexing file.",
     )
     parser.add_argument(
         "--corpus_path",
         type=str,
-        default="/home/peterjin/mnt/data/retrieval-corpus/wiki-18.jsonl",
+        default="./data/searchR1/wiki-18.jsonl",
         help="Local corpus file.",
     )
     parser.add_argument(
