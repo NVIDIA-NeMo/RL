@@ -989,8 +989,8 @@ class DTensorPolicyWorker:
                     # yet our attention mask above is not always all 1s
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
-                    attention_mask_input_all_ones = torch.ones(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    attention_mask_input_all_ones = torch.ones_like(
+                        input_ids, dtype=torch.long, device=input_ids.device
                     )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
@@ -1019,7 +1019,7 @@ class DTensorPolicyWorker:
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
-                            attention_mask=attention_mask_input_all_ones,
+                            attention_mask=attention_mask if self.enable_seq_packing else attention_mask_input_all_ones ,
                             position_ids=position_ids,
                             use_cache=False,
                             flash_attn_kwargs=flash_attn_kwargs,
