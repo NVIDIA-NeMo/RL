@@ -1037,6 +1037,54 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM can generate text."""
+
+    # Create separate configs for each policy
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+
+    # Set here to true for http server
+    vllm_config["vllm_cfg"]["expose_http_server"] = True
+
+    # Ensure we can get same output
+    assert vllm_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert vllm_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, vllm_config)
+
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == 1
+
+    # Generate and check result
+    from openai import OpenAI
+    client = OpenAI(
+        base_url=base_urls[0],
+        api_key="dummy_key",
+    )
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=0.0,
+        logprobs=True,
+        extra_body={
+            "return_tokens_as_token_ids": True,
+        },
+    )
+    with open("temp.json", "w") as f:
+        f.write(chat_completion.model_dump_json(indent=4) + "\n")
+
+    # Clean up
+    vllm_generation.shutdown()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
