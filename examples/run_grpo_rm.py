@@ -34,6 +34,7 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
@@ -45,7 +46,13 @@ OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Returns:
+        Tuple of (parsed_args, overrides) where:
+        - parsed_args: Namespace object containing parsed arguments
+        - overrides: List of remaining unparsed arguments (Hydra overrides)
+    """
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -63,7 +70,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 TokenizerType = PreTrainedTokenizerBase
 
 
-# TaskDataProcessFnCallable
 def hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -153,16 +159,15 @@ def setup_data(
         defaultdict(lambda: (reward_model_task_spec, hf_data_processor))
     )
     task_data_processors[task_name] = (reward_model_task_spec, hf_data_processor)
-
-    # reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-    #     runtime_env={
-    #         "py_executable": get_actor_python_env(
-    #             "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-    #         ),
-    #         "env_vars": dict(os.environ),  # Pass thru all user environment variables
-    #     }
-    # ).remote(env_configs["reward_model"])
-    reward_model_env = RewardModelEnvironment(env_configs["reward_model"])
+    print(f"OS envs: {dict(os.environ)}")
+    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+            ),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        }
+    ).remote(env_configs["reward_model"])
 
     # Add sleep to let reward model load before policy starts
     print("⏳ Waiting 120 seconds for reward model to load...")

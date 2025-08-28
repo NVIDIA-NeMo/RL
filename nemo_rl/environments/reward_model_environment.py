@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
+import ray
 import torch
 
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -31,6 +33,26 @@ from nemo_rl.models.policy.lm_policy import Policy
 
 
 class RewardModelEnvironmentConfig(TypedDict):
+    """Configuration for RewardModelEnvironment.
+
+    Attributes:
+        enabled: Whether the reward model environment is enabled
+        model_name: Name of the reward model to use (e.g., "Skywork/Skywork-Reward-V2-Qwen3-0.6B")
+        tokenizer: Tokenizer configuration
+        precision: Model precision (e.g., "bfloat16", "float16", "float32")
+        batch_size: Batch size for processing conversations
+        checkpoint_path: Path to model checkpoint (optional)
+        max_model_len: Maximum sequence length for the model
+        logprob_batch_size: Batch size for log probability computation
+        resources: Resource allocation configuration
+        reward_model_cfg: Reward model specific configuration
+        dtensor_cfg: DTensor configuration for distributed training
+        dynamic_batching: Dynamic batching configuration
+        sequence_packing: Sequence packing configuration
+        max_grad_norm: Maximum gradient norm for training
+        generation: Generation configuration for VLLM
+    """
+
     enabled: bool
     model_name: str
     precision: str
@@ -45,9 +67,20 @@ class RewardModelEnvironmentConfig(TypedDict):
     generation: Optional[VllmConfig] = None
 
 
-# @ray.remote
+@ray.remote
 class RewardModelEnvironment(EnvironmentInterface):
-    """Environment that uses a reward model to score conversations."""
+    """Environment that uses a reward model to score conversations.
+
+    This environment implements a reward model-based scoring system for reinforcement
+    learning tasks. It takes conversation logs as input and returns rewards based on
+    the quality of the assistant's responses as judged by a pre-trained reward model.
+
+    Attributes:
+        config: Configuration dictionary containing all environment settings
+        virtual_cluster: Ray virtual cluster for resource management
+        tokenizer: Tokenizer for text processing
+        reward_model_policy: Policy object containing the reward model
+    """
 
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.BASE
 
@@ -55,13 +88,17 @@ class RewardModelEnvironment(EnvironmentInterface):
         """Initialize the reward model environment.
 
         Args:
-            config: Configuration dictionary containing reward model settings
+            config: Configuration dictionary containing reward model settings.
+                   Must include model_name, tokenizer, resources, and other
+                   required parameters as defined in RewardModelEnvironmentConfig.
         """
         print("🚀 REWARD MODEL ENVIRONMENT INITIALIZATION STARTED")
         print("=" * 60)
         print(f"📋 Received config: {config}")
 
         self.config = config
+        # Remove CUDA_VISIBLE_DEVICES to let ray fully control the GPU allocation
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         self.virtual_cluster = RayVirtualCluster(
             name="grpo_reward_model_cluster",
             bundle_ct_per_node_list=[self.config["resources"]["gpus_per_node"]]
@@ -73,21 +110,11 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(
             f"🔧 Virtual cluster created with {self.virtual_cluster.get_placement_groups()} "
         )
-        self.reward_model_policy = None
-
         # Initialize reward model worker with proper resource management
         print("🔧 Setting up reward model worker...")
         weights_path = self.config.get("checkpoint_path", None)
         # Initialize tokenizer
         self.tokenizer = get_tokenizer(self.config["tokenizer"])
-
-        # Ensure tokenizer has pad_token_id
-        # self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
-        # if self.tokenizer.pad_token_id is None:
-        #     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        #     print(
-        #         f"⚠️  Tokenizer pad_token_id was None, set to {self.tokenizer.pad_token_id}"
-        #     )
 
         print(
             f"✅ Tokenizer initialized with pad_token_id: {self.tokenizer.pad_token_id}"
@@ -110,9 +137,20 @@ class RewardModelEnvironment(EnvironmentInterface):
     ) -> BatchedDataDict[GenerationDatumSpec]:
         """Preprocess the message logs for the reward model.
 
-        Args:
-            message_logs: List of conversation message logs
+        This method tokenizes and formats conversation logs into the format expected
+        by the reward model. It handles:
+        - Tokenization of user and assistant messages
+        - Formatting with proper special tokens
+        - Batching and padding for efficient processing
+        - Sequence length validation and truncation
 
+        Args:
+            message_logs: List of conversation message logs, where each log contains
+                         a list of messages with 'role' and 'content' fields.
+
+        Returns:
+            BatchedDataDict containing tokenized and formatted data ready for
+            reward model inference.
         """
         task_data_spec = TaskDataSpec(
             task_name="reward_model_env",
@@ -159,12 +197,26 @@ class RewardModelEnvironment(EnvironmentInterface):
     ) -> EnvironmentReturn:
         """Calculate rewards for the given message logs using the reward model.
 
+        This method processes conversation logs through the reward model to compute
+        quality scores for each conversation. The rewards are based on the reward
+        model's assessment of how well the assistant's responses align with human
+        preferences.
+
         Args:
-            message_logs: List of conversation message logs
-            env_infos: List of environment info dictionaries
+            message_logs: List of conversation message logs to be scored.
+                         Each log should contain alternating user and assistant messages.
+            env_infos: List of environment info dictionaries (currently unused
+                      but required by the interface).
 
         Returns:
-            EnvironmentReturn with rewards and termination info
+            EnvironmentReturn containing:
+            - observations: List of observation dictionaries with reward information
+            - metadata: List of metadata dictionaries (currently None)
+            - next_stop_strings: List of stop strings (currently None)
+            - rewards: Tensor of computed rewards for each conversation
+            - terminateds: Tensor indicating episode termination (all True)
+            - answers: List of assistant responses from the conversations
+
         """
         # Preprocess the message logs
         reward_data = self.preprocess_data(message_logs)
@@ -203,11 +255,21 @@ class RewardModelEnvironment(EnvironmentInterface):
     ) -> Tuple[BatchedDataDict, dict]:
         """Post processing function after all rollouts are done for the batch and returns metrics.
 
+        This method computes aggregate statistics and metrics from the processed batch.
+        It provides insights into reward distribution and processing statistics.
+
         Args:
-            batch: The batch data dictionary
+            batch: The batch data dictionary containing processed conversations and rewards.
 
         Returns:
-            Tuple of (processed_batch, metrics_dict)
+            Tuple of (processed_batch, metrics_dict) where:
+            - processed_batch: The input batch (no modifications)
+            - metrics_dict: Dictionary containing computed metrics including:
+              - reward_model_env/num_samples: Number of samples processed
+              - reward_model_env/mean_reward: Average reward across the batch
+              - reward_model_env/std_reward: Standard deviation of rewards
+              - reward_model_env/min_reward: Minimum reward in the batch
+              - reward_model_env/max_reward: Maximum reward in the batch
         """
         # For reward model environment, no post-processing is needed
         # Just return the batch as-is and empty metrics
@@ -230,8 +292,34 @@ class RewardModelEnvironment(EnvironmentInterface):
 
         return batch, metrics
 
+    def get_worker_group(self):
+        return self.reward_model_policy.worker_group
+
+    def get_gpu_task_ids(self):
+        import os
+
+        print(
+            "reward_model_environment GPU IDs: {}".format(
+                ray.get_runtime_context().get_accelerator_ids()["GPU"]
+            )
+        )
+        print(
+            "reward_model_environment CUDA_VISIBLE_DEVICES: {}".format(
+                os.environ["CUDA_VISIBLE_DEVICES"]
+            )
+        )
+
     def shutdown(self):
-        """Shutdown the reward model worker and virtual cluster."""
+        """Shutdown the reward model worker and virtual cluster.
+
+        This method properly cleans up resources by shutting down the reward model
+        policy and virtual cluster. It should be called when the environment is
+        no longer needed to prevent resource leaks.
+
+        Note:
+            The environment will also automatically call this method in its destructor,
+            but it's recommended to call it explicitly for better resource management.
+        """
         if self.reward_model_policy is not None:
             try:
                 self.reward_model_policy.shutdown()
@@ -247,10 +335,11 @@ class RewardModelEnvironment(EnvironmentInterface):
             self.virtual_cluster = None
 
     def __del__(self):
-        """Shuts down the worker groups when the object is deleted or is garbage collected.
+        """Destructor that ensures proper cleanup when the object is garbage collected.
 
-        This is an extra safety net in case the user forgets to call shutdown() and the pointer to
-        the object is lost due to leaving a function scope. It's always recommended that the
-        user calls shutdown().
+        This is an extra safety net in case the user forgets to call shutdown() and
+        the pointer to the object is lost due to leaving a function scope. It's always
+        recommended that the user calls shutdown() explicitly for better resource
+        management.
         """
         self.shutdown()
