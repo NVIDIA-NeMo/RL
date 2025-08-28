@@ -1052,6 +1052,8 @@ def test_vllm_http_server(cluster, tokenizer):
     vllm_config["vllm_cfg"]["async_engine"] = True
     vllm_config["vllm_cfg"]["expose_http_server"] = True
 
+    print(cluster, vllm_config)
+
     # Ensure we can get same output
     assert vllm_config["model_name"] == "Qwen/Qwen3-0.6B", (
         "Model name should be Qwen/Qwen3-0.6B to get expected output"
