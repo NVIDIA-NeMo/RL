@@ -1153,9 +1153,26 @@ def test_vllm_http_server(cluster, tokenizer):
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
     actual_result = response.json()
-    import json
-    with open("temp.json", "w") as f:
-        json.dump(actual_result, f, indent=4)
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198
+        ],
+        "token_strs": None
+    }
+    assert expected_result == actual_result
 
     # Clean up
     vllm_generation.shutdown()
