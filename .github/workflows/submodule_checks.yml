@@ -15,7 +15,8 @@
 name: "Submodule Fast-Forward Check"
 
 on:
-  - pull_request_target
+  push:
+  pull_request_target:
 
 jobs:
 
