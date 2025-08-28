@@ -1062,25 +1062,21 @@ def test_vllm_http_server(cluster, tokenizer):
     assert len(base_urls) == cluster.num_gpus_per_node
 
     # Generate and check result
-    from openai import OpenAI
-    client = OpenAI(
-        base_url=base_urls[0],
-        api_key="dummy_key",
+    import requests
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=dict(
+            messages=[
+                {"role": "user", "content": "count to 5"},
+            ],
+            temperature=0.0,
+            logprobs=True,
+            return_tokens_as_token_ids=True,
+        )
     )
-
-    # Let's just check one of them
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {"role": "user", "content": "count to 5"},
-        ],
-        temperature=0.0,
-        logprobs=True,
-        extra_body={
-            "return_tokens_as_token_ids": True,
-        },
-    )
+    result = response.json()
     with open("temp.json", "w") as f:
-        f.write(chat_completion.model_dump_json(indent=4) + "\n")
+        f.write(result + "\n")
 
     # Clean up
     vllm_generation.shutdown()
