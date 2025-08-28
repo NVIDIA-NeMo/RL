@@ -770,7 +770,9 @@ class MegatronPolicyWorker:
         # vars used for refit
         ## will be initialized in prepare_refit_info
         # refit_param_info_mcore combines the conversion tasks with the param memory
-        # [(MegatronWeightConversionTask, estimated_memory), ...]
+        # [(mcore_param_name, estimated_memory), ...]
+        # Note: here param name is local param name, with local layer number and
+        # local expert id etc.
         self.refit_conversion_tasks = (
             None  # Meta data for conversion params from megatron bridge
         )
