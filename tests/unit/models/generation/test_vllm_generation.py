@@ -1059,7 +1059,7 @@ def test_vllm_http_server(cluster, tokenizer):
     vllm_generation = VllmGeneration(cluster, vllm_config)
 
     base_urls = vllm_generation.dp_openai_server_base_urls
-    assert len(base_urls) == 1
+    assert len(base_urls) == cluster.num_gpus_per_node
 
     # Generate and check result
     from openai import OpenAI
@@ -1068,6 +1068,7 @@ def test_vllm_http_server(cluster, tokenizer):
         api_key="dummy_key",
     )
 
+    # Let's just check one of them
     chat_completion = client.chat.completions.create(
         messages=[
             {"role": "user", "content": "count to 5"},
