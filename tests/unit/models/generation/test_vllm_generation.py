@@ -1061,6 +1061,7 @@ def test_vllm_http_server(cluster, tokenizer):
 
     base_urls = vllm_generation.dp_openai_server_base_urls
     assert len(base_urls) == cluster.num_gpus_per_node
+    print(base_urls)
 
     # Generate and check result
     import requests
