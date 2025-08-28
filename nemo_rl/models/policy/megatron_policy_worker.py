@@ -776,7 +776,6 @@ class MegatronPolicyWorker:
         )
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
-        self.refit_param_info_hf = None
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -1482,7 +1481,6 @@ class MegatronPolicyWorker:
             else:
                 metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
-        self.refit_param_info_hf = refit_param_info_hf
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
