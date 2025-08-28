@@ -99,7 +99,13 @@ def setup_data(
     train_data_path: str,
     valid_data_path: str,
     task_name: str = "searchR1",
-):
+) -> tuple[
+    AllTaskProcessedDataset,
+    AllTaskProcessedDataset,
+    dict[str, SearchEnv],
+    dict[str, SearchEnv],
+]:
+    """Setup the dataloader, which reads from parquet files."""
     task_spec = TaskDataSpec(task_name=task_name)
 
     train_dataset = load_dataset("parquet", data_files=train_data_path)["train"]

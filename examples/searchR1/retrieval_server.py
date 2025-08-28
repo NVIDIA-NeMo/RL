@@ -77,7 +77,16 @@ def pooling(
 
 
 class Encoder:
-    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+    """An encoder that converts string to vector."""
+
+    def __init__(
+        self,
+        model_name: str,
+        model_path: os.PathLike,
+        pooling_method: str,
+        max_length: int,
+        use_fp16: bool,
+    ):
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
@@ -90,7 +99,8 @@ class Encoder:
         self.model.eval()
 
     @torch.no_grad()
-    def encode(self, query_list: list[str], is_query=True) -> np.ndarray:
+    def encode(self, query_list: list[str], is_query: bool = True) -> np.ndarray:
+        """Encode the query list into vectors."""
         # processing query for different encoders
         if isinstance(query_list, str):
             query_list = [query_list]

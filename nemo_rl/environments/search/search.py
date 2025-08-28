@@ -173,7 +173,8 @@ def _call_search_api(
     return None, last_error
 
 
-def _passages2string(retrieval_result):
+def _passages2string(retrieval_result: list[dict]) -> str:
+    """Format the retrieval result into a string."""
     format_reference = ""
     for idx, doc_item in enumerate(retrieval_result):
         content = doc_item["document"]["contents"].strip()
@@ -186,7 +187,8 @@ class SearchWorker:
         self.url = cfg["search_url"]
         self.max_turns = cfg["max_turns"]
 
-    def search(self, query: str):
+    def search(self, query: str) -> str:
+        """Call the search API with a single query."""
         api_response, error_msg = _call_search_api(self.url, query)
         result_text = json.dumps(
             {"result": "Search request failed or timed out after retries."}
@@ -219,25 +221,31 @@ class SearchWorker:
             )
         return result_text
 
-    def _is_done(self, log: LLMMessageLogType, metadata: SearchEnvMetadata):
+    def _is_done(self, log: LLMMessageLogType, metadata: SearchEnvMetadata) -> bool:
+        """Check if the search is done."""
         if metadata["num_turns"] >= self.max_turns:
             return True
         msg = log[-1]["content"]
         return "<answer>" in msg and "</answer>" in msg
 
-    def _get_reward(self, answer: str | None, ground_truth: str, done: bool):
+    def _get_reward(self, answer: str | None, ground_truth: str, done: bool) -> float:
+        """Get the reward for the search. If not done, return 0.0."""
         if done:
             return compute_score(answer, ground_truth)
         else:
             return 0.0
 
-    def _parse_action(self, action: str) -> List[Optional[str]]:
+    def _parse_action(self, action: str) -> List[str] | None:
+        """Parse the action from the message."""
         match = None
         if "<search>" in action and "</search>" in action:
             match = re.search(r"<search>(.*?)</search>", action, re.DOTALL)
         return match.group(1) if match else None
 
-    def process_turn(self, log: LLMMessageLogType, metadata: SearchEnvMetadata):
+    def process_turn(
+        self, log: LLMMessageLogType, metadata: SearchEnvMetadata
+    ) -> SearchWorkerResult:
+        """Process a single turn of the search given the generated action."""
         ground_truth = metadata["ground_truth"]
 
         done = self._is_done(log, metadata)
@@ -290,6 +298,8 @@ class SearchWorker:
 
 @ray.remote
 class SearchEnv(EnvironmentInterface[SearchEnvMetadata]):
+    """Search environment that maintains state between steps."""
+
     def __init__(self, cfg: SearchEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
@@ -300,6 +310,7 @@ class SearchEnv(EnvironmentInterface[SearchEnvMetadata]):
         message_log_batch: list[LLMMessageLogType],
         metadata: list[SearchEnvMetadata],
     ) -> EnvironmentReturn:
+        """Process a batch of search steps."""
         # chunk the responses and ground truths
         results = [
             self.worker.process_turn(msg_log, metadata)
@@ -328,6 +339,7 @@ class SearchEnv(EnvironmentInterface[SearchEnvMetadata]):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict
     ) -> tuple[BatchedDataDict, dict]:
+        """Calculate the success rate based on the final reward."""
         # Calculate success rate based on final reward == 1.0
         final_rewards = batch.get(
             "total_reward", torch.tensor([0.0] * len(batch["idx"]))
