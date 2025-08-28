@@ -18,6 +18,7 @@ import pprint
 from typing import Any
 
 from datasets import load_dataset
+from environment.search import SearchEnv, SearchEnvConfig
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -29,7 +30,6 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.search.search import SearchEnv, SearchEnvConfig
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir

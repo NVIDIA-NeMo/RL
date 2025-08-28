@@ -44,7 +44,7 @@ cd ../../
 ### Download Dataset
 
 ```
-uv run --active bash prepare.sh
+uv run --active bash ./data/prepare.sh
 ```
 
 ### Launch Retrieval Server
@@ -52,7 +52,7 @@ uv run --active bash prepare.sh
 The `wiki-18` dataset requires 2 80GB GPUs to run.
 
 ```
-uv run --active sh retrieval_launch.sh 
+uv run --active bash ./retrieval/retrieval_launch.sh 
 ```
 
 ## Launch Training Script
