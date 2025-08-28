@@ -130,6 +130,8 @@ def pooling(
 
 
 class Encoder:
+    """An encoder that converts string to vector."""
+
     def __init__(
         self,
         model_name: str,
@@ -151,6 +153,7 @@ class Encoder:
 
     @torch.no_grad()
     def encode(self, query_list: list[str], is_query: bool = True) -> np.ndarray:
+        """Encode the query list into vectors."""
         # processing query for different encoders
 
         if isinstance(query_list, str):
