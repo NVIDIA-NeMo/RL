@@ -342,6 +342,13 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_DP_MASTER_IP"] = os.environ["MASTER_ADDR"]
         os.environ["VLLM_DP_MASTER_PORT"] = os.environ["MASTER_PORT"]
 
+        print(f"RANK: {os.environ['RANK']}")
+        print(f"LOCAL_RANK: {os.environ['LOCAL_RANK']}")
+        print(f"VLLM_DP_RANK: {os.environ['VLLM_DP_RANK']}")
+        print(f"VLLM_DP_RANK_LOCAL: {os.environ['VLLM_DP_RANK_LOCAL']}")
+        print(f"VLLM_DP_MASTER_IP: {os.environ['VLLM_DP_MASTER_IP']}")
+        print(f"VLLM_DP_MASTER_PORT: {os.environ['VLLM_DP_MASTER_PORT']}")
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
