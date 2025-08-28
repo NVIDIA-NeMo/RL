@@ -44,7 +44,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
 
         self.server_thread, self.base_url, self.http_server = None, None, None
-        if self.cfg.get("expose_http_server"):
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
             self.server_thread, self.base_url, self.http_server = self._setup_vllm_server()
 
     async def post_init_async(self):
