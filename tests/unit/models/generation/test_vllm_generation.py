@@ -1077,8 +1077,8 @@ def test_vllm_http_server(cluster, tokenizer):
         max_tokens=1,
     )
 
-    # Generate and check result
-    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    # Generate and check result. We set the timeout here to 30s since it may take a few seconds for the server to spinup. We only need this one the first call.
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body, timeout=30)
     actual_result = response.json()
 
     # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
