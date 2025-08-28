@@ -75,12 +75,10 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    is_vllm_v1_engine_enabled,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -126,9 +124,6 @@ class DTensorPolicyWorkerV2:
         # with different order of node_bundles
         configure_dynamo_cache()
 
-        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-        configure_expandable_segments()
-
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
@@ -170,8 +165,8 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
-        self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
-            "enabled", False
+        self._is_reward_model = (
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
         )
         if self._is_reward_model:
             # Ensure sequence packing is disabled.
@@ -424,13 +419,8 @@ class DTensorPolicyWorkerV2:
         self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        # Apply temperature scaling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
-            # The V1 engine returns raw logits before temperature scaling.
-            # The V0 engine returns scaled logits.
-            # Therefore, we only divide if we are not using the V1 engine.
-            if not is_vllm_v1_engine_enabled():
-                logits.div_(self.cfg["generation"]["temperature"])
+            logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
@@ -570,6 +560,8 @@ class DTensorPolicyWorkerV2:
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
+                    torch.cuda.empty_cache()
+
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()

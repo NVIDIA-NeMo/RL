@@ -661,6 +661,25 @@ def _parallelize_model(
         for i in range(len(layers)):
             layers[i].mlp = checkpoint_wrapper(layers[i].mlp)  # type: ignore
 
+            """
+            the extra memory overhead for layer norm seems to be only present
+            in mistral models, where some intermediate state is converted to float32
+
+            need to find a better solution for checkpointing
+            """
+            if hasattr(layers[i], "self_attn"):
+                layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+            if hasattr(layers[i], "input_layernorm"):
+                layers[i].input_layernorm = checkpoint_wrapper(
+                    layers[i].input_layernorm  # type: ignore
+                )
+
+            if hasattr(layers[i], "post_attention_layernorm"):
+                layers[i].post_attention_layernorm = checkpoint_wrapper(
+                    layers[i].post_attention_layernorm  # type: ignore
+                )
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,

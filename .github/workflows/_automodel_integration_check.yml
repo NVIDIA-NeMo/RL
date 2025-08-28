@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: "Automodel Integration Synchronization Check"
+name: "Automodel Integration Files Consistency Check"
 
 on:
   workflow_call:
@@ -60,6 +60,7 @@ jobs:
           # Define the file paths
           PARALLELIZE_FILE="nemo_rl/models/dtensor/parallelize.py"
           OPTIMIZED_TP_PLANS_FILE="3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/optimized_tp_plans.py"
+          PARALLELIZER_FILE="3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/parallelizer.py"
           
           needs_attention=0
           comment_body=""
@@ -82,7 +83,16 @@ jobs:
             optimized_tp_plans_changed=0
           fi
           
-          # Check if both files exist
+          # Check if parallelizer.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${PARALLELIZER_FILE}$"; then
+            echo "✅ Found changes in ${PARALLELIZER_FILE}"
+            parallelizer_changed=1
+          else
+            echo "ℹ️  No changes found in ${PARALLELIZER_FILE}"
+            parallelizer_changed=0
+          fi
+          
+          # Check if all files exist
           if [[ ! -f "$PARALLELIZE_FILE" ]]; then
             echo "⚠️  Warning: ${PARALLELIZE_FILE} does not exist"
           fi
@@ -91,79 +101,33 @@ jobs:
             echo "⚠️  Warning: ${OPTIMIZED_TP_PLANS_FILE} does not exist"
           fi
           
+          if [[ ! -f "$PARALLELIZER_FILE" ]]; then
+            echo "⚠️  Warning: ${PARALLELIZER_FILE} does not exist"
+          fi
+          
           # Analyze the relationship between the changes
-          if [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 0 ]]; then
-            echo "❌ parallelize.py was modified but optimized_tp_plans.py was not updated"
+          # Success case: If parallelize.py is changed, either optimized_tp_plans.py OR parallelizer.py should also be changed
+          if [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 0 && $parallelizer_changed -eq 0 ]]; then
+            echo "❌ parallelize.py was modified but neither optimized_tp_plans.py nor parallelizer.py was updated"
             needs_attention=1
             comment_body+="### ⚠️  Parallel Plans Synchronization Warning"$'\n\n'
-            comment_body+="The file \`${PARALLELIZE_FILE}\` was modified in this PR, but \`${OPTIMIZED_TP_PLANS_FILE}\` was not updated."$'\n\n'
+            comment_body+="The file \`${PARALLELIZE_FILE}\` was modified in this PR, but neither \`${OPTIMIZED_TP_PLANS_FILE}\` nor \`${PARALLELIZER_FILE}\` was updated."$'\n\n'
             comment_body+="**Why this matters:**"$'\n'
             comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
             comment_body+="**Action required:**"$'\n'
-            comment_body+="- Please review if the changes in \`${PARALLELIZE_FILE}\` should also be applied to \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
-            comment_body+="- Update \`${OPTIMIZED_TP_PLANS_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- Please review if the changes in \`${PARALLELIZE_FILE}\` should also be applied to \`${OPTIMIZED_TP_PLANS_FILE}\` or \`${PARALLELIZER_FILE}\`"$'\n'
+            comment_body+="- Update the appropriate related file(s) if necessary to maintain functional consistency"$'\n'
+            comment_body+="- Request access to the [NVIDIA-NeMo/Automodel](https://github.com/NVIDIA-NeMo/Automodel/) repository, create a PR against the \`nemo-rl-submodule\` branch, and update the Automodel submodule in the nemo-rl index"$'\n'
+            comment_body+="- Add @ffrujeri as a reviewer of this PR if you have any questions about the consistency requirements"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${PARALLELIZE_FILE}\`"$'\n'
-            comment_body+="- Not modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n\n'
-            
-          elif [[ $parallelize_changed -eq 0 && $optimized_tp_plans_changed -eq 1 ]]; then
-            echo "❌ optimized_tp_plans.py was modified but parallelize.py was not updated"
-            needs_attention=1
-            comment_body+="### ⚠️  Parallel Plans Synchronization Warning"$'\n\n'
-            comment_body+="The file \`${OPTIMIZED_TP_PLANS_FILE}\` was modified in this PR, but \`${PARALLELIZE_FILE}\` was not updated."$'\n\n'
-            comment_body+="**Why this matters:**"$'\n'
-            comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
-            comment_body+="**Action required:**"$'\n'
-            comment_body+="- Please review if the changes in \`${OPTIMIZED_TP_PLANS_FILE}\` should also be applied to \`${PARALLELIZE_FILE}\`"$'\n'
-            comment_body+="- Update \`${PARALLELIZE_FILE}\` if necessary to maintain synchronization"$'\n'
-            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
-            comment_body+="**Files to check:**"$'\n'
-            comment_body+="- Modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
-            comment_body+="- Not modified: \`${PARALLELIZE_FILE}\`"$'\n\n'
-            
-          elif [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 1 ]]; then
-            echo "✅ Both parallel plan files were modified"
-            comment_body+="### ✅ Parallel Plans Synchronization Check"$'\n\n'
-            comment_body+="Both parallel plan files were modified in this PR:"$'\n'
-            comment_body+="- \`${PARALLELIZE_FILE}\`"$'\n'
-            comment_body+="- \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n\n'
-            comment_body+="Please ensure that the changes are consistent between both files where applicable."$'\n\n'
+            comment_body+="- Not modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${PARALLELIZER_FILE}\`"$'\n\n'
             
           else
-            echo "ℹ️  No parallel plan files were modified in this PR"
+            echo "ℹ️  No consistency issues detected for parallel plan files"
             # Don't set comment_body in this case to avoid unnecessary comments
-          fi
-          
-          # Additional check: Compare specific functions that should be similar
-          if [[ $parallelize_changed -eq 1 || $optimized_tp_plans_changed -eq 1 ]]; then
-            echo ""
-            echo "📊 Performing content analysis..."
-            
-            # Check if both files have the critical functions
-            functions_to_check=("_parallelize_gemma3" "_parallelize_llama" "_parallelize_qwen" "RotaryEmbedParallel")
-            
-            for func in "${functions_to_check[@]}"; do
-              if [[ -f "$PARALLELIZE_FILE" ]] && grep -q "$func" "$PARALLELIZE_FILE"; then
-                parallelize_has_func=1
-              else
-                parallelize_has_func=0
-              fi
-              
-              if [[ -f "$OPTIMIZED_TP_PLANS_FILE" ]] && grep -q "$func" "$OPTIMIZED_TP_PLANS_FILE"; then
-                optimized_has_func=1
-              else
-                optimized_has_func=0
-              fi
-              
-              if [[ $parallelize_has_func -eq 1 && $optimized_has_func -eq 0 ]]; then
-                echo "⚠️  Function $func exists in parallelize.py but not in optimized_tp_plans.py"
-              elif [[ $parallelize_has_func -eq 0 && $optimized_has_func -eq 1 ]]; then
-                echo "⚠️  Function $func exists in optimized_tp_plans.py but not in parallelize.py"
-              elif [[ $parallelize_has_func -eq 1 && $optimized_has_func -eq 1 ]]; then
-                echo "✅ Function $func exists in both files"
-              fi
-            done
           fi
           
           echo ""
@@ -210,7 +174,7 @@ jobs:
             comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
             comment_body+="**Action required:**"$'\n'
             comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
-            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_V2_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_V2_FILE}\` if necessary to maintain consistency"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
@@ -225,7 +189,7 @@ jobs:
             comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
             comment_body+="**Action required:**"$'\n'
             comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_V2_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
-            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_FILE}\` if necessary to maintain synchronization"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_FILE}\` if necessary to maintain consistency"$'\n'
             comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
             comment_body+="**Files to check:**"$'\n'
             comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
@@ -254,11 +218,11 @@ jobs:
           
           if [[ $needs_attention -eq 1 ]]; then
             echo ""
-            echo "⚠️  File synchronization needs attention"
+            echo "⚠️  Files consistency needs attention"
             echo "Please review the changes and ensure related files are properly synchronized"
           else
             echo ""
-            echo "✅ File synchronization check completed"
+            echo "✅ File consistency check completed"
           fi
 
   comment:
@@ -273,8 +237,8 @@ jobs:
           script: |
             const needsAttention = ${{ toJSON(needs.check.outputs.needs_attention) }} === '1';
             const title = needsAttention ? 
-              '## ⚠️  File Synchronization Check' : 
-              '## ℹ️  File Synchronization Check';
+              '## ⚠️  File Consistency Check' : 
+              '## ℹ️  File Consistency Check';
             
             const headSha = ${{ toJSON(inputs.head_sha) }};
             const prNumber = ${{ toJSON(inputs.pr_number) }};

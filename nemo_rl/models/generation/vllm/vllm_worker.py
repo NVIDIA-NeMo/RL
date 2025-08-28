@@ -250,6 +250,43 @@ class BaseVllmGenerationWorker:
             _patch_vllm_init_workers_ray()
             logger.info("Successfully patched vllm _init_workers_ray.")
 
+            # Patch the vLLM sampler.py file to modify logprobs computation wrt temperature.
+            # This replaces raw_logprobs = self.compute_logprobs(logits) with custom temperature-applied logprobs.
+            # TODO(zhanda): This is only a temporary fix to address the issue of incorrect logprobs returned by vllm
+            # and should be removed or improved after vllm's new logprobs option is released. And currently, other
+            # sampling parameters like top_p, top_k, etc. are not supported.
+            # See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details.
+            def _patch_vllm_sampler():
+                try:
+                    import vllm.v1.sample.sampler as sampler_module
+
+                    file_to_patch = sampler_module.__file__
+
+                    with open(file_to_patch, "r") as f:
+                        content = f.read()
+
+                    old_line = "raw_logprobs = self.compute_logprobs(logits)"
+                    new_lines = "raw_logprobs = self.compute_logprobs(self.apply_temperature(logits.to(torch.float32), sampling_metadata.temperature) if sampling_metadata.temperature is not None else logits)"
+
+                    if new_lines in content:
+                        return
+
+                    if old_line not in content:
+                        return
+
+                    # Replace all instances of the old line with the new lines
+                    patched_content = content.replace(old_line, new_lines)
+
+                    # Write back the patched content
+                    with open(file_to_patch, "w") as f:
+                        f.write(patched_content)
+
+                except (ImportError, FileNotFoundError, PermissionError):
+                    # Allow failures gracefully
+                    pass
+
+            _patch_vllm_sampler()
+
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
             pass

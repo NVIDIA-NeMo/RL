@@ -39,7 +39,13 @@ basic_vllm_test_config: VllmConfig = {
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
-    "temperature": 0.8,
+    # Set temperature=1.0 to ensure consistent probability scaling when comparing vLLM and HF policy outputs.
+    # Note: greedy=True is only used in tests for deterministic behavior and not used in the real training.
+    # In vLLM, enabling greedy=True disables temperature scaling (temperature is overridden to None).
+    # The HF policy worker does not currently support greedy=True for get_logprobs.
+    # Using temperature=1.0 allows us to meaningfully test the average probability multiplicative error between the two implementations,
+    # while still maintaining the deterministic behavior.
+    "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
     "stop_token_ids": None,
@@ -324,6 +330,43 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+def test_vllm_top_p_top_k_validation(cluster):
+    """Test that top_p and top_k validation works correctly with threshold-based logic."""
+    # Test that values above thresholds are allowed
+    config_above_thresholds = deepcopy(basic_vllm_test_config)
+    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
+    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
+
+    # Should not raise an error
+    try:
+        VllmGeneration(cluster, config_above_thresholds)
+        print("Successfully initialized with top_p=0.99 and top_k=8000")
+    except Exception as e:
+        pytest.fail(f"Should not raise error with values above thresholds: {e}")
+
+    # Test that values below thresholds are rejected
+    config_below_thresholds = deepcopy(basic_vllm_test_config)
+    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_below_thresholds)
+
+    error_message = str(excinfo.value)
+    assert "top_p sampling with values < 0.99 is not supported" in error_message
+    print(f"Successfully caught low top_p value with error: {error_message}")
+
+    # Test that low top_k values are rejected
+    config_low_top_k = deepcopy(basic_vllm_test_config)
+    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_low_top_k)
+
+    error_message = str(excinfo.value)
+    assert "top_k sampling with values < 8000 is not supported" in error_message
+    print(f"Successfully caught low top_k value with error: {error_message}")
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

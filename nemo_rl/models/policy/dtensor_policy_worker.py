@@ -65,12 +65,10 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    is_vllm_v1_engine_enabled,
     resolve_model_class,
     sliding_window_overwrite,
 )
@@ -173,9 +171,6 @@ class DTensorPolicyWorker:
         # with different order of node_bundles
         configure_dynamo_cache()
 
-        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-        configure_expandable_segments()
-
         # vars used for refit
         ## will be initialized in prepare_refit_info
         self.refit_param_info = None
@@ -230,8 +225,8 @@ class DTensorPolicyWorker:
         )
 
         # reward model
-        self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
-            "enabled", False
+        self._is_reward_model = (
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
         )
         if self._is_reward_model:
             # Ensure sequence packing is disabled.
@@ -475,13 +470,8 @@ class DTensorPolicyWorker:
     # based on https://github.com/pytorch/torchtitan/blob/cddd7dc809f36fe0ed51cdaaea0671c084d75442/torchtitan/distributed/utils.py#L178
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
-        # Apply temperature scaling to logits if configured and not using V1 engine.
         if "generation" in self.cfg and self.cfg["generation"] is not None:
-            # The V1 engine returns raw logits before temperature scaling.
-            # The V0 engine returns scaled logits.
-            # Therefore, we only divide if we are not using the V1 engine.
-            if not is_vllm_v1_engine_enabled():
-                logits.div_(self.cfg["generation"]["temperature"])
+            logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
     @staticmethod
@@ -642,6 +632,8 @@ class DTensorPolicyWorker:
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
+                    torch.cuda.empty_cache()
+
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         if self.enable_seq_packing:
                             input_ids = mb.get("input_ids").cuda()
