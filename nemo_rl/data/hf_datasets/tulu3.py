@@ -20,7 +20,7 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def format_tulu3_preference(
+def to_preference_data_format(
     data: dict[str, Any],
 ) -> dict[
     str, list[dict[str, int | list[dict[str, str | Any]]]] | list[dict[str, str]]
@@ -72,7 +72,7 @@ class Tulu3PreferenceDataset:
             path="allenai/llama-3.1-tulu-3-8b-preference-mixture",
             trust_remote_code=True,
         )
-        self.formatted_ds = ds.map(format_tulu3_preference)
+        self.formatted_ds = ds.map(to_preference_data_format)
 
         self.task_spec = TaskDataSpec(
             task_name="Tulu3Preference",
