@@ -1,0 +1,259 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Automodel Integration Files Consistency Check"
+
+on:
+  workflow_call:
+    inputs:
+      base_ref:
+        required: true
+        type: string
+        description: "Target branch to check against"
+      head_ref:
+        required: true
+        type: string
+        description: "Feature branch name"
+      pr_number:
+        required: true
+        type: string
+        description: "Pull request number"
+      head_sha:
+        required: true
+        type: string
+        description: "Head commit SHA of the feature branch"
+
+jobs:
+  check:
+    name: Related FilesSynchronization Check
+    runs-on: ubuntu-latest
+    outputs:
+      needs_attention: ${{ steps.check.outputs.needs_attention }}
+      comment_body: ${{ steps.check.outputs.comment_body }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Fetch target branch reference
+        run: |
+          git fetch origin ${{ inputs.base_ref }}
+      
+      - name: Check parallel plans sync status
+        id: check
+        shell: bash -x -e {0}
+        run: |
+          echo "Checking if parallel plan files are synchronized..."
+          
+          # Define the file paths
+          PARALLELIZE_FILE="nemo_rl/models/dtensor/parallelize.py"
+          OPTIMIZED_TP_PLANS_FILE="3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/optimized_tp_plans.py"
+          PARALLELIZER_FILE="3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed/parallelizer.py"
+          
+          needs_attention=0
+          comment_body=""
+          
+          # Check if parallelize.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${PARALLELIZE_FILE}$"; then
+            echo "✅ Found changes in ${PARALLELIZE_FILE}"
+            parallelize_changed=1
+          else
+            echo "ℹ️  No changes found in ${PARALLELIZE_FILE}"
+            parallelize_changed=0
+          fi
+          
+          # Check if optimized_tp_plans.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${OPTIMIZED_TP_PLANS_FILE}$"; then
+            echo "✅ Found changes in ${OPTIMIZED_TP_PLANS_FILE}"
+            optimized_tp_plans_changed=1
+          else
+            echo "ℹ️  No changes found in ${OPTIMIZED_TP_PLANS_FILE}"
+            optimized_tp_plans_changed=0
+          fi
+          
+          # Check if parallelizer.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${PARALLELIZER_FILE}$"; then
+            echo "✅ Found changes in ${PARALLELIZER_FILE}"
+            parallelizer_changed=1
+          else
+            echo "ℹ️  No changes found in ${PARALLELIZER_FILE}"
+            parallelizer_changed=0
+          fi
+          
+          # Check if all files exist
+          if [[ ! -f "$PARALLELIZE_FILE" ]]; then
+            echo "⚠️  Warning: ${PARALLELIZE_FILE} does not exist"
+          fi
+          
+          if [[ ! -f "$OPTIMIZED_TP_PLANS_FILE" ]]; then
+            echo "⚠️  Warning: ${OPTIMIZED_TP_PLANS_FILE} does not exist"
+          fi
+          
+          if [[ ! -f "$PARALLELIZER_FILE" ]]; then
+            echo "⚠️  Warning: ${PARALLELIZER_FILE} does not exist"
+          fi
+          
+          # Analyze the relationship between the changes
+          # Success case: If parallelize.py is changed, either optimized_tp_plans.py OR parallelizer.py should also be changed
+          if [[ $parallelize_changed -eq 1 && $optimized_tp_plans_changed -eq 0 && $parallelizer_changed -eq 0 ]]; then
+            echo "❌ parallelize.py was modified but neither optimized_tp_plans.py nor parallelizer.py was updated"
+            needs_attention=1
+            comment_body+="### ⚠️  Parallel Plans Synchronization Warning"$'\n\n'
+            comment_body+="The file \`${PARALLELIZE_FILE}\` was modified in this PR, but neither \`${OPTIMIZED_TP_PLANS_FILE}\` nor \`${PARALLELIZER_FILE}\` was updated."$'\n\n'
+            comment_body+="**Why this matters:**"$'\n'
+            comment_body+="These files contain similar parallel plan implementations that should be kept synchronized to ensure consistency across the codebase."$'\n\n'
+            comment_body+="**Action required:**"$'\n'
+            comment_body+="- Please review if the changes in \`${PARALLELIZE_FILE}\` should also be applied to \`${OPTIMIZED_TP_PLANS_FILE}\` or \`${PARALLELIZER_FILE}\`"$'\n'
+            comment_body+="- Update the appropriate related file(s) if necessary to maintain functional consistency"$'\n'
+            comment_body+="- Request access to the [NVIDIA-NeMo/Automodel](https://github.com/NVIDIA-NeMo/Automodel/) repository, create a PR against the \`nemo-rl-submodule\` branch, and update the Automodel submodule in the nemo-rl index"$'\n'
+            comment_body+="- Add @ffrujeri as a reviewer of this PR if you have any questions about the consistency requirements"$'\n'
+            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
+            comment_body+="**Files to check:**"$'\n'
+            comment_body+="- Modified: \`${PARALLELIZE_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${OPTIMIZED_TP_PLANS_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${PARALLELIZER_FILE}\`"$'\n\n'
+            
+          else
+            echo "ℹ️  No consistency issues detected for parallel plan files"
+            # Don't set comment_body in this case to avoid unnecessary comments
+          fi
+          
+          echo ""
+          echo "Checking if dtensor policy worker files are synchronized..."
+          
+          # Define the dtensor policy worker file paths
+          DTENSOR_POLICY_WORKER_FILE="nemo_rl/models/policy/dtensor_policy_worker.py"
+          DTENSOR_POLICY_WORKER_V2_FILE="nemo_rl/models/policy/dtensor_policy_worker_v2.py"
+          
+          # Check if dtensor_policy_worker.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${DTENSOR_POLICY_WORKER_FILE}$"; then
+            echo "✅ Found changes in ${DTENSOR_POLICY_WORKER_FILE}"
+            dtensor_worker_changed=1
+          else
+            echo "ℹ️  No changes found in ${DTENSOR_POLICY_WORKER_FILE}"
+            dtensor_worker_changed=0
+          fi
+          
+          # Check if dtensor_policy_worker_v2.py was modified in this PR
+          if git diff --name-only origin/${{ inputs.base_ref }}..HEAD | grep -q "^${DTENSOR_POLICY_WORKER_V2_FILE}$"; then
+            echo "✅ Found changes in ${DTENSOR_POLICY_WORKER_V2_FILE}"
+            dtensor_worker_v2_changed=1
+          else
+            echo "ℹ️  No changes found in ${DTENSOR_POLICY_WORKER_V2_FILE}"
+            dtensor_worker_v2_changed=0
+          fi
+          
+          # Check if both dtensor policy worker files exist
+          if [[ ! -f "$DTENSOR_POLICY_WORKER_FILE" ]]; then
+            echo "⚠️  Warning: ${DTENSOR_POLICY_WORKER_FILE} does not exist"
+          fi
+          
+          if [[ ! -f "$DTENSOR_POLICY_WORKER_V2_FILE" ]]; then
+            echo "⚠️  Warning: ${DTENSOR_POLICY_WORKER_V2_FILE} does not exist"
+          fi
+          
+          # Analyze the relationship between the dtensor policy worker changes
+          if [[ $dtensor_worker_changed -eq 1 && $dtensor_worker_v2_changed -eq 0 ]]; then
+            echo "❌ dtensor_policy_worker.py was modified but dtensor_policy_worker_v2.py was not updated"
+            needs_attention=1
+            comment_body+="### ⚠️  DTensor Policy Worker Synchronization Warning"$'\n\n'
+            comment_body+="The file \`${DTENSOR_POLICY_WORKER_FILE}\` was modified in this PR, but \`${DTENSOR_POLICY_WORKER_V2_FILE}\` was not updated."$'\n\n'
+            comment_body+="**Why this matters:**"$'\n'
+            comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
+            comment_body+="**Action required:**"$'\n'
+            comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_V2_FILE}\` if necessary to maintain consistency"$'\n'
+            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
+            comment_body+="**Files to check:**"$'\n'
+            comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n\n'
+            
+          elif [[ $dtensor_worker_changed -eq 0 && $dtensor_worker_v2_changed -eq 1 ]]; then
+            echo "❌ dtensor_policy_worker_v2.py was modified but dtensor_policy_worker.py was not updated"
+            needs_attention=1
+            comment_body+="### ⚠️  DTensor Policy Worker Synchronization Warning"$'\n\n'
+            comment_body+="The file \`${DTENSOR_POLICY_WORKER_V2_FILE}\` was modified in this PR, but \`${DTENSOR_POLICY_WORKER_FILE}\` was not updated."$'\n\n'
+            comment_body+="**Why this matters:**"$'\n'
+            comment_body+="These files contain related DTensor policy worker implementations that should be kept synchronized to ensure consistency across different versions."$'\n\n'
+            comment_body+="**Action required:**"$'\n'
+            comment_body+="- Please review if the changes in \`${DTENSOR_POLICY_WORKER_V2_FILE}\` should also be applied to \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
+            comment_body+="- Update \`${DTENSOR_POLICY_WORKER_FILE}\` if necessary to maintain consistency"$'\n'
+            comment_body+="- If the files are intentionally different, please add a comment in the PR explaining why"$'\n\n'
+            comment_body+="**Files to check:**"$'\n'
+            comment_body+="- Modified: \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n'
+            comment_body+="- Not modified: \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n\n'
+            
+          elif [[ $dtensor_worker_changed -eq 1 && $dtensor_worker_v2_changed -eq 1 ]]; then
+            echo "✅ Both DTensor policy worker files were modified"
+            comment_body+="### ✅ DTensor Policy Worker Synchronization Check"$'\n\n'
+            comment_body+="Both DTensor policy worker files were modified in this PR:"$'\n'
+            comment_body+="- \`${DTENSOR_POLICY_WORKER_FILE}\`"$'\n'
+            comment_body+="- \`${DTENSOR_POLICY_WORKER_V2_FILE}\`"$'\n\n'
+            comment_body+="Please ensure that the changes are consistent between both files where applicable."$'\n\n'
+            
+          else
+            echo "ℹ️  No DTensor policy worker files were modified in this PR"
+            # Don't set comment_body in this case to avoid unnecessary comments
+          fi
+          
+          # Set outputs
+          echo "needs_attention=$needs_attention" >> $GITHUB_OUTPUT
+          if [[ -n "$comment_body" ]]; then
+            echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+            echo "$comment_body" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          
+          if [[ $needs_attention -eq 1 ]]; then
+            echo ""
+            echo "⚠️  Files consistency needs attention"
+            echo "Please review the changes and ensure related files are properly synchronized"
+          else
+            echo ""
+            echo "✅ File consistency check completed"
+          fi
+
+  comment:
+    name: Comment on PR
+    needs: [check]
+    runs-on: ubuntu-latest
+    if: always() && needs.check.outputs.comment_body != ''
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needsAttention = ${{ toJSON(needs.check.outputs.needs_attention) }} === '1';
+            const title = needsAttention ? 
+              '## ⚠️  File Consistency Check' : 
+              '## ℹ️  File Consistency Check';
+            
+            const headSha = ${{ toJSON(inputs.head_sha) }};
+            const prNumber = ${{ toJSON(inputs.pr_number) }};
+            const headRef = ${{ toJSON(inputs.head_ref) }};
+            const checkOutputs = ${{ toJSON(needs.check.outputs.comment_body) }};
+            
+            const commentBody = title + '\n\n' +
+              '**Check based on commit:** ' + headSha + ' (PR #' + prNumber + ' from `' + headRef + '`)\n\n' +
+              checkOutputs + '\n\n' +
+              '---\n' +
+              '<sub>This check ensures that related file implementations remain synchronized across the codebase. If you believe this warning is incorrect or the files should intentionally differ, please add a comment explaining the reasoning.</sub>';
+            
+            await github.rest.issues.createComment({
+              issue_number: parseInt(prNumber),
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
