@@ -115,7 +115,10 @@ def dpo_preprocessor(
         chosen_completion = datum_dict["completions"][1]
         rejected_completion = datum_dict["completions"][0]
     else:
-        raise NotImplementedError("Ties are not supported yet.")
+        raise NotImplementedError(
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <LocalPathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+        )
+
     messages_chosen = datum_dict["context"] + chosen_completion["completion"]
     messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 

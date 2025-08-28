@@ -270,15 +270,17 @@ def validate(
 
         val_metrics[prefix + "_loss"] = k_val_metrics["val_loss"]
         val_metrics[prefix + "_accuracy"] = k_val_metrics["accuracy"]
-        validation_timings[prefix + "_total_val_time"] = k_validation_timings[
-            "total_val_time"
+        validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
+            "total_validation_time"
         ]
 
     total_validation_time = sum(validation_timings.values())
     logger.log_metrics(
-        {"total_val_time": total_validation_time}, step, prefix="timing/validation"
+        {"total_validation_time": total_validation_time},
+        step,
+        prefix="timing/validation",
     )
-    validation_timings["total_val_time"] = total_validation_time
+    validation_timings["total_validation_time"] = total_validation_time
 
     return val_metrics, validation_timings
 
@@ -301,7 +303,7 @@ def validate_one_dataset(
 
     timer = Timer()
 
-    with timer.time("total_val_time"):
+    with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         # Show a progress indicator for validation
@@ -387,7 +389,7 @@ def validate_one_dataset(
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-    validation_time = timing_metrics.get("total_val_time", 0)
+    validation_time = timing_metrics.get("total_validation_time", 0)
 
     if num_valid_batches > 0:
         # Print summary of validation results
@@ -406,7 +408,7 @@ def validate_one_dataset(
 
         # Print timing information
         print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
-        validation_time = timing_metrics.get("total_val_time", 0)
+        validation_time = timing_metrics.get("total_validation_time", 0)
         print(f"    • Total validation time: {validation_time:.2f}s")
 
     # Make sure to reset the timer after validation

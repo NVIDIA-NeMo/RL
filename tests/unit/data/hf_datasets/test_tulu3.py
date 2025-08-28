@@ -35,8 +35,14 @@ def test_to_preference_data_format():
     """Test the `to_preference_data_format()` function with different preference values."""
     data = {
         "prompt": "What is 2+2?",
-        "chosen": [{"content": "What is 2+2?", "role": "user"}, {"role": "assistant", "content": "The answer is 4."}],
-        "rejected": [{"content": "What is 2+2?", "role": "user"}, {"role": "assistant", "content": "I don't know."}],
+        "chosen": [
+            {"content": "What is 2+2?", "role": "user"},
+            {"role": "assistant", "content": "The answer is 4."},
+        ],
+        "rejected": [
+            {"content": "What is 2+2?", "role": "user"},
+            {"role": "assistant", "content": "I don't know."},
+        ],
     }
     result = to_preference_data_format(data)
     assert result["context"] == [{"content": "What is 2+2?", "role": "user"}]
