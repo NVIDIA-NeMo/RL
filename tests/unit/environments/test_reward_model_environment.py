@@ -1,53 +1,33 @@
-from typing import List
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import numpy as np
+
 import pytest
 import torch
-from datasets import load_dataset
-from tqdm import tqdm
 
-from nemo_rl.data.interfaces import LLMMessageLogType
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
     RewardModelEnvironmentConfig,
 )
-from nemo_rl.models.generation.vllm import VllmConfig
 
+# Model configuration constants
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-REWARD_MODEL_NAME = "Skywork/Skywork-Reward-V2-Qwen3-8B"
+REWARD_MODEL_NAME = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+MAX_MODEL_LEN = 1024
 
-basic_vllm_config: VllmConfig = {
-    "backend": "vllm",
-    "model_name": MODEL_NAME,
-    "dtype": "bfloat16",
-    "max_new_tokens": 100,
-    "temperature": 1.0,
-    "top_p": 1.0,
-    "top_k": None,
-    "stop_token_ids": None,
-    "stop_strings": None,
-    "vllm_cfg": {
-        "async_engine": False,
-        "precision": "bfloat16",
-        "tensor_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "max_model_len": 1024,
-        "disable_log_stats": True,
-        "disable_log_requests": True,
-        "gpu_memory_utilization": 0.6,
-        "enforce_eager": "False",
-    },
-    "colocated": {
-        "enabled": True,
-        "resources": {
-            "gpus_per_node": None,
-            "num_nodes": None,
-        },
-    },
-}
-
-
+# Basic reward model environment configuration
+# This config sets up a reward model environment for testing reward computation
 basic_env_config: RewardModelEnvironmentConfig = {
     "enabled": True,
     "model_name": REWARD_MODEL_NAME,
@@ -55,8 +35,8 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "precision": "bfloat16",
     "batch_size": 32,
     "checkpoint_path": None,
-    "max_model_len": basic_vllm_config["vllm_cfg"]["max_model_len"],
-    "resources": {"gpus_per_node": 8, "num_nodes": 1},
+    "max_model_len": MAX_MODEL_LEN,
+    "resources": {"gpus_per_node": 1, "num_nodes": 1},
     "reward_model_cfg": {
         "enabled": True,
         "reward_model_type": "bradley_terry",
@@ -66,7 +46,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
         "cpu_offload": False,
         "sequence_parallel": False,
         "activation_checkpointing": False,
-        "tensor_parallel_size": 8,
+        "tensor_parallel_size": 1,
         "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
@@ -78,7 +58,16 @@ basic_env_config: RewardModelEnvironmentConfig = {
 
 @pytest.fixture(scope="function")
 def reward_model_env():
-    """Create a reward model environment for testing."""
+    """
+    Create a reward model environment for testing.
+
+    This fixture creates a RewardModelEnvironment instance with the basic
+    configuration and ensures proper cleanup after each test.
+
+    Yields:
+        RewardModelEnvironment: A configured reward model environment instance.
+    """
+    env_actor = None
     try:
         env_actor = RewardModelEnvironment(basic_env_config)
         yield env_actor
@@ -87,108 +76,88 @@ def reward_model_env():
             env_actor.shutdown()
 
 
-@pytest.fixture(scope="function")
-def cluster():
-    """Create a virtual cluster for testing."""
-    cluster_instance = None
-    cluster_name = f"test-reward-model-cluster-{id(cluster_instance)}"
-    print(f"\nCreating virtual cluster '{cluster_name}'...")
-    try:
-        cluster_instance = RayVirtualCluster(
-            name=cluster_name,
-            bundle_ct_per_node_list=[1],
-            use_gpus=True,
-            num_gpus_per_node=8,
-            max_colocated_worker_groups=2,
-        )
-        yield cluster_instance
-    finally:
-        print(f"\nCleaning up cluster '{cluster_name}'...")
-        if cluster_instance:
-            cluster_instance.shutdown()
+class TestRewardModelEnvironment:
+    """Test suite for RewardModelEnvironment functionality."""
 
+    def test_reward_model_environment_initialization(self, reward_model_env):
+        """
+        Test that the reward model environment initializes correctly.
 
-EVAL_SET = "allenai/reward-bench"
+        This test verifies that the environment is properly configured
+        and ready for use.
 
+        Args:
+            reward_model_env: The reward model environment fixture.
+        """
+        # Verify the environment is properly initialized
+        assert reward_model_env is not None
+        assert reward_model_env.config is not None
+        assert reward_model_env.virtual_cluster is not None
+        assert reward_model_env.tokenizer is not None
+        assert reward_model_env.reward_model_policy is not None
 
-# EVAL_SET = "THU-KEG/RM-Bench"
-def test_reward_model_environment_performance(reward_model_env):
-    """Test the reward model environment."""
-    raw_dataset = load_dataset(EVAL_SET, split="filtered")
-    subsets = raw_dataset["subset"]
-    batch_size = 32
-    dataloader = torch.utils.data.DataLoader(
-        raw_dataset,
-        batch_size=batch_size,
-        collate_fn=None,
-        shuffle=False,
-        drop_last=False,
-    )
-    reward_data_chosen = []
-    reward_data_rejected = []
-    for idx, batch in enumerate(tqdm(dataloader, desc="Processing dataset")):
-        message_log_batch_chosen: List[LLMMessageLogType] = []
-        message_log_batch_rejected: List[LLMMessageLogType] = []
-        for example in batch:
-            message_log_chosen = [
-                {"role": "user", "content": example["prompt"]},
-                {"role": "assistant", "content": example["chosen"]},
-            ]
-            message_log_rejected = [
-                {"role": "user", "content": example["prompt"]},
-                {"role": "assistant", "content": example["rejected"]},
-            ]
-            message_log_batch_chosen.append(message_log_chosen)
-            message_log_batch_rejected.append(message_log_rejected)
-        reward_data_chosen_batch = reward_model_env.preprocess_data(
-            message_log_batch_chosen
-        )
-        reward_data_rejected_batch = reward_model_env.preprocess_data(
-            message_log_batch_rejected
-        )
-        reward_data_chosen_scores = reward_model_env.reward_model_policy.score(
-            reward_data_chosen_batch
-        )["scores"]
-        reward_data_rejected_scores = reward_model_env.reward_model_policy.score(
-            reward_data_rejected_batch
-        )["scores"]
-        reward_data_chosen.extend(reward_data_chosen_scores)
-        reward_data_rejected.extend(reward_data_rejected_scores)
-    results = []
-    for chosen, rejected in zip(reward_data_chosen, reward_data_rejected):
-        results.append(1) if chosen > rejected else results.append(0)
-    print(results)
-    print(len(results))
-    out_dataset = raw_dataset.add_column("results", results)
+    def test_reward_model_environment_preprocess_data(self, reward_model_env):
+        """
+        Test the reward model environment's ability to preprocess data.
 
-    # add subsets back (removed so it's not handled by cuda)
-    out_dataset = out_dataset.add_column("subset", subsets)
-    present_subsets = np.unique(subsets)
-    results_grouped = {}
-    for subset in present_subsets:
-        subset_dataset = out_dataset.filter(lambda example: example["subset"] == subset)
-        num_correct = sum(subset_dataset["results"])
-        num_total = len(subset_dataset["results"])
-        print(f"{subset}: {num_correct}/{num_total} ({num_correct / num_total})")
-        results_grouped[subset] = num_correct / num_total
-    print(results_grouped)
+        This test verifies that the environment can preprocess data correctly.
+        """
+        message_log_batch = [
+            [
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "The capital of Brazil is Brasilia."},
+            ],
+        ]
+        output = reward_model_env.preprocess_data(message_log_batch)
+        target_length = 29
+        assert output is not None
+        assert output["input_ids"] is not None
+        assert output["input_lengths"] is not None
 
+        assert output["input_ids"].shape == (1, target_length)
+        assert output["input_lengths"].shape == (1,)
+        assert output["input_lengths"][0] == target_length
 
-def test_reward_model_environment_generate_responses(reward_model_env):
-    """Test the reward model environment generate responses."""
+    def test_reward_model_environment_generate_rewards(self, reward_model_env):
+        """
+        Test the reward model environment's ability to generate responses and compute rewards.
 
-    message_log_batch = [
-        [
-            {"role": "user", "content": "What is the capital of France?"},
-            {"role": "assistant", "content": "The capital of Brazil is Brasilia."},
-        ],
-        [
-            {"role": "user", "content": "What is the capital of France?"},
-            {"role": "assistant", "content": "The capital of France is Paris."},
-        ],
-    ]
+        This test verifies that:
+        1. The environment can process message logs
+        2. Rewards are computed correctly
+        3. The reward values are reasonable (incorrect answer gets lower reward)
+        4. The output format is correct
 
-    output = reward_model_env.step(message_log_batch, [])
-    assert output.rewards.shape == (2,)
-    assert output.rewards.dtype == torch.float32
-    assert output.rewards[0] < output.rewards[1]
+        Args:
+            reward_model_env: The reward model environment fixture.
+        """
+        # Test data: Two conversation pairs with correct and incorrect answers
+        message_log_batch = [
+            [
+                {"role": "user", "content": "What is the capital of France?"},
+                {
+                    "role": "assistant",
+                    "content": "The capital of Brazil is Brasilia.",
+                },  # Incorrect answer
+            ],
+            [
+                {"role": "user", "content": "What is the capital of France?"},
+                {
+                    "role": "assistant",
+                    "content": "The capital of France is Paris.",
+                },  # Correct answer
+            ],
+        ]
+
+        # Execute the environment step
+        output = reward_model_env.step(message_log_batch, [])
+
+        # Verify the reward model name
+        assert REWARD_MODEL_NAME == "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+        # Verify output structure and properties
+        assert output.rewards is not None
+        assert output.rewards.shape == (2,)
+        assert output.rewards.dtype == torch.float32
+        # Verify expected reward values (with tolerance for floating point precision)
+        expected_rewards = torch.tensor([-5.3750, 2.6250])
+        assert torch.allclose(output.rewards, expected_rewards, atol=1e-4)
