@@ -89,17 +89,42 @@ class PenguinWorker:
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
         from nemo_gym.openai_utils import NeMoGymResponse
 
-        response = NeMoGymResponse.model_validate(penguin_result["response"])
+        # Check if it is indeed what we expect to receive here.
+        NeMoGymResponse.model_validate(penguin_result["response"])
+
         nemo_rl_message_log = []
-        for output_item in response.output:
-            
-            nemo_rl_message = {
-                # "role": 
-            }
-            nemo_rl_message_log.append(nemo_rl_message)
+        seen_token_ids: List[int] = []
+        for output_item_dict in penguin_result["response"]["output"]:
+            # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
+            # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
+            # Eventually we can maybe be smarter about this, but this is functional for now.
+
+            # Note that Penguin will only return token ids on "assistant" messages and not other message types.
+            if "generation_token_ids" not in output_item_dict:
+                continue
+
+            assert seen_token_ids == output_item_dict["prompt_token_ids"][:seen_token_ids], "Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated."
+
+            nemo_rl_message_log.append({
+                    "role": "user",
+                    "content": "",
+                    "token_ids": output_item_dict["prompt_token_ids"][seen_token_ids:],
+                }
+            )
+            nemo_rl_message_log.append({
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": output_item_dict["generation_token_ids"],
+                    "generation_logprobs": output_item_dict["generation_logprobs"],
+                }
+            )
+
+            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
+            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
         return {
-            "message_log": nemo_rl_message_log,
+            "message_log": nemo_rl_message_log[1:],
+            "input_message_log": nemo_rl_message_log[:1],
         }
 
     async def run_rollouts(self, examples: list[dict]) -> list[dict]:
