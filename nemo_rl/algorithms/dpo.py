@@ -312,7 +312,9 @@ def validate(
         ]
 
     total_validation_time = sum(validation_timings.values())
-    logger.log_metrics({"total_val_time": total_validation_time}, step, prefix=f"timing/validation")
+    logger.log_metrics(
+        {"total_val_time": total_validation_time}, step, prefix="timing/validation"
+    )
     validation_timings["total_val_time"] = total_validation_time
 
     return val_metrics, validation_timings
