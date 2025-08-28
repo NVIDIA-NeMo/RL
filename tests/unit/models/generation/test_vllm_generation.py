@@ -1061,7 +1061,7 @@ def test_vllm_http_server(cluster, tokenizer):
 
     base_urls = vllm_generation.dp_openai_server_base_urls
     assert len(base_urls) == cluster.num_gpus_per_node
-    print(base_urls)
+    print("Base URLs", base_urls)
 
     # Generate and check result
     import requests
@@ -1077,8 +1077,10 @@ def test_vllm_http_server(cluster, tokenizer):
         )
     )
     result = response.json()
+    print(result)
+    import json
     with open("temp.json", "w") as f:
-        f.write(result + "\n")
+        json.dump(result, f, indent=4)
 
     # Clean up
     vllm_generation.shutdown()
