@@ -118,7 +118,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
     get_megatron_checkpoint_dir,
@@ -400,7 +399,7 @@ class MegatronPolicyWorker:
         self.dtype = dtype_map[self.cfg["precision"]]
 
         # Reward models are not yet supported with Megatron.
-        if self.cfg.get("reward_model_cfg", {}).get("enabled", False):
+        if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
             raise NotImplementedError(
                 "Reward models are not yet supported with the Megatron backend, this issue is "
                 "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
@@ -409,9 +408,6 @@ class MegatronPolicyWorker:
         # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
         # with different order of node_bundles
         configure_dynamo_cache()
-
-        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-        configure_expandable_segments()
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
@@ -832,7 +828,9 @@ class MegatronPolicyWorker:
                         f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                     )
 
-            forward_step = partial(forward_step_arbitrary_loss, loss_fn=loss_fn)
+            forward_step = partial(
+                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+            )
             all_mb_metrics = []
             losses = []
             for gb_idx in range(num_global_batches):
@@ -1122,6 +1120,11 @@ class MegatronPolicyWorker:
                 attention_mask,
                 packed_seq_params=packed_seq_params,
             )
+
+            # Apply temperature scaling to logits for training
+            # This matches the dtensor worker's _apply_temperature_scaling in the train method
+            if "generation" in self.cfg and self.cfg["generation"] is not None:
+                output_tensor.div_(self.cfg["generation"]["temperature"])
 
             def collection_fn(output_tensor):
                 stc = time.time()

@@ -4,19 +4,19 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=150
-MAX_STEPS=150
+STEPS_PER_RUN=30
+MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=140
+NUM_MINUTES=150
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_dpo.py \
+PYTHONPATH=$HF_HOME/modules:$PYTHONPATH uv run examples/run_grpo_math.py \
     --config $CONFIG_PATH \
-    dpo.max_num_steps=$MAX_STEPS \
+    grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
@@ -34,9 +34,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 3.6' \
-        'data["train/loss"]["150"] < 3.0' \
-        'data["train/preference_loss"]["1"] > 0.69314' \
-        'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["150"] < 0.4'
-fi 
+        'mean(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["30"] < 1.1' \
+        'mean(data["train/reward"]) > 0.45' \
+        'mean(data["timing/train/total_step_time"], -11, -1) < 70'
+fi

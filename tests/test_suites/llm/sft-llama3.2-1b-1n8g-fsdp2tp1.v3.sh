@@ -2,15 +2,12 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
-# TODO: this config can crash on OOM
-# https://github.com/NVIDIA-NeMo/RL/issues/263
-
 # ===== BEGIN CONFIG =====
-NUM_NODES=4
-STEPS_PER_RUN=20  # step_time ~ 29sec
-MAX_STEPS=20
+NUM_NODES=1
+STEPS_PER_RUN=250
+MAX_STEPS=250
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=15
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -37,7 +34,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 1.5' \
-        'data["train/loss"]["20"] < 0.3' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 35'
-fi 
+        'data["train/loss"]["1"] < 0.82' \
+        'data["train/loss"]["250"] < 0.5' \
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 25' \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 0.6'
+fi
