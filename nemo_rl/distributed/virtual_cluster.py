@@ -52,7 +52,7 @@ class PY_EXECUTABLES:
     AUTOMODEL = "uv run --locked --extra automodel"
 
     # Use Penguin dependencies
-    PENGUIN = "uv run --locked --group penguin"
+    PENGUIN = "uv run --locked --extra penguin"
 
     # Megatron-core (and nemo dependencies)
     # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
