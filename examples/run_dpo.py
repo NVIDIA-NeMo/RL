@@ -182,7 +182,9 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         train_dataset = data.formatted_ds["train"]
         val_dataset = data.formatted_ds["validation"]
     else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
+        raise ValueError(
+            f"Unknown dataset class: {data_cls}. Supported datasets are: PreferenceDataset, HelpSteer3, Tulu3Preference, and DPODataset (deprecated)."
+        )
 
     if train_dataset:
         print(

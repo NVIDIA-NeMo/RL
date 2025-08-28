@@ -20,7 +20,11 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-def format_tulu3_preference(data: dict[str, Any]) -> dict[str, str | dict[str, str]]:
+def format_tulu3_preference(
+    data: dict[str, Any],
+) -> dict[
+    str, list[dict[str, int | list[dict[str, str | Any]]]] | list[dict[str, str]]
+]:
     chosen_conversation = data["chosen"]
     rejected_conversation = data["rejected"]
 
@@ -46,9 +50,17 @@ def format_tulu3_preference(data: dict[str, Any]) -> dict[str, str | dict[str, s
     rejected_response = rejected_conversation[-1]["content"]
 
     return {
-        "prompt": context,
-        "chosen_response": chosen_response,
-        "rejected_response": rejected_response,
+        "context": context,
+        "completions": [
+            {
+                "rank": 0,
+                "completion": [{"role": "assistant", "content": chosen_response}],
+            },
+            {
+                "rank": 1,
+                "completion": [{"role": "assistant", "content": rejected_response}],
+            },
+        ],
     }
 
 

@@ -133,7 +133,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         train_dataset = data.formatted_ds["train"]
         val_dataset = None
     else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
+        raise ValueError(
+            f"Unknown dataset class: {data_cls}. Supported datasets are: PreferenceDataset, HelpSteer3, and Tulu3Preference."
+        )
 
     if train_dataset:
         print(
