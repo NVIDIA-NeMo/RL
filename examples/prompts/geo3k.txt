@@ -1,0 +1,5 @@
+Think step-by-step to solve the following math problem, and answer in the following format: <think> step-by-step thought process </think> <answer> only answer here </answer>.
+Note that your final answer must only contain a number or mathematical expression 
+
+Let's think step-by-step: 
+{}

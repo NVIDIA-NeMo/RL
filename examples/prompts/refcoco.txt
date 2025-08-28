@@ -1,0 +1,5 @@
+Think step-by-step to solve the following problem, and answer in the following format: <think> step-by-step thought process </think> <answer> [x1, y1, x2, y2] </answer> 
+Your answer must contain a bounding box with the following format: [x1, y1, x2, y2] where x1, y1 are the top left coordinates, and x2, y2 are the bottom right coordinates. The coordinates should be normalized from [0, 1000].
+
+Let's think step-by-step: 
+{}

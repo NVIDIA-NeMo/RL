@@ -38,5 +38,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'data["train/loss"]["20"] < 3.4' \
         'data["train/preference_loss"]["1"] > 0.69314' \
         'data["train/preference_loss"]["1"] < 0.69316' \
-        'data["train/preference_loss"]["20"] < 0.6'
-fi 
+        'data["train/preference_loss"]["20"] < 0.6' \
+        'mean(data["timing/train/total_step_time"], -10) < 6.7'
+fi

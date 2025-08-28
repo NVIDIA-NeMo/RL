@@ -34,11 +34,12 @@ hf_datasets_cache/
 datasets/
 docker/*
 !docker/Dockerfile
+!docker/Dockerfile.ngc_pytorch
 !docker/README.md
 wandb/
 checkpoints/
 results/
-code_snapshots/
+code_snapshots*/
 
 # Runtime env
 *runtime_env.yaml

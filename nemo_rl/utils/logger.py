@@ -72,11 +72,11 @@ class LoggerConfig(TypedDict):
     tensorboard_enabled: bool
     mlflow_enabled: bool
     wandb: WandbConfig
-    tensorboard: TensorboardConfig
+    tensorboard: NotRequired[TensorboardConfig]
     mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
-    num_val_samples_to_print: int
+    num_val_samples_to_print: NotRequired[int]
 
 
 class LoggerInterface(ABC):

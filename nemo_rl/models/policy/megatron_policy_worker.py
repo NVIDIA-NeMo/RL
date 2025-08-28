@@ -118,7 +118,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
-    configure_expandable_segments,
     get_gpu_info,
     get_handle_from_tensor,
     get_megatron_checkpoint_dir,
@@ -217,6 +216,9 @@ def setup_megatron_model(
         overlap_param_gather_with_optimizer_step=cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=cfg.rng_config.data_parallel_random_init,
         model_post_init_fns=model_post_init_fns,
+        wrap_cast_model_output_to_fp32=(
+            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
+        ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -397,7 +399,7 @@ class MegatronPolicyWorker:
         self.dtype = dtype_map[self.cfg["precision"]]
 
         # Reward models are not yet supported with Megatron.
-        if self.cfg.get("reward_model_cfg", {}).get("enabled", False):
+        if "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]:
             raise NotImplementedError(
                 "Reward models are not yet supported with the Megatron backend, this issue is "
                 "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
@@ -406,9 +408,6 @@ class MegatronPolicyWorker:
         # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
         # with different order of node_bundles
         configure_dynamo_cache()
-
-        # Only enable expandable_segments on Hopper and newer architectures (compute capability 9.x+)
-        configure_expandable_segments()
 
         # cfg["model_name"] is allowed to be either an HF model name or a path to an HF checkpoint
         # check if hf_model_name is a path
@@ -662,6 +661,9 @@ class MegatronPolicyWorker:
                 use_torch_fsdp2=self.megatron_cfg.dist_config.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
                 data_parallel_random_init=self.megatron_cfg.rng_config.data_parallel_random_init,
+                wrap_cast_model_output_to_fp32=(
+                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
+                ),
             )
             print("Loading the Reference Model")
             if (
@@ -818,7 +820,9 @@ class MegatronPolicyWorker:
                         f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                     )
 
-            forward_step = partial(forward_step_arbitrary_loss, loss_fn=loss_fn)
+            forward_step = partial(
+                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+            )
             all_mb_metrics = []
             losses = []
             for gb_idx in range(num_global_batches):
@@ -1109,10 +1113,16 @@ class MegatronPolicyWorker:
                 packed_seq_params=packed_seq_params,
             )
 
+            # Apply temperature scaling to logits for training
+            # This matches the dtensor worker's _apply_temperature_scaling in the train method
+            if "generation" in self.cfg and self.cfg["generation"] is not None:
+                output_tensor.div_(self.cfg["generation"]["temperature"])
+
             def collection_fn(output_tensor):
                 stc = time.time()
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
+                logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 if self.cfg["sequence_packing"]["enabled"]:
                     token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                         output_tensor,
@@ -1124,15 +1134,17 @@ class MegatronPolicyWorker:
                         group=tp_grp,
                         inference_only=True,
                         cp_group=get_context_parallel_group(),
+                        chunk_size=logprob_chunk_size,
                     )
                 else:
                     token_logprobs = from_parallel_logits_to_logprobs(
-                        output_tensor.to(torch.float32),
+                        output_tensor,
                         target=unpacked_input_ids,
                         vocab_start_index=tp_rank * output_tensor.shape[-1],
                         vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                         tp_group=tp_grp,
                         inference_only=True,
+                        chunk_size=logprob_chunk_size,
                     )
 
                 # Prepend 0 logprob for first token to maintain same sequence length as input
@@ -1761,6 +1773,8 @@ class MegatronPolicyWorker:
             if not is_training:
                 self.model.eval()
 
+            if self.should_disable_forward_pre_hook:
+                self.disable_forward_pre_hook()
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],
@@ -1775,6 +1789,8 @@ class MegatronPolicyWorker:
                 blocking=True,
                 terminate=True,
             )
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()

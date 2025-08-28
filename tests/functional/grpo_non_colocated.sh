@@ -39,5 +39,5 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'max(data["train/token_mult_prob_error"]) < 1.05'
 

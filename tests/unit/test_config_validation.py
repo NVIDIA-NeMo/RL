@@ -32,6 +32,9 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config_with_inheritance
 from nemo_rl.utils.logger import LoggerConfig
 
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
 
 def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:
     """Extract required keys from a TypedDict class, excluding NotRequired fields."""

@@ -26,6 +26,7 @@ time uv run --no-sync bash ./tests/functional/rm.sh
 time uv run --no-sync bash ./tests/functional/eval.sh
 time uv run --no-sync bash ./tests/functional/eval_async.sh
 time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
+time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
 cd /opt/nemo-rl/tests
 coverage combine .coverage*
