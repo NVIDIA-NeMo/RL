@@ -62,7 +62,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
         from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
 
-        node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
+        node_ip, free_port = _get_node_ip_and_free_port()
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
 
