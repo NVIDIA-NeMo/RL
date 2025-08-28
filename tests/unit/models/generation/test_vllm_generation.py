@@ -1074,10 +1074,10 @@ def test_vllm_http_server(cluster, tokenizer):
             temperature=0.0,
             logprobs=True,
             return_tokens_as_token_ids=True,
+            max_tokens=1,
         )
     )
     result = response.json()
-    print(result)
     import json
     with open("temp.json", "w") as f:
         json.dump(result, f, indent=4)
