@@ -306,10 +306,7 @@ def validate_one_dataset(
         # val_total = len(val_dataloader)
 
         dict_val_metrics = defaultdict(list)
-
         num_valid_batches = 0
-
-        policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
             ## just run model fwd
             val_results = policy.train(
@@ -336,14 +333,11 @@ def validate_one_dataset(
                     "accuracy",
                     "rewards_chosen_mean",
                     "rewards_rejected_mean",
+                    "num_valid_samples",
                 ]:
                     dict_val_metrics[k if k != "loss" else "val_loss"] += [
-                        value * sum_num_valid_samples
-                        for value in val_results["all_mb_metrics"][k]
+                        sum(val_results["all_mb_metrics"][k])
                     ]
-                dict_val_metrics["num_valid_samples"] += val_results["all_mb_metrics"][
-                    "num_valid_samples"
-                ]
 
                 num_valid_batches += 1
 
@@ -351,19 +345,6 @@ def validate_one_dataset(
                 break
 
         if num_valid_batches > 0:
-            assert (
-                len(dict_val_metrics["val_loss"])
-                == len(dict_val_metrics["accuracy"])
-                == len(dict_val_metrics["rewards_chosen_mean"])
-                == len(dict_val_metrics["rewards_rejected_mean"])
-                == len(dict_val_metrics["num_valid_samples"])
-            ), (
-                f"len(dict_val_metrics['val_loss']) == {len(dict_val_metrics['val_loss'])}\n"
-                f"len(dict_val_metrics['accuracy']) == {len(dict_val_metrics['accuracy'])}\n"
-                f"len(dict_val_metrics['rewards_chosen_mean']) == {len(dict_val_metrics['rewards_chosen_mean'])}\n"
-                f"len(dict_val_metrics['rewards_rejected_mean']) == {len(dict_val_metrics['rewards_rejected_mean'])}\n"
-                f"len(dict_val_metrics['num_valid_samples']) == {len(dict_val_metrics['num_valid_samples'])}"
-            )
 
             sum_num_valid_samples = sum(dict_val_metrics["num_valid_samples"])
             val_metrics = RMValMetrics(
