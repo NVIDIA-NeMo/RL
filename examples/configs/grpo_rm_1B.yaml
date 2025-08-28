@@ -147,12 +147,13 @@ env:
     max_model_len: ${policy.max_total_sequence_length}
     logprob_batch_size: ${policy.logprob_batch_size}
     resources:
-      gpus_per_node: 4
+      gpus_per_node: 1
       num_nodes: 1
     reward_model_cfg:
       enabled: true  # loads model as a Reward Model (do not change)
       reward_model_type: "bradley_terry"
     dtensor_cfg:
+      _v2: true
       enabled: true
       cpu_offload: False
       sequence_parallel: false
