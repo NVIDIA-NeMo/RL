@@ -335,9 +335,10 @@ class BaseVllmGenerationWorker:
 
         # Use vllm DP
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        dp_size = int(os.environ["VLLM_DP_SIZE"])
-        os.environ["VLLM_DP_RANK"] = str(int(os.environ["RANK"]) // dp_size)
-        os.environ["VLLM_DP_RANK_LOCAL"] = str(int(os.environ["LOCAL_RANK"]) // dp_size)
+        global_dp_rank = int(os.environ["RANK"]) // model_parallel_size
+        local_dp_rank = int(os.environ["LOCAL_RANK"]) // model_parallel_size
+        os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
+        os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
         os.environ["VLLM_DP_MASTER_IP"] = os.environ["MASTER_ADDR"]
         os.environ["VLLM_DP_MASTER_PORT"] = os.environ["MASTER_PORT"]
 
