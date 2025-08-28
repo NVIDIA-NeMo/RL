@@ -59,8 +59,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         import uvicorn
 
-        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
+        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, OpenAIServingTokenization, BaseModelPath
+        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse, TokenizeRequest, TokenizeResponse
 
         node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
         base_url = f"http://{node_ip}:{free_port}/v1"
@@ -88,6 +88,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             chat_template_content_format="auto",
             return_tokens_as_token_ids=True,
         )
+        openai_serving_tokenization = OpenAIServingTokenization(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+
+        # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
             generator = await openai_serving_chat.create_chat_completion(request, raw_request)
@@ -100,6 +110,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return JSONResponse(content=generator.model_dump())
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        @app.post("/tokenize")
+        async def tokenize(request: TokenizeRequest, raw_request: Request):
+            handler = openai_serving_tokenization(raw_request)
+
+            generator = await handler.create_tokenize(request, raw_request)
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(),
+                                    status_code=generator.code)
+            elif isinstance(generator, TokenizeResponse):
+                return JSONResponse(content=generator.model_dump())
 
         config = uvicorn.Config(
             app,
