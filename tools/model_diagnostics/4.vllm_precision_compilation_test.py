@@ -185,10 +185,14 @@ def main():
     )
 
     assert_logprobs_close(
-        cuda_graph_prompt_lps, eager_prompt_lps, "Eager and cuda graph mode lps"
+        cuda_graph_prompt_lps,
+        eager_prompt_lps,
+        "Eager and cuda graph mode lps (prompt lps)",
     )
     assert_logprobs_close(
-        cuda_graph_generation_lps, eager_generation_lps, "Eager and cuda graph mode lps"
+        cuda_graph_generation_lps,
+        eager_generation_lps,
+        "Eager and cuda graph mode lps (generation lps)",
     )
 
     torch.cuda.empty_cache()
@@ -203,12 +207,12 @@ def main():
     assert_logprobs_close(
         cuda_graph_prompt_lps_w_flag,
         eager_prompt_lps,
-        "Eager and cuda graph mode lps with torch inductor precision flag",
+        "Eager and cuda graph mode lps with torch inductor precision flag (prompt lps)",
     )
     assert_logprobs_close(
         cuda_graph_generation_lps_w_flag,
         eager_generation_lps,
-        "Eager and cuda graph mode lps with torch inductor precision flag",
+        "Eager and cuda graph mode lps with torch inductor precision flag (generation lps)",
     )
 
     torch.cuda.empty_cache()
@@ -229,12 +233,12 @@ def main():
     assert_logprobs_close(
         cuda_graph_prompt_lps_w_inductor_disabled,
         eager_prompt_lps,
-        "Eager and cuda graph mode lps with use_inductor disabled",
+        "Eager and cuda graph mode lps with use_inductor disabled (prompt lps)",
     )
     assert_logprobs_close(
         cuda_graph_generation_lps_w_inductor_disabled,
         eager_generation_lps,
-        "Eager and cuda graph mode lps with use_inductor disabled",
+        "Eager and cuda graph mode lps with use_inductor disabled (generation lps)",
     )
 
 

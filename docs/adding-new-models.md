@@ -208,6 +208,70 @@ uv run --extra vllm tools/model_diagnostics/4.vllm_precision_compilation_test.py
 # Eager and cuda graph mode lps with use_inductor disabled: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
 ```
 
+See example for model `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`
+```
+====================================================================================================
+Eager and cuda graph mode lps (prompt lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+Mismatched elements: 96 / 515 (18.6%)
+Max absolute difference among violations: 0.3885002
+Max relative difference among violations: 0.20179409
+ ACTUAL: array([[-1.424489e+01, -3.924684e-01, -3.135911e+00, -4.258007e-01,
+        -3.443364e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+ DESIRED: array([[-1.420929e+01, -3.619126e-01, -3.241854e+00, -4.308376e-01,
+        -3.047717e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+====================================================================================================
+====================================================================================================
+Eager and cuda graph mode lps (generation lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+nan location mismatch:
+ ACTUAL: array([[-1.231834e+01, -1.411233e-01, -3.764260e-01, ...,           nan,
+                  nan,           nan],
+       [-8.567932e+00, -1.066314e+01, -4.463661e-01, ...,           nan,...
+ DESIRED: array([[-1.226752e+01, -1.508305e-01, -4.024158e-01, ...,           nan,
+                  nan,           nan],
+       [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
+====================================================================================================
+...
+====================================================================================================
+Eager and cuda graph mode lps with torch inductor precision flag (prompt lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+Mismatched elements: 96 / 515 (18.6%)
+Max absolute difference among violations: 0.3885002
+Max relative difference among violations: 0.20179409
+ ACTUAL: array([[-1.424489e+01, -3.924684e-01, -3.135911e+00, -4.258007e-01,
+        -3.443364e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+ DESIRED: array([[-1.420929e+01, -3.619126e-01, -3.241854e+00, -4.308376e-01,
+        -3.047717e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+====================================================================================================
+====================================================================================================
+Eager and cuda graph mode lps with torch inductor precision flag (generation lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+nan location mismatch:
+ ACTUAL: array([[-1.231834e+01, -1.411233e-01, -3.764260e-01, ...,           nan,
+                  nan,           nan],
+       [-8.567932e+00, -1.066314e+01, -4.463661e-01, ...,           nan,...
+ DESIRED: array([[-1.226752e+01, -1.508305e-01, -4.024158e-01, ...,           nan,
+                  nan,           nan],
+       [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
+====================================================================================================
+...
+Eager and cuda graph mode lps with use_inductor disabled (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+```
+
 **What this script tests:**
 
 1. **Eager vs CUDA Graph Mode**: Compares log probabilities between eager execution (ground truth) and CUDA graph compilation mode
