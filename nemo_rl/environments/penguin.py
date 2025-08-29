@@ -146,8 +146,8 @@ class Penguin(EnvironmentInterface):
         self.workers = [
             PenguinWorker.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.PENGUIN}
-            ).remote(self.cfg)
-            for _ in range(self.cfg["base_urls"])
+            ).remote(self.cfg, base_url)
+            for base_url in self.cfg["base_urls"]
         ]
 
     async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
