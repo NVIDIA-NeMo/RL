@@ -487,6 +487,8 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
+        # Set for rank for non-collocated to check which ranks to broadcast from
+        self.rank = get_rank_safe()
         # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
         torch.distributed.init_process_group("nccl")
         if pt_checkpoint_exists:
