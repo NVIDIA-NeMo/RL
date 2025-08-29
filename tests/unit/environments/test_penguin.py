@@ -144,6 +144,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data):
 
         for output in response["output"]:
             output.pop("id")
+            output.pop("call_id", None)  # Only present for tool call and tool output items.
 
         return d
 
