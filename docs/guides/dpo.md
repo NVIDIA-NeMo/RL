@@ -98,7 +98,8 @@ We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_
 data:
   dataset_name: PreferenceDataset
   train_data_path: <LocalPathToTrainingDataset>
-  val_data_path: <LocalPathToValidationDataset>
+  val_data_paths:
+    <NameOfValidationDataset>: <LocalPathToValidationDataset>
 ```
 with support for multiple validation sets achieved with:
 ```yaml
@@ -109,9 +110,9 @@ data:
     <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
     <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
 ```
-If using multiple validation sets, please note:
-- If you are using a logger, the prefix used for each validation set will be `val-<NameOfValidationDataset>`.
-- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `val-<NameOfValidationDataset1>_loss`.
+Please note:
+- If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
 
 The older [DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class is deprecated. This class is also compatible with JSONL-formatted preference datsets. It assumes train and validation datasets have been split and processed into the expected format offline. The JSONL files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 

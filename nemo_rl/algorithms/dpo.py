@@ -43,7 +43,6 @@ class DPOSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
 
 
@@ -170,9 +169,6 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    if not isinstance(val_dataset, dict):
-        val_dataset = {"validation": val_dataset}
-
     val_dataloader = {
         k: StatefulDataLoader(
             v,
@@ -297,27 +293,25 @@ def validate(
             val_mbs=val_mbs,
             dataset_name=val_dataset_name,
         )
-        if val_dataset_name == "validation":
-            prefix = "val"
-        else:
-            prefix = f"val-{val_dataset_name}"
+        prefix = f"validation-{val_dataset_name}"
 
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        val_metrics[prefix + "_loss"] = k_val_metrics["val_loss"]
-        val_metrics[prefix + "_accuracy"] = k_val_metrics["accuracy"]
+        val_metrics[f"{prefix}_loss"] = k_val_metrics["loss"]
+        val_metrics[f"{prefix}_accuracy"] = k_val_metrics["accuracy"]
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
         ]
 
-    total_validation_time = sum(validation_timings.values())
-    logger.log_metrics(
-        {"total_validation_time": total_validation_time},
-        step,
-        prefix="timing/validation",
-    )
-    validation_timings["total_validation_time"] = total_validation_time
+    if len(validation_timings) > 0:
+        total_validation_time = sum(validation_timings.values())
+        logger.log_metrics(
+            {"total_validation_time": total_validation_time},
+            step,
+            prefix="timing/validation",
+        )
+        validation_timings["total_validation_time"] = total_validation_time
 
     return val_metrics, validation_timings
 

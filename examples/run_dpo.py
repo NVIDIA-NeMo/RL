@@ -209,35 +209,14 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = (
-        {
-            "validation": AllTaskProcessedDataset(
-                val_dataset,
-                tokenizer,
-                dpo_task_spec,
-                dpo_preprocessor,
-                max_seq_length=data_config["max_input_seq_length"],
-            )
-        }
-        if val_dataset
-        else {}
-    )
-
     if data_cls == "PreferenceDataset":
-        if data_config.get("val_data_path"):
-            assert data_config.get("val_data_paths") is None, (
-                "val_data_path and val_data_paths cannot be used together"
-            )
-            val_data_paths = {"validation": data_config.get("val_data_path")}
+        val_dataset = {}
 
-        elif data_config.get("val_data_paths"):
-            assert isinstance(data_config["val_data_paths"], dict), (
-                f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
-            )
-            val_data_paths = data_config.get("val_data_paths")
-
-        else:
-            raise ValueError("Either val_data_path or val_data_paths must be provided")
+        assert "val_data_paths" in data_config, "val_data_paths must be provided"
+        assert isinstance(data_config["val_data_paths"], dict), (
+            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
+        )
+        val_data_paths = data_config.get("val_data_paths")
 
         for val_dataset_name, val_dataset_path in val_data_paths.items():
             assert val_dataset_name not in val_dataset
@@ -254,6 +233,20 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
                 dpo_preprocessor,
                 max_seq_length=data_config["max_input_seq_length"],
             )
+    else:
+        val_dataset = (
+            {
+                "default": AllTaskProcessedDataset(
+                    val_dataset,
+                    tokenizer,
+                    dpo_task_spec,
+                    dpo_preprocessor,
+                    max_seq_length=data_config["max_input_seq_length"],
+                )
+            }
+            if val_dataset
+            else {}
+        )
 
     return train_dataset, val_dataset, tokenizer, dpo_task_spec
 

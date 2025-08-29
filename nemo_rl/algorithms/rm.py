@@ -47,7 +47,6 @@ class RMSaveState(TypedDict):
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: float
     consumed_samples: int
 
 
@@ -81,7 +80,7 @@ class MasterConfig(TypedDict):
 
 
 class RMValMetrics(TypedDict):
-    val_loss: float
+    loss: float
     accuracy: float
     rewards_chosen_mean: float
     rewards_rejected_mean: float
@@ -159,9 +158,6 @@ def setup(
             os.path.join(last_checkpoint_path, "train_dataloader.pt")
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
-
-    if not isinstance(val_dataset, dict):
-        val_dataset = {"validation": val_dataset}
 
     val_dataloader = {
         k: StatefulDataLoader(
@@ -260,27 +256,26 @@ def validate(
             val_mbs=val_mbs,
             dataset_name=val_dataset_name,
         )
-        if val_dataset_name == "validation":
-            prefix = "val"
-        else:
-            prefix = f"val-{val_dataset_name}"
+        prefix = f"validation-{val_dataset_name}"
 
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        val_metrics[prefix + "_loss"] = k_val_metrics["val_loss"]
-        val_metrics[prefix + "_accuracy"] = k_val_metrics["accuracy"]
+        for metric_name in RMValMetrics.__annotations__.keys():
+            if metric_name != "num_valid_samples":
+                val_metrics[f"{prefix}_{metric_name}"] = k_val_metrics[metric_name]
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
         ]
 
-    total_validation_time = sum(validation_timings.values())
-    logger.log_metrics(
-        {"total_validation_time": total_validation_time},
-        step,
-        prefix="timing/validation",
-    )
-    validation_timings["total_validation_time"] = total_validation_time
+    if len(validation_timings) > 0:
+        total_validation_time = sum(validation_timings.values())
+        logger.log_metrics(
+            {"total_validation_time": total_validation_time},
+            step,
+            prefix="timing/validation",
+        )
+        validation_timings["total_validation_time"] = total_validation_time
 
     return val_metrics, validation_timings
 
@@ -329,18 +324,9 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                sum_num_valid_samples = sum(
-                    val_results["all_mb_metrics"]["num_valid_samples"]
-                )
-                for k in [
-                    "loss",
-                    "accuracy",
-                    "rewards_chosen_mean",
-                    "rewards_rejected_mean",
-                    "num_valid_samples",
-                ]:
-                    dict_val_metrics[k if k != "loss" else "val_loss"] += [
-                        sum(val_results["all_mb_metrics"][k])
+                for metric_name in RMValMetrics.__annotations__.keys():
+                    dict_val_metrics[metric_name] += [
+                        sum(val_results["all_mb_metrics"][metric_name])
                     ]
 
                 num_valid_batches += 1
@@ -353,22 +339,17 @@ def validate_one_dataset(
             val_metrics = RMValMetrics(
                 num_valid_samples=sum_num_valid_samples,
                 **{
-                    k: sum(
+                    metric_name: sum(
                         [
                             value * weight
                             for value, weight in zip(
-                                dict_val_metrics[k],
+                                dict_val_metrics[metric_name],
                                 dict_val_metrics["num_valid_samples"],
                             )
                         ]
                     )
                     / sum_num_valid_samples
-                    for k in [
-                        "val_loss",
-                        "accuracy",
-                        "rewards_chosen_mean",
-                        "rewards_rejected_mean",
-                    ]
+                    for metric_name in RMValMetrics.__annotations__.keys() if metric_name != "num_valid_samples"
                 },
             )
         else:
@@ -376,13 +357,7 @@ def validate_one_dataset(
                 "No validation metrics were collected."
                 " This is likely because there were no valid samples in the validation set."
             )
-            val_metrics = RMValMetrics(
-                val_loss=0.0,
-                accuracy=0.0,
-                rewards_chosen_mean=0.0,
-                rewards_rejected_mean=0.0,
-                num_valid_samples=0.0,
-            )
+            val_metrics = RMValMetrics(**{metric_name: 0.0 for metric_name in RMValMetrics.__annotations__.keys()})
 
         # Calculate validation metrics
         policy.prepare_for_training()
@@ -394,17 +369,13 @@ def validate_one_dataset(
     if num_valid_batches > 0:
         # Print summary of validation results
         print(f"\n📊 Validation Results for `{dataset_name}` set:")
-        print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
-        print(f"    • Validation accuracy: {val_metrics['accuracy']:.4f}")
-        print(
-            f"    • Validation rewards chosen mean: {val_metrics['rewards_chosen_mean']:.4f}"
-        )
-        print(
-            f"    • Validation rewards rejected mean: {val_metrics['rewards_rejected_mean']:.4f}"
-        )
-        print(
-            f"    • Validation num valid samples: {val_metrics['num_valid_samples']:.0f}"
-        )
+        for metric_name in RMValMetrics.__annotations__.keys():
+            if metric_name != "num_valid_samples":
+                print(f"    • Validation {metric_name}: {val_metrics[metric_name]:.4f}")
+            else:
+                print(
+                    f"    • Validation num valid samples: {val_metrics['num_valid_samples']:.0f}"
+                )
 
         # Print timing information
         print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
@@ -533,7 +504,7 @@ def rm_train(
                     for key in list(rm_save_state):
                         if (
                             key.startswith("val")
-                            and (key.endswith("_loss") or key.endswith("_accuracy"))
+                            and any([key.endswith(f"_{metric_name}") for metric_name in RMValMetrics.__annotations__.keys() if metric_name != "num_valid_samples"])
                             and (val_metrics is None or key not in val_metrics)
                         ):
                             del rm_save_state[key]
@@ -588,15 +559,11 @@ def rm_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            print(f"  • Loss: {float(metrics['loss']):.4f}")
-            print(f"  • Accuracy: {float(metrics['accuracy']):.4f}")
-            print(
-                f"  • Rewards chosen mean: {float(metrics['rewards_chosen_mean']):.4f}"
-            )
-            print(
-                f"  • Rewards rejected mean: {float(metrics['rewards_rejected_mean']):.4f}"
-            )
-            print(f"  • Num valid samples: {float(metrics['num_valid_samples']):.0f}")
+            for metric_name in RMValMetrics.__annotations__.keys():
+                if metric_name != "num_valid_samples":
+                    print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
+                else:
+                    print(f"  • num valid samples: {float(metrics[metric_name]):.0f}")
 
             print("\n⏱️  Timing:")
             # Display total time first, separately
