@@ -101,4 +101,5 @@ def test_penguin_sanity(penguin, penguin_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
     result = ray.get(penguin.run_rollouts.remote(penguin_test_data))
 
-    print(result)
+    with open("temp_env.json", "w") as f:
+        json.dump(result, f, indent=4)
