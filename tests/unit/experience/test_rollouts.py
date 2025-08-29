@@ -756,7 +756,7 @@ def test_run_async_penguin_rollout(
         input_batch=input_batch,
         tokenizer=penguin_tokenizer,
         task_to_env={"penguin": penguin},
-        max_seq_len=1024,
+        max_seq_len=None,
         generation_config=penguin_vllm_generation.cfg,
         max_rollout_turns=None,
     )
