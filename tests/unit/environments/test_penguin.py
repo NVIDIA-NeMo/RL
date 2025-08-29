@@ -15,6 +15,8 @@ import time
 
 import json
 
+from copy import deepcopy
+
 from pathlib import Path
 
 from yaml import safe_load
@@ -110,7 +112,15 @@ def penguin_sanity_test_data():
 
 def test_penguin_sanity(penguin, penguin_sanity_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
-    result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
+    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
 
-    with open("temp_env.json", "w") as f:
-        json.dump(result, f, indent=4)
+    expected_result = penguin_sanity_test_data["expected_output"]
+    def _standardize(d):
+        d = deepcopy(d)
+        d["response"].pop("id")
+        d["response"].pop("created_at")
+
+        for output in d["response"]["output"]:
+            output.pop("id")
+
+    assert _standardize(expected_result) == _standardize(actual_result)
