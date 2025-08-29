@@ -94,7 +94,7 @@ mcore = [
 ]
 penguin = [
     # TODO we should somehow rename this to penguin...
-    "nemo_gym @ git+https://gitlab-master.nvidia.com/bxyu/nemo-gym.git@961a3826065545d9417761b16b9323aac62f2259",
+    "nemo_gym @ git+https://gitlab-master.nvidia.com/bxyu/nemo-gym.git@363c44f0bd07f77ad9c2fe81941b63090928713a",
     # Later on, swap to the Github URL
     # "nemo_gym @ https://github.com/NVIDIA-NeMo/Gym",
 ]
