@@ -30,7 +30,7 @@ from nemo_rl.environments.penguin import Penguin, PenguinConfig
 from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer, configure_http_server_config
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def vllm_generation(cluster, tokenizer):
     vllm_config = configure_http_server_config(tokenizer)
     vllm_generation = VllmGeneration(cluster, vllm_config)
@@ -40,7 +40,7 @@ def vllm_generation(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function")
 def penguin(vllm_generation):
     """Create a Penguin actor for testing."""
 
