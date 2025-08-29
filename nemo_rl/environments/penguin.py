@@ -119,7 +119,7 @@ class PenguinWorker:
                     "role": "assistant",
                     "content": "",
                     "token_ids": output_item_dict["generation_token_ids"],
-                    "generation_logprobs": output_item_dict["generation_logprobs"],
+                    "generation_logprobs": output_item_dict["generation_log_probs"],
                 }
             )
 
