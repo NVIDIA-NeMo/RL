@@ -21,6 +21,7 @@ import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -43,7 +44,12 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
-from tests.unit.environments.test_penguin import penguin, vllm_generation, penguin_test_data
+from tests.unit.environments.test_penguin import (
+    penguin,
+    vllm_generation as penguin_vllm_generation,
+    penguin_test_data,
+    tokenizer as penguin_tokenizer,
+)
 
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -734,14 +740,24 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
-def test_run_async_penguin_rollout(penguin, vllm_generation, penguin_test_data):
+def test_run_async_penguin_rollout(
+    penguin,
+    penguin_vllm_generation,
+    penguin_test_data,
+    penguin_tokenizer,
+):
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "extra_env_info": penguin_test_data
+        }
+    )
     results = run_async_penguin_rollout(
-        policy_generation=vllm_generation,
-        input_batch=None,
-        tokenizer=None,
+        policy_generation=penguin_vllm_generation,
+        input_batch=input_batch,
+        tokenizer=penguin_tokenizer,
         task_to_env={"penguin": penguin},
         max_seq_len=1024,
-        generation_config=vllm_generation.cfg,
+        generation_config=penguin_vllm_generation.cfg,
         max_rollout_turns=None,
     )
     print(results)
