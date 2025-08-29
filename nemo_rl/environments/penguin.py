@@ -15,8 +15,6 @@ from typing import Any, Dict, List, TypedDict
 
 from pathlib import Path
 
-from omegaconf import open_dict
-
 import ray
 
 from tqdm.auto import tqdm
