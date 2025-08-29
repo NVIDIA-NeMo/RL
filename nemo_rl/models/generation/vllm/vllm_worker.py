@@ -29,6 +29,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -133,7 +134,9 @@ class BaseVllmGenerationWorker:
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
+        self.enable_expert_parallel = self.cfg["vllm_cfg"]["enable_expert_parallel"]
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
@@ -201,9 +204,14 @@ class BaseVllmGenerationWorker:
             logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
 
             def _patch_vllm_init_workers_ray():
-                # Patch the vLLM ray_distributed_executor.py file to pass custom runtime_env in _init_workers_ray call.
-                # This allows passing custom py_executable to worker initialization.
+                """Patch the vLLM ray_distributed_executor.py file.
 
+                1. Pass custom runtime_env in _init_workers_ray call.
+                    - This allows passing custom py_executable to worker initialization.
+                2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
+                    - This is a workaround to fix async vllm in some scenarios.
+                    - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+                """
                 try:
                     import vllm.executor.ray_distributed_executor as ray_executor_module
 
@@ -212,16 +220,63 @@ class BaseVllmGenerationWorker:
                     with open(file_to_patch, "r") as f:
                         content = f.read()
 
-                    old_line = "self._init_workers_ray(placement_group)"
-                    new_line = f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})'
+                    old_lines = [
+                        "self._init_workers_ray(placement_group)",
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+                    ]
 
-                    if new_line in content:
+                    new_lines = [
+                        f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                    ]
+
+                    need_replace = False
+                    for old_line, new_line in zip(old_lines, new_lines):
+                        if new_line in content or old_line not in content:
+                            continue
+                        content = content.replace(old_line, new_line)
+                        need_replace = True
+
+                    if not need_replace:
+                        return
+
+                    # Write back the patched content
+                    with open(file_to_patch, "w") as f:
+                        f.write(content)
+
+                except (ImportError, FileNotFoundError, PermissionError):
+                    # Allow failures gracefully
+                    pass
+
+            _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
+
+            # Patch the vLLM sampler.py file to modify logprobs computation wrt temperature.
+            # This replaces raw_logprobs = self.compute_logprobs(logits) with custom temperature-applied logprobs.
+            # TODO(zhanda): This is only a temporary fix to address the issue of incorrect logprobs returned by vllm
+            # and should be removed or improved after vllm's new logprobs option is released. And currently, other
+            # sampling parameters like top_p, top_k, etc. are not supported.
+            # See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details.
+            def _patch_vllm_sampler():
+                try:
+                    import vllm.v1.sample.sampler as sampler_module
+
+                    file_to_patch = sampler_module.__file__
+
+                    with open(file_to_patch, "r") as f:
+                        content = f.read()
+
+                    old_line = "raw_logprobs = self.compute_logprobs(logits)"
+                    new_lines = "raw_logprobs = self.compute_logprobs(self.apply_temperature(logits.to(torch.float32), sampling_metadata.temperature) if sampling_metadata.temperature is not None else logits)"
+
+                    if new_lines in content:
                         return
 
                     if old_line not in content:
                         return
 
-                    patched_content = content.replace(old_line, new_line)
+                    # Replace all instances of the old line with the new lines
+                    patched_content = content.replace(old_line, new_lines)
 
                     # Write back the patched content
                     with open(file_to_patch, "w") as f:
@@ -231,7 +286,7 @@ class BaseVllmGenerationWorker:
                     # Allow failures gracefully
                     pass
 
-            _patch_vllm_init_workers_ray()
+            _patch_vllm_sampler()
 
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
@@ -294,6 +349,16 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
+        if self.cfg["vllm_cfg"]["precision"] == "fp8":
+            from nemo_rl.models.generation.fp8 import init_fp8
+
+            fp8_kwargs = init_fp8(
+                self.cfg["vllm_cfg"], self.model_name, model_parallel_size
+            )
+            vllm_kwargs.update(fp8_kwargs)
+            # overriden by quant config, however vllm complains if this not passed
+            self.precision = "bfloat16"
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -302,9 +367,10 @@ class BaseVllmGenerationWorker:
             skip_tokenizer_init=False,
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
+            enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            dtype=self.cfg["vllm_cfg"]["precision"],
+            dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
@@ -448,23 +514,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
 
-        # Convert inputs to vLLM format
-        batch_size = input_ids.shape[0]
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Prepare prompts for vLLM (removing padding)
-        prompts = []
-
-        for i in range(batch_size):
-            # Use input_lengths to get only valid tokens (not padding)
-            valid_length = input_lengths[i].item()
-            valid_ids = (
-                input_ids[i, :valid_length] if valid_length > 0 else input_ids[i, :0]
-            )
-            token_ids = valid_ids.tolist()
-
-            prompts.append({"prompt_token_ids": token_ids})
+        # Convert inputs to vLLM format
+        prompts = format_prompt_for_vllm_generation(data)
 
         # Generate outputs
         assert self.llm is not None, (

@@ -31,9 +31,31 @@ def max(value):
     return __builtins__.max(float(v) for v in value.values())
 
 
-def mean(value):
-    """Return the mean of values in a dictionary."""
-    return statistics.mean(float(v) for v in value.values())
+def mean(value, range_start=1, range_end=0):
+    """Return the mean of values (or a range of values) in a dictionary.
+
+    Note:
+        step, and ranges, are 1 indexed. Range_end is exclusive.
+        range_end=0 means to include until the last step in the run
+    """
+
+    ## find potential offset that might arise from resuming from a checkpoint
+    max_step_reached = __builtins__.max([int(s) for s in value.keys()])
+    ## this is the number of steps that occurred prior to resuming
+    offset = max_step_reached - len(value)
+
+    num_elem = len(value)
+    if range_start < 0:
+        range_start += num_elem + 1 + offset
+    if range_end <= 0:
+        range_end += num_elem + 1 + offset
+
+    vals = []
+    for step, v in value.items():
+        if range_start <= int(step) and int(step) < range_end:
+            vals.append(float(v))
+
+    return statistics.mean(vals)
 
 
 def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:

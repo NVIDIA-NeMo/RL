@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, TypedDict, TypeVar
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 
@@ -21,8 +21,8 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
-from nemo_rl.models.dtensor.parallelize import (
+from nemo_rl.distributed.model_utils import (
+    from_parallel_logits_to_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
 
@@ -37,6 +37,11 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     token_level_loss: bool
+    # If True, apply the off-policy importance-sampling correction at the
+    # sequence level (one weight per generated sample), as in GSPO.
+    # If False (default), correction is applied at the token level as in the
+    # original GRPO paper.
+    sequence_level_importance_ratios: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -60,6 +65,7 @@ class ClippedPGLossFn(LossFunction):
     - PPO (Clipped) - https://arxiv.org/abs/1707.06347
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
+    - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -101,10 +107,18 @@ class ClippedPGLossFn(LossFunction):
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
         ]
-
+        # Whether to compute importance weights per-sequence instead of per-token.
+        self.sequence_level_importance_ratios = cfg.get(
+            "sequence_level_importance_ratios",
+            False,
+        )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
+        if self.sequence_level_importance_ratios:
+            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
+                "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
 
     def __call__(
         self,
@@ -204,7 +218,17 @@ class ClippedPGLossFn(LossFunction):
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if not self.disable_ppo_ratio:
-            ratios = (curr_logprobs - prev_logprobs).exp()
+            log_ratios = curr_logprobs - prev_logprobs
+            if self.sequence_level_importance_ratios:
+                seq_log_ratio_mean = masked_mean(
+                    log_ratios,
+                    token_mask,
+                    dim=-1,
+                ).unsqueeze(-1)
+                seq_ratio = seq_log_ratio_mean.exp()
+                ratios = seq_ratio.repeat(1, advantages.shape[1])
+            else:
+                ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
                 1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
             )
@@ -228,11 +252,29 @@ class ClippedPGLossFn(LossFunction):
                 advantages < 0, torch.min(clip_loss, loss3), clip_loss
             )
 
+        # -------------------------------------------------------------
+        # Off-policy (actor) importance-sampling correction
+        # -------------------------------------------------------------
         # See: docs/guides/grpo.md#importance-sampling-correction
-        actor_importance_weights = torch.exp(prev_logprobs - generation_logprobs)
-        actor_importance_weights = torch.nan_to_num(
-            actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        if self.sequence_level_importance_ratios:
+            # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
+            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            actor_importance_weights = torch.exp(seq_lp_diff).detach()
+            actor_importance_weights = torch.nan_to_num(
+                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            # Broadcast to token dimension so we can reuse existing reduction
+            actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
+        else:
+            # Token-level correction
+            actor_importance_weights_expanded = torch.exp(
+                prev_logprobs - generation_logprobs
+            )
+            actor_importance_weights_expanded = torch.nan_to_num(
+                actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
+            )
+        actor_importance_weights = actor_importance_weights_expanded
+        del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:
             importance_weights_to_use = actor_importance_weights
         else:
@@ -255,12 +297,20 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_seqs,
             )
 
+        # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
-        sample_importance_ratio = masked_mean(
-            actor_importance_weights,
-            mask,
-            global_normalization_factor=global_valid_toks,
-        )
+        if self.sequence_level_importance_ratios:
+            sample_importance_ratio = masked_mean(
+                actor_importance_weights,
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+        else:
+            sample_importance_ratio = masked_mean(
+                actor_importance_weights,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
 
         # Approximating entropy as E_{s ~ \pi_{gen}(s)}[-(\pi_{curr}/\pi_{gen})log(\pi_{curr}(s))]
         # See more details and other metrics in docs/guides/grpo.md#metrics

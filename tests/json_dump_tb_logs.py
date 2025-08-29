@@ -38,16 +38,16 @@ console = Console()
 error_console = Console(stderr=True)
 
 
-def merge_tb_logs_to_json(log_dir, output_path, allow_conflicts=False):
+def merge_tb_logs_to_json(log_dir, output_path, error_on_conflicts=False):
     """Merge multiple TensorBoard event files into a single JSON file.
 
     Arguments:
         log_dir: Path to directory containing TensorBoard event files (searched recursively)
         output_path: Path to save the output JSON file
-        allow_conflicts: If True, allow multiple values for the same step (last one wins)
+        error_on_conflicts: If True, raise an error if conflicting values are found for the same step
 
     Raises:
-        ValueError: If conflicting values are found for the same step and allow_conflicts is False
+        ValueError: If conflicting values are found for the same step and error_on_conflicts is True
     """
     # Find all event files recursively
     files = glob.glob(f"{log_dir}/**/events*tfevents*", recursive=True)
@@ -89,19 +89,19 @@ def merge_tb_logs_to_json(log_dir, output_path, allow_conflicts=False):
             for scalar in ea.Scalars(metric_name):
                 step, value = scalar.step, scalar.value
 
-                # Check for conflicts - immediately raise error if not allowing conflicts
+                # Check for conflicts - raise error only if error_on_conflicts is True
                 if step in merged_data[metric_name]:
                     existing_value, existing_file = merged_data[metric_name][step]
 
                     # Only consider it a conflict if the values are different
                     if existing_value != value:
-                        if not allow_conflicts:
-                            # Immediate error if not allowing conflicts
+                        if error_on_conflicts:
+                            # Immediate error if we choose to error on conflicts
                             raise ValueError(
                                 f"Conflict detected for metric '{metric_name}' at step {step}:\n"
                                 f"  File #{file_index_map[existing_file]}: {existing_file} has value {existing_value}\n"
                                 f"  File #{file_index_map[event_file]}: {event_file} has value {value}\n"
-                                f"Use --allow-conflicts to force merging with latest value."
+                                f"Re-run without --error-on-conflicts to merge with the latest value."
                             )
 
                 # Add or override the value
@@ -218,15 +218,15 @@ if __name__ == "__main__":
         help="Path to save the output JSON file",
     )
     parser.add_argument(
-        "--allow-conflicts",
+        "--error-on-conflicts",
         action="store_true",
-        help="Allow conflicting values for the same step (last one wins)",
+        help="Error out when conflicting values are found for the same step",
     )
 
     args = parser.parse_args()
 
     try:
-        merge_tb_logs_to_json(args.log_dir, args.output_path, args.allow_conflicts)
+        merge_tb_logs_to_json(args.log_dir, args.output_path, args.error_on_conflicts)
     except Exception as e:
         error_console.print(f"[bold red]Error: {e}[/bold red]")
         sys.exit(1)

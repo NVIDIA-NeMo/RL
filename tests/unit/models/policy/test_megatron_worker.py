@@ -18,9 +18,6 @@ from typing import Optional
 import pytest
 import torch
 
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
-
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -504,7 +501,7 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping megatorn generation tests for now")
+@pytest.mark.skip(reason="Skipping megatron generation tests for now")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",

@@ -155,7 +155,14 @@ class VllmInternalWorkerExtension:
                     weights.append((name, tensor))
 
             # Load weights into the model
-            self.model_runner.model.load_weights(weights=weights)
+            from nemo_rl.models.generation import fp8
+
+            if fp8.is_fp8_model(self.model_runner.vllm_config):
+                # the fp8 load_weights additionally casts bf16 weights into fp8
+                fp8.load_weights(weights, self.model_runner)
+            else:
+                self.model_runner.model.load_weights(weights=weights)
+
             return True
         except Exception as e:
             print(
@@ -177,7 +184,14 @@ class VllmInternalWorkerExtension:
             for name, (shape, dtype) in self.state_dict_info.items():
                 weight = torch.empty(shape, dtype=dtype, device="cuda")
                 self.model_update_group.broadcast(weight, src=0)
-                self.model_runner.model.load_weights(weights=[(name, weight)])
+
+                from nemo_rl.models.generation import fp8
+
+                if fp8.is_fp8_model(self.model_runner.vllm_config):
+                    # the fp8 load_weights additionally casts bf16 weights into fp8
+                    fp8.load_weights([(name, weight)], self.model_runner)
+                else:
+                    self.model_runner.model.load_weights(weights=[(name, weight)])
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

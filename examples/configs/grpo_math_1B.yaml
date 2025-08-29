@@ -21,6 +21,7 @@ loss_fn:
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
+  sequence_level_importance_ratios: false
   token_level_loss: true
 
 checkpointing:
@@ -45,6 +46,7 @@ policy:
   logprob_chunk_size: null
 
   dtensor_cfg:
+    _v2: true
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -115,6 +117,8 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    env_vars: null
+
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
@@ -172,9 +176,13 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

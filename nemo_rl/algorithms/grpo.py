@@ -21,6 +21,7 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -129,6 +130,7 @@ def setup(
     tokenizer: TokenizerType,
     dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -318,6 +320,11 @@ def setup(
         )
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            assert loss_config["use_importance_sampling_correction"] is True, (
+                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+
         policy_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
         )
@@ -339,6 +346,7 @@ def setup(
         cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
@@ -490,6 +498,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -676,6 +685,8 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+                # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")
