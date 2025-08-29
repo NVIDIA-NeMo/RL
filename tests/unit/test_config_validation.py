@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Type, Union, get_type_hints
 
 import pytest
+import ray
 from omegaconf import OmegaConf
 from typing_extensions import NotRequired
 
@@ -31,6 +32,16 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config_with_inheritance
 from nemo_rl.utils.logger import LoggerConfig
+
+
+@ray.remote
+def hello_world() -> str:
+    return "hello"
+
+
+def test_ray_remote():
+    result = ray.get(hello_world.remote())
+    assert result == "hello"
 
 
 def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:

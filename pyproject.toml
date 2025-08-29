@@ -130,6 +130,7 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "pytest-asyncio",
+    "pytest-testmon",
 ]
 
 [tool.uv.sources]
@@ -192,7 +193,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=15 -s -rA -x"
+addopts = "--testmon --durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
