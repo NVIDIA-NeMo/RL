@@ -3057,7 +3057,6 @@ mcore = [
 vllm = [
     { name = "causal-conv1d" },
     { name = "cuda-python" },
-    { name = "deep-gemm" },
     { name = "flash-attn" },
     { name = "mamba-ssm" },
     { name = "num2words" },
@@ -3095,6 +3094,9 @@ test = [
     { name = "pytest-cov" },
     { name = "pytest-timeout" },
 ]
+vllm = [
+    { name = "deep-gemm" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -3106,7 +3108,6 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
-    { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
@@ -3178,6 +3179,7 @@ test = [
     { name = "pytest-cov" },
     { name = "pytest-timeout" },
 ]
+vllm = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" }]
 
 [[package]]
 name = "nemo-run"
