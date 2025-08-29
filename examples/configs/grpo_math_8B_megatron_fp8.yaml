@@ -9,5 +9,10 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    fp8_cfg:
+      enabled: true
+      fp8: "hybrid"
+      fp8_recipe: "blockwise"
+      fp8_param: false
