@@ -99,9 +99,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             engine_client,
             model_config,
             openai_serving_models,
-            request_logger=None,
-            chat_template=None,
-            chat_template_content_format="auto",
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
         )
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
