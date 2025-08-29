@@ -24,7 +24,7 @@ from tqdm.auto import tqdm
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
-from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
 
 
 class PenguinConfig(TypedDict):
@@ -39,7 +39,8 @@ class PenguinWorker:
         self.cfg = cfg
 
         self.nemo_rl_openai_base_url = nemo_rl_openai_base_url
-        self.node_ip, self.head_server_port = _get_node_ip_and_free_port()
+        self.node_ip = _get_node_ip_local()
+        self.head_server_port = _get_free_port_local()
 
         # TODO we should probably rename this somehow to penguin. But that is a lot of work...
         from nemo_gym.cli import RunHelper
