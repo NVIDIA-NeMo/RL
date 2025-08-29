@@ -56,9 +56,9 @@ def rm_preprocessor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary for RM training."""
-    assert (
-        len(datum_dict["completions"]) == 2
-    )  # Currently only supporting 2 completions
+    assert len(datum_dict["completions"]) == 2, (
+        "RM training supports only two completions"
+    )
     # Lower rank is preferred
     if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
         chosen_completion = datum_dict["completions"][0]
@@ -162,11 +162,16 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     if data_cls == "PreferenceDataset":
         val_dataset = {}
 
-        assert "val_data_paths" in data_config, "val_data_paths must be provided"
-        assert isinstance(data_config["val_data_paths"], dict), (
-            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}"
+        assert "val_data_path" not in data_config, (
+            "`val_data_path` cannot be provided for PreferenceDataset. You should use `val_data_paths` instead."
         )
-        val_data_paths = data_config.get("val_data_paths")
+        assert "val_data_paths" in data_config, (
+            "`val_data_paths` must be provided for PreferenceDataset"
+        )
+        assert isinstance(data_config["val_data_paths"], dict), (
+            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
+        )
+        val_data_paths = data_config["val_data_paths"]
 
         for val_dataset_name, val_dataset_path in val_data_paths.items():
             assert val_dataset_name not in val_dataset
@@ -193,7 +198,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                     rm_preprocessor,
                     max_seq_length=data_config["max_input_seq_length"],
                 )
-            } if val_dataset else {}
+            }
+            if val_dataset
+            else {}
         )
 
     return train_dataset, val_dataset, rm_task_spec

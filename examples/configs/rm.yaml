@@ -135,7 +135,7 @@ data:
   #       ...
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "val-<NameOfValidationDataset1>_loss"
+  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:

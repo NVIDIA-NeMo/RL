@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
-from typing import NotRequired, Optional, TypedDict, cast
+from typing import Optional, TypedDict, cast
 
 import numpy as np
 import torch
@@ -592,6 +592,7 @@ def dpo_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            print(f"  • Accuracy: {float(metrics['accuracy']):.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]

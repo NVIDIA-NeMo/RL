@@ -349,7 +349,8 @@ def validate_one_dataset(
                         ]
                     )
                     / sum_num_valid_samples
-                    for metric_name in RMValMetrics.__annotations__.keys() if metric_name != "num_valid_samples"
+                    for metric_name in RMValMetrics.__annotations__.keys()
+                    if metric_name != "num_valid_samples"
                 },
             )
         else:
@@ -357,7 +358,12 @@ def validate_one_dataset(
                 "No validation metrics were collected."
                 " This is likely because there were no valid samples in the validation set."
             )
-            val_metrics = RMValMetrics(**{metric_name: 0.0 for metric_name in RMValMetrics.__annotations__.keys()})
+            val_metrics = RMValMetrics(
+                **{
+                    metric_name: 0.0
+                    for metric_name in RMValMetrics.__annotations__.keys()
+                }
+            )
 
         # Calculate validation metrics
         policy.prepare_for_training()
@@ -504,7 +510,13 @@ def rm_train(
                     for key in list(rm_save_state):
                         if (
                             key.startswith("val")
-                            and any([key.endswith(f"_{metric_name}") for metric_name in RMValMetrics.__annotations__.keys() if metric_name != "num_valid_samples"])
+                            and any(
+                                [
+                                    key.endswith(f"_{metric_name}")
+                                    for metric_name in RMValMetrics.__annotations__.keys()
+                                    if metric_name != "num_valid_samples"
+                                ]
+                            )
                             and (val_metrics is None or key not in val_metrics)
                         ):
                             del rm_save_state[key]
