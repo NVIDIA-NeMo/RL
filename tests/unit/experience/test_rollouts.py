@@ -751,7 +751,7 @@ def test_run_async_penguin_rollout(
             "extra_env_info": penguin_test_data
         }
     )
-    results = run_async_penguin_rollout(
+    input_ids, final_batch, rollout_metrics = run_async_penguin_rollout(
         policy_generation=penguin_vllm_generation,
         input_batch=input_batch,
         tokenizer=penguin_tokenizer,
@@ -760,4 +760,13 @@ def test_run_async_penguin_rollout(
         generation_config=penguin_vllm_generation.cfg,
         max_rollout_turns=None,
     )
-    print(results)
+    with open("temp_rollout.json", "w") as f:
+        import json
+        json.dump(
+            {
+                "input_ids": input_ids.tolist(),
+                "final_batch": final_batch.get_dict(),
+                "rollout_metrics": rollout_metrics,
+            },
+            f, indent=4
+        )

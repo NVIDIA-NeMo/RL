@@ -897,11 +897,11 @@ def run_async_penguin_rollout(
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
-    max_seq_len: int,
     generation_config: GenerationConfig,
+    max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
-) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
+) -> tuple[torch.Tensor, BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
@@ -912,6 +912,7 @@ def run_async_penguin_rollout(
     # Penguin policy is "What you see is what you get".
     assert not greedy, f"`greedy` is not supported in Penguin path!"
     assert max_rollout_turns is None, f"`max_rollout_turns` is not supported in Penguin path!"
+    assert max_seq_len is None, f"`max_seq_len` is not supported in Penguin path!"
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], f"Stop strings is not supported in the generation config in Penguin path!"
     assert not generation_config["stop_token_ids"], f"Stop strings is not supported in the generation config in Penguin path!"
