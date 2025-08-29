@@ -107,12 +107,12 @@ class PenguinWorker:
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert seen_token_ids == output_item_dict["prompt_token_ids"][:seen_token_ids], "Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated."
+            assert seen_token_ids == output_item_dict["prompt_token_ids"][:len(seen_token_ids)], "Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated."
 
             nemo_rl_message_log.append({
                     "role": "user",
                     "content": "",
-                    "token_ids": output_item_dict["prompt_token_ids"][seen_token_ids:],
+                    "token_ids": output_item_dict["prompt_token_ids"][len(seen_token_ids):],
                 }
             )
             nemo_rl_message_log.append({
