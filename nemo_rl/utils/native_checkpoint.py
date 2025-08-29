@@ -18,121 +18,25 @@ import os
 from typing import Any, Optional
 
 import torch
-import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
+
+# Apply torch backports for compatibility with torch==2.7.1
+from nemo_automodel.components.checkpoint._torch_backports import apply_patches
+
+# Import from nemo-automodel
+from nemo_automodel.components.checkpoint.checkpointing import (
+    CheckpointingConfig,
+    load_model,
+    load_optimizer,
+    save_model,
+    save_optimizer,
 )
-from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from transformers import AutoConfig, AutoTokenizer
 
-
-## modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
-class ModelState(Stateful):
-    """Helper class for tracking model state in distributed checkpointing.
-
-    This class is compliant with the Stateful protocol, allowing DCP to automatically
-    call state_dict/load_state_dict as needed in the dcp.save/load APIs.
-
-    Args:
-        model: The PyTorch model to track.
-    """
-
-    def __init__(self, model: torch.nn.Module):
-        self.model = model
-
-    def state_dict(self) -> dict[str, Any]:
-        """Get the model's state dictionary.
-
-        Returns:
-            dict: Dictionary containing the model's state dict with CPU offloading enabled.
-        """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        model_state_dict = get_model_state_dict(
-            self.model,
-            options=torch.distributed.checkpoint.state_dict.StateDictOptions(
-                cpu_offload=True
-            ),
-        )
-        return model_state_dict
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load the state dictionary into the model.
-
-        Args:
-            state_dict (dict): State dictionary to load.
-        """
-        # sets our state dicts on the model, now that we've loaded
-        set_model_state_dict(
-            self.model,
-            state_dict,
-        )
+apply_patches()
 
 
-class OptimizerState(Stateful):
-    """Helper class for tracking optimizer state in distributed checkpointing.
-
-    This class is compliant with the Stateful protocol, allowing DCP to automatically
-    call state_dict/load_state_dict as needed in the dcp.save/load APIs.
-
-    Args:
-        model: The PyTorch model associated with the optimizer.
-        optimizer: The optimizer to track.
-        scheduler: Optional learning rate scheduler.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Optional[Any] = None,
-    ):
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-
-    def state_dict(self) -> dict[str, Any]:
-        """Get the optimizer and scheduler state dictionaries.
-
-        Returns:
-            dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
-        """
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        optimizer_state_dict = get_optimizer_state_dict(
-            self.model,
-            self.optimizer,
-            options=torch.distributed.checkpoint.state_dict.StateDictOptions(
-                cpu_offload=True
-            ),
-        )
-
-        state_dict = {
-            "optim": optimizer_state_dict,
-        }
-        if self.scheduler is not None:
-            state_dict["sched"] = self.scheduler.state_dict()
-
-        return state_dict
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load the state dictionaries into the optimizer and scheduler.
-
-        Args:
-            state_dict (dict): State dictionary containing optimizer and scheduler states to load.
-        """
-        # sets our state dicts on the optimizer, now that we've loaded
-        set_optimizer_state_dict(
-            self.model,
-            self.optimizer,
-            state_dict["optim"],
-        )
-
-        ## load the scheduler state if it exists
-        if "sched" in state_dict and self.scheduler is not None:
-            self.scheduler.load_state_dict(state_dict["sched"])
+# ModelState and OptimizerState are now imported from nemo-automodel
 
 
 def save_checkpoint(
@@ -143,6 +47,10 @@ def save_checkpoint(
     optimizer_path: Optional[str] = None,
     tokenizer: Optional[Any] = None,
     tokenizer_path: Optional[str] = None,
+    model_save_format: str = "safetensors",
+    is_peft: bool = False,
+    peft_config: Optional[Any] = None,
+    save_consolidated: bool = False,
 ) -> None:
     """Save a checkpoint of the model and optionally optimizer state.
 
@@ -154,23 +62,45 @@ def save_checkpoint(
         optimizer_path: Path to save optimizer state (required if optimizer provided)
         tokenizer: Optional tokenizer to save
         tokenizer_path: Path to save tokenizer state (required if tokenizer provided)
+        model_save_format: Format for saving model ("torch_save" or "safetensors")
+        is_peft: Whether the model uses PEFT
+        peft_config: PEFT configuration if is_peft is True
     """
-    model_state = {"model": ModelState(model)}
-    dcp.save(model_state, checkpoint_id=weights_path)
+    # Create checkpoint config
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=os.path.dirname(weights_path),
+        model_save_format=model_save_format,
+        model_cache_dir="",
+        model_repo_id="",
+        save_consolidated=save_consolidated,
+        is_peft=is_peft,
+    )
 
+    # Save model using nemo-automodel API
+    save_model(
+        model=model,
+        weights_path=weights_path,
+        checkpoint_config=checkpoint_config,
+        peft_config=peft_config,
+        tokenizer=tokenizer if tokenizer_path is None else None,
+    )
+
+    # Save optimizer if provided
     if optimizer is not None:
         if optimizer_path is None:
             raise ValueError(
                 "optimizer_path must be provided when saving optimizer state"
             )
-        optimizer_state = {"optim": OptimizerState(model, optimizer, scheduler)}
-        dcp.save(optimizer_state, checkpoint_id=optimizer_path)
+        save_optimizer(
+            optimizer=optimizer,
+            model=model,
+            weights_path=optimizer_path,
+            scheduler=scheduler,
+        )
 
-    if tokenizer is not None:
-        if tokenizer_path is None:
-            raise ValueError(
-                "tokenizer_path must be provided when saving tokenizer state"
-            )
+    # Save tokenizer separately if tokenizer_path provided
+    if tokenizer is not None and tokenizer_path is not None:
         print(f"Saving tokenizer (or processor) to {tokenizer_path}")
         tokenizer.save_pretrained(tokenizer_path)
 
@@ -181,6 +111,8 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
     optimizer_path: Optional[str] = None,
+    model_save_format: str = "safetensors",
+    is_peft: bool = False,
 ) -> None:
     """Load a model weights and optionally optimizer state.
 
@@ -190,10 +122,28 @@ def load_checkpoint(
         optimizer: Optional optimizer to load state into
         scheduler: Optional scheduler to load state into
         optimizer_path: Path to load optimizer state from (required if optimizer provided)
+        model_save_format: Format model was saved in ("torch_save" or "safetensors")
+        is_peft: Whether the model uses PEFT
     """
     print(f"Loading weights from {weights_path}")
-    model_state_dict = {"model": ModelState(model)}
-    dcp.load(state_dict=model_state_dict, checkpoint_id=weights_path)
+
+    # Create checkpoint config
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=os.path.dirname(weights_path),
+        model_save_format=model_save_format,
+        model_cache_dir="",  # Not used for basic loading
+        model_repo_id="",  # Not used for basic loading
+        save_consolidated=False,  # Keep original behavior
+        is_peft=is_peft,
+    )
+
+    # Load model using nemo-automodel API
+    load_model(
+        model=model,
+        weights_path=weights_path,
+        checkpoint_config=checkpoint_config,
+    )
 
     if optimizer is not None:
         if optimizer_path is None:
@@ -201,8 +151,12 @@ def load_checkpoint(
                 "optimizer_path must be provided when loading optimizer state"
             )
         print(f"Loading optimizer from {optimizer_path}")
-        optimizer_state_dict = {"optim": OptimizerState(model, optimizer, scheduler)}
-        dcp.load(state_dict=optimizer_state_dict, checkpoint_id=optimizer_path)
+        load_optimizer(
+            optimizer=optimizer,
+            model=model,
+            weights_path=optimizer_path,
+            scheduler=scheduler,
+        )
 
 
 def convert_dcp_to_hf(

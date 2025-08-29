@@ -1387,6 +1387,10 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_save_format="safetensors",
+            is_peft=False,
+            peft_config=None,
+            save_consolidated=False,
         )
 
     def load_checkpoint(
