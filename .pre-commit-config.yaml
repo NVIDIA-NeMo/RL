@@ -46,3 +46,28 @@ repos:
         require_serial: true
         additional_dependencies: []
         minimum_pre_commit_version: "2.9.2"
+
+  - repo: local
+    hooks:
+      - id: configs-minimize-check-llm
+        name: minimize-check llm recipes
+        language: system
+        pass_filenames: false
+        entry: bash
+        args:
+          - -lc
+          - |
+            set -euo pipefail
+            base="examples/configs/dpo.yaml"; for f in examples/configs/recipes/llm/dpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
+            base="examples/configs/grpo_math_1B.yaml"; for f in examples/configs/recipes/llm/grpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
+            base="examples/configs/sft.yaml"; for f in examples/configs/recipes/llm/sft-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
+      - id: configs-minimize-check-vlm
+        name: minimize-check vlm recipes
+        language: system
+        pass_filenames: false
+        entry: bash
+        args:
+          - -lc
+          - |
+            set -euo pipefail
+            base="examples/configs/vlm_grpo_3B.yaml"; for f in examples/configs/recipes/vlm/vlm_grpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
