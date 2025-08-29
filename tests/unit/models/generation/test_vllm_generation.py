@@ -1041,7 +1041,7 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
-def configure_http_server_config(tokenizer):
+def configure_http_server_config(tokenizer) -> VllmConfig:
     # Create separate configs for each policy
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)

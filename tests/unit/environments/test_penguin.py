@@ -33,6 +33,11 @@ from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer
 @pytest.fixture(scope="function")
 def vllm_generation(cluster, tokenizer):
     vllm_config = configure_http_server_config(tokenizer)
+    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
+        "enable_auto_tool_choice": True,
+        "tool_call_parser": "hermes",
+        "reasoning_parser": "qwen3",
+    }
     vllm_generation = VllmGeneration(cluster, vllm_config)
 
     yield vllm_generation

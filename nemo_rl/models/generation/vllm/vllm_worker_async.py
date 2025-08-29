@@ -89,6 +89,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             chat_template=None,
             chat_template_content_format="auto",
             return_tokens_as_token_ids=True,
+            **self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict()),
         )
         openai_serving_tokenization = OpenAIServingTokenization(
             engine_client,
