@@ -22,7 +22,7 @@ dependencies = [
     "setuptools",
     "ninja",  # for flash-attn parallel build
     "torch==2.7.1",
-    # "triton",
+    "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     # transformers==4.54.0/4.54.1 both fail on rm models
