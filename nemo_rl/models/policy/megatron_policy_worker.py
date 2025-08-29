@@ -923,7 +923,12 @@ class MegatronPolicyWorker:
                     torch.cuda.empty_cache()
 
                 # Update parameters.
-                update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+                if not eval_mode:
+                    update_successful, grad_norm, num_zeros_in_grad = (
+                        self.optimizer.step()
+                    )
+                else:
+                    update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
                 # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
                 # so we must gather across mp ranks
