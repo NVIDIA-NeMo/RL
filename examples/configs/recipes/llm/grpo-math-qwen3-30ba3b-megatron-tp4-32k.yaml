@@ -10,6 +10,7 @@ checkpointing:
 grpo:
   normalize_rewards: True
   use_leave_one_out_baseline: True
+  max_num_epochs: 1
   max_num_steps: 3
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
