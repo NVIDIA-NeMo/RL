@@ -80,16 +80,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        openai_serving_chat = OpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
+        
+        serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
+        )
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
+        openai_serving_chat = OpenAIServingChat(
+            engine_client,
+            model_config,
+            openai_serving_models,
             return_tokens_as_token_ids=True,
-            **self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict()),
+            **serving_chat_kwargs,
         )
         openai_serving_tokenization = OpenAIServingTokenization(
             engine_client,

@@ -61,6 +61,7 @@ def vllm_generation(cluster, tokenizer):
         r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
     )
     tokenizer.chat_template = chat_template
+    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
 
     vllm_generation = VllmGeneration(cluster, vllm_config)
 
