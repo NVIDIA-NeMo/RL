@@ -29,6 +29,7 @@ policy:
     name: ${policy.model_name}
   train_global_batch_size: 256
   train_micro_batch_size: 1
+  val_drop_last: true
   max_total_sequence_length: 2048
   precision: "bfloat16"
   dtensor_cfg:

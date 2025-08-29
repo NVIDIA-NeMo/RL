@@ -32,6 +32,7 @@ policy:
     name: google/gemma-3-1b-it
   train_global_batch_size: 512
   train_micro_batch_size: 4
+  val_drop_last: true
   generation_batch_size: 32
   logprob_batch_size: 4
   max_total_sequence_length: 512

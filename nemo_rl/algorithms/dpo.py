@@ -180,7 +180,7 @@ def setup(
                 "make_sequence_length_divisible_by"
             ],
         ),
-        drop_last=True,
+        drop_last=policy_config["val_drop_last"],
     )
 
     # ==========================
@@ -297,6 +297,7 @@ def validate(
                 eval_mode=True,
                 gbs=val_batch_size * 2,
                 mbs=val_mbs * 2,
+                mbs_last_val=2,
             )
 
             if len(val_results["all_mb_metrics"]) == 0:
@@ -434,6 +435,7 @@ def dpo_train(
                         ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                         gbs=master_config["policy"]["train_global_batch_size"] * 2,
                         mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                        mbs_last_val=2,
                     )
 
                 is_last_step = total_steps + 1 >= master_config["dpo"][

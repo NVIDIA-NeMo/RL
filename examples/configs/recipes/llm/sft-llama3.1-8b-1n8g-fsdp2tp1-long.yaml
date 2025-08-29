@@ -19,6 +19,7 @@ policy:
   model_name: meta-llama/Llama-3.1-8B
   tokenizer:
     name: meta-llama/Llama-3.1-8B-Instruct
+  val_drop_last: true
   train_global_batch_size: 512
   train_micro_batch_size: 2
   max_total_sequence_length: 4096

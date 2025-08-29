@@ -8,6 +8,7 @@ loss_fn:
 
 policy:
   max_total_sequence_length: 24576
+  val_drop_last: true
   logprob_batch_size: 2
 
   dtensor_cfg:

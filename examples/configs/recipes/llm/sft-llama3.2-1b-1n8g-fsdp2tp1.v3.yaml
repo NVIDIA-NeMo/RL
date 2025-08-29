@@ -22,6 +22,7 @@ policy:
     chat_template: '{% for message in messages %}{%- if message[''role''] == ''system''  %}{{''Context: '' + message[''content''].strip()}}{%- elif message[''role''] == ''user''  %}{{'' Question: '' + message[''content''].strip() + '' Answer:''}}{%- elif message[''role''] == ''assistant''  %}{{'' '' + message[''content''].strip()}}{%- endif %}{% endfor %}'
   train_global_batch_size: 32
   train_micro_batch_size: 1
+  val_drop_last: true
   max_total_sequence_length: 1024
   precision: bfloat16
   dtensor_cfg:

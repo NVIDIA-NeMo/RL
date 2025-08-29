@@ -41,7 +41,7 @@ policy:
   logprob_batch_size: 8
   max_total_sequence_length: 512
   precision: "bfloat16"
-
+  val_drop_last: true
   dtensor_cfg:
     enabled: false
 

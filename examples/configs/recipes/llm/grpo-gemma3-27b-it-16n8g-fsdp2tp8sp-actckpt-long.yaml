@@ -28,6 +28,7 @@ checkpointing:
   checkpoint_must_save_by: null
 policy:
   model_name: google/gemma-3-27b-it
+  val_drop_last: true
   tokenizer:
     name: google/gemma-3-27b-it
   train_global_batch_size: 512

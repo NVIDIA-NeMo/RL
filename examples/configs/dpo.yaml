@@ -38,6 +38,7 @@ policy:
   # so the actual batch size processed by the model is train_global_batch_size * 2
   train_global_batch_size: 128
   train_micro_batch_size: 2
+  val_drop_last: true
 
   ## TODO(@ashors) support
   #logprob_batch_size: ${policy.train_micro_batch_size}

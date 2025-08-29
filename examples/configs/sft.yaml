@@ -30,7 +30,7 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
   precision: "bfloat16"
-
+  val_drop_last: true
   dtensor_cfg:
     enabled: true
     cpu_offload: False
