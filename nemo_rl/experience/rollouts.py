@@ -497,6 +497,7 @@ def run_multi_turn_rollout(
 
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
+    current_batch["truncated"] = sample_truncated
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -842,6 +843,10 @@ def run_async_multi_turn_rollout(
                 "idx": [
                     state.get("idx", i) for i, state in enumerate(final_sample_states)
                 ],
+                "truncated": torch.tensor(
+                    [metrics["truncated"] for metrics in all_sample_metrics],
+                    dtype=torch.bool,
+                ),
             }
         )
 
