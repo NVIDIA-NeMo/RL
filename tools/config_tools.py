@@ -32,14 +32,14 @@ Example:
       base_config=examples/configs/grpo_math_1B.yaml
     fi
     for recipe in examples/configs/recipes/llm/${algo}-*.yaml; do
-      uv run tools/config_tools.py minimize $recipe examples/configs/${algo}.yaml --in-place
+      uv run tools/config_tools.py minimize $recipe $base_config --in-place
     done
   done
 
   # Compare two configs
   uv run tools/config_tools.py compare examples/configs/grpo_math_1B.yaml examples/configs/grpo_math_8B.yaml
 
-  # Minimize a config and compare it to not minimzing (should be the same)
+  # Minimize a config and compare it to not minimzing (may see config differences since you are effectively re-parenting the config)
   uv run tools/config_tools.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml examples/configs/dpo.yaml >examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
   uv run tools/config_tools.py compare \
     examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml \
