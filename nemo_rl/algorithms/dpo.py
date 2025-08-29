@@ -85,6 +85,11 @@ class MasterConfig(TypedDict):
     checkpointing: CheckpointingConfig
 
 
+class DPOValMetrics(TypedDict):
+    loss: float
+    accuracy: float
+
+
 # =======================================================
 # Setup & Initialization
 # =======================================================
@@ -298,8 +303,8 @@ def validate(
         logger.log_metrics(k_val_metrics, step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        val_metrics[f"{prefix}_loss"] = k_val_metrics["loss"]
-        val_metrics[f"{prefix}_accuracy"] = k_val_metrics["accuracy"]
+        for metric_name in DPOValMetrics.__annotations__.keys():
+            val_metrics[f"{prefix}_{metric_name}"] = k_val_metrics[metric_name]
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
         ]
@@ -389,8 +394,8 @@ def validate_one_dataset(
     else:
         # Print summary of validation results
         print(f"\n📊 Validation Results for `{dataset_name}` set:")
-        print(f"    • Validation loss: {float(val_metrics['loss']):.4f}")
-        print(f"    • Validation accuracy: {float(val_metrics['accuracy']):.4f}")
+        for metric_name in DPOValMetrics.__annotations__.keys():
+            print(f"    • Validation {metric_name}: {val_metrics[metric_name]:.4f}")
 
         # Print timing information
         print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
@@ -537,7 +542,13 @@ def dpo_train(
                     for key in list(dpo_save_state):
                         if (
                             key.startswith("val")
-                            and (key.endswith("_loss") or key.endswith("_accuracy"))
+                            and any(
+                                [
+                                    key.endswith(f"_{metric_name}")
+                                    for metric_name in DPOValMetrics.__annotations__.keys()
+                                    if metric_name != "num_valid_samples"
+                                ]
+                            )
                             and (val_metrics is None or key not in val_metrics)
                         ):
                             del dpo_save_state[key]
@@ -591,8 +602,8 @@ def dpo_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            print(f"  • Loss: {float(metrics['loss']):.4f}")
-            print(f"  • Accuracy: {float(metrics['accuracy']):.4f}")
+            for metric_name in DPOValMetrics.__annotations__.keys():
+                print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]
