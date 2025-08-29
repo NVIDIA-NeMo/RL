@@ -26,7 +26,6 @@ from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
 from nemo_automodel.components._transformers.utils import (
-    resolve_model_class,
     sliding_window_overwrite,
 )
 from nemo_automodel.components.distributed.cp_utils import (
@@ -82,6 +81,7 @@ from nemo_rl.models.policy.utils import (
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
+    resolve_model_class,
 )
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
