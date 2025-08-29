@@ -14,11 +14,9 @@
 
 import importlib
 import os
-from collections import defaultdict
-from typing import Any
+from typing import Any, Dict
 
 import torch
-from torch import nn
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -26,25 +24,57 @@ from transformers import (
     AutoModelForTextToWaveform,
 )
 
+# Try to import nemo_automodel classes, fallback to None if not available
+try:
+    from nemo_automodel.components._transformers.auto_model import (
+        NeMoAutoModelForCausalLM,
+        NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForTextToWaveform,
+    )
+
+    NEMO_AUTOMODEL_AVAILABLE = True
+except ImportError:
+    # nemo_automodel is not installed, classes will be None
+    NeMoAutoModelForCausalLM = None  # type: ignore
+    NeMoAutoModelForImageTextToText = None  # type: ignore
+    NeMoAutoModelForTextToWaveform = None  # type: ignore
+    NEMO_AUTOMODEL_AVAILABLE = False
+
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
 # an automodel factory for loading the huggingface models from correct class
-AUTOMODEL_FACTORY = defaultdict(lambda: AutoModelForCausalLM)
-AUTOMODEL_FACTORY["qwen2_5_vl"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["qwen2_vl"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["qwen2_5_omni"] = AutoModelForTextToWaveform
-AUTOMODEL_FACTORY["llava"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["internvl"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["gemma3"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["smolvlm"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["mistral3"] = AutoModelForImageTextToText
-AUTOMODEL_FACTORY["llama4"] = AutoModelForImageTextToText
+
+AUTOMODEL_FACTORY: Dict[str, Any] = {
+    "qwen2_5_vl": AutoModelForImageTextToText,
+    "qwen2_vl": AutoModelForImageTextToText,
+    "qwen2_5_omni": AutoModelForTextToWaveform,
+    "llava": AutoModelForImageTextToText,
+    "internvl": AutoModelForImageTextToText,
+    "gemma3": AutoModelForImageTextToText,
+    "smolvlm": AutoModelForImageTextToText,
+    "mistral3": AutoModelForImageTextToText,
+    "llama4": AutoModelForImageTextToText,
+}
+
+if NEMO_AUTOMODEL_AVAILABLE:
+    AUTOMODEL_FACTORY = {
+        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "llava": NeMoAutoModelForImageTextToText,
+        "internvl": NeMoAutoModelForImageTextToText,
+        "gemma3": NeMoAutoModelForImageTextToText,
+        "smolvlm": NeMoAutoModelForImageTextToText,
+        "mistral3": NeMoAutoModelForImageTextToText,
+        "llama4": NeMoAutoModelForImageTextToText,
+    }
 
 
-def resolve_model_class(model_name: str) -> nn.Module:
-    if model_name.lower() in AUTOMODEL_FACTORY.keys():
-        return AUTOMODEL_FACTORY[model_name.lower()]
-    return AutoModelForCausalLM
+def resolve_model_class(model_name: str) -> Any:
+    """Resolve the appropriate model class for a given model name."""
+    if NEMO_AUTOMODEL_AVAILABLE:
+        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
