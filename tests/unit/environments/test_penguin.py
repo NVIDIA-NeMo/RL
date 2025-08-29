@@ -99,6 +99,6 @@ def penguin_test_data():
 
 def test_penguin_sanity(penguin, penguin_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
-    result = ray.get(penguin.run_rollouts(penguin_test_data))
+    result = ray.get(penguin.run_rollouts.remote(penguin_test_data))
 
     print(result)
