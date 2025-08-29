@@ -1041,9 +1041,7 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
-def test_vllm_http_server(cluster, tokenizer):
-    """Test that vLLM http server works."""
-
+def configure_http_server_config(tokenizer):
     # Create separate configs for each policy
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
@@ -1052,7 +1050,13 @@ def test_vllm_http_server(cluster, tokenizer):
     vllm_config["vllm_cfg"]["async_engine"] = True
     vllm_config["vllm_cfg"]["expose_http_server"] = True
 
-    print(cluster, vllm_config)
+    return vllm_config
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    vllm_config = configure_http_server_config(tokenizer)
 
     # Ensure we can get same output
     assert vllm_config["model_name"] == "Qwen/Qwen3-0.6B", (
