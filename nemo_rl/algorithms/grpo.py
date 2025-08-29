@@ -32,10 +32,9 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
-from nemo_rl.data.interfaces import (
-    DatumSpec,
-)
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,

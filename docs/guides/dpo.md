@@ -41,7 +41,7 @@ DPO datasets are expected to follow a specific format with three key fields:
 - `chosen_response`: The preferred/winning response
 - `rejected_response`: The non-preferred/losing response
 
-[data/hf_datasets/helpsteer3.py](../../nemo_rl/data/hf_datasets/helpsteer3.py) provides an example of how to format data for DPO:
+[preference_datasets/helpsteer3.py](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) provides an example of how to format data for DPO:
 
 ```python
 def format_helpsteer3(data):
@@ -66,7 +66,15 @@ def format_helpsteer3(data):
     }
 ```
 
-We also provide a [DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class that is compatible with jsonl-formatted preference datsets. This class assumes train and validation datasets have been split and processed into the expected format offline. The jsonl files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
+We also provide a [LocalPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/local_preference_dataset.py) class that is compatible with jsonl-formatted preference datasets. You can use `prompt_key`, `chosen_key`, `rejected_key` to specify which fields in your data correspond to the prompt, chosen response, and rejected response respectively. Here's an example configuration:
+```
+data:
+    train_data_path: "/path/to/train/data/path"
+    val_data_path: "/path/to/val/data/path"
+    prompt_key: "prompt"
+    chosen_key: "chosen"
+    rejected_key: "rejected"
+```
 
 ## Adding Custom DPO Datasets
 
