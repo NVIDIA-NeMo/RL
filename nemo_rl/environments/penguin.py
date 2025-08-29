@@ -43,6 +43,7 @@ class PenguinWorker:
         self.head_server_port = _get_free_port_local()
 
         # TODO we should probably rename this somehow to penguin. But that is a lot of work...
+        from omegaconf import DictConfig
         from nemo_gym.cli import RunHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME
 
@@ -50,22 +51,21 @@ class PenguinWorker:
         assert __file__.endswith(RELATIVE_PATH)
 
         initial_global_config_dict = self.cfg["initial_global_config_dict"]
-        with open_dict(initial_global_config_dict):
-            # Policy information
-            initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
-            initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
-            initial_global_config_dict["policy_base_url"] = self.nemo_rl_openai_base_url
+        # Policy information
+        initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
+        initial_global_config_dict["policy_base_url"] = self.nemo_rl_openai_base_url
 
-            # Head server
-            initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
-                "host": "0.0.0.0",
-                "port": self.head_server_port,
-            }
+        # Head server
+        initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
+            "host": "0.0.0.0",
+            "port": self.head_server_port,
+        }
 
         self.rh = RunHelper()
         self.rh.start(
             dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
-            initial_global_config_dict=initial_global_config_dict,
+            initial_global_config_dict=DictConfig(initial_global_config_dict),
         )
 
     async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
