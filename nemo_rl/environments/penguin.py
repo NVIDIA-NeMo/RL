@@ -44,7 +44,7 @@ class PenguinWorker:
 
         # TODO we should probably rename this somehow to penguin. But that is a lot of work...
         from omegaconf import DictConfig
-        from nemo_gym.cli import RunHelper
+        from nemo_gym.cli import RunHelper, GlobalConfigDictParserConfig
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
@@ -64,8 +64,10 @@ class PenguinWorker:
 
         self.rh = RunHelper()
         self.rh.start(
-            dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
-            initial_global_config_dict=DictConfig(initial_global_config_dict),
+            global_config_dict_parser_config=GlobalConfigDictParserConfig(
+                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
+                initial_global_config_dict=DictConfig(initial_global_config_dict),
+            )
         )
 
     async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
