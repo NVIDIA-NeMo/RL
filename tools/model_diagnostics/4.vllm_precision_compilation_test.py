@@ -69,10 +69,6 @@ def extract_logprobs(logprobs):
     return output
 
 
-def calculate_error(a, b):
-    return torch.exp(torch.abs(a - b)).mean().item()
-
-
 def pad_logprobs_list(logprobs_list):
     """Pad a list of logprobs lists into a numpy array.
 
