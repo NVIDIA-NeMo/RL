@@ -191,3 +191,48 @@ uv run --extra mcore tools/model_diagnostics/3.check_hf_model_embeddings_untrain
   - `--near-zero-threshold` (default: `1e-10`)
   - `--identical-threshold` (default: `1e-8`)
 - If any near-zero or identical rows are reported, the model may have issues of numerical instability (e.g., inf grad norms) during post-training if any of these problematic tokens are encountered. We have observed this happening when special tokens are reserved in the tokenizer and embedding, but none are encountered during pre-training. It may help to initialize these embeddings similar to how they were initialize during pre-training.
+
+## [4.vllm_precision_compilation_test.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/4.vllm_precision_compilation_test.py)
+
+Tests vLLM precision compilation by comparing log probabilities across different compilation modes and configurations. This script helps diagnose numerical precision issues that commonly arise when using different vLLM compilation settings. **Note that this is not a strict pass/fail test** - it's designed to help you understand and investigate numerical discrepancies.
+
+```sh
+# Example run
+uv run --extra vllm tools/model_diagnostics/4.vllm_precision_compilation_test.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+# Typical output shows mixed results:
+# Eager and cuda graph mode lps: FAILED - Arrays are different
+...
+# Eager and cuda graph mode lps with torch inductor precision flag: FAILED - Arrays are different  
+...
+# Eager and cuda graph mode lps with use_inductor disabled: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+```
+
+**What this script tests:**
+
+1. **Eager vs CUDA Graph Mode**: Compares log probabilities between eager execution (ground truth) and CUDA graph compilation mode
+   - **⚠️ Commonly fails**: This comparison often shows discrepancies due to compilation optimizations
+2. **Torch Inductor Precision**: Tests with `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` environment variable
+   - **⚠️ May help**: This flag may help but typically doesn't resolve all the numerical differences
+3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`use_inductor=False`) maintains output consistency
+   - **✅ Usually works well**: This configuration often produces results very close to eager mode
+   - **Note**: `use_inductor=False` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
+
+**Why this matters:**
+
+- **Debugging**: Helps identify which compilation settings cause numerical differences
+- **Configuration**: Shows which settings work best for your model
+- **Understanding**: Reveals how compilation affects model outputs
+
+**When to use:**
+
+- **Model integration** - understand numerical behavior across vLLM configurations
+- **Debugging** - investigate differences between development and production
+- **Research** - study compilation strategy impacts on precision
+
+**Interpreting results:**
+
+- **Eager vs CUDA Graph failures are normal** - don't panic if this fails
+- **Focus on patterns** - some models are more sensitive than others
+- **Use as guidance** - helps choose reliable compilation settings
+- **Balance precision vs performance** - choose what works for your use case
