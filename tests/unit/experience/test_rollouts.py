@@ -32,6 +32,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_async_penguin_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -42,6 +43,8 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
+from tests.unit.environments.test_penguin import penguin, vllm_generation, penguin_test_data
+
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -729,3 +732,16 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     assert environment_message_count > 3, "Expected at least one environment message"
 
     print("\nSliding Puzzle VLLM Test assertions passed.")
+
+
+def test_run_async_penguin_rollout(penguin, vllm_generation, penguin_test_data):
+    results = run_async_penguin_rollout(
+        policy_generation=vllm_generation,
+        input_batch=None,
+        tokenizer=None,
+        task_to_env={"penguin": penguin},
+        max_seq_len=1024,
+        generation_config=vllm_generation.cfg,
+        max_rollout_turns=None,
+    )
+    print(results)
