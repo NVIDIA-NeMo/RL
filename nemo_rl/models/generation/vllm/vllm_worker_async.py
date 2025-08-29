@@ -103,6 +103,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+            print(request, raw_request)
             generator = await openai_serving_chat.create_chat_completion(request, raw_request)
 
             if isinstance(generator, ErrorResponse):
