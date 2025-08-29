@@ -64,7 +64,7 @@ echo
 
 # Step 2: Prepare environment from uv.lock
 echo "[2/3] Syncing dependencies to container environment from uv.lock..."
-uv sync --locked --no-install-project
+uv sync --locked --no-install-project --extra vllm
 if [ $? -ne 0 ]; then
     echo "Error: Failed to sync dependencies from uv.lock. Exiting."
     exit 1
@@ -169,7 +169,6 @@ srun --job-name=${JOB_NAME} \
      --container-image=${CONTAINER_IMAGE} \
      --container-workdir=${PROJECT_DIR} \
      --container-mounts=${PROJECT_DIR}:${PROJECT_DIR} \
-     --output="${LOG_DIR}/notebook_job_%j.log" \
      bash -c "$COMMAND_BLOCK"
 
 echo "Interactive job finished."
