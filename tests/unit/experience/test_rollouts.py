@@ -47,7 +47,7 @@ from tests.unit.test_envs import (
 from tests.unit.environments.test_penguin import (
     penguin,
     vllm_generation as penguin_vllm_generation,
-    penguin_test_data,
+    penguin_sanity_test_data,
     tokenizer as penguin_tokenizer,
 )
 
@@ -743,12 +743,12 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 def test_run_async_penguin_rollout(
     penguin,
     penguin_vllm_generation,
-    penguin_test_data,
+    penguin_sanity_test_data,
     penguin_tokenizer,
 ):
     input_batch = BatchedDataDict[DatumSpec](
         {
-            "extra_env_info": penguin_test_data
+            "extra_env_info": penguin_sanity_test_data["input"]
         }
     )
     input_ids, final_batch, rollout_metrics = run_async_penguin_rollout(
