@@ -43,6 +43,25 @@ def vllm_generation(cluster, tokenizer):
         "tool_parser": "hermes",
         "reasoning_parser": "qwen3",
     }
+
+    # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
+    chat_template = tokenizer.chat_template
+    to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}"""
+    assert to_replace in chat_template
+    chat_template = chat_template.replace(
+        to_replace,
+        r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
+    )
+    tokenizer.chat_template = chat_template
+
     vllm_generation = VllmGeneration(cluster, vllm_config)
 
     yield vllm_generation

@@ -133,11 +133,6 @@ class PenguinWorker:
     async def run_rollouts(self, examples: list[dict]) -> list[dict]:
         penguin_results = await self._call_penguin_for_rollouts(examples)
 
-        # TODO remove
-        with open("temp_penguin_rollout_results.json", "w") as f:
-            import json
-            json.dump(penguin_results, f, indent=4)
-
         nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
         return nemo_rl_results
 
