@@ -129,6 +129,7 @@ class PenguinWorker:
         return {
             "message_log": nemo_rl_message_log[1:],
             "input_message_log": nemo_rl_message_log[:1],
+            "full_result": penguin_result,
         }
 
     async def run_rollouts(self, examples: list[dict]) -> list[dict]:
