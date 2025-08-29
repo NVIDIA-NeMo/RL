@@ -9,10 +9,44 @@ Subcommands:
     the base config file.
 
 Both commands support printing to stdout or in-place editing of the config file.
+
+Example:
+  # Expand a config with a root level "defaults" key to see the full config; print to stdout
+  uv run tools/config_tools.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+
+  # Expand a config with a root level "defaults" key to see the full config; edit the config in place
+  uv run tools/config_tools.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+
+  # Minimize a config and remove all keys that are present in the base config; print to stdout
+  # uv run tools/config_tools.py minimize <config> <base_config>
+  uv run tools/config_tools.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml examples/configs/dpo.yaml
+
+  # Minimize a config and remove all keys that are present in the base config; edit the config in place
+  # uv run tools/config_tools.py minimize <config> <base_config>
+  uv run tools/config_tools.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml examples/configs/dpo.yaml --in-place
+
+  # Minimize all llm the configs:
+  for algo in grpo dpo sft; do
+    base_config=examples/configs/${algo}.yaml
+    if [[ ${algo} == grpo ]]; then
+      base_config=examples/configs/grpo_math_1B.yaml
+    fi
+    for recipe in examples/configs/recipes/llm/${algo}-*.yaml; do
+      uv run tools/config_tools.py minimize $recipe examples/configs/${algo}.yaml --in-place
+    done
+  done
+
+  # Compare two configs
+  uv run tools/config_tools.py compare examples/configs/grpo_math_1B.yaml examples/configs/grpo_math_8B.yaml
+
+  # Minimize a config and compare it to not minimzing (should be the same)
+  uv run tools/config_tools.py minimize examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml examples/configs/dpo.yaml >examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
+  uv run tools/config_tools.py compare \
+    examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml \
+    examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
 """
 
 import argparse
-import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -117,7 +151,7 @@ def expand(args: argparse.Namespace) -> int:
     if args.in_place:
         Path(args.config).write_text(text)
     else:
-        sys.stdout.write(text + ("\n" if not text.endswith("\n") else ""))
+        print(text + ("\n" if not text.endswith("\n") else ""), end="")
 
 
 def minimize(args: argparse.Namespace) -> int:
@@ -160,7 +194,70 @@ def minimize(args: argparse.Namespace) -> int:
     if args.in_place:
         Path(args.config).write_text(text)
     else:
-        sys.stdout.write(text + ("\n" if not text.endswith("\n") else ""))
+        print(text + ("\n" if not text.endswith("\n") else ""), end="")
+
+
+def _flatten(d: Any, prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.update(_flatten(v, key))
+    elif isinstance(d, list):
+        for i, v in enumerate(d):
+            key = f"{prefix}[{i}]"
+            out.update(_flatten(v, key))
+    else:
+        out[prefix] = d
+    return out
+
+
+def compare(args: argparse.Namespace) -> int:
+    left_path = Path(args.left).resolve()
+    right_path = Path(args.right).resolve()
+
+    # Expand via repo loader, then convert to plain dict/list so _flatten works
+    left = OmegaConf.to_container(load_config(str(left_path)))  # type: ignore[assignment]
+    right = OmegaConf.to_container(load_config(str(right_path)))  # type: ignore[assignment]
+
+    lf = _flatten(left)
+    rf = _flatten(right)
+
+    left_keys = set(lf.keys())
+    right_keys = set(rf.keys())
+
+    added = sorted(right_keys - left_keys)
+    removed = sorted(left_keys - right_keys)
+    common = sorted(left_keys & right_keys)
+
+    changed: list[str] = []
+    for k in common:
+        if lf[k] != rf[k]:
+            changed.append(k)
+
+    if not added and not removed and not changed:
+        print("Configs are identical after expansion")
+        return 0
+
+    # Print concise report with explicit left/right context
+    print("Comparing configs after expansion:")
+    print(f"  Left : {left_path}")
+    print(f"  Right: {right_path}")
+
+    if added:
+        print("\nAdded in Right (missing in Left):")
+        for k in added:
+            print(f"  {k} = {rf[k]}")
+
+    if removed:
+        print("\nRemoved in Right (only in Left):")
+        for k in removed:
+            print(f"  {k} = {lf[k]}")
+
+    if changed:
+        print("\nChanged (Left -> Right):")
+        for k in changed:
+            print(f"  {k}: {lf[k]} -> {rf[k]}")
 
 
 if __name__ == "__main__":
@@ -190,6 +287,13 @@ if __name__ == "__main__":
         help="Edit file in place instead of printing",
     )
     p_min.set_defaults(func=minimize)
+
+    p_cmp = sub.add_parser(
+        "compare", help="Compare two configs after expanding their defaults"
+    )
+    p_cmp.add_argument("left", help="Left config path")
+    p_cmp.add_argument("right", help="Right config path")
+    p_cmp.set_defaults(func=compare)
 
     args = parser.parse_args()
     args.func(args)
