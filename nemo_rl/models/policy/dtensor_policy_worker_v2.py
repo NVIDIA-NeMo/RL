@@ -959,7 +959,7 @@ class DTensorPolicyWorkerV2:
 
                 with get_train_context(False, False, context_parallel_ctx)():
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        model_args = self.model(
+                        model_args = dict(
                             input_ids=input_ids,
                             attention_mask=attention_mask_input_all_ones,
                             position_ids=position_ids,
