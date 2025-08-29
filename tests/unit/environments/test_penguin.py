@@ -115,12 +115,15 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data):
     actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
 
     expected_result = penguin_sanity_test_data["expected_output"]
-    def _standardize(d):
+    def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d["response"].pop("id")
         d["response"].pop("created_at")
 
         for output in d["response"]["output"]:
             output.pop("id")
+
+    def _standardize(l: list[dict]):
+        return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)
