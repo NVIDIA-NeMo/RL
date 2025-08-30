@@ -1,0 +1,183 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "PR Comment"
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+        description: "Pull request number"
+      artifact_name:
+        required: true
+        type: string
+        description: "Name of the artifact containing the comment body"
+      head_sha:
+        required: true
+        type: string
+        description: "Head commit SHA of the pull request"
+      max_retries:
+        required: false
+        type: number
+        default: 30
+        description: "Maximum number of polling attempts"
+      sleep_duration:
+        required: false
+        type: number
+        default: 10
+        description: "Sleep duration in seconds between polling attempts"
+
+jobs:
+  comment:
+    name: Comment on PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for and download artifact
+        id: find-artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = ${{ toJSON(inputs.artifact_name) }};
+            const headSha = ${{ toJSON(inputs.head_sha) }};
+            const prNumber = ${{ toJSON(inputs.pr_number) }};
+            const maxRetries = ${{ inputs.max_retries }};
+            const sleepDuration = ${{ inputs.sleep_duration }};
+
+            console.log(`Waiting for artifact: ${artifactName}`);
+            console.log(`PR: #${prNumber}, Head SHA: ${headSha}`);
+            console.log(`Max retries: ${maxRetries}, Sleep duration: ${sleepDuration}s`);
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              console.log(`Attempt ${attempt}/${maxRetries}: Searching for artifact in workflow runs for commit ${headSha}...`);
+
+              try {
+                // Get workflow runs for the specific commit SHA
+                console.log(`Searching for workflow runs for commit: ${headSha}`);
+                const workflowRuns = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  head_sha: headSha,
+                  per_page: 50
+                });
+
+                console.log(`Found ${workflowRuns.data.workflow_runs.length} workflow runs for commit ${headSha}`);
+
+                // Search through each workflow run for the artifact
+                for (const run of workflowRuns.data.workflow_runs) {
+                  console.log(`Checking workflow run: ${run.name} (ID: ${run.id})`);
+
+                  try {
+                    const artifactsResponse = await github.rest.actions.listWorkflowRunArtifacts({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      run_id: run.id
+                    });
+
+                    const artifact = artifactsResponse.data.artifacts.find(a => a.name === artifactName);
+                    if (artifact) {
+                      console.log(`Found artifact '${artifactName}' in workflow '${run.name}' (run ${run.id})`);
+
+                      // Download the artifact using GitHub API
+                      console.log(`Downloading artifact ${artifact.id}...`);
+                      const download = await github.rest.actions.downloadArtifact({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        artifact_id: artifact.id,
+                        archive_format: 'zip'
+                      });
+
+                                            // Save the artifact to a file
+                      const fs = require('fs');
+                      fs.writeFileSync('artifact.zip', Buffer.from(download.data));
+                      console.log('Artifact downloaded successfully');
+
+                      core.setOutput('artifact_found', 'true');
+                      return; // Exit successfully
+                    }
+                  } catch (runError) {
+                    console.log(`Error checking workflow run ${run.id}: ${runError.message}`);
+                    // Continue to next run
+                  }
+                }
+
+                if (attempt < maxRetries) {
+                  console.log(`Artifact not found in any workflow runs for commit ${headSha}, waiting ${sleepDuration} seconds...`);
+                  await new Promise(resolve => setTimeout(resolve, sleepDuration * 1000));
+                }
+              } catch (error) {
+                console.log(`Error searching for artifact: ${error.message}`);
+                if (attempt < maxRetries) {
+                  await new Promise(resolve => setTimeout(resolve, sleepDuration * 1000));
+                }
+              }
+            }
+
+            console.log(`Artifact '${artifactName}' not found in any workflow runs for commit ${headSha} (PR #${prNumber}) after ${maxRetries} attempts`);
+            console.log('No comment will be posted as no artifact was found.');
+            core.setOutput('artifact_found', 'false');
+            return;
+
+      - name: Extract comment body
+        id: extract-comment
+        if: steps.find-artifact.outputs.artifact_found == 'true'
+        run: |
+          # Unzip the artifact
+          unzip -q artifact.zip
+
+          # Find the comment body file
+          if [ -f "comment.txt" ]; then
+            COMMENT_FILE="comment.txt"
+          elif [ -f "comment.md" ]; then
+            COMMENT_FILE="comment.md"
+          elif [ -f "comment" ]; then
+            COMMENT_FILE="comment"
+          else
+            # Take the first text file found
+            COMMENT_FILE=$(find . -maxdepth 1 -type f -name "*.txt" -o -name "*.md" | head -1)
+            if [ -z "$COMMENT_FILE" ]; then
+              echo "No comment file found in artifact"
+              exit 1
+            fi
+          fi
+
+          echo "Found comment file: $COMMENT_FILE"
+
+          # Read the comment body and set it as output
+          {
+            echo 'COMMENT_BODY<<EOF'
+            cat "$COMMENT_FILE"
+            echo
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: steps.find-artifact.outputs.artifact_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentBody = ${{ toJSON(steps.extract-comment.outputs.COMMENT_BODY) }};
+            const prNumber = ${{ toJSON(inputs.pr_number) }};
+
+            console.log(`Creating comment on PR #${prNumber}`);
+
+            await github.rest.issues.createComment({
+              issue_number: parseInt(prNumber),
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+            console.log('Comment created successfully');
