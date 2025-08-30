@@ -182,6 +182,13 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         data = hf_datasets.Tulu3PreferenceDataset()
         train_dataset = data.formatted_ds["train"]
         val_dataset = None
+    elif data_config["dataset_name"] == "DPOChatML":
+        data = hf_datasets.DPOChatMLDataset(
+            train_data_path=data_config["train_data_path"],
+            val_data_path=data_config["val_data_path"],
+        )
+        train_dataset = data.formatted_ds["train"]
+        val_dataset = data.formatted_ds["validation"]
     else:
         data = hf_datasets.DPODataset(
             train_data_path=data_config["train_data_path"],
