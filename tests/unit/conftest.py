@@ -29,6 +29,7 @@ import torch.multiprocessing as mp
 from nemo_rl.distributed.virtual_cluster import init_ray
 
 dir_path = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.abspath(os.path.join(dir_path, "..", ".."))
 
 
 def pytest_addoption(parser):
@@ -47,8 +48,46 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Modify test collection to skip tests based on markers unless explicitly requested."""
+    """Modify test collection to skip tests based on markers unless explicitly requested.
+
+    This wrapper snapshots collected items before other plugins (e.g., testmon) modify the list,
+    then after they run, it unions in any impacted tests from the static ray-remote analyzer.
+    """
+    # Pre: snapshot original list
+    original_by_nodeid = {it.nodeid: it for it in list(items)}
+
+    # Let other plugins (testmon) run and possibly filter items
+    outcome = yield
+
+    # Post: compute impacted tests and append if missing
+    extra_nodeids: list[str] = []
+    try:
+        import subprocess, sys
+        out = subprocess.run(
+            [sys.executable, os.path.join(repo_root, "tools", "ray_remote_static.py")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if out.stdout.strip():
+            extra_nodeids = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    except Exception:
+        extra_nodeids = []
+
+    if extra_nodeids:
+        present = {it.nodeid for it in items}
+        for raw_nodeid in extra_nodeids:
+            # Normalize absolute nodeids printed by the analyzer to pytest's relative nodeids
+            nodeid = raw_nodeid
+            if nodeid.startswith(repo_root + "/"):
+                nodeid = nodeid[len(repo_root) + 1 :]
+            if nodeid in present:
+                continue
+            if nodeid in original_by_nodeid:
+                items.append(original_by_nodeid[nodeid])
+
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
     marker_expr = config.getoption("-m", default="")
