@@ -28,6 +28,21 @@ from typing import Any, Mapping, NotRequired, Optional, TypedDict, Union
 import numpy as np
 import torch
 import yaml
+from nemo_automodel.components.checkpoint._torch_backports import apply_patches
+
+# Import nemo-automodel functionality
+from nemo_automodel.components.checkpoint.checkpointing import (
+    CheckpointingConfig as AutomodelCheckpointingConfig,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
+    load_model,
+    load_optimizer,
+    save_model,
+    save_optimizer,
+)
+
+# Apply torch backports for compatibility with torch==2.7.1
+apply_patches()
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
@@ -41,6 +56,11 @@ class CheckpointingConfig(TypedDict):
     metric_name (str | None): Name of the metric to use for determining best checkpoints.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+    model_save_format (str): Format for saving model ("torch_save" or "safetensors").
+    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
+    model_cache_dir (str): Directory for model cache (for safetensors format).
+    model_repo_id (str): Repository ID for the model (for safetensors format).
+    is_peft (bool): Whether the model uses PEFT.
     """
 
     enabled: bool
@@ -50,6 +70,12 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    # New nemo-automodel integration fields
+    model_save_format: NotRequired[str]  # Default: "safetensors"
+    save_consolidated: NotRequired[bool]  # Default: False
+    model_cache_dir: NotRequired[str]  # Default: ""
+    model_repo_id: NotRequired[str]  # Default: ""
+    is_peft: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -84,6 +110,34 @@ class CheckpointManager:
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
 
+        # Store nemo-automodel specific config options
+        self.model_save_format = config.get("model_save_format", "safetensors")
+        self.save_consolidated = config.get("save_consolidated", False)
+        self.model_cache_dir = config.get("model_cache_dir", "")
+        self.model_repo_id = config.get("model_repo_id", "")
+        self.is_peft = config.get("is_peft", False)
+
+    def _create_automodel_config(
+        self, checkpoint_path: PathLike
+    ) -> AutomodelCheckpointingConfig:
+        """Create nemo-automodel CheckpointingConfig from our config.
+
+        Args:
+            checkpoint_path: Path to the specific checkpoint directory
+
+        Returns:
+            AutomodelCheckpointingConfig: Configuration for nemo-automodel checkpointing
+        """
+        return AutomodelCheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_path,
+            model_save_format=self.model_save_format,
+            model_cache_dir=self.model_cache_dir,
+            model_repo_id=self.model_repo_id,
+            save_consolidated=self.save_consolidated,
+            is_peft=self.is_peft,
+        )
+
     def init_tmp_checkpoint(
         self,
         step: int,
@@ -113,10 +167,11 @@ class CheckpointManager:
         # save training info
         with open(save_dir / "training_info.json", "w") as f:
             # make any numpy items serializable
-            for k, v in training_info.items():
+            serializable_training_info = dict(training_info)
+            for k, v in serializable_training_info.items():
                 if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
-                    training_info[k] = v.item()
-            json.dump(training_info, f)
+                    serializable_training_info[k] = v.item()
+            json.dump(serializable_training_info, f)
 
         # save config
         if run_config is not None:
@@ -124,6 +179,92 @@ class CheckpointManager:
                 yaml.safe_dump(run_config, f)
 
         return Path(os.path.abspath(save_dir))
+
+    def save_model_checkpoint(
+        self,
+        model: torch.nn.Module,
+        checkpoint_path: PathLike,
+        tokenizer: Optional[Any] = None,
+        peft_config: Optional[Any] = None,
+    ) -> None:
+        """Save model checkpoint using nemo-automodel API.
+
+        Args:
+            model: PyTorch model to save
+            checkpoint_path: Path to the checkpoint directory
+            tokenizer: Optional tokenizer to save
+            peft_config: Optional PEFT configuration
+        """
+        config = self._create_automodel_config(checkpoint_path)
+        save_model(
+            model=model,
+            weights_path=str(checkpoint_path),
+            checkpoint_config=config,
+            tokenizer=tokenizer,
+            peft_config=peft_config,
+        )
+
+    def load_model_checkpoint(
+        self,
+        model: torch.nn.Module,
+        checkpoint_path: PathLike,
+    ) -> None:
+        """Load model checkpoint using nemo-automodel API.
+
+        Args:
+            model: PyTorch model to load into
+            checkpoint_path: Path to the checkpoint directory
+        """
+        config = self._create_automodel_config(checkpoint_path)
+        load_model(
+            model=model,
+            weights_path=str(checkpoint_path),
+            checkpoint_config=config,
+        )
+
+    def save_optimizer_checkpoint(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+        checkpoint_path: PathLike,
+        scheduler: Optional[Any] = None,
+    ) -> None:
+        """Save optimizer checkpoint using nemo-automodel API.
+
+        Args:
+            optimizer: PyTorch optimizer to save
+            model: Associated PyTorch model
+            checkpoint_path: Path to the checkpoint directory
+            scheduler: Optional learning rate scheduler
+        """
+        save_optimizer(
+            optimizer=optimizer,
+            model=model,
+            weights_path=str(checkpoint_path),
+            scheduler=scheduler,
+        )
+
+    def load_optimizer_checkpoint(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+        checkpoint_path: PathLike,
+        scheduler: Optional[Any] = None,
+    ) -> None:
+        """Load optimizer checkpoint using nemo-automodel API.
+
+        Args:
+            optimizer: PyTorch optimizer to load into
+            model: Associated PyTorch model
+            checkpoint_path: Path to the checkpoint directory
+            scheduler: Optional learning rate scheduler
+        """
+        load_optimizer(
+            optimizer=optimizer,
+            model=model,
+            weights_path=str(checkpoint_path),
+            scheduler=scheduler,
+        )
 
     def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Complete a checkpoint by moving it from temporary to permanent location.
@@ -182,18 +323,18 @@ class CheckpointManager:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
             try:
-                assert self.metric_name is not None  # Type checker hint
+                metric_name = (
+                    self.metric_name
+                )  # Type checker hint - capture the non-None value
                 # sort by metric value first, then by step number (for equal metrics, prefer more recent)
                 if self.higher_is_better:
                     # For higher_is_better=True: higher metric values first, then higher step numbers
                     checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
+                        key=lambda x: (x[2][metric_name], x[0]), reverse=True
                     )
                 else:
                     # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], -x[0])
-                    )
+                    checkpoint_history.sort(key=lambda x: (x[2][metric_name], -x[0]))
             except KeyError:
                 warnings.warn(
                     f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
@@ -230,8 +371,9 @@ class CheckpointManager:
             )
             return self.get_latest_checkpoint_path()
 
+        metric_name = self.metric_name  # Type checker hint - capture the non-None value
         checkpoint_history.sort(
-            key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
+            key=lambda x: x[2][metric_name], reverse=self.higher_is_better
         )
         return str(checkpoint_history[0][1])
 

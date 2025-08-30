@@ -80,6 +80,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     import_class_from_path,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -1374,11 +1375,22 @@ class DTensorPolicyWorkerV2:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        # Get checkpointing configuration from config
+        model_save_format: str = cast(
+            str, checkpointing_cfg.get("model_save_format", "safetensors")
+        )
+        save_consolidated: bool = cast(
+            bool, checkpointing_cfg.get("save_consolidated", False)
+        )
+        is_peft: bool = cast(bool, checkpointing_cfg.get("is_peft", False))
+        peft_config = checkpointing_cfg.get("peft_config", None)
+
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1387,18 +1399,32 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_save_format=model_save_format,
+            is_peft=is_peft,
+            peft_config=peft_config,
+            save_consolidated=save_consolidated,
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Load a checkpoint into the model."""
+        model_save_format: str = cast(
+            str, checkpointing_cfg.get("model_save_format", "safetensors")
+        )
+        is_peft: bool = cast(bool, checkpointing_cfg.get("is_peft", False))
+
         load_checkpoint(
             model=self.model,
             weights_path=weights_path,
             optimizer=self.optimizer if optimizer_path else None,
             scheduler=self.scheduler if optimizer_path else None,
             optimizer_path=optimizer_path,
+            model_save_format=model_save_format,
+            is_peft=is_peft,
         )
 
     def shutdown(self) -> None:
