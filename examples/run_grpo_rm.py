@@ -15,7 +15,6 @@
 import argparse
 import os
 import pprint
-import time
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -159,7 +158,10 @@ def setup_data(
         defaultdict(lambda: (reward_model_task_spec, hf_data_processor))
     )
     task_data_processors[task_name] = (reward_model_task_spec, hf_data_processor)
-    print(f"OS envs: {dict(os.environ)}")
+
+    # Disable dynamic batching and sequence packing for reward model
+    env_configs["reward_model"]["dynamic_batching"]["enabled"] = False
+    env_configs["reward_model"]["sequence_packing"]["enabled"] = False
     reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
@@ -168,11 +170,6 @@ def setup_data(
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
     ).remote(env_configs["reward_model"])
-
-    # Add sleep to let reward model load before policy starts
-    print("⏳ Waiting 120 seconds for reward model to load...")
-    time.sleep(120)
-    print("✓ Sleep complete, continuing with policy setup")
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
@@ -242,6 +239,10 @@ def main() -> None:
         config["policy"]["generation"], tokenizer
     )
 
+    # Reward model only supports a single node for now
+    assert config["cluster"]["num_nodes"] == 1, (
+        "Reward model only supports a single node. Please set cluster.num_nodes to 1"
+    )
     # setup data
     (
         dataset,

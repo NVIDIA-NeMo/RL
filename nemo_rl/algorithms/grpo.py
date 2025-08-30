@@ -219,7 +219,7 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...")
     colocated_inference = generation_config["colocated"]["enabled"]
-    reward_model_enabled = env_configs["reward_model"]["enabled"]
+    reward_model_enabled = env_configs.get("reward_model", {}).get("enabled", False)
 
     total_nodes = cluster_config["num_nodes"]
     if reward_model_enabled:
@@ -263,7 +263,7 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
-        print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+        print(f"  ✓ Ray cluster initialized with {policy_nodes} nodes")
 
     else:
         assert generation_config["backend"] != "megatron", (
