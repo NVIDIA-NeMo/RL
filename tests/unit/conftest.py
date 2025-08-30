@@ -50,16 +50,51 @@ def pytest_addoption(parser):
 
 @pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_collection_modifyitems(config, items):
-    """Modify test collection to skip tests based on markers unless explicitly requested.
+    """Modify collection and union in impacted @ray.remote tests when testmon is active.
 
-    This wrapper snapshots collected items before other plugins (e.g., testmon) modify the list,
-    then after they run, it unions in any impacted tests from the static ray-remote analyzer.
+    Behavior:
+    - Runs as a hook wrapper (wrapper=True, trylast=True) to control order:
+      1) Pre-yield: apply hf_gated/mcore marker-based filtering.
+      2) Yield: let other plugins (e.g., pytest-testmon) filter/modify.
+      3) Post-yield: if testmon is active, union back tests impacted by @ray.remote
+         body changes (and re-apply the same marker filtering to those additions).
+    - The augmentation only runs when the testmon plugin is enabled. Otherwise,
+      we leave selection entirely to default pytest behavior.
+
+    Also applies your existing marker-based filtering (hf_gated, mcore) after union.
     """
-    # Pre: snapshot original list
+    # Pre: snapshot original list (full collection prior to any filtering)
     original_by_nodeid = {it.nodeid: it for it in list(items)}
+
+    # Step 1: apply marker-based filtering before other plugins run
+    run_hf_gated = config.getoption("--hf-gated")
+    run_mcore_only = config.getoption("--mcore-only")
+    marker_expr = config.getoption("-m", default="")
+
+    def _passes_marker_filter(item: pytest.Item) -> bool:
+        if marker_expr:
+            # Respect explicit -m user selection by not applying our own filtering logic
+            return True
+        if run_mcore_only and run_hf_gated:
+            return bool(item.get_closest_marker("mcore"))
+        if run_mcore_only:
+            return bool(item.get_closest_marker("mcore")) and not item.get_closest_marker(
+                "hf_gated"
+            )
+        if run_hf_gated:
+            return not item.get_closest_marker("mcore")
+        # default: exclude both hf_gated and mcore
+        return not item.get_closest_marker("hf_gated") and not item.get_closest_marker("mcore")
+
+    if not marker_expr:
+        items[:] = [it for it in items if _passes_marker_filter(it)]
 
     # Let other plugins (testmon) run and possibly filter items
     outcome = yield
+
+    # Only augment when testmon is active (feature is hidden behind testmon)
+    if not config.pluginmanager.hasplugin("testmon"):
+        return  # no augmentation
 
     # Post: compute impacted tests and append if missing
     extra_nodeids: list[str] = []
@@ -85,45 +120,11 @@ def pytest_collection_modifyitems(config, items):
                 nodeid = nodeid[len(repo_root) + 1 :]
             if nodeid in present:
                 continue
-            if nodeid in original_by_nodeid:
-                items.append(original_by_nodeid[nodeid])
-
-    run_hf_gated = config.getoption("--hf-gated")
-    run_mcore_only = config.getoption("--mcore-only")
-    marker_expr = config.getoption("-m", default="")
-
-    # If user specified -m marker expressions, let pytest handle everything normally
-    if marker_expr:
-        return
-
-    # Filter tests based on the desired configurations
-    new_items = []
-
-    if run_mcore_only and run_hf_gated:
-        # Configuration 4: Only mcore tests, including ones with hf_gated
-        new_items = [item for item in items if item.get_closest_marker("mcore")]
-    elif run_mcore_only:
-        # Configuration 3: Only mcore tests, excluding ones with hf_gated
-        new_items = [
-            item
-            for item in items
-            if item.get_closest_marker("mcore")
-            and not item.get_closest_marker("hf_gated")
-        ]
-    elif run_hf_gated:
-        # Configuration 2: Default tests + hf_gated tests, excluding mcore
-        new_items = [item for item in items if not item.get_closest_marker("mcore")]
-    else:
-        # Configuration 1: Default only - exclude both hf_gated and mcore
-        new_items = [
-            item
-            for item in items
-            if not item.get_closest_marker("hf_gated")
-            and not item.get_closest_marker("mcore")
-        ]
-
-    # Update the items list in-place
-    items[:] = new_items
+            item = original_by_nodeid.get(nodeid)
+            if item is None:
+                continue
+            if _passes_marker_filter(item):
+                items.append(item)
 
 
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")

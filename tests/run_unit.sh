@@ -45,7 +45,9 @@ if ! pytest $pytest_args; then
     exit 1
 fi
 
-# Update DB to current state after run
+# Update DB to current state after run.
+# This keeps the static analyzer's DB fresh so the next run can compare
+# current @ray.remote bodies against the latest snapshot.
 python ${PROJECT_ROOT}/tools/ray_remote_static.py --update || true
 
 echo "Unit tests passed!"
