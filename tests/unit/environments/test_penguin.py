@@ -41,7 +41,6 @@ def vllm_generation(cluster, tokenizer):
     vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
         "enable_auto_tools": True,
         "tool_parser": "hermes",
-        # "reasoning_parser": "qwen3",
     }
 
     # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
