@@ -18,9 +18,6 @@ from typing import Optional
 import pytest
 import torch
 
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
-
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
 from nemo_rl.algorithms.utils import get_tokenizer
