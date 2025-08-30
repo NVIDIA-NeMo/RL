@@ -115,6 +115,12 @@ dataset = AllTaskProcessedDataset(
 
 Ensure you provide a mapping of tasks to their processors so the dataset knows which processor to use when handling samples.
 
+## Environments
+
+GRPO supports various types of environments for different tasks, including **[Math](nemo_rl/environments/math_environment.py)**, **[Code](nemo_rl/environments/code_environment.py)**, and **[Reward Model](nemo_rl/environments/reward_model_environment.py)** environments. Each environment provides a standardized interface for reward computation and evaluation, enabling consistent training across diverse domains.
+
+For more information about environments, see the [Environments Guide](environments.md).
+
 ## Policy Model
 
 We define a {py:class}`PolicyInterface]() <nemo_rl.models.interfaces>` that contains everything you need to train a Policy model.
