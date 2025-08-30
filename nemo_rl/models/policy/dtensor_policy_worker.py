@@ -72,6 +72,7 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
     sliding_window_overwrite,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -1478,6 +1479,7 @@ class DTensorPolicyWorker:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -1494,7 +1496,10 @@ class DTensorPolicyWorker:
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Load a checkpoint into the model."""
         load_checkpoint(

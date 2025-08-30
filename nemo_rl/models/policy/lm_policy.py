@@ -42,6 +42,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_default_hf_config,
@@ -589,6 +590,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -596,6 +598,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             tokenizer_path=tokenizer_path,
+            checkpointing_cfg=checkpointing_cfg,
         )
         ray.get(futures)
 
