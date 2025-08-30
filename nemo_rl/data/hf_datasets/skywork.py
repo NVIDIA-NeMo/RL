@@ -45,7 +45,7 @@ def format_data(data: dict[str, str | float | int]) -> dict[str, list[Any] | str
 def prepare_skywork_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     """Load and split the Skywork-OR1 dataset into train and test sets."""
     # Load the original dataset for training
-    train_ds = load_dataset("Skywork/Skywork-OR1-RL-Data", split="train")
+    train_ds = load_dataset("Skywork/Skywork-OR1-RL-Data", split="math")
     train_ds = train_ds.map(format_data)
 
     # Load hendrydong/aime24 dataset for validation
