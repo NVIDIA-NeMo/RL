@@ -220,7 +220,7 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    reward_model_enabled = env_configs["reward_model"]["enabled"]
+    reward_model_enabled = env_configs.get("reward_model", {}).get("enabled", False)
 
     total_nodes = cluster_config["num_nodes"]
     if reward_model_enabled:
