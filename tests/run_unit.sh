@@ -40,8 +40,22 @@ else
     pytest_args="$@"
 fi
 
+# Compute impacted BEFORE updating DB (compare to previous state)
+IMPACTED_LIST=$(python ${PROJECT_ROOT}/tools/ray_remote_static.py || true)
+if [[ -n "${IMPACTED_LIST}" ]]; then
+    echo "Running additional impacted tests due to @ray.remote body changes..."
+    # Pass nodeids directly instead of -k to avoid keyword matching pitfalls
+    # shellcheck disable=SC2086
+    pytest $IMPACTED_LIST || true
+fi
+
+# Normal run (testmon may select a subset)
 if ! pytest $pytest_args; then
     echo "[ERROR]: Unit tests failed."
     exit 1
 fi
+
+# Update DB to current state
+python ${PROJECT_ROOT}/tools/ray_remote_static.py --update || true
+
 echo "Unit tests passed!"

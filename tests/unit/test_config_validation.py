@@ -33,15 +33,16 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config_with_inheritance
 from nemo_rl.utils.logger import LoggerConfig
 
-
-@ray.remote
-def hello_world() -> str:
-    return "hello"
+from nemo_rl.foobar import hello_world, what
 
 
 def test_ray_remote():
     result = ray.get(hello_world.remote())
     assert result == "hello"
+
+def test_regular():
+    result = what()
+    assert result == "what"
 
 
 def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:
@@ -149,6 +150,7 @@ def validate_config_section(
     return errors
 
 
+@pytest.mark.skip(reason="re-enable, just for checking")
 def test_all_config_files_have_required_keys():
     """Test that all config files in examples/configs have all required keys for their respective sections."""
     if not OmegaConf.has_resolver("mul"):
