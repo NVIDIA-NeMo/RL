@@ -16,6 +16,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.state import GlobalState
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -26,7 +27,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from nemo.tron.state import GlobalState
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict

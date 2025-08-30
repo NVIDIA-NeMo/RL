@@ -82,9 +82,13 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.3.0",
+
+    # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
+    # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
+    # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
+    "transformer-engine[pytorch]==2.5.0",
     "megatron-core",
-    "nemo-tron",
+    "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "vllm==0.10.0",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -134,9 +138,8 @@ test = [
 
 [tool.uv.sources]
 megatron-core = { workspace = true }
-nemo-tron = { workspace = true }
 nemo-automodel = { workspace = true }
-# The NeMo Run source to be used by nemo-tron
+megatron-bridge = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -154,8 +157,8 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc30
 [tool.uv.workspace]
 members = [
     "3rdparty/Megatron-LM-workspace",
-    "3rdparty/NeMo-workspace",
     "3rdparty/Automodel-workspace/Automodel",
+    "3rdparty/Megatron-Bridge-workspace",
 ]
 
 [[tool.uv.index]]
