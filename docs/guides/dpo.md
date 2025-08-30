@@ -34,7 +34,7 @@ uv run examples/run_dpo.py \
 
 Each DPO dataset class is expected to have the following attributes:
 1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
-```jsonc
+```json
 {
   "context": [], // list of dicts - The prompt message (including previous turns, if any)
   "completions": [ // list of dicts — The list of completions
