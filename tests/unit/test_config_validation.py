@@ -33,16 +33,20 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config_with_inheritance
 from nemo_rl.utils.logger import LoggerConfig
 
-from nemo_rl.foobar import hello_world, what
 
-
-def test_ray_remote():
+def test_ray_remote_hi():
     result = ray.get(hello_world.remote())
-    assert result == "hello"
+    assert result == "hello world3"
 
-def test_regular():
-    result = what()
-    assert result == "what"
+
+@ray.remote
+def hello_world():
+    return ray.get(hello.remote() + " world")
+
+
+@ray.remote
+def hello():
+    return "hello"
 
 
 def get_keys_from_typeddict(typed_dict_class: dict) -> Set[str]:
