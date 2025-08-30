@@ -138,6 +138,7 @@ class DynamicBatchingConfig(TypedDict):
 
 class PolicyConfig(TypedDict):
     model_name: str
+    model_kwargs: NotRequired[dict[str, Any]]
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
