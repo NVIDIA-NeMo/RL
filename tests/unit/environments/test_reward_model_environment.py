@@ -123,32 +123,50 @@ class TestRewardModelEnvironment:
         assert reward_model_env is not None
         assert hasattr(reward_model_env, "shutdown")
 
-    def test_reward_model_environment_preprocess_data(self, reward_model_env):
+    @pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+    def test_reward_model_environment_preprocess_data(
+        self, reward_model_env, batch_size
+    ):
         """
-        Test the reward model environment's ability to preprocess data.
+        Test the reward model environment's ability to preprocess data with different batch sizes.
 
         This test verifies that the environment can preprocess conversation
         data correctly, including tokenization, formatting, and batching.
-        It ensures that the output format is compatible with the reward model.
+        It ensures that the output format is compatible with the reward model
+        and works correctly with different batch sizes, including edge cases like batch_size=1.
+
+        Args:
+            reward_model_env: The reward model environment fixture.
+            batch_size: The batch size to test (1, 2, 4, 8).
         """
+        # Create message log batch with the specified batch size
         message_log_batch = [
             [
-                {"role": "user", "content": "What is the capital of France?"},
-                {"role": "assistant", "content": "The capital of Brazil is Brasilia."},
-            ],
+                {
+                    "role": "user",
+                    "content": f"What is the capital of France? (test {i})",
+                },
+                {
+                    "role": "assistant",
+                    "content": f"The capital of Brazil is Brasilia. (response {i})",
+                },
+            ]
+            for i in range(batch_size)
         ]
+
         # Use remote call for Ray Actor
         future = reward_model_env.preprocess_data.remote(message_log_batch)
         output = ray.get(future)
 
-        target_length = 29
+        target_length = 39
         assert output is not None
         assert output["input_ids"] is not None
         assert output["input_lengths"] is not None
 
-        assert output["input_ids"].shape == (1, target_length)
-        assert output["input_lengths"].shape == (1,)
-        assert output["input_lengths"][0] == target_length
+        # Verify the output shapes match the batch size
+        assert output["input_ids"].shape == (batch_size, target_length)
+        assert output["input_lengths"].shape == (batch_size,)
+        assert all(length == target_length for length in output["input_lengths"])
 
     def test_reward_model_environment_generate_rewards(self, reward_model_env):
         """
