@@ -65,7 +65,8 @@ class RewardModelEnvironmentConfig(TypedDict):
     generation: Optional[VllmConfig] = None
 
 
-@ray.remote
+# Nested ray actor with GPU will have some issues when init.
+# So we directly inherit from Policy and EnvironmentInterface and not use ray.remote.
 class RewardModelEnvironment(Policy, EnvironmentInterface):
     """Environment that uses a reward model to score conversations.
 

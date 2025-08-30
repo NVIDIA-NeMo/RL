@@ -100,7 +100,7 @@ def reward_model_env():
     finally:
         if env_actor:
             try:
-                env_actor.shutdown.remote()
+                env_actor.shutdown()
             except Exception as e:
                 print(f"Warning: Error during actor shutdown: {e}")
 
@@ -145,7 +145,7 @@ class TestRewardModelEnvironment:
             ],
         ]
         # Use remote call for Ray Actor
-        future = reward_model_env.preprocess_data.remote(message_log_batch)
+        future = reward_model_env.preprocess_data(message_log_batch)
         output = ray.get(future)
 
         target_length = 29
@@ -189,8 +189,7 @@ class TestRewardModelEnvironment:
         ]
 
         # Execute the environment step
-        future = reward_model_env.step.remote(message_log_batch, [])
-        output = ray.get(future)
+        output = reward_model_env.step(message_log_batch, [])
 
         # Verify the reward model name
         assert REWARD_MODEL_NAME == "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
