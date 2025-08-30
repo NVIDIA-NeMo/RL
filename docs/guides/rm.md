@@ -22,3 +22,61 @@ The default YAML config shares the same base template as the SFT config but incl
 ## Datasets
 
 By default, NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+## Using Reward Models as Environments
+
+Trained reward models can be used as environments in GRPO training for reinforcement learning from human feedback (RLHF). This allows you to use your trained reward model to provide rewards during policy optimization.
+
+### Reward Model Environment
+
+The Reward Model Environment provides a standardized interface for using trained reward models in RL training:
+
+```python
+from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
+
+env_config = {
+    "enabled": True,
+    "model_name": "path/to/your/trained/reward/model",
+    "tokenizer": {"name": "path/to/your/trained/reward/model"},
+    "precision": "bfloat16",
+    "batch_size": 32,
+    "resources": {"gpus_per_node": 1, "num_nodes": 1},
+    "reward_model_cfg": {
+        "enabled": True,
+        "reward_model_type": "bradley_terry",
+    },
+}
+
+reward_env = RewardModelEnvironment(env_config)
+```
+
+### Integration with GRPO
+
+To use your trained reward model with GRPO, you can use the [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) script:
+
+```bash
+# Run GRPO training with your trained reward model
+uv run examples/run_grpo_rm.py --config examples/configs/grpo_rm_1B.yaml
+```
+
+### Configuration
+
+In your GRPO configuration, specify the reward model environment:
+
+```yaml
+env:
+  reward_model:
+    enabled: true
+    model_name: "path/to/your/trained/reward/model"
+    tokenizer:
+      name: "path/to/your/trained/reward/model"
+    precision: "bfloat16"
+    batch_size: 32
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+```
+
