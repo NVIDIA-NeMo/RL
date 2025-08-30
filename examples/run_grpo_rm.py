@@ -34,8 +34,7 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
-from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 from nemo_rl.models.generation import configure_generation_config
@@ -160,14 +159,27 @@ def setup_data(
     )
     task_data_processors[task_name] = (reward_model_task_spec, hf_data_processor)
     print(f"OS envs: {dict(os.environ)}")
-    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["reward_model"])
+
+    # initialize cluster
+    reward_model_config = env_configs["reward_model"]
+    cluster = RayVirtualCluster(
+        name="grpo_reward_model_cluster",
+        bundle_ct_per_node_list=[reward_model_config["resources"]["gpus_per_node"]]
+        * reward_model_config["resources"]["num_nodes"],
+        use_gpus=True,
+        num_gpus_per_node=reward_model_config["resources"]["gpus_per_node"],
+        max_colocated_worker_groups=1,
+    )
+
+    reward_model_env = RewardModelEnvironment(
+        cluster=cluster,
+        config=reward_model_config,
+        tokenizer=tokenizer,
+        name_prefix="reward_model_policy",
+        init_optimizer=False,
+        init_reference_model=False,
+        weights_path=reward_model_config.get("checkpoint_path", None),
+    )
 
     # Add sleep to let reward model load before policy starts
     print("⏳ Waiting 120 seconds for reward model to load...")

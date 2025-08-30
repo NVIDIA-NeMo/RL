@@ -11,15 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
-import os
-
 import pytest
 import ray
 import torch
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
     RewardModelEnvironmentConfig,
@@ -73,17 +70,28 @@ def reward_model_env():
     env_actor = None
     try:
         assert ray.is_initialized()
+
+        # Initialize cluster
+        cluster = RayVirtualCluster(
+            name="grpo_reward_model_cluster",
+            bundle_ct_per_node_list=[basic_env_config["resources"]["gpus_per_node"]]
+            * basic_env_config["resources"]["num_nodes"],
+            use_gpus=True,
+            num_gpus_per_node=basic_env_config["resources"]["gpus_per_node"],
+            max_colocated_worker_groups=1,
+        )
+
         # Create the actor with proper resource management
-        env_actor = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-            runtime_env={
-                "py_executable": get_actor_python_env(
-                    "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-                ),
-                "env_vars": dict(
-                    os.environ
-                ),  # Pass thru all user environment variables
-            }
-        ).remote(basic_env_config)
+        tokenizer = get_tokenizer(basic_env_config["tokenizer"])
+        env_actor = RewardModelEnvironment(
+            cluster=cluster,
+            config=basic_env_config,
+            tokenizer=tokenizer,
+            name_prefix="reward_model_policy",
+            init_optimizer=False,
+            init_reference_model=False,
+            weights_path=basic_env_config.get("checkpoint_path", None),
+        )
 
         yield env_actor
     except Exception as e:

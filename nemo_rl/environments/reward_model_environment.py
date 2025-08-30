@@ -12,20 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import ray
 import torch
 
-from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_formatted_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.vllm import VllmConfig
@@ -68,7 +66,7 @@ class RewardModelEnvironmentConfig(TypedDict):
 
 
 @ray.remote
-class RewardModelEnvironment(EnvironmentInterface):
+class RewardModelEnvironment(Policy, EnvironmentInterface):
     """Environment that uses a reward model to score conversations.
 
     This environment implements a reward model-based scoring system for reinforcement
@@ -84,53 +82,9 @@ class RewardModelEnvironment(EnvironmentInterface):
 
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.BASE
 
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize the reward model environment.
-
-        Args:
-            config: Configuration dictionary containing reward model settings.
-                   Must include model_name, tokenizer, resources, and other
-                   required parameters as defined in RewardModelEnvironmentConfig.
-        """
-        print("🚀 REWARD MODEL ENVIRONMENT INITIALIZATION STARTED")
-        print("=" * 60)
-        print(f"📋 Received config: {config}")
-
-        self.config = config
-        # Remove CUDA_VISIBLE_DEVICES to let ray fully control the GPU allocation
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        self.virtual_cluster = RayVirtualCluster(
-            name="grpo_reward_model_cluster",
-            bundle_ct_per_node_list=[self.config["resources"]["gpus_per_node"]]
-            * self.config["resources"]["num_nodes"],
-            use_gpus=True,
-            num_gpus_per_node=self.config["resources"]["gpus_per_node"],
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"🔧 Virtual cluster created with {self.virtual_cluster.get_placement_groups()} "
-        )
-        # Initialize reward model worker with proper resource management
-        print("🔧 Setting up reward model worker...")
-        weights_path = self.config.get("checkpoint_path", None)
-        # Initialize tokenizer
-        self.tokenizer = get_tokenizer(self.config["tokenizer"])
-
-        print(
-            f"✅ Tokenizer initialized with pad_token_id: {self.tokenizer.pad_token_id}"
-        )
-
-        self.reward_model_policy = Policy(
-            cluster=self.virtual_cluster,
-            config=self.config,
-            tokenizer=self.tokenizer,
-            name_prefix="reward_model_policy",
-            init_optimizer=False,
-            init_reference_model=False,
-            weights_path=weights_path,
-        )
-
-        print("✅ REWARD MODEL ENVIRONMENT INITIALIZATION COMPLETE")
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.tokenizer = kwargs["tokenizer"]
 
     def preprocess_data(
         self, message_logs: List[LLMMessageLogType]
@@ -175,7 +129,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        max_model_len = self.config["max_model_len"]
+        max_model_len = self.cfg["max_model_len"]
         if input_lengths.max().item() > max_model_len:
             print(
                 f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}"
@@ -222,7 +176,7 @@ class RewardModelEnvironment(EnvironmentInterface):
         reward_data = self.preprocess_data(message_logs)
 
         # Score the message logs
-        rewards = self.reward_model_policy.score(reward_data)["scores"]
+        rewards = self.score(reward_data)["scores"]
 
         # Create observations with meaningful content based on rewards (like math environment)
         observations = []
@@ -291,55 +245,3 @@ class RewardModelEnvironment(EnvironmentInterface):
                 )
 
         return batch, metrics
-
-    def get_worker_group(self):
-        return self.reward_model_policy.worker_group
-
-    def get_gpu_task_ids(self):
-        import os
-
-        print(
-            "reward_model_environment GPU IDs: {}".format(
-                ray.get_runtime_context().get_accelerator_ids()["GPU"]
-            )
-        )
-        print(
-            "reward_model_environment CUDA_VISIBLE_DEVICES: {}".format(
-                os.environ["CUDA_VISIBLE_DEVICES"]
-            )
-        )
-
-    def shutdown(self):
-        """Shutdown the reward model worker and virtual cluster.
-
-        This method properly cleans up resources by shutting down the reward model
-        policy and virtual cluster. It should be called when the environment is
-        no longer needed to prevent resource leaks.
-
-        Note:
-            The environment will also automatically call this method in its destructor,
-            but it's recommended to call it explicitly for better resource management.
-        """
-        if self.reward_model_policy is not None:
-            try:
-                self.reward_model_policy.shutdown()
-            except Exception as e:
-                print(f"Warning: Error shutting down reward model policy: {e}")
-            self.reward_model_policy = None
-
-        if self.virtual_cluster is not None:
-            try:
-                self.virtual_cluster.shutdown()
-            except Exception as e:
-                print(f"Warning: Error shutting down virtual cluster: {e}")
-            self.virtual_cluster = None
-
-    def __del__(self):
-        """Destructor that ensures proper cleanup when the object is garbage collected.
-
-        This is an extra safety net in case the user forgets to call shutdown() and
-        the pointer to the object is lost due to leaving a function scope. It's always
-        recommended that the user calls shutdown() explicitly for better resource
-        management.
-        """
-        self.shutdown()
