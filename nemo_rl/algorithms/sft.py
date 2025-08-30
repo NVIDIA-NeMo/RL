@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import warnings
 from pathlib import Path
@@ -270,32 +271,29 @@ def validate(
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
             if val_data.size < val_batch_size:
-                val_data_size = val_data.size
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                min_padding = (
+                    math.ceil(val_data.size / (val_mbs * dp_size)) * val_mbs * dp_size
+                ) - val_data.size
                 print(
-                    f"Padding last batch with {val_batch_size - val_data_size} padding samples"
+                    f"Padding last validation batch with {min_padding} padding samples"
                 )
                 val_data["input_ids"] = torch.cat(
                     [
                         val_data["input_ids"],
-                        val_data["input_ids"][-1]
-                        .unsqueeze(0)
-                        .repeat(val_batch_size - val_data_size, 1),
+                        val_data["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
                     ]
                 )
                 val_data["input_lengths"] = torch.cat(
                     [
                         val_data["input_lengths"],
-                        val_data["input_lengths"][-1]
-                        .unsqueeze(0)
-                        .repeat(val_batch_size - val_data_size),
+                        val_data["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
                     ]
                 )
                 val_data["token_mask"] = torch.cat(
                     [
                         val_data["token_mask"],
-                        val_data["token_mask"][-1]
-                        .unsqueeze(0)
-                        .repeat(val_batch_size - val_data_size, 1),
+                        val_data["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
                     ]
                 )
                 val_data["sample_mask"] = torch.cat(
@@ -303,7 +301,7 @@ def validate(
                         val_data["sample_mask"],
                         torch.zeros_like(val_data["sample_mask"][-1])
                         .unsqueeze(0)
-                        .repeat(val_batch_size - val_data_size),
+                        .repeat(min_padding),
                     ]
                 )
 
@@ -312,7 +310,7 @@ def validate(
                 val_data,
                 loss_fn,
                 eval_mode=True,
-                gbs=val_batch_size,
+                gbs=val_data.size,
                 mbs=val_mbs,
             )
 

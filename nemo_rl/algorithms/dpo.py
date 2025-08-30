@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -180,7 +181,7 @@ def setup(
                 "make_sequence_length_divisible_by"
             ],
         ),
-        drop_last=True,
+        drop_last=False,
     )
 
     # ==========================
@@ -290,12 +291,71 @@ def validate(
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
+            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size
+            if val_batch.size < val_batch_size * 2:
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                min_padding = (
+                    math.ceil(val_batch.size / (val_mbs * 2 * dp_size))
+                    * val_mbs
+                    * 2
+                    * dp_size
+                ) - val_batch.size
+                if min_padding > 0:
+                    print(
+                        f"Padding last validation batch with {min_padding} padding samples"
+                    )
+                    # Pad input_ids
+                    val_batch["input_ids"] = torch.cat(
+                        [
+                            val_batch["input_ids"],
+                            val_batch["input_ids"][-1]
+                            .unsqueeze(0)
+                            .repeat(min_padding, 1),
+                        ]
+                    )
+                    # Pad input_lengths
+                    val_batch["input_lengths"] = torch.cat(
+                        [
+                            val_batch["input_lengths"],
+                            val_batch["input_lengths"][-1]
+                            .unsqueeze(0)
+                            .repeat(min_padding),
+                        ]
+                    )
+                    # Pad token_mask
+                    val_batch["token_mask"] = torch.cat(
+                        [
+                            val_batch["token_mask"],
+                            val_batch["token_mask"][-1]
+                            .unsqueeze(0)
+                            .repeat(min_padding, 1),
+                        ]
+                    )
+                    # Pad sample_mask
+                    val_batch["sample_mask"] = torch.cat(
+                        [
+                            val_batch["sample_mask"],
+                            torch.zeros_like(val_batch["sample_mask"][-1])
+                            .unsqueeze(0)
+                            .repeat(min_padding),
+                        ]
+                    )
+                    # Pad reference_policy_logprobs
+                    val_batch["reference_policy_logprobs"] = torch.cat(
+                        [
+                            val_batch["reference_policy_logprobs"],
+                            val_batch["reference_policy_logprobs"][-1]
+                            .unsqueeze(0)
+                            .repeat(min_padding, 1),
+                        ]
+                    )
+
             ## just run model fwd
             val_results = policy.train(
                 val_batch,
                 loss_fn,
                 eval_mode=True,
-                gbs=val_batch_size * 2,
+                gbs=val_batch.size,
                 mbs=val_mbs * 2,
             )
 
