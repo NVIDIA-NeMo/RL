@@ -231,6 +231,9 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
 
 def preference_collate_fn(
     data_batch: list[DPODatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+    add_loss_mask: bool,
 ) -> BatchedDataDict[Any]:
     """Collate function for preference data training.
 
@@ -240,9 +243,11 @@ def preference_collate_fn(
 
     Args:
         data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
-
+        tokenizer: Tokenizer for text processing
+        make_sequence_length_divisible_by: Make the sequence length divisible by this value
+        add_loss_mask: Whether to add a token_mask to the returned data
     Returns:
-        BatchedDataDict with message_log, length, loss_multiplier, task_name, and idx fields.
+        BatchedDataDict with input_ids, input_lengths, token_mask (optional), and sample_mask fields.
     """
     message_log = []
     length = []
@@ -272,31 +277,11 @@ def preference_collate_fn(
         batch_max_length=batch_max_length,
     )
 
-    return batch
-
-
-def dpo_collate_fn(
-    data_batch: list[DPODatumSpec],
-    tokenizer: TokenizerType,
-    make_sequence_length_divisible_by: int,
-) -> BatchedDataDict[Any]:
-    """Collate function for DPO training.
-
-    Args:
-        data_batch: List of data samples with message_log_chosen, message_log_rejected, length_chosen, length_rejected, loss_multiplier, idx, and task_name fields.
-        tokenizer: Tokenizer for text processing
-        make_sequence_length_divisible_by: Make the sequence length divisible by this value
-
-    Returns:
-        BatchedDataDict with input_ids, input_lengths, token_mask, and sample_mask fields.
-    """
-    batch = preference_collate_fn(data_batch)
-
-    ## add loss mask based on role to every message
-    add_loss_mask_to_message_log(
-        batch["message_log"],
-        only_unmask_final=True,
-    )
+    if add_loss_mask:
+        add_loss_mask_to_message_log(
+            batch["message_log"],
+            only_unmask_final=True,
+        )
 
     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
         batch["message_log"],
@@ -304,16 +289,17 @@ def dpo_collate_fn(
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
 
-    train_data: BatchedDataDict[Any] = BatchedDataDict(
+    data: BatchedDataDict[Any] = BatchedDataDict(
         {
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
-            "token_mask": cat_and_padded["token_loss_mask"],
             "sample_mask": batch["loss_multiplier"],
         }
     )
+    if add_loss_mask:
+        data["token_mask"] = cat_and_padded["token_loss_mask"]
 
-    return train_data
+    return data
 
 
 def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:

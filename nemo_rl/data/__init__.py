@@ -31,6 +31,8 @@ class DataConfig(TypedDict):
     shuffle: NotRequired[bool]
     seed: NotRequired[int]
     download_dir: NotRequired[str]
+    train_data_path: NotRequired[str]
+    val_data_paths: NotRequired[dict[str, str]]
 
 
 class MathDataConfig(DataConfig):

@@ -21,4 +21,84 @@ The default YAML config shares the same base template as the SFT config but incl
 
 ## Datasets
 
-By default, NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+Each RM dataset class is expected to have the following attributes:
+1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
+```json
+{
+  "context": [], // list of dicts - The prompt message (including previous turns, if any)
+  "completions": [ // list of dicts — The list of completions
+    {
+      "rank": 0, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    },
+    {
+      "rank": 1, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    }
+  ]
+}
+```
+2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
+
+Currently, RM training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
+```json
+{
+    "context": [
+        {
+            "role": "user",
+            "content": "What's the capital of France?"
+        },
+        {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        },
+        {
+            "role": "user",
+            "content": "Thanks! And what's the capital of Germany?"
+        }
+    ],
+    "completions": [
+        {
+            "rank": 0,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Berlin."
+                }
+            ]
+        },
+        {
+            "rank": 1,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Munich."
+                }
+            ]
+        }
+    ]
+}
+```
+
+NeMo RL provides a RM-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+```yaml
+data:
+  dataset_name: PreferenceDataset
+  train_data_path: <LocalPathToTrainingDataset>
+  val_data_paths:
+    <NameOfValidationDataset>: <LocalPathToValidationDataset>
+```
+with support for multiple validation sets achieved with:
+```yaml
+data:
+  dataset_name: PreferenceDataset
+  train_data_path: <LocalPathToTrainingDataset>
+  val_data_paths:
+    <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+```
+Please note:
+- If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
