@@ -85,7 +85,7 @@ jobs:
     uses: ./.github/workflows/_healthcheck_vm.yml
     with:
       vm: ${{ matrix.vm }}
-      n_gpus: ${{ matrix.n_gpus }}
+      n_gpus: "2"
       is_recheck: true
     secrets:
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
