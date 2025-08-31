@@ -22,6 +22,8 @@ loss_fn:
   use_importance_sampling_correction: false
   sequence_level_importance_ratios: false
   token_level_loss: true
+  # see https://arxiv.org/pdf/2506.09477
+  use_correct_grad_kl: false
 
 checkpointing:
   enabled: true
