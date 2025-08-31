@@ -27,11 +27,7 @@ jobs:
                 | select(.status == "online")
                 | select(.name | contains("cpu") | not)
                 | {
-                  "vm": .name,
-                  "n_gpus": [
-                    .labels[]
-                    | select(.name | endswith("gpu")) | .name
-                  ][0][:1]
+                  "vm": .name
                 }
               ]
             '
@@ -47,7 +43,7 @@ jobs:
     uses: ./.github/workflows/_healthcheck_vm.yml
     with:
       vm: ${{ matrix.vm }}
-      n_gpus: ${{ matrix.n_gpus }}
+      n_gpus: "2"
     secrets:
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_RELEASE_ENDPOINT: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
@@ -94,7 +90,7 @@ jobs:
           sleep $((WAIT_MINUTES * 60))
 
   recheck:
-    needs: wait-for-reboot
+    needs: [pre-flight, wait-for-reboot]
     if: ${{ always() && needs.wait-for-reboot.result == 'success' }}
     strategy:
       fail-fast: false
