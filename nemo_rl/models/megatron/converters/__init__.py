@@ -11,11 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    from megatron.bridge import AutoBridge  # noqa: F401
 
-    INSTALLED = True
-except Exception:
-    INSTALLED = False
+from .common import (
+    get_global_expert_num,
+    get_global_layer_num,
+    get_local_expert_num,
+    get_local_layer_num,
+)
 
-print(f"Megatron Bridge {INSTALLED=}")
+__all__ = [
+    "get_global_expert_num",
+    "get_global_layer_num",
+    "get_local_expert_num",
+    "get_local_layer_num",
+]

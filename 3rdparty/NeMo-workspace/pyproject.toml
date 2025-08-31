@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+
+[project]
+name = "nemo-tron"
+dynamic = ["dependencies", "version"]
+authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+description = "Standalone packaging for the NeMo Tron sub-module."
+requires-python = ">=3.10"
+# Dependencies will be managed in setup.py
