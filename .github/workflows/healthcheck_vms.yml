@@ -48,19 +48,39 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
+          # Debug: Check if token is available
+          if [[ -z "$GITHUB_TOKEN" ]]; then
+            echo "ERROR: GITHUB_TOKEN is empty - PAT secret may not be configured"
+            exit 1
+          fi
+
+          echo "Fetching runners from GitHub API..."
           RUNNERS=$(curl -L \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             ${{ github.api_url }}/repos/${{ github.repository }}/actions/runners)
 
-          OFFLINE_COUNT=$(echo $RUNNERS | jq '[.runners[] | select(.status == "offline")] | length')
+          # Debug: Check API response
+          if [[ -z "$RUNNERS" || "$RUNNERS" == "null" ]]; then
+            echo "ERROR: API response is empty or null"
+            echo "Response: $RUNNERS"
+            exit 1
+          fi
+
+          echo "API response received, checking for offline runners..."
+          OFFLINE_COUNT=$(echo "$RUNNERS" | jq -r '[.runners[]? | select(.status == "offline")] | length')
+
+          if [[ "$OFFLINE_COUNT" == "null" || -z "$OFFLINE_COUNT" ]]; then
+            echo "WARNING: Could not parse offline count, assuming no offline runners"
+            OFFLINE_COUNT=0
+          fi
 
           if [[ $OFFLINE_COUNT -gt 0 ]]; then
             echo "Found $OFFLINE_COUNT offline runners"
             echo "has_offline=true" >> "$GITHUB_OUTPUT"
           else
-            echo "All runners are online"
+            echo "All runners are online (checked $OFFLINE_COUNT offline)"
             echo "has_offline=false" >> "$GITHUB_OUTPUT"
           fi
 
