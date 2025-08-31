@@ -19,15 +19,17 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 ## modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
@@ -236,19 +238,33 @@ def convert_dcp_to_hf(
             f"HF checkpoint already exists at {hf_ckpt_path}. Delete it to run or set overwrite=True."
         )
 
-    os.makedirs(hf_ckpt_path, exist_ok=True)
-    weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
-    dcp_to_torch_save(dcp_ckpt_path, weights_path)
+    state_dict = {}
 
-    # Need to reload and save b/c the state dict is scoped inside the model key {"model": actual_state_dict}
-    state_dict = torch.load(weights_path)
+    _load_state_dict(
+        state_dict,
+        storage_reader=FileSystemReader(dcp_ckpt_path),
+        planner=_EmptyStateDictLoadPlanner(),
+        no_dist=True,
+    )
+
     assert set(state_dict.keys()) == {"model"}, (
         f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
     )
-    torch.save(state_dict["model"], weights_path)
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
-    config.save_pretrained(hf_ckpt_path)
+
+    for key, value in state_dict["model"].items():
+        if value.dtype == torch.float32:
+            state_dict["model"][key] = value.to(config.torch_dtype)
+
+    model = AutoModelForCausalLM.from_config(config)
+
+    model.save_pretrained(
+        hf_ckpt_path,
+        state_dict=state_dict["model"],
+        max_shard_size="5GB",
+        safe_serialization=True,
+    )
 
     # TODO: After the following PR gets merged:
     # https://github.com/NVIDIA-NeMo/RL/pull/148/files
