@@ -67,7 +67,7 @@ policy:
       # and fused to False
       foreach: False
       fused: False
-    
+
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
@@ -86,15 +86,15 @@ policy:
     moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
-    #gives ~20% training perf speedup with sequence packing 
-    apply_rope_fusion: True   
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
 
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6
       min_lr: 4.9999e-6
       weight_decay: 0.1
-      bf16: false
+      bf16: true
       fp16: false
       params_dtype: "float32"
 
