@@ -40,6 +40,7 @@ jobs:
     needs: healthcheck
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    environment: main
     outputs:
       has_offline: ${{ steps.check.outputs.has_offline }}
     steps:
