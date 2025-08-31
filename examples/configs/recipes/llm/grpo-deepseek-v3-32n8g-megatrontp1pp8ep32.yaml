@@ -1,0 +1,170 @@
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_steps: 20
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 10
+  val_at_start: false
+  max_val_samples: 16
+  val_batch_size: 4
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  token_level_loss: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-deepseek-v3-32n8g-megatrontp1pp8ep32
+  metric_name: val_reward
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/users/yifuw/hf_checkpoints/dsv3/DeepSeek-V3-BF16
+  tokenizer:
+    name: /lustre/fsw/portfolios/coreai/users/yifuw/hf_checkpoints/dsv3/DeepSeek-V3-BF16
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  precision: bfloat16
+  fsdp_offload_enabled: false
+  activation_checkpointing_enabled: false
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 0
+    activation_checkpointing: false
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 8
+    context_parallel_size: 1
+    pipeline_dtype: bfloat16
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0
+    apply_rope_fusion: false
+
+    optimizer:
+      optimizer: adam
+      lr: 5e-06
+      min_lr: 5e-07
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: float32
+
+      # adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-08
+
+      # sgd
+      sgd_momentum: 0.9
+
+      # distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: 1
+
+    converter_type: DeepseekV3ForCausalLM
+
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 13
+      lr_warmup_init: 5e-07
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      data_parallel_sharding_strategy: optim_grads_params
+      use_custom_fsdp: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1
+  optimizer: null
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1
+        total_iters: 13
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1
+        total_iters: 10000000000
+    - milestones:
+        - 13
+  generation:
+    backend: vllm
+    max_new_tokens: 512
+    temperature: 1
+    top_p: 1
+    top_k: null
+    stop_token_ids:
+      - 1
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 64
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: 512
+      enforce_eager: False
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+data:
+  max_input_seq_length: 512
+  prompt_file: examples/prompts/cot.txt
+  system_prompt_file: null
+  dataset_name: OpenMathInstruct-2
+env:
+  math:
+    num_workers: 8
+logger:
+  log_dir: logs/grpo-deepseek-v3-32n8g-megatrontp1pp8ep32
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: grpo-deepseek-v3-32n8g-megatrontp1pp8ep32
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
