@@ -764,6 +764,7 @@ def test_run_async_penguin_rollout(
 
     final_batch_dict = final_batch.get_dict()
     final_batch_dict.pop("message_log")
+    final_batch_dict["total_reward"] = final_batch_dict["total_reward"].tolist()
     with open("temp_rollout.json", "w") as f:
         import json
         json.dump(
