@@ -951,8 +951,8 @@ def run_async_penguin_rollout(
     )
 
     # Tensorize all token ids
-    _tensorize_token_ids(r["input_message_log"])
-    _tensorize_token_ids(r["message_log"])
+    [_tensorize_token_ids(r["input_message_log"]) for r in results]
+    [_tensorize_token_ids(r["message_log"]) for r in results]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
