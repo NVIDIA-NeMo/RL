@@ -97,8 +97,8 @@ openai_model:
 """
 
     config = PenguinConfig(
-        model_name=vllm_generation.cfg["model_name"],
-        base_urls=vllm_generation.dp_openai_server_base_urls,
+        model_name=penguin_vllm_generation.cfg["model_name"],
+        base_urls=penguin_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
     )
     env = Penguin.options(
