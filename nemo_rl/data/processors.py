@@ -87,6 +87,7 @@ def math_data_processor(
         "extra_env_info": extra_env_info,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
+        "original_problem": problem,
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
