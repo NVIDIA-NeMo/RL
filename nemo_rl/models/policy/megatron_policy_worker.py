@@ -22,6 +22,42 @@ from typing import Any, Iterator, Optional, TypeVar
 
 import ray
 import torch
+from megatron.bridge import AutoBridge
+from megatron.bridge.models.model_provider import get_model
+from megatron.bridge.training import fault_tolerance
+from megatron.bridge.training.checkpointing import (
+    checkpoint_exists,
+    init_checkpointing_context,
+    load_checkpoint,
+    maybe_finalize_async_save,
+    save_checkpoint,
+)
+from megatron.bridge.training.config import (
+    CheckpointConfig,
+    ConfigContainer,
+    DistributedDataParallelConfig,
+    LoggerConfig,
+    OptimizerConfig,
+    SchedulerConfig,
+    TokenizerConfig,
+    TrainingConfig,
+)
+from megatron.bridge.training.initialize import (
+    initialize_megatron,
+    set_jit_fusion_options,
+)
+from megatron.bridge.training.optim import setup_optimizer
+from megatron.bridge.training.setup import (
+    HAVE_FSDP2,
+    _update_model_config_funcs,
+)
+from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+from megatron.bridge.training.utils.train_utils import (
+    logical_and_across_model_parallel_group,
+    reduce_max_stat_across_model_parallel_group,
+)
+from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.custom_fsdp import (
@@ -56,34 +92,6 @@ from megatron.inference.text_generation.mcore_engine_server import (
     run_mcore_engine,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from nemo.tron import fault_tolerance
-from nemo.tron.checkpointing import checkpoint_exists, load_checkpoint, save_checkpoint
-from nemo.tron.config import (
-    CheckpointConfig,
-    ConfigContainer,
-    DistributedDataParallelConfig,
-    LoggerConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    TokenizerConfig,
-    TrainingConfig,
-)
-from nemo.tron.init import initialize_megatron, set_jit_fusion_options
-from nemo.tron.model import get_model_from_config
-from nemo.tron.optim import setup_optimizer
-from nemo.tron.setup import (
-    HAVE_FSDP2,
-    _init_checkpointing_context,
-    _update_model_config_funcs,
-)
-from nemo.tron.state import GlobalState
-from nemo.tron.tokenizers.tokenizer import build_tokenizer
-from nemo.tron.utils.async_utils import maybe_finalize_async_save
-from nemo.tron.utils.common_utils import get_rank_safe
-from nemo.tron.utils.train_utils import (
-    logical_and_across_model_parallel_group,
-    reduce_max_stat_across_model_parallel_group,
-)
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
 
@@ -105,12 +113,6 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
 )
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
-from nemo_rl.models.megatron.converters.common import MegatronToHFConverter
-from nemo_rl.models.megatron.refit_utils import (
-    gather_params,
-    get_local_key_to_global_keys,
-    get_param_info,
-)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -128,6 +130,59 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def broadcast_object_across_pp_ranks(obj):
+    """Broadcast an object across pipeline parallel ranks.
+
+    This utility function handles broadcasting an object from the rank that owns it
+    to all other pipeline parallel ranks. If only one rank has the object (non-None),
+    it will be broadcast to all other ranks.
+
+    Args:
+        obj: The object to broadcast. Can be None on ranks that don't own it.
+
+    Returns:
+        The object on all ranks (either the original or the broadcast copy).
+
+    Raises:
+        ValueError: If the object doesn't exist on any pipeline parallel rank.
+    """
+    pp_size = get_pipeline_model_parallel_world_size()
+    pp_group = get_pipeline_model_parallel_group()
+
+    if pp_size == 1:
+        return obj
+
+    # ------------------------------------------------------------------
+    # 1. Gather presence flags from all PP ranks to find the source rank
+    # ------------------------------------------------------------------
+    has_obj = obj is not None
+    obj_flags = [None] * pp_size
+    torch.distributed.all_gather_object(obj_flags, has_obj, group=pp_group)
+
+    # ------------------------------------------------------------------
+    # 2. Identify the owning rank (the only rank with True flag)
+    # ------------------------------------------------------------------
+    src_rank = None  # Rank *inside* the PP group
+    for rank, flag in enumerate(obj_flags):
+        if flag:
+            src_rank = rank
+            break
+
+    if src_rank is None:
+        raise ValueError("Object must exist on at least one PP rank")
+
+    # ------------------------------------------------------------------
+    # 3. Broadcast the object from the source rank to all ranks
+    # ------------------------------------------------------------------
+    # Use broadcast_object_list which is more robust than all_gather_object
+    obj_list = [obj]
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    global_src = pp_ranks[src_rank]
+    torch.distributed.broadcast_object_list(obj_list, src=global_src, group=pp_group)
+
+    return obj_list[0]
+
+
 def setup_megatron_model(
     policy_cfg: PolicyConfig,
     cfg: ConfigContainer,
@@ -139,19 +194,19 @@ def setup_megatron_model(
     state.cfg = cfg
     # TODO: Freeze state.cfg
 
+    cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
         cfg=cfg,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
-        gpu_visibility_externally_set=True,
     )
 
-    if cfg.ft_config and cfg.ft_config.enable_ft_package:
+    if cfg.ft and cfg.ft.enable_ft_package:
         fault_tolerance.setup(cfg, state)
-        fault_tolerance.maybe_setup_simulated_fault(cfg.ft_config)
+        fault_tolerance.maybe_setup_simulated_fault(cfg.ft)
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options(cfg.model_config, cfg.train_config.micro_batch_size)
+    set_jit_fusion_options(cfg.model, cfg.train.micro_batch_size)
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -170,62 +225,67 @@ def setup_megatron_model(
     torch.distributed.barrier()
 
     # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = _init_checkpointing_context(cfg.checkpoint_config)
+    checkpointing_context = init_checkpointing_context(cfg.checkpoint)
 
     # Tokenizer
     build_tokenizer(
-        cfg.tokenizer_config,
-        make_vocab_size_divisible_by=cfg.model_config.make_vocab_size_divisible_by
-        // cfg.model_config.tensor_model_parallel_size,
-        tensor_model_parallel_size=cfg.model_config.tensor_model_parallel_size,
+        cfg.tokenizer,
+        make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
+        // cfg.model.tensor_model_parallel_size,
+        tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
     )
-    if not cfg.model_config.vocab_size:
-        cfg.model_config.vocab_size = cfg.tokenizer_config.padded_vocab_size
+    if not cfg.model.vocab_size:
+        cfg.model.vocab_size = cfg.tokenizer.padded_vocab_size
 
     torch.distributed.barrier()
 
-    model_post_init_fns = []
+    pre_wrap_hook = []
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
-        def freeze_moe_router(model_module):
-            # Handle both wrapped (Float16Module) and unwrapped models
-            if isinstance(model_module, Float16Module):
-                model_module = model_module.module
-            for layer in model_module.decoder.layers:
-                if hasattr(layer.mlp, "router"):
-                    layer.mlp.router.weight.requires_grad = False
+        def freeze_moe_router(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                for layer in model_module.decoder.layers:
+                    if hasattr(layer.mlp, "router"):
+                        layer.mlp.router.weight.requires_grad = False
 
         # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
         # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
-        def re_enable_float32_expert_bias(model_module):
-            # Handle both wrapped (Float16Module) and unwrapped models
-            if isinstance(model_module, Float16Module):
-                model_module = model_module.module
-            for layer in model_module.decoder.layers:
-                if hasattr(layer.mlp, "router"):
-                    layer.mlp.router._maintain_float32_expert_bias()
+        def re_enable_float32_expert_bias(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module
+                for layer in model_module.decoder.layers:
+                    if hasattr(layer.mlp, "router"):
+                        layer.mlp.router._maintain_float32_expert_bias()
 
-        model_post_init_fns.append(freeze_moe_router)
-        model_post_init_fns.append(re_enable_float32_expert_bias)
+        pre_wrap_hook.extend([freeze_moe_router, re_enable_float32_expert_bias])
 
     # Model, optimizer, and learning rate.
-    model = get_model_from_config(
-        cfg.model_config,
-        cfg.ddp_config,
-        use_torch_fsdp2=cfg.dist_config.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=cfg.rng_config.data_parallel_random_init,
-        model_post_init_fns=model_post_init_fns,
+    model = get_model(
+        cfg.model,
+        cfg.ddp,
+        use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        pre_wrap_hook=pre_wrap_hook,
         wrap_cast_model_output_to_fp32=(
             not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
         ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
-            optimizer_config=cfg.optimizer_config,
-            scheduler_config=cfg.scheduler_config,
+            optimizer_config=cfg.optimizer,
+            scheduler_config=cfg.scheduler,
             model=model,
-            use_gloo_process_groups=cfg.dist_config.use_gloo_process_groups,
+            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
         )
     else:
         optimizer = None
@@ -236,11 +296,11 @@ def setup_megatron_model(
 
     # Load checkpoint if applicable
     if (
-        cfg.checkpoint_config.load is not None
-        or cfg.checkpoint_config.pretrained_checkpoint is not None
+        cfg.checkpoint.load is not None
+        or cfg.checkpoint.pretrained_checkpoint is not None
     ) and (
-        checkpoint_exists(cfg.checkpoint_config.load)
-        or checkpoint_exists(cfg.checkpoint_config.pretrained_checkpoint)
+        checkpoint_exists(cfg.checkpoint.load)
+        or checkpoint_exists(cfg.checkpoint.pretrained_checkpoint)
     ):
         load_checkpoint(
             state,
@@ -248,7 +308,7 @@ def setup_megatron_model(
             optimizer,
             scheduler,
             checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist_config.use_torch_fsdp2,
+            skip_load_to_model_and_opt=HAVE_FSDP2 and cfg.dist.use_torch_fsdp2,
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
@@ -279,7 +339,9 @@ def destroy_parallel_state():
     # Reset async calls queue to prevent call_idx mismatches after distributed context recreation
     try:
         import nemo.tron.utils.async_utils as nemo_async_utils
-        from nemo.tron.utils.async_utils import AsyncCallsQueue
+        from megatron.core.dist_checkpointing.strategies.async_utils import (
+            AsyncCallsQueue,
+        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(nemo_async_utils._async_calls_queue, "call_idx", None)
@@ -425,44 +487,16 @@ class MegatronPolicyWorker:
         # Ensure clean slate before import
         destroy_parallel_state()
 
+        # Set for rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
-        if self.rank == 0:
-            if pt_checkpoint_exists:
-                print(
-                    f"Checkpoint already exists at {pretrained_path}. Skipping import."
-                )
-            else:
-                try:
-                    # Clean environment to prevent conflicts
-                    env_backup = {}
-                    env_vars_to_clean = [
-                        "MASTER_ADDR",
-                        "MASTER_PORT",
-                        "WORLD_SIZE",
-                        "LOCAL_RANK",
-                    ]
-                    for var in env_vars_to_clean:
-                        if var in os.environ:
-                            env_backup[var] = os.environ[var]
-                            del os.environ[var]
-
-                    import_model_from_hf_name(hf_model_name, pretrained_path)
-
-                    # Restore environment
-                    for var, val in env_backup.items():
-                        os.environ[var] = val
-
-                except Exception as e:
-                    print(f"Error importing model: {e}")
-                    raise
-                finally:
-                    # Force cleanup after import
-                    destroy_parallel_state()
-            pre_init_communication_queue.put(True)
+        # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
+        torch.distributed.init_process_group("nccl")
+        if pt_checkpoint_exists:
+            print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
         else:
-            pre_init_communication_queue.get()
-            pre_init_communication_queue.put(True)
-        destroy_parallel_state()
+            import_model_from_hf_name(
+                hf_model_name, pretrained_path, self.cfg["megatron_cfg"]
+            )
 
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
@@ -477,9 +511,11 @@ class MegatronPolicyWorker:
                 f"Pretrained run config not found at {pretrained_run_config} on rank={get_rank_safe()}. This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory not being mounted on this node. Please check "
             )
 
-        cfg_from_pretrained = ConfigContainer.from_yaml(pretrained_run_config)
-        model_cfg = cfg_from_pretrained.model_config
-        cfg_from_pretrained.logger_config = LoggerConfig()
+        cfg_from_pretrained = ConfigContainer.from_yaml(
+            pretrained_run_config, mode=0
+        )  # strict loading
+        model_cfg = cfg_from_pretrained.model
+        cfg_from_pretrained.logger = LoggerConfig()
 
         model_cfg.tensor_model_parallel_size = self.cfg["megatron_cfg"][
             "tensor_model_parallel_size"
@@ -569,18 +605,18 @@ class MegatronPolicyWorker:
             load_rng=False,
         )
         self.megatron_cfg = ConfigContainer(
-            model_config=model_cfg,
-            checkpoint_config=checkpoint_config,
-            logger_config=LoggerConfig(logging_level=0),
-            train_config=TrainingConfig(
+            model=model_cfg,
+            checkpoint=checkpoint_config,
+            logger=LoggerConfig(logging_level=0),
+            train=TrainingConfig(
                 micro_batch_size=1,  # ignored
                 global_batch_size=self.cfg["train_global_batch_size"],  # ignored
                 train_iters=1000,  # Default value for inference
             ),
-            optimizer_config=OptimizerConfig(
+            optimizer=OptimizerConfig(
                 **self.cfg["megatron_cfg"]["optimizer"],
             ),
-            ddp_config=DistributedDataParallelConfig(
+            ddp=DistributedDataParallelConfig(
                 check_for_nan_in_grad=True,
                 grad_reduce_in_fp32=self.cfg["megatron_cfg"][
                     "distributed_data_parallel_config"
@@ -601,11 +637,11 @@ class MegatronPolicyWorker:
                     "distributed_data_parallel_config"
                 ]["data_parallel_sharding_strategy"],
             ),
-            scheduler_config=SchedulerConfig(
+            scheduler=SchedulerConfig(
                 **self.cfg["megatron_cfg"]["scheduler"],
             ),
-            dataset_config=None,
-            tokenizer_config=TokenizerConfig(
+            dataset=None,
+            tokenizer=TokenizerConfig(
                 tokenizer_type="HuggingFaceTokenizer",
                 tokenizer_model=hf_model_name,
             ),
@@ -623,8 +659,8 @@ class MegatronPolicyWorker:
 
         # Set the param sync function for the model
         if (
-            self.megatron_cfg.ddp_config.overlap_param_gather
-            and self.megatron_cfg.ddp_config.align_param_gather
+            self.megatron_cfg.ddp.overlap_param_gather
+            and self.megatron_cfg.ddp.align_param_gather
         ):
             self.megatron_cfg.param_sync_func = [
                 model_chunk.start_param_sync for model_chunk in self.model
@@ -636,31 +672,31 @@ class MegatronPolicyWorker:
 
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
-            ref_ckpt_context = _init_checkpointing_context(ref_checkpoint_config)
+            ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
 
             # Create a separate megatron config for the reference model with the correct checkpoint config
             ref_megatron_cfg = ConfigContainer(
-                model_config=self.megatron_cfg.model_config,
-                checkpoint_config=ref_checkpoint_config,  # Use the reference checkpoint config
-                logger_config=self.megatron_cfg.logger_config,
-                train_config=self.megatron_cfg.train_config,
-                optimizer_config=self.megatron_cfg.optimizer_config,
-                ddp_config=self.megatron_cfg.ddp_config,
-                scheduler_config=self.megatron_cfg.scheduler_config,
-                dataset_config=self.megatron_cfg.dataset_config,
-                tokenizer_config=self.megatron_cfg.tokenizer_config,
+                model=self.megatron_cfg.model,
+                checkpoint=ref_checkpoint_config,  # Use the reference checkpoint config
+                logger=self.megatron_cfg.logger,
+                train=self.megatron_cfg.train,
+                optimizer=self.megatron_cfg.optimizer,
+                ddp=self.megatron_cfg.ddp,
+                scheduler=self.megatron_cfg.scheduler,
+                dataset=self.megatron_cfg.dataset,
+                tokenizer=self.megatron_cfg.tokenizer,
             )
 
             # Create a separate state object for the reference model
             ref_state = GlobalState()
             ref_state.cfg = ref_megatron_cfg
 
-            reference_model = get_model_from_config(
-                self.megatron_cfg.model_config,
-                self.megatron_cfg.ddp_config,
-                use_torch_fsdp2=self.megatron_cfg.dist_config.use_torch_fsdp2,
-                overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer_config.overlap_param_gather_with_optimizer_step,
-                data_parallel_random_init=self.megatron_cfg.rng_config.data_parallel_random_init,
+            reference_model = get_model(
+                self.megatron_cfg.model,
+                self.megatron_cfg.ddp,
+                use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
+                overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+                pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
                 wrap_cast_model_output_to_fp32=(
                     not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
                 ),
@@ -677,7 +713,7 @@ class MegatronPolicyWorker:
                     None,  # no scheduler
                     checkpointing_context=ref_ckpt_context,
                     skip_load_to_model_and_opt=HAVE_FSDP2
-                    and self.megatron_cfg.dist_config.use_torch_fsdp2,
+                    and self.megatron_cfg.dist.use_torch_fsdp2,
                 )
                 reference_model = reference_model[0]
                 reference_model.eval()
@@ -699,13 +735,13 @@ class MegatronPolicyWorker:
 
         _update_model_config_funcs(
             [self.model],
-            self.megatron_cfg.model_config,
-            self.megatron_cfg.ddp_config,
+            self.megatron_cfg.model,
+            self.megatron_cfg.ddp,
             self.optimizer,
-            align_grad_reduce=self.megatron_cfg.dist_config.align_grad_reduce,
+            align_grad_reduce=self.megatron_cfg.dist.align_grad_reduce,
         )
 
-        from nemo.tron.tokenizers.tokenizer import build_tokenizer
+        from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 
         tokenizer_config = TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
@@ -714,7 +750,7 @@ class MegatronPolicyWorker:
 
         self.megatron_tokenizer = build_tokenizer(
             tokenizer_config,
-            make_vocab_size_divisible_by=self.megatron_cfg.model_config.make_vocab_size_divisible_by
+            make_vocab_size_divisible_by=self.megatron_cfg.model.make_vocab_size_divisible_by
             // self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
             tensor_model_parallel_size=self.cfg["megatron_cfg"][
                 "tensor_model_parallel_size"
@@ -722,7 +758,9 @@ class MegatronPolicyWorker:
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
-        self.megatron_to_hf_converter = MegatronToHFConverter(hf_model_name, self.model)
+        self.megatron_bridge = AutoBridge.from_hf_pretrained(
+            hf_model_name, trust_remote_code=True
+        )
 
         self.should_disable_forward_pre_hook = (
             self.cfg["megatron_cfg"]["optimizer"]["use_distributed_optimizer"]
@@ -733,8 +771,16 @@ class MegatronPolicyWorker:
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
+        # refit_param_info_mcore combines the conversion tasks with the param memory
+        # [(mcore_param_name, estimated_memory), ...]
+        # Note: here param name is local param name, with local layer number and
+        # local expert id etc.
+        self.refit_conversion_tasks = (
+            None  # Meta data for conversion params from megatron bridge
+        )
+        self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
-        self.local_key_to_global_keys = None
+
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
@@ -1315,7 +1361,7 @@ class MegatronPolicyWorker:
                 f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
             )
 
-        model_cfg = self.megatron_cfg.model_config
+        model_cfg = self.megatron_cfg.model
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=model_cfg.hidden_size,
             inference_batch_times_seqlen_threshold=1000000,
@@ -1429,38 +1475,73 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
-        # Get parameter info for refit
-        # param_info: list of ((name, shape, dtype), size_in_bytes) tuples
-        self.refit_param_info_mcore = get_param_info(self.model, self.dtype)
+        # Get parameter info for refit / mcore side info
+        self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Create a map that maps any local parameter name to a list of global parameter names.
-        # This map is repeatedly used by parameter gatherring phase during refit of every step.
-        self.local_key_to_global_keys = get_local_key_to_global_keys(
-            self.model, state_dict_info=self.refit_param_info_mcore
-        )
-
-        # Collect tensor metadata for refit
+        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        for key, _ in self.refit_param_info_mcore:
-            # gather megatron params
-            gathered_megatron_params = gather_params(
-                self.model,
-                [key],
-                key_to_global_keys=self.local_key_to_global_keys,
-            )
-            # convert to hf params
-            gathered_hf_params = self.megatron_to_hf_converter.convert(
-                gathered_megatron_params, self.model.config
-            )
-            # collect tensor metadata
-            for name, tensor in gathered_hf_params.items():
-                if self.is_generation_colocated:
-                    metadata = (tensor.shape, tensor.dtype, tensor.numel())
-                else:
-                    metadata = (tensor.shape, tensor.dtype)
-                refit_param_info_hf[name] = metadata
-
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+        )
+        for name, tensor in hf_params_generator:
+            if self.is_generation_colocated:
+                metadata = (tensor.shape, tensor.dtype, tensor.numel())
+            else:
+                metadata = (tensor.shape, tensor.dtype)
+            refit_param_info_hf[name] = metadata
         return refit_param_info_hf
+
+    def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
+        """Calculate parameter information for refit.
+
+        Each task contains:
+        - param_name: Local parameter name without module prefixes
+        - mapping: MegatronParamMapping instance for weight transformation
+        - pp_rank: Pipeline-parallel rank owning the parameter
+        - vp_stage: Virtual-pipeline stage index
+        - megatron_module: Reference to Megatron model/submodule
+        - param_weight: Target parameter tensor for converted weight
+
+        Returns:
+            List of (parameter_name, size_in_bytes) tuples.
+        """
+        self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+            [self.model]
+        )
+        param_info = []
+
+        def calculate_size_in_bytes(param, tp_size, ep_size):
+            if param is None:
+                # need to broadcast for other pp ranks
+                size_in_bytes = None
+            else:
+                # Calculate size for this parameter
+                prec_to_bytes = {
+                    torch.bfloat16: 2,
+                    torch.float16: 2,
+                    torch.float32: 4,
+                }
+                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                size_in_bytes = (
+                    param.element_size() * param.numel() * tp_size * ep_size * scale
+                )
+
+            # Broadcast size_in_bytes across pipeline parallel ranks
+            return broadcast_object_across_pp_ranks(size_in_bytes)
+
+        for task in self.refit_conversion_tasks:
+            param_info.append(
+                (
+                    task.param_name,
+                    calculate_size_in_bytes(
+                        task.param_weight,
+                        task.mapping.tp_size,
+                        task.mapping.ep_size if task.mapping.is_expert else 1,
+                    ),
+                )
+            )
+        return param_info
 
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_weights_for_ipc")
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
@@ -1479,7 +1560,7 @@ class MegatronPolicyWorker:
         ## default to 20% to get some more speedup than 10%, OOM if set to 30%
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
-
+        self.refit_conversion_tasks_current_index = 0
         return self.refit_param_info_mcore, total_available_bytes
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
@@ -1497,15 +1578,19 @@ class MegatronPolicyWorker:
             del self._held_gather_buffer
             self._held_gather_buffer = None
 
-        gathered_megatron_params = gather_params(
-            self.model,
-            keys,
-            key_to_global_keys=self.local_key_to_global_keys,
-        )
+        # extract the conversion tasks in this pack
+        conversion_tasks = self.refit_conversion_tasks[
+            self.refit_conversion_tasks_current_index : self.refit_conversion_tasks_current_index
+            + len(keys)
+        ]
+        self.refit_conversion_tasks_current_index += len(keys)
 
-        gathered_hf_params = self.megatron_to_hf_converter.convert(
-            gathered_megatron_params, self.model.config
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+            conversion_tasks=conversion_tasks,
         )
+        gathered_hf_params = {name: tensor for name, tensor in hf_params_generator}
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
@@ -1576,21 +1661,14 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
         """Broadcast the weights for collective communication."""
-        for key, _ in self.refit_param_info_mcore:
-            # gather megatron params
-            gathered_megatron_params = gather_params(
-                self.model,
-                [key],
-                key_to_global_keys=self.local_key_to_global_keys,
-            )
-            # convert to hf params
-            gathered_hf_params = self.megatron_to_hf_converter.convert(
-                gathered_megatron_params, self.model.config
-            )
-            # broadcast from train rank0 worker to inference workers
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+        )
+        # broadcast from train rank0 worker to inference workers
+        for _, tensor in hf_params_generator:
             if self.rank == 0:
-                for _, tensor in gathered_hf_params.items():
-                    self.model_update_group.broadcast(tensor, src=0)
+                self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
@@ -1752,15 +1830,17 @@ class MegatronPolicyWorker:
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
 
-        original_save_path = self.mcore_state.cfg.checkpoint_config.save
+        original_save_path = self.mcore_state.cfg.checkpoint.save
         # save_dir = os.path.dirname(weights_path)
         release_name = os.path.basename(weights_path)
 
         try:
             maybe_finalize_async_save(
-                ckpt_cfg=self.mcore_state.cfg.checkpoint_config, blocking=False
+                self.mcore_state,
+                ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                blocking=False,
             )
-            self.mcore_state.cfg.checkpoint_config.save = weights_path
+            self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None
             scheduler_to_save = None
@@ -1790,7 +1870,8 @@ class MegatronPolicyWorker:
             )
             print(f"Saved checkpoint to {weights_path}")
             maybe_finalize_async_save(
-                ckpt_cfg=self.mcore_state.cfg.checkpoint_config,
+                self.mcore_state,
+                ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
                 terminate=True,
             )
@@ -1804,7 +1885,7 @@ class MegatronPolicyWorker:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
             raise
         finally:
-            self.mcore_state.cfg.checkpoint_config.save = original_save_path
+            self.mcore_state.cfg.checkpoint.save = original_save_path
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
