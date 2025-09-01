@@ -61,20 +61,24 @@ class PreferenceDataset:
     }
 
     Args:
-        train_ds_path: Path to the JSON file containing training data
-        val_ds_path: Path to the JSON file containing validation data
+        train_data_path: Path to the JSON file containing training data
+        val_data_path: Path to the JSON file containing validation data
         prompt_key: Key for the input prompt/context, set to None and not used for rank format
         chosen_key: Key for the preferred/winning response, set to None and not used for rank format
         rejected_key: Key for the non-preferred/losing response, set to None and not used for rank format
+        train_split: Split name for the training data, default is "train"
+        val_split: Split name for the validation data, default is "train"
     """
 
     def __init__(
         self,
-        train_ds_path: str,
-        val_ds_path: Optional[str] = None,
+        train_data_path: str,
+        val_data_path: Optional[str] = None,
         prompt_key: str = None,
         chosen_key: str = None,
         rejected_key: str = None,
+        train_split: str = "train",
+        val_split: str = "train",
     ):
         self.prompt_key = prompt_key
         self.chosen_key = chosen_key
@@ -89,18 +93,21 @@ class PreferenceDataset:
         else:
             print("Using the preference dataset in chosen - rejected format.")
 
-        train_ds = load_dataset("json", data_files=train_ds_path)["train"]
-        if val_ds_path:
-            val_ds = load_dataset("json", data_files=val_ds_path)["train"]
+        # load from json file
+        train_ds = load_dataset("json", data_files=train_data_path)[train_split]
+        if val_data_path:
+            val_ds = load_dataset("json", data_files=val_data_path)[val_split]
         else:
             val_ds = None
 
+        # format the dataset
         # convert chosen - rejected format to rank format
         if not is_rank_format:
             train_ds = train_ds.map(to_preference_data_format)
             if val_ds:
                 val_ds = val_ds.map(to_preference_data_format)
 
+        # store the formatted dataset
         self.formatted_ds = {
             "train": train_ds,
             "validation": val_ds,

@@ -88,11 +88,15 @@ def load_response_dataset(data_config, seed: int):
         )
     # fall back to load from JSON file
     else:
+        extra_kwargs = {}
+        for key in ["val_data_path", "train_split", "val_split"]:
+            if key in data_config:
+                extra_kwargs[key] = data_config[key]
         base_dataset = ResponseDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["input_key"],
-            data_config["output_key"],
+            train_data_path=data_config["train_data_path"],
+            input_key=data_config["input_key"],
+            output_key=data_config["output_key"],
+            **extra_kwargs,
         )
 
     return base_dataset
