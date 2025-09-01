@@ -66,8 +66,8 @@ jobs:
             echo "reboot_needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "✅ VM ${{ inputs.vm }} is healthy - found $NUM_GPUS/${{ inputs.n_gpus }} GPUs"
-            echo "main=degraded" >> "$GITHUB_OUTPUT"
-            echo "reboot_needed=true" >> "$GITHUB_OUTPUT"
+            echo "main=healthy" >> "$GITHUB_OUTPUT"
+            echo "reboot_needed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Save reboot status to artifact
