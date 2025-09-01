@@ -30,17 +30,20 @@ def load_preference_dataset(data_config):
         base_dataset = Tulu3PreferenceDataset()
     # fall back to load from JSON file
     else:
-        prompt_key = data_config["prompt_key"] if "prompt_key" in data_config else None
-        chosen_key = data_config["chosen_key"] if "chosen_key" in data_config else None
-        rejected_key = (
-            data_config["rejected_key"] if "rejected_key" in data_config else None
-        )
+        extra_kwargs = {}
+        for key in [
+            "val_data_path",
+            "prompt_key",
+            "chosen_key",
+            "rejected_key",
+            "train_split",
+            "val_split",
+        ]:
+            if key in data_config:
+                extra_kwargs[key] = data_config[key]
         base_dataset = PreferenceDataset(
-            train_ds_path=data_config["train_data_path"],
-            val_ds_path=data_config["val_data_path"],
-            prompt_key=prompt_key,
-            chosen_key=chosen_key,
-            rejected_key=rejected_key,
+            train_data_path=data_config["train_data_path"],
+            **extra_kwargs,
         )
 
     return base_dataset
