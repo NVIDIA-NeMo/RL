@@ -19,6 +19,7 @@ TEMP_DIR="/tmp/llada_hf_converted"
 SERVER_MODE="batch"  # "batch" or "streaming"
 BATCH_SIZE=8
 MAX_WAIT_TIME=0.1
+VERBOSE=false
 
 # Default values - SLURM
 LOCAL_MODE=false
@@ -80,6 +81,7 @@ show_usage() {
     echo ""
     echo "Execution Mode:"
     echo "  --local                 Run locally (default: run as SLURM job)"
+    echo "  --verbose               Enable verbose debug logging (helpful for troubleshooting)"
     echo ""
     echo "SLURM Job Options (ignored with --local):"
     echo "  --job-name NAME         SLURM job name (default: $JOB_NAME)"
@@ -111,6 +113,9 @@ show_usage() {
     echo ""
     echo "  # High-throughput batch server"
     echo "  $0 --local --model-path /path/to/model --batch-size 32 --max-wait-time 0.05"
+    echo ""
+    echo "  # Debug server with verbose logging"
+    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --verbose"
     echo ""
     echo "Performance Tips:"
     echo "  • Batch server provides 3-5x speedup for evaluation workloads"
@@ -172,6 +177,10 @@ while [[ $# -gt 0 ]]; do
         # Execution mode
         --local)
             LOCAL_MODE=true
+            shift 1
+            ;;
+        --verbose)
+            VERBOSE=true
             shift 1
             ;;
         # SLURM options
@@ -303,6 +312,11 @@ fi
 # Add batch-specific arguments
 if [[ "$SERVER_MODE" == "batch" ]]; then
     LLADA_ARGS="$LLADA_ARGS --batch-size '$BATCH_SIZE' --max-wait-time '$MAX_WAIT_TIME'"
+fi
+
+# Add verbose flag if enabled
+if [[ "$VERBOSE" == true ]]; then
+    LLADA_ARGS="$LLADA_ARGS --verbose"
 fi
 
 # Function to run locally
@@ -603,6 +617,10 @@ if [[ "$LOCAL_MODE" == true ]]; then
     echo "  💻 Execution mode: LOCAL"
 else
     echo "  🖥️  Execution mode: SLURM"
+fi
+
+if [[ "$VERBOSE" == true ]]; then
+    echo "  🔍 Verbose logging: ENABLED (detailed debugging)"
 fi
 
 echo "=============================================================="
