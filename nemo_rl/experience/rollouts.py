@@ -941,7 +941,7 @@ def run_async_penguin_rollout(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["message_log"] for r in results],
-            "total_reward": torch.stack([r["reward"] for r in results]),
+            "total_reward": torch.stack([r["full_result"]["reward"] for r in results]),
         }
     )
 
@@ -949,7 +949,7 @@ def run_async_penguin_rollout(
     batch_size = len(penguin_rows)
     all_sample_metrics = [
         {
-            "total_reward": r["reward"]
+            "total_reward": r["full_result"]["reward"]
         }
         for r in results
     ]
