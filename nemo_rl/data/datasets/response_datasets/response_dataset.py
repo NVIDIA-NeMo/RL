@@ -19,7 +19,23 @@ from datasets import load_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class PromptResponseDataset:
+class ResponseDataset:
+    """Dataset class for response data which can be loaded from a JSON file.
+
+    This class handles loading of response data for SFT and RL training.
+    The input JSON files should contain examples with the following structure:
+    {
+        input_key: str,     # The input prompt/context
+        output_key: str,    # The output response/answer
+    }
+
+    Args:
+        train_ds_path: Path to the JSON file containing training data
+        val_ds_path: Path to the JSON file containing validation data
+        input_key: Key for the input text
+        output_key: Key for the output text
+    """
+
     def __init__(
         self,
         train_ds_path: str,
@@ -41,9 +57,7 @@ class PromptResponseDataset:
             "validation": formatted_val_dataset,
         }
 
-        self.task_spec = TaskDataSpec(
-            "json_dataset",
-        )
+        self.task_spec = TaskDataSpec(task_name="json_dataset")
 
     def add_messages_key(
         self, example: dict[str, Any]
