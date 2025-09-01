@@ -31,12 +31,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.penguin import Penguin, PenguinConfig
 
 # cluster and tokenizer are fixture imports
-from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer, configure_http_server_config
+from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer as penguin_tokenizer, configure_http_server_config
 
 
 @pytest.fixture(scope="function")
-def vllm_generation(cluster, tokenizer):
-    vllm_config = configure_http_server_config(tokenizer)
+def penguin_vllm_generation(cluster, penguin_tokenizer):
+    vllm_config = configure_http_server_config(penguin_tokenizer)
     vllm_config["vllm_cfg"]["max_model_len"] = 16_384
     vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
         "enable_auto_tools": True,
@@ -44,7 +44,7 @@ def vllm_generation(cluster, tokenizer):
     }
 
     # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
-    chat_template = tokenizer.chat_template
+    chat_template = penguin_tokenizer.chat_template
     to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
             {%- if loop.last or (not loop.last and reasoning_content) %}
                 {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
@@ -59,8 +59,8 @@ def vllm_generation(cluster, tokenizer):
         to_replace,
         r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
     )
-    tokenizer.chat_template = chat_template
-    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
+    penguin_tokenizer.chat_template = chat_template
+    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = penguin_tokenizer.chat_template
 
     vllm_generation = VllmGeneration(cluster, vllm_config)
 
@@ -70,7 +70,7 @@ def vllm_generation(cluster, tokenizer):
 
 
 @pytest.fixture(scope="function")
-def penguin(vllm_generation):
+def penguin(penguin_vllm_generation):
     """Create a Penguin actor for testing."""
 
     yaml_str = r"""multineedle_resources_server:
