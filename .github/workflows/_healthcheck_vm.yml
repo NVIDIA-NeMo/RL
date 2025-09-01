@@ -115,4 +115,4 @@ jobs:
           curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
 
           echo "Recheck detected persistent issues - stopping runner service to take VM offline"
-          echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'sleep 30 && cd /home/azureuser/actions-runner && ./svc.sh stop'
+          echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'nohup bash -c "sleep 30 && cd /home/azureuser/actions-runner && ./svc.sh stop" > /dev/null 2>&1 &'
