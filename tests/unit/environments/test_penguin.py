@@ -132,13 +132,11 @@ def penguin_sanity_test_data():
 def test_penguin_sanity(penguin, penguin_sanity_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
     actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
-    with open("temp_env.json", "w") as f:
-        json.dump(actual_result, f, indent=4)
-
     expected_result = penguin_sanity_test_data["expected_output"]
+
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
-        d.pop("full_result")
+        d.pop("full_result", None)
         return d
 
     def _standardize(l: list[dict]):
