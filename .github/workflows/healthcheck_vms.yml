@@ -15,9 +15,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
-          # Hardcoded for testing purposes
-          MATRIX='[{"vm": "azure-gpu-vm-runner2"}]'
-          echo "Using hardcoded test runner: $MATRIX"
+          RUNNERS=$(curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/runners)
+
+          MATRIX=$(echo $RUNNERS \
+            | jq -c '[
+                .runners[]
+                | select(.status == "online")
+                | select(.name | contains("cpu") | not)
+                | {
+                  "vm": .name
+                }
+              ]
+            '
+          )
           echo main=$MATRIX | tee -a "$GITHUB_OUTPUT"
 
   healthcheck:
