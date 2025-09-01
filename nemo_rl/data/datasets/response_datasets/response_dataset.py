@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Optional
 
 from datasets import load_dataset
 
@@ -30,31 +30,42 @@ class ResponseDataset:
     }
 
     Args:
-        train_ds_path: Path to the JSON file containing training data
-        val_ds_path: Path to the JSON file containing validation data
+        train_data_path: Path to the JSON file containing training data
+        val_data_path: Path to the JSON file containing validation data
         input_key: Key for the input text
         output_key: Key for the output text
+        train_split: Split name for the training data, default is "train"
+        val_split: Split name for the validation data, default is "train"
     """
 
     def __init__(
         self,
-        train_ds_path: str,
-        val_ds_path: str,
+        train_data_path: str,
+        val_data_path: Optional[str] = None,
         input_key: str = "input",
         output_key: str = "output",
+        train_split: str = "train",
+        val_split: str = "train",
     ):
-        train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
-        val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
-
         self.input_key = input_key
         self.output_key = output_key
 
-        formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-        formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+        # load from json file
+        train_ds = load_dataset("json", data_files=train_data_path)[train_split]
+        if val_data_path:
+            val_ds = load_dataset("json", data_files=val_data_path)[val_split]
+        else:
+            val_ds = None
 
+        # format the dataset
+        train_ds = train_ds.map(self.add_messages_key)
+        if val_ds:
+            val_ds = val_ds.map(self.add_messages_key)
+
+        # store the formatted dataset
         self.formatted_ds = {
-            "train": formatted_train_dataset,
-            "validation": formatted_val_dataset,
+            "train": train_ds,
+            "validation": val_ds,
         }
 
         self.task_spec = TaskDataSpec(task_name="json_dataset")
