@@ -931,7 +931,7 @@ def run_async_penguin_rollout(
         # generation_config["max_new_tokens"]
 
     penguin_environment = task_to_env["penguin"]
-    results = asyncio.run(penguin_environment.run_rollouts(penguin_rows))
+    results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
     final_batch = BatchedDataDict[DatumSpec](
         {
