@@ -76,11 +76,8 @@ jobs:
         run: |
           if [[ "${{ steps.status.outputs.reboot_needed }}" == "true" ]]; then
             echo "Rebooting VM..."
-            # Add some debug info
-            if [[ -z "${{ secrets.VM_KEY }}" ]]; then
-              echo "ERROR: VM_KEY secret is empty"
-              exit 1
-            fi
+            echo "Disconnecting runner from GitHub Actions..."
+            echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'cd /home/azureuser/actions-runner && ./svc.sh stop'
             echo "Scheduling reboot in 30 seconds to allow workflow to complete..."
             echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'nohup bash -c "sleep 30 && reboot" > /dev/null 2>&1 &'
             echo "Reboot scheduled, workflow will continue..."
