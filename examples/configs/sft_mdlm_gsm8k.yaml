@@ -152,6 +152,9 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: true
+  chat_key: "messages"
+  system_key: null
+  system_prompt: null
 
 logger:
   log_dir: "logs"  # Base directory for all logs
