@@ -10,6 +10,7 @@ sft:
   val_global_batch_size: 32
   val_micro_batch_size: 4
   val_at_start: true
+  val_drop_last: false
   seed: 42
 
 checkpointing:

@@ -161,7 +161,7 @@ def setup(
         batch_size=rm_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=preference_collate_fn,
-        drop_last=False,
+        drop_last=rm_config["val_drop_last"],
     )
 
     # ==========================

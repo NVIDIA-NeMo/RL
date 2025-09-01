@@ -160,7 +160,7 @@ def setup(
                 "make_sequence_length_divisible_by"
             ],
         ),
-        drop_last=True,
+        drop_last=dpo_config["val_drop_last"],
     )
 
     if last_checkpoint_path is not None:
