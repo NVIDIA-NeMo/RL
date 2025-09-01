@@ -123,21 +123,21 @@ def _register_builtin_algorithms():
     """Register all built-in generation algorithms."""
     try:
         from .basic import BasicGeneration
-        register_algorithm(BasicGeneration(), aliases=['no_cache', 'simple'])
+        register_algorithm(BasicGeneration(), aliases=['basic', 'no_cache', 'simple'])
         logger.debug("Registered basic generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register basic generation: {e}")
     
     try:
         from .prefix_cache import PrefixCacheGeneration
-        register_algorithm(PrefixCacheGeneration(), aliases=['prefix', 'cache'])
+        register_algorithm(PrefixCacheGeneration(), aliases=['prefix_cache', 'prefix', 'cache'])
         logger.debug("Registered prefix cache generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register prefix cache generation: {e}")
     
     try:
         from .dual_cache import DualCacheGeneration
-        register_algorithm(DualCacheGeneration(), aliases=['dual', 'double_cache'])
+        register_algorithm(DualCacheGeneration(), aliases=['dual_cache', 'dual', 'double_cache'])
         logger.debug("Registered dual cache generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register dual cache generation: {e}")
