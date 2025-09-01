@@ -234,7 +234,12 @@ def calculate_rewards(
 
     # Group messages by task type
     task_groups: dict[str, list[tuple[int, LLMMessageLogType]]] = {}
-    is_reward_model_env = isinstance(task_to_env[task_names[0]], RewardModelEnvironment)
+    if len(task_names) == 0:
+        is_reward_model_env = False
+    else:
+        is_reward_model_env = isinstance(
+            task_to_env[task_names[0]], RewardModelEnvironment
+        )
     for i, task_name in enumerate(task_names):
         assert is_reward_model_env == isinstance(
             task_to_env[task_name], RewardModelEnvironment
