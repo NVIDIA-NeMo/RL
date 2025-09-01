@@ -3,7 +3,7 @@ sft:
   ## total number of steps to train will equal
   ## min((max_num_epochs * len(train_dataloader)), max_num_steps)
   max_num_epochs: 100000000000
-  max_num_steps: 2000
+  max_num_steps: 100000000000
 
   val_period: 10
   val_batches: 8
@@ -74,8 +74,12 @@ policy:
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
         T_max: 1500
-        eta_min: 1e-6
-    - milestones: [100]
+        eta_min: ${mul:${policy.optimizer.kwargs.lr}, 0.1}
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 0.1
+        total_iters: 10000000000
+    - milestones: [100, 1600]
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
