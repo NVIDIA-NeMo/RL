@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.utils import get_tokenizer, maybe_pad_last_batch
-from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
