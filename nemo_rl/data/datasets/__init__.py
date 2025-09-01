@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from nemo_rl.data.datasets.eval_datasets import load_eval_dataset
 from nemo_rl.data.datasets.processed_dataset import AllTaskProcessedDataset
 from nemo_rl.data.datasets.utils import assert_no_double_bos
 
 __all__ = [
     "AllTaskProcessedDataset",
+    "load_eval_dataset",
     "assert_no_double_bos",
 ]
