@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from datasets import load_dataset
 
-from nemo_rl.data.hf_datasets.clevr import pil_to_base64
+from nemo_rl.data.datasets.utils import pil_to_base64
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
