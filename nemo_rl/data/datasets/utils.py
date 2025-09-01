@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import base64
+import io
 from typing import Union
 
 import torch
+from PIL import Image
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
@@ -38,3 +41,19 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
         print(
             f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
         )
+
+
+def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
+    """Converts a PIL Image object to a base64 encoded string.
+
+    Args:
+        image: The PIL Image object to convert.
+        format: The image format (e.g., "PNG", "JPEG"). Defaults to "PNG".
+
+    Returns:
+        A base64 encoded string representation of the image.
+    """
+    buffered = io.BytesIO()
+    image.save(buffered, format=format)
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{img_str}"
