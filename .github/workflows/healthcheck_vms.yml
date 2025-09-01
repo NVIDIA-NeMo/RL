@@ -49,8 +49,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
-          echo "Waiting 30 seconds for runners to reboot if necessary..."
-          sleep 30
+          echo "Waiting 60 seconds for runners to reboot if necessary..."
+          sleep 60
           echo "Fetching runners from GitHub API..."
           RUNNERS=$(curl -L \
             -H "Accept: application/vnd.github+json" \
