@@ -57,7 +57,7 @@ else:
 
 # Import NeMo-RL utilities for DCP handling (optional for local mode)
 try:
-    from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, load_checkpoint
+    from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf, load_checkpoint
     NEMO_RL_AVAILABLE = True
 except ImportError:
     NEMO_RL_AVAILABLE = False
@@ -274,14 +274,32 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/ll
     logger.info(f"Temp HF path: {temp_dir}")
     
     try:
-        # Convert DCP to HF format
-        hf_path = convert_dcp_to_hf(
-            dcp_ckpt_path=dcp_path,
-            hf_ckpt_path=temp_dir,
-            model_name_or_path=base_model,
-            tokenizer_name_or_path=base_model,
-            overwrite=True
-        )
+        # Check if this is a structured checkpoint (has weights/ and tokenizer/ subdirectories)
+        weights_dir = os.path.join(dcp_path, "weights")
+        tokenizer_dir = os.path.join(dcp_path, "tokenizer")
+        
+        if os.path.exists(weights_dir) and os.path.exists(tokenizer_dir):
+            logger.info(f"Detected structured DCP checkpoint with weights/ and tokenizer/ directories")
+            logger.info(f"  Weights: {weights_dir}")
+            logger.info(f"  Tokenizer: {tokenizer_dir}")
+            
+            # Use the new structured conversion function
+            hf_path = convert_structured_dcp_to_hf(
+                dcp_root_path=dcp_path,
+                hf_ckpt_path=temp_dir,
+                model_name_or_path=base_model,
+                overwrite=True
+            )
+        else:
+            logger.info(f"Using legacy DCP checkpoint format (direct weights path)")
+            # Convert DCP to HF format using the old method
+            hf_path = convert_dcp_to_hf(
+                dcp_ckpt_path=dcp_path,
+                hf_ckpt_path=temp_dir,
+                model_name_or_path=base_model,
+                tokenizer_name_or_path=base_model,
+                overwrite=True
+            )
         
         logger.info(f"Conversion completed. Loading from: {hf_path}")
         

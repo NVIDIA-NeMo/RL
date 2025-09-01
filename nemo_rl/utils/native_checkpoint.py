@@ -259,3 +259,84 @@ def convert_dcp_to_hf(
     tokenizer.save_pretrained(hf_ckpt_path)
 
     return hf_ckpt_path
+
+
+def convert_structured_dcp_to_hf(
+    dcp_root_path: str,
+    hf_ckpt_path: str,
+    model_name_or_path: str,
+    overwrite: bool = False,
+) -> str:
+    """Convert a structured DCP checkpoint to a Hugging Face checkpoint.
+    
+    This function supports the new directory structure:
+    dcp_root_path/
+    ├── optimizer/
+    │   ├── __0_0.distcp
+    │   └── ...
+    ├── tokenizer/
+    │   ├── chat_template.jinja
+    │   ├── special_tokens_map.json
+    │   ├── tokenizer_config.json
+    │   └── tokenizer.json
+    └── weights/
+        ├── __0_0.distcp
+        └── ...
+
+    Args:
+        dcp_root_path (str): Path to the root directory containing weights/, tokenizer/, and optimizer/ subdirs
+        hf_ckpt_path (str): Path to save HF checkpoint
+        model_name_or_path (str): Model name or path for config
+        overwrite (bool, optional): Whether to overwrite existing checkpoint. Defaults to False.
+
+    Returns:
+        str: Path to the saved HF checkpoint
+
+    Raises:
+        FileExistsError: If HF checkpoint already exists and overwrite is False
+        FileNotFoundError: If required directories (weights/, tokenizer/) are not found
+    """
+    if os.path.exists(hf_ckpt_path) and not overwrite:
+        raise FileExistsError(
+            f"HF checkpoint already exists at {hf_ckpt_path}. Delete it to run or set overwrite=True."
+        )
+
+    # Check for required directories
+    weights_dir = os.path.join(dcp_root_path, "weights")
+    tokenizer_dir = os.path.join(dcp_root_path, "tokenizer")
+    
+    if not os.path.exists(weights_dir):
+        raise FileNotFoundError(f"Weights directory not found: {weights_dir}")
+    if not os.path.exists(tokenizer_dir):
+        raise FileNotFoundError(f"Tokenizer directory not found: {tokenizer_dir}")
+
+    print(f"Converting structured DCP checkpoint to HuggingFace format...")
+    print(f"  Root path: {dcp_root_path}")
+    print(f"  Weights path: {weights_dir}")
+    print(f"  Tokenizer path: {tokenizer_dir}")
+    print(f"  HF output path: {hf_ckpt_path}")
+
+    os.makedirs(hf_ckpt_path, exist_ok=True)
+    
+    # Convert weights from DCP to pytorch format
+    weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
+    dcp_to_torch_save(weights_dir, weights_path)
+
+    # Need to reload and save b/c the state dict is scoped inside the model key {"model": actual_state_dict}
+    state_dict = torch.load(weights_path)
+    assert set(state_dict.keys()) == {"model"}, (
+        f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
+    )
+    torch.save(state_dict["model"], weights_path)
+
+    # Load and save model config
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config.save_pretrained(hf_ckpt_path)
+
+    # Copy tokenizer from the tokenizer directory
+    print(f"Loading tokenizer from: {tokenizer_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+    tokenizer.save_pretrained(hf_ckpt_path)
+    print(f"Tokenizer loaded and saved successfully")
+
+    return hf_ckpt_path
