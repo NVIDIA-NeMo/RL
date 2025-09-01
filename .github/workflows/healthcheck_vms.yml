@@ -32,7 +32,7 @@ jobs:
       n_gpus: "2"
     secrets:
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_RELEASE_ENDPOINT: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+      SLACK_GITHUB_CI_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
       VM_KEY: ${{ secrets.VM_KEY }}
       PAT: ${{ secrets.PAT }}
 
@@ -112,6 +112,6 @@ jobs:
       is_recheck: true
     secrets:
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_RELEASE_ENDPOINT: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+      SLACK_GITHUB_CI_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
       VM_KEY: ${{ secrets.VM_KEY }}
       PAT: ${{ secrets.PAT }}
