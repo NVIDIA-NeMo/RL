@@ -933,6 +933,11 @@ def run_async_penguin_rollout(
     penguin_environment = task_to_env["penguin"]
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
+    # TODO remove this
+    with open("temp_rollout_results.json", "w") as f:
+        import json
+        json.dump(results, f)
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["message_log"] for r in results],
