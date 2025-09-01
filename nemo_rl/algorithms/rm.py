@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
 import warnings
 from pathlib import Path
@@ -25,7 +24,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss_functions import (
     PreferenceLoss,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
@@ -276,48 +275,7 @@ def validate(
             # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size
             if val_data.size < val_batch_size * 2:
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                min_padding = (
-                    math.ceil(val_data.size / (val_mbs * 2 * dp_size))
-                    * val_mbs
-                    * 2
-                    * dp_size
-                ) - val_data.size
-                if min_padding > 0:
-                    print(
-                        f"Padding last validation batch with {min_padding} padding samples"
-                    )
-                    val_data["input_ids"] = torch.cat(
-                        [
-                            val_data["input_ids"],
-                            val_data["input_ids"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding, 1),
-                        ]
-                    )
-                    val_data["input_lengths"] = torch.cat(
-                        [
-                            val_data["input_lengths"],
-                            val_data["input_lengths"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding),
-                        ]
-                    )
-                    val_data["token_mask"] = torch.cat(
-                        [
-                            val_data["token_mask"],
-                            val_data["token_mask"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding, 1),
-                        ]
-                    )
-                    val_data["sample_mask"] = torch.cat(
-                        [
-                            val_data["sample_mask"],
-                            torch.zeros_like(val_data["sample_mask"][-1])
-                            .unsqueeze(0)
-                            .repeat(min_padding),
-                        ]
-                    )
+                val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs * 2)
 
             ## just run model fwd
             val_results = policy.train(

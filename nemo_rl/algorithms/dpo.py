@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 import os
 import warnings
 from collections import defaultdict
@@ -27,7 +26,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss_functions import (
     DPOLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, dpo_collate_fn
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -247,6 +246,10 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
                 else master_config["policy"]["train_micro_batch_size"] * 2
             )
 
+            dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+            if batch.size % (dp_size * micro_batch_size) != 0:
+                batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
+
             ## append ref policy logprobs to batch
             logprobs = policy.get_reference_policy_logprobs(
                 batch,
@@ -293,62 +296,11 @@ def validate(
         ):
             # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size
             if val_batch.size < val_batch_size * 2:
-                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                min_padding = (
-                    math.ceil(val_batch.size / (val_mbs * 2 * dp_size))
-                    * val_mbs
-                    * 2
-                    * dp_size
-                ) - val_batch.size
-                if min_padding > 0:
-                    print(
-                        f"Padding last validation batch with {min_padding} padding samples"
-                    )
-                    # Pad input_ids
-                    val_batch["input_ids"] = torch.cat(
-                        [
-                            val_batch["input_ids"],
-                            val_batch["input_ids"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding, 1),
-                        ]
-                    )
-                    # Pad input_lengths
-                    val_batch["input_lengths"] = torch.cat(
-                        [
-                            val_batch["input_lengths"],
-                            val_batch["input_lengths"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding),
-                        ]
-                    )
-                    # Pad token_mask
-                    val_batch["token_mask"] = torch.cat(
-                        [
-                            val_batch["token_mask"],
-                            val_batch["token_mask"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding, 1),
-                        ]
-                    )
-                    # Pad sample_mask
-                    val_batch["sample_mask"] = torch.cat(
-                        [
-                            val_batch["sample_mask"],
-                            torch.zeros_like(val_batch["sample_mask"][-1])
-                            .unsqueeze(0)
-                            .repeat(min_padding),
-                        ]
-                    )
-                    # Pad reference_policy_logprobs
-                    val_batch["reference_policy_logprobs"] = torch.cat(
-                        [
-                            val_batch["reference_policy_logprobs"],
-                            val_batch["reference_policy_logprobs"][-1]
-                            .unsqueeze(0)
-                            .repeat(min_padding, 1),
-                        ]
-                    )
+                val_batch = maybe_pad_last_batch(
+                    val_batch,
+                    policy.sharding_annotations.get_axis_size("data_parallel"),
+                    val_mbs * 2,
+                )
 
             ## just run model fwd
             val_results = policy.train(
