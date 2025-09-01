@@ -19,7 +19,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.hf_datasets.prompt_response_dataset import PromptResponseDataset
+from nemo_rl.data.datasets.response_datasets import ResponseDataset, SquadDataset
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def sample_data(request):
 @pytest.mark.parametrize("sample_data", [("input", "output")], indirect=True)
 def test_dataset_initialization(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(train_path, val_path)
+    dataset = ResponseDataset(train_path, val_path)
 
     assert dataset.input_key == "input"
     assert dataset.output_key == "output"
@@ -66,7 +66,7 @@ def test_dataset_initialization(sample_data):
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_custom_keys(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(
+    dataset = ResponseDataset(
         train_path, val_path, input_key="question", output_key="answer"
     )
 
@@ -78,7 +78,7 @@ def test_custom_keys(sample_data):
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_message_formatting(sample_data):
     train_path, val_path = sample_data
-    dataset = PromptResponseDataset(
+    dataset = ResponseDataset(
         train_path, val_path, input_key="question", output_key="answer"
     )
 
@@ -103,3 +103,39 @@ def test_message_formatting(sample_data):
     assert combined_message == "".join(
         message["content"] for message in first_example["messages"]
     )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.skip(reason="dataset download is flaky")
+def test_squad_dataset():
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+    squad_dataset = SquadDataset()
+
+    # check that the dataset is formatted correctly
+    for example in squad_dataset.formatted_ds["train"].take(5):
+        assert "messages" in example
+        assert len(example["messages"]) == 3
+
+        assert example["messages"][0]["role"] == "system"
+        assert example["messages"][1]["role"] == "user"
+        assert example["messages"][2]["role"] == "assistant"
+
+        template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+
+        ## check that applying chat template works as expected
+        default_templated = tokenizer.apply_chat_template(
+            example["messages"],
+            chat_template=template,
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+
+        assert default_templated == (
+            "Context: "
+            + example["messages"][0]["content"]
+            + " Question: "
+            + example["messages"][1]["content"]
+            + " Answer: "
+            + example["messages"][2]["content"]
+        )

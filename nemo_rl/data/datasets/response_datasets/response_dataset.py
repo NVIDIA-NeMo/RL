@@ -68,7 +68,7 @@ class ResponseDataset:
             "validation": val_ds,
         }
 
-        self.task_spec = TaskDataSpec(task_name="json_dataset")
+        self.task_spec = TaskDataSpec(task_name="ResponseDataset")
 
     def add_messages_key(
         self, example: dict[str, Any]
