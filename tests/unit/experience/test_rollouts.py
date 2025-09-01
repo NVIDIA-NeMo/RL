@@ -15,6 +15,8 @@
 import gc
 from copy import deepcopy
 
+from dataclasses import asdict
+
 import pytest
 import ray
 import torch
@@ -761,6 +763,7 @@ def test_run_async_penguin_rollout(
         generation_config=penguin_vllm_generation.cfg,
         max_rollout_turns=None,
     )
+    actual_result = asdict(actual_result)
 
     expected_result = {
         "final_batch": {

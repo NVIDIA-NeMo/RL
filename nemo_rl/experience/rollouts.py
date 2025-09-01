@@ -19,6 +19,8 @@ import asyncio
 import copy
 from typing import Any, Optional
 
+from dataclasses import dataclass
+
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -897,6 +899,13 @@ def _tensorize_token_ids(message_logs: list):
         m["token_ids"] = torch.tensor(m["token_ids"])
 
 
+@dataclass
+class AsyncPenguinRolloutResult:
+    input_ids: torch.Tensor
+    final_batch: BatchedDataDict[DatumSpec]
+    rollout_metrics: dict[str, Any]
+
+
 def run_async_penguin_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -906,7 +915,7 @@ def run_async_penguin_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
-) -> tuple[torch.Tensor, BatchedDataDict[DatumSpec], dict[str, Any]]:
+) -> AsyncPenguinRolloutResult:
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
     """
 
@@ -1011,4 +1020,8 @@ def run_async_penguin_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
-    return input_ids, final_batch, rollout_metrics
+    return AsyncPenguinRolloutResult(
+        input_ids=input_ids,
+        final_batch=final_batch,
+        rollout_metrics=rollout_metrics,
+    )

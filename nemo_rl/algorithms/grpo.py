@@ -610,11 +610,7 @@ def grpo_train(
                 # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                 if _should_use_penguin(master_config):
                     generation_config = master_config["policy"]["generation"]
-                    (
-                        input_ids,
-                        repeated_batch,
-                        rollout_metrics,
-                    ) = run_async_penguin_rollout(
+                    penguin_rollout_result = run_async_penguin_rollout(
                         policy_generation=policy_generation,
                         input_batch=repeated_batch,
                         tokenizer=tokenizer,
@@ -626,6 +622,9 @@ def grpo_train(
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
+                    input_ids = penguin_rollout_result.input_ids
+                    repeated_batch = penguin_rollout_result.final_batch
+                    rollout_metrics = penguin_rollout_result.rollout_metrics
                 # Use async rollouts if vLLM async engine is enabled
                 elif _should_use_async_rollouts(master_config):
                     (
