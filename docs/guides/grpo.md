@@ -117,7 +117,7 @@ Ensure you provide a mapping of tasks to their processors so the dataset knows w
 
 ## Environments
 
-GRPO supports various types of environments for different tasks, including **[Math](nemo_rl/environments/math_environment.py)**, **[Code](nemo_rl/environments/code_environment.py)**, and **[Reward Model](nemo_rl/environments/reward_model_environment.py)** environments. Each environment provides a standardized interface for reward computation and evaluation, enabling consistent training across diverse domains.
+GRPO supports various types of environments for different tasks, including **[Math](../../nemo_rl/environments/math_environment.py)**, **[Code](../../nemo_rl/environments/code_environment.py)**, and **[Reward Model](../../nemo_rl/environments/reward_model_environment.py)** environments. Each environment provides a standardized interface for reward computation and evaluation, enabling consistent training across diverse domains.
 
 For more information about environments, see the [Environments Guide](environments.md).
 
