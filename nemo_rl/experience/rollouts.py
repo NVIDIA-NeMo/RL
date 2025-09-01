@@ -892,6 +892,11 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
+def _tensorize_token_ids(message_logs: list):
+    for m in message_logs:
+        m["token_ids"] = torch.tensor(m["token_ids"])
+
+
 def run_async_penguin_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -944,6 +949,15 @@ def run_async_penguin_rollout(
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
         }
     )
+
+    # TODO it's still unclear what we want to do with the full result after we get the reward from it
+    # We need to report additional metrics and log stuff but that will come later.
+    for r in results:
+        r.pop("full_result")
+
+    # Tensorize all token ids
+    _tensorize_token_ids(r["input_message_log"])
+    _tensorize_token_ids(r["message_log"])
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
