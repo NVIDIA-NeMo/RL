@@ -103,9 +103,23 @@ class PreferenceDataset:
         # format the dataset
         # convert chosen - rejected format to rank format
         if not is_rank_format:
-            train_ds = train_ds.map(to_preference_data_format)
+            train_ds = train_ds.map(
+                to_preference_data_format,
+                fn_kwargs={
+                    "prompt_key": prompt_key,
+                    "chosen_key": chosen_key,
+                    "rejected_key": rejected_key,
+                },
+            )
             if val_ds:
-                val_ds = val_ds.map(to_preference_data_format)
+                val_ds = val_ds.map(
+                    to_preference_data_format,
+                    fn_kwargs={
+                        "prompt_key": prompt_key,
+                        "chosen_key": chosen_key,
+                        "rejected_key": rejected_key,
+                    },
+                )
 
         # store the formatted dataset
         self.formatted_ds = {
@@ -113,4 +127,4 @@ class PreferenceDataset:
             "validation": val_ds,
         }
 
-        self.task_spec = TaskDataSpec(task_name="json_dataset")
+        self.task_spec = TaskDataSpec(task_name="PreferenceDataset")
