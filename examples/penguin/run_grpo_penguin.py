@@ -52,6 +52,48 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+def setup_qwen3_penguin_config(config: MasterConfig, tokenizer):
+    generation_config = config["policy"]["generation"]
+
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
+        "enable_auto_tools": True,
+        "tool_parser": "hermes",
+    }
+
+    # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
+    chat_template = penguin_tokenizer.chat_template
+    to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}"""
+    assert to_replace in chat_template
+    chat_template = chat_template.replace(
+        to_replace,
+        r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
+    )
+    tokenizer.chat_template = chat_template
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
+
+
+def setup_penguin_config(config: MasterConfig, tokenizer):
+    generation_config = config["policy"]["generation"]
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    # Stop strings or token ids are not supported
+    generation_config["stop_strings"] = None
+    generation_config["stop_token_ids"] = None
+
+    setup_qwen3_penguin_config(config, tokenizer)
+
+
 def main() -> None:
     """Main entry point."""
     # Parse arguments
@@ -59,7 +101,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
+            os.path.dirname(__file__), "grpo_math_1B_vllm_http_server.yaml"
         )
 
     config = load_config(args.config)
@@ -72,10 +114,6 @@ def main() -> None:
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
     print("Applied CLI overrides")
 
-    # Print config
-    print("Final config:")
-    pprint.pprint(config)
-
     # Get the next experiment directory with incremented ID
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
     print(f"📊 Using log directory: {config['logger']['log_dir']}")
@@ -83,8 +121,6 @@ def main() -> None:
         print(
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
-
-    init_ray()
 
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
@@ -94,6 +130,18 @@ def main() -> None:
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], tokenizer
     )
+
+    # Penguin specific config setup.
+    setup_qwen3_penguin_config(config)
+
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
+
+    # We assert here since this is right after the final config has been materialized.
+    assert _should_use_penguin(config)
+
+    init_ray()
 
     print("\n▶ Setting up data...")
     input_jsonl_fpath = config["data"]["input_jsonl_fpath"]
@@ -109,19 +157,6 @@ def main() -> None:
     )
     val_dataset = None
 
-    # TODO move this after the setup and call .remote properly (need the base urls)
-    assert _should_use_penguin(config)
-    penguin = Penguin.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.penguin.Penguin"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(config["env"])  # We use the entire env here.
-    task_to_env = {"penguin": penguin}
-    val_task_to_env = task_to_env
-
     (
         policy,
         policy_generation,
@@ -134,6 +169,18 @@ def main() -> None:
         grpo_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
+    # TODO move this after the setup and call .remote properly (need the base urls)
+    penguin = Penguin.options(  # type: ignore # it's wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.penguin.Penguin"
+            ),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        }
+    ).remote(config["env"])  # We use the entire env here.
+    task_to_env = {"penguin": penguin}
+    val_task_to_env = task_to_env
 
     grpo_train(
         policy,
