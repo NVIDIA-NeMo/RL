@@ -70,6 +70,19 @@ jobs:
             echo "reboot_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Save reboot status to artifact
+        run: |
+          mkdir -p /tmp/healthcheck-results
+          echo "${{ steps.status.outputs.reboot_needed }}" > /tmp/healthcheck-results/${{ inputs.vm }}-reboot-needed.txt
+          echo "${{ steps.status.outputs.main }}" > /tmp/healthcheck-results/${{ inputs.vm }}-status.txt
+
+      - name: Upload healthcheck results
+        uses: actions/upload-artifact@v4
+        with:
+          name: healthcheck-${{ inputs.vm }}
+          path: /tmp/healthcheck-results/
+          retention-days: 1
+
       - name: Take Action on Issues
         if: ${{ (steps.status.outputs.main == 'degraded' || failure()) && inputs.is_recheck != true }}
         continue-on-error: true

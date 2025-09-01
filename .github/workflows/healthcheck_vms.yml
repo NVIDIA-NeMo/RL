@@ -79,7 +79,7 @@ jobs:
           sleep $((WAIT_MINUTES * 60))
 
   recheck:
-    needs: [preflight, wait-for-reboot]
+    needs: [pre-flight, wait-for-reboot]
     if: ${{ always() && needs.wait-for-reboot.result == 'success' }}
     strategy:
       fail-fast: false
