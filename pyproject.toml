@@ -55,9 +55,11 @@ dependencies = [
 [project.optional-dependencies]
 # Currently unused, but after https://github.com/NVIDIA-NeMo/RL/issues/501 is resolved, we should use this for the "BASE" PYEXECUTABLE
 automodel = [
+    "nemo-automodel",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
+    "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.7.4.post1",
     "mamba-ssm",
     "causal-conv1d",
@@ -80,9 +82,13 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.3.0",
+
+    # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
+    # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
+    # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
+    "transformer-engine[pytorch]==2.5.0",
     "megatron-core",
-    "nemo-tron",
+    "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "vllm==0.10.0",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -117,7 +123,7 @@ docs = [
     "nvidia-sphinx-theme",  # Our NVIDIA theme
 ]
 dev = [
-    "pre-commit==3.6.0",
+    "pre-commit>=4.2.0",
     "ruff==0.9.9",
     "types-PyYAML",
     "types-requests",
@@ -132,8 +138,8 @@ test = [
 
 [tool.uv.sources]
 megatron-core = { workspace = true }
-nemo-tron = { workspace = true }
-# The NeMo Run source to be used by nemo-tron
+nemo-automodel = { workspace = true }
+megatron-bridge = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -151,7 +157,8 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc30
 [tool.uv.workspace]
 members = [
     "3rdparty/Megatron-LM-workspace",
-    "3rdparty/NeMo-workspace",
+    "3rdparty/Automodel-workspace/Automodel",
+    "3rdparty/Megatron-Bridge-workspace",
 ]
 
 [[tool.uv.index]]
@@ -160,7 +167,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -192,6 +199,7 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
+    "run_first: marks tests that should run before others",
     "mcore: marks tests that require the mcore extra",
     "hf_gated: marks tests that require HuggingFace token access for gated models",
 ]
@@ -229,4 +237,3 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
-
