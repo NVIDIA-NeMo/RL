@@ -205,9 +205,9 @@ env:
     tokenizer:
       name: ${env.reward_model.model_name}
     precision: "bfloat16"
-    batch_size: 32
+    batch_size: ${policy.train_micro_batch_size}
     checkpoint_path: null
-    max_model_len: ${policy.max_total_sequence_length}
+    max_model_len: 2048
     logprob_batch_size: ${policy.logprob_batch_size}
     resources:
       gpus_per_node: 1
