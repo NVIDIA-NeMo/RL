@@ -13,13 +13,10 @@
 # limitations under the License.
 
 
-import os
-
 import pytest
 import ray
 import torch
 
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
     RewardModelEnvironmentConfig,
@@ -74,18 +71,7 @@ def reward_model_env():
     env_actor = None
     try:
         assert ray.is_initialized()
-        # Create the actor with proper resource management
-        env_actor = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-            runtime_env={
-                "py_executable": get_actor_python_env(
-                    "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-                ),
-                "env_vars": dict(
-                    os.environ
-                ),  # Pass thru all user environment variables
-            }
-        ).remote(basic_env_config)
-
+        env_actor = RewardModelEnvironment(basic_env_config)
         yield env_actor
     except Exception as e:
         print(f"Error creating reward model environment: {e}")
@@ -93,7 +79,7 @@ def reward_model_env():
     finally:
         if env_actor:
             try:
-                env_actor.shutdown.remote()
+                env_actor.shutdown()
             except Exception as e:
                 print(f"Warning: Error during actor shutdown: {e}")
 
@@ -155,8 +141,7 @@ class TestRewardModelEnvironment:
         ]
 
         # Use remote call for Ray Actor
-        future = reward_model_env.preprocess_data.remote(message_log_batch)
-        output = ray.get(future)
+        output = reward_model_env.preprocess_data(message_log_batch)
 
         target_length = 39
         assert output is not None
@@ -200,8 +185,7 @@ class TestRewardModelEnvironment:
         ]
 
         # Execute the environment step
-        future = reward_model_env.step.remote(message_log_batch, [])
-        output = ray.get(future)
+        output = reward_model_env.step(message_log_batch, [])
 
         # Verify the reward model name
         assert REWARD_MODEL_NAME == "Skywork/Skywork-Reward-V2-Qwen3-0.6B"

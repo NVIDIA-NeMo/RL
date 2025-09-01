@@ -33,7 +33,6 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
@@ -162,14 +161,8 @@ def setup_data(
     # Disable dynamic batching and sequence packing for reward model
     env_configs["reward_model"]["dynamic_batching"]["enabled"] = False
     env_configs["reward_model"]["sequence_packing"]["enabled"] = False
-    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["reward_model"])
+
+    reward_model_env = RewardModelEnvironment(env_configs["reward_model"])
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
@@ -239,10 +232,6 @@ def main() -> None:
         config["policy"]["generation"], tokenizer
     )
 
-    # Reward model only supports a single node for now
-    assert config["cluster"]["num_nodes"] == 1, (
-        "Reward model only supports a single node. Please set cluster.num_nodes to 1"
-    )
     # setup data
     (
         dataset,
