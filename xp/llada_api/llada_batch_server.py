@@ -66,7 +66,7 @@ from llada_generate import (
 )
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Global variables
@@ -434,6 +434,20 @@ class BatchProcessor:
             try:
                 logger.info(f"Using {algorithm.name} generation for {batch_input_ids.shape[0]} requests: {algorithm.description}")
                 
+                # Log detailed tensor information before generation
+                logger.info(f"🔍 GENERATION DEBUG INFO:")
+                logger.info(f"  batch_input_ids.shape: {batch_input_ids.shape}")
+                logger.info(f"  batch_input_ids.device: {batch_input_ids.device}")
+                logger.info(f"  batch_input_ids.dtype: {batch_input_ids.dtype}")
+                logger.info(f"  config: {config}")
+                logger.info(f"  gen_length: {gen_length}")
+                logger.info(f"  block_length: {block_length}")
+                logger.info(f"  algorithm: {algorithm.name}")
+                
+                # Log individual prompt shapes for debugging
+                for i, prompt_ids in enumerate(padded_prompts):
+                    logger.info(f"  prompt[{i}] shape: {prompt_ids.shape}")
+                
                 output, nfe = algorithm.generate(
                     model=model,
                     prompt=batch_input_ids,
@@ -446,10 +460,24 @@ class BatchProcessor:
                     factor=config['factor']
                 )
                 
-                logger.info(f"Batch generation completed with {nfe} forward passes")
+                logger.info(f"✅ Batch generation completed with {nfe} forward passes")
+                logger.info(f"  output.shape: {output.shape}")
+                logger.info(f"  output.device: {output.device}")
+                logger.info(f"  output.dtype: {output.dtype}")
                 
             except Exception as e:
-                logger.error(f"Fast-dLLM batch generation failed: {e}")
+                import traceback
+                logger.error(f"❌ Fast-dLLM batch generation failed with detailed context:")
+                logger.error(f"  Error: {e}")
+                logger.error(f"  Error type: {type(e).__name__}")
+                logger.error(f"  batch_input_ids.shape: {batch_input_ids.shape}")
+                logger.error(f"  gen_length: {gen_length}")
+                logger.error(f"  block_length: {block_length}")
+                logger.error(f"  algorithm: {algorithm.name}")
+                logger.error(f"  config: {config}")
+                logger.error(f"  Full traceback:")
+                for line in traceback.format_exc().split('\n'):
+                    logger.error(f"    {line}")
                 return [HTTPException(status_code=500, detail=f"Generation failed: {e}") for _ in batch_requests]
             
             # Decode and format responses
@@ -457,14 +485,29 @@ class BatchProcessor:
             sample_response_text = None  # Store sample response for pretty printing
             sample_output_request_id = None  # Store the request ID of the sample output
             
+            logger.info(f"🔍 RESPONSE DECODING DEBUG INFO:")
+            logger.info(f"  output.shape: {output.shape}")
+            logger.info(f"  len(batch_requests): {len(batch_requests)}")
+            logger.info(f"  len(padded_prompts): {len(padded_prompts)}")
+            
             for i, (batch_req, prompt_ids) in enumerate(zip(batch_requests, padded_prompts)):
                 try:
+                    logger.debug(f"  Processing response {i}/{len(batch_requests)}")
+                    logger.debug(f"    batch_req.request_id: {batch_req.request_id}")
+                    logger.debug(f"    prompt_ids.shape: {prompt_ids.shape}")
+                    logger.debug(f"    output[{i}] shape would be: {output[i:i+1].shape}")
+                    logger.debug(f"    slice [{i}:{i+1}, {prompt_ids.shape[1]}:] from output.shape {output.shape}")
+                    
                     # Extract generated tokens for this request
                     generated_tokens = output[i:i+1, prompt_ids.shape[1]:]
+                    logger.debug(f"    generated_tokens.shape: {generated_tokens.shape}")
+                    
                     generated_text = tokenizer.batch_decode(
                         generated_tokens, 
                         skip_special_tokens=True
                     )[0].strip()
+                    
+                    logger.debug(f"    generated_text length: {len(generated_text)}")
                     
                     # Store response from the same request we printed input for
                     if batch_req.request_id == sample_request_id:
@@ -500,7 +543,17 @@ class BatchProcessor:
                     results.append(response)
                     
                 except Exception as e:
-                    logger.error(f"Failed to decode response for request {batch_req.request_id}: {e}")
+                    import traceback
+                    logger.error(f"❌ Failed to decode response for request {batch_req.request_id}:")
+                    logger.error(f"  Error: {e}")
+                    logger.error(f"  Error type: {type(e).__name__}")
+                    logger.error(f"  Request index: {i}")
+                    logger.error(f"  prompt_ids.shape: {prompt_ids.shape}")
+                    logger.error(f"  output.shape: {output.shape}")
+                    logger.error(f"  Attempted slice: output[{i}:{i+1}, {prompt_ids.shape[1]}:]")
+                    logger.error(f"  Full traceback:")
+                    for line in traceback.format_exc().split('\n'):
+                        logger.error(f"    {line}")
                     results.append(HTTPException(status_code=500, detail=f"Failed to decode response: {e}"))
             
             # Pretty print sample response from the same request we printed input for
@@ -657,8 +710,17 @@ def main():
                        help="Maximum batch size for processing requests")
     parser.add_argument("--max-wait-time", type=float, default=0.1,
                        help="Maximum time to wait for batch to fill (seconds)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Enable verbose debug logging (very verbose, use for troubleshooting)")
     
     args = parser.parse_args()
+    
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("🔍 VERBOSE MODE ENABLED - Logging will be very verbose!")
+    else:
+        logging.getLogger().setLevel(logging.INFO)
     
     # Load model
     if args.model_path:
