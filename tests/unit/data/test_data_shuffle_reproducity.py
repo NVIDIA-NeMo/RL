@@ -22,7 +22,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.models.policy import TokenizerConfig
