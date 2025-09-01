@@ -38,8 +38,9 @@ from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer
 def penguin_vllm_generation(cluster, penguin_tokenizer):
     vllm_config = configure_http_server_config(penguin_tokenizer)
 
-    # Stop strings are not supported
+    # Stop strings or token idsare not supported
     vllm_config["stop_strings"] = None
+    vllm_config["stop_token_ids"] = None
 
     vllm_config["vllm_cfg"]["max_model_len"] = 16_384
     vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
