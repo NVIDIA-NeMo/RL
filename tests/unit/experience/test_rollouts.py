@@ -46,6 +46,7 @@ from tests.unit.test_envs import (
 )
 from tests.unit.environments.test_penguin import (
     penguin,
+    cluster,
     penguin_vllm_generation,
     penguin_sanity_test_data,
     penguin_tokenizer,
