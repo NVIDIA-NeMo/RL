@@ -37,6 +37,11 @@ from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer
 @pytest.fixture(scope="function")
 def penguin_vllm_generation(cluster, penguin_tokenizer):
     vllm_config = configure_http_server_config(penguin_tokenizer)
+
+    # Stop strings or token ids are not supported
+    vllm_config.pop("stop_strings", None)
+    vllm_config.pop("stop_token_ids", None)
+
     vllm_config["vllm_cfg"]["max_model_len"] = 16_384
     vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
         "enable_auto_tools": True,
