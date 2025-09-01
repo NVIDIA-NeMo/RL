@@ -138,14 +138,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data):
     expected_result = penguin_sanity_test_data["expected_output"]
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
-        response = d["full_result"]["response"]
-        response.pop("id")
-        response.pop("created_at")
-
-        for output in response["output"]:
-            output.pop("id")
-            output.pop("call_id", None)  # Only present for tool call and tool output items.
-
+        d.pop("full_result")
         return d
 
     def _standardize(l: list[dict]):
