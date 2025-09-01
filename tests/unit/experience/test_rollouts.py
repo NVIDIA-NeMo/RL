@@ -752,7 +752,7 @@ def test_run_async_penguin_rollout(
             "extra_env_info": penguin_sanity_test_data["input"]
         }
     )
-    input_ids, final_batch, rollout_metrics = run_async_penguin_rollout(
+    actual_result = run_async_penguin_rollout(
         policy_generation=penguin_vllm_generation,
         input_batch=input_batch,
         tokenizer=penguin_tokenizer,
@@ -762,16 +762,16 @@ def test_run_async_penguin_rollout(
         max_rollout_turns=None,
     )
 
-    final_batch_dict = final_batch.get_dict()
-    final_batch_dict.pop("message_log")
-    final_batch_dict["total_reward"] = final_batch_dict["total_reward"].tolist()
-    with open("temp_rollout.json", "w") as f:
-        import json
-        json.dump(
-            {
-                "input_ids": input_ids.tolist(),
-                "final_batch": final_batch_dict,
-                "rollout_metrics": rollout_metrics,
-            },
-            f, indent=4
-        )
+    expected_result = {
+        "final_batch": {
+            "total_reward": [0.0, 0.0]
+        },
+        "rollout_metrics": {
+            "mean_total_reward": 0.0,
+            "max_total_reward": 0.0,
+            "min_total_reward": 0.0
+        }
+    }
+
+    assert expected_result["final_batch"]["total_reward"] == actual_result["final_batch"]["total_reward"].tolist()
+    assert expected_result["rollout_metrics"] == actual_result["rollout_metrics"]
