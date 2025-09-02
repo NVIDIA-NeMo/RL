@@ -14,8 +14,7 @@
 
 from typing import Any, Optional
 
-from datasets import load_dataset
-
+from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
@@ -50,10 +49,10 @@ class ResponseDataset:
         self.input_key = input_key
         self.output_key = output_key
 
-        # load from json file
-        train_ds = load_dataset("json", data_files=train_data_path)[train_split]
+        # load from json file or huggingface
+        train_ds = load_dataset_from_path(train_data_path, train_split)
         if val_data_path:
-            val_ds = load_dataset("json", data_files=val_data_path)[val_split]
+            val_ds = load_dataset_from_path(val_data_path, val_split)
         else:
             val_ds = None
 
