@@ -769,9 +769,9 @@ def test_run_async_penguin_rollout(
 
     expected_result = {
         "final_batch": {
-            "total_reward": [0.0, 0.0],
-            "length": [0, 0],
-            "loss_multiplier": [1.0, 1.0],
+            "total_reward": torch.tensor([0.0, 0.0]),
+            "length": [3088, 3056],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
         },
         "rollout_metrics": {
             "mean_total_reward": 0.0,
@@ -783,8 +783,6 @@ def test_run_async_penguin_rollout(
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
-        if not isinstance(final_batch["total_reward"], list):
-            final_batch["total_reward"] = final_batch["total_reward"].tolist()
         return {
             "final_batch": final_batch,
             "rollout_metrics": d["rollout_metrics"],
