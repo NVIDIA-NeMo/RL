@@ -65,7 +65,7 @@ def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optio
 
     if num_repeats:
         previous_length = len(examples)
-        examples = list(chain.from_iterable(repeat(example, config.num_repeats) for example in examples))
+        examples = list(chain.from_iterable(repeat(example, num_repeats) for example in examples))
         print(f"Repeating examples (in a pattern of abc to aabbcc) from {previous_length} to {len(examples)}!")
 
     return AllTaskProcessedDataset(
