@@ -469,6 +469,9 @@ class AsyncTrajectoryCollector:
                         f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
                     )
                     self._refit_pause_cleared.wait()
+                    
+                    # After refit finishes if weight version has updated, reflect that in the new trajectories
+                    generation_weight_version = self.current_weight_version
 
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)

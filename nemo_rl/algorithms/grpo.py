@@ -1485,11 +1485,13 @@ def async_grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
 
-                        trajectory_collector.resume_after_refit.remote()
-
-                        # Notify collector about the new weight version (post-update)
+                        #Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
+
+                        trajectory_collector.resume_after_refit.remote()
+                        
+                        
 
                 # Validation
                 val_metrics, validation_timings = None, None
