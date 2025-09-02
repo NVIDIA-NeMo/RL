@@ -123,8 +123,20 @@ policy:
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "HelpSteer3"
   shuffle: true
+
+  dataset_name: HelpSteer3
+  # You can use custom preference datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: PreferenceDataset
+  #     train_data_path: <LocalPathToTrainingDataset>
+  #     val_data_paths:
+  #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #       ...
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #   ...
 
 logger:
   log_dir: "logs"  # Base directory for all logs

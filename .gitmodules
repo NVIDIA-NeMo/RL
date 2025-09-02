@@ -1,12 +1,12 @@
-[submodule "3rdparty/NeMo"]
-	path = 3rdparty/NeMo-workspace/NeMo
-	url = https://github.com/NVIDIA/NeMo.git
-	branch = pjin/ashors/rl-qwen3-export
-	shallow = true
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
 	url = https://github.com/terrykong/Megatron-LM.git
-	branch = sahilj/megatron-external-loss-norm
+	branch = yuya/nemo-rl-use
+	shallow = true
+[submodule "3rdparty/Megatron-Bridge"]
+	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+	branch = yuya/nemo-rl-use-chunkpatch
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel

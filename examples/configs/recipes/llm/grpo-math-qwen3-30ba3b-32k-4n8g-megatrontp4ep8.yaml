@@ -16,6 +16,7 @@ grpo:
   max_rollout_turns: 1
   val_period: 3
   val_at_start: False
+  overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
   seed: 42

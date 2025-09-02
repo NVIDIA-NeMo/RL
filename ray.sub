@@ -69,7 +69,12 @@ DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
 # It's session based and won't affect the system outside the script
-ulimit -Sn 65535
+# Ensure that the soft limit isn't above the hard limit
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+  echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
+fi
 
 # On our clusters, the largest port range on an idle worker appeared between 52369-64607
 # (not including the other ports set by this script). So this range is chosen to be
@@ -306,6 +311,37 @@ monitor-sidecar() {
   done
 }
 monitor-sidecar &
+
+# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
+log-sync-sidecar() {
+  set +x
+  if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
+    return
+  fi
+  mkdir -p $LOG_DIR/ray/$node_i
+  while true; do
+    sleep $RAY_LOG_SYNC_FREQUENCY
+    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in /tmp/ray/session_[0-9]*/; do
+        if [[ -d "\$session_dir/logs" ]]; then
+          session_name=\$(basename "\$session_dir")
+          mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
+          if command -v rsync > /dev/null 2>&1; then
+            rsync -ahP "\$session_dir/logs/" $LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
+          else
+            cp -r "\$session_dir/logs" $LOG_DIR/ray/$node_i/\$session_name/
+          fi
+        fi
+      done
+    fi
+    if [[ -f "$LOG_DIR/ENDED" ]]; then
+      echo "Log sync sidecar terminating..."
+      break
+    fi
+  done
+}
+log-sync-sidecar &
 
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
