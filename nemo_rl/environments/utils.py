@@ -59,3 +59,40 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
 
     return chunks
+
+def extract_answer_from_box(string):
+    r"""Extract Answer String from \\boxed expression."""
+    idx = string.rfind("\\boxed")
+    if idx < 0:
+        idx = string.rfind("\\fbox")
+        if idx < 0:
+            return None
+
+    i = idx
+    right_brace_idx = None
+    num_left_braces_open = 0
+    while i < len(string):
+        if string[i] == "{":
+            num_left_braces_open += 1
+        if string[i] == "}":
+            num_left_braces_open -= 1
+            if num_left_braces_open == 0:
+                right_brace_idx = i
+                break
+        i += 1
+
+    if right_brace_idx is None:
+        retval = None
+    else:
+        retval = string[idx : right_brace_idx + 1]
+
+    if retval:
+        left = "\\boxed{"
+        try:
+            assert retval[: len(left)] == left
+            assert retval[-1] == "}"
+            return retval[len(left) : -1]
+        except AssertionError:
+            return None
+
+    return None
