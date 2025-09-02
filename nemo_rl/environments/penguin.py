@@ -187,3 +187,74 @@ class Penguin(EnvironmentInterface):
     def global_post_process_and_metrics(self, batch):
         # Similar to the step function, this is not used.
         raise NotImplementedError
+
+
+########################################
+# Global config utils
+########################################
+
+def setup_qwen3_penguin_config(config: MasterConfig, tokenizer):
+    generation_config = config["policy"]["generation"]
+
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
+        "enable_auto_tools": True,
+        "tool_parser": "hermes",
+    }
+
+    # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
+    chat_template = penguin_tokenizer.chat_template
+    to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}"""
+    assert to_replace in chat_template
+    chat_template = chat_template.replace(
+        to_replace,
+        r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
+    )
+    tokenizer.chat_template = chat_template
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
+
+
+def setup_penguin_config(config: MasterConfig, tokenizer) -> None:
+    generation_config = config["policy"]["generation"]
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    # Stop strings or token ids are not supported
+    generation_config["stop_strings"] = None
+    generation_config["stop_token_ids"] = None
+
+
+
+def _should_use_penguin(master_config: MasterConfig) -> bool:
+    """Determine if Penguin should be used for rollouts and validation based on the configuration.
+    """
+    env_config = master_config["env"]
+    should_use_penguin = bool(env_config.get("should_use_penguin"))
+    if not should_use_penguin:
+        return should_use_penguin
+
+    # Validate the setup for training with Penguin
+    assert _should_use_async_rollouts(master_config), (
+        "❌ Error: In order to use Penguin, you must use vllm generation backend with `async_engine: true`!"
+    )
+
+    generation_config = master_config["policy"]["generation"]
+
+    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
+    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
+    assert should_expose_http_server, f"In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
+
+    # Penguin is strictly incompatible with reasoning parser. There is one source 
+    serving_chat_kwargs = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
+    assert serving_chat_kwargs.get("reasoning_parser") is None, "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
+
+    return should_use_penguin

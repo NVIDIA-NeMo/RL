@@ -20,7 +20,7 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
+from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import (
@@ -31,7 +31,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.penguin import Penguin
+from nemo_rl.environments.penguin import (
+    Penguin,
+    _should_use_penguin,
+    setup_qwen3_penguin_config,
+    setup_penguin_config,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -50,48 +55,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
-
-
-def setup_qwen3_penguin_config(config: MasterConfig, tokenizer):
-    generation_config = config["policy"]["generation"]
-
-    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
-        "enable_auto_tools": True,
-        "tool_parser": "hermes",
-    }
-
-    # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
-    chat_template = penguin_tokenizer.chat_template
-    to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
-            {%- if loop.last or (not loop.last and reasoning_content) %}
-                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
-            {%- else %}
-                {{- '<|im_start|>' + message.role + '\n' + content }}
-            {%- endif %}
-        {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
-        {%- endif %}"""
-    assert to_replace in chat_template
-    chat_template = chat_template.replace(
-        to_replace,
-        r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
-    )
-    tokenizer.chat_template = chat_template
-    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
-
-
-def setup_penguin_config(config: MasterConfig, tokenizer):
-    generation_config = config["policy"]["generation"]
-
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
-
-    # Stop strings or token ids are not supported
-    generation_config["stop_strings"] = None
-    generation_config["stop_token_ids"] = None
-
-    setup_qwen3_penguin_config(config, tokenizer)
 
 
 def main() -> None:
@@ -132,7 +95,8 @@ def main() -> None:
     )
 
     # Penguin specific config setup.
-    setup_qwen3_penguin_config(config)
+    setup_penguin_config(config, tokenizer)
+    setup_qwen3_penguin_config(config, tokenizer)
 
     # Print config
     print("Final config:")

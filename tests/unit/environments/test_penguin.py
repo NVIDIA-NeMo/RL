@@ -28,46 +28,20 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.penguin import Penguin, PenguinConfig
+from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_config, setup_qwen3_penguin_config
 
 # cluster and tokenizer are fixture imports
-from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer as penguin_tokenizer, configure_http_server_config
+from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer as penguin_tokenizer, basic_vllm_test_config
 
 
 @pytest.fixture(scope="function")
 def penguin_vllm_generation(cluster, penguin_tokenizer):
-    vllm_config = configure_http_server_config(penguin_tokenizer)
+    setup_penguin_config(basic_vllm_test_config, penguin_tokenizer)
+    setup_qwen3_penguin_config(basic_vllm_test_config, penguin_tokenizer)
 
-    # Stop strings or token idsare not supported
-    vllm_config["stop_strings"] = None
-    vllm_config["stop_token_ids"] = None
+    generation_config["vllm_cfg"]["max_model_len"] = 16_384
 
-    vllm_config["vllm_cfg"]["max_model_len"] = 16_384
-    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
-        "enable_auto_tools": True,
-        "tool_parser": "hermes",
-    }
-
-    # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
-    chat_template = penguin_tokenizer.chat_template
-    to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
-            {%- if loop.last or (not loop.last and reasoning_content) %}
-                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
-            {%- else %}
-                {{- '<|im_start|>' + message.role + '\n' + content }}
-            {%- endif %}
-        {%- else %}
-            {{- '<|im_start|>' + message.role + '\n' + content }}
-        {%- endif %}"""
-    assert to_replace in chat_template
-    chat_template = chat_template.replace(
-        to_replace,
-        r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
-    )
-    penguin_tokenizer.chat_template = chat_template
-    vllm_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = penguin_tokenizer.chat_template
-
-    vllm_generation = VllmGeneration(cluster, vllm_config)
+    vllm_generation = VllmGeneration(cluster, generation_config)
 
     yield vllm_generation
 
