@@ -9,8 +9,8 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
-  max_val_samples: 256
-  val_batch_size: 256
+  max_val_samples: 480  # 30 examples in AIME24 * 16 generations each.
+  val_batch_size: ${grpo.max_val_samples}
   seed: 42
 
 loss_fn:
@@ -171,7 +171,7 @@ policy:
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
