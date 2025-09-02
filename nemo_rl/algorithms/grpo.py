@@ -940,16 +940,20 @@ def validate(
             # We cascade penguin first since penguin also uses async rollouts.
             if _should_use_penguin(master_config):
                 generation_config = master_config["policy"]["generation"]
-                val_batch, gen_metrics = run_async_penguin_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
+                penguin_rollout_result = run_async_penguin_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=repeated_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=master_config["policy"][
+                        "max_total_sequence_length"
+                    ],
                     generation_config=generation_config,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
+                val_batch = penguin_rollout_result.final_batch
+                gen_metrics = penguin_rollout_result.rollout_metrics
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
