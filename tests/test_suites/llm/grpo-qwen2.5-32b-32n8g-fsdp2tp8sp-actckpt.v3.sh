@@ -7,7 +7,7 @@ NUM_NODES=32
 STEPS_PER_RUN=2  # 40min: step_time: [1341, 801]
 MAX_STEPS=2
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=60
+NUM_MINUTES=40
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

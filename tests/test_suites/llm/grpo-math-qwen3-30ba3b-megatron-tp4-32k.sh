@@ -7,7 +7,7 @@ NUM_NODES=4
 STEPS_PER_RUN=3
 MAX_STEPS=3
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=240 # TODO(ahmadki): tune
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
