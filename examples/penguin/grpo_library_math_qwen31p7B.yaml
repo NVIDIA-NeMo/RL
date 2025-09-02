@@ -192,15 +192,22 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
-  dataset_name: "OpenMathInstruct-2"
+  input_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/library_judge_math/train.jsonl
+  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/library_judge_math/validation.jsonl
   shuffle: true
 
 env:
-  math:
-    num_workers: 8
+  should_use_penguin: true
+  penguin:
+    config_paths:
+    - responses_api_models/openai_model/configs/openai_model.yaml
+    - resources_servers/library_judge_math/configs/library_judge_math.yaml
+    library_judge_math:
+      resources_servers:
+        library_judge_math:
+          judge_model_server:
+            name: openai_model
+          should_use_judge: false
 
 logger:
   log_dir: "logs"  # Base directory for all logs
