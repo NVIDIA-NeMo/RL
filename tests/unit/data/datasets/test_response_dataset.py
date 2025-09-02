@@ -19,7 +19,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.datasets.response_datasets import ResponseDataset, SquadDataset
+from nemo_rl.data.datasets import load_response_dataset
 
 
 @pytest.fixture
@@ -54,8 +54,13 @@ def sample_data(request):
 
 @pytest.mark.parametrize("sample_data", [("input", "output")], indirect=True)
 def test_dataset_initialization(sample_data):
+    # load the dataset
     train_path, val_path = sample_data
-    dataset = ResponseDataset(train_path, val_path)
+    data_config = {
+        "train_data_path": train_path,
+        "val_data_path": val_path,
+    }
+    dataset = load_response_dataset(data_config)
 
     assert dataset.input_key == "input"
     assert dataset.output_key == "output"
@@ -65,10 +70,15 @@ def test_dataset_initialization(sample_data):
 
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_custom_keys(sample_data):
+    # load the dataset
     train_path, val_path = sample_data
-    dataset = ResponseDataset(
-        train_path, val_path, input_key="question", output_key="answer"
-    )
+    data_config = {
+        "train_data_path": train_path,
+        "val_data_path": val_path,
+        "input_key": "question",
+        "output_key": "answer",
+    }
+    dataset = load_response_dataset(data_config)
 
     assert dataset.input_key == "question"
     assert dataset.output_key == "answer"
@@ -77,10 +87,15 @@ def test_custom_keys(sample_data):
 @pytest.mark.hf_gated
 @pytest.mark.parametrize("sample_data", [("question", "answer")], indirect=True)
 def test_message_formatting(sample_data):
+    # load the dataset
     train_path, val_path = sample_data
-    dataset = ResponseDataset(
-        train_path, val_path, input_key="question", output_key="answer"
-    )
+    data_config = {
+        "train_data_path": train_path,
+        "val_data_path": val_path,
+        "input_key": "question",
+        "output_key": "answer",
+    }
+    dataset = load_response_dataset(data_config)
 
     first_example = dataset.formatted_ds["train"][0]
 
@@ -108,8 +123,16 @@ def test_message_formatting(sample_data):
 @pytest.mark.hf_gated
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_squad_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "squad",
+        "prompt_file": None,
+        "system_prompt_file": None,
+    }
+    squad_dataset = load_response_dataset(data_config)
+
+    # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-    squad_dataset = SquadDataset()
 
     # check that the dataset is formatted correctly
     for example in squad_dataset.formatted_ds["train"].take(5):
