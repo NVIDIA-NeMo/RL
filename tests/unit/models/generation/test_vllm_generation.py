@@ -1043,31 +1043,31 @@ def test_vllm_generate_text(cluster, tokenizer):
 
 def configure_http_server_config(tokenizer) -> VllmConfig:
     # Create separate configs for each policy
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
-    vllm_config["vllm_cfg"]["async_engine"] = True
-    vllm_config["vllm_cfg"]["expose_http_server"] = True
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
 
-    return vllm_config
+    return generation_config
 
 
 def test_vllm_http_server(cluster, tokenizer):
     """Test that vLLM http server works."""
 
-    vllm_config = configure_http_server_config(tokenizer)
+    generation_config = configure_http_server_config(tokenizer)
 
     # Ensure we can get same output
-    assert vllm_config["model_name"] == "Qwen/Qwen3-0.6B", (
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
         "Model name should be Qwen/Qwen3-0.6B to get expected output"
     )
-    assert vllm_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
         "Tensor parallel size should be 1 to get expected output"
     )
 
     # Create vLLM generation
-    vllm_generation = VllmGeneration(cluster, vllm_config)
+    vllm_generation = VllmGeneration(cluster, generation_config)
 
     # We expect one server per vLLM DP rank.
     base_urls = vllm_generation.dp_openai_server_base_urls
