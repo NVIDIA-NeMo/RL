@@ -91,30 +91,33 @@ DPO training supports only two completions (where the lowest rank is preferred a
 }
 ```
 
-NeMo RL provides a DPO-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+We provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+- rank format
+  ```yaml
+  data:
+    train_data_path: <LocalPathToTrainingDataset>
+    # multiple validation sets is supported
+    val_data_paths:
+      <NameOfValidationDataset>: <LocalPathToValidationDataset1>
+      <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+    train_split: <TrainSplit>, default is "train"
+    val_split: <ValSplit>, default is "train"
+  ```
+- chosen - rejected format
+  ```yaml
+  data:
+    train_data_path: <LocalPathToTrainingDataset>
+    val_data_path: <LocalPathToValidationDataset>
+    prompt_key: <PromptKey>
+    chosen_key: <ChosenKey>
+    rejected_key: <RejectedKey>
+    train_split: <TrainSplit>, default is "train"
+    val_split: <ValSplit>, default is "train"
+  ```
 
-We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
-```yaml
-data:
-  dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_paths:
-    <NameOfValidationDataset>: <LocalPathToValidationDataset>
-```
-with support for multiple validation sets achieved with:
-```yaml
-data:
-  dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_paths:
-    <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
-    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
-```
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
-
-The older [DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class is deprecated. This class is also compatible with JSONL-formatted preference datsets. It assumes train and validation datasets have been split and processed into the expected format offline. The JSONL files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 
 ## DPO-Specific Parameters
 
