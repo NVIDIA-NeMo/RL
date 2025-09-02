@@ -18,6 +18,7 @@ import pprint
 import json
 from typing import Optional
 from itertools import chain, repeat
+from time import sleep
 
 from omegaconf import OmegaConf
 import torch
@@ -179,6 +180,10 @@ def main() -> None:
     ).remote(config)
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
+
+    sleep_time = 15
+    print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
+    sleep(sleep_time)
 
     grpo_train(
         policy,
