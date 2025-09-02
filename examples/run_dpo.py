@@ -198,12 +198,12 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
 
         for val_dataset_name, val_dataset_path in val_data_paths.items():
             assert val_dataset_name not in val_dataset
-            val_data = PreferenceDataset(val_dataset_path, split="validation")
+            val_data = PreferenceDataset(val_dataset_path)
             print(
-                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['validation'])} samples."
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
             )
             val_dataset[val_dataset_name] = AllTaskProcessedDataset(
-                val_data.formatted_ds["validation"],
+                val_data.formatted_ds["train"],
                 tokenizer,
                 val_data.task_spec,
                 dpo_preprocessor,
