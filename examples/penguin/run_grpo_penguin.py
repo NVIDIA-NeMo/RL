@@ -64,9 +64,9 @@ def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optio
     print(f"Loaded data at {jsonl_fpath}. Found {len(examples)} examples")
 
     if num_repeats:
-        previous_length = len(rows)
-        rows = list(chain.from_iterable(repeat(row, config.num_repeats) for row in rows))
-        print(f"Repeating rows (in a pattern of abc to aabbcc) from {previous_length} to {len(rows)}!")
+        previous_length = len(examples)
+        examples = list(chain.from_iterable(repeat(example, config.num_repeats) for example in examples))
+        print(f"Repeating examples (in a pattern of abc to aabbcc) from {previous_length} to {len(examples)}!")
 
     return AllTaskProcessedDataset(
         examples,
