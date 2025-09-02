@@ -193,7 +193,7 @@ class Penguin(EnvironmentInterface):
 # Global config utils
 ########################################
 
-def setup_qwen3_penguin_config(config: MasterConfig, tokenizer):
+def setup_qwen3_penguin_config(config, tokenizer):
     generation_config = config["policy"]["generation"]
 
     generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
@@ -221,7 +221,7 @@ def setup_qwen3_penguin_config(config: MasterConfig, tokenizer):
     generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"]["chat_template"] = tokenizer.chat_template
 
 
-def setup_penguin_config(config: MasterConfig, tokenizer) -> None:
+def setup_penguin_config(config, tokenizer) -> None:
     generation_config = config["policy"]["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
@@ -234,7 +234,7 @@ def setup_penguin_config(config: MasterConfig, tokenizer) -> None:
 
 
 
-def _should_use_penguin(master_config: MasterConfig) -> bool:
+def _should_use_penguin(master_config) -> bool:
     """Determine if Penguin should be used for rollouts and validation based on the configuration.
     """
     env_config = master_config["env"]
