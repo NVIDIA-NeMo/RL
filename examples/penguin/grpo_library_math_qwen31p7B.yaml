@@ -228,5 +228,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
+  gpus_per_node: 8
   num_nodes: 1
