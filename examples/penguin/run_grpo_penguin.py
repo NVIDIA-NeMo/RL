@@ -58,6 +58,10 @@ def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optio
     with open(jsonl_fpath) as f:
         examples = list(map(json.loads, f))
 
+    for example in examples:
+        example["task_name"] = "penguin"
+        example["token_ids"] = []  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
+
     print(f"Loaded data at {jsonl_fpath}. Found {len(examples)} examples")
 
     if num_repeats:
@@ -65,11 +69,12 @@ def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optio
         examples = list(chain.from_iterable(repeat(example, num_repeats) for example in examples))
         print(f"Repeating examples (in a pattern of abc to aabbcc) from {previous_length} to {len(examples)}!")
 
+    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
     return AllTaskProcessedDataset(
         examples,
         tokenizer,
-        dict(),
-        dict(),
+        None,
+        passthrough_task_processor,
     )
 
 
