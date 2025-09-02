@@ -63,7 +63,7 @@ class PenguinWorker:
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
+                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "penguin_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
             )
