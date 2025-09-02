@@ -894,9 +894,12 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
-def _tensorize_token_ids(message_logs: list):
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
     for m in message_logs:
-        m["token_ids"] = torch.tensor(m["token_ids"])
+        m[key] = torch.tensor(m[key])
 
 
 @dataclass
@@ -948,8 +951,9 @@ def run_async_penguin_rollout(
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
     # Tensorize all token ids
-    [_tensorize_token_ids(r["input_message_log"]) for r in results]
-    [_tensorize_token_ids(r["message_log"]) for r in results]
+    [_tensorize_by_key(r["input_message_log"], "token_ids") for r in results]
+    [_tensorize_by_key(r["message_log"], "token_ids") for r in results]
+    [_tensorize_by_key(r["message_log"], "generation_logprobs") for r in results]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
