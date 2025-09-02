@@ -22,6 +22,7 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
+from nemo_rl.data.datasets import rl_collate_fn
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -32,6 +33,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.penguin import penguin_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -749,11 +751,11 @@ def test_run_async_penguin_rollout(
     penguin_sanity_test_data,
     penguin_tokenizer,
 ):
-    input_batch = BatchedDataDict[DatumSpec](
-        {
-            "extra_env_info": penguin_sanity_test_data["input"]
-        }
-    )
+    nemo_rl_compatible_examples: list[DatumSpec] = [
+        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
+        for idx, penguin_example in enumerate(penguin_sanity_test_data["input"])
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
     actual_result = run_async_penguin_rollout(
         policy_generation=penguin_vllm_generation,
         input_batch=input_batch,

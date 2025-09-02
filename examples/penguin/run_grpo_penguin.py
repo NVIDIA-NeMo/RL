@@ -21,7 +21,6 @@ from itertools import chain, repeat
 from time import sleep
 
 from omegaconf import OmegaConf
-import torch
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -35,6 +34,7 @@ from nemo_rl.environments.penguin import (
     PenguinConfig,
     setup_qwen3_penguin_config,
     setup_penguin_config,
+    penguin_example_to_nemo_rl_datum_spec,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -67,21 +67,10 @@ def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optio
         penguin_examples = list(chain.from_iterable(repeat(penguin_example, num_repeats) for penguin_example in penguin_examples))
         print(f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(penguin_examples)}!")
 
-    # We do some light preprocessing here to make our data format compatible with nemo rl format
-    nemo_rl_compatible_examples: list[DatumSpec] = []
-    for idx, penguin_example in enumerate(penguin_examples):
-        nemo_rl_compatible_example = DatumSpec(
-            message_log=[{"role": "user", "content": "", "token_ids": torch.tensor([])}],  # Fake message
-            length=0,
-            extra_env_info=penguin_example,
-            loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples
-            idx=idx,
-            task_name="penguin",
-            stop_strings=None,
-            # Extra vars
-            token_ids=[],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
-        )
-        nemo_rl_compatible_examples.append(nemo_rl_compatible_example)
+    nemo_rl_compatible_examples: list[DatumSpec] = [
+        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
+        for idx, penguin_example in enumerate(penguin_examples)
+    ]
 
     passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
     return AllTaskProcessedDataset(

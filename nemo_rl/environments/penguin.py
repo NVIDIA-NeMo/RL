@@ -16,9 +16,11 @@ from typing import Any, Dict, List, TypedDict
 from pathlib import Path
 
 import ray
+import torch
 
 from tqdm.auto import tqdm
 
+from nemo_rl.data.datasets import DatumSpec
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
@@ -232,3 +234,21 @@ def setup_penguin_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
+
+########################################
+# Data utils
+########################################
+
+# We do some light preprocessing here to make our data format compatible with nemo rl format
+def penguin_example_to_nemo_rl_datum_spec(penguin_example: dict, idx: int) -> DatumSpec:
+    return DatumSpec(
+        message_log=[{"role": "user", "content": "", "token_ids": torch.tensor([])}],  # Fake message
+        length=0,
+        extra_env_info=penguin_example,
+        loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples
+        idx=idx,
+        task_name="penguin",
+        stop_strings=None,
+        # Extra vars
+        token_ids=[],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
+    )
