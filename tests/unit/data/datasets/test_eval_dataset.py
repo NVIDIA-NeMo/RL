@@ -14,17 +14,21 @@
 import pytest
 from transformers import AutoTokenizer
 
-from nemo_rl.data.datasets.eval_datasets import (
-    GPQADataset,
-    MathDataset,
-    MMLUDataset,
-)
+from nemo_rl.data.datasets import load_eval_dataset
 
 
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_gpqa_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "gpqa",
+        "prompt_file": None,
+        "system_prompt_file": None,
+    }
+    gpqa_dataset = load_eval_dataset(data_config)
+
+    # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
-    gpqa_dataset = GPQADataset()
 
     # check that the dataset is formatted correctly
     for example in gpqa_dataset.rekeyed_ds.take(5):
@@ -48,8 +52,16 @@ def test_gpqa_dataset():
 
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_math_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "math",
+        "prompt_file": None,
+        "system_prompt_file": None,
+    }
+    math_dataset = load_eval_dataset(data_config)
+
+    # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
-    math_dataset = MathDataset()
 
     # check that the dataset is formatted correctly
     for example in math_dataset.rekeyed_ds.take(5):
@@ -72,8 +84,16 @@ def test_math_dataset():
 
 @pytest.mark.skip(reason="dataset download is flaky")
 def test_mmlu_dataset():
+    # load the dataset
+    data_config = {
+        "dataset_name": "mmlu",
+        "prompt_file": None,
+        "system_prompt_file": None,
+    }
+    mmlu_dataset = load_eval_dataset(data_config)
+
+    # load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
-    mmlu_dataset = MMLUDataset()
 
     # check that the dataset is formatted correctly
     for example in mmlu_dataset.rekeyed_ds.take(5):
