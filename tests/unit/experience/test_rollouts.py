@@ -782,7 +782,7 @@ def test_run_async_penguin_rollout(
 
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
-        final_batch.pop("message_log")
+        final_batch.pop("message_log", None)
         if not isinstance(final_batch["total_reward"], list):
             final_batch["total_reward"] = final_batch["total_reward"].tolist()
         return {
