@@ -10,4 +10,4 @@
 	shallow = true
 [submodule "3rdparty/Fast-dLLM"]
 	path = 3rdparty/Fast-dLLM
-	url = https://github.com/NVlabs/Fast-dLLM.git
+	url = git@github.com:MahanFathi/Fast-dLLM.git
