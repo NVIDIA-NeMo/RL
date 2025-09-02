@@ -375,10 +375,14 @@ def validate_one_dataset(
                 )
 
             else:
-                samples_in_this_batch = val_results["num_valid_samples"]
                 for k, v in val_results["all_mb_metrics"].items():
-                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                        val_metrics[k] += np.mean(v).item() * samples_in_this_batch
+                    samples_in_this_batch = val_batch["sample_mask"].sum()
+                    if k in {"lr", "wd"}:
+                        continue
+                    if k in {"global_valid_seqs", "global_valid_toks"}:
+                        val_metrics[k] += np.mean(v).item()
+                    elif k == "num_valid_samples":
+                        val_metrics[k] += np.sum(v).item()
                     else:
                         val_metrics[k] += np.sum(v).item() * samples_in_this_batch
                 sum_num_valid_samples += samples_in_this_batch
@@ -387,7 +391,7 @@ def validate_one_dataset(
                 break
 
         for k, v in val_metrics.items():
-            if k == "num_valid_samples":
+            if k in {"num_valid_samples","global_valid_seqs", "global_valid_toks"}:
                 continue
             val_metrics[k] /= sum_num_valid_samples
 
