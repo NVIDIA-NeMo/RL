@@ -16,7 +16,8 @@ import argparse
 import os
 import pprint
 import json
-from typing import Any
+from typing import Any, Optional
+from itertools import chain, repeat
 
 from omegaconf import OmegaConf
 
@@ -55,6 +56,26 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
+
+
+def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None):
+    input_jsonl_fpath = config["data"]["input_jsonl_fpath"]
+    with open(input_jsonl_fpath) as f:
+        examples = list(map(json.loads, f))
+
+    print(f"Loaded data at {jsonl_fpath}. Found {len(examples)} examples")
+
+    if num_repeats:
+        previous_length = len(rows)
+        rows = list(chain.from_iterable(repeat(row, config.num_repeats) for row in rows))
+        print(f"Repeating rows (in a pattern of abc to aabbcc) from {previous_length} to {len(rows)}!")
+
+    return AllTaskProcessedDataset(
+        examples,
+        tokenizer,
+        dict(),
+        dict(),
+    )
 
 
 def main() -> None:
@@ -108,18 +129,15 @@ def main() -> None:
     init_ray()
 
     print("\n▶ Setting up data...")
-    input_jsonl_fpath = config["data"]["input_jsonl_fpath"]
-    with open(input_jsonl_fpath) as f:
-        dataset = list(map(json.loads, f))
-
-    dataset = AllTaskProcessedDataset(
-        dataset,
-        tokenizer,
-        dict(),
-        dict(),
-        max_seq_length=config["data"]["max_input_seq_length"],
+    train_dataset = setup_single_penguin_dataset(
+        jsonl_fpath=config["data"]["train_jsonl_fpath"],
+        tokenizer=tokenizer,
     )
-    val_dataset = None
+    val_dataset = setup_single_penguin_dataset(
+        jsonl_fpath=config["data"]["validation_jsonl_fpath"],
+        tokenizer=tokenizer,
+        num_repeats=config["grpo"]["num_generations_per_prompt"],
+    )
 
     (
         policy,
@@ -132,7 +150,7 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(config, tokenizer, train_dataset, val_dataset)
 
     config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],
