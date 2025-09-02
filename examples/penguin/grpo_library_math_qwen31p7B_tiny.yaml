@@ -1,0 +1,7 @@
+# GRPO Algorithm Configuration
+# A copy of examples/configs/grpo_math_1B.yaml with modifications for `policy.generation.expose_http_server: true`
+defaults: "grpo_library_math_qwen31p7B.yaml"
+
+grpo:
+  num_prompts_per_step: 1
+  max_num_steps: 1
