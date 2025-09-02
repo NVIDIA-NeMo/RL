@@ -767,7 +767,9 @@ def test_run_async_penguin_rollout(
 
     expected_result = {
         "final_batch": {
-            "total_reward": [0.0, 0.0]
+            "total_reward": [0.0, 0.0],
+            "length": [0, 0],
+            "loss_multiplier": [1.0, 1.0],
         },
         "rollout_metrics": {
             "mean_total_reward": 0.0,
@@ -776,5 +778,14 @@ def test_run_async_penguin_rollout(
         }
     }
 
-    assert expected_result["final_batch"]["total_reward"] == actual_result["final_batch"]["total_reward"].tolist()
-    assert expected_result["rollout_metrics"] == actual_result["rollout_metrics"]
+    def _standardize(d: dict) -> dict:
+        final_batch = d["final_batch"].copy()
+        final_batch.pop("message_log")
+        if not isinstance(final_batch["total_reward"], list):
+            final_batch["total_reward"] = final_batch["total_reward"].tolist()
+        return {
+            "final_batch": final_batch,
+            "rollout_metrics": d["rollout_metrics"],
+        }
+
+    assert _standardize(expected_result) == _standardize(actual_result)

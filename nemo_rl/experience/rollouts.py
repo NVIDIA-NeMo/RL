@@ -1012,7 +1012,7 @@ def run_async_penguin_rollout(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["message_log"] for r in results],
-            "length": [len(r["input_message_log"]["token_ids"]) for r in results],
+            "length": [len(r["input_message_log"][0]["token_ids"]) for r in results],
             "loss_multiplier": input_batch["loss_multiplier"],
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
