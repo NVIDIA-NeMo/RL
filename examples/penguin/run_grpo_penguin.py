@@ -16,7 +16,7 @@ import argparse
 import os
 import pprint
 import json
-from typing import Any, Optional
+from typing import Optional
 from itertools import chain, repeat
 
 from omegaconf import OmegaConf
@@ -24,16 +24,13 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import (
-    DatumSpec,
-)
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.penguin import (
     Penguin,
+    PenguinConfig,
     setup_qwen3_penguin_config,
     setup_penguin_config,
 )
@@ -155,7 +152,7 @@ def main() -> None:
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["penguin"],
     )
-    env = Penguin.options(
+    penguin = Penguin.options(
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.penguin.Penguin"
