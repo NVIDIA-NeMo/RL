@@ -232,29 +232,3 @@ def setup_penguin_config(config, tokenizer) -> None:
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
 
-
-
-def _should_use_penguin(master_config) -> bool:
-    """Determine if Penguin should be used for rollouts and validation based on the configuration.
-    """
-    env_config = master_config["env"]
-    should_use_penguin = bool(env_config.get("should_use_penguin"))
-    if not should_use_penguin:
-        return should_use_penguin
-
-    # Validate the setup for training with Penguin
-    assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use Penguin, you must use vllm generation backend with `async_engine: true`!"
-    )
-
-    generation_config = master_config["policy"]["generation"]
-
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, f"In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
-
-    # Penguin is strictly incompatible with reasoning parser. There is one source 
-    serving_chat_kwargs = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
-    assert serving_chat_kwargs.get("reasoning_parser") is None, "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
-
-    return should_use_penguin
