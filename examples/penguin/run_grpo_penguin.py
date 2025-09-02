@@ -20,10 +20,11 @@ from typing import Optional
 from itertools import chain, repeat
 
 from omegaconf import OmegaConf
+import torch
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.datasets import AllTaskProcessedDataset, DatumSpec
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
@@ -56,22 +57,34 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None):
     with open(jsonl_fpath) as f:
-        examples = list(map(json.loads, f))
+        penguin_examples = list(map(json.loads, f))
 
-    for example in examples:
-        example["task_name"] = "penguin"
-        example["token_ids"] = []  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
-
-    print(f"Loaded data at {jsonl_fpath}. Found {len(examples)} examples")
+    print(f"Loaded data at {jsonl_fpath}. Found {len(penguin_examples)} examples")
 
     if num_repeats:
-        previous_length = len(examples)
-        examples = list(chain.from_iterable(repeat(example, num_repeats) for example in examples))
-        print(f"Repeating examples (in a pattern of abc to aabbcc) from {previous_length} to {len(examples)}!")
+        previous_length = len(penguin_examples)
+        penguin_examples = list(chain.from_iterable(repeat(penguin_example, num_repeats) for penguin_example in penguin_examples))
+        print(f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(penguin_examples)}!")
+
+    # We do some light preprocessing here to make our data format compatible with nemo rl format
+    nemo_rl_compatible_examples: list[DatumSpec] = []
+    for idx, penguin_example in enumerate(penguin_examples):
+        nemo_rl_compatible_example = DatumSpec(
+            message_log=[{"role": "user", "content": "", "token_ids": torch.tensor([])}],  # Fake message
+            length=0,
+            extra_env_info=penguin_example,
+            loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples
+            idx=idx,
+            task_name="penguin",
+            stop_strings=None,
+            # Extra vars
+            token_ids=[],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
+        )
+        nemo_rl_compatible_examples.append(nemo_rl_compatible_example)
 
     passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
     return AllTaskProcessedDataset(
-        examples,
+        nemo_rl_compatible_examples,
         tokenizer,
         None,
         passthrough_task_processor,
