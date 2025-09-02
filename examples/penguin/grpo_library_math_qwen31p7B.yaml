@@ -200,7 +200,7 @@ env:
   should_use_penguin: true
   penguin:
     config_paths:
-    - responses_api_models/openai_model/configs/openai_model.yaml
+    - responses_api_models/vllm_model/configs/vllm_model.yaml  # Required!
     - resources_servers/library_judge_math/configs/library_judge_math.yaml
     library_judge_math:
       resources_servers:
