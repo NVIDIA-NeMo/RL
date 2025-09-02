@@ -15,12 +15,15 @@
 import gc
 from copy import deepcopy
 
+from dataclasses import asdict
+
 import pytest
 import ray
 import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -32,6 +35,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_async_penguin_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -42,6 +46,14 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
+from tests.unit.environments.test_penguin import (
+    penguin,
+    cluster,
+    penguin_vllm_generation,
+    penguin_sanity_test_data,
+    penguin_tokenizer,
+)
+
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -729,3 +741,40 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     assert environment_message_count > 3, "Expected at least one environment message"
 
     print("\nSliding Puzzle VLLM Test assertions passed.")
+
+
+def test_run_async_penguin_rollout(
+    penguin,
+    penguin_vllm_generation,
+    penguin_sanity_test_data,
+    penguin_tokenizer,
+):
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "extra_env_info": penguin_sanity_test_data["input"]
+        }
+    )
+    actual_result = run_async_penguin_rollout(
+        policy_generation=penguin_vllm_generation,
+        input_batch=input_batch,
+        tokenizer=penguin_tokenizer,
+        task_to_env={"penguin": penguin},
+        max_seq_len=None,
+        generation_config=penguin_vllm_generation.cfg,
+        max_rollout_turns=None,
+    )
+    actual_result = asdict(actual_result)
+
+    expected_result = {
+        "final_batch": {
+            "total_reward": [0.0, 0.0]
+        },
+        "rollout_metrics": {
+            "mean_total_reward": 0.0,
+            "max_total_reward": 0.0,
+            "min_total_reward": 0.0
+        }
+    }
+
+    assert expected_result["final_batch"]["total_reward"] == actual_result["final_batch"]["total_reward"].tolist()
+    assert expected_result["rollout_metrics"] == actual_result["rollout_metrics"]

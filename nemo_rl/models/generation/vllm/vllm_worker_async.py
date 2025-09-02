@@ -22,6 +22,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -43,7 +44,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
 
         self.server_thread, self.base_url, self.http_server = None, None, None
-        if self.cfg.get("expose_http_server"):
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
             self.server_thread, self.base_url, self.http_server = self._setup_vllm_server()
 
     async def post_init_async(self):
@@ -58,12 +59,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         import uvicorn
 
-        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, BaseModelPath
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse
+        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, OpenAIServingTokenization, BaseModelPath
+        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse, TokenizeRequest, TokenizeResponse
 
-        from nemo_rl.distributed.virtual_cluster import _get_node_ip_and_free_port
+        node_ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
 
-        node_ip, free_port = ray.get(_get_node_ip_and_free_port.remote())
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
 
@@ -79,16 +80,31 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        openai_serving_chat = OpenAIServingChat(
-            engine_client,
-            model_config,
-            openai_serving_models,
+        
+        serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
-            return_tokens_as_token_ids=True,
         )
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
+        openai_serving_chat = OpenAIServingChat(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            return_tokens_as_token_ids=True,
+            **serving_chat_kwargs,
+        )
+        openai_serving_tokenization = OpenAIServingTokenization(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
+        )
+
+        # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
             generator = await openai_serving_chat.create_chat_completion(request, raw_request)
@@ -101,6 +117,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return JSONResponse(content=generator.model_dump())
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        @app.post("/tokenize")
+        async def tokenize(request: TokenizeRequest, raw_request: Request):
+            generator = await openai_serving_tokenization.create_tokenize(request, raw_request)
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(content=generator.model_dump(),
+                                    status_code=generator.code)
+            elif isinstance(generator, TokenizeResponse):
+                return JSONResponse(content=generator.model_dump())
 
         config = uvicorn.Config(
             app,

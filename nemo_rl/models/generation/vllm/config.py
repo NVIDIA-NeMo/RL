@@ -29,6 +29,7 @@ class VllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     enforce_eager: NotRequired[bool]
     expose_http_server: NotRequired[bool]
+    http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
 
 
 class VllmConfig(GenerationConfig):

@@ -63,16 +63,25 @@ class PY_EXECUTABLES:
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:
-    import socket
+    return _get_node_ip_local(), _get_free_port_local()
 
+
+def _get_node_ip_local() -> str:  # pragma: no cover
     # Get the IP address of the current node
     node_ip = ray._private.services.get_node_ip_address()
+
+    return node_ip
+
+
+def _get_free_port_local() -> int:  # pragma: no cover
+    import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))  # Bind to port 0 to get a random free port
         s.listen(1)
         port = s.getsockname()[1]
-    return node_ip, port
+
+    return port
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:

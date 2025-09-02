@@ -17,7 +17,9 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
+
+from dataclasses import dataclass
 
 import ray
 import torch
@@ -41,7 +43,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GenerationConfig,
 )
+
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -888,3 +892,136 @@ def run_async_multi_turn_rollout(
         return final_batch, rollout_metrics
 
     return asyncio.run(_async_rollout_implementation())
+
+
+def _tensorize_token_ids(message_logs: list):
+    for m in message_logs:
+        m["token_ids"] = torch.tensor(m["token_ids"])
+
+
+@dataclass
+class AsyncPenguinRolloutResult:
+    input_ids: torch.Tensor
+    final_batch: BatchedDataDict[DatumSpec]
+    rollout_metrics: dict[str, Any]
+
+
+def run_async_penguin_rollout(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    generation_config: GenerationConfig,
+    max_seq_len: Optional[int] = None,
+    max_rollout_turns: Optional[int] = None,
+    greedy: bool = False,
+) -> AsyncPenguinRolloutResult:
+    """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
+    """
+
+    # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
+    penguin_rows = input_batch["extra_env_info"]
+
+    # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
+    # Penguin policy is "What you see is what you get".
+    assert not greedy, f"`greedy` is not supported in Penguin path!"
+    assert max_rollout_turns is None, f"`max_rollout_turns` is not supported in Penguin path!"
+    assert max_seq_len is None, f"`max_seq_len` is not supported in Penguin path!"
+    # We don't use these stop criteria
+    assert not generation_config["stop_strings"], f"Stop strings is not supported in the generation config in Penguin path!"
+    assert not generation_config["stop_token_ids"], f"Stop strings is not supported in the generation config in Penguin path!"
+    # Top k is not OpenAI compatible, so Penguin does not guarantee support over it.
+    assert not generation_config["top_k"], f"Top k is not supported in the generation config in Penguin path!"
+
+    for row in penguin_rows:
+        # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
+        # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
+        # row["max_tokens"] = max_seq_len
+
+        row["temperature"] = generation_config["temperature"]
+        row["top_p"] = generation_config["top_p"]
+
+        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
+        # generation_config["max_new_tokens"]
+
+    penguin_environment = task_to_env["penguin"]
+    results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
+
+    # TODO remove this
+    with open("temp_rollout_results.json", "w") as f:
+        import json
+        json.dump(results, f)
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["message_log"] for r in results],
+            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+        }
+    )
+
+    # Tensorize all token ids
+    [_tensorize_token_ids(r["input_message_log"]) for r in results]
+    [_tensorize_token_ids(r["message_log"]) for r in results]
+
+    # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
+    batch_size = len(penguin_rows)
+    all_sample_metrics = [
+        {
+            "total_reward": r["full_result"]["reward"]
+        }
+        for r in results
+    ]
+
+    # Aggregate metrics across all samples
+    rollout_metrics = {
+        # TODO: support these metrics.
+        # # Overall metrics
+        # "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
+        # "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
+        # / batch_size,
+        # "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+        # "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+        # / batch_size,
+        # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
+        # / batch_size,
+        # "max_turns_reached_rate": sum(
+        #     m["max_turns_reached"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # # Token usage metrics
+        # "mean_total_tokens_per_sample": sum(
+        #     m["total_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # "mean_gen_tokens_per_sample": sum(
+        #     m["assistant_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # "mean_env_tokens_per_sample": sum(
+        #     m["env_tokens"] for m in all_sample_metrics
+        # )
+        # / batch_size,
+        # Reward metrics
+        "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
+        / batch_size,
+        "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+        "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+    }
+
+    # Convert LLMMessageLogType to FlatMessagesType for generation
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["input_message_log"] for r in results],
+        }
+    )
+    batched_flat, _ = batched_message_log_to_flat_message(
+        input_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    input_ids = batched_flat["token_ids"]
+
+    return AsyncPenguinRolloutResult(
+        input_ids=input_ids,
+        final_batch=final_batch,
+        rollout_metrics=rollout_metrics,
+    )

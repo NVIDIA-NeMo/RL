@@ -15,6 +15,10 @@
 import os
 from copy import deepcopy
 
+import requests
+
+from time import sleep
+
 import pytest
 import ray
 import torch
@@ -1035,6 +1039,164 @@ def test_vllm_generate_text(cluster, tokenizer):
 
     # Clean up
     vllm_generation.shutdown()
+
+
+def configure_http_server_config(tokenizer) -> VllmConfig:
+    # Create separate configs for each policy
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    return generation_config
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        # Set to greedy for test reproducibility.
+        temperature=0.0,
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    # Take a short nap for the server to spinup. Maybe there is a better way to do this?
+    sleep(3)
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    actual_result = response.json()
+
+    # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
+    expected_result = {
+        "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
+        "object": "chat.completion",
+        "created": 1756421711,
+        "model": "Qwen/Qwen3-0.6B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>",
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning_content": None
+                },
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:151667",
+                            "logprob": -0.00023779425828251988,
+                            "bytes": [
+                                60,
+                                116,
+                                104,
+                                105,
+                                110,
+                                107,
+                                62
+                            ],
+                            "top_logprobs": []
+                        }
+                    ]
+                },
+                "finish_reason": "length",
+                "stop_reason": None
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": None
+        },
+        "prompt_logprobs": None,
+        "kv_transfer_params": None
+    }
+
+    def _standardize(d: dict) -> dict:
+        d = deepcopy(d)
+        d.pop("id")
+        d.pop("created")
+        # We don't want to implicate log prob accuracy in this test.
+        d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        return d
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that tokenization route works
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198
+        ],
+        "token_strs": None
+    }
+    assert expected_result == actual_result
+
+    # Clean up
+    vllm_generation.shutdown()
+
+    # We should not be able to connect after shutdown
+    with pytest.raises(requests.ConnectionError):
+        requests.post(
+            url=f"{base_urls[0]}/chat/completions",
+            json=dict(
+                messages=[
+                    {"role": "user", "content": "count to 5"},
+                ],
+                temperature=0.0,
+                logprobs=True,
+                return_tokens_as_token_ids=True,
+                max_tokens=1,
+            )
+        )
 
 
 @pytest.mark.timeout(180)
