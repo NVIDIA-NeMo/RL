@@ -947,18 +947,6 @@ def run_async_penguin_rollout(
     penguin_environment = task_to_env["penguin"]
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
-    # TODO remove this
-    with open("temp_rollout_results.json", "w") as f:
-        import json
-        json.dump(results, f)
-
-    final_batch = BatchedDataDict[DatumSpec](
-        {
-            "message_log": [r["message_log"] for r in results],
-            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-        }
-    )
-
     # Tensorize all token ids
     [_tensorize_token_ids(r["input_message_log"]) for r in results]
     [_tensorize_token_ids(r["message_log"]) for r in results]
@@ -1019,6 +1007,22 @@ def run_async_penguin_rollout(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["message_log"] for r in results],
+            "length": [len(r["input_message_log"]["token_ids"]) for r in results],
+            "loss_multiplier": input_batch["loss_multiplier"],
+            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+            # extra_env_info: dict[str, Any]
+            # idx: int
+            # task_name: NotRequired[str]
+            # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+            # Extra information not in the DatumSpec used by the GRPO algorithm
+            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+        }
+    )
 
     return AsyncPenguinRolloutResult(
         input_ids=input_ids,
