@@ -202,7 +202,7 @@ def setup_qwen3_penguin_config(config, tokenizer):
     }
 
     # For Qwen 3 models we need to disable thinking truncation over steps and turns. Here, we modify the chat template to do so.
-    chat_template = penguin_tokenizer.chat_template
+    chat_template = tokenizer.chat_template
     to_replace = r"""        {%- if loop.index0 > ns.last_query_index %}
             {%- if loop.last or (not loop.last and reasoning_content) %}
                 {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
