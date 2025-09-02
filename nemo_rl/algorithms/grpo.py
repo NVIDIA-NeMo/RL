@@ -410,7 +410,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
-def _should_use_penguin(master_config) -> bool:
+def _should_use_penguin(master_config: MasterConfig) -> bool:
     """Determine if Penguin should be used for rollouts and validation based on the configuration.
     """
     env_config = master_config["env"]

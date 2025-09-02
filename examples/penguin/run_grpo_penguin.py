@@ -21,7 +21,7 @@ from itertools import chain, repeat
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import (
@@ -34,7 +34,6 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.penguin import (
     Penguin,
-    _should_use_penguin,
     setup_qwen3_penguin_config,
     setup_penguin_config,
 )
