@@ -126,8 +126,6 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_penguin(config)
 
-    init_ray()
-
     print("\n▶ Setting up data...")
     train_dataset = setup_single_penguin_dataset(
         jsonl_fpath=config["data"]["train_jsonl_fpath"],
@@ -138,6 +136,8 @@ def main() -> None:
         tokenizer=tokenizer,
         num_repeats=config["grpo"]["num_generations_per_prompt"],
     )
+
+    init_ray()
 
     (
         policy,
