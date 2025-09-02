@@ -58,8 +58,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None):
-    input_jsonl_fpath = config["data"]["input_jsonl_fpath"]
-    with open(input_jsonl_fpath) as f:
+    with open(jsonl_fpath) as f:
         examples = list(map(json.loads, f))
 
     print(f"Loaded data at {jsonl_fpath}. Found {len(examples)} examples")
