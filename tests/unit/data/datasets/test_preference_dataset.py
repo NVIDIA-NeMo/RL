@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 
-from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
+from nemo_rl.data.datasets import load_preference_dataset
 
 
 @pytest.fixture
@@ -80,7 +80,9 @@ def mock_rank_data():
 
 def test_rank_dataset_initialization(mock_rank_data):
     """Test that PreferenceDataset initializes correctly with valid data files."""
-    dataset = PreferenceDataset(mock_rank_data, train_split="train")
+    # Load the dataset
+    data_config = {"train_data_path": mock_rank_data}
+    dataset = load_preference_dataset(data_config)
 
     # Verify dataset initialization
     assert dataset.task_spec.task_name == "PreferenceDataset"
@@ -92,7 +94,9 @@ def test_rank_dataset_initialization(mock_rank_data):
 
 def test_rank_dataset_data_format(mock_rank_data):
     """Test that PreferenceDataset correctly loads and formats the data."""
-    dataset = PreferenceDataset(mock_rank_data, train_split="train")
+    # Load the dataset
+    data_config = {"train_data_path": mock_rank_data}
+    dataset = load_preference_dataset(data_config)
 
     # Verify data format
     sample = dataset.formatted_ds["train"][0]
@@ -161,15 +165,16 @@ def mock_chosen_rejected_data():
 
 def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
     """Test that PreferenceDataset initializes correctly with valid data files."""
+    # Load the dataset
     train_path, val_path = mock_chosen_rejected_data
-
-    dataset = PreferenceDataset(
-        train_data_path=train_path,
-        val_data_path=val_path,
-        prompt_key="prompt",
-        chosen_key="chosen_response",
-        rejected_key="rejected_response",
-    )
+    data_config = {
+        "train_data_path": train_path,
+        "val_data_path": val_path,
+        "prompt_key": "prompt",
+        "chosen_key": "chosen_response",
+        "rejected_key": "rejected_response",
+    }
+    dataset = load_preference_dataset(data_config)
 
     # Verify dataset initialization
     assert dataset.task_spec.task_name == "PreferenceDataset"
@@ -185,25 +190,28 @@ def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
 def test_chosen_rejected_dataset_invalid_files():
     """Test that PreferenceDataset raises appropriate errors with invalid files."""
     with pytest.raises(FileNotFoundError):
-        PreferenceDataset(
-            train_data_path="nonexistent.json",
-            val_data_path="nonexistent.json",
-            prompt_key="prompt",
-            chosen_key="chosen_response",
-            rejected_key="rejected_response",
-        )
+        data_config = {
+            "train_data_path": "nonexistent.json",
+            "val_data_path": "nonexistent.json",
+            "prompt_key": "prompt",
+            "chosen_key": "chosen_response",
+            "rejected_key": "rejected_response",
+        }
+        load_preference_dataset(data_config)
 
 
 def test_chosen_rejected_dataset_data_format(mock_chosen_rejected_data):
     """Test that PreferenceDataset correctly formats the data."""
+    # Load the dataset
     train_path, val_path = mock_chosen_rejected_data
-    dataset = PreferenceDataset(
-        train_data_path=train_path,
-        val_data_path=val_path,
-        prompt_key="prompt",
-        chosen_key="chosen_response",
-        rejected_key="rejected_response",
-    )
+    data_config = {
+        "train_data_path": train_path,
+        "val_data_path": val_path,
+        "prompt_key": "prompt",
+        "chosen_key": "chosen_response",
+        "rejected_key": "rejected_response",
+    }
+    dataset = load_preference_dataset(data_config)
 
     # Verify data format
     train_sample = dataset.formatted_ds["train"][0]
