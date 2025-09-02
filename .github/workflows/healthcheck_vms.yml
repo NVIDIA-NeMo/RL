@@ -1,0 +1,145 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: VM Health Check and Reboot
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  pre-flight:
+    runs-on: ubuntu-latest
+    outputs:
+      list-of-vms: ${{ steps.main.outputs.main }}
+    environment: main
+    steps:
+      - name: Get list of VMs
+        id: main
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          RUNNERS=$(curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/runners)
+
+          MATRIX=$(echo $RUNNERS \
+            | jq -c '[
+                .runners[]
+                | select(.status == "online")
+                | select(.name | contains("cpu") | not)
+                | {
+                  "vm": .name
+                }
+              ]
+            '
+          )
+          echo main=$MATRIX | tee -a "$GITHUB_OUTPUT"
+
+  healthcheck:
+    needs: pre-flight
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.pre-flight.outputs.list-of-vms )}}
+    uses: ./.github/workflows/_healthcheck_vm.yml
+    with:
+      vm: ${{ matrix.vm }}
+      n_gpus: "2"
+    secrets:
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      SLACK_GITHUB_CI_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
+      VM_KEY: ${{ secrets.VM_KEY }}
+      PAT: ${{ secrets.PAT }}
+
+  check-reboots-needed:
+    needs: [pre-flight, healthcheck]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      has_reboots: ${{ steps.check-artifacts.outputs.has_reboots }}
+    steps:
+      - name: Download all healthcheck artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: healthcheck-*
+          path: ./healthcheck-results/
+          merge-multiple: true
+
+      - name: Check if any VMs needed reboots
+        id: check-artifacts
+        env:
+          VM_LIST: ${{ needs.pre-flight.outputs.list-of-vms }}
+        run: |
+          echo "Checking healthcheck artifacts for reboot status..."
+          HAS_REBOOTS=false
+
+          # Create a list of VMs to check
+          VM_NAMES=$(echo "$VM_LIST" | jq -r '.[] | .vm')
+
+          # Check each VM's artifact
+          for VM in $VM_NAMES; do
+            echo "Checking reboot status for VM: $VM"
+
+            REBOOT_FILE="./healthcheck-results/${VM}-reboot-needed.txt"
+            if [[ -f "$REBOOT_FILE" ]]; then
+              REBOOT_NEEDED=$(cat "$REBOOT_FILE")
+              echo "VM $VM reboot needed: $REBOOT_NEEDED"
+
+              if [[ "$REBOOT_NEEDED" == "true" ]]; then
+                echo "VM $VM needs/needed a reboot"
+                HAS_REBOOTS=true
+              fi
+            else
+              echo "WARNING: No artifact found for VM $VM"
+            fi
+          done
+
+          if [[ "$HAS_REBOOTS" == "true" ]]; then
+            echo "At least one VM was rebooted"
+            echo "has_reboots=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No VMs were rebooted"
+            echo "has_reboots=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  wait-for-reboot:
+    needs: check-reboots-needed
+    if: ${{ needs.check-reboots-needed.outputs.has_reboots == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for VMs to come back online
+        run: |
+          WAIT_MINUTES=3
+          echo "Waiting ${WAIT_MINUTES} minutes for rebooted VMs to come back online..."
+          sleep $((WAIT_MINUTES * 60))
+
+  recheck:
+    needs: [pre-flight, wait-for-reboot]
+    if: ${{ always() && needs.wait-for-reboot.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.pre-flight.outputs.list-of-vms )}}
+    uses: ./.github/workflows/_healthcheck_vm.yml
+    with:
+      vm: ${{ matrix.vm }}
+      n_gpus: "2"
+      is_recheck: true
+    secrets:
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      SLACK_GITHUB_CI_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
+      VM_KEY: ${{ secrets.VM_KEY }}
+      PAT: ${{ secrets.PAT }}
