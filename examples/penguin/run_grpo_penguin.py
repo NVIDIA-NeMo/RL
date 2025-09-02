@@ -134,15 +134,18 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    # TODO move this after the setup and call .remote properly (need the base urls)
-    penguin = Penguin.options(  # type: ignore # it's wrapped with ray.remote
+    config = PenguinConfig(
+        model_name=policy_generation.cfg["model_name"],
+        base_urls=policy_generation.dp_openai_server_base_urls,
+        initial_global_config_dict=config["env"]["penguin"],
+    )
+    env = Penguin.options(
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.penguin.Penguin"
             ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
-    ).remote(config["env"])  # We use the entire env here.
+    ).remote(config)
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
