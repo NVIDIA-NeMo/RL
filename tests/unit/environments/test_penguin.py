@@ -36,10 +36,13 @@ from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer
 
 @pytest.fixture(scope="function")
 def penguin_vllm_generation(cluster, penguin_tokenizer):
-    setup_penguin_config(basic_vllm_test_config, penguin_tokenizer)
-    setup_qwen3_penguin_config(basic_vllm_test_config, penguin_tokenizer)
+    master_config = {
+        "policy": basic_vllm_test_config,
+    }
+    setup_penguin_config(master_config, penguin_tokenizer)
+    setup_qwen3_penguin_config(master_config, penguin_tokenizer)
 
-    generation_config["vllm_cfg"]["max_model_len"] = 16_384
+    basic_vllm_test_config["vllm_cfg"]["max_model_len"] = 16_384
 
     vllm_generation = VllmGeneration(cluster, generation_config)
 
