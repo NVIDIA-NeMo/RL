@@ -347,7 +347,7 @@ def validate_one_dataset(
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         val_metrics = defaultdict(lambda: 0.0)
-        num_valid_batches = 0
+        sum_num_valid_samples = 0
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
@@ -375,12 +375,13 @@ def validate_one_dataset(
                 )
 
             else:
+                samples_in_this_batch = val_results["num_valid_samples"]
                 for k, v in val_results["all_mb_metrics"].items():
                     if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                        val_metrics[k] += np.mean(v).item()
+                        val_metrics[k] += np.mean(v).item() * samples_in_this_batch
                     else:
-                        val_metrics[k] += np.sum(v).item()
-                num_valid_batches += 1
+                        val_metrics[k] += np.sum(v).item() * samples_in_this_batch
+                sum_num_valid_samples += samples_in_this_batch
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
@@ -388,7 +389,7 @@ def validate_one_dataset(
         for k, v in val_metrics.items():
             if k == "num_valid_samples":
                 continue
-            val_metrics[k] /= num_valid_batches
+            val_metrics[k] /= sum_num_valid_samples
 
         # Calculate validation metrics
         policy.prepare_for_training()

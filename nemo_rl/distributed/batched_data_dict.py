@@ -335,7 +335,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         # Get the total batch size
         batch_sizes = set()
-        for key, val in self.data.items():
+        for val in self.data.values():
             if isinstance(val, torch.Tensor):
                 batch_sizes.add(val.size(0))
             else:

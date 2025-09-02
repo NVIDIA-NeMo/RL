@@ -6,7 +6,7 @@ sft:
   max_num_steps: 60
 
   val_period: 10
-  val_batches: -1 #8
+  val_batches: 8
   val_global_batch_size: 32
   val_micro_batch_size: 4
   val_at_start: true
