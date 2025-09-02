@@ -37,12 +37,12 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
-  train_micro_batch_size: 4
+  train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  logprob_batch_size: 4
+  logprob_batch_size: 1
   max_total_sequence_length: 32768
   precision: "bfloat16"
-  logprob_chunk_size: null
+  logprob_chunk_size: 1024
 
   dtensor_cfg:
     _v2: true
