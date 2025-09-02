@@ -959,7 +959,8 @@ def run_async_penguin_rollout(
     batch_size = len(penguin_rows)
     all_sample_metrics = [
         {
-            "total_reward": r["full_result"]["reward"]
+            "total_reward": r["full_result"]["reward"],
+            "assistant_tokens": sum(len(m["token_ids"]) for m in r["message_log"] if m["role"] == "assistant"),
         }
         for r in results
     ]
@@ -980,15 +981,15 @@ def run_async_penguin_rollout(
         #     m["max_turns_reached"] for m in all_sample_metrics
         # )
         # / batch_size,
-        # # Token usage metrics
+        # Token usage metrics
         # "mean_total_tokens_per_sample": sum(
         #     m["total_tokens"] for m in all_sample_metrics
         # )
         # / batch_size,
-        # "mean_gen_tokens_per_sample": sum(
-        #     m["assistant_tokens"] for m in all_sample_metrics
-        # )
-        # / batch_size,
+        "mean_gen_tokens_per_sample": sum(
+            m["assistant_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
         # )
