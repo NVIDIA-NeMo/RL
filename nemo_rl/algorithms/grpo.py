@@ -615,11 +615,9 @@ def grpo_train(
                         input_batch=repeated_batch,
                         tokenizer=tokenizer,
                         task_to_env=task_to_env,
-                        max_seq_len=master_config["policy"][
-                            "max_total_sequence_length"
-                        ],
+                        max_seq_len=None,
                         generation_config=generation_config,
-                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        max_rollout_turns=None,
                         greedy=False,
                     )
                     input_ids = penguin_rollout_result.input_ids
@@ -967,14 +965,12 @@ def validate(
                 generation_config = master_config["policy"]["generation"]
                 penguin_rollout_result = run_async_penguin_rollout(
                     policy_generation=policy_generation,
-                    input_batch=repeated_batch,
+                    input_batch=val_batch,
                     tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=master_config["policy"][
-                        "max_total_sequence_length"
-                    ],
+                    task_to_env=val_task_to_env,
+                    max_seq_len=None,
                     generation_config=generation_config,
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                    max_rollout_turns=None,
                     greedy=False,
                 )
                 val_batch = penguin_rollout_result.final_batch
