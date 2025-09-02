@@ -33,17 +33,68 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
 
-#! Potentitally define a base class for all samplers
+
+@ray.remote
+class ReplayBuffer:
+    """Replay buffer storing per-prompt groups.
+
+    A single entry corresponds to 1 prompt repeated by
+    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
+    """
+
+    def __init__(self, max_size: int, sampler_type: str = "fifo"):
+        self.max_size = max_size
+        self.trajectories = []
+        self.trajectory_versions = []  # weight-version used for generation
+        self.target_weight_versions = []  # weight-version this trajectory is targeted for
+        self.last_target_weight_already_generated = -1
+        self._lock = _threading.Lock()
+
+        self.sampler_type = sampler_type
+        self.sampler_fns = {
+            "fifo": self.fifo_sample,
+            "mixed": self.mixed_sample,
+        }
+        
+
+    def push_with_wait_signal(
+        self,
+        trajectory: dict[str, Any],
+        weight_version: int,
+        target_weight_version: int,
+    ) -> str:
+        """Add a per-prompt trajectory group with metadata.
+
+        Args:
+            trajectory: data dict
+            weight_version: version of the model weights used for generation
+            target_weight_version: version of the model weights this trajectory is intended for training
+        """
+        with self._lock:
+            if len(self.trajectories) >= self.max_size:
+                return "full"
+
+            print("🔍 ReplayBuffer.push_with_wait_signal: Adding trajectory")
+            self.trajectories.append(trajectory)
+            self.trajectory_versions.append(weight_version)
+            self.target_weight_versions.append(target_weight_version)
+            self.last_target_weight_already_generated = max(
+                self.last_target_weight_already_generated, target_weight_version
+            )
+            print(
+                f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
+            )
+            return "success"
 
 
-class FIFOSampler:
-    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, target_weight_versions: list[int]) -> list[int]:
+    def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
+
 
         intended_indices = [
-                i
-                for i in valid_indices
-                if target_weight_versions[i] == current_weight_version
-            ]
+            i
+            for i in valid_indices
+            if self.target_weight_versions[i] == current_weight_version
+        ]
 
         print(
             f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
@@ -66,20 +117,13 @@ class FIFOSampler:
         )
 
         return selected
-        
 
-
-class MixedSampler:
-    def select(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: int) -> list[int]:
-
-
-        #! We select a total of num_prompt_groups trajectories        
-        #! Mixed sampler works by first finding out for how many trajectories is this is the last chance to be selected. Adds those into the selected list
+    def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
 
         intended_indices = [
                 i
                 for i, v in enumerate(self.trajectory_versions)
-                if i == min_valid_version
+                if v == min_valid_version
         ]
 
         #! These indices have to be selected because its their last chance. Now we have remaining num_prompt_groups - len(intended_indices) left to sample from the remaining valid_indices of trajectories those we sample randomly from the remaining
@@ -117,66 +161,6 @@ class MixedSampler:
         return selected
 
 
-
-
-
-
-
-
-
-        
-
-
-@ray.remote
-class ReplayBuffer:
-    """Replay buffer storing per-prompt groups.
-
-    A single entry corresponds to 1 prompt repeated by
-    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
-    """
-
-    def __init__(self, max_size: int, sampler_type: str = "fifo"):
-        self.max_size = max_size
-        self.trajectories = []
-        self.trajectory_versions = []  # weight-version used for generation
-        self.target_weight_versions = []  # weight-version this trajectory is targeted for
-        self.last_target_weight_already_generated = -1
-        self._lock = _threading.Lock()
-
-        if sampler_type == "fifo":
-            self.sampler = FIFOSampler()
-        elif sampler_type == "mixed":
-            self.sampler = MixedSampler()
-        
-
-    def push_with_wait_signal(
-        self,
-        trajectory: dict[str, Any],
-        weight_version: int,
-        target_weight_version: int,
-    ) -> str:
-        """Add a per-prompt trajectory group with metadata.
-
-        Args:
-            trajectory: data dict
-            weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
-        """
-        with self._lock:
-            if len(self.trajectories) >= self.max_size:
-                return "full"
-
-            print("🔍 ReplayBuffer.push_with_wait_signal: Adding trajectory")
-            self.trajectories.append(trajectory)
-            self.trajectory_versions.append(weight_version)
-            self.target_weight_versions.append(target_weight_version)
-            self.last_target_weight_already_generated = max(
-                self.last_target_weight_already_generated, target_weight_version
-            )
-            print(
-                f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
-            )
-            return "success"
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
@@ -239,9 +223,10 @@ class ReplayBuffer:
                 v for v in self.trajectory_versions if v < min_valid_version
             ]
             if old_trajectories:
-                raise ValueError(
-                    f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
-                )
+                # raise ValueError(
+                #     f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
+                # )
+                print(f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}")
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -266,7 +251,12 @@ class ReplayBuffer:
             # Only select trajectories intended for the current training step
             # This ensures no trajectory loses its "last chance" to be used for its intended step
 
-            selected = self.sampler.select(valid_indices, num_prompt_groups, current_weight_version, self.target_weight_versions)
+
+            #---
+            #valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: 
+            #---
+
+            selected = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version)
 
             from collections import Counter
 
