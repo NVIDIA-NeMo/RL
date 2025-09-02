@@ -13,9 +13,11 @@
 # limitations under the License.
 import base64
 import io
-from typing import Union
+import os
+from typing import Optional, Union
 
 import torch
+from datasets import load_dataset
 from PIL import Image
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -57,3 +59,22 @@ def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
     image.save(buffered, format=format)
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{img_str}"
+
+
+def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
+    """Load a dataset from a json or huggingface dataset.
+
+    Args:
+        data_path: The path to the dataset.
+        data_split: The split to load from the dataset.
+    """
+    suffix = os.path.splitext(data_path)[-1]
+    if suffix in [".json", ".jsonl"]:
+        raw_dataset = load_dataset("json", data_files=data_path)
+    else:
+        raw_dataset = load_dataset(data_path)
+
+    if data_split:
+        raw_dataset = raw_dataset[data_split]
+
+    return raw_dataset
