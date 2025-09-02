@@ -997,17 +997,16 @@ def run_async_penguin_rollout(
     }
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
-    input_batch = BatchedDataDict[DatumSpec](
+    input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["input_message_log"] for r in results],
         }
     )
     batched_flat, _ = batched_message_log_to_flat_message(
-        input_batch["message_log"],
+        input_batch_for_input_ids["message_log"],
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
-
 
     final_batch = BatchedDataDict[DatumSpec](
         {
