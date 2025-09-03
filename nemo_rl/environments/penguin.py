@@ -169,7 +169,7 @@ class Penguin(EnvironmentInterface):
             futures.append(future)
 
         results = []
-        for result in ray.get(futures):
+        for result in tqdm.gather(*futures, desc="Running DP rollouts"):
             results.extend(result)
 
         return results
