@@ -103,10 +103,6 @@ def setup_data(
     )
     task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
 
-    # Disable dynamic batching and sequence packing for reward model
-    env_configs["reward_model"]["dynamic_batching"]["enabled"] = False
-    env_configs["reward_model"]["sequence_packing"]["enabled"] = False
-
     reward_model_env = RewardModelEnvironment(env_configs["reward_model"])
 
     dataset = AllTaskProcessedDataset(

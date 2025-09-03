@@ -8,6 +8,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
@@ -208,7 +209,6 @@ env:
     batch_size: ${policy.train_micro_batch_size}
     checkpoint_path: null
     max_model_len: 2048
-    logprob_batch_size: ${policy.logprob_batch_size}
     resources:
       gpus_per_node: 1
       num_nodes: 1
@@ -221,7 +221,6 @@ env:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
-    max_grad_norm: null # Won't use this, but need to set it to null to avoid error
 
 logger:
   log_dir: "logs"  # Base directory for all logs
