@@ -1,0 +1,11 @@
+# GRPO Algorithm Configuration
+# A copy of examples/configs/grpo_math_1B.yaml with modifications for `policy.generation.expose_http_server: true`
+defaults: "grpo_library_math_qwen31p7B.yaml"
+
+grpo:
+  max_num_steps: 5
+  val_at_start: true
+  val_period: 5
+
+policy:
+  model_name: "Qwen/Qwen3-4B-Instruct-2507"
