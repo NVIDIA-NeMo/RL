@@ -175,7 +175,7 @@ policy:
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.9
       max_model_len: ${policy.max_total_sequence_length}
-      enforce_eager: False
+      enforce_eager: true
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
