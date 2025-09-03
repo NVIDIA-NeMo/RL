@@ -15,3 +15,4 @@ policy:
 
   dtensor_cfg:
     tensor_parallel_size: 1
+    _v2: false
