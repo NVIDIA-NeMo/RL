@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.data.datasets.eval_datasets.aime2024 import AIME2024Dataset
-from nemo_rl.data.datasets.eval_datasets.aime2025 import AIME2025Dataset
+from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
@@ -46,12 +45,14 @@ def load_eval_dataset(data_config):
         )
     # aime
     elif dataset_name == "aime2024":
-        base_dataset = AIME2024Dataset(
+        base_dataset = AIMEDataset(
+            variant="2024",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
     elif dataset_name == "aime2025":
-        base_dataset = AIME2025Dataset(
+        base_dataset = AIMEDataset(
+            variant="2025",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
@@ -98,8 +99,7 @@ def load_eval_dataset(data_config):
 
 
 __all__ = [
-    "AIME2024Dataset",
-    "AIME2025Dataset",
+    "AIMEDataset",
     "GPQADataset",
     "LocalMathDataset",
     "MathDataset",

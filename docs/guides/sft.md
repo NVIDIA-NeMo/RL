@@ -71,7 +71,6 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
 
-
 By default, NeMo RL has support for [OpenAssistant](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/response_datasets/oasst.py), [Squad](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/response_datasets/squad.py) and [OpenMathInstruct-2](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) datasets. All of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
