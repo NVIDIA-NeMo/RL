@@ -240,7 +240,7 @@ def validate(
         # val_total = len(val_dataloader)
 
         val_metrics = {"val_loss": 0.0}
-        num_valid_tokens = 0
+        sum_num_valid_tokens = 0
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
@@ -288,17 +288,17 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                num_tokens = (
+                num_valid_tokens = (
                     val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
                 ).sum()
-                val_metrics["val_loss"] += float(val_results["loss"]) * num_tokens
-                num_valid_tokens += num_tokens
+                val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
+                sum_num_valid_tokens += num_valid_tokens
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
-        if num_valid_tokens > 0:
-            val_metrics["val_loss"] /= num_valid_tokens
+        if sum_num_valid_tokens > 0:
+            val_metrics["val_loss"] /= sum_num_valid_tokens
         else:
             warnings.warn(
                 "No validation metrics were collected."
@@ -312,7 +312,7 @@ def validate(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if num_valid_tokens > 0:
+    if sum_num_valid_tokens > 0:
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
