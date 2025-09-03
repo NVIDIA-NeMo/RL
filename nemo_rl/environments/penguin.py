@@ -127,7 +127,7 @@ class PenguinWorker:
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
         return {
-            "message_log": nemo_rl_message_log[1:],
+            "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": penguin_result,
         }
