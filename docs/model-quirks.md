@@ -47,3 +47,7 @@ export NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800  # Default: 600 (10 minutes)
 ```
 
 If you encounter timeout errors, the system will suggest doubling the current timeout value.
+
+## Long Context Length Support for Qwen3-32B
+
+According to the official [document](https://arxiv.org/abs/2309.00071), Qwen3 natively supports context lengths of up to 32,768 tokens. Longer context lengths up to 131,072 tokens can be supported using [YaRN](https://arxiv.org/abs/2309.00071). In the Qwen3-32B + long context recipe (`examples/configs/recipes/llm/grpo-math-qwen3-32b-128k-4n8g-megatrontp8cp4.yaml`), we enable `YaRN` in both rollout and training configurations.
