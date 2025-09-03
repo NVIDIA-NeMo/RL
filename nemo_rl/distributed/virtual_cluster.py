@@ -97,7 +97,6 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     # Try to attach to an existing cluster
     try:
-        raise ConnectionError("force create")
         ray.init(
             address="auto",
             log_to_driver=True,
