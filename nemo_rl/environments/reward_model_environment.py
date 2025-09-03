@@ -107,6 +107,7 @@ class RewardModelEnvironment(EnvironmentInterface):
         self.config.setdefault("sequence_packing", {})
         self.config["dynamic_batching"]["enabled"] = False
         self.config["sequence_packing"]["enabled"] = False
+        self.config["max_grad_norm"] = None
 
         # Remove CUDA_VISIBLE_DEVICES to let ray fully control the GPU allocation
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
