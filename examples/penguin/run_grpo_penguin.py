@@ -155,7 +155,7 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    config = PenguinConfig(
+    penguin_config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["penguin"],
@@ -166,11 +166,11 @@ def main() -> None:
                 "nemo_rl.environments.penguin.Penguin"
             ),
         }
-    ).remote(config)
+    ).remote(penguin_config)
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
-    sleep_time = int(config["env"].get("init_sleep_time", 15))
+    sleep_time = int(master_config["env"].get("init_sleep_time", 15))
     print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
     sleep(sleep_time)
 
