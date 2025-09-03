@@ -212,9 +212,6 @@ env:
     resources:
       gpus_per_node: 1
       num_nodes: 1
-    reward_model_cfg:
-      enabled: true  # loads model as a Reward Model (do not change)
-      reward_model_type: "bradley_terry"
     dtensor_cfg:
       _v2: true
       enabled: true
@@ -224,10 +221,6 @@ env:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
-    dynamic_batching:
-      enabled: False
-    sequence_packing:
-      enabled: False
     max_grad_norm: null # Won't use this, but need to set it to null to avoid error
 
 logger:

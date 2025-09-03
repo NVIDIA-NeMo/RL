@@ -61,8 +61,8 @@ class RewardModelEnvironmentConfig(TypedDict):
     logprob_batch_size: int
     resources: Dict[str, Any]
     dtensor_cfg: Optional[Dict[str, Any]] = None
-    dynamic_batching: Optional[Dict[str, Any]] = None
-    sequence_packing: Optional[Dict[str, Any]] = None
+    dynamic_batching: Optional[Dict[str, Any]] = {"enabled": False}
+    sequence_packing: Optional[Dict[str, Any]] = {"enabled": False}
     max_grad_norm: Optional[float] = None
     generation: Optional[VllmConfig] = None
 
@@ -98,6 +98,16 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(f"📋 Received config: {config}")
 
         self.config = config
+        # Add values for reward model cfg. reward_model_cfg must be enabled in reward model environment config.
+        self.config.setdefault("reward_model_cfg", {})
+        self.config["reward_model_cfg"]["enabled"] = True
+        self.config["reward_model_cfg"]["reward_model_type"] = "bradley_terry"
+        # Dynamic batching and sequence packing are disabled in reward model environment config.
+        self.config.setdefault("dynamic_batching", {})
+        self.config.setdefault("sequence_packing", {})
+        self.config["dynamic_batching"]["enabled"] = False
+        self.config["sequence_packing"]["enabled"] = False
+
         # Remove CUDA_VISIBLE_DEVICES to let ray fully control the GPU allocation
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         self.virtual_cluster = RayVirtualCluster(

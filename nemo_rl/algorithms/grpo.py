@@ -265,7 +265,7 @@ def setup(
         train_cluster = cluster
         inference_cluster = cluster
         print(
-            f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
         )
 
