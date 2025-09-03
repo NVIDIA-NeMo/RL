@@ -400,6 +400,8 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
         scores = [score for _, score, _ in results_tuples]
         log_dicts = [log_dict for _, _, log_dict in results_tuples]
 
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
         with open(self.log_path, "a") as f:
             for log_dict in log_dicts:
                 f.write(
