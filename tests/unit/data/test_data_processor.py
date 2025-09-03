@@ -27,8 +27,7 @@ from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.datasets.eval_datasets import (
-    AIME2024Dataset,
-    AIME2025Dataset,
+    AIMEDataset,
     GPQADataset,
     MathDataset,
     MMLUDataset,
@@ -156,11 +155,10 @@ def system_prompt_file(request):
 @pytest.mark.parametrize(
     "dataset_cls",
     [
-        MMLUDataset,
+        AIMEDataset,
         GPQADataset,
         MathDataset,
-        AIME2024Dataset,
-        AIME2025Dataset,
+        MMLUDataset,
     ],
 )
 @pytest.mark.parametrize(
