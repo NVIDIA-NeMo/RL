@@ -8,7 +8,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
-  val_at_start: false
+  val_at_start: true
   max_val_samples: 480  # 30 examples in AIME24 * 16 generations each.
   val_batch_size: ${grpo.max_val_samples}
   seed: 42
