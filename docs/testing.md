@@ -55,6 +55,16 @@ Limitations and tips:
 - The remote-aware selection uses a conservative static import map (no dynamic import resolution). If a test loads code dynamically that isn’t visible via imports, you may need to run it explicitly once to seed the map.
 - The helper is test-only and does not alter library behavior. It activates automatically when you pass `--testmon`.
 
+Refreshing remote-selection artifacts
+-------------------------------------
+If you change test layout or significantly refactor imports, the remote-selection artifacts may become stale.
+To rebuild them, delete the following files at the repo root and re-run with `--testmon` to seed again:
+
+```sh
+# At the root of nemo-rl
+rm .nrl_remote_map.json .nrl_remote_state.json
+```
+
 
 ### Run Unit Tests in a Hermetic Environment
 
