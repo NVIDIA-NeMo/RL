@@ -561,6 +561,9 @@ class MegatronPolicyWorker:
             "moe_router_bias_update_rate"
         ]
 
+        if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
+            model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
+
         model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
         model_cfg.bf16 = self.dtype == torch.bfloat16
         model_cfg.fp16 = self.dtype == torch.float16
