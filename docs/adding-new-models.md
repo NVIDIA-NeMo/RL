@@ -274,6 +274,8 @@ Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSE
 
 **What this script tests:**
 
+The script is to compare both prompt and generation logprobs under the following setups:
+
 1. **Eager vs CUDA Graph Mode**: Compares log probabilities between eager execution (ground truth) and CUDA graph compilation mode
    - **⚠️ Commonly fails**: This comparison often shows discrepancies due to compilation optimizations
 2. **Torch Inductor Precision**: Tests with `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` environment variable
@@ -281,6 +283,16 @@ Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSE
 3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`use_inductor=False`) maintains output consistency
    - **✅ Usually works well**: This configuration often produces results very close to eager mode
    - **Note**: `use_inductor=False` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
+
+**Performance vs Accuracy Trade-offs:**
+
+The different compilation modes offer distinct trade-offs between accuracy and performance:
+
+- **Eager Mode** (`enforce_eager=True`): Highest accuracy (ground truth) but slowest execution
+- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"use_inductor": False}`): Near-eager accuracy with significant speedup from CUDA graph optimization
+- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"use_inductor": True}`): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
+
+**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `use_inductor=True` and `use_inductor=False`, making the accuracy-preserving option preferable.
 
 **Why this matters:**
 
