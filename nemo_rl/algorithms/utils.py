@@ -287,13 +287,14 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
                 batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
             ]
         )
-        # Pad token_mask
-        batch["token_mask"] = torch.cat(
-            [
-                batch["token_mask"],
-                batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
-            ]
-        )
+        if "token_mask" in batch:
+            # Pad token_mask
+            batch["token_mask"] = torch.cat(
+                [
+                    batch["token_mask"],
+                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
+                ]
+            )
         # Pad sample_mask
         batch["sample_mask"] = torch.cat(
             [
