@@ -88,6 +88,9 @@ class MasterConfig(TypedDict):
 class DPOValMetrics(TypedDict):
     loss: float
     accuracy: float
+    rewards_chosen_mean: float
+    rewards_rejected_mean: float
+    num_valid_samples: float
 
 
 # =======================================================
@@ -346,8 +349,8 @@ def validate_one_dataset(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
-        val_metrics = defaultdict(lambda: 0.0)
-        sum_num_valid_samples = 0
+        val_metrics = defaultdict(list)
+        num_valid_batches = 0
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
@@ -373,27 +376,44 @@ def validate_one_dataset(
                     "No validation metrics were collected for this batch."
                     " This is likely because there were no valid samples."
                 )
-
             else:
-                for k, v in val_results["all_mb_metrics"].items():
-                    samples_in_this_batch = val_batch["sample_mask"].sum()
-                    if k in {"lr", "wd"}:
-                        continue
-                    if k in {"global_valid_seqs", "global_valid_toks"}:
-                        val_metrics[k] += np.mean(v).item()
-                    elif k == "num_valid_samples":
-                        val_metrics[k] += np.sum(v).item()
-                    else:
-                        val_metrics[k] += np.sum(v).item() * samples_in_this_batch
-                sum_num_valid_samples += samples_in_this_batch
+                for metric_name in DPOValMetrics.__annotations__.keys():
+                    val_metrics[metric_name] += [
+                        sum(val_results["all_mb_metrics"][metric_name])
+                    ]
 
-            if val_batches > 0 and batch_idx >= val_batches - 1:
-                break
+                num_valid_batches += 1
 
-        for k, v in val_metrics.items():
-            if k in {"num_valid_samples","global_valid_seqs", "global_valid_toks"}:
-                continue
-            val_metrics[k] /= sum_num_valid_samples
+        if num_valid_batches > 0:
+            sum_num_valid_samples = sum(val_metrics["num_valid_samples"])
+            val_metrics = DPOValMetrics(
+                num_valid_samples=sum_num_valid_samples,
+                **{
+                    metric_name: sum(
+                        [
+                            value * weight
+                            for value, weight in zip(
+                                val_metrics[metric_name],
+                                val_metrics["num_valid_samples"],
+                            )
+                        ]
+                    )
+                    / sum_num_valid_samples
+                    for metric_name in DPOValMetrics.__annotations__.keys()
+                    if metric_name != "num_valid_samples"
+                },
+            )
+        else:
+            warnings.warn(
+                "No validation metrics were collected."
+                " This is likely because there were no valid samples in the validation set."
+            )
+            val_metrics = DPOValMetrics(
+                **{
+                    metric_name: 0.0
+                    for metric_name in DPOValMetrics.__annotations__.keys()
+                }
+            )
 
         # Calculate validation metrics
         policy.prepare_for_training()
