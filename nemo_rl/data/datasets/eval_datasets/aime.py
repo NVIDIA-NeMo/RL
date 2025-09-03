@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AIME 2025 dataset."""
+"""AIME dataset."""
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from datasets import concatenate_datasets, load_dataset
 
@@ -22,18 +22,27 @@ from nemo_rl.data import processors
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class AIME2025Dataset:
+class AIMEDataset:
     def __init__(
         self,
+        variant: Literal["2024", "2025"] = "2025",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
-        ds0 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
-        ds1 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
-        ds = concatenate_datasets([ds0, ds1])
+        if variant == "2024":
+            ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+            self.input_key = "problem"
+        elif variant == "2025":
+            ds0 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+            ds1 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+            ds = concatenate_datasets([ds0, ds1])
+            self.input_key = "question"
+        else:
+            raise ValueError(f"Invalid variant for aime dataset: aime{variant}")
+
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
-            task_name="aime2025",
+            task_name=f"aime{variant}",
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
@@ -41,6 +50,6 @@ class AIME2025Dataset:
 
     def _rekey(self, data: dict[str, Any]):
         return {
-            "problem": data["question"],
+            "problem": data[self.input_key],
             "expected_answer": data["answer"],
         }
