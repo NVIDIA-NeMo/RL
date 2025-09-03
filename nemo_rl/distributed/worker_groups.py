@@ -160,9 +160,6 @@ class RayWorkerBuilder:
             Returns:
                 A Ray actor reference to the created worker
             """
-            # No-op to test --testmon remote-aware selection
-            _nrl_remote_select_noop = 1
-
             # Set up worker arguments and resources
             module_name, class_name = self.ray_actor_class_fqn.rsplit(".", 1)
             module = importlib.import_module(module_name)
@@ -203,7 +200,6 @@ class RayWorkerBuilder:
                 placement_group_capture_child_tasks=True,
             )
             options["num_gpus"] = num_gpus
-
             worker = worker_class.options(**options).remote(
                 *self.init_args, **worker_kwargs
             )
