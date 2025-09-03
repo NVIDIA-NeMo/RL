@@ -87,7 +87,7 @@ class ReplayBuffer:
             return "success"
 
 
-    def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
+    def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, max_age_steps: int) -> Optional[dict[str, Any]]:
 
 
         intended_indices = [
@@ -118,7 +118,7 @@ class ReplayBuffer:
 
         return selected
 
-    def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
+    def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, max_age_steps: int) -> Optional[dict[str, Any]]:
 
         intended_indices = [
                 i
@@ -126,22 +126,47 @@ class ReplayBuffer:
                 if v == min_valid_version
         ]
 
-        #! These indices have to be selected because its their last chance. Now we have remaining num_prompt_groups - len(intended_indices) left to sample from the remaining valid_indices of trajectories those we sample randomly from the remaining
+        #! These indices have to be selected because its their last chance.
 
         print(f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}")
 
-        # If enough intended are available, just take those (FIFO within intended)
-        if len(intended_indices) >= num_prompt_groups:
+        #! If this is the last chance to pick them and there are more than num_prompt_groups then this is a problem and we should raise an error. This is a problem becaue next step we will have old trajectories in the buffer which will raise an error
+        if len(intended_indices) > num_prompt_groups:
 
-            #! If this happens its an indidication that something went wrong somewhere else
+            raise ValueError(f"There are {len(intended_indices)} minimum {min_valid_version} trajectories intended for current step {current_weight_version}. This is not possible since we can only select {num_prompt_groups}")
 
-            selected: list[int] = intended_indices[:num_prompt_groups]
-            print(f"🔴 Selected {len(selected)} trajectories all intended for step {current_weight_version}")
-            return selected
-
+        #! So len(intended_indices) has to <= num_prompt_groups.
         selected: list[int] = list(intended_indices)
         remaining_slots = num_prompt_groups - len(selected)
         
+        
+        #! Now, if len(intended_indices)==0. It means there are no trajectories for which this is the last chance. However, we still might need to select some minimum number of trajecrtories who have the lowest current_weight_version so as to not cause issues in future steps
+        if len(intended_indices) == 0:
+            min_current_weight_version = min(self.trajectory_versions)
+            
+            groups_with_min_current_weight_version = [i for i,v in enumerate(self.trajectory_versions) if v == min_current_weight_version]
+            num_groups_with_min_current_weight_version = len(groups_with_min_current_weight_version)
+
+            step_until_all_have_to_go = min_valid_version + max_age_steps
+
+            #! Assume all future steps pick the same minimum trajectory. Calculate how many at minimum need to be picked now.
+
+            remaining_steps_until_all_have_to_go = step_until_all_have_to_go - current_weight_version
+            max_pikcups_of_min_current_weight_version = remaining_steps_until_all_have_to_go * num_prompt_groups
+
+            num_min_current_weight_version_to_pick = num_groups_with_min_current_weight_version - max_pikcups_of_min_current_weight_version
+
+            if num_min_current_weight_version_to_pick > 0:
+                #! We need to pick atleast num_min_current_weight_version_to_pick from groups_with_min_current_weight_version
+                new_min_picks = random.sample(groups_with_min_current_weight_version, num_min_current_weight_version_to_pick)
+                selected.extend(new_min_picks)
+            else:
+                #! No need to pick anything, we still can pick randomly without issues
+                pass
+
+            remaining_slots = num_prompt_groups - len(selected)
+
+
         #! Find the remaining indices not in selected. This can be faster but this is not the blocker anyways so doesn't matter either way (?)
         remaining_pool = [
             i for i in valid_indices
@@ -215,6 +240,11 @@ class ReplayBuffer:
 
             # Compute minimum valid version based on age window
             # max_age_steps=1 means trajectories from the last 1 step are valid
+
+            #8 
+
+
+
             min_valid_version = max(0, current_weight_version - max_age_steps)
             print(f"   min_valid_version={min_valid_version}")
 
@@ -223,10 +253,10 @@ class ReplayBuffer:
                 v for v in self.trajectory_versions if v < min_valid_version
             ]
             if old_trajectories:
-                # raise ValueError(
-                #     f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
-                # )
-                print(f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}")
+                raise ValueError(
+                    f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
+                )
+                # print(f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}")
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -256,7 +286,7 @@ class ReplayBuffer:
             #valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: 
             #---
 
-            selected = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version)
+            selected = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version, max_age_steps)
 
             from collections import Counter
 
