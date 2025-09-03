@@ -134,6 +134,7 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "pytest-asyncio",
+    "pytest-testmon",
 ]
 
 [tool.uv.sources]

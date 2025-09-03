@@ -302,8 +302,8 @@ name = "bitsandbytes"
 version = "0.45.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
-    { name = "torch", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "torch", marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/b7/cb5ce4d1a382cf53c19ef06c5fc29e85f5e129b4da6527dd207d90a5b8ad/bitsandbytes-0.45.5-py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:a5453f30cc6aab6ccaac364e6bf51a7808d3da5f71763dffeb6d9694c59136e4", size = 76059261, upload-time = "2025-04-07T13:32:52.573Z" },
@@ -567,7 +567,7 @@ name = "coloredlogs"
 version = "15.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "humanfriendly" },
+    { name = "humanfriendly", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cc/c7/eed8f27100517e8c0e6b923d5f0845d0cb99763da6fdee00478f91db7325/coloredlogs-15.0.1.tar.gz", hash = "sha256:7c991aa71a4577af2f82600d8f8f3a89f936baeaf9b50a9c197da014e5bf16b0", size = 278520, upload-time = "2021-06-11T10:22:45.202Z" }
 wheels = [
@@ -735,9 +735,9 @@ name = "cppimport"
 version = "22.8.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock" },
-    { name = "mako" },
-    { name = "pybind11" },
+    { name = "filelock", marker = "sys_platform != 'darwin'" },
+    { name = "mako", marker = "sys_platform != 'darwin'" },
+    { name = "pybind11", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/54/27/01d9078a77b9e31b79b9716e66ca4db74f4744c5232bcb3e8769395c4280/cppimport-22.8.2.tar.gz", hash = "sha256:bbb4957102db41bc99ad72c233bce92f9d1fd91be352fc07878c4361033a401f", size = 26635, upload-time = "2022-08-02T16:50:36.872Z" }
 
@@ -824,8 +824,8 @@ name = "cupy-cuda12x"
 version = "13.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "fastrlock" },
-    { name = "numpy" },
+    { name = "fastrlock", marker = "sys_platform != 'darwin'" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/12/c5/7e7fc4816d0de0154e5d9053242c3a08a0ca8b43ee656a6f7b3b95055a7b/cupy_cuda12x-13.6.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:a6970ceefe40f9acbede41d7fe17416bd277b1bd2093adcde457b23b578c5a59", size = 127334633, upload-time = "2025-08-18T08:24:43.065Z" },
@@ -1965,8 +1965,8 @@ name = "liger-kernel"
 version = "0.5.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
-    { name = "triton", marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "torch", marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "triton", marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a2/55/3a703f337110e2a121a04e503abfeec2c191529cbee18bb1fb630d65642a/liger_kernel-0.5.8.tar.gz", hash = "sha256:3246d7dced89e0f982a52de259d4f78fd10eb9171246b28ae52b63ad09fc0732", size = 3593097, upload-time = "2025-04-12T16:44:32.252Z" }
 wheels = [
@@ -2517,12 +2517,12 @@ name = "mlx-lm"
 version = "0.26.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "jinja2", marker = "sys_platform != 'linux'" },
-    { name = "mlx", marker = "sys_platform != 'linux'" },
-    { name = "numpy", marker = "sys_platform != 'linux'" },
-    { name = "protobuf", marker = "sys_platform != 'linux'" },
-    { name = "pyyaml", marker = "sys_platform != 'linux'" },
-    { name = "transformers", marker = "sys_platform != 'linux'" },
+    { name = "jinja2", marker = "sys_platform == 'darwin'" },
+    { name = "mlx", marker = "sys_platform == 'darwin'" },
+    { name = "numpy", marker = "sys_platform == 'darwin'" },
+    { name = "protobuf", marker = "sys_platform == 'darwin'" },
+    { name = "pyyaml", marker = "sys_platform == 'darwin'" },
+    { name = "transformers", marker = "sys_platform == 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/af/4b/ed8ec01f182203b0897415a9d20f0cd8a141def77ad43deea18ffaba4c9c/mlx_lm-0.26.3.tar.gz", hash = "sha256:06cd74ee3eea920335c528e68feb854eede45fe4e5f149b464ac100c1dbeaded", size = 172096, upload-time = "2025-08-06T21:48:22.762Z" }
 wheels = [
@@ -2900,6 +2900,7 @@ test = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pytest-testmon" },
     { name = "pytest-timeout" },
 ]
 
@@ -2983,6 +2984,7 @@ test = [
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pytest-testmon" },
     { name = "pytest-timeout" },
 ]
 
@@ -3238,22 +3240,22 @@ name = "nvidia-modelopt"
 version = "0.33.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ninja" },
-    { name = "numpy" },
-    { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt-core" },
-    { name = "packaging" },
-    { name = "pulp" },
-    { name = "pydantic" },
-    { name = "regex" },
-    { name = "rich" },
-    { name = "safetensors" },
-    { name = "scipy" },
-    { name = "torch" },
-    { name = "torchprofile" },
+    { name = "ninja", marker = "sys_platform != 'darwin'" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-ml-py", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-modelopt-core", marker = "sys_platform != 'darwin'" },
+    { name = "packaging", marker = "sys_platform != 'darwin'" },
+    { name = "pulp", marker = "sys_platform != 'darwin'" },
+    { name = "pydantic", marker = "sys_platform != 'darwin'" },
+    { name = "regex", marker = "sys_platform != 'darwin'" },
+    { name = "rich", marker = "sys_platform != 'darwin'" },
+    { name = "safetensors", marker = "sys_platform != 'darwin'" },
+    { name = "scipy", marker = "sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
+    { name = "torchprofile", marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.22.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
-    { name = "tqdm" },
+    { name = "torchvision", version = "0.22.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "tqdm", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ca/cb/4af39357792a96f334c7877ea0380c9337aec210ff4794a7dd95beb7c349/nvidia_modelopt-0.33.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:6c51091683a117cd40fdb96a0ec28579f2276f6b627db7ccddc370df544e1dd7", size = 751683, upload-time = "2025-08-12T18:37:48.832Z" },
@@ -3262,18 +3264,18 @@ wheels = [
 
 [package.optional-dependencies]
 onnx = [
-    { name = "cppimport" },
+    { name = "cppimport", marker = "sys_platform != 'darwin'" },
     { name = "cupy-cuda12x", marker = "platform_machine != 'aarch64' and sys_platform != 'darwin'" },
-    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
-    { name = "onnx" },
-    { name = "onnx-graphsurgeon" },
-    { name = "onnxconverter-common" },
-    { name = "onnxruntime", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin'" },
+    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform != 'darwin'" },
+    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform != 'darwin'" },
+    { name = "onnx", marker = "sys_platform != 'darwin'" },
+    { name = "onnx-graphsurgeon", marker = "sys_platform != 'darwin'" },
+    { name = "onnxconverter-common", marker = "sys_platform != 'darwin'" },
+    { name = "onnxruntime", marker = "platform_machine == 'aarch64' and sys_platform != 'darwin'" },
     { name = "onnxruntime-gpu", version = "1.20.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'win32'" },
     { name = "onnxruntime-gpu", version = "1.22.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'win32'" },
-    { name = "onnxscript" },
-    { name = "polygraphy" },
+    { name = "onnxscript", marker = "sys_platform != 'darwin'" },
+    { name = "polygraphy", marker = "sys_platform != 'darwin'" },
 ]
 
 [[package]]
@@ -3314,13 +3316,13 @@ name = "nvidia-resiliency-ext"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "defusedxml" },
-    { name = "nvidia-ml-py" },
-    { name = "packaging" },
-    { name = "psutil" },
-    { name = "pynvml" },
-    { name = "pyyaml" },
-    { name = "torch" },
+    { name = "defusedxml", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-ml-py", marker = "sys_platform != 'darwin'" },
+    { name = "packaging", marker = "sys_platform != 'darwin'" },
+    { name = "psutil", marker = "sys_platform != 'darwin'" },
+    { name = "pynvml", marker = "sys_platform != 'darwin'" },
+    { name = "pyyaml", marker = "sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/70/05/38d491962273c7905708762279f440520eb79f3c00b67a023497215ad023/nvidia_resiliency_ext-0.4.1-cp312-cp312-manylinux_2_31_aarch64.whl", hash = "sha256:b3bd5f01535574b16d0f38bca6e39afe3806c4a2896eee1b321cd944e00025a7", size = 444570, upload-time = "2025-07-17T03:50:58.877Z" },
@@ -3371,9 +3373,9 @@ name = "onnx"
 version = "1.18.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "protobuf" },
-    { name = "typing-extensions" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "protobuf", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3d/60/e56e8ec44ed34006e6d4a73c92a04d9eea6163cc12440e35045aec069175/onnx-1.18.0.tar.gz", hash = "sha256:3d8dbf9e996629131ba3aa1afd1d8239b660d1f830c6688dd7e03157cccd6b9c", size = 12563009, upload-time = "2025-05-12T22:03:09.626Z" }
 wheels = [
@@ -3395,8 +3397,8 @@ name = "onnx-graphsurgeon"
 version = "0.5.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "onnx" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "onnx", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/53/98334c4f64a9e289a8cb48f5e7966b8ff015414d0bf26587cf46d764f1d8/onnx_graphsurgeon-0.5.8-py2.py3-none-any.whl", hash = "sha256:6f611ea29a8e4740fbab1aae52bf4c40b8b9918f8459058d20b99acc79fce121", size = 57923, upload-time = "2025-04-10T18:49:24.483Z" },
@@ -3407,11 +3409,11 @@ name = "onnx-ir"
 version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy" },
-    { name = "onnx" },
-    { name = "typing-extensions" },
+    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform != 'darwin'" },
+    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform != 'darwin'" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "onnx", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6a/14/4a003926218f8edee6da19546f69a1831b74cdd993eaf5ff50a2fb168e70/onnx_ir-0.1.7.tar.gz", hash = "sha256:4734b7587807ca657158b042c138879c3f454756fae74e949f6c99f0107d8df6", size = 107944, upload-time = "2025-08-22T15:01:16.383Z" }
 wheels = [
@@ -3423,10 +3425,10 @@ name = "onnxconverter-common"
 version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "onnx" },
-    { name = "packaging" },
-    { name = "protobuf" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "onnx", marker = "sys_platform != 'darwin'" },
+    { name = "packaging", marker = "sys_platform != 'darwin'" },
+    { name = "protobuf", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/ac/c3ff41cc2d36c8caab51bffa9185ea64019f161850b9641eb0409b243ae1/onnxconverter_common-1.15.0-py2.py3-none-any.whl", hash = "sha256:24579ed1bb3c10beca39a4517d196c17341911be5bd09bd0e6050a7379a2a7d9", size = 89640, upload-time = "2025-07-01T16:42:56.968Z" },
@@ -3437,12 +3439,12 @@ name = "onnxruntime"
 version = "1.22.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "coloredlogs", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { name = "flatbuffers", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { name = "numpy", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { name = "packaging", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { name = "protobuf", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { name = "sympy", marker = "platform_machine == 'aarch64' or sys_platform == 'darwin' or sys_platform == 'win32'" },
+    { name = "coloredlogs", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "flatbuffers", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "numpy", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "packaging", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "protobuf", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "sympy", marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/29/e5/00b099b4d4f6223b610421080d0eed9327ef9986785c9141819bbba0d396/onnxruntime-1.22.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:984cea2a02fcc5dfea44ade9aca9fe0f7a8a2cd6f77c258fc4388238618f3928", size = 14473861, upload-time = "2025-07-10T19:15:42.911Z" },
@@ -3500,13 +3502,13 @@ name = "onnxscript"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
-    { name = "numpy" },
-    { name = "onnx" },
-    { name = "onnx-ir" },
-    { name = "packaging" },
-    { name = "typing-extensions" },
+    { name = "ml-dtypes", version = "0.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' and sys_platform != 'darwin'" },
+    { name = "ml-dtypes", version = "0.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' and sys_platform != 'darwin'" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "onnx", marker = "sys_platform != 'darwin'" },
+    { name = "onnx-ir", marker = "sys_platform != 'darwin'" },
+    { name = "packaging", marker = "sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a8/9f/45aed9951d3fa50a97b910487186ef9c15ad08d3c9cb3605aabd99f65f92/onnxscript-0.4.0.tar.gz", hash = "sha256:de618eeb6e0c57f5a70f85909ab1f829cbb2053ad55f8f2fcc2701fa29b7adfc", size = 567393, upload-time = "2025-08-22T21:05:46.416Z" }
 wheels = [
@@ -4322,7 +4324,7 @@ name = "pynvml"
 version = "12.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-ml-py" },
+    { name = "nvidia-ml-py", marker = "sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/26/6f/6b5880ed0239e85b9a39aed103b65b2ef81425beef9f45e5c035bf008330/pynvml-12.0.0.tar.gz", hash = "sha256:299ce2451a6a17e6822d6faee750103e25b415f06f59abb8db65d30f794166f5", size = 33636, upload-time = "2024-12-02T15:04:36.631Z" }
 wheels = [
@@ -4427,6 +4429,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a8/ad/a2a32d91effe0f84a300b9ba6c9d000bd52f31b77f8e49d8fd8653a9ddc3/pytest_random_order-1.2.0.tar.gz", hash = "sha256:12b2d4ee977ec9922b5e3575afe13c22cbdb06e3d03e550abc43df137b90439a", size = 107304, upload-time = "2025-06-22T14:44:43.807Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/7f/92c8dbe185aa38270fec1e73e0ed70d8e5de31963aa057ba621055f8b008/pytest_random_order-1.2.0-py3-none-any.whl", hash = "sha256:78d1d6f346222cdf26a7302c502d2f1cab19454529af960b8b9e1427a99ab277", size = 10889, upload-time = "2025-06-22T14:44:42.438Z" },
+]
+
+[[package]]
+name = "pytest-testmon"
+version = "2.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "coverage" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/54/24/b17712bc8b9d9814a30346e5bd76a6c4539f5187455f4e0d99d95f033da6/pytest_testmon-2.1.3.tar.gz", hash = "sha256:dad41aa7d501d74571750da1abd3f6673b63fd9dbf3023bd1623814999018c97", size = 22608, upload-time = "2024-12-22T12:43:28.822Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/08/278800711d937e76ce59105fea1bb739ae5ff5c13583fd064fe3b4e64fa1/pytest_testmon-2.1.3-py3-none-any.whl", hash = "sha256:53ba06d8a90ce24c3a191b196aac72ca4b788beff5eb1c1bffee04dc50ec7105", size = 24994, upload-time = "2024-12-22T12:43:10.173Z" },
 ]
 
 [[package]]
@@ -5647,10 +5662,10 @@ name = "torchprofile"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "torch", marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.22.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "torchvision", version = "0.22.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6f/36/574c0c46e818533b78b3c09505211162918188325ab4165ef11a3f295755/torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b", size = 4557, upload-time = "2021-06-22T04:58:03.592Z" }
 wheels = [
