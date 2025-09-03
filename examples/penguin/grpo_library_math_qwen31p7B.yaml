@@ -57,8 +57,8 @@ policy:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 0
-    activation_checkpointing: false
-    converter_type: "Qwen2ForCausalLM"
+    activation_checkpointing: true
+    converter_type: "Qwen2ForCausalLM"  # Apparently this is comptible with Qwen 3 dense models.
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -74,7 +74,7 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: true
 
     optimizer:
       optimizer: "adam"
