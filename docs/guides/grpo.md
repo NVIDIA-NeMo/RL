@@ -38,7 +38,7 @@ To support this, we need to know:
 
 #### Dataset
 
-By default, NeMo RL has support for `OpenAssistant` and `DeepScaler` datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+By default, NeMo RL has support for [OpenMathInstruct-2](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) and [DeepScaler](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/response_datasets/deepscaler.py) datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
