@@ -168,8 +168,9 @@ class Penguin(EnvironmentInterface):
             future = worker.run_rollouts.remote(this_batch_penguin_examples)
             futures.append(future)
 
+        batched_results = await tqdm.gather(*futures, desc="Running DP rollouts")
         results = []
-        for result in tqdm.gather(*futures, desc="Running DP rollouts"):
+        for result in batched_results:
             results.extend(result)
 
         return results
