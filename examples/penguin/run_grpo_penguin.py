@@ -170,7 +170,7 @@ def main() -> None:
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
-    sleep_time = 15
+    sleep_time = int(config["env"].get("init_sleep_time", 15))
     print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
     sleep(sleep_time)
 
