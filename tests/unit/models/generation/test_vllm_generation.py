@@ -55,7 +55,7 @@ basic_vllm_test_config: VllmConfig = {
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "enable_expert_parallel": False,
-        "gpu_memory_utilization": 0.5,
+        "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
         "skip_tokenizer_init": False,
