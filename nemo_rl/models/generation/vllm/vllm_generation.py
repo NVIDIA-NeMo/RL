@@ -59,7 +59,7 @@ class VllmGeneration(GenerationInterface):
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.dp_size = cluster.world_size() // self.tp_size // self.pp_size
-        self.vllm_dp_size = self.dp_size // self.ep_size
+        self.vllm_dp_size = self.ep_size // self.tp_size
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -69,7 +69,7 @@ class VllmGeneration(GenerationInterface):
 
         if self.ep_size > 1:
             assert self.ep_size % self.tp_size == 0, (
-                "When EP > 1, it must be a multiple of TP since EP = DP * TP in vLLM. "
+                "When EP > 1, EP must be a multiple of TP since EP = DP * TP in vLLM. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
             if self.ep_size != self.tp_size:

@@ -338,18 +338,16 @@ class BaseVllmGenerationWorker:
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.expert_parallel_size > self.tensor_parallel_size:
             # set vLLM DP rank
-            global_dp_rank = int(os.environ["RANK"]) // model_parallel_size
-            local_dp_rank = (int(os.environ["RANK"]) % 8) // model_parallel_size
-            os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
-            # set vLLM DP master address and port
-            dp_leader_rank = (
-                int(os.environ["RANK"]) // model_parallel_size * model_parallel_size
-            )
+            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
+            rank = int(os.environ["RANK"]) % world_size
+            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
+            os.environ["VLLM_DP_RANK_LOCAL"] = str((rank % 8) // model_parallel_size)
+            # set vLLM DP address and port
+            leader_rank = int(os.environ["RANK"]) // world_size * world_size
             addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
             port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
-            os.environ["VLLM_DP_MASTER_IP"] = addr_list[dp_leader_rank]
-            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[dp_leader_rank])
+            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
+            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
