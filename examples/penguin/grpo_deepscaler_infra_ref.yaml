@@ -4,7 +4,7 @@ defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
 
 grpo:
   num_generations_per_prompt: 16
-  num_prompts_per_step: 1
+  num_prompts_per_step: 4
   max_num_steps: 10
   val_at_start: false
 
