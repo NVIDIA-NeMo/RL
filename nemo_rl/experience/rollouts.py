@@ -941,11 +941,13 @@ def run_async_penguin_rollout(
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
         # row["max_tokens"] = max_seq_len
 
-        row["temperature"] = generation_config["temperature"]
-        row["top_p"] = generation_config["top_p"]
+        responses_create_params = row["responses_create_params"]
+        responses_create_params["temperature"] = generation_config["temperature"]
+        responses_create_params["top_p"] = generation_config["top_p"]
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
+    print(row)
 
     penguin_environment = task_to_env["penguin"]
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
