@@ -457,6 +457,17 @@ class RayWorkerGroup:
         # Get all placement groups
         placement_groups = self.cluster.get_placement_groups()
 
+        # Get available address and port for each worker
+        available_addresses = []
+        available_ports = []
+        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+            for local_rank, bundle_idx in enumerate(local_bundle_indices):
+                addr, port = self.cluster.get_available_address_and_port(
+                    pg_idx, bundle_idx
+                )
+                available_addresses.append(addr)
+                available_ports.append(port)
+
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
 
@@ -478,6 +489,8 @@ class RayWorkerGroup:
                         "MASTER_ADDR": self.master_address,
                         "MASTER_PORT": str(self.master_port),
                         "NODE_RANK": str(pg_idx),
+                        "AVAILABLE_ADDR_LIST": str(available_addresses),
+                        "AVAILABLE_PORT_LIST": str(available_ports),
                     }
                 )
                 worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
