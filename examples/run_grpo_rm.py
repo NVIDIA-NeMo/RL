@@ -32,6 +32,7 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.data.processors import math_hf_data_processor
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
@@ -103,7 +104,21 @@ def setup_data(
     )
     task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
 
-    reward_model_env = RewardModelEnvironment(env_configs["reward_model"])
+    # Reward model environment uses the same python environment as the policy worker
+    reward_model_py_executable_class = (
+        "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+        if env_configs["reward_model"]["dtensor_cfg"]["_v2"]
+        else "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+    )
+    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+        runtime_env={
+            "py_executable": get_actor_python_env(
+                # reward_model_py_executable_class
+                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+            ),
+            "env_vars": dict(os.environ),  # Pass thru all user environment variables
+        }
+    ).remote(env_configs["reward_model"])
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
