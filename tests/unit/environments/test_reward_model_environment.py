@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 
 import pytest
 import ray
 import torch
 
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.reward_model_environment import (
     RewardModelEnvironment,
     RewardModelEnvironmentConfig,
@@ -36,7 +38,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "batch_size": 32,
     "checkpoint_path": None,
     "max_model_len": MAX_MODEL_LEN,
-    "resources": {"gpus_per_node": 1, "num_nodes": 1},
+    "resources": {"gpus_per_node": 1, "num_nodes": 2},
     "reward_model_cfg": {
         "enabled": True,
         "reward_model_type": "bradley_terry",
@@ -71,7 +73,22 @@ def reward_model_env():
     env_actor = None
     try:
         assert ray.is_initialized()
-        env_actor = RewardModelEnvironment(basic_env_config)
+        reward_model_py_executable_class = (
+            "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+            if basic_env_config["dtensor_cfg"]["_v2"]
+            else "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+        )
+        env_actor = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    # reward_model_py_executable_class
+                    "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+                ),
+                "env_vars": dict(
+                    os.environ
+                ),  # Pass thru all user environment variables
+            }
+        ).remote(basic_env_config)
         yield env_actor
     except Exception as e:
         print(f"Error creating reward model environment: {e}")
@@ -79,7 +96,7 @@ def reward_model_env():
     finally:
         if env_actor:
             try:
-                env_actor.shutdown()
+                env_actor.shutdown.remote()
             except Exception as e:
                 print(f"Warning: Error during actor shutdown: {e}")
 
@@ -141,7 +158,8 @@ class TestRewardModelEnvironment:
         ]
 
         # Use remote call for Ray Actor
-        output = reward_model_env.preprocess_data(message_log_batch)
+        future = reward_model_env.preprocess_data.remote(message_log_batch)
+        output = ray.get(future)
 
         target_length = 39
         assert output is not None
@@ -185,7 +203,8 @@ class TestRewardModelEnvironment:
         ]
 
         # Execute the environment step
-        output = reward_model_env.step(message_log_batch, [])
+        future = reward_model_env.step.remote(message_log_batch, [])
+        output = ray.get(future)
 
         # Verify the reward model name
         assert REWARD_MODEL_NAME == "Skywork/Skywork-Reward-V2-Qwen3-0.6B"

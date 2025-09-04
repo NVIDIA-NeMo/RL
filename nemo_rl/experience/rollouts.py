@@ -37,7 +37,6 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
-from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -234,18 +233,7 @@ def calculate_rewards(
 
     # Group messages by task type
     task_groups: dict[str, list[tuple[int, LLMMessageLogType]]] = {}
-    if not task_names or len(task_to_env) == 0 or len(task_names) == 0:
-        is_reward_model_env = False
-    else:
-        is_reward_model_env = isinstance(
-            task_to_env[task_names[0]], RewardModelEnvironment
-        )
     for i, task_name in enumerate(task_names):
-        assert task_name not in task_to_env or is_reward_model_env == isinstance(
-            task_to_env[task_name], RewardModelEnvironment
-        ), (
-            "All tasks must be of the same type. Reward model environment and other environments are not supported together."
-        )
         if task_name not in task_groups:
             task_groups[task_name] = []
         task_groups[task_name].append((i, to_env[i]))
@@ -265,17 +253,11 @@ def calculate_rewards(
         env_info = [batch["extra_env_info"][i] for i in indices]
 
         # Submit task to environment and store future
-        if is_reward_model_env:
-            future = task_to_env[task_name].step(messages, env_info)
-        else:
-            future = task_to_env[task_name].step.remote(messages, env_info)
-            future_to_indices[future] = indices
+        future = task_to_env[task_name].step.remote(messages, env_info)
+        future_to_indices[future] = indices
         futures.append(future)
 
-    # Get results based on environment type
-    results = futures if is_reward_model_env else ray.get(futures)
-
-    # Initialize result containers
+    results = ray.get(futures)
     all_rewards = []
     all_env_observations = []
     all_terminateds = []
@@ -285,12 +267,7 @@ def calculate_rewards(
     all_answers = []
 
     for future, result in zip(futures, results):
-        # Get indices based on environment type
-        indices = (
-            range(len(result.rewards))
-            if is_reward_model_env
-            else future_to_indices[future]
-        )
+        indices = future_to_indices[future]
         # Environment step returns: EnvironmentReturn
         (
             env_observations,
@@ -316,12 +293,10 @@ def calculate_rewards(
             all_answers.append(answers[i])
 
     # Sort results by original index to maintain order
-    if is_reward_model_env:
-        sorted_indices = range(len(all_rewards))
-    else:
-        sorted_indices = sorted(
-            range(len(all_indices_order)), key=lambda k: all_indices_order[k]
-        )
+    sorted_indices = sorted(
+        range(len(all_indices_order)), key=lambda k: all_indices_order[k]
+    )
+    sorted_indices = range(len(all_rewards))
     rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
