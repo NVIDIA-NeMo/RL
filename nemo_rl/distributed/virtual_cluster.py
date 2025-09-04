@@ -45,11 +45,11 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies.
     BASE = "uv run --locked"
 
-    # Use NeMo-RL direct dependencies.
-    AUTOMODEL = "uv run --locked --extra automodel"
-
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
+
+    # Use NeMo-RL direct dependencies and nemo-automodel.
+    AUTOMODEL = "uv run --locked --extra automodel"
 
     # Megatron-core (and nemo dependencies)
     # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
@@ -78,6 +78,9 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     Try to attach to an existing local cluster.
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
+
+    Args:
+        log_dir: Optional directory to store Ray logs and temp files.
     """
     # Set up runtime environment
     env_vars = dict(os.environ)

@@ -380,6 +380,7 @@ def run_multi_turn_rollout(
         # Extract input_ids and lengths from the flat messages
         active_input_ids = active_flat_messages["token_ids"]
 
+        # Prepare generation input data
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": active_input_ids,
@@ -387,6 +388,17 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        # add the multimodal data to the generation input data
+        multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
+        generation_input_data.update(multimodal_data)
+
+        # keep message log for generation
+        if "vllm_content" in active_batch:
+            generation_input_data["vllm_content"] = active_batch["vllm_content"]
+        if "vllm_images" in active_batch:
+            generation_input_data["vllm_images"] = active_batch["vllm_images"]
+        if "vllm_videos" in active_batch:
+            generation_input_data["vllm_videos"] = active_batch["vllm_videos"]
 
         # generate_responses updates active_batch["message_log"] in-place
         active_batch, generated_ids, gen_metrics = generate_responses(
@@ -485,6 +497,7 @@ def run_multi_turn_rollout(
 
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
+    current_batch["truncated"] = sample_truncated
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -830,6 +843,10 @@ def run_async_multi_turn_rollout(
                 "idx": [
                     state.get("idx", i) for i, state in enumerate(final_sample_states)
                 ],
+                "truncated": torch.tensor(
+                    [metrics["truncated"] for metrics in all_sample_metrics],
+                    dtype=torch.bool,
+                ),
             }
         )
 
