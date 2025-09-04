@@ -49,8 +49,10 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  # NOTE(mfathi): this ensures the training sequences are all max_total_sequence_length long, very important for dLLM training
-  make_sequence_length_divisible_by: ${policy.max_total_sequence_length}  
+  # NOTE(mfathi): we need to use a dynamic sequence length for dLLM training as per LLaDA training, 
+  # this used to be set to ${policy.max_total_sequence_length} to ensure that the training sequences 
+  # have a fixed length, which resulted in a training-inference mismatch
+  make_sequence_length_divisible_by: 1 
   max_grad_norm: 1.0
 
   optimizer:
