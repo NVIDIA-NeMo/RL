@@ -792,4 +792,5 @@ def test_run_async_penguin_rollout(
             "rollout_metrics": d["rollout_metrics"],
         }
 
+    print(_standardize(actual_result))
     assert _standardize(expected_result) == _standardize(actual_result)
