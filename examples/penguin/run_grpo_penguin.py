@@ -170,7 +170,8 @@ def main() -> None:
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
-    sleep_time = int(master_config["env"].get("init_sleep_time", 15))
+    # TODO: Eventually there will be a better way to check if the servers have spun up on Penguin side.
+    sleep_time = int(master_config["env"].get("init_sleep_time", 30))  # 30s default.
     print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
     sleep(sleep_time)
 

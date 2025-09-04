@@ -95,8 +95,8 @@ openai_model:
     ).remote(config)
 
     # A quick power nap
-    print("Sleeping for 15s for Penguin to spin up...")
-    time.sleep(15)
+    print("Sleeping for 30s for Penguin to spin up...")
+    time.sleep(30)
 
     yield env
     # Clean up the actor and wait for it to be killed
