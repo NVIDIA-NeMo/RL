@@ -480,7 +480,7 @@ class RayWorkerGroup:
 
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
                 # Set up basic distributed environment variables
-                worker_env_vars = deepcopy(env_vars)
+                worker_env_vars = {}
                 worker_env_vars.update(
                     {
                         "RANK": str(global_rank),

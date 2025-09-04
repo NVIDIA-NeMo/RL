@@ -67,8 +67,7 @@ class RewardModelEnvironmentConfig(TypedDict):
     generation: Optional[VllmConfig] = None
 
 
-# Nested ray actor with multi nodes will have some issues when init.
-# So EnvironmentInterface and not use ray.remote.
+@ray.remote
 class RewardModelEnvironment(EnvironmentInterface):
     """Environment that uses a reward model to score conversations.
 
