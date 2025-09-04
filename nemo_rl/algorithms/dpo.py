@@ -258,6 +258,8 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
                 else master_config["policy"]["train_micro_batch_size"] * 2
             )
 
+            # when running validation with drop_last=False, we might end up with a partial batch.
+            # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
             dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
             if batch.size % (dp_size * micro_batch_size) != 0:
                 batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
@@ -354,14 +356,6 @@ def validate_one_dataset(
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
         ):
-            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size
-            if val_batch.size < val_batch_size * 2:
-                val_batch = maybe_pad_last_batch(
-                    val_batch,
-                    policy.sharding_annotations.get_axis_size("data_parallel"),
-                    val_mbs * 2,
-                )
-
             ## just run model fwd
             val_results = policy.train(
                 val_batch,
