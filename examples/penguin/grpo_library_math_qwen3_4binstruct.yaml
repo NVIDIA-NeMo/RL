@@ -149,16 +149,11 @@ policy:
       fused: False
 
   scheduler:
-    - name: "torch.optim.lr_scheduler.LinearLR"
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 50
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
         factor: 1.0
         total_iters: 10000000000
-    - milestones: [50]
+    - milestones: []
 
   generation:
     backend: "vllm"
