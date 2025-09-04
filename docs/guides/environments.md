@@ -63,7 +63,7 @@ env_config = {
     },
 }
 
-reward_env = RewardModelEnvironment(env_config)
+reward_env = RewardModelEnvironment.remote(env_config)
 ```
 ### Complete GRPO Training with Reward Model Environments
 
