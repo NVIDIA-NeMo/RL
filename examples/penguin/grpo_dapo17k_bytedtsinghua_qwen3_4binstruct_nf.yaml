@@ -1,6 +1,8 @@
 # GRPO Algorithm Configuration
 # A copy of examples/configs/grpo_math_1B.yaml with modifications for `policy.generation.expose_http_server: true`
 defaults: "grpo_dapo17k_qwen3_4binstruct_nf.yaml"
+grpo:
+  max_val_samples: 960  # BytedTsinghua uses 30 examples in AIME24 * 32 generations each.
 
 data:
   train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/bytedtsinghua_dapo17k/train.jsonl
