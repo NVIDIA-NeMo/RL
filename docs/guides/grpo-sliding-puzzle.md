@@ -175,7 +175,7 @@ The [sliding_puzzle.py](../../nemo_rl/environments/games/sliding_puzzle.py) defi
 #### SlidingPuzzleEnv
 The SlidingPuzzleEnv class serves as the main environment, implementing a Ray remote actor for distributed processing and using functions from both the SlidingPuzzleGameLogic and SlidingPuzzleRunner classes to interact with the environment.
 
-```echanics with stat
+```python
 @ray.remote
 class SlidingPuzzleEnv(EnvironmentInterface):
     def __init__(self, cfg: Optional[SlidingPuzzleConfig] = None):
