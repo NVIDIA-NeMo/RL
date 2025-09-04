@@ -78,6 +78,9 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     Try to attach to an existing local cluster.
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
+
+    Args:
+        log_dir: Optional directory to store Ray logs and temp files.
     """
     # Set up runtime environment
     env_vars = dict(os.environ)
