@@ -27,7 +27,7 @@ checkpointing:
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 10
+  save_period: 1
   checkpoint_must_save_by: null
 
 policy:
