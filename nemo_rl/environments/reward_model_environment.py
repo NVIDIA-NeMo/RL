@@ -107,6 +107,12 @@ class RewardModelEnvironment(EnvironmentInterface):
         self.config["dynamic_batching"]["enabled"] = False
         self.config["sequence_packing"]["enabled"] = False
         self.config["max_grad_norm"] = None
+        # Reward model environment is always using DTensor
+        self.config["dtensor_cfg"]["enabled"] = True
+
+        self.task_data_spec = TaskDataSpec(
+            task_name="reward_model_env",
+        )
 
         # Remove CUDA_VISIBLE_DEVICES to let ray fully control the GPU allocation
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -163,17 +169,13 @@ class RewardModelEnvironment(EnvironmentInterface):
             BatchedDataDict containing tokenized and formatted data ready for
             reward model inference.
         """
-        task_data_spec = TaskDataSpec(
-            task_name="reward_model_env",
-        )
-
         # Tokenize each message_log
         tokenized_message_logs = []
         for message_log in message_logs:
             tokenized_log = get_formatted_message_log(
                 message_log,
                 tokenizer=self.tokenizer,
-                task_data_spec=task_data_spec,
+                task_data_spec=self.task_data_spec,
                 add_bos_token=True,
                 add_eos_token=True,
                 add_generation_prompt=False,
