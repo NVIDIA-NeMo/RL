@@ -16,26 +16,25 @@ import argparse
 import os
 import pprint
 import json
-from typing import Any
+from typing import Optional
+from itertools import chain, repeat
+from time import sleep
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import (
-    DatumSpec,
-)
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.data.datasets import AllTaskProcessedDataset, DatumSpec
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.penguin import (
     Penguin,
-    _should_use_penguin,
+    PenguinConfig,
     setup_qwen3_penguin_config,
     setup_penguin_config,
+    penguin_example_to_nemo_rl_datum_spec,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -55,6 +54,31 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     args, overrides = parser.parse_known_args()
 
     return args, overrides
+
+
+def setup_single_penguin_dataset(jsonl_fpath: str, tokenizer, num_repeats: Optional[int] = None):
+    with open(jsonl_fpath) as f:
+        penguin_examples = list(map(json.loads, f))
+
+    print(f"Loaded data at {jsonl_fpath}. Found {len(penguin_examples)} examples")
+
+    if num_repeats:
+        previous_length = len(penguin_examples)
+        penguin_examples = list(chain.from_iterable(repeat(penguin_example, num_repeats) for penguin_example in penguin_examples))
+        print(f"Repeating examples (in a pattern of abc to aabbcc) for {jsonl_fpath} from {previous_length} to {len(penguin_examples)}!")
+
+    nemo_rl_compatible_examples: list[DatumSpec] = [
+        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
+        for idx, penguin_example in enumerate(penguin_examples)
+    ]
+
+    passthrough_task_processor = lambda datum_dict, *args, **kwargs: datum_dict
+    return AllTaskProcessedDataset(
+        nemo_rl_compatible_examples,
+        tokenizer,
+        None,
+        passthrough_task_processor,
+    )
 
 
 def main() -> None:
@@ -105,21 +129,18 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_penguin(config)
 
-    init_ray()
-
     print("\n▶ Setting up data...")
-    input_jsonl_fpath = config["data"]["input_jsonl_fpath"]
-    with open(input_jsonl_fpath) as f:
-        dataset = list(map(json.loads, f))
-
-    dataset = AllTaskProcessedDataset(
-        dataset,
-        tokenizer,
-        dict(),
-        dict(),
-        max_seq_length=config["data"]["max_input_seq_length"],
+    train_dataset = setup_single_penguin_dataset(
+        jsonl_fpath=config["data"]["train_jsonl_fpath"],
+        tokenizer=tokenizer,
     )
-    val_dataset = None
+    val_dataset = setup_single_penguin_dataset(
+        jsonl_fpath=config["data"]["validation_jsonl_fpath"],
+        tokenizer=tokenizer,
+        num_repeats=config["grpo"]["num_generations_per_prompt"],
+    )
+
+    init_ray()
 
     (
         policy,
@@ -132,22 +153,26 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    config = PenguinConfig(
+    penguin_config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["penguin"],
     )
-    env = Penguin.options(
+    penguin = Penguin.options(
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.penguin.Penguin"
             ),
         }
-    ).remote(config)
+    ).remote(penguin_config)
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
+
+    sleep_time = int(master_config["env"].get("init_sleep_time", 15))
+    print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
+    sleep(sleep_time)
 
     grpo_train(
         policy,

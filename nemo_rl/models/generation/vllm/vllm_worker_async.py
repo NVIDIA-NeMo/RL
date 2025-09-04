@@ -39,6 +39,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.config import CompilationConfig
+
+        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
+        if llm_kwargs.get("compilation_config", None):
+            llm_kwargs["compilation_config"] = CompilationConfig(**llm_kwargs["compilation_config"])
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)

@@ -16,9 +16,11 @@ from typing import Any, Dict, List, TypedDict
 from pathlib import Path
 
 import ray
+import torch
 
 from tqdm.auto import tqdm
 
+from nemo_rl.data.datasets import DatumSpec
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
@@ -63,7 +65,7 @@ class PenguinWorker:
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "env.yaml",
+                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "penguin_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
             )
@@ -125,7 +127,7 @@ class PenguinWorker:
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
         return {
-            "message_log": nemo_rl_message_log[1:],
+            "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": penguin_result,
         }
@@ -166,8 +168,9 @@ class Penguin(EnvironmentInterface):
             future = worker.run_rollouts.remote(this_batch_penguin_examples)
             futures.append(future)
 
+        batched_results = await tqdm.gather(*futures, desc="Running DP rollouts")
         results = []
-        for result in ray.get(futures):
+        for result in batched_results:
             results.extend(result)
 
         return results
@@ -233,28 +236,20 @@ def setup_penguin_config(config, tokenizer) -> None:
     generation_config["stop_token_ids"] = None
 
 
+########################################
+# Data utils
+########################################
 
-def _should_use_penguin(master_config) -> bool:
-    """Determine if Penguin should be used for rollouts and validation based on the configuration.
-    """
-    env_config = master_config["env"]
-    should_use_penguin = bool(env_config.get("should_use_penguin"))
-    if not should_use_penguin:
-        return should_use_penguin
-
-    # Validate the setup for training with Penguin
-    assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use Penguin, you must use vllm generation backend with `async_engine: true`!"
+# We do some light preprocessing here to make our data format compatible with nemo rl format
+def penguin_example_to_nemo_rl_datum_spec(penguin_example: dict, idx: int) -> DatumSpec:
+    return DatumSpec(
+        message_log=[{"role": "user", "content": "", "token_ids": torch.tensor([])}],  # Fake message
+        length=0,
+        extra_env_info=penguin_example,
+        loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples
+        idx=idx,
+        task_name="penguin",
+        stop_strings=None,
+        # Extra vars
+        token_ids=[],  # Just need this empty key to be compatible with the current NeMo RL GRPO impl
     )
-
-    generation_config = master_config["policy"]["generation"]
-
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, f"In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
-
-    # Penguin is strictly incompatible with reasoning parser. There is one source 
-    serving_chat_kwargs = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
-    assert serving_chat_kwargs.get("reasoning_parser") is None, "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
-
-    return should_use_penguin

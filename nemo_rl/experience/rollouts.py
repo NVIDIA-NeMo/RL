@@ -894,9 +894,12 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
-def _tensorize_token_ids(message_logs: list):
+def _tensorize_by_key(message_logs: list, key: str):
+    if not message_logs or key not in message_logs[0]:
+        return
+
     for m in message_logs:
-        m["token_ids"] = torch.tensor(m["token_ids"])
+        m[key] = torch.tensor(m[key])
 
 
 @dataclass
@@ -947,27 +950,17 @@ def run_async_penguin_rollout(
     penguin_environment = task_to_env["penguin"]
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
-    # TODO remove this
-    with open("temp_rollout_results.json", "w") as f:
-        import json
-        json.dump(results, f)
-
-    final_batch = BatchedDataDict[DatumSpec](
-        {
-            "message_log": [r["message_log"] for r in results],
-            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-        }
-    )
-
     # Tensorize all token ids
-    [_tensorize_token_ids(r["input_message_log"]) for r in results]
-    [_tensorize_token_ids(r["message_log"]) for r in results]
+    [_tensorize_by_key(r["input_message_log"], "token_ids") for r in results]
+    [_tensorize_by_key(r["message_log"], "token_ids") for r in results]
+    [_tensorize_by_key([m for m in r["message_log"] if m["role"] == "assistant"], "generation_logprobs") for r in results]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
     all_sample_metrics = [
         {
-            "total_reward": r["full_result"]["reward"]
+            "total_reward": r["full_result"]["reward"],
+            "assistant_tokens": sum(len(m["token_ids"]) for m in r["message_log"] if m["role"] == "assistant"),
         }
         for r in results
     ]
@@ -988,15 +981,15 @@ def run_async_penguin_rollout(
         #     m["max_turns_reached"] for m in all_sample_metrics
         # )
         # / batch_size,
-        # # Token usage metrics
+        # Token usage metrics
         # "mean_total_tokens_per_sample": sum(
         #     m["total_tokens"] for m in all_sample_metrics
         # )
         # / batch_size,
-        # "mean_gen_tokens_per_sample": sum(
-        #     m["assistant_tokens"] for m in all_sample_metrics
-        # )
-        # / batch_size,
+        "mean_gen_tokens_per_sample": sum(
+            m["assistant_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
         # )
@@ -1009,16 +1002,31 @@ def run_async_penguin_rollout(
     }
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
-    input_batch = BatchedDataDict[DatumSpec](
+    input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["input_message_log"] for r in results],
         }
     )
     batched_flat, _ = batched_message_log_to_flat_message(
-        input_batch["message_log"],
+        input_batch_for_input_ids["message_log"],
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [r["message_log"] for r in results],
+            "length": torch.tensor([len(r["input_message_log"][0]["token_ids"]) for r in results]),
+            "loss_multiplier": input_batch["loss_multiplier"],
+            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+            # extra_env_info: dict[str, Any]
+            # idx: int
+            # task_name: NotRequired[str]
+            # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+            # Extra information not in the DatumSpec used by the GRPO algorithm
+            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+        }
+    )
 
     return AsyncPenguinRolloutResult(
         input_ids=input_ids,
