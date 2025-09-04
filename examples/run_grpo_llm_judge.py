@@ -27,6 +27,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.hf_datasets.rl_jsonl import JsonlDataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -40,6 +41,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
+from nemo_rl.environments.double_llm_judge_async_environment import DoubleLLMJudgeAsyncEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -77,7 +79,6 @@ def hf_data_processor(
     """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Math Environment."""
     user_message = datum_dict["messages"]
     problem = user_message[0]["content"]
-    extra_env_info = {"ground_truth": user_message[1]["content"]}
 
     message_log: LLMMessageLogType = []
     user_message = {
@@ -113,7 +114,7 @@ def hf_data_processor(
     output: DatumSpec = {
         "message_log": message_log,
         "length": length,
-        "extra_env_info": extra_env_info,
+        "extra_env_info": {"question": problem},
         "loss_multiplier": loss_multiplier,
         "idx": idx,
         "task_name": datum_dict["task_name"],
@@ -133,8 +134,8 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
-    math_task_spec = TaskDataSpec(
-        task_name="math",
+    llm_judge_task_spec = TaskDataSpec(
+        task_name="llm_judge",
         prompt_file=data_config["prompt_file"],
         system_prompt_file=data_config["system_prompt_file"],
     )
@@ -148,18 +149,21 @@ def setup_data(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         data: Any = DeepScalerDataset(seed=seed)
+    elif data_config["dataset_name"] == "jsonl":
+        print("Loading jsonl dataset for training and validation")
+        data: Any = JsonlDataset(data_config["train_path"], data_config["val_path"])
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (math_task_spec, hf_data_processor))
+        defaultdict(lambda: (llm_judge_task_spec, hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, hf_data_processor)
+    task_data_processors["llm_judge"] = (llm_judge_task_spec, hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
-        math_task_spec,
+        llm_judge_task_spec,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -169,27 +173,24 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
-            math_task_spec,
+            llm_judge_task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
     else:
         val_dataset = None
 
-    
+    max_concurrency = env_configs["double_llm_judge_async"].get("max_concurrency", 16)
 
-    max_concurrency = env_configs["llm_judge_async"].get("max_concurrency", 16)
-
-    llm_judge_async_env = LLMJudgeAsyncEnvironment.options(
+    llm_judge_async_env = DoubleLLMJudgeAsyncEnvironment.options(
         max_concurrency=max_concurrency,
         runtime_env={
-            "py_executable": LLMJudgeAsyncEnvironment.DEFAULT_PY_EXECUTABLE,
+            "py_executable": DoubleLLMJudgeAsyncEnvironment.DEFAULT_PY_EXECUTABLE,
             "env_vars": dict(os.environ),
         },
-    ).remote(env_configs["llm_judge_async"])
+    ).remote(env_configs["double_llm_judge_async"])
     task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: llm_judge_async_env)
     task_to_env["llm_judge"] = llm_judge_async_env
-    task_to_env["math"] = llm_judge_async_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
@@ -275,3 +276,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

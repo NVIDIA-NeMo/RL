@@ -33,7 +33,8 @@ from nemo_rl.environments.utils import extract_answer_from_box
 
 class LLMJudgeAsyncConfig(TypedDict):
     num_workers: int
-    model_name: str
+    target_model_name: str
+    judge_model_name: str
     tensor_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
@@ -66,7 +67,7 @@ class AsyncVLLMWorker:
     """
 
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.VLLM
-    DEFAULT_JUDGE_PROMPT_TEMPLATE = """You are an expert judge. You will be given a question, a model's prediction to evaluate, a reference answer, and evaluation criteria.
+    DEFAULT_JUDGE_PROMPT_TEMPLATE = """You are an expert judge. You will be given a question, a model's prediction to evaluate, and evaluation criteria.
 
 Question:
 {question}
@@ -93,6 +94,7 @@ Answer yes or no, then give your reasoning.
         reasoning_split_word: Optional[
             str
         ] = None,  # Configurable split word for response processing
+        worker_type: str = "judge",  # "judge" or "target"
         **engine_kwargs,  # Allow passing other EngineArgs
     ):
         # Imports moved here to be within the Ray actor's context,
@@ -138,7 +140,8 @@ Answer yes or no, then give your reasoning.
         )
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.reasoning_split_word = reasoning_split_word  # Store as-is, could be None
-        logging.info(f"AsyncVLLMWorker initialized with model: {model_name}")
+        self.worker_type = worker_type  # Store worker type
+        logging.info(f"AsyncVLLMWorker ({worker_type}) initialized with model: {model_name}")
 
     async def judge(
         self,
@@ -225,6 +228,42 @@ Answer yes or no, then give your reasoning.
 
         return request_id, score
 
+    async def generate(
+        self,
+        request_id: str,
+        question: str,
+        sampling_params_dict: dict,
+    ) -> Tuple[str, str]:
+        """Generates a response to a question using the target LLM.
+
+        Args:
+            request_id: A unique ID for this generation request.
+            question: The question string to answer.
+            sampling_params_dict: Dictionary to initialize vllm.SamplingParams.
+
+        Returns:
+            Tuple of (request_id, generated_response)
+        """
+        sampling_params = self.SamplingParams(**sampling_params_dict)
+        
+        results_generator = self.engine.generate(question, sampling_params, request_id)
+        
+        final_output = None
+        async for request_output in results_generator:
+            final_output = request_output
+        
+        generated_response = ""
+        if final_output and not final_output.finished:
+            logging.warning(f"Target request {request_id} did not finish within token limit")
+            generated_response = final_output.outputs[0].text if final_output.outputs else ""
+        elif final_output:
+            generated_response = final_output.outputs[0].text.strip()
+            logging.info(f"Target generated response for request {request_id}: '{generated_response[:100]}...'")
+        else:
+            logging.warning(f"No output received from target LLM for request {request_id}")
+        
+        return request_id, generated_response
+
 
 @ray.remote
 class LLMJudgeAsyncEnvironment(EnvironmentInterface):
@@ -281,15 +320,9 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
             "num_gpus": tensor_parallel_size,
         }
 
-        self.workers = []
+        # Create target workers
+        self.target_workers = []
         for i in range(self.num_workers):
-            # If tensor_parallel_size == 1, we can safely pin the actor to a
-            # single-GPU bundle inside the placement group. Otherwise, each
-            # actor needs multiple GPUs and cannot fit into the 1-GPU bundles
-            # created by RayVirtualCluster. In that case we rely on Ray's
-            # default scheduler (no placement group) to allocate all requested
-            # GPUs on the same node.
-
             if tensor_parallel_size == 1:
                 pg_index = i % len(placement_groups)
                 pg = placement_groups[pg_index]
@@ -299,30 +332,56 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
                     )
                 )
             else:
-                # No placement group – let Ray handle multi-GPU allocation.
-                # TODO @yashaswikarnati: improve with custom scheduling strategy
                 scheduling_kwargs = {}
             worker = AsyncVLLMWorker.options(
                 **worker_options,
                 **scheduling_kwargs,
             ).remote(
-                model_name=cfg["model_name"],
+                model_name=cfg["target_model_name"],
                 tensor_parallel_size=tensor_parallel_size,
                 gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.85),
                 max_model_len=cfg.get("max_model_len"),
                 reasoning_split_word=cfg.get("reasoning_split_word"),
-                # Pass any other engine args from cfg if needed
+                worker_type="target",
             )
-            self.workers.append(worker)
+            self.target_workers.append(worker)
 
-        logging.info(f"Created {len(self.workers)} AsyncVLLMWorker actors.")
+        # Create judge workers  
+        self.judge_workers = []
+        for i in range(self.num_workers):
+            if tensor_parallel_size == 1:
+                pg_index = i % len(placement_groups)
+                pg = placement_groups[pg_index]
+                scheduling_kwargs = dict(
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    )
+                )
+            else:
+                scheduling_kwargs = {}
+            worker = AsyncVLLMWorker.options(
+                **worker_options,
+                **scheduling_kwargs,
+            ).remote(
+                model_name=cfg["judge_model_name"],
+                tensor_parallel_size=tensor_parallel_size,
+                gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.85),
+                max_model_len=cfg.get("max_model_len"),
+                reasoning_split_word=cfg.get("reasoning_split_word"),
+                worker_type="judge",
+            )
+            self.judge_workers.append(worker)
+
+        logging.info(f"Created {len(self.target_workers)} target workers and {len(self.judge_workers)} judge workers.")
         self._request_counter = 0  # For generating unique request IDs per step call
         self._actor_id_prefix = str(uuid.uuid4())[
             :8
         ]  # Unique prefix for this actor instance
 
     def shutdown(self):
-        for worker in self.workers:
+        for worker in self.target_workers:
+            ray.kill(worker)
+        for worker in self.judge_workers:
             ray.kill(worker)
         if self.virtual_cluster is not None:
             self.virtual_cluster.shutdown()
@@ -344,62 +403,78 @@ class LLMJudgeAsyncEnvironment(EnvironmentInterface):
                   each observation is a dictionary representing the judge's feedback
                   (e.g., `{"role": "environment", "content": "Environment: Score = X.XX"}`).
         """
-        assistant_responses = []
+        # Extract questions from metadata
         questions = []
-        for conversation, single_metadata in zip(message_log_batch, metadata):
-            assert len(conversation) == 2, (
-                "LLMJudgeAsyncEnvironment only supports single turn conversations for now"
-            )
-
-            # Read question from metadata instead of parsing conversation
+        for single_metadata in metadata:
             question = single_metadata.get("question")
             assert question is not None, "Question not found in metadata"
             questions.append(question)
-            assistant_responses.append(conversation[-1]["content"])
 
-        futures = []
+        # Stage 1: Generate responses using target workers
+        target_futures = []
+        target_sampling_params = {
+            "temperature": 1.0,  # Higher temperature for target generation
+            "max_tokens": self.cfg.get("max_tokens", 512),
+            "stop": self.cfg.get("stop", None),
+        }
 
-        # Prepare default sampling parameters from config
-        default_sampling_params = {
+        for i, question_str in enumerate(questions):
+            request_id = f"target_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
+            worker_idx = i % len(self.target_workers)
+            
+            future = self.target_workers[worker_idx].generate.remote(
+                request_id,
+                question_str,
+                target_sampling_params,
+            )
+            target_futures.append(future)
+
+        # Wait for target generation to complete
+        target_results: List[Tuple[str, str]] = ray.get(target_futures)
+        assistant_responses = [response for _, response in target_results]
+
+        # Stage 2: Judge responses using judge workers
+        judge_futures = []
+
+        # Prepare default sampling parameters for judge
+        judge_sampling_params = {
             "temperature": self.cfg.get("temperature", 0.0),
             "max_tokens": self.cfg.get("max_tokens", 512),
             "stop": self.cfg.get("stop", None),
         }
 
-        # For each batch, loop through each conversation and send it to a judge worker asynchronously
+        # For each response, send it to a judge worker
         for i, (question_str, response_str, single_metadata) in enumerate(
             zip(questions, assistant_responses, metadata)
         ):
             # Generate a unique request ID for vLLM for this specific call to judge
-            request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
+            request_id = f"judge_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
 
-            worker_idx = i % self.num_workers  # Simple round-robin
+            worker_idx = i % len(self.judge_workers)  # Simple round-robin
 
-            current_sampling_params = default_sampling_params.copy()
-
-            future = self.workers[worker_idx].judge.remote(
+            future = self.judge_workers[worker_idx].judge.remote(
                 request_id,
                 question_str,
                 response_str,
                 single_metadata,
-                current_sampling_params,
+                judge_sampling_params,
             )
-            futures.append(future)
+            judge_futures.append(future)
 
         self._request_counter += 1  # Increment for the next step call
 
-        results_tuples: List[Tuple[str, float]] = ray.get(futures)
+        results_tuples: List[Tuple[str, float]] = ray.get(judge_futures)
 
         # Assuming ray.get(futures) preserves the order, which it does.
         scores = [score for _, score in results_tuples]
 
         observations = []
-        for score, single_meta in zip(scores, metadata):
+        for score, response, single_meta in zip(scores, assistant_responses, metadata):
             ref_answer = single_meta.get("reference_answer", "N/A")
             observations.append(
                 {
                     "role": "environment",
-                    "content": f"Environment: Score = {score:.2f}\nGround Truth: {ref_answer}",
+                    "content": f"Target Response: {response}\n\nEnvironment: Score = {score:.2f}\nGround Truth: {ref_answer}",
                 }
             )
 

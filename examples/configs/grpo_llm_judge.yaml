@@ -202,18 +202,52 @@ data:
 env:
   math:
     num_workers: 8
-  llm_judge_async: # Configuration for the LlmJudgeAsyncEnvironment
-    enable: false
-    num_workers: 2 # Number of parallel judge workers
-    model_name: "Qwen/Qwen3-8B" # Judge model
-    tensor_parallel_size: 4 # TP size for the judge model
-    gpu_memory_utilization: 0.85 # For judge model
-    max_model_len: 4096 # Max sequence length for the judge model
+  llm_judge_async: # Configuration for the dual LLM Judge Environment (target + judge)
+    enable: true
+    num_workers: 4 # Number of parallel workers for each model type
+    target_model_name: "Qwen/Qwen3-4B-Instruct-2507" # Target model that generates responses
+    model_name: "Qwen/Qwen3-4B-Instruct-2507" # Judge model that evaluates responses
+    judge_model_name: "nvidia/Llama-3_3-Nemotron-Super-49B-GenRM-Multilingual" # Target model that generates responses
+    tensor_parallel_size: 1 # TP size for both models
+    gpu_memory_utilization: 0.85 # For both models
+    max_model_len: 4096 # Max sequence length for both models
     temperature: 0.0 # Judge temperature (usually lower for more deterministic judging)
-    max_tokens: 512  # Max tokens for the judge's evaluation
+    max_tokens: 512  # Max tokens for both generation and evaluation
     reasoning_split_word: "</think>" # The word to split the response into reasoning and answer
-    stop: null # Stop strings for the judge's evaluation
+    stop: null # Stop strings for both models
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor (default: 16)
+  
+  double_llm_judge_async: # Configuration for the DoubleLlmJudgeAsyncEnvironment
+    enable: false
+    use_separate_nodes: true # Use separate nodes for target and judge workers
+    gpu_memory_utilization: 0.85 # Default GPU memory utilization for both models
+    max_model_len: 4096 # Default max sequence length for both models
+    reasoning_split_word: "</think>" # The word to split responses into reasoning and answer
+    max_concurrency: 16 # Maximum concurrent step calls for the environment actor
+    
+    target_model:
+      num_workers: 4 # Single target worker with multiple GPUs
+      model_name: "Qwen/Qwen3-4B-Instruct-2507" # Target model for generating responses
+      tensor_parallel_size: 1 # TP size for the target model (4 GPUs per worker)
+      gpu_memory_utilization: 0.8 # GPU memory utilization for target model
+      max_model_len: 4096 # Max sequence length for target model
+      # Target model sampling parameters
+      temperature: 1.0 # Higher temperature for diverse target responses
+      top_p: 0.9
+      max_tokens: 512 # Max tokens for target model generation
+      stop: null # Stop strings for target generation
+      
+    judge_model:
+      num_workers: 1 # Single judge worker with multiple GPUs
+      model_name: "nvidia/Llama-3_3-Nemotron-Super-49B-GenRM-Multilingual" # Judge model for evaluating responses
+      tensor_parallel_size: 4 # TP size for the judge model (4 GPUs per worker)
+      gpu_memory_utilization: 0.8 # GPU memory utilization for judge model
+      max_model_len: 40000 # Max sequence length for judge model
+      reasoning_split_word: "</think>" # Split word for judge model responses
+      # Judge model sampling parameters
+      temperature: 0.0 # Lower temperature for deterministic judging
+      max_tokens: 16384 # Max tokens for judge evaluation
+      stop: null # Stop strings for judge evaluation
 
 
 logger:
@@ -235,5 +269,6 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
-  num_nodes: 1
+  gpus_per_node: 8  # 8 A100 GPUs per node
+  num_nodes: 1      # 1 node for both target and judge models
+
