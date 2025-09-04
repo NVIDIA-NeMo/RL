@@ -44,8 +44,8 @@ class PenguinWorker:
 
         # TODO we should probably rename this somehow to penguin. But that is a lot of work...
         from omegaconf import DictConfig
-        from nemo_gym.cli import RunHelper, GlobalConfigDictParserConfig
-        from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME
+        from penguin.cli import RunHelper, GlobalConfigDictParserConfig
+        from penguin.server_utils import HEAD_SERVER_KEY_NAME
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
@@ -72,7 +72,7 @@ class PenguinWorker:
         )
 
     async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
-        from nemo_gym.server_utils import ServerClient, BaseServerConfig
+        from penguin.server_utils import ServerClient, BaseServerConfig
 
         head_server_config = BaseServerConfig(
             host=self.node_ip,
@@ -91,11 +91,6 @@ class PenguinWorker:
         return [r.json() for r in results]
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
-        from nemo_gym.openai_utils import NeMoGymResponse
-
-        # Check if it is indeed what we expect to receive here.
-        NeMoGymResponse.model_validate(penguin_result["response"])
-
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in penguin_result["response"]["output"]:
