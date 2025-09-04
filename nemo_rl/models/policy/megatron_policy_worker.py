@@ -589,6 +589,14 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
+        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+            try:
+                model_cfg.fp8 = fp8_cfg["fp8"]
+                model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
+                model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            except KeyError as e:
+                raise KeyError(f"Missing key in fp8_cfg: {e}")
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,

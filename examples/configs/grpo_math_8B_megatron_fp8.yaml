@@ -9,5 +9,19 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
+    vllm_kwargs:
+      compilation_config:
+        pass_config:
+          enable_fusion: true
+          enable_noop: true
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      fp8: "hybrid"
+      fp8_recipe: "blockwise"
+      fp8_param: true
+    optimizer:
+      use_precision_aware_optimizer: false
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_param_gather: true
