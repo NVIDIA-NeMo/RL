@@ -420,6 +420,76 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
+def _call_env_global_post_process_and_metrics(
+    batch: BatchedDataDict[DatumSpec],
+    task_to_env: Optional[dict[str, EnvironmentInterface]],
+) -> dict[str, float | int]:
+    """Group samples by task and call each environment's global post process hook.
+
+    Returns a flat dict of metrics with keys namespaced by env name (e.g., env/math/accuracy).
+    """
+    if task_to_env is None or len(batch) == 0:
+        return {}
+
+    if "task_name" not in batch or len(batch["task_name"]) == 0:
+        return {}
+
+    # Group indices by task
+    task_groups: dict[str, list[int]] = {}
+    for i, name in enumerate(batch["task_name"]):
+        task_groups.setdefault(name, []).append(i)
+
+    futures = []
+    env_names: list[str] = []
+    for task_name, indices in task_groups.items():
+        if task_name not in task_to_env:
+            continue
+
+        # Build a minimal batch expected by env hooks
+        env_batch = BatchedDataDict()
+        # Required/commonly used fields
+        for key in [
+            "idx",
+            "task_name",
+            "total_reward",
+            "rewards",
+            "is_end",
+            "generation_lengths",
+            "prompt_lengths",
+            "text",
+        ]:
+            if key in batch:
+                value = batch[key]
+                if key in {"idx", "task_name"}:
+                    env_batch[key] = [value[i] for i in indices]
+                elif isinstance(value, (torch.Tensor, np.ndarray)):
+                    env_batch[key] = value[indices]
+                else:
+                    env_batch[key] = [value[i] for i in indices]
+
+        # Some envs expect 'rewards' key; alias from total_reward if missing
+        if "rewards" not in env_batch and "total_reward" in env_batch:
+            env_batch["rewards"] = env_batch["total_reward"]
+
+        # Call ray remote hook
+        futures.append(
+            task_to_env[task_name].global_post_process_and_metrics.remote(env_batch)  # type: ignore
+        )
+        env_names.append(task_name)
+
+    if not futures:
+        return {}
+
+    results = ray.get(futures)
+    # results: list[tuple[batch, metrics]]; we ignore returned batch and only use metrics
+    merged_metrics: dict[str, float | int] = {}
+    for env_name, (_, metrics) in zip(env_names, results):
+        for k, v in metrics.items():
+            merged_metrics[f"env/{env_name}/{k}"] = v
+
+    return merged_metrics
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -533,6 +603,8 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    # Persist latest validation metrics across steps so checkpoints always carry the metric
+    latest_val_metrics: Optional[dict[str, Any]] = None
 
     # Run validation at the start if configured
     if val_at_start and step == 0:
@@ -553,6 +625,7 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
         logger.log_metrics(validation_timings, step, prefix="timing/validation")
+        latest_val_metrics = val_metrics
 
     # Run grpo training (single-turn)
     batch: BatchedDataDict[DatumSpec]
@@ -625,6 +698,13 @@ def grpo_train(
                         greedy=False,
                     )
                 policy_generation.finish_generation()
+
+            # Per-environment global post processing and metrics
+            with timer.time("env_global_post_process"):
+                env_metrics = _call_env_global_post_process_and_metrics(
+                    repeated_batch, task_to_env
+                )
+                rollout_metrics.update(env_metrics)
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...", flush=True)
@@ -752,6 +832,7 @@ def grpo_train(
                     validation_timings, step + 1, prefix="timing/validation"
                 )
                 logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                latest_val_metrics = val_metrics
 
             ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -771,10 +852,17 @@ def grpo_train(
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1
-                if val_metrics is not None:
-                    grpo_save_state["val_reward"] = val_metrics["accuracy"]
-                elif "val_reward" in grpo_save_state:
-                    del grpo_save_state["val_reward"]
+                # Determine which validation metrics to store for checkpoint ranking
+                metrics_to_store = (
+                    val_metrics if val_metrics is not None else latest_val_metrics
+                )
+                if metrics_to_store is not None:
+                    # Backward-compatible key for default validation reward
+                    if "accuracy" in metrics_to_store:
+                        grpo_save_state["val_reward"] = metrics_to_store["accuracy"]
+                    # Store all available validation metrics (e.g., pass@samples_per_prompt)
+                    for mk, mv in metrics_to_store.items():
+                        grpo_save_state[mk] = mv
                 grpo_save_state["consumed_samples"] = consumed_samples
 
                 if master_config["checkpointing"]["metric_name"] is not None:
@@ -968,6 +1056,11 @@ def validate(
                 )
             rewards = val_batch["total_reward"]
 
+            # Per-environment global post processing and metrics for validation batch
+            env_metrics = _call_env_global_post_process_and_metrics(
+                val_batch, val_task_to_env
+            )
+
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
@@ -989,6 +1082,9 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+
+        # Merge env metrics into validation metrics
+        val_metrics.update(env_metrics)
 
         # Print sample conversations only once at the end of validation
         try:
