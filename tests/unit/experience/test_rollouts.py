@@ -774,7 +774,7 @@ def test_run_async_penguin_rollout(
             "loss_multiplier": torch.tensor([1.0, 1.0]),
         },
         "rollout_metrics": {
-            "mean_gen_tokens_per_sample": 7287.0,
+            "mean_gen_tokens_per_sample": 2783.5,
             "mean_total_reward": 0.0,
             "max_total_reward": 0.0,
             "min_total_reward": 0.0

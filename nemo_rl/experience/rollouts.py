@@ -947,7 +947,6 @@ def run_async_penguin_rollout(
 
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
-    print(row)
 
     penguin_environment = task_to_env["penguin"]
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
@@ -1018,6 +1017,7 @@ def run_async_penguin_rollout(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "message_log": [r["message_log"] for r in results],
+            # length is used downstream for mean_prompt_length
             "length": torch.tensor([len(r["input_message_log"][0]["token_ids"]) for r in results]),
             "loss_multiplier": input_batch["loss_multiplier"],
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
