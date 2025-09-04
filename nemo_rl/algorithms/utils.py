@@ -270,6 +270,16 @@ def get_tokenizer(
 
 
 def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+    """Pads the given batch so that its size is divisible by (mbs * dp_size).
+
+    Args:
+        batch (dict): The batch to pad.
+        dp_size (int): Data parallel size.
+        mbs (int): Micro batch size.
+
+    Returns:
+        dict: The padded batch.
+    """
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
