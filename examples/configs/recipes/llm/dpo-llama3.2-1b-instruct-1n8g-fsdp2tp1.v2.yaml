@@ -81,6 +81,7 @@ logger:
   log_dir: "logs"
   wandb_enabled: true
   tensorboard_enabled: true
+  swanlab_enabled: false # Disable SwanLab logging
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
