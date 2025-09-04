@@ -832,6 +832,8 @@ def grpo_train(
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
+        log_data["token_mask"] = flat_messages["token_loss_mask"].tolist()
+        log_data["sample_mask"] = repeated_batch["loss_multiplier"].tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
         metrics = {
