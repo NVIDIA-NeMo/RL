@@ -307,7 +307,8 @@ def validate_one_dataset(
         dict_val_metrics = defaultdict(list)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(val_dataloader):
-            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size
+            # When running validation with drop_last=False, we might end up with a partial batch.
+            # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
             if val_batch.size < val_batch_size * 2:
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
                 val_batch = maybe_pad_last_batch(val_batch, dp_size, val_mbs * 2)

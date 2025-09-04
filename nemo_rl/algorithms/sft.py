@@ -269,6 +269,8 @@ def validate(
 
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+            # When running validation with drop_last=False, we might end up with a partial batch.
+            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
             if val_data.size < val_batch_size:
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
