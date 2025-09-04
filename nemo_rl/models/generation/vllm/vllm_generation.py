@@ -57,13 +57,26 @@ class VllmGeneration(GenerationInterface):
         self.cfg = config
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
+        self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.dp_size = cluster.world_size() // self.tp_size // self.pp_size
+        self.vllm_dp_size = self.dp_size // self.ep_size
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
                 "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
                 "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
             )
+
+        if self.ep_size > 1:
+            assert self.ep_size % self.tp_size == 0, (
+                "When EP > 1, it must be a multiple of TP since EP = DP * TP in vLLM. "
+                "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
+            )
+            if self.ep_size != self.tp_size:
+                assert self.tp_size <= 8, (
+                    "Currently we don't support TP > 8 when using vLLM DP. "
+                    "Please update your configuration to set tensor_parallel_size <= 8 or equal to expert_parallel_size."
+                )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
@@ -142,8 +155,10 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
-        # Use vllm DP
-        env_vars["VLLM_DP_SIZE"] = str(self.dp_size)
+        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
+        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
+        if self.ep_size > self.tp_size:
+            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
