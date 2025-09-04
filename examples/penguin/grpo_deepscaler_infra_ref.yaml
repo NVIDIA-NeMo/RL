@@ -16,5 +16,6 @@ data:
   shuffle: true
 
 env:
+  should_use_penguin: false
   math:
     num_workers: 16
