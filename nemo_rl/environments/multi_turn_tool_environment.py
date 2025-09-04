@@ -312,11 +312,12 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
         # Check if tool tags exist
         if '<tool>' not in assistant_response:
             tool_results.append("Function call not found in current assistant response.")
-            model_calls_made.append("No function call made'")
+            model_calls_made.append("No function call made")
             turn_success = False
         else:
             # Parse tool calls
             model_tool_calls = self.tool_manager.parse_tool_calls(assistant_response)
+            #print(f"    Parsed {len(model_tool_calls)} tool calls from assistant response")
             if not model_tool_calls:
                 tool_results.append("Error: Invalid tool command. Parsing tool calls failed. Ensure correct formatting. "
                                 "Tool command must be one list of JSON objects.")
@@ -325,9 +326,11 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             else:
 
                 for tool_call in model_tool_calls:
+                    #print(f"    Executing tool call: {tool_call}")
                     result, success = self.tool_manager.execute_tool_call(
                         tool_call, metadata["model_tool_instances"]
                     )
+                    #print(f"    Result: {result}, Success: {success}")
                     tool_results.append(result)
                     func_name = tool_call.get('name', '')
                     args = tool_call.get('args', {})
@@ -386,7 +389,7 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
         metadata: List[Dict[str, Any]],
     ) -> EnvironmentReturn:
         """Process single turn for each sample in batch."""
-        print("In environment here ")
+        #print("In environment here ")
         # Initialize or update metadata
         processed_metadata = []
         for meta in metadata:

@@ -81,14 +81,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
                 )
             }
         ).remote(env_configs["bfcl_multiturn"])
-        
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            )
-        }
-    ).remote(env_configs["math"])
+    else:
+        # Default to MathEnvironment only if no other environment is enabled
+        env = MathEnvironment.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.math_environment.MathEnvironment"
+                )
+            }
+        ).remote(env_configs["math"])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
@@ -155,6 +156,7 @@ def main():
         dataloader,
         env,
         master_config,
+        tokenizer,
     )
 
 

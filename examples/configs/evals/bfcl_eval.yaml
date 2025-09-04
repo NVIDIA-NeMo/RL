@@ -9,7 +9,7 @@ generation:
 data:
   prompt_file: "examples/prompts/bfcl_multiturn.txt"
   dataset_name: "bfcl_multiturn"
-  dataset_path: "/workspace/datasets/bfcl_multiturn_filtered.jsonl"
+  dataset_path: "/workspace/dataset/bfcl_multiturn_val.jsonl"
 
 env:
   bfcl_multiturn:

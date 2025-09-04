@@ -420,9 +420,11 @@ def run_multi_turn_rollout(
 
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
-
+        #print("env rewards", env_output.rewards)
+        #print("turn", turn)
         total_rewards[active_indices] += env_output.rewards
-
+        #print("total rewards", total_rewards)
+        print("length of active indices", len(env_output.rewards))
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
@@ -492,7 +494,7 @@ def run_multi_turn_rollout(
             if continuing_metadata[i] is not None:
                 current_batch["extra_env_info"][global_idx] = continuing_metadata[i]
     
-    print("continuing indices ", continuing_indices_global)
+    #print("continuing indices ", continuing_indices_global)
     for global_idx in continuing_indices_global.tolist():
         #print("here in append next user question")
         _append_next_user_question(

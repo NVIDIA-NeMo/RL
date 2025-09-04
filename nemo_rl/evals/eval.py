@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import ray
 import torch
@@ -34,6 +34,10 @@ from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 
 # ===============================================================================
 # Configuration
@@ -46,6 +50,7 @@ class EvalConfig(TypedDict):
     seed: int
     k_value: int
     save_path: str | None
+    pass_k_threshold: NotRequired[float]  # Optional: minimum reward value to consider as "correct" for pass@k
 
 
 class MasterConfig(TypedDict):
@@ -166,13 +171,15 @@ def setup(
 # ===============================================================================
 
 
-def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> float:
+def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, threshold: float = 1.0) -> float:
     """Evaluate pass@k score using an unbiased estimator.
 
     Reference: https://github.com/huggingface/evaluate/blob/32546aafec25cdc2a5d7dd9f941fc5be56ba122f/metrics/code_eval/code_eval.py#L198-L213
     Args:
         rewards: Tensor of shape (batch_size * num_tests_per_prompt)
+        num_tests_per_prompt: int (number of test samples per prompt)
         k: int (pass@k value)
+        threshold: float (minimum reward value to consider as "correct", default=1.0)
 
     Returns:
         pass_k_score: float
@@ -188,7 +195,9 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
     group_rewards = rewards.split(num_tests_per_prompt)
     pass_k_score = 0.0
     for group_reward in group_rewards:
-        num_correct = group_reward.sum().item()
+        # Convert continuous rewards to binary based on threshold
+        correct_mask = group_reward >= threshold
+        num_correct = correct_mask.sum().item()  # Count of samples above threshold
         pass_k_score += eval_single_chunk(num_tests_per_prompt, num_correct, k)
 
     return pass_k_score
@@ -268,7 +277,7 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(vllm_generation, dataloader, env, master_config, tokenizer=None):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
@@ -278,24 +287,25 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        tokenizer: Tokenizer for multi-turn evaluation (required for bfcl_multiturn).
     """
     # Check if async engine is enabled and run appropriate version
     if master_config["generation"]["vllm_cfg"]["async_engine"]:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
+                vllm_generation, dataloader, env, master_config, tokenizer=tokenizer, use_async=True
             )
         )
     else:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
+                vllm_generation, dataloader, env, master_config, tokenizer=tokenizer, use_async=False
             )
         )
 
 
 async def _run_env_eval_impl(
-    vllm_generation, dataloader, env, master_config, use_async=False
+    vllm_generation, dataloader, env, master_config, tokenizer=None, use_async=False
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
@@ -308,6 +318,9 @@ async def _run_env_eval_impl(
     # List to collect evaluation data for parquet file
     evaluation_data = []
 
+    # Check if multi-turn evaluation should be used
+    use_multiturn = master_config["env"].get("bfcl_multiturn", {}).get("enable", False)
+    
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
@@ -315,31 +328,104 @@ async def _run_env_eval_impl(
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # Initialize multiturn state
-        current_message_logs = batch["message_log"].copy()
-        current_metadata = batch["extra_env_info"].copy()
-        #print("current_metadata", current_metadata)
-        final_rewards = None
-        all_turns_data = []
-        
-        # Multiturn conversation loop
-        for turn in range(max_turns):
-            print(f"\n=== Turn {turn + 1} ===")                
-            # get input prompt from current message_log
+        if use_multiturn:
+            print('use_multiturn')
+            print("env", env)
+            # Use multi-turn rollout functions (like in validate function)
+            if tokenizer is None:
+                raise ValueError("tokenizer is required for multi-turn evaluation (bfcl_multiturn)")
+            
+            # Set up task_to_env mapping
+            # Extract unique task names from the batch and map them all to the provided env
+            unique_task_names = set()
+            if "task_name" in batch:
+                unique_task_names.update(batch["task_name"])
+            else:
+                # Fallback to default task name if not present in batch
+                unique_task_names.add("bfcl_multiturn")
+
+            task_to_env = {task_name: env for task_name in unique_task_names}
+
+            # Ensure batch has a task_name field for downstream rollout/reward code
+            if "task_name" not in batch:
+                default_task_name = next(iter(unique_task_names))
+                batch["task_name"] = [default_task_name] * len(batch["message_log"])
+            
+            # Get rollout parameters from config
+            max_rollout_turns = master_config["env"]["bfcl_multiturn"].get("max_turns", 999999)
+            print('max_rollout_turns', max_rollout_turns)
+            # Determine max_seq_len - try different config paths
+            max_seq_len = None
+            if "policy" in master_config and "max_total_sequence_length" in master_config["policy"]:
+                max_seq_len = master_config["policy"]["max_total_sequence_length"]
+            elif "generation" in master_config and "vllm_cfg" in master_config["generation"]:
+                max_seq_len = master_config["generation"]["vllm_cfg"].get("max_model_len", 8192)
+            else:
+                max_seq_len = 8192  # fallback
+            
+            # Use rollout function based on async setting
+            if use_async and hasattr(vllm_generation, 'cfg') and \
+               master_config["generation"]["vllm_cfg"].get("async_engine", False):
+                batch, rollout_metrics = run_async_multi_turn_rollout(
+                    policy_generation=vllm_generation,
+                    input_batch=batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=max_rollout_turns,
+                    greedy=False,
+                )
+            else:
+                batch, rollout_metrics = run_multi_turn_rollout(
+                    policy_generation=vllm_generation,
+                    input_batch=batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=max_rollout_turns,
+                    greedy=False,
+                )
+            
+            # Get rewards from rollout result
+            rewards = batch["total_reward"]
+            print("rollout_metrics", rollout_metrics)
+            # For data collection, extract final prompts and outputs
             prompts = []
-            print("length of current_message_logs", len(current_message_logs))
-            for message_log in current_message_logs:
+            outputs = []
+            for message_log in batch["message_log"]:
+                # Get initial content as prompt
+                initial_content = []
+                final_response = ""
+                for msg in message_log:
+                    if msg["role"] == "user":
+                        initial_content.append(msg["content"])
+                    elif msg["role"] == "assistant" and not final_response:
+                        final_response = msg["content"]
+                    elif msg["role"] == "environment" and msg["content"] == "Environment: correct":
+                        print("correct")
+                prompts.append("\n".join(initial_content))
+                outputs.append(final_response)
+            #print("prompts", prompts[0])
+            #print("outputs", outputs[0])
+            #print("message_log", batch["message_log"][0])
+            #print("rewards", rewards[0])
+            print("length of rewards", len(rewards))
+        else:
+            # Original single-turn evaluation logic
+            # get input prompt from message_log
+            prompts = []
+            for message_log in batch["message_log"]:
                 content = [message["content"] for message in message_log]
                 content = "\n".join(content)
                 prompts.append(content)
-            print("prompts", prompts[0])
+
             # generate by vllm
             inputs = BatchedDataDict({"prompts": prompts})
             outputs = await _generate_texts(vllm_generation, inputs, use_async)
 
             # append to message_log
             for idx, output in enumerate(outputs):
-                current_message_logs[idx].append(
+                batch["message_log"][idx].append(
                     {
                         "role": "assistant",
                         "content": output,
@@ -348,78 +434,12 @@ async def _run_env_eval_impl(
 
             # evaluate generations with the environment
             to_env = [
-                get_keys_from_message_log(current_message_logs[i], ["role", "content"])
-                for i in range(len(current_message_logs))
+                get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
+                for i in range(len(batch["message_log"]))
             ]
-            env_return = ray.get(env.step.remote(to_env, current_metadata))
-            #print("env return" , env_return)
-            print("0", env_return.terminateds[0])
-            print("rewards", env_return.rewards[0])
-            # Store turn data
-            turn_data = {
-                "turn": turn + 1,
-                "prompts": prompts.copy(),
-                "outputs": outputs.copy(),
-                "message_logs": [msg_log.copy() for msg_log in current_message_logs],
-                "rewards": env_return.rewards.clone(),
-                "terminateds": env_return.terminateds.clone(),
-            }
-            all_turns_data.append(turn_data)
-            
-            # Update final rewards (use latest rewards)
-            final_rewards = env_return.rewards #see if this is correct
-            
-            # Check if all episodes are terminated
-            if env_return.terminateds.all():
-                print(f"All episodes terminated at turn {turn + 1}")
-                break
-                
-            # Prepare for next turn - add user questions from user_question_bank
-            current_metadata = env_return.metadata
-            current_observations = env_return.observations
-            print("current_metadata", current_metadata[0])
-            print("observations ", env_return.observations[0])
-            print("length of loop", len(env_return.terminateds))
-            i =0 
-            for idx, terminated in enumerate(env_return.terminateds):
-                observation = current_observations[idx]
-                current_message_logs[idx].append(observation)
-                print("terminated", terminated)
-                print("turn_success", current_metadata[idx]['turn_success'])
-                if not terminated and current_metadata[idx]['turn_success']:
-                    print("not terminated")
-                    # Get user questions for the next turn from user_question_bank
-                    user_question_bank = current_metadata[idx].get("user_question_bank", [])
-                    if turn < len(user_question_bank):
-                        # Get questions for this turn (turn is 0-indexed)
-                        turn_questions = user_question_bank[turn]
-                        # Each turn has a single question (wrapped in a list)
-                        if turn_questions:
-                            question = turn_questions[0]
-                            current_message_logs[idx].append({
-                                "role": "user", 
-                                "content": question.get("content", "")
-                            })
-                    if i == 0:
-                        print("current_message_logs", current_message_logs[0])
-                        i=1
-        # Use final rewards for scoring
-        if final_rewards is not None:
-            rewards = final_rewards
-            print("Final rewards:", rewards)
-        else:
-            # Fallback in case no turns were executed
-            print("Warning: No rewards generated")
-            rewards = torch.zeros(len(batch["message_log"]), dtype=torch.float32)
 
-        # evaluate generations with the environment
-        to_env = [
-            get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
-            for i in range(len(batch["message_log"]))
-        ]
-
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
-        rewards = env_return.rewards
+            env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
+            rewards = env_return.rewards
 
         # Collect data for JSON file
         for i, (prompt, output, message_log, reward, extra_info) in enumerate(
@@ -441,10 +461,13 @@ async def _run_env_eval_impl(
                     "sample_index": len(evaluation_data),
                 }
             )
-
+        num_greater_than_one = (rewards > 1).sum().item()
+        print("Number of samples > 1:", num_greater_than_one)
         # update stats
         if metric == "pass@k":
-            score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
+            # Get threshold from config, default to 1.0 for backwards compatibility
+            threshold = eval_config.get("pass_k_threshold", 1.0)
+            score += eval_pass_k(rewards, num_tests_per_prompt, 1.0, threshold)
         elif metric == "cons@k":
             extracted_answers = env_return.answers
             score += eval_cons_k(
