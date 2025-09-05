@@ -129,7 +129,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             **serving_chat_kwargs,
         )
 
-
         generation_config = self.cfg
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
