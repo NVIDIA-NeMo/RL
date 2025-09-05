@@ -124,7 +124,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         example["responses_create_params"]["temperature"] = generation_config["temperature"]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
-    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data))
+    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
     expected_result = penguin_sanity_test_data["expected_output"]
 
     def _standardize_single_result(d: dict):
