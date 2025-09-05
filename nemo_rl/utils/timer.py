@@ -19,6 +19,14 @@ from typing import Callable, Generator, Optional, Sequence, Union
 import numpy as np
 
 
+class NullTimer:
+    """A null timer that does nothing but provides the same interface as Timer."""
+
+    @contextmanager
+    def time(self, label: str) -> Generator[None, None, None]:
+        yield
+
+
 class Timer:
     """A utility for timing code execution.
 
