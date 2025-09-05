@@ -107,6 +107,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 # -1 here since we cannot merge a next token
                 for i in range(len(request.required_prefix_token_ids) - 1):
+                    pass
                     # TODO Impl the checking and correction here
                     # We may not even need a for loop here, not sure
                     # We honestly just need the last idx of the prefix provided to us in the returned prompt_token_ids
