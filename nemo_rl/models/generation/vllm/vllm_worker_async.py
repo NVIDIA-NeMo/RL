@@ -109,12 +109,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
         )
 
+        generation_config = self.cfg
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly set this to -1.
             request.top_k = -1
+
+            # The request sampling params need to exactly match those as are set in NeMo RL.
+            # If they do not match, the inference will be off policy and destroy training stability.
+            assert request.temperature == generation_config["temperature"]
+            assert request.top_p == generation_config["top_p"]
 
             generator = await openai_serving_chat.create_chat_completion(request, raw_request)
 
