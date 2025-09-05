@@ -1493,6 +1493,21 @@ class MegatronPolicyWorker:
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
+        if not hasattr(self, 'prof'):
+            self.prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    "grpo_refit_trace_mbridge",
+                    use_gzip=True,
+                ),
+            )
+
+        self.prof.start()
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
@@ -1571,6 +1586,7 @@ class MegatronPolicyWorker:
             self._held_gather_buffer = gathered_hf_params
             serialized = (False, all_handles)
 
+        self.prof.stop()
         return {device_uuid: serialized}
 
     @torch.no_grad()
