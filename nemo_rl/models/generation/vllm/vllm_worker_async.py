@@ -15,7 +15,7 @@
 import asyncio
 import gc
 import uuid
-from typing import Any, AsyncGenerator, cast, Optional, List
+from typing import Any, AsyncGenerator, cast
 
 import ray
 import torch
@@ -57,6 +57,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return self.base_url
 
     def _setup_vllm_server(self) -> None:
+        from typing import List, Optional
+
         import threading
 
         from fastapi import FastAPI, Request
