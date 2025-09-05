@@ -41,8 +41,12 @@ def import_model_from_hf_name(
     orig_pipeline_model_parallel_size = model_provider.pipeline_model_parallel_size
     orig_expert_model_parallel_size = model_provider.expert_model_parallel_size
     orig_expert_tensor_parallel_size = model_provider.expert_tensor_parallel_size
-    orig_num_layers_in_first_pipeline_stage = model_provider.num_layers_in_first_pipeline_stage
-    orig_num_layers_in_last_pipeline_stage = model_provider.num_layers_in_last_pipeline_stage
+    orig_num_layers_in_first_pipeline_stage = (
+        model_provider.num_layers_in_first_pipeline_stage
+    )
+    orig_num_layers_in_last_pipeline_stage = (
+        model_provider.num_layers_in_last_pipeline_stage
+    )
     orig_pipeline_dtype = model_provider.pipeline_dtype
 
     if megatron_config is not None:
@@ -71,13 +75,14 @@ def import_model_from_hf_name(
     # The above parallelism settings are used to load the model in a distributed manner.
     # However, we do not want to save the parallelism settings to the checkpoint config
     # because they may result in validation errors when loading the checkpoint.
-    megatron_model[0].config.tensor_model_parallel_size = orig_tensor_model_parallel_size
-    megatron_model[0].config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
-    megatron_model[0].config.expert_model_parallel_size = orig_expert_model_parallel_size
-    megatron_model[0].config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
-    megatron_model[0].config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
-    megatron_model[0].config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
-    megatron_model[0].config.pipeline_dtype = orig_pipeline_dtype
+    config = megatron_model[0].config
+    config.tensor_model_parallel_size = orig_tensor_model_parallel_size
+    config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
+    config.expert_model_parallel_size = orig_expert_model_parallel_size
+    config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
+    config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
+    config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
+    config.pipeline_dtype = orig_pipeline_dtype
 
     bridge.save_megatron_model(megatron_model, output_path)
 
@@ -85,7 +90,6 @@ def import_model_from_hf_name(
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
-
 
 
 def export_model_from_megatron(
