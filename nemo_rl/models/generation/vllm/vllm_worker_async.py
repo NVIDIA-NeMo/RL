@@ -15,7 +15,7 @@
 import asyncio
 import gc
 import uuid
-from typing import Any, AsyncGenerator, cast
+from typing import Any, AsyncGenerator, cast, Optional, List
 
 import ray
 import torch
@@ -122,7 +122,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             chat_template_content_format="auto",
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
-        openai_serving_chat = OpenAIServingChat(
+        openai_serving_chat = NeMoRLOpenAIServingChat(
             engine_client,
             model_config,
             openai_serving_models,
