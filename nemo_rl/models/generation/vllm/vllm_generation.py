@@ -69,13 +69,14 @@ class VllmGeneration(GenerationInterface):
 
         if self.ep_size > 1:
             assert self.ep_size % self.tp_size == 0, (
-                "When EP > 1, EP must be a multiple of TP since EP = DP * TP in vLLM. "
+                "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
             if self.ep_size != self.tp_size:
-                assert self.tp_size <= 8, (
-                    "Currently we don't support TP > 8 when using vLLM DP. "
-                    "Please update your configuration to set tensor_parallel_size <= 8 or equal to expert_parallel_size."
+                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
+                assert not self.cfg["vllm_cfg"]["async_engine"], (
+                    "vLLM async_engine has some issues when using DP inside vLLM. "
+                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`."
                 )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
