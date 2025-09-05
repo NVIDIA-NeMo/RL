@@ -58,6 +58,7 @@ from megatron.bridge.training.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.custom_fsdp import (
@@ -512,8 +513,8 @@ class MegatronPolicyWorker:
             )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(
-            pretrained_run_config, mode=0
-        )  # strict loading
+            pretrained_run_config, mode=InstantiationMode.STRICT
+        )
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
 
