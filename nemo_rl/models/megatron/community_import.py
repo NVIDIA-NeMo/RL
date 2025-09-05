@@ -36,6 +36,15 @@ def import_model_from_hf_name(
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
+    # Keep track of defaults so can restore them to the config after loading the model
+    orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
+    orig_pipeline_model_parallel_size = model_provider.pipeline_model_parallel_size
+    orig_expert_model_parallel_size = model_provider.expert_model_parallel_size
+    orig_expert_tensor_parallel_size = model_provider.expert_tensor_parallel_size
+    orig_num_layers_in_first_pipeline_stage = model_provider.num_layers_in_first_pipeline_stage
+    orig_num_layers_in_last_pipeline_stage = model_provider.num_layers_in_last_pipeline_stage
+    orig_pipeline_dtype = model_provider.pipeline_dtype
+
     if megatron_config is not None:
         model_provider.tensor_model_parallel_size = megatron_config[
             "tensor_model_parallel_size"
@@ -59,12 +68,24 @@ def import_model_from_hf_name(
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
+    # The above parallelism settings are used to load the model in a distributed manner.
+    # However, we do not want to save the parallelism settings to the checkpoint config
+    # because they may result in validation errors when loading the checkpoint.
+    megatron_model[0].config.tensor_model_parallel_size = orig_tensor_model_parallel_size
+    megatron_model[0].config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
+    megatron_model[0].config.expert_model_parallel_size = orig_expert_model_parallel_size
+    megatron_model[0].config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
+    megatron_model[0].config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
+    megatron_model[0].config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
+    megatron_model[0].config.pipeline_dtype = orig_pipeline_dtype
+
     bridge.save_megatron_model(megatron_model, output_path)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
+
 
 
 def export_model_from_megatron(
