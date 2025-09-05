@@ -121,6 +121,7 @@ docs = [
     "sphinx-copybutton",  # Adds a copy button for code blocks
     "myst_parser",  # For our markdown docs
     "nvidia-sphinx-theme",  # Our NVIDIA theme
+    "gitpython",  # To git-related information
 ]
 dev = [
     "pre-commit>=4.2.0",

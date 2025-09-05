@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
@@ -2910,6 +2910,7 @@ dev = [
     { name = "types-requests" },
 ]
 docs = [
+    { name = "gitpython" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
     { name = "sphinx" },
@@ -2998,6 +2999,7 @@ dev = [
     { name = "types-requests" },
 ]
 docs = [
+    { name = "gitpython" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
     { name = "sphinx" },

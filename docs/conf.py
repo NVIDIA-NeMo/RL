@@ -22,6 +22,14 @@
 
 import os
 import sys
+from pathlib import Path
+from typing import Any
+
+import git
+from docutils import nodes
+from docutils.transforms import Transform
+from sphinx import addnodes
+from sphinx.application import Sphinx
 
 project = "NeMo-RL"
 copyright = "2025, NVIDIA Corporation"
@@ -99,19 +107,21 @@ html_theme_options = {
 }
 html_extra_path = ["project.json", "versions1.json"]
 
-# -- Supporting rendering GitHub alerts correctly ----------------------------
-# https://github.com/executablebooks/MyST-Parser/issues/845
 
-_GITHUB_ADMONITIONS = {
-    "> [!NOTE]": "note",
-    "> [!TIP]": "tip",
-    "> [!IMPORTANT]": "important",
-    "> [!WARNING]": "warning",
-    "> [!CAUTION]": "caution",
-}
+def _convert_gh_admonitions(
+    app: Sphinx, relative_path: Path, parent_docname: str, contents: list[str]
+) -> None:
+    """Supporting rendering GitHub alerts correctly.
 
-
-def convert_gh_admonitions(app, relative_path, parent_docname, contents):
+    # https://github.com/executablebooks/MyST-Parser/issues/845
+    """
+    _github_admonitions = {
+        "> [!NOTE]": "note",
+        "> [!TIP]": "tip",
+        "> [!IMPORTANT]": "important",
+        "> [!WARNING]": "warning",
+        "> [!CAUTION]": "caution",
+    }
     # loop through content lines, replace github admonitions
     for i, orig_content in enumerate(contents):
         orig_line_splits = orig_content.split("\n")
@@ -119,11 +129,11 @@ def convert_gh_admonitions(app, relative_path, parent_docname, contents):
         for j, line in enumerate(orig_line_splits):
             # look for admonition key
             line_roi = line.lstrip()
-            for admonition_key in _GITHUB_ADMONITIONS:
+            for admonition_key in _github_admonitions:
                 if line_roi.startswith(admonition_key):
                     line = line.replace(
                         admonition_key,
-                        "```{" + _GITHUB_ADMONITIONS[admonition_key] + "}",
+                        "```{" + _github_admonitions[admonition_key] + "}",
                     )
                     # start replacing quotes in subsequent lines
                     replacing = True
@@ -147,5 +157,35 @@ def convert_gh_admonitions(app, relative_path, parent_docname, contents):
         contents[i] = "\n".join(orig_line_splits)
 
 
-def setup(app):
-    app.connect("include-read", convert_gh_admonitions)
+class _GitHubLinkTransform(Transform):
+    """Converting the relative path to a file in a Markdown to the URL of that file on GitHub."""
+
+    default_priority = 500  # type: ignore[bad-override]
+
+    def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
+        repo = git.Repo(search_parent_directories=True)
+        origin_url = repo.remotes.origin.url
+        if origin_url.startswith("git@github.com:"):
+            origin_url = origin_url.replace("git@github.com:", "https://github.com/", 1)
+        if origin_url.endswith(".git"):
+            origin_url = origin_url[: -len(".git")]
+        blob = f"blob/{repo.head.object.hexsha}"
+        for node in self.document.traverse(addnodes.download_reference):
+            # `node["refdoc"]` would be, e.g., "guides/grpo". Therefore, `md_dir` would
+            # be, e.g., `"docs/guides"`.
+            # Avoid using `os.path` or `pathlib` for path manipulation because, well,
+            # what if we try to build the docs on Windows?
+            md_dir = "/".join(["docs"] + node["refdoc"].split("/")[:-1])
+            # `file_path` would be `"docs/grpo/../../examples/run_grpo_math.py"`.
+            file_path = "/".join((md_dir, node["reftarget"]))
+            # `refuri` would be `"https://github.com/NVIDIA-NeMo/RL/blob/<commit sha>/docs/guides/../../examples/run_grpo_math.py"`.
+            refuri = "/".join((origin_url, blob, file_path))
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
+            if node.children:
+                new_node += node.children
+            node.replace_self(new_node)
+
+
+def setup(app: Sphinx) -> None:
+    app.add_transform(_GitHubLinkTransform)
+    app.connect("include-read", _convert_gh_admonitions)
