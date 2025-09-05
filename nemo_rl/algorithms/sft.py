@@ -21,7 +21,11 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
+    HAVE_FUSED_LINEAR_CE,
+    FusedLinearCrossEntropyLoss,
+    FusedLinearCrossEntropyLossConfig,
     NLLLoss,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -69,6 +73,7 @@ class SFTConfig(TypedDict):
     val_micro_batch_size: int
     val_at_start: bool
     seed: int
+    loss_fn: NotRequired[dict]  # Optional loss function configuration
 
 
 class MasterConfig(TypedDict):
@@ -93,7 +98,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     StatefulDataLoader,
-    NLLLoss,
+    LossFunction,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -191,7 +196,34 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
-    loss_fn = NLLLoss()
+    # Create loss function based on configuration
+    loss_config = sft_config.get("loss_fn", None)
+    if loss_config is not None:
+        loss_type = loss_config.get("type", "NLLLoss")
+        if loss_type == "FusedLinearCrossEntropyLoss":
+            if not HAVE_FUSED_LINEAR_CE:
+                raise ImportError(
+                    "FusedLinearCrossEntropy is not available. Please install nemo-automodel with the required dependencies."
+                )
+            # Ensure model is configured to output hidden states
+            if "model_config" not in policy_config:
+                policy_config["model_config"] = {}
+            policy_config["model_config"]["output_hidden_states"] = True
+
+            # Create FusedLinearCrossEntropy loss
+            fused_config: FusedLinearCrossEntropyLossConfig = {
+                "ignore_index": loss_config.get("ignore_index", -100),
+                "logit_softcapping": loss_config.get("logit_softcapping", 0.0),
+                "reduction": loss_config.get("reduction", "sum"),
+            }
+            loss_fn = FusedLinearCrossEntropyLoss(fused_config)
+        else:
+            # Default to NLLLoss for any other type or unknown type
+            loss_fn = NLLLoss()
+    else:
+        # Default loss function if not specified
+        loss_fn = NLLLoss()
+
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)

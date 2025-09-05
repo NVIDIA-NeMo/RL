@@ -17,9 +17,13 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss_functions import (
+    HAVE_FUSED_LINEAR_CE,
     ClippedPGLossFn,
     DPOLossFn,
+    FusedLinearCrossEntropyLoss,
+    FusedLinearCrossEntropyLossConfig,
     NLLLoss,
+    SequencePackingLossWrapper,
 )
 from nemo_rl.algorithms.utils import masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1410,3 +1414,358 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
         global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
     )
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
+
+
+def create_mock_model_for_fused_loss(vocab_size: int = 100, hidden_size: int = 64):
+    """Create a mock model with lm_head for testing FusedLinearCrossEntropy."""
+
+    class MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+            # Initialize with small weights for deterministic testing
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.01)
+
+        def forward(self, input_ids, **kwargs):
+            batch_size, seq_len = input_ids.shape
+            # Return mock hidden states
+            hidden_states = torch.randn(batch_size, seq_len, hidden_size)
+            return type(
+                "MockOutput",
+                (),
+                {
+                    "hidden_states": [hidden_states],  # List of layer outputs
+                    "last_hidden_state": hidden_states,
+                    "logits": self.lm_head(hidden_states),
+                },
+            )()
+
+    return MockModel()
+
+
+def setup_fused_loss_test_data(
+    vocab_size=100, batch_size=2, seq_len=8, hidden_size=64, device="cuda"
+):
+    """Setup test data for FusedLinearCrossEntropy tests."""
+    input_ids = torch.randint(
+        0, vocab_size, (batch_size, seq_len), dtype=torch.long, device=device
+    )
+
+    # Create token mask: mask first token and some random positions
+    token_mask = torch.ones((batch_size, seq_len), dtype=torch.float, device=device)
+    token_mask[:, 0] = 0  # Always mask first token
+    token_mask[0, -1] = 0  # Mask last token for first sample
+
+    sample_mask = torch.ones(batch_size, dtype=torch.float, device=device)
+
+    # Create hidden states
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=device)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "hidden_states": hidden_states,
+        }
+    )
+
+    return data, input_ids, token_mask, sample_mask, hidden_states
+
+
+@pytest.mark.skipif(
+    not HAVE_FUSED_LINEAR_CE,
+    reason="FusedLinearCrossEntropy dependencies not available",
+)
+def test_fused_linear_cross_entropy_loss_initialization():
+    """Test FusedLinearCrossEntropyLoss initialization with different configs."""
+
+    # Test default configuration
+    config: FusedLinearCrossEntropyLossConfig = {}
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    assert loss_fn.ignore_index == -100
+    assert loss_fn.logit_softcapping == 0.0
+    assert loss_fn.reduction == "sum"
+
+    # Test custom configuration
+    config = {
+        "ignore_index": -1,
+        "logit_softcapping": 30.0,
+        "reduction": "mean",
+    }
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    assert loss_fn.ignore_index == -1
+    assert loss_fn.logit_softcapping == 30.0
+    assert loss_fn.reduction == "mean"
+
+
+@pytest.mark.skipif(
+    not HAVE_FUSED_LINEAR_CE,
+    reason="FusedLinearCrossEntropy dependencies not available",
+)
+def test_fused_linear_cross_entropy_loss_basic_computation():
+    """Test basic loss computation with FusedLinearCrossEntropy."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    vocab_size = 50
+    batch_size = 2
+    seq_len = 6
+    hidden_size = 32
+
+    # Setup test data
+    data, input_ids, token_mask, sample_mask, hidden_states = (
+        setup_fused_loss_test_data(
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            device=device,
+        )
+    )
+
+    # Create model
+    model = create_mock_model_for_fused_loss(
+        vocab_size=vocab_size, hidden_size=hidden_size
+    )
+    model = model.to(device)
+
+    # Create loss function
+    config: FusedLinearCrossEntropyLossConfig = {
+        "ignore_index": -100,
+        "reduction": "sum",
+    }
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    # Compute loss
+    global_valid_seqs = torch.tensor(batch_size, device=device)
+    global_valid_toks = torch.tensor(token_mask.sum().item(), device=device)
+
+    loss, metrics = loss_fn(
+        next_token_logits=torch.empty(0),  # Not used
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        model=model,
+    )
+
+    # Verify loss properties
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0  # Scalar loss
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Verify metrics
+    assert "loss" in metrics
+    assert "num_valid_tokens" in metrics
+    assert "num_valid_samples" in metrics
+    assert metrics["num_valid_tokens"] > 0
+    assert metrics["num_valid_samples"] == batch_size
+
+
+@pytest.mark.skipif(
+    not HAVE_FUSED_LINEAR_CE,
+    reason="FusedLinearCrossEntropy dependencies not available",
+)
+def test_fused_linear_cross_entropy_loss_error_cases():
+    """Test error handling in FusedLinearCrossEntropy."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    vocab_size = 50
+    batch_size = 2
+    seq_len = 6
+    hidden_size = 32
+
+    data, _, _, _, _ = setup_fused_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        device=device,
+    )
+
+    config: FusedLinearCrossEntropyLossConfig = {}
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    global_valid_seqs = torch.tensor(batch_size, device=device)
+    global_valid_toks = torch.tensor(10, device=device)
+
+    # Test missing model parameter
+    with pytest.raises(ValueError, match="Model must be provided"):
+        loss_fn(
+            next_token_logits=torch.empty(0),
+            data=data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            model=None,
+        )
+
+    # Test model without lm_head
+    class MockModelWithoutLMHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(hidden_size, vocab_size)
+
+    bad_model = MockModelWithoutLMHead().to(device)
+
+    with pytest.raises(ValueError, match="Model must have accessible lm_head.weight"):
+        loss_fn(
+            next_token_logits=torch.empty(0),
+            data=data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            model=bad_model,
+        )
+
+
+@pytest.mark.skipif(
+    not HAVE_FUSED_LINEAR_CE,
+    reason="FusedLinearCrossEntropy dependencies not available",
+)
+def test_fused_linear_cross_entropy_loss_masking():
+    """Test that FusedLinearCrossEntropy properly handles masking."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    vocab_size = 50
+    batch_size = 2
+    seq_len = 6
+    hidden_size = 32
+
+    # Setup test data
+    data, input_ids, token_mask, sample_mask, hidden_states = (
+        setup_fused_loss_test_data(
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            device=device,
+        )
+    )
+
+    model = create_mock_model_for_fused_loss(
+        vocab_size=vocab_size, hidden_size=hidden_size
+    )
+    model = model.to(device)
+
+    config: FusedLinearCrossEntropyLossConfig = {"reduction": "sum"}
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    global_valid_seqs = torch.tensor(batch_size, device=device)
+    global_valid_toks = torch.tensor(token_mask.sum().item(), device=device)
+
+    # Compute loss with current mask
+    loss1, metrics1 = loss_fn(
+        next_token_logits=torch.empty(0),
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        model=model,
+    )
+
+    # Modify mask to zero out more tokens
+    data_masked = BatchedDataDict(data)
+    data_masked["token_mask"] = token_mask.clone()
+    data_masked["token_mask"][:, 1:3] = 0  # Mask more tokens
+
+    new_global_valid_toks = torch.tensor(
+        data_masked["token_mask"].sum().item(), device=device
+    )
+
+    loss2, metrics2 = loss_fn(
+        next_token_logits=torch.empty(0),
+        data=data_masked,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=new_global_valid_toks,
+        model=model,
+    )
+
+    # Verify that masking changes the metrics
+    assert metrics1["num_valid_tokens"] > metrics2["num_valid_tokens"]
+    # Loss values may differ due to different normalization
+
+
+@pytest.mark.skipif(
+    not HAVE_FUSED_LINEAR_CE,
+    reason="FusedLinearCrossEntropy dependencies not available",
+)
+def test_sequence_packing_wrapper_with_fused_loss():
+    """Test that SequencePackingLossWrapper works correctly with FusedLinearCrossEntropy."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    vocab_size = 50
+    batch_size = 2
+    seq_len = 6
+    hidden_size = 32
+
+    # Setup test data
+    data, input_ids, token_mask, sample_mask, hidden_states = (
+        setup_fused_loss_test_data(
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            device=device,
+        )
+    )
+
+    model = create_mock_model_for_fused_loss(
+        vocab_size=vocab_size, hidden_size=hidden_size
+    )
+    model = model.to(device)
+
+    config: FusedLinearCrossEntropyLossConfig = {"reduction": "sum"}
+    base_loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    # Create dummy cu_seqlens for sequence packing
+    # This simulates two sequences of length 3 each
+    cu_seqlens_q = torch.tensor([0, 3, 6], device=device)
+
+    # Wrap the loss function
+    wrapped_loss_fn = SequencePackingLossWrapper(
+        loss_fn=base_loss_fn,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_q_padded=cu_seqlens_q,
+    )
+
+    global_valid_seqs = torch.tensor(batch_size, device=device)
+    global_valid_toks = torch.tensor(token_mask.sum().item(), device=device)
+
+    # Create logits for the packed sequence
+    next_token_logits = torch.randn(1, seq_len, vocab_size, device=device)
+
+    # Test that the wrapped loss function can be called with model parameter
+    loss, metrics = wrapped_loss_fn(
+        next_token_logits=next_token_logits,
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        model=model,
+    )
+
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+
+def test_fused_loss_type_attribute():
+    """Test that FusedLinearCrossEntropyLoss has the correct loss_type."""
+    if not HAVE_FUSED_LINEAR_CE:
+        pytest.skip("FusedLinearCrossEntropy dependencies not available")
+
+    from nemo_rl.algorithms.interfaces import LossType
+
+    config: FusedLinearCrossEntropyLossConfig = {}
+    loss_fn = FusedLinearCrossEntropyLoss(config)
+
+    assert hasattr(loss_fn, "loss_type")
+    assert loss_fn.loss_type == LossType.TOKEN_LEVEL

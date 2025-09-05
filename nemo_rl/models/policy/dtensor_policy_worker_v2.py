@@ -63,7 +63,10 @@ from transformers import (
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.loss_functions import (
+    FusedLinearCrossEntropyLoss,
+    SequencePackingLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
 from nemo_rl.models.huggingface.common import (
@@ -652,6 +655,12 @@ class DTensorPolicyWorkerV2:
                                 flash_attn_kwargs=flash_attn_kwargs,
                                 **vlm_kwargs,
                             )
+                            # Check if we need hidden states for FusedLinearCrossEntropy
+                            need_hidden_states = isinstance(
+                                loss_fn, FusedLinearCrossEntropyLoss
+                            )
+                            if need_hidden_states:
+                                model_args["output_hidden_states"] = True
 
                             if self._is_reward_model:
                                 # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
@@ -665,11 +674,28 @@ class DTensorPolicyWorkerV2:
 
                             outputs = self.model(**model_args)
 
-                        # Get logprobs
+                        # Get logprobs and hidden states if needed
                         if not hasattr(outputs, "logits"):
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
+
+                        # Store hidden states for FusedLinearCrossEntropy if needed
+                        hidden_states = None
+                        if need_hidden_states and hasattr(outputs, "hidden_states"):
+                            hidden_states = outputs.hidden_states[
+                                -1
+                            ]  # Last layer hidden states
+                        elif need_hidden_states and hasattr(
+                            outputs, "last_hidden_state"
+                        ):
+                            hidden_states = outputs.last_hidden_state
+                        elif need_hidden_states:
+                            raise ValueError(
+                                "FusedLinearCrossEntropy requires hidden states but model output doesn't contain them. "
+                                "Set model.config.output_hidden_states=True"
+                            )
+
                         del outputs
 
                         # Apply temperature scaling
@@ -731,12 +757,31 @@ class DTensorPolicyWorkerV2:
                         else:
                             loss_fn_ = loss_fn
 
-                        loss, loss_metrics = loss_fn_(
-                            logits,
-                            mb,
-                            global_valid_seqs,
-                            global_valid_toks,
-                        )
+                        # Add hidden states to the data for FusedLinearCrossEntropy
+                        if need_hidden_states and hidden_states is not None:
+                            mb["hidden_states"] = hidden_states
+
+                        # Call loss function with model parameter if it's FusedLinearCrossEntropy (direct or wrapped)
+                        if isinstance(loss_fn_, FusedLinearCrossEntropyLoss) or (
+                            hasattr(loss_fn_, "loss_fn")
+                            and isinstance(
+                                loss_fn_.loss_fn, FusedLinearCrossEntropyLoss
+                            )
+                        ):
+                            loss, loss_metrics = loss_fn_(
+                                logits,
+                                mb,
+                                global_valid_seqs,
+                                global_valid_toks,
+                                model=self.model,
+                            )
+                        else:
+                            loss, loss_metrics = loss_fn_(
+                                logits,
+                                mb,
+                                global_valid_seqs,
+                                global_valid_toks,
+                            )
                         del logits
 
                         # skip the update for dummy batches

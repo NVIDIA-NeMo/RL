@@ -26,6 +26,14 @@ from nemo_rl.distributed.model_utils import (
     get_logprobs_from_vocab_parallel_logits,
 )
 
+# Import FusedLinearCrossEntropy from nemo-automodel
+try:
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+    HAVE_FUSED_LINEAR_CE = True
+except ImportError:
+    HAVE_FUSED_LINEAR_CE = False
+
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
@@ -760,6 +768,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        model: Optional[torch.nn.Module] = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -802,14 +811,24 @@ class SequencePackingLossWrapper:
             )
             next_token_logits_slice = next_token_logits[:, logit_slice_idxs, :]
 
+            # Check if the loss function needs the model parameter
+            loss_fn_kwargs = {
+                "vocab_parallel_rank": vocab_parallel_rank,
+                "vocab_parallel_group": vocab_parallel_group,
+                "context_parallel_group": context_parallel_group,
+            }
+            if (
+                isinstance(self.loss_fn, FusedLinearCrossEntropyLoss)
+                and model is not None
+            ):
+                loss_fn_kwargs["model"] = model
+
             loss, metrics = self.loss_fn(
                 next_token_logits_slice,
                 unpadded_seq_data,
                 global_valid_seqs,
                 global_valid_toks,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
+                **loss_fn_kwargs,
             )
             loss_accum += loss
             for k, v in metrics.items():
@@ -818,3 +837,162 @@ class SequencePackingLossWrapper:
                 metrics_accum[k] += v
 
         return loss_accum, metrics_accum
+
+
+class FusedLinearCrossEntropyLossDataDict(TypedDict):
+    """Required keys for the FusedLinearCrossEntropy loss function."""
+
+    input_ids: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    hidden_states: torch.Tensor  # Last layer hidden states from the model
+    __extra__: Any
+
+
+class FusedLinearCrossEntropyLossConfig(TypedDict):
+    """Configuration for FusedLinearCrossEntropy loss function."""
+
+    ignore_index: NotRequired[
+        int
+    ]  # Target value that is ignored when computing the loss. Defaults to -100.
+    logit_softcapping: NotRequired[
+        float
+    ]  # Value for softcapping logits (0 means no capping). Defaults to 0.
+    reduction: NotRequired[str]  # Type of reduction. Defaults to "sum".
+
+
+class FusedLinearCrossEntropyLoss(LossFunction):
+    """Adapter for FusedLinearCrossEntropy to work with nemo-rl's LossFunction protocol.
+
+    This class wraps the nemo-automodel FusedLinearCrossEntropy to make it compatible
+    with nemo-rl's loss function interface. It handles the conversion between the
+    different parameter formats and provides the expected metrics.
+
+    The FusedLinearCrossEntropy performs fused linear transformation and cross-entropy
+    computation, which can be more memory efficient than computing logits and then
+    applying cross-entropy separately.
+
+    Requirements:
+    - Model must output hidden states (set model.output_hidden_states=True)
+    - Model must have accessible lm_head.weight parameter
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+
+    def __init__(self, cfg: FusedLinearCrossEntropyLossConfig):
+        if not HAVE_FUSED_LINEAR_CE:
+            raise ImportError(
+                "FusedLinearCrossEntropy is not available. Please install the required "
+                "dependencies from nemo-automodel."
+            )
+
+        self.ignore_index = cfg.get("ignore_index", -100)
+        self.logit_softcapping = cfg.get("logit_softcapping", 0.0)
+        self.reduction = cfg.get("reduction", "sum")
+
+        # Initialize the underlying FusedLinearCrossEntropy
+        self._fused_loss = FusedLinearCrossEntropy(
+            ignore_index=self.ignore_index,
+            logit_softcapping=self.logit_softcapping,
+            reduction=self.reduction,
+        )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[FusedLinearCrossEntropyLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        model: Optional[torch.nn.Module] = None,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute fused linear cross entropy loss.
+
+        Args:
+            next_token_logits: Not used for FusedLinearCrossEntropy (we use hidden states instead)
+            data: BatchedDataDict containing hidden_states, input_ids, masks
+            global_valid_seqs: Number of valid sequences for normalization
+            global_valid_toks: Number of valid tokens for normalization
+            model: The model instance to access lm_head.weight
+
+        Returns:
+            tuple: (loss, metrics)
+        """
+        if model is None:
+            raise ValueError(
+                "Model must be provided for FusedLinearCrossEntropy to access lm_head.weight"
+            )
+
+        # Extract required data
+        hidden_states = data[
+            "hidden_states"
+        ]  # Shape: [batch_size, seq_len, hidden_size]
+        input_ids = data["input_ids"]  # Shape: [batch_size, seq_len]
+        token_mask = data["token_mask"]  # Shape: [batch_size, seq_len]
+        sample_mask = data["sample_mask"]  # Shape: [batch_size]
+
+        # Get the language model head weights
+        if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
+            lm_weight = model.lm_head.weight
+        else:
+            raise ValueError(
+                "Model must have accessible lm_head.weight parameter for FusedLinearCrossEntropy"
+            )
+
+        # Prepare labels (shift input_ids by 1 for next token prediction)
+        labels = input_ids[:, 1:].contiguous()  # Shape: [batch_size, seq_len-1]
+
+        # Use hidden states from all positions except the last (for next token prediction)
+        hidden_states_input = hidden_states[
+            :, :-1
+        ].contiguous()  # Shape: [batch_size, seq_len-1, hidden_size]
+
+        # Apply token mask (excluding the first token since we're predicting next tokens)
+        mask = token_mask[:, 1:] * sample_mask.unsqueeze(
+            -1
+        )  # Shape: [batch_size, seq_len-1]
+
+        # Flatten for the fused computation
+        batch_size, seq_len = labels.shape
+        hidden_states_flat = hidden_states_input.view(
+            -1, hidden_states_input.shape[-1]
+        )  # [batch_size * seq_len, hidden_size]
+        labels_flat = labels.view(-1)  # [batch_size * seq_len]
+        mask_flat = mask.view(-1)  # [batch_size * seq_len]
+
+        # Apply mask to labels (set ignored positions to ignore_index)
+        labels_masked = labels_flat.clone()
+        labels_masked[mask_flat == 0] = self.ignore_index
+
+        # Calculate number of valid tokens for normalization
+        num_valid_tokens = mask.sum().item()
+
+        # Compute the fused linear cross entropy loss
+        if self.reduction == "sum":
+            # Let the fused loss handle the sum, then normalize by valid tokens
+            loss = self._fused_loss(
+                hidden_states=hidden_states_flat,
+                labels=labels_masked,
+                lm_weight=lm_weight,
+                num_label_tokens=num_valid_tokens if num_valid_tokens > 0 else 1,
+            )
+        else:
+            # Use the specified reduction
+            loss = self._fused_loss(
+                hidden_states=hidden_states_flat,
+                labels=labels_masked,
+                lm_weight=lm_weight,
+            )
+
+        # Apply global normalization if using token-level loss
+        if global_valid_toks is not None and global_valid_toks > 0:
+            # Scale by the ratio of global to local valid tokens for proper distributed training
+            loss = loss * (num_valid_tokens / global_valid_toks.item())
+
+        return loss, {
+            "loss": loss.item(),
+            "num_valid_tokens": num_valid_tokens,
+            "num_valid_samples": sample_mask.sum().item(),
+        }
