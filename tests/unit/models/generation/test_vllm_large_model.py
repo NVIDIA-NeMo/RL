@@ -44,7 +44,7 @@ large_model_vllm_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 8,
         "pipeline_parallel_size": 2,
-        "enable_expert_parallel": False,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": True,

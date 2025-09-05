@@ -52,7 +52,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "enable_expert_parallel": False,
+        "expert_parallel_size": 1,
         "max_model_len": 1024,
         "disable_log_stats": True,
         "disable_log_requests": True,
