@@ -112,6 +112,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+            # Right now we explicitly set this to -1.
+            request.top_k = -1
+
             generator = await openai_serving_chat.create_chat_completion(request, raw_request)
 
             if isinstance(generator, ErrorResponse):
