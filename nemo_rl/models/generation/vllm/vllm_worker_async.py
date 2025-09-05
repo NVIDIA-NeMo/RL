@@ -85,7 +85,35 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        
+
+        ########################################
+        # /v1/chat/completions endpoint
+        ########################################
+
+        class NeMoRLChatCompletionRequest(ChatCompletionRequest):
+            required_prefix_token_ids: Optional[List[int]] = None
+
+
+        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+            async def _preprocess_chat(self, request: NeMoRLChatCompletionRequest, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
+                # res is conversation, [request_prompt], [engine_prompt]
+                res = await super()._preprocess_chat(request, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt, continue_final_message, tool_dicts, documents, chat_template_kwargs, tool_parser, truncate_prompt_tokens, add_special_tokens)
+
+                if request.required_token_ids is None:
+                    return res
+
+                request_prompt = res[1][0]  # We need to modify request_prompt.prompt_token_ids
+                engine_prompt = res[2][0]  # We need to modify engine_prompt.prompt_token_ids
+
+                # -1 here since we cannot merge a next token
+                for i in range(len(request.required_prefix_token_ids) - 1):
+                    # TODO Impl the checking and correction here
+                    # We may not even need a for loop here, not sure
+                    # We honestly just need the last idx of the prefix provided to us in the returned prompt_token_ids
+
+                return res
+
+
         serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
@@ -100,19 +128,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             return_tokens_as_token_ids=True,
             **serving_chat_kwargs,
         )
-        openai_serving_tokenization = OpenAIServingTokenization(
-            engine_client,
-            model_config,
-            openai_serving_models,
-            request_logger=serving_chat_kwargs["request_logger"],
-            chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
-        )
+
 
         generation_config = self.cfg
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
-        async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+        async def create_chat_completion(request: NeMoRLChatCompletionRequest, raw_request: Request):
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly set this to -1.
             request.top_k = -1
@@ -133,6 +154,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
+        ########################################
+        # /tokenize endpoint
+        ########################################
+
+        openai_serving_tokenization = OpenAIServingTokenization(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
+        )
+
         @app.post("/tokenize")
         async def tokenize(request: TokenizeRequest, raw_request: Request):
             generator = await openai_serving_tokenization.create_tokenize(request, raw_request)
@@ -142,6 +176,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                                     status_code=generator.code)
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        ########################################
+        # Server spinup
+        ########################################
 
         config = uvicorn.Config(
             app,
