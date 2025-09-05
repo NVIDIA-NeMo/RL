@@ -945,6 +945,10 @@ def run_async_penguin_rollout(
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
+        # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+        # Right now we explicitly set this to -1.
+        responses_create_params["top_k"] = -1
+
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
 
