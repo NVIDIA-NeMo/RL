@@ -1,5 +1,6 @@
 python-version = "3.12.0"
 replace-imports-with-any = [
+    "nemo_automodel.*",
     "pynvml.*",
     "hydra._internal.*",
     "hydra.core.override_parser.*",
