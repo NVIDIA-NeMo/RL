@@ -718,7 +718,9 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("use_v2", [True, False])
-def test_dtensor_v1_policy_flops_range_check(tiny_llama_model_path, two_gpu_virtual_cluster, use_v2):
+def test_dtensor_v1_policy_flops_range_check(
+    tiny_llama_model_path, two_gpu_virtual_cluster, use_v2
+):
     """Test that the returned FLOPS is within a reasonable range using dtensor backend.
 
     Performs 2 warmup iterations and measures FLOPS for the next 3 iterations.
