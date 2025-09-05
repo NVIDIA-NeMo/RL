@@ -1,0 +1,175 @@
+# SFT Algorithm Configuration
+sft:
+  ## total number of steps to train will equal
+  ## min((max_num_epochs * len(train_dataloader)), max_num_steps)
+  max_num_epochs: 1
+  max_num_steps: 60
+
+  val_period: 10
+  val_batches: 8
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: true
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft"
+  metric_name: "val_loss" ## set to null to save most recent k checkpoints
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "meta-llama/Llama-3.2-1B"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  precision: "bfloat16"
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    fp8:
+      recipe_name: tensorwise  # Options: tensorwise, rowwise, rowwise_with_gw_hp
+      enable_fsdp_float8_all_gather: true
+      precompute_float8_dynamic_scale_for_fsdp: true
+      force_recompute_fp8_weight_in_bwd: true
+      filter_fqns: ["lm_head"]
+      emulate: false  # Set to true for testing on older GPUs without native FP8 support
+  
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-5
+      # when using Dtensor, we need to set foreach
+      # and fused to False
+      foreach: False
+      fused: False
+    
+  ## ignored since enabled=false, but needed for testing purposes
+  megatron_cfg:
+    enabled: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: false
+    freeze_moe_router: false
+    moe_router_dtype: null
+    moe_router_load_balancing_type: "aux_loss"
+    moe_router_bias_update_rate: 1e-3
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True   
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6
+      min_lr: 4.9999e-6
+      weight_decay: 0.1
+      bf16: false
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-5
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 50
+      lr_warmup_init: 4.9999e-6
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "squad"
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+
+  ## unused with squad dataset
+  prompt_file: null
+  split: null
+  output_key: null
+  seed: null
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "sft-dev"
+    name: "sft-dev-${data.dataset_name}"
+  tensorboard:
+    log_dir: "tb_logs-sft-dev-${data.dataset_name}"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "sft-dev-${data.dataset_name}"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

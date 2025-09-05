@@ -45,6 +45,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.quantization.fp8 import FP8Config
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -61,7 +62,9 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
+from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+from transformers.utils import ContextManagers
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
@@ -166,6 +169,13 @@ class DTensorPolicyWorkerV2:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
+        # Load FP8 config from nemo-automodel's definition
+        self.fp8_config = (
+            FP8Config(**self.cfg["dtensor_cfg"]["fp8"])
+            if "fp8" in self.cfg["dtensor_cfg"]
+            else None
+        )
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -232,10 +242,11 @@ class DTensorPolicyWorkerV2:
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()])
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
-
-        with init_empty_weights():
+        with init_ctx:
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
@@ -245,6 +256,7 @@ class DTensorPolicyWorkerV2:
                 if self.enable_seq_packing
                 else None,
                 use_liger_kernel=False,
+                fp8_config=self.fp8_config,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
