@@ -26,6 +26,9 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
+from wandb import Table
+from wandb.plot import histogram
+
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
@@ -910,6 +913,17 @@ class AsyncPenguinRolloutResult:
     rollout_metrics: dict[str, Any]
 
 
+def _calculate_single_metric(values: list[float], batch_size: int, key_name: str) -> dict:
+    return {
+        f"mean_{key_name}": sum(values) / batch_size,
+        f"max_{key_name}": max(values),
+        f"min_{key_name}": min(values),
+        f"median_{key_name}": statistics.median(values),
+        f"stddev_{key_name}": statistics.stdev(values),
+        f"histogram_{key_name}": histogram(Table(data=values, columns=[key_name]), key_name, title=key_name),
+    }
+
+
 def run_async_penguin_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -963,53 +977,27 @@ def run_async_penguin_rollout(
         {
             "total_reward": r["full_result"]["reward"],
             "assistant_tokens": sum(len(m["token_ids"]) for m in r["message_log"] if m["role"] == "assistant"),
+            "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
+            "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
         }
         for r in results
     ]
 
     # Aggregate metrics across all samples
     rollout_metrics = {
-        # TODO: support these metrics.
-        # # Overall metrics
-        # "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-        # "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-        # / batch_size,
-        # "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
-        # "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-        # / batch_size,
-        # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
-        # / batch_size,
-        # "max_turns_reached_rate": sum(
-        #     m["max_turns_reached"] for m in all_sample_metrics
-        # )
-        # / batch_size,
-        # Token usage metrics
-        # "mean_total_tokens_per_sample": sum(
-        #     m["total_tokens"] for m in all_sample_metrics
-        # )
-        # / batch_size,
-        "mean_gen_tokens_per_sample": sum(
-            m["assistant_tokens"] for m in all_sample_metrics
-        )
-        / batch_size,
-        "min_gen_tokens_per_sample": min(
-            m["assistant_tokens"] for m in all_sample_metrics
-        ),
-        "max_gen_tokens_per_sample": max(
-            m["assistant_tokens"] for m in all_sample_metrics
-        ),
-        "median_gen_tokens_per_sample": statistics.median(
-            m["assistant_tokens"] for m in all_sample_metrics
-        ),
+        **_calculate_single_metric([m["turn_count"] for m in all_sample_metrics], batch_size, "turns_per_sample"),
+        **_calculate_single_metric([m["total_tokens"] for m in all_sample_metrics], batch_size, "total_tokens_per_sample"),
+        **_calculate_single_metric([m["assistant_tokens"] for m in all_sample_metrics], batch_size, "gen_tokens_per_sample"),
+        **_calculate_single_metric([m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"),
+        # TODO there may be some other metrics here that are good to log.
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
         # )
         # / batch_size,
-        # Reward metrics
-        "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
-        / batch_size,
-        "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
-        "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+        # "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+        # / batch_size,
+        # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
+        # / batch_size,
     }
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
