@@ -289,6 +289,39 @@ class BaseVllmGenerationWorker:
 
             _patch_vllm_sampler()
 
+            # Monkey patch for vLLM to ensure RAY_ADDRESS is set in Ray actors.
+            from vllm.v1.engine.core_client import (
+                AsyncMPClient,
+                DPAsyncMPClient,
+                EngineCoreClient,
+                MPClient,
+            )
+            from vllm.v1.executor.abstract import Executor
+
+            @staticmethod
+            def _patch_make_async_mp_client(
+                vllm_config: VllmConfig,
+                executor_class: type[Executor],
+                log_stats: bool,
+                client_addresses: Optional[dict[str, str]] = None,
+                client_index: int = 0,
+            ) -> "MPClient":
+                parallel_config = vllm_config.parallel_config
+                client_args = (
+                    vllm_config,
+                    executor_class,
+                    log_stats,
+                    client_addresses,
+                    client_index,
+                )
+                if parallel_config.data_parallel_size > 1:
+                    # Always use external load balancer - client per DP rank.
+                    return DPAsyncMPClient(*client_args)
+                return AsyncMPClient(*client_args)
+
+            EngineCoreClient.make_async_mp_client = _patch_make_async_mp_client
+            logger.info("Successfully patched EngineCoreClient.make_async_mp_client.")
+
         except (ImportError, AttributeError):
             # vllm not installed or has a different structure, skipping patch.
             pass
