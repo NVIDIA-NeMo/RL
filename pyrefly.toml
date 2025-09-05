@@ -13,6 +13,7 @@ replace-imports-with-any = [
     "megatron.*",
     "ray.*",
     "numpy.*",
+    "sphinx.*"
 ]
 project-includes = [
     # TODO: enable these once we have 100 correctness

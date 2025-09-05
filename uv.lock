@@ -2885,7 +2885,6 @@ dev = [
     { name = "pre-commit" },
     { name = "pyrefly" },
     { name = "ruff" },
-    { name = "sphinx" },
     { name = "types-pyyaml" },
     { name = "types-requests" },
 ]
@@ -2971,7 +2970,6 @@ dev = [
     { name = "pre-commit", specifier = ">=4.2.0" },
     { name = "pyrefly", specifier = "==0.24.2" },
     { name = "ruff", specifier = "==0.9.9" },
-    { name = "sphinx" },
     { name = "types-pyyaml" },
     { name = "types-requests" },
 ]

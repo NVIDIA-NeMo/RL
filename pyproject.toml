@@ -124,7 +124,6 @@ docs = [
     "gitpython",  # To git-related information
 ]
 dev = [
-    "sphinx",
     "pre-commit>=4.2.0",
     "ruff==0.9.9",
     "types-PyYAML",
