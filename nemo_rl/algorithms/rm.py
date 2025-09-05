@@ -172,7 +172,7 @@ def setup(
                 ],
                 add_loss_mask=False,
             ),
-            drop_last=rm_config["val_drop_last"],
+            drop_last=False,
         )
         for k, v in val_dataset.items()
     }
@@ -318,9 +318,9 @@ def validate_one_dataset(
                 val_batch,
                 loss_fn,
                 eval_mode=True,
-                ## NOTE: we double the batch size here because each preference example corresponds to a pair of
-                ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                 gbs=val_batch.size,
+                # NOTE: we double the batch size because each preference example corresponds to a pair of
+                # examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                 mbs=val_mbs * 2,
             )
 

@@ -168,7 +168,7 @@ def setup(
             ],
             add_loss_mask=True,
         ),
-        drop_last=True,
+        drop_last=False,
     )
 
     if last_checkpoint_path is not None:
@@ -262,9 +262,6 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
             # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
             dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
             if batch.size % (dp_size * micro_batch_size) != 0:
-                assert is_val, (
-                    "Partial batches should only happen during validation, but got a partial batch during training."
-                )
                 batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
 
             ## append ref policy logprobs to batch
