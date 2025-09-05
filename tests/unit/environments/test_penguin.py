@@ -135,4 +135,8 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
     def _standardize(l: list[dict]):
         return list(map(_standardize_single_result, l))
 
+    with open("temp_test_penguin_sanity_actual_result.json", "w") as f:
+        import json
+        json.dump(_standardize(actual_result), f)
+
     assert _standardize(expected_result) == _standardize(actual_result)
