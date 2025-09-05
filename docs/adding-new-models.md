@@ -191,3 +191,124 @@ uv run --extra mcore tools/model_diagnostics/3.check_hf_model_embeddings_untrain
   - `--near-zero-threshold` (default: `1e-10`)
   - `--identical-threshold` (default: `1e-8`)
 - If any near-zero or identical rows are reported, the model may have issues of numerical instability (e.g., inf grad norms) during post-training if any of these problematic tokens are encountered. We have observed this happening when special tokens are reserved in the tokenizer and embedding, but none are encountered during pre-training. It may help to initialize these embeddings similar to how they were initialize during pre-training.
+
+## [4.vllm_precision_compilation_test.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/4.vllm_precision_compilation_test.py)
+
+Tests vLLM precision compilation by comparing log probabilities across different compilation modes and configurations. This script helps diagnose numerical precision issues that commonly arise when using different vLLM compilation settings. **Note that this is not a strict pass/fail test** - it's designed to help you understand and investigate numerical discrepancies.
+
+```sh
+# Example run
+uv run --extra vllm tools/model_diagnostics/4.vllm_precision_compilation_test.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+
+# Typical output shows mixed results:
+# Eager and cuda graph mode lps: FAILED - Arrays are different
+...
+# Eager and cuda graph mode lps with torch inductor precision flag: FAILED - Arrays are different  
+...
+# Eager and cuda graph mode lps with use_inductor disabled: PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+```
+
+See example for model `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`
+```
+====================================================================================================
+Eager and cuda graph mode lps (prompt lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+Mismatched elements: 96 / 515 (18.6%)
+Max absolute difference among violations: 0.3885002
+Max relative difference among violations: 0.20179409
+ ACTUAL: array([[-1.424489e+01, -3.924684e-01, -3.135911e+00, -4.258007e-01,
+        -3.443364e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+ DESIRED: array([[-1.420929e+01, -3.619126e-01, -3.241854e+00, -4.308376e-01,
+        -3.047717e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+====================================================================================================
+====================================================================================================
+Eager and cuda graph mode lps (generation lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+nan location mismatch:
+ ACTUAL: array([[-1.231834e+01, -1.411233e-01, -3.764260e-01, ...,           nan,
+                  nan,           nan],
+       [-8.567932e+00, -1.066314e+01, -4.463661e-01, ...,           nan,...
+ DESIRED: array([[-1.226752e+01, -1.508305e-01, -4.024158e-01, ...,           nan,
+                  nan,           nan],
+       [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
+====================================================================================================
+...
+====================================================================================================
+Eager and cuda graph mode lps with torch inductor precision flag (prompt lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+Mismatched elements: 96 / 515 (18.6%)
+Max absolute difference among violations: 0.3885002
+Max relative difference among violations: 0.20179409
+ ACTUAL: array([[-1.424489e+01, -3.924684e-01, -3.135911e+00, -4.258007e-01,
+        -3.443364e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+ DESIRED: array([[-1.420929e+01, -3.619126e-01, -3.241854e+00, -4.308376e-01,
+        -3.047717e-04,           nan,           nan,           nan,
+                  nan,           nan,           nan,           nan,...
+====================================================================================================
+====================================================================================================
+Eager and cuda graph mode lps with torch inductor precision flag (generation lps): FAILED - Arrays are different
+  Detailed error: 
+Not equal to tolerance rtol=0.001, atol=0.001
+
+nan location mismatch:
+ ACTUAL: array([[-1.231834e+01, -1.411233e-01, -3.764260e-01, ...,           nan,
+                  nan,           nan],
+       [-8.567932e+00, -1.066314e+01, -4.463661e-01, ...,           nan,...
+ DESIRED: array([[-1.226752e+01, -1.508305e-01, -4.024158e-01, ...,           nan,
+                  nan,           nan],
+       [-8.610202e+00, -1.067061e+01, -4.593382e-01, ..., -1.060957e-05,...
+====================================================================================================
+...
+Eager and cuda graph mode lps with use_inductor disabled (prompt lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+Eager and cuda graph mode lps with use_inductor disabled (generation lps): PASSED - Arrays are close within tolerance (atol=0.001, rtol=0.001)
+```
+
+**What this script tests:**
+
+The script is to compare both prompt and generation logprobs under the following setups:
+
+1. **Eager vs CUDA Graph Mode**: Compares log probabilities between eager execution (ground truth) and CUDA graph compilation mode
+   - **⚠️ Commonly fails**: This comparison often shows discrepancies due to compilation optimizations
+2. **Torch Inductor Precision**: Tests with `TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` environment variable
+   - **⚠️ May help**: This flag may help but typically doesn't resolve all the numerical differences
+3. **Inductor Disabled**: Verifies that disabling Torch Inductor compilation (`use_inductor=False`) maintains output consistency
+   - **✅ Usually works well**: This configuration often produces results very close to eager mode
+   - **Note**: `use_inductor=False` disables Inductor compilation but keeps CUDA graph capture active for compatible operations
+
+**Performance vs Accuracy Trade-offs:**
+
+The different compilation modes offer distinct trade-offs between accuracy and performance:
+
+- **Eager Mode** (`enforce_eager=True`): Highest accuracy (ground truth) but slowest execution
+- **CUDA Graph Mode with Inductor Disabled** (`enforce_eager=False` and `compilation_config={"use_inductor": False}`): Near-eager accuracy with significant speedup from CUDA graph optimization
+- **CUDA Graph Mode with Inductor Enabled** (`enforce_eager=False` and `compilation_config={"use_inductor": True}`): Potentially fastest execution with custom Triton kernels (since Triton is the current backend of Inductor), but may introduce numerical differences. For accuracy improvement, try the torch inductor precision flag: `export TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1`
+
+**Note**: Performance characteristics vary by model. For example, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` shows similar speed performance between `use_inductor=True` and `use_inductor=False`, making the accuracy-preserving option preferable.
+
+**Why this matters:**
+
+- **Debugging**: Helps identify which compilation settings cause numerical differences
+- **Configuration**: Shows which settings work best for your model
+- **Understanding**: Reveals how compilation affects model outputs
+
+**When to use:**
+
+- **Model integration** - understand numerical behavior across vLLM configurations
+- **Debugging** - investigate differences between development and production
+- **Research** - study compilation strategy impacts on precision
+
+**Interpreting results:**
+
+- **Eager vs CUDA Graph failures are normal** - don't panic if this fails
+- **Focus on patterns** - some models are more sensitive than others
+- **Use as guidance** - helps choose reliable compilation settings
+- **Balance precision vs performance** - choose what works for your use case

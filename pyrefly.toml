@@ -115,6 +115,7 @@ project-includes = [
     "nemo_rl/utils/venvs.py",
     "tools/model_diagnostics/1.max_model_len_respected.py",
     "tools/model_diagnostics/2.long_generation_decode_vs_prefill.py",
+    "tools/model_diagnostics/4.vllm_precision_compilation_test.py",
 ]
 
 # Disable TypedDict mutation errors since TypedDict objects are regular dicts at runtime
