@@ -176,6 +176,7 @@ class DTensorPolicyWorkerV2:
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
+            **self.cfg.get("model_kwargs", {}),
         )
 
         self._is_reward_model = (
