@@ -43,6 +43,7 @@ def import_model_from_hf_name(
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
         ]
+        model_provider.sequence_parallel = megatron_config["sequence_parallel"]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"
         ]
