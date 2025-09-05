@@ -87,10 +87,13 @@ class MasterConfig(TypedDict):
 
 class DPOValMetrics(TypedDict):
     loss: float
+    sft_loss: float
+    preference_loss: float
     accuracy: float
     rewards_chosen_mean: float
     rewards_rejected_mean: float
     num_valid_samples: float
+    global_valid_toks: float
 
 
 # =======================================================
@@ -190,7 +193,7 @@ def setup(
                 ],
                 add_loss_mask=True,
             ),
-            drop_last=dpo_config["val_drop_last"],
+            drop_last=False,
         )
         for k, v in val_dataset.items()
     }
@@ -262,6 +265,9 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
             # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
             dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
             if batch.size % (dp_size * micro_batch_size) != 0:
+                assert is_val, (
+                    "Partial batches should only happen during validation, but got a partial batch during training."
+                )
                 batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
 
             ## append ref policy logprobs to batch
@@ -378,10 +384,15 @@ def validate_one_dataset(
 
                 num_valid_batches += 1
 
+            if val_batches > 0 and batch_idx >= val_batches - 1:
+                break
+
         if num_valid_batches > 0:
             sum_num_valid_samples = sum(val_metrics["num_valid_samples"])
+            global_valid_toks = sum(val_metrics["global_valid_toks"])
             val_metrics = DPOValMetrics(
                 num_valid_samples=sum_num_valid_samples,
+                global_valid_toks=global_valid_toks,
                 **{
                     metric_name: sum(
                         [
@@ -394,7 +405,7 @@ def validate_one_dataset(
                     )
                     / sum_num_valid_samples
                     for metric_name in DPOValMetrics.__annotations__.keys()
-                    if metric_name != "num_valid_samples"
+                    if metric_name not in {"num_valid_samples", "global_valid_toks"}
                 },
             )
         else:
