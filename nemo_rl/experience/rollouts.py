@@ -20,6 +20,7 @@ import copy
 from typing import Any, Optional
 
 from dataclasses import dataclass
+import statistics
 
 import ray
 import torch
@@ -991,6 +992,15 @@ def run_async_penguin_rollout(
             m["assistant_tokens"] for m in all_sample_metrics
         )
         / batch_size,
+        "min_gen_tokens_per_sample": min(
+            m["assistant_tokens"] for m in all_sample_metrics
+        ),
+        "max_gen_tokens_per_sample": max(
+            m["assistant_tokens"] for m in all_sample_metrics
+        ),
+        "median_gen_tokens_per_sample": statistics.median(
+            m["assistant_tokens"] for m in all_sample_metrics
+        ),
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
         # )
