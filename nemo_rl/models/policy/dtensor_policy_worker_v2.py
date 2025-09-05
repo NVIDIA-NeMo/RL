@@ -164,87 +164,6 @@ class DTensorPolicyWorkerV2:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
-        model_config = AutoConfig.from_pretrained(
-            model_name,
-            # Always load the model in float32 to keep master weights in float32.
-            # Keeping the master weights in lower precision has shown to cause issues with convergence.
-            torch_dtype=torch.float32,
-            trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
-            attn_implementation="flash_attention_2"
-            if self.enable_seq_packing
-            else None,
-        )
-
-        self._is_reward_model = (
-            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
-        )
-        if self._is_reward_model:
-            # Ensure sequence packing is disabled.
-            if self.enable_seq_packing:
-                raise NotImplementedError(
-                    "Sequence packing is not supported for reward models"
-                )
-            # Load model as a Reward Model.
-            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
-            if rm_type == "bradley_terry":
-                model_class = NeMoAutoModelForSequenceClassification
-                if model_config.num_labels != 1:
-                    # For Bradley-Terry reward models, the linear head has a single output.
-                    # In the transformers library, the default setting for model_config.num_labels is 2
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
-                    # Since num_labels is used as the out_features for the linear head
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
-                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
-                    # from the model checkpoint and are instead initialized using model_config.initializer_range
-                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
-                    print(
-                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
-                        "for the linear head of Bradley-Terry reward models."
-                    )
-                    model_config.num_labels = 1
-            else:
-                raise ValueError(f"Unknown reward model type: {rm_type}")
-        else:
-            # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
-
-        full_state_dict = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = model_class.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-                torch_dtype=str(model_config.torch_dtype),
-            )
-
-            full_state_dict = model.state_dict()
-            del model
-
-        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
-        # All ranks initialize model on meta device, so FSDP can shard it.
-        # The actual weights will be broadcast from rank 0.
-
-        with init_empty_weights():
-            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
-            # so we need to set it to None if sequence packing is disabled
-            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-            self.model = model_class.from_config(
-                model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
-                trust_remote_code=True,
-                torch_dtype=str(model_config.torch_dtype),
-            )
-
-        if self.model.config.pad_token_id is None:
-            self.model.config.pad_token_id = tokenizer.pad_token_id
-
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         if cp_size > 1 and self.enable_seq_packing:
@@ -310,6 +229,91 @@ class DTensorPolicyWorkerV2:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.device_mesh = device_mesh
+
+        model_config = AutoConfig.from_pretrained(
+            model_name,
+            # Always load the model in float32 to keep master weights in float32.
+            # Keeping the master weights in lower precision has shown to cause issues with convergence.
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+            **sliding_window_overwrite(
+                model_name
+            ),  # due to https://github.com/huggingface/transformers/issues/38002
+            attn_implementation="flash_attention_2"
+            if self.enable_seq_packing
+            else None,
+        )
+
+        self._is_reward_model = (
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
+        )
+        if self._is_reward_model:
+            # Ensure sequence packing is disabled.
+            if self.enable_seq_packing:
+                raise NotImplementedError(
+                    "Sequence packing is not supported for reward models"
+                )
+            # Load model as a Reward Model.
+            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
+            if rm_type == "bradley_terry":
+                model_class = NeMoAutoModelForSequenceClassification
+                if model_config.num_labels != 1:
+                    # For Bradley-Terry reward models, the linear head has a single output.
+                    # In the transformers library, the default setting for model_config.num_labels is 2
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/configuration_utils.py#L259).
+                    # Since num_labels is used as the out_features for the linear head
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/modeling_llama.py#L738)
+                    # if num_labels is not 1, we set it to 1. This change may trigger a warning that some weights are not initialized
+                    # from the model checkpoint and are instead initialized using model_config.initializer_range
+                    # (https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/llama/configuration_llama.py#L62).
+                    print(
+                        "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                        "for the linear head of Bradley-Terry reward models."
+                    )
+                    model_config.num_labels = 1
+            else:
+                raise ValueError(f"Unknown reward model type: {rm_type}")
+        else:
+            # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
+            model_class = resolve_model_class(model_config.model_type)
+
+        full_state_dict = None
+        if self.rank == 0:
+            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+            model = model_class.from_pretrained(
+                model_name,
+                device_map="cpu",  # load weights onto CPU initially
+                trust_remote_code=True,
+                use_liger_kernel=(
+                    cp_size == 1
+                ),  # liger-kernel doesn't support context parallel yet
+                config=model_config,
+                torch_dtype=str(model_config.torch_dtype),
+            )
+
+            full_state_dict = model.state_dict()
+            del model
+
+        print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
+        # All ranks initialize model on meta device, so FSDP can shard it.
+        # The actual weights will be broadcast from rank 0.
+
+        with init_empty_weights():
+            # NeMoAutoModelForCausalLM exposes attn_implementation in the from_config method and
+            # sets flash_attention_2 by default so we need to set it model_config._attn_implementation
+            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
+            self.model = model_class.from_config(
+                model_config,
+                attn_implementation=model_config._attn_implementation,
+                use_liger_kernel=(
+                    cp_size == 1
+                ),  # liger-kernel doesn't support context parallel yet
+                trust_remote_code=True,
+                torch_dtype=str(model_config.torch_dtype),
+            )
+
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = tokenizer.pad_token_id
 
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
