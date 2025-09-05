@@ -93,6 +93,7 @@ class DPOValMetrics(TypedDict):
     rewards_chosen_mean: float
     rewards_rejected_mean: float
     num_valid_samples: float
+    global_valid_seqs: float
     global_valid_toks: float
 
 
@@ -171,7 +172,7 @@ def setup(
             ],
             add_loss_mask=True,
         ),
-        drop_last=False,
+        drop_last=True,
     )
 
     if last_checkpoint_path is not None:
@@ -378,8 +379,13 @@ def validate_one_dataset(
                 )
             else:
                 for metric_name in DPOValMetrics.__annotations__.keys():
+                    reduction = (
+                        np.mean
+                        if metric_name in {"global_valid_seqs", "global_valid_toks"}
+                        else sum
+                    )
                     val_metrics[metric_name] += [
-                        sum(val_results["all_mb_metrics"][metric_name])
+                        reduction(val_results["all_mb_metrics"][metric_name])
                     ]
 
                 num_valid_batches += 1
@@ -390,8 +396,10 @@ def validate_one_dataset(
         if num_valid_batches > 0:
             sum_num_valid_samples = sum(val_metrics["num_valid_samples"])
             global_valid_toks = sum(val_metrics["global_valid_toks"])
+            global_valid_seqs = sum(val_metrics["global_valid_seqs"])
             val_metrics = DPOValMetrics(
                 num_valid_samples=sum_num_valid_samples,
+                global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
                 **{
                     metric_name: sum(
@@ -405,7 +413,12 @@ def validate_one_dataset(
                     )
                     / sum_num_valid_samples
                     for metric_name in DPOValMetrics.__annotations__.keys()
-                    if metric_name not in {"num_valid_samples", "global_valid_toks"}
+                    if metric_name
+                    not in {
+                        "num_valid_samples",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                    }
                 },
             )
         else:
