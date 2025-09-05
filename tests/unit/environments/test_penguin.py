@@ -114,9 +114,17 @@ def penguin_sanity_test_data():
     return data
 
 
-def test_penguin_sanity(penguin, penguin_sanity_test_data):
+def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation):
     """Test basic functionality of MathEnvironment step with simple messages."""
-    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
+
+    # We need to match NeMo RL generation config params before sending to Penguin
+    generation_config = penguin_vllm_generation.cfg
+    examples = penguin_sanity_test_data["input"]
+    for example in examples:
+        example["responses_create_params"]["temperature"] = generation_config["temperature"]
+        example["responses_create_params"]["top_p"] = generation_config["top_p"]
+
+    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data))
     expected_result = penguin_sanity_test_data["expected_output"]
 
     def _standardize_single_result(d: dict):
