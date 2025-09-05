@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import re
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import ray
@@ -42,6 +44,9 @@ class LLMJudgeAsyncConfig(TypedDict):
     max_tokens: Optional[int]
     stop: Optional[List[str]] # Note: vLLM's AsyncEngine uses 'stop'
     max_concurrency: Optional[int] # Maximum concurrent step calls for the environment actor
+    # Logging configuration
+    log_dir: Optional[str] # Directory to save conversation logs
+    log_conversations: Optional[bool] # Whether to log conversations
     # Any other vllm.SamplingParams can be added here
 
 class LLMJudgeEnvironmentMetadata(TypedDict): # Reusing from previous
@@ -218,12 +223,28 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
 
     def __init__(self, cfg: LLMJudgeAsyncConfig):
         self.cfg = cfg
-        # Use single workers for batching efficiency
-        self.num_target_workers = 1
-        self.num_judge_workers = 1
+        self.num_target_workers = cfg["target_model"]["num_workers"]
+        self.num_judge_workers = cfg["judge_model"]["num_workers"]
         
         target_tensor_parallel_size = cfg["target_model"]["tensor_parallel_size"]
         judge_tensor_parallel_size = cfg["judge_model"]["tensor_parallel_size"]
+
+        # Initialize conversation logging
+        self.log_conversations = cfg.get("log_conversations", False)
+        self.log_dir = None
+        self.step_counter = 0
+        
+        if self.log_conversations:
+            log_dir = cfg.get("log_dir", "./env_logs")
+            self.log_dir = Path(log_dir)
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create timestamped subdirectory for this environment instance
+            timestamp = uuid.uuid4().hex[:8]
+            self.env_log_dir = self.log_dir / f"env_{timestamp}"
+            self.env_log_dir.mkdir(exist_ok=True)
+            
+            logging.info(f"Environment logging enabled. Logs will be saved to: {self.env_log_dir}")
 
         # Pass down critical environment variables (HF cache, etc.) to workers.
         env_vars_to_pass = {}
@@ -244,20 +265,25 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         #                       Target Workers                    
         #########################################################
         
-        # Simplified placement group logic for single workers
-        # Only create placement groups if both models use TP=1 (single GPU each)
-        if target_tensor_parallel_size == 1 and judge_tensor_parallel_size == 1:
-            # 2 workers total, each needs 1 GPU
-            bundle_ct_per_node_list = [1, 1]  # 1 GPU per worker
+        # Create placement groups for workers that need single-GPU bundles (TP=1)
+        single_gpu_workers = 0
+        if target_tensor_parallel_size == 1:
+            single_gpu_workers += self.num_target_workers
+        if judge_tensor_parallel_size == 1:
+            single_gpu_workers += self.num_judge_workers
+            
+        if single_gpu_workers > 0:
+            bundle_ct_per_node_list = [1] * single_gpu_workers  # 1 GPU per single-GPU worker
 
             self.virtual_cluster = RayVirtualCluster(
                 bundle_ct_per_node_list=bundle_ct_per_node_list,
                 use_gpus=True,
                 name="llm_judge_async_vc",
             )
+            # self.virtual_cluster.print_cluster_grid()
             placement_groups = self.virtual_cluster.get_placement_groups()
         else:
-            # Multi-GPU workers -> rely on Ray scheduler
+            # No placement group / virtual cluster -> rely on Ray scheduler.
             self.virtual_cluster = None
             placement_groups = []
 
@@ -276,31 +302,41 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         }
         
         
-        # Create single target worker for batching
-        print(f"Creating 1 target AsyncVLLMWorker actor with TP={target_tensor_parallel_size}")
-        
-        if target_tensor_parallel_size == 1 and placement_groups:
-            # Use first placement group for single GPU
-            scheduling_kwargs = dict(
-                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=placement_groups[0]
+        self.target_workers = []
+        print(f"Creating {self.num_target_workers} AsyncVLLMWorker actors.")
+        for i in range(self.num_target_workers):
+            # If tensor_parallel_size == 1, we can safely pin the actor to a
+            # single-GPU bundle inside the placement group. Otherwise, each
+            # actor needs multiple GPUs and cannot fit into the 1-GPU bundles
+            # created by RayVirtualCluster. In that case we rely on Ray's
+            # default scheduler (no placement group) to allocate all requested
+            # GPUs on the same node.
+
+            if target_tensor_parallel_size == 1:
+                pg_index = i % len(placement_groups)
+                pg = placement_groups[pg_index]
+                scheduling_kwargs = dict(
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    )
                 )
+            else:
+                # No placement group – let Ray handle multi-GPU allocation.
+                # TODO @yashaswikarnati: improve with custom scheduling strategy
+                scheduling_kwargs = {}
+            worker = AsyncVLLMWorker.options(
+                **target_worker_options,
+                **scheduling_kwargs,
+            ).remote(
+                model_name=cfg["target_model"]["model_name"],
+                tensor_parallel_size=cfg["target_model"]["tensor_parallel_size"],
+                gpu_memory_utilization=cfg["target_model"].get("gpu_memory_utilization", 0.85),
+                max_model_len=cfg["target_model"].get("max_model_len", 8192),
+                # Pass any other engine args from cfg if needed
             )
-        else:
-            # Multi-GPU or no placement groups -> let Ray handle allocation
-            scheduling_kwargs = {}
-            
-        self.target_worker = AsyncVLLMWorker.options(
-            **target_worker_options,
-            **scheduling_kwargs,
-        ).remote(
-            model_name=cfg["target_model"]["model_name"],
-            tensor_parallel_size=cfg["target_model"]["tensor_parallel_size"],
-            gpu_memory_utilization=cfg["target_model"].get("gpu_memory_utilization", 0.85),
-            max_model_len=cfg["target_model"].get("max_model_len"),
-        )
+            self.target_workers.append(worker)
         
-        logging.info(f"Created target AsyncVLLMWorker actor.")
+        logging.info(f"Created {len(self.target_workers)} AsyncVLLMWorker actors.")
         self._request_counter = 0 # For generating unique request IDs per step call
         self._actor_id_prefix = str(uuid.uuid4())[:8] # Unique prefix for this actor instance
 
@@ -321,37 +357,61 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
             "num_gpus": judge_tensor_parallel_size,
         }
 
-        # Create single judge worker for batching
-        print(f"Creating 1 judge AsyncVLLMWorker actor with TP={judge_tensor_parallel_size}")
-        
-        if judge_tensor_parallel_size == 1 and placement_groups:
-            # Use second placement group for single GPU (target uses first)
-            pg_index = 1 if len(placement_groups) > 1 else 0
-            scheduling_kwargs = dict(
-                scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=placement_groups[pg_index]
+        self.judge_workers = []
+        print(f"Creating {self.num_judge_workers} AsyncVLLMWorker actors.")
+        for i in range(self.num_judge_workers):
+            if judge_tensor_parallel_size == 1:
+                # Judge workers use placement groups AFTER target workers (only if target workers also use TP=1)
+                target_workers_using_pg = self.num_target_workers if target_tensor_parallel_size == 1 else 0
+                pg_index = (target_workers_using_pg + i) % len(placement_groups)
+                pg = placement_groups[pg_index]
+                scheduling_kwargs = dict(
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    )
                 )
+            else:
+                # No placement group – let Ray handle multi-GPU allocation.
+                # TODO @yashaswikarnati: improve with custom scheduling strategy
+                scheduling_kwargs = {}
+            worker = AsyncVLLMWorker.options(
+                **judge_worker_options,
+                **scheduling_kwargs,
+            ).remote(
+                model_name=cfg["judge_model"]["model_name"],
+                tensor_parallel_size=cfg["judge_model"]["tensor_parallel_size"],
+                gpu_memory_utilization=cfg["judge_model"].get("gpu_memory_utilization", 0.85),
+                max_model_len=cfg["judge_model"].get("max_model_len", 40000),
             )
-        else:
-            # Multi-GPU or no placement groups -> let Ray handle allocation
-            scheduling_kwargs = {}
-            
-        self.judge_worker = AsyncVLLMWorker.options(
-            **judge_worker_options,
-            **scheduling_kwargs,
-        ).remote(
-            model_name=cfg["judge_model"]["model_name"],
-            tensor_parallel_size=cfg["judge_model"]["tensor_parallel_size"],
-            gpu_memory_utilization=cfg["judge_model"].get("gpu_memory_utilization", 0.85),
-            max_model_len=cfg["judge_model"].get("max_model_len"),
-        )
+            self.judge_workers.append(worker)
         #########################################################
 
     def shutdown(self):
-        ray.kill(self.target_worker)
-        ray.kill(self.judge_worker)
+        for worker in self.target_workers + self.judge_workers:
+            ray.kill(worker)
         if self.virtual_cluster is not None:
             self.virtual_cluster.shutdown()
+
+    def _log_step_data(self, step_data: Dict) -> None:
+        """Log conversation data for this step to a JSON file."""
+        if not self.log_conversations or not hasattr(self, 'env_log_dir'):
+            return
+            
+        try:
+            # Create filename with step counter
+            filename = f"step_{self.step_counter:06d}.json"
+            log_file = self.env_log_dir / filename
+            
+            # Add metadata
+            step_data["step_number"] = self.step_counter
+            step_data["timestamp"] = uuid.uuid4().hex
+            
+            # Write to file
+            with open(log_file, 'w', encoding='utf-8') as f:
+                json.dump(step_data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            logging.warning(f"Failed to log step data: {e}")
 
     def extract_score(self, judge_response: str) -> float:
         individual_pattern = r'\[The Begin of Individual Scores\](.*?)\[The End of Individual Scores\]'
@@ -396,21 +456,24 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
 
         futures = []
         
-        # Prepare default sampling parameters from config
-        default_sampling_params = {
-            "temperature": self.cfg.get("temperature", 0.0),
-            "max_tokens": self.cfg.get("max_tokens", 512),
-            "stop": self.cfg.get("stop", None),
+        # Prepare target sampling parameters from target model config
+        target_sampling_params = {
+            "temperature": self.cfg["target_model"].get("temperature", 0.0),
+            "max_tokens": self.cfg["target_model"].get("max_tokens", 512),
+            "stop": self.cfg["target_model"].get("stop", None),
         }
 
-        # Send all requests to the single target worker for batching
+        # For each batch, loop through each conversation and send it to a target worker asynchronously
         for i, (prompt, single_metadata) in enumerate(zip(generated_prompts, metadata)):
-            # Generate a unique request ID for vLLM for this specific call
+            # Generate a unique request ID for vLLM for this specific call to target
             request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
-            current_sampling_params = default_sampling_params.copy()
+            
+            worker_idx = i % self.num_target_workers # Simple round-robin
+            
+            current_target_params = target_sampling_params.copy()
 
-            future = self.target_worker.get_response.remote(
-                request_id, prompt, single_metadata, current_sampling_params,
+            future = self.target_workers[worker_idx].get_response.remote(
+                request_id, prompt, single_metadata, current_target_params,
             )
             futures.append(future)
         
@@ -446,12 +509,21 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
                 ]
             )
         
-        # Send all judge requests to the single judge worker for batching
-        judge_futures = []  # Create a new futures list for judge workers
+        # Prepare judge sampling parameters from judge model config
+        judge_sampling_params = {
+            "temperature": self.cfg["judge_model"].get("temperature", 0.0),
+            "max_tokens": self.cfg["judge_model"].get("max_tokens", 2048),  # Judges typically need more tokens
+            "stop": self.cfg["judge_model"].get("stop", None),
+        }
         
+        judge_futures = []  # Create a new futures list for judge workers
         for i, prompt in enumerate(judge_prompts):
             request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
-            future = self.judge_worker.get_response.remote(request_id, prompt, metadata[i], current_sampling_params)
+            worker_idx = i % self.num_judge_workers
+            
+            current_judge_params = judge_sampling_params.copy()
+            
+            future = self.judge_workers[worker_idx].get_response.remote(request_id, prompt, metadata[i], current_judge_params)
             judge_futures.append(future)
         
         judge_responses: List[Tuple[str, float]] = ray.get(judge_futures)
@@ -479,6 +551,22 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
         
         next_stop_strings = [None] * len(message_log_batch) 
+
+        # Log conversation data
+        if self.log_conversations:
+            step_data = {
+                "input_conversations": message_log_batch,
+                "generated_prompts": generated_prompts,
+                "target_responses": target_responses,
+                "judge_prompts": judge_prompts,
+                "judge_responses": judge_responses,
+                "rewards": rewards,
+                "metadata": metadata
+            }
+            self._log_step_data(step_data)
+            
+        # Increment step counter
+        self.step_counter += 1
 
         return EnvironmentReturn(
             observations=observations,
