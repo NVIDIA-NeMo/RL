@@ -221,16 +221,16 @@ env:
     enable: false
     use_separate_nodes: true # Use separate nodes for target and judge workers
     gpu_memory_utilization: 0.85 # Default GPU memory utilization for both models
-    max_model_len: 4096 # Default max sequence length for both models
+    max_model_len: 8192 # Default max sequence length for both models
     reasoning_split_word: "</think>" # The word to split responses into reasoning and answer
     max_concurrency: 16 # Maximum concurrent step calls for the environment actor
     
     target_model:
-      num_workers: 4 # Single target worker with multiple GPUs
+      num_workers: 1 # Single target worker with multiple GPUs
       model_name: "Qwen/Qwen3-4B-Instruct-2507" # Target model for generating responses
-      tensor_parallel_size: 1 # TP size for the target model (4 GPUs per worker)
+      tensor_parallel_size: 4 # TP size for the target model (4 GPUs per worker)
       gpu_memory_utilization: 0.8 # GPU memory utilization for target model
-      max_model_len: 4096 # Max sequence length for target model
+      max_model_len: 8192 # Max sequence length for target model
       # Target model sampling parameters
       temperature: 1.0 # Higher temperature for diverse target responses
       top_p: 0.9
