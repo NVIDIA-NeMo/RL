@@ -630,9 +630,13 @@ class DTensorPolicyWorker:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
                     iterator_len = batch.size // mbs
 
-                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get("empty_cache_every_n_steps")
+                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+                    "empty_cache_every_n_steps"
+                )
                 if empty_cache_steps:
-                    warnings.warn(f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead.")
+                    warnings.warn(
+                        f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
+                    )
 
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
