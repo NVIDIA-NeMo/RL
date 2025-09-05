@@ -99,7 +99,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # res is conversation, [request_prompt], [engine_prompt]
                 res = await super()._preprocess_chat(request, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt, continue_final_message, tool_dicts, documents, chat_template_kwargs, tool_parser, truncate_prompt_tokens, add_special_tokens)
 
-                if request.required_token_ids is None:
+                if request.required_prefix_token_ids is None:
                     return res
 
                 request_prompt = res[1][0]  # We need to modify request_prompt.prompt_token_ids
