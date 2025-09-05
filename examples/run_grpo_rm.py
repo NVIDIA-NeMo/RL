@@ -221,6 +221,10 @@ def main() -> None:
         master_config,
     )
 
+    for task_name in val_task_to_env.keys():
+        env = val_task_to_env[task_name]
+        env.shutdown.remote()
+
 
 if __name__ == "__main__":
     main()
