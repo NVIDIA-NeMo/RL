@@ -794,3 +794,9 @@ def test_run_async_penguin_rollout(
 
     print(_standardize(actual_result))
     assert _standardize(expected_result) == _standardize(actual_result)
+
+    """
+    If the result here does not match, please check the following:
+    1. In nemo_rl/experience/rollouts.py::run_async_penguin_rollout, the sampling params are passed appropriately
+    2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
+    """
