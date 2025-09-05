@@ -182,7 +182,7 @@ class Penguin(EnvironmentInterface):
             ray.kill(worker)
 
     def step(self, message_log_batch, metadata):
-        # This is not used since NeMo Gym will handle the rollouts entirely.
+        # This is not used since Penguin will handle the rollouts entirely.
         raise NotImplementedError
 
     def global_post_process_and_metrics(self, batch):
