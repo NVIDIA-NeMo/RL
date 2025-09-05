@@ -718,24 +718,14 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("use_v2", [True, False])
-def test_dtensor_v1_policy_flops_range_check(tiny_llama_model_path, use_v2):
+def test_dtensor_v1_policy_flops_range_check(tiny_llama_model_path, two_gpu_virtual_cluster, use_v2):
     """Test that the returned FLOPS is within a reasonable range using dtensor backend.
 
     Performs 2 warmup iterations and measures FLOPS for the next 3 iterations.
     """
-    num_gpus = 1
     batch_size = 8
     seq_len = 128
     vocab_size = 32000
-
-    # Create cluster for FLOPS testing
-    cluster = RayVirtualCluster(
-        name="test-dtensor-v1-flops-tracker",
-        bundle_ct_per_node_list=[num_gpus],
-        use_gpus=True,
-        num_gpus_per_node=num_gpus,
-        max_colocated_worker_groups=1,
-    )
 
     # Create dtensor v1 config with default settings
     config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
@@ -750,7 +740,7 @@ def test_dtensor_v1_policy_flops_range_check(tiny_llama_model_path, use_v2):
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
     policy = Policy(
-        cluster=cluster,
+        cluster=two_gpu_virtual_cluster,
         config=config,
         tokenizer=tokenizer,
         init_reference_model=False,
@@ -831,4 +821,3 @@ def test_dtensor_v1_policy_flops_range_check(tiny_llama_model_path, use_v2):
 
     finally:
         policy.shutdown()
-        cluster.shutdown()
