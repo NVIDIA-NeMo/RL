@@ -25,6 +25,8 @@ coverage.json
 unit_results.json
 unit_results/
 test_assets/
+.nrl_remote_map.json
+.nrl_remote_state.json
 
 # Cache
 uv_cache/

@@ -26,7 +26,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss_functions import (
     DPOLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, preference_collate_fn
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -87,7 +87,14 @@ class MasterConfig(TypedDict):
 
 class DPOValMetrics(TypedDict):
     loss: float
+    sft_loss: float
+    preference_loss: float
     accuracy: float
+    rewards_chosen_mean: float
+    rewards_rejected_mean: float
+    num_valid_samples: float
+    global_valid_seqs: float
+    global_valid_toks: float
 
 
 # =======================================================
@@ -187,7 +194,7 @@ def setup(
                 ],
                 add_loss_mask=True,
             ),
-            drop_last=True,
+            drop_last=False,
         )
         for k, v in val_dataset.items()
     }
@@ -254,6 +261,15 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
                 if is_val
                 else master_config["policy"]["train_micro_batch_size"] * 2
             )
+
+            # when running validation with drop_last=False, we might end up with a partial batch.
+            # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
+            dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+            if batch.size % (dp_size * micro_batch_size) != 0:
+                assert is_val, (
+                    "Partial batches should only happen during validation, but got a partial batch during training."
+                )
+                batch = maybe_pad_last_batch(batch, dp_size, micro_batch_size)
 
             ## append ref policy logprobs to batch
             logprobs = policy.get_reference_policy_logprobs(
@@ -342,7 +358,7 @@ def validate_one_dataset(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
-        val_metrics = defaultdict(lambda: 0.0)
+        val_metrics = defaultdict(list)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(
             add_ref_logprobs_to_data(val_dataloader, policy, master_config, is_val=True)
@@ -352,7 +368,7 @@ def validate_one_dataset(
                 val_batch,
                 loss_fn,
                 eval_mode=True,
-                gbs=val_batch_size * 2,
+                gbs=val_batch.size,
                 mbs=val_mbs * 2,
             )
 
@@ -361,22 +377,61 @@ def validate_one_dataset(
                     "No validation metrics were collected for this batch."
                     " This is likely because there were no valid samples."
                 )
-
             else:
-                for k, v in val_results["all_mb_metrics"].items():
-                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                        val_metrics[k] += np.mean(v).item()
-                    else:
-                        val_metrics[k] += np.sum(v).item()
+                for metric_name in DPOValMetrics.__annotations__.keys():
+                    reduction = (
+                        np.mean
+                        if metric_name in {"global_valid_seqs", "global_valid_toks"}
+                        else sum
+                    )
+                    val_metrics[metric_name] += [
+                        reduction(val_results["all_mb_metrics"][metric_name])
+                    ]
+
                 num_valid_batches += 1
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
-        for k, v in val_metrics.items():
-            if k == "num_valid_samples":
-                continue
-            val_metrics[k] /= num_valid_batches
+        if num_valid_batches > 0:
+            sum_num_valid_samples = sum(val_metrics["num_valid_samples"])
+            global_valid_toks = sum(val_metrics["global_valid_toks"])
+            global_valid_seqs = sum(val_metrics["global_valid_seqs"])
+            val_metrics = DPOValMetrics(
+                num_valid_samples=sum_num_valid_samples,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                **{
+                    metric_name: sum(
+                        [
+                            value * weight
+                            for value, weight in zip(
+                                val_metrics[metric_name],
+                                val_metrics["num_valid_samples"],
+                            )
+                        ]
+                    )
+                    / sum_num_valid_samples
+                    for metric_name in DPOValMetrics.__annotations__.keys()
+                    if metric_name
+                    not in {
+                        "num_valid_samples",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                    }
+                },
+            )
+        else:
+            warnings.warn(
+                "No validation metrics were collected."
+                " This is likely because there were no valid samples in the validation set."
+            )
+            val_metrics = DPOValMetrics(
+                **{
+                    metric_name: 0.0
+                    for metric_name in DPOValMetrics.__annotations__.keys()
+                }
+            )
 
         # Calculate validation metrics
         policy.prepare_for_training()

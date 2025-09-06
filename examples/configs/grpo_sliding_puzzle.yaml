@@ -6,6 +6,7 @@ grpo:
   num_generations_per_prompt: 16
   max_rollout_turns: 50 # Maximum turns allowed per rollout
   max_num_steps: 10000
+  max_num_epochs: 1
 
 checkpointing:
   enabled: true

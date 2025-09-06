@@ -564,6 +564,8 @@ class MegatronPolicyWorker:
         ]
 
         model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
+        if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
+            model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
 
         model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
         model_cfg.bf16 = self.dtype == torch.bfloat16

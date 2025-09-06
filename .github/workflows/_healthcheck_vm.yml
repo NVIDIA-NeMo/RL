@@ -1,0 +1,118 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: ~monitor a single VM
+
+on:
+  workflow_call:
+    inputs:
+      vm:
+        type: string
+        description: Name of VM
+        required: true
+      n_gpus:
+        type: string
+        description: Number of GPUs this VM has
+        required: true
+      is_recheck:
+        type: boolean
+        description: Whether this is a recheck after reboot
+        required: false
+        default: false
+    secrets:
+      SLACK_WEBHOOK_ADMIN:
+        description: Slack webhook admin identifier
+        required: true
+      SLACK_GITHUB_CI_WEBHOOK:
+        description: Slack webhook URL for notifications
+        required: true
+      VM_KEY:
+        description: VM user credentials
+        required: true
+      PAT:
+        description: GitHub Personal Access Token
+        required: true
+
+jobs:
+  check-status-and-maybe-shutdown:
+    environment: main
+    runs-on: ${{ inputs.vm }}
+    outputs:
+      status: ${{ steps.status.outputs.main }}
+      reboot_needed: ${{ steps.status.outputs.reboot_needed }}
+    steps:
+      - name: Check status
+        id: status
+        run: |
+          echo "🔍 Running health check on VM ${{ inputs.vm }}"
+
+          docker run --rm --runtime=nvidia --gpus ${{ inputs.n_gpus }} ubuntu nvidia-smi
+
+          NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+
+          if [[ $NUM_GPUS -ne ${{ inputs.n_gpus }} ]]; then
+            echo "Issues with GPU detected"
+            echo "main=degraded" >> "$GITHUB_OUTPUT"
+            echo "reboot_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ VM ${{ inputs.vm }} is healthy - found $NUM_GPUS/${{ inputs.n_gpus }} GPUs"
+            echo "main=healthy" >> "$GITHUB_OUTPUT"
+            echo "reboot_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save reboot status to artifact
+        if: ${{ inputs.is_recheck != true }}
+        run: |
+          mkdir -p /tmp/healthcheck-results
+          echo "${{ steps.status.outputs.reboot_needed }}" > /tmp/healthcheck-results/${{ inputs.vm }}-reboot-needed.txt
+          echo "${{ steps.status.outputs.main }}" > /tmp/healthcheck-results/${{ inputs.vm }}-status.txt
+
+      - name: Upload healthcheck results
+        if: ${{ inputs.is_recheck != true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: healthcheck-${{ inputs.vm }}
+          path: /tmp/healthcheck-results/
+          retention-days: 1
+
+      - name: Take Action on Issues
+        if: ${{ (steps.status.outputs.main == 'degraded' || failure()) && inputs.is_recheck != true }}
+        continue-on-error: true
+        run: |
+          if [[ "${{ steps.status.outputs.reboot_needed }}" == "true" ]]; then
+            echo "Rebooting VM..."
+            echo "Scheduling reboot in 30 seconds to allow workflow to complete..."
+            echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'nohup bash -c "sleep 30 && cd /home/azureuser/actions-runner && ./svc.sh stop && sleep 30 && reboot" > /dev/null 2>&1 &'
+            echo "Reboot scheduled, workflow will continue..."
+          fi
+
+      - name: Send Slack Alert & Stop Service for Persistent Issues
+        if: ${{ (steps.status.outputs.main == 'degraded' || failure()) && inputs.is_recheck == true }}
+        continue-on-error: true
+        run: |
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":alert: VM bot 🤖: Hey <!subteam^${{ secrets.SLACK_WEBHOOK_ADMIN }}>: VM `${{ inputs.vm }}` still has issues after reboot - stopping service and needs manual intervention."
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
+
+          echo "Recheck detected persistent issues - stopping runner service to take VM offline"
+          echo '${{ secrets.VM_KEY }}' | sudo -S bash -c 'nohup bash -c "sleep 30 && cd /home/azureuser/actions-runner && ./svc.sh stop" > /dev/null 2>&1 &'
