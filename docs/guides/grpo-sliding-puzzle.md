@@ -7,11 +7,11 @@ The sliding puzzle task serves as a simple, yet effective example, to illustrate
 
 ## Quick Start Guide
 
-#### 1. Install and Set Up NeMo RL with Megatron Backend (Optional)
+### 1. Install and Set Up NeMo RL with Megatron Backend (Optional)
 
 To get started, clone and set up the NeMo RL repository by initializing submodules, installing CUDA dependencies, and configuring the environment with uv. Refer to [Prerequisites](https://github.com/NVIDIA-NeMo/RL/tree/main?tab=readme-ov-file#prerequisites) for detailed instructions on installation.
 
-#### 2. Train a Model
+### 2. Train a Model
 
 Train a model to solve the sliding puzzle using GRPO with the default 2×2 configuration.
 
@@ -19,7 +19,7 @@ Train a model to solve the sliding puzzle using GRPO with the default 2×2 confi
 uv run python examples/run_grpo_sliding_puzzle.py 
 ```
 
-#### 3. Customize Puzzle Configuration
+### 3. Customize Puzzle Configuration
 
 By default, this training script uses the configuration in [grpo_sliding_puzzle.yaml](../../examples/configs/grpo_sliding_puzzle.yaml). You can customize parameters with command-line overrides to experiment with different puzzle sizes or levels of difficulty.
 ```bash
@@ -29,7 +29,7 @@ uv run python examples/run_grpo_sliding_puzzle.py \
     env.sliding_puzzle_game.cfg.game_config.shuffle_moves=10
 ```
 
-#### 4. Monitor Progress
+### 4. Monitor Progress
 
 You can enable logging via Weights & Biases and TensorBoard to monitor training metrics such as rewards, success rate, and loss curves.
 
