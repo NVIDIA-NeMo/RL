@@ -110,6 +110,12 @@ _GITHUB_ADMONITIONS = {
     "> [!CAUTION]": "caution",
 }
 
+# Github links are now getting rate limited from the Github Actions
+linkcheck_ignore = [
+    ".*github\\.com.*",
+    ".*githubusercontent\\.com.*",
+]
+
 
 def convert_gh_admonitions(app, relative_path, parent_docname, contents):
     # loop through content lines, replace github admonitions

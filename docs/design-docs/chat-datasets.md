@@ -27,7 +27,7 @@ Hugging Face chat datasets are expected to have the following structure: Each ex
 
 ## Chat Templates
 
-Formatting the data in this way allows us to take advantage of the Hugging Face tokenizers' `apply_chat_template` functionality to combine the messages. Chat templates can be used to add special tokens or task-specific information to each example in the dataset. Refer to the [HuggingFace apply_chat_template documentation](https://huggingface.co/docs/transformers/main/en/chat_templating#applychattemplate) for details.
+Formatting the data in this way allows us to take advantage of the Hugging Face tokenizers' `apply_chat_template` functionality to combine the messages. Chat templates can be used to add special tokens or task-specific information to each example in the dataset. Refer to the [HuggingFace apply_chat_template documentation](https://huggingface.co/docs/transformers/main/en/chat_templating#using-applychattemplate) for details.
 
 By default, `apply_chat_template` attempts to apply the `chat_template` associated with the tokenizer. However, in some cases, users might want to specify their own chat template. Also, note that many tokenizers do not have associated `chat_template`s, in which case an explicit chat template is required. Users can specify an explicit chat template string using Jinja format and can pass that string to `apply_chat_template`. 
 The following is an example using a simple template which prepends a role header to each turn:
