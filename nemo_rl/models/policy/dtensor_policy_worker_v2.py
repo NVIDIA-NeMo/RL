@@ -15,6 +15,7 @@
 import gc
 import itertools
 import os
+import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, cast
@@ -573,10 +574,20 @@ class DTensorPolicyWorkerV2:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
                     iterator_len = batch.size // mbs
 
+                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+                    "empty_cache_every_n_steps"
+                )
+                if empty_cache_steps:
+                    warnings.warn(
+                        f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
+                    )
+
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
-                    torch.cuda.empty_cache()
+                    # Conditioanlly empty cache when sensitive to fragmentation
+                    if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                        torch.cuda.empty_cache()
 
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         if self.enable_seq_packing:

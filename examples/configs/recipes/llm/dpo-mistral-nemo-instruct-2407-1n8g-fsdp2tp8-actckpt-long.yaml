@@ -49,6 +49,7 @@ policy:
     tensor_parallel_size: 8
     context_parallel_size: 1
     custom_parallel_plan: null
+    clear_cache_every_n_steps: 1
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
 
