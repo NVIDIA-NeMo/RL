@@ -697,3 +697,159 @@ def get_logprobs_from_vocab_parallel_logits(
         seq_index=seq_index,
         chunk_size=chunk_size,
     )
+
+
+@torch.no_grad()
+def distributed_vocab_topk(
+    vocab_parallel_logits: torch.Tensor,
+    k: int,
+    tp_group: torch.distributed.ProcessGroup,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute global top-k over TP-sharded vocabulary logits.
+
+    Args:
+        vocab_parallel_logits: [B, S, V_local]
+        k: number of top tokens to select globally
+        tp_group: tensor-parallel process group
+        vocab_start_index: global vocab start for this rank (inclusive)
+        vocab_end_index: global vocab end for this rank (exclusive)
+        chunk_size: optional chunk along sequence dim to bound memory
+
+    Returns:
+        topk_vals: [B, S, k]
+        topk_global_indices: [B, S, k] (global token ids)
+    """
+    assert vocab_end_index > vocab_start_index
+    world_size = torch.distributed.get_world_size(tp_group)
+
+    logits = vocab_parallel_logits.to(dtype=torch.float32)
+    B, S, V_local = logits.shape
+    V_total = V_local * world_size
+    K_eff = int(min(k, max(1, V_total)))
+
+    if chunk_size is None:
+        chunk_size = S
+
+    vals_chunks: list[torch.Tensor] = []
+    idx_chunks: list[torch.Tensor] = []
+
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        # local top-k on this TP rank
+        local_vals, local_idx_local = torch.topk(
+            logits[:, s0:s1, :], min(k, V_local), dim=-1
+        )
+        local_idx_global = local_idx_local + int(vocab_start_index)
+
+        # gather candidates from all TP ranks
+        gathered_vals = [torch.empty_like(local_vals) for _ in range(world_size)]
+        gathered_idx = [torch.empty_like(local_idx_global) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_vals, local_vals, group=tp_group)
+        torch.distributed.all_gather(gathered_idx, local_idx_global, group=tp_group)
+
+        all_vals = torch.cat(gathered_vals, dim=-1)
+        all_idx = torch.cat(gathered_idx, dim=-1)
+
+        sel_vals, sel_pos = torch.topk(all_vals, K_eff, dim=-1)
+        sel_idx = torch.gather(all_idx, dim=-1, index=sel_pos)
+
+        vals_chunks.append(sel_vals)
+        idx_chunks.append(sel_idx)
+
+    topk_vals = (
+        torch.cat(vals_chunks, dim=1) if len(vals_chunks) > 1 else vals_chunks[0]
+    )
+    topk_global_indices = (
+        torch.cat(idx_chunks, dim=1) if len(idx_chunks) > 1 else idx_chunks[0]
+    )
+
+    return topk_vals, topk_global_indices
+
+
+def gather_logits_at_global_indices(
+    vocab_parallel_logits: torch.Tensor,
+    global_indices: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Gather student logits at given global token indices under TP+CP sharding.
+
+    Differentiable w.r.t. vocab_parallel_logits.
+
+    Args:
+        vocab_parallel_logits: [B, S_cp, V_local] where S_cp is CP sharded sequence length
+        global_indices: [B, S_full, k] where S_full is full sequence length
+        tp_group: tensor-parallel process group
+        vocab_start_index: global vocab start for this rank (inclusive)
+        vocab_end_index: global vocab end for this rank (exclusive)
+        chunk_size: optional chunk along sequence dim to bound memory
+        cp_group: context-parallel process group
+
+    Returns:
+        gathered_logits: [B, S_full, k]
+    """
+    # CP support: get CP group and size
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+
+    # Handle CP sharding of global_indices (similar to from_parallel_logits_to_logprobs)
+    pad_len = 0
+    if cp_size > 1:
+        # Pad the global_indices to local size * cp_size if needed
+        pad_len = vocab_parallel_logits.shape[1] * cp_size - global_indices.shape[1]
+        if pad_len > 0:
+            global_indices = torch.nn.functional.pad(
+                global_indices, (0, 0, 0, pad_len), value=0
+            )
+
+        # Shard the global_indices by context parallelism
+        cp_rank = torch.distributed.get_rank(cp_group)
+        global_indices = _get_tokens_on_this_cp_rank(
+            global_indices, cp_rank, cp_size, seq_dim=1
+        )
+
+    logits = vocab_parallel_logits.to(dtype=torch.float32)
+    B, S, V_local = logits.shape
+    if chunk_size is None:
+        chunk_size = S
+
+    out_chunks: list[torch.Tensor] = []
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        gi = global_indices[:, s0:s1, :]
+
+        in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
+        # Map global ids to local shard ids and clamp to valid range to avoid OOB gather
+        V_local = logits.shape[-1]
+        li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+
+        local_vals = torch.gather(logits[:, s0:s1, :], dim=-1, index=li)
+        local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
+
+        torch.distributed.all_reduce(
+            local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+        out_chunks.append(local_vals)
+
+    gathered_logits = (
+        torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+    )
+
+    # CP gather: gather the logits by context parallelism
+    if cp_size > 1:
+        gathered_logits = allgather_cp_sharded_tensor(
+            gathered_logits, cp_group, seq_dim=1
+        )
+
+        # Remove padding if we added it earlier
+        if pad_len > 0:
+            gathered_logits = gathered_logits[:, :-pad_len, :]
+
+    return gathered_logits
