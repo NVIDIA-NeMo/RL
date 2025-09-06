@@ -32,7 +32,8 @@ class DTensorConfig(TypedDict):
 class SequencePackingConfig(TypedDict):
     enabled: bool
     train_mb_tokens: int
-    logprob_mb_tokens: int
+    # Not required because some algorithms like SFT don't calculate log probs
+    logprob_mb_tokens: NotRequired[int]
     algorithm: str
 
 

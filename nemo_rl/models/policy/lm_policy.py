@@ -174,8 +174,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
             self.sequence_packing_args: SequencePackingArgs = {
-                "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
-                "logprob_mb_tokens": config["sequence_packing"]["logprob_mb_tokens"],
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",

@@ -22,7 +22,7 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-gemma3-27b-it-16n8g-fsdp2tp8sp-actckpt-long
+  checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
   metric_name: val_reward
   higher_is_better: true
   keep_top_k: 3
@@ -41,7 +41,7 @@ policy:
   dtensor_cfg:
     enabled: true
     cpu_offload: false
-    sequence_parallel: true
+    sequence_parallel: false
     activation_checkpointing: true
     tensor_parallel_size: 8
     context_parallel_size: 1
@@ -115,7 +115,7 @@ env:
   math:
     num_workers: 8
 logger:
-  log_dir: logs/grpo-gemma3-27b-it-16n8g-fsdp2tp8sp-actckpt-long
+  log_dir: logs/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
@@ -123,11 +123,11 @@ logger:
   monitor_gpus: true
   wandb:
     project: nemo-rl
-    name: grpo-gemma3-27b-it-16n8g-fsdp2tp8sp-actckpt-long
+    name: grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 16
+  num_nodes: 8
