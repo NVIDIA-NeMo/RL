@@ -81,7 +81,7 @@ def mock_rank_data():
 def test_rank_dataset_initialization(mock_rank_data):
     """Test that PreferenceDataset initializes correctly with valid data files."""
     # Load the dataset
-    data_config = {"train_data_path": mock_rank_data}
+    data_config = {"train_data_path": mock_rank_data, "dataset_type": "rank"}
     dataset = load_preference_dataset(data_config)
 
     # Verify dataset initialization
@@ -95,7 +95,7 @@ def test_rank_dataset_initialization(mock_rank_data):
 def test_rank_dataset_data_format(mock_rank_data):
     """Test that PreferenceDataset correctly loads and formats the data."""
     # Load the dataset
-    data_config = {"train_data_path": mock_rank_data}
+    data_config = {"train_data_path": mock_rank_data, "dataset_type": "rank"}
     dataset = load_preference_dataset(data_config)
 
     # Verify data format
@@ -168,6 +168,7 @@ def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
     # Load the dataset
     train_path, val_path = mock_chosen_rejected_data
     data_config = {
+        "dataset_type": "binary",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "prompt_key": "prompt",
@@ -177,7 +178,7 @@ def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
     dataset = load_preference_dataset(data_config)
 
     # Verify dataset initialization
-    assert dataset.task_spec.task_name == "PreferenceDataset"
+    assert dataset.task_spec.task_name == "BinaryPreferenceDataset"
 
     # Verify formatted_ds structure
     assert "train" in dataset.formatted_ds
@@ -191,6 +192,7 @@ def test_chosen_rejected_dataset_invalid_files():
     """Test that PreferenceDataset raises appropriate errors with invalid files."""
     with pytest.raises(FileNotFoundError):
         data_config = {
+            "dataset_type": "binary",
             "train_data_path": "nonexistent.json",
             "val_data_path": "nonexistent.json",
             "prompt_key": "prompt",
@@ -205,6 +207,7 @@ def test_chosen_rejected_dataset_data_format(mock_chosen_rejected_data):
     # Load the dataset
     train_path, val_path = mock_chosen_rejected_data
     data_config = {
+        "dataset_type": "binary",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "prompt_key": "prompt",

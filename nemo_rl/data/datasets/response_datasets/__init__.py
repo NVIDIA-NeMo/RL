@@ -26,12 +26,13 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
 def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
     dataset_name = (
-        data_config["dataset_name"] if "dataset_name" in data_config else "from_json"
+        data_config["dataset_name"] if "dataset_name" in data_config else ""
     )
 
     # TODO @yukih: remove duplicated dataset_name (openmathinstruct2, clevr_cogent)
@@ -88,16 +89,13 @@ def load_response_dataset(data_config, seed: int = 42):
         )
     # fall back to load from JSON file
     else:
-        extra_kwargs = {}
-        for key in [
+        extra_kwargs = get_extra_kwargs(data_config, [
             "val_data_path",
             "input_key",
             "output_key",
             "train_split",
             "val_split",
-        ]:
-            if key in data_config:
-                extra_kwargs[key] = data_config[key]
+        ])
         base_dataset = ResponseDataset(
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
