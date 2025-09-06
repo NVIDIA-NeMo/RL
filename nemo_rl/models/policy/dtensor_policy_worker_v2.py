@@ -83,10 +83,11 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.utils.native_checkpoint import (
+from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -1422,11 +1423,26 @@ class DTensorPolicyWorkerV2:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        assert checkpointing_cfg is not None, (
+            "checkpointing_cfg must be provided when saving checkpoint"
+        )
+
+        # Get checkpointing configuration from config
+        model_save_format: str = cast(
+            str, checkpointing_cfg.get("model_save_format", "safetensors")
+        )
+        save_consolidated: bool = cast(
+            bool, checkpointing_cfg.get("save_consolidated", False)
+        )
+        is_peft: bool = cast(bool, checkpointing_cfg.get("is_peft", False))
+        peft_config = checkpointing_cfg.get("peft_config", None)
+
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1435,10 +1451,16 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_save_format=model_save_format,
+            is_peft=is_peft,
+            peft_config=peft_config,
+            save_consolidated=save_consolidated,
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model."""
         load_checkpoint(
