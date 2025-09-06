@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.preference_datasets.binary_preference_dataset import (
     BinaryPreferenceDataset,
 )
+from nemo_rl.data.datasets.preference_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
     PreferenceDataset,
 )
@@ -24,12 +24,8 @@ from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 def load_preference_dataset(data_config):
     """Loads preference dataset."""
-    dataset_name = (
-        data_config["dataset_name"] if "dataset_name" in data_config else ""
-    )
-    dataset_type = (
-        data_config["dataset_type"] if "dataset_type" in data_config else ""
-    )
+    dataset_name = data_config["dataset_name"] if "dataset_name" in data_config else ""
+    dataset_type = data_config["dataset_type"] if "dataset_type" in data_config else ""
 
     if dataset_name == "HelpSteer3":
         base_dataset = HelpSteer3Dataset()
@@ -37,24 +33,30 @@ def load_preference_dataset(data_config):
         base_dataset = Tulu3PreferenceDataset()
     # fall back to load from JSON file
     elif dataset_type == "binary":
-        extra_kwargs = get_extra_kwargs(data_config, [
-            "val_data_path",
-            "prompt_key",
-            "chosen_key",
-            "rejected_key",
-            "train_split",
-            "val_split",
-        ])
+        extra_kwargs = get_extra_kwargs(
+            data_config,
+            [
+                "val_data_path",
+                "prompt_key",
+                "chosen_key",
+                "rejected_key",
+                "train_split",
+                "val_split",
+            ],
+        )
         base_dataset = BinaryPreferenceDataset(
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
         )
     elif dataset_type == "rank":
-        extra_kwargs = get_extra_kwargs(data_config, [
-            "val_data_path",
-            "train_split",
-            "val_split",
-        ])
+        extra_kwargs = get_extra_kwargs(
+            data_config,
+            [
+                "val_data_path",
+                "train_split",
+                "val_split",
+            ],
+        )
         base_dataset = PreferenceDataset(
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
