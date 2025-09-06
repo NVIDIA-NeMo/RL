@@ -1502,7 +1502,7 @@ class MegatronPolicyWorker:
                 record_shapes=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "grpo_refit_trace_mbridge",
+                    "grpo_refit_trace_no_mbridge_16tp",
                     use_gzip=True,
                 ),
             )
