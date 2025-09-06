@@ -32,6 +32,47 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
+def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actual_token_ids: list[int]) -> list[int]:
+    if not reference_token_ids:
+        return actual_token_ids
+
+    assert len(reference_token_ids) <= len(actual_token_ids), (len(reference_token_ids), len(actual_token_ids))
+
+    final_token_ids: list[int] = []
+    reference_pointer = 0
+    actual_pointer = 0
+    # -1 here since we cannot merge a next token at the last 
+    while reference_pointer < len(reference_token_ids) - 1:
+        reference_token_id = reference_token_ids[reference_pointer]
+        actual_token_id = actual_token_ids[actual_pointer]
+
+        if reference_token_id == actual_token_id:
+            final_token_ids.append(actual_token_id)
+            reference_pointer += 1
+            actual_pointer += 1
+            continue
+
+        next_reference_token_id = reference_token_ids[reference_pointer]
+        reference_decoded_str = tokenizer.decode([reference_token_id, next_reference_token_id])
+        actual_decoded_str = tokenizer.decode([actual_token_id])
+
+        if reference_decoded_str == actual_decoded_str:
+            final_token_ids.extend([reference_token_id, next_reference_token_id])
+            reference_pointer += 2
+            actual_pointer += 1
+        else:
+            # For now, if a trajectory is not monotonically increasing, we assert.
+            # Eventually when we support non-monotonic training, we need to update this logic
+            raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
+Reference token ids: {reference_token_ids}
+Actual token ids: {actual_token_ids}"""
+            )
+
+    assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
+
+    return final_token_ids
+
+
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
@@ -104,7 +145,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             required_prefix_token_ids: Optional[List[int]] = None
 
             def model_post_init(self, context):
-
                 # Penguin specific processing. This is just how Penguin returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
@@ -115,7 +155,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
 
-        vllm_worker_handle = self
         class NeMoRLOpenAIServingChat(OpenAIServingChat):
             async def _preprocess_chat(self, request: NeMoRLChatCompletionRequest, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
                 # res is conversation, [request_prompt], [engine_prompt]
@@ -127,7 +166,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 request_prompt = res[1][0]  # We need to modify request_prompt.prompt_token_ids
                 engine_prompt = res[2][0]  # We need to modify engine_prompt.prompt_token_ids
 
-                final_prompt_token_ids = vllm_worker_handle._maybe_correct_merged_tokens(
+                final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
                     reference_token_ids=request.required_prefix_token_ids,
                     actual_token_ids=request_prompt.prompt_token_ids,
@@ -216,47 +255,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         thread.start()
 
         return thread, base_url, server
-
-    @staticmethod
-    def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actual_token_ids: list[int]) -> list[int]:
-        if not reference_token_ids:
-            return actual_token_ids
-
-        assert len(reference_token_ids) <= len(actual_token_ids), (len(reference_token_ids), len(actual_token_ids))
-
-        final_token_ids: list[int] = []
-        reference_pointer = 0
-        actual_pointer = 0
-        # -1 here since we cannot merge a next token at the last 
-        while reference_pointer < len(reference_token_ids) - 1:
-            reference_token_id = reference_token_ids[reference_pointer]
-            actual_token_id = actual_token_ids[actual_pointer]
-
-            if reference_token_id == actual_token_id:
-                final_token_ids.append(actual_token_id)
-                reference_pointer += 1
-                actual_pointer += 1
-                continue
-
-            next_reference_token_id = reference_token_ids[reference_pointer]
-            reference_decoded_str = tokenizer.decode([reference_token_id, next_reference_token_id])
-            actual_decoded_str = tokenizer.decode([actual_token_id])
-
-            if reference_decoded_str == actual_decoded_str:
-                final_token_ids.extend([reference_token_id, next_reference_token_id])
-                reference_pointer += 2
-                actual_pointer += 1
-            else:
-                # For now, if a trajectory is not monotonically increasing, we assert.
-                # Eventually when we support non-monotonic training, we need to update this logic
-                raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
-Reference token ids: {reference_token_ids}
-Actual token ids: {actual_token_ids}"""
-                )
-
-        assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
-
-        return final_token_ids
 
     async def init_collective_async(
         self, rank_prefix: int, ip: str, port: int, world_size: int
