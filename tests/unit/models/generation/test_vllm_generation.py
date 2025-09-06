@@ -1044,7 +1044,7 @@ def test_vllm_generate_text(cluster, tokenizer):
 def configure_http_server_config(tokenizer) -> VllmConfig:
     # Create separate configs for each policy
     generation_config = deepcopy(basic_vllm_test_config)
-    generation_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+    generation_config = configure_generation_config(generation_config, tokenizer, is_eval=True)
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
     generation_config["vllm_cfg"]["async_engine"] = True
