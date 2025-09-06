@@ -18,10 +18,8 @@ import tempfile
 import pytest
 from transformers import AutoTokenizer
 
-from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.hf_datasets.oai_format_dataset import (
-    OpenAIFormatDataset,
-)
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.datasets.response_datasets import OpenAIFormatDataset
 
 
 @pytest.fixture

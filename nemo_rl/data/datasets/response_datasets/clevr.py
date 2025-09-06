@@ -12,30 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
-import io
 from typing import Any, Optional
 
 from datasets import load_dataset
-from PIL import Image
 
+from nemo_rl.data.datasets.utils import pil_to_base64
 from nemo_rl.data.interfaces import TaskDataSpec
-
-
-def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
-    """Converts a PIL Image object to a base64 encoded string.
-
-    Args:
-        image: The PIL Image object to convert.
-        format: The image format (e.g., "PNG", "JPEG"). Defaults to "PNG".
-
-    Returns:
-        A base64 encoded string representation of the image.
-    """
-    buffered = io.BytesIO()
-    image.save(buffered, format=format)
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{img_str}"
 
 
 def format_answer_fromtags(answer: str) -> str:
