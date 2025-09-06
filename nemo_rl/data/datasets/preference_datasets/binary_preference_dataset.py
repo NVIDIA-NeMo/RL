@@ -16,6 +16,7 @@ from typing import Any, Optional
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 from nemo_rl.data.interfaces import TaskDataSpec
 
+
 def to_preference_data_format(
     data: dict[str, Any], prompt_key: str, chosen_key: str, rejected_key: str
 ) -> dict[str, list[dict[str, Any]]]:
