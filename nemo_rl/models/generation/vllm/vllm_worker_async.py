@@ -57,7 +57,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return self.base_url
 
     def _setup_vllm_server(self) -> None:
-        from typing import List, Optional
+        from typing import List, Optional, Union
 
         import threading
 
@@ -67,7 +67,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         import uvicorn
 
         from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, OpenAIServingTokenization, BaseModelPath
-        from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse, ChatCompletionResponse, TokenizeRequest, TokenizeResponse
+        from vllm.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            ErrorResponse,
+            ChatCompletionResponse,
+            TokenizeRequest,
+            TokenizeResponse,
+            ChatCompletionMessageParam,
+        )
+        from vllm.entrypoints.chat_utils import CustomChatCompletionMessageParam
 
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local()
@@ -94,6 +102,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         class NeMoRLChatCompletionRequest(ChatCompletionRequest):
             required_prefix_token_ids: Optional[List[int]] = None
+
+            def model_post_init(self, context):
+
+                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                if self.required_prefix_token_ids is None:
+                    for message in reversed(self.messages):
+                        if hasattr(message, "prompt_token_ids"):
+                            self.required_prefix_token_ids = message.prompt_token_ids + message.generation_token_ids
+                            break
+
+                return super().model_post_init(context)
+
 
         vllm_worker_handle = self
         class NeMoRLOpenAIServingChat(OpenAIServingChat):
