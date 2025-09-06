@@ -52,9 +52,9 @@ class BinaryPreferenceDataset:
     Args:
         train_data_path: Path to the JSON file containing training data
         val_data_path: Path to the JSON file containing validation data
-        prompt_key: Key for the input prompt/context
-        chosen_key: Key for the preferred/winning response
-        rejected_key: Key for the non-preferred/losing response
+        prompt_key: Key for the input prompt/context, default is "prompt"
+        chosen_key: Key for the preferred/winning response, default is "chosen"
+        rejected_key: Key for the non-preferred/losing response, default is "rejected"
         train_split: Split name for the training data, default is "train"
         val_split: Split name for the validation data, default is "train"
     """

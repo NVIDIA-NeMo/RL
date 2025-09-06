@@ -82,10 +82,11 @@ Currently, RM training supports only two completions (where the lowest rank is p
 
 By default, NeMo RL has support for [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+We provide [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) and [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) classes that are compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
 - rank format
   ```yaml
   data:
+    dataset_type: "rank"
     train_data_path: <LocalPathToTrainingDataset>
     # multiple validation sets is supported
     val_data_paths:
@@ -97,11 +98,12 @@ We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets
 - chosen - rejected format
   ```yaml
   data:
+    dataset_type: "binary"
     train_data_path: <LocalPathToTrainingDataset>
     val_data_path: <LocalPathToValidationDataset>
-    prompt_key: <PromptKey>
-    chosen_key: <ChosenKey>
-    rejected_key: <RejectedKey>
+    prompt_key: <PromptKey>, default is "prompt"
+    chosen_key: <ChosenKey>, default is "chosen"
+    rejected_key: <RejectedKey>, default is "rejected"
     train_split: <TrainSplit>, default is "train"
     val_split: <ValSplit>, default is "train"
   ```
