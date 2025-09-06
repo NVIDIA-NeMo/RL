@@ -97,6 +97,7 @@ logger:
   wandb:
     project: "nemo-rl"
     name: "dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long"
+  tensorboard: {}
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
