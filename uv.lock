@@ -2342,6 +2342,18 @@ requires-dist = [
 ]
 
 [[package]]
+name = "megatron-fsdp"
+version = "0.1.0rc1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a0/be/06ada3d765ebca304e2d87873d6cf00807b43155ed57058abcd813d13a5d/megatron_fsdp-0.1.0rc1.tar.gz", hash = "sha256:4852a1c62bb95b5fc9567165ee7119f2e68bc75d6103af06bd1e6d392a50021f", size = 71600, upload-time = "2025-09-02T21:29:10.757Z" }
+
+[[package]]
 name = "mistral-common"
 version = "1.8.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2755,6 +2767,7 @@ build = [
 ]
 dev = [
     { name = "cut-cross-entropy" },
+    { name = "megatron-fsdp" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -2807,7 +2820,10 @@ build = [
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = "<=2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.8.0", index = "https://pypi.org/simple" },
 ]
-dev = [{ name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" }]
+dev = [
+    { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86ab" },
+    { name = "megatron-fsdp" },
+]
 docs = [
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },

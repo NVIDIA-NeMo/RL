@@ -32,6 +32,10 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  is_peft: false
+  peft_config: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
