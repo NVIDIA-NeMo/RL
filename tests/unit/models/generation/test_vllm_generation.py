@@ -1227,8 +1227,8 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     with pytest.raises(AssertionError, match="Found a non-monotonically increasing trajectory"):
         _maybe_correct_merged_tokens(
             tokenizer=tokenizer,
-            reference_token_ids=[26951],
-            actual_token_ids=[3834],
+            reference_token_ids=[26951, 26951, 26951, 26951],
+            actual_token_ids=[26951, 26951, 3834, 3834, 3834],
         )
 
     test_data_fpath = Path(__file__).with_name("maybe_correct_merged_tokens_test_data.json")
