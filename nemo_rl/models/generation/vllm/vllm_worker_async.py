@@ -66,6 +66,8 @@ Reference token ids: {reference_token_ids}
 Actual token ids: {actual_token_ids}"""
             )
 
+    final_token_ids.extend(actual_token_ids[len(final_token_ids):])
+
     assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
 
     return final_token_ids
