@@ -70,7 +70,7 @@ Actual token ids: {actual_token_ids}"""
 
     with open("test_maybe_correct_merged_tokens.json", "w") as f:
         import json
-        json.dump(actual_result, f)
+        json.dump(final_token_ids, f)
     assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
 
     return final_token_ids
