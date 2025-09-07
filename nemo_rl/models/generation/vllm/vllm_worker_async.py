@@ -50,7 +50,7 @@ def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actu
             actual_pointer += 1
             continue
 
-        next_reference_token_id = reference_token_ids[reference_pointer]
+        next_reference_token_id = reference_token_ids[reference_pointer + 1]
         reference_decoded_str = tokenizer.decode([reference_token_id, next_reference_token_id])
         actual_decoded_str = tokenizer.decode([actual_token_id])
 
