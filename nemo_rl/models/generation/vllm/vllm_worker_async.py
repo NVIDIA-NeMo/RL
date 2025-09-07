@@ -36,8 +36,6 @@ def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actu
     if not reference_token_ids:
         return actual_token_ids
 
-    assert len(reference_token_ids) <= len(actual_token_ids), (len(reference_token_ids), len(actual_token_ids))
-
     final_token_ids: list[int] = []
     reference_pointer = 0
     actual_pointer = 0
