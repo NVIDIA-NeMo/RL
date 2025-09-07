@@ -14,6 +14,8 @@
 
 import os
 from copy import deepcopy
+from pathlib import Path
+import json
 
 import requests
 
@@ -29,7 +31,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration, _maybe_correct_merged_tokens
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1197,6 +1199,49 @@ def test_vllm_http_server(cluster, tokenizer):
                 max_tokens=1,
             )
         )
+
+
+def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+
+    # [26951, 3834] and [94224] both detokenize to " skinny"
+    # Test super simple example of correcting the merged tokens
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[94224],
+    )
+    expected_result = [26951, 3834]
+    assert expected_result == actual_result
+
+    # Test no-op
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[26951, 3834],
+    )
+    expected_result = [26951, 3834]
+
+    # Test sanity failure assert
+    with pytest.raises(AssertionError, match="Found a non-monotonically increasing trajectory"):
+        _maybe_correct_merged_tokens(
+            tokenizer=tokenizer,
+            reference_token_ids=[26951],
+            actual_token_ids=[3834],
+        )
+
+    test_data_fpath = Path(__file__).with_name("maybe_correct_merged_tokens_test_data.json")
+    with test_data_fpath.open() as f:
+        test_data = json.load(f)
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=test_data["seen_token_ids"],
+        actual_token_ids=test_data["output_prompt_token_ids"],
+    )
+    expected_result = test_data["expected_output"]
+    assert expected_result == actual_result
+
 
 
 @pytest.mark.timeout(180)
