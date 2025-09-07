@@ -62,15 +62,15 @@ def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actu
             # For now, if a trajectory is not monotonically increasing, we assert.
             # Eventually when we support non-monotonic training, we need to update this logic
             raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
+Reference decoded str: {reference_decoded_str} (token ids [{reference_token_id}, {next_reference_token_id}])
+Actual decoded str: {actual_decoded_str} (token id {actual_token_id})
+
 Reference token ids: {reference_token_ids}
 Actual token ids: {actual_token_ids}"""
             )
 
     final_token_ids.extend(actual_token_ids[len(final_token_ids):])
 
-    with open("test_maybe_correct_merged_tokens.json", "w") as f:
-        import json
-        json.dump(final_token_ids, f)
     assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
 
     return final_token_ids
