@@ -50,6 +50,7 @@ def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actu
             actual_pointer += 1
             continue
 
+        # Try 2:1 merge.
         next_reference_token_id = reference_token_ids[reference_pointer + 1]
         reference_decoded_str = tokenizer.decode([reference_token_id, next_reference_token_id])
         actual_decoded_str = tokenizer.decode([actual_token_id])
@@ -58,10 +59,21 @@ def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actu
             final_token_ids.extend([reference_token_id, next_reference_token_id])
             reference_pointer += 2
             actual_pointer += 1
-        else:
-            # For now, if a trajectory is not monotonically increasing, we assert.
-            # Eventually when we support non-monotonic training, we need to update this logic
-            raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
+            continue
+
+        # Try 2:2 merge
+        next_actual_token_id = actual_token_ids[actual_pointer + 1]
+        actual_decoded_str = tokenizer.decode([actual_token_id, next_actual_token_id])
+
+        if reference_decoded_str == actual_decoded_str:
+            final_token_ids.extend([reference_token_id, next_reference_token_id])
+            reference_pointer += 2
+            actual_pointer += 2
+            continue
+
+        # For now, if a trajectory is not monotonically increasing, we assert.
+        # Eventually when we support non-monotonic training, we need to update this logic
+        raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
 Reference decoded str: {reference_decoded_str} (token ids [{reference_token_id}, {next_reference_token_id}])
 Actual decoded str: {actual_decoded_str} (token id {actual_token_id})
 
