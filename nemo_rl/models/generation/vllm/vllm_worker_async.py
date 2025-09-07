@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, cast
 
 import ray
 import torch
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
@@ -32,60 +33,42 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
-def _maybe_correct_merged_tokens(tokenizer, reference_token_ids: list[int], actual_token_ids: list[int]) -> list[int]:
+def _maybe_correct_merged_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    reference_token_ids: list[int],
+    actual_token_ids: list[int],
+) -> list[int]:
     if not reference_token_ids:
         return actual_token_ids
 
-    final_token_ids: list[int] = []
-    reference_pointer = 0
-    actual_pointer = 0
-    # -1 here since we cannot merge a next token at the last 
-    while reference_pointer < len(reference_token_ids) - 1:
-        reference_token_id = reference_token_ids[reference_pointer]
-        actual_token_id = actual_token_ids[actual_pointer]
+    # No merges
+    if reference_token_ids == actual_token_ids[:len(reference_token_ids)]:
+        return actual_token_ids
 
-        if reference_token_id == actual_token_id:
-            final_token_ids.append(actual_token_id)
-            reference_pointer += 1
-            actual_pointer += 1
-            continue
+    reference_str, actual_str = tokenizer.batch_decode([reference_token_ids, actual_token_ids])
 
-        # Try 2:1 merge.
-        next_reference_token_id = reference_token_ids[reference_pointer + 1]
-        reference_decoded_str = tokenizer.decode([reference_token_id, next_reference_token_id])
-        actual_decoded_str = tokenizer.decode([actual_token_id])
-
-        if reference_decoded_str == actual_decoded_str:
-            final_token_ids.extend([reference_token_id, next_reference_token_id])
-            reference_pointer += 2
-            actual_pointer += 1
-            continue
-
-        # Try 2:2 merge
-        next_actual_token_id = actual_token_ids[actual_pointer + 1]
-        actual_decoded_str = tokenizer.decode([actual_token_id, next_actual_token_id])
-
-        if reference_decoded_str == actual_decoded_str:
-            final_token_ids.extend([reference_token_id, next_reference_token_id])
-            reference_pointer += 2
-            actual_pointer += 2
-            continue
-
-        # For now, if a trajectory is not monotonically increasing, we assert.
-        # Eventually when we support non-monotonic training, we need to update this logic
-        raise ValueError(f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
-Reference decoded str: {reference_decoded_str} (token ids [{reference_token_id}, {next_reference_token_id}])
-Actual decoded str: {actual_decoded_str} (token id {actual_token_id})
+    # For now, if a trajectory is not monotonically increasing, we assert.
+    # Eventually when we support non-monotonic training, we need to update this logic
+    assert reference_str == actual_str[:len(reference_str)], f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
+Reference str: {reference_str}
+Actual str: {actual_str}
 
 Reference token ids: {reference_token_ids}
 Actual token ids: {actual_token_ids}"""
-            )
 
-    final_token_ids.extend(actual_token_ids[len(final_token_ids):])
+    # Now we want to try to find the subsequence of actual_token_ids that corresponds to reference_str
+    # Since tokenizers are trained to encode text in the least number of tokens, it's a fair assumption that the
+    # tokens output by the model to represent the reference str is lessthan or equal to the number of tokens
+    # that tokenization needed to represent the reference str
+    candidate_token_ids = actual_token_ids[:len(reference_token_ids)]
+    candidate_str = tokenizer.decode(candidate_token_ids)
+    while candidate_str != reference_str and len(candidate_str) > len(reference_str):
+        candidate_token_ids.pop()
+        candidate_str = tokenizer.decode(candidate_token_ids)
 
-    assert reference_token_ids == final_token_ids[:len(reference_token_ids)]
+    assert candidate_str == reference_str
 
-    return final_token_ids
+    return reference_token_ids + actual_token_ids[len(candidate_token_ids):]
 
 
 @ray.remote(
