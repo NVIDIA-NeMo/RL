@@ -1224,7 +1224,7 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     expected_result = [26951, 3834]
 
     # Test sanity failure assert
-    with pytest.raises(AssertionError, match="Found a non-monotonically increasing trajectory"):
+    with pytest.raises(ValueError, match="Found a non-monotonically increasing trajectory"):
         _maybe_correct_merged_tokens(
             tokenizer=tokenizer,
             reference_token_ids=[26951, 26951, 26951, 26951],
