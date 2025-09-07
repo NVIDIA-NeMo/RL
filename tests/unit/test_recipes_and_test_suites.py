@@ -28,12 +28,6 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
-nightly_performance_test_suite_path = os.path.join(
-    test_suites_dir, "nightly_performance.txt"
-)
-release_performance_test_suite_path = os.path.join(
-    test_suites_dir, "release_performance.txt"
-)
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
@@ -67,40 +61,11 @@ def release_test_suite():
 
 
 @pytest.fixture
-def nightly_performance_test_suite():
-    nightly_performance_suite = []
-    with open(nightly_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                nightly_performance_suite.append(line)
-    return nightly_performance_suite
-
-
-@pytest.fixture
-def release_performance_test_suite():
-    release_performance_suite = []
-    with open(release_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                release_performance_suite.append(line)
-    return release_performance_suite
-
-
-@pytest.fixture
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
-    nightly_performance_test_suite,
-    release_performance_test_suite,
 ):
-    return (
-        nightly_test_suite
-        + release_test_suite
-        + nightly_performance_test_suite
-        + release_performance_test_suite
-    )
+    return nightly_test_suite + release_test_suite
 
 
 @pytest.fixture
@@ -118,14 +83,10 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
-        nightly_performance_test_suite_path,
-        release_performance_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
-        "nightly_performance_test_suite",
-        "release_performance_test_suite",
     ],
 )
 def test_test_suites_exist(test_suite_path):
