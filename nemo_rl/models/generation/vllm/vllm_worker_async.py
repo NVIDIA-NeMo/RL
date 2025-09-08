@@ -227,7 +227,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
         class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest):
-            pass
+            required_prefix_token_ids: Optional[List[int]] = None
 
         NeMoRLTokenizeRequest = Union[TokenizeCompletionRequest, NeMoRLTokenizeChatRequest]
 
