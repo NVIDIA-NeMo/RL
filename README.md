@@ -58,7 +58,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Environment Isolation** - Dependency isolation between components.
 - ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
-- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models (Megatron)
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
 
 
@@ -69,20 +69,17 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Table of Contents
   - [Prerequisites](#prerequisites)
-  - Algorithms
+  - Support Matrix
 
     <p></p>
     
-    | |Single Node|Multi-node|
+    |Algorithms|Single Node|Multi-node|
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
 
-    <div align="center">
-
-    </div>
     <p></p>
 
   - [Evaluation](#evaluation)
