@@ -135,25 +135,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_modules=None,
         )
 
-        ########################################
-        # /v1/chat/completions endpoint
-        ########################################
-
-        class NeMoRLChatCompletionRequest(ChatCompletionRequest):
-            required_prefix_token_ids: Optional[List[int]] = None
-
-            def model_post_init(self, context):
-                # Penguin specific processing. This is just how Penguin returns the extra token information.
-                if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
-                            break
-
-                return super().model_post_init(context)
-
-
-        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+        class NeMoRLOpenAIServingMixin:
             async def _preprocess_chat(self, request: NeMoRLChatCompletionRequest, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
                 # res is conversation, [request_prompt], [engine_prompt]
                 res = await super()._preprocess_chat(request, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt, continue_final_message, tool_dicts, documents, chat_template_kwargs, tool_parser, truncate_prompt_tokens, add_special_tokens)
@@ -173,6 +155,30 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 return res
 
+        class NeMoRLOpenAIChatRequestMixin:
+            def model_post_init(self, context):
+                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                if self.required_prefix_token_ids is None:
+                    for message in reversed(self.messages):
+                        if "prompt_token_ids" in message:
+                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
+                            break
+
+                return super().model_post_init(context)
+
+
+        ########################################
+        # /v1/chat/completions endpoint
+        ########################################
+
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > ChatCompletionRequest
+        class NeMoRLChatCompletionRequest(NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest):
+            required_prefix_token_ids: Optional[List[int]] = None
+
+
+        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
+            pass
 
         serving_chat_default_kwargs = dict(
             response_role="assistant",
@@ -217,7 +223,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # /tokenize endpoint
         ########################################
 
-        openai_serving_tokenization = OpenAIServingTokenization(
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
+        class NeMoRLTokenizeRequest(NeMoRLOpenAIChatRequestMixin, TokenizeRequest):
+            pass
+
+        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
+        class NeMoRLOpenAIServingTokenization(NeMoRLOpenAIServingMixin, OpenAIServingTokenization):
+            pass
+
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             engine_client,
             model_config,
             openai_serving_models,
@@ -227,7 +241,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
 
         @app.post("/tokenize")
-        async def tokenize(request: TokenizeRequest, raw_request: Request):
+        async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
             generator = await openai_serving_tokenization.create_tokenize(request, raw_request)
 
             if isinstance(generator, ErrorResponse):
