@@ -79,6 +79,7 @@ openai_model:
       base_url: ${policy_base_url}
       api_key: ${policy_api_key}
       model: ${policy_model_name}
+      return_token_id_information: true
 """
 
     config = PenguinConfig(
