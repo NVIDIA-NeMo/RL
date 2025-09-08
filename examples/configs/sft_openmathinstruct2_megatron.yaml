@@ -69,7 +69,7 @@ policy:
     pipeline_model_parallel_size: 1
     scheduler:
       end_weight_decay: 0.01
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_decay_style: constant
       lr_warmup_init: 0.00001999999
       lr_warmup_iters: 1
