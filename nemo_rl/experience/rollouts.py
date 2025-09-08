@@ -1000,6 +1000,9 @@ def run_async_penguin_rollout(
         # / batch_size,
     }
 
+    # TODO remove this
+    print(rollout_metrics)
+
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
