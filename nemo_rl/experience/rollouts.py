@@ -253,9 +253,9 @@ def calculate_rewards(
         env_info = [batch["extra_env_info"][i] for i in indices]
 
         # Submit task to environment and store future
-        future = task_to_env[task_name].step.remote(messages, env_info)
-        future_to_indices[future] = indices
+        future = task_to_env[task_name].step.remote(messages, env_info)  # type: ignore # ray actor call
         futures.append(future)
+        future_to_indices[future] = indices
 
     results = ray.get(futures)
     all_rewards = []
@@ -296,7 +296,6 @@ def calculate_rewards(
     sorted_indices = sorted(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
-    sorted_indices = range(len(all_rewards))
     rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
     env_observations = [all_env_observations[i] for i in sorted_indices]
     terminateds = torch.tensor([all_terminateds[i] for i in sorted_indices])
