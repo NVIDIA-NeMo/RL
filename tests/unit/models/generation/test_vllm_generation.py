@@ -1215,6 +1215,22 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     expected_result = [26951, 3834]
     assert expected_result == actual_result
 
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[61830, 65],
+        actual_token_ids=[2435, 20828],
+    )
+    expected_result = [61830, 65]
+    assert expected_result == actual_result
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[89038],
+        actual_token_ids=[758, 12601],
+    )
+    expected_result = [26951, 3834]
+    assert expected_result == actual_result
+
     # Test no-op
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
