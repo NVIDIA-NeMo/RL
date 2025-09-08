@@ -847,6 +847,11 @@ def test_run_async_penguin_rollout(
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()
+
+        for key in d["rollout_metrics"]:
+            if key.startswith("histogram_"):
+                d["rollout_metrics"][key]["table"] = None
+
         return {
             "final_batch": final_batch,
             "rollout_metrics": d["rollout_metrics"],
