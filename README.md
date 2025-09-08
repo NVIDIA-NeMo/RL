@@ -62,7 +62,6 @@ What you can expect:
 - 🔜 **Megatron-Bridge Integration** - Integrate Megatron-Bridge to enable training Huggingface models with all powerful features from Megatron-Core.
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path for day-0 support of new Huggingface models.
 - 🔜 **New Models** - gpt-oss.
-- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 - 🔜 **Expand Algorithms** - DAPO, GSPO.
 - 🔜 **GB200** - Add container support for GB200.
 
