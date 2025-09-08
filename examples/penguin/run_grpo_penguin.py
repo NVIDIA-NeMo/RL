@@ -88,7 +88,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "grpo_math_1B_vllm_http_server.yaml"
+            os.path.dirname(__file__), "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
         )
 
     config = load_config(args.config)
