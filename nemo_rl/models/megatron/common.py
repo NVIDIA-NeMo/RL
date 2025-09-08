@@ -334,8 +334,8 @@ def forward_step_arbitrary_loss(
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
-                eod_token=0, # used for loss_mask, which we don't use
-                pad_token=0, # used for loss_mask, which we don't use
+                eod_token=0,  # used for loss_mask, which we don't use
+                pad_token=0,  # used for loss_mask, which we don't use
                 reset_position_ids=False,
                 reset_attention_mask=False,
                 eod_mask_loss=False,
