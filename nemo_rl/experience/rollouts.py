@@ -920,7 +920,7 @@ def _calculate_single_metric(values: list[float], batch_size: int, key_name: str
         f"min_{key_name}": min(values),
         f"median_{key_name}": statistics.median(values),
         f"stddev_{key_name}": statistics.stdev(values),
-        f"table_{key_name}": Table(data=[[v] for v in values], columns=[key_name]),
+        f"histogram_{key_name}": histogram(Table(data=[[v] for v in values], columns=[key_name]), key_name, title=key_name),
     }
 
 
