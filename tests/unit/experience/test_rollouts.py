@@ -769,9 +769,9 @@ def test_run_async_penguin_rollout(
 
     expected_result = {
         "final_batch": {
-            "length": [3088, 3056],
-            "loss_multiplier": [1.0, 1.0],
-            "total_reward": [0.0, 0.0],
+            "length": torch.tensor([3088, 3056]),
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "total_reward": torch.tensor([0.0, 0.0]),
         },
         "rollout_metrics": {
             "mean_turns_per_sample": 2.5,
