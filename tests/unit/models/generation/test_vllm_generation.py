@@ -1257,8 +1257,6 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
         actual_token_ids=test_data["output_prompt_token_ids"],
     )
     expected_result = test_data["expected_output"]
-    with open("test_maybe_correct_merged_tokens.json", "w") as f:
-        json.dump(actual_result, f)
     assert expected_result == actual_result
 
 
