@@ -4,9 +4,15 @@
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
+
+<details>
+<summary>Previous News</summary>
+
 * [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
 * [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
+
+</details>
 
 ## Overview
 
@@ -59,28 +65,24 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
 - 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
 
-## Support Matrix
-<!-- markdown all in one -->
-- [Nemo RL: A Scalable and Efficient Post-Training Library](#nemo-rl-a-scalable-and-efficient-post-training-library)
-  - [📣 News](#-news)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
+## Table of Contents
   - [Prerequisites](#prerequisites)
-  - [Training Backends](#training-backends)
-  - [GRPO](#grpo)
-    - [GRPO Single Node](#grpo-single-node)
-    - [GRPO Multi-node](#grpo-multi-node)
-      - [GRPO Qwen2.5-32B](#grpo-qwen25-32b)
-      - [GRPO Multi-Turn](#grpo-multi-turn)
-  - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
-    - [SFT Single Node](#sft-single-node)
-    - [SFT Multi-node](#sft-multi-node)
-  - [DPO](#dpo)
-    - [DPO Single Node](#dpo-single-node)
-    - [DPO Multi-node](#dpo-multi-node)
-  - [RM](#rm)
-    - [RM Single Node](#rm-single-node)
-    - [RM Multi-node](#rm-multi-node)
+  - Algorithms
+
+    <p></p>
+    
+    | |Single Node|Multi-node|
+    |-|-|-|
+    |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
+    |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
+    |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
+    |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
+
+    <div align="center">
+
+    </div>
+    <p></p>
+
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
