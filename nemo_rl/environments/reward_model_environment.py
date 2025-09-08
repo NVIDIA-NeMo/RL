@@ -305,23 +305,6 @@ class RewardModelEnvironment(EnvironmentInterface):
 
         return batch, metrics
 
-    def get_worker_group(self):
-        return self.reward_model_policy.worker_group
-
-    def get_gpu_task_ids(self):
-        import os
-
-        print(
-            "reward_model_environment GPU IDs: {}".format(
-                ray.get_runtime_context().get_accelerator_ids()["GPU"]
-            )
-        )
-        print(
-            "reward_model_environment CUDA_VISIBLE_DEVICES: {}".format(
-                os.environ["CUDA_VISIBLE_DEVICES"]
-            )
-        )
-
     def shutdown(self):
         """Shutdown the reward model worker and virtual cluster.
 
@@ -346,6 +329,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             except Exception as e:
                 print(f"Warning: Error shutting down virtual cluster: {e}")
             self.virtual_cluster = None
+        ray.actor.exit_actor()
 
     def __del__(self):
         """Destructor that ensures proper cleanup when the object is garbage collected.
@@ -356,3 +340,4 @@ class RewardModelEnvironment(EnvironmentInterface):
         management.
         """
         self.shutdown()
+        ray.actor.exit_actor()
