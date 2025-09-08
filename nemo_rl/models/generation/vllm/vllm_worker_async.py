@@ -163,16 +163,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 if request.required_prefix_token_ids is None:
                     return res
 
-                request_prompt = res[1][0]  # We need to modify request_prompt.prompt_token_ids
                 engine_prompt = res[2][0]  # We need to modify engine_prompt.prompt_token_ids
 
                 final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
                     reference_token_ids=request.required_prefix_token_ids,
-                    actual_token_ids=request_prompt.prompt_token_ids,
+                    actual_token_ids=engine_prompt.prompt_token_ids,
                 )
 
-                request_prompt.prompt_token_ids = final_prompt_token_ids
                 engine_prompt.prompt_token_ids = final_prompt_token_ids
 
                 return res
