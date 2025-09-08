@@ -128,6 +128,23 @@ CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 
 num_retries=3
 
+# Track backgrounded srun client PIDs for head and workers
+declare -A SRUN_PIDS
+
+# Verify all backgrounded srun client processes are still alive; exit fast if any died
+check_srun_processes() {
+  for name in "${!SRUN_PIDS[@]}"; do
+    pid="${SRUN_PIDS[$name]}"
+    # Check if the process is still running
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] Background srun '$name' died (pid=$pid). Could be a failure in startup or an issue with the node preventing the srun to start. Attempting to exit." >&2
+      # Signal sidecars inside containers to terminate ASAP
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+  done
+}
+
 # Getting the node names and IP addresses in the SLURM allocation
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
@@ -278,6 +295,7 @@ exit 1
 EOF
 )
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
 
 NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
@@ -375,11 +393,12 @@ exit 1
 EOF
 )
   srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  SRUN_PIDS["ray-worker-$i"]=$!
   sleep 3
 done
 
 # Then we wait here for the file to be created by the head node container
-while ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do 
+while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do
   echo "[INFO][$(date)] Waiting for head node container to start..."
   sleep 2
 done
@@ -404,9 +423,10 @@ extract_worker_units() {
 while true; do
   worker_units=$(extract_worker_units)
   echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
-  if [ "$worker_units" -eq "$NUM_ACTORS" ]; then
+  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
     break
   fi
+  check_srun_processes
   sleep 2
 done
 

@@ -2,6 +2,7 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_rollout_turns: 1
+  max_num_epochs: 1
   max_num_steps: 500
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -97,7 +98,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 2
       lr_warmup_init: 5.0e-8
 
@@ -160,4 +161,4 @@ logger:
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 1
