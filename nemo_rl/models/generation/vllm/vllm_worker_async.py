@@ -110,7 +110,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ChatCompletionRequest,
             ErrorResponse,
             ChatCompletionResponse,
-            TokenizeRequest,
+            TokenizeChatRequest,
+            TokenizeCompletionRequest,
             TokenizeResponse,
             ChatCompletionMessageParam,
         )
@@ -225,8 +226,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ########################################
 
         # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
-        class NeMoRLTokenizeRequest(NeMoRLOpenAIChatRequestMixin, TokenizeRequest):
+        class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest):
             pass
+
+        NeMoRLTokenizeRequest = Union[TokenizeCompletionRequest, NeMoRLTokenizeChatRequest]
 
         # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
         class NeMoRLOpenAIServingTokenization(NeMoRLOpenAIServingMixin, OpenAIServingTokenization):
