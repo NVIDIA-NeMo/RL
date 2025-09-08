@@ -166,10 +166,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
                     reference_token_ids=request.required_prefix_token_ids,
-                    actual_token_ids=engine_prompt.prompt_token_ids,
+                    actual_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
-                engine_prompt.prompt_token_ids = final_prompt_token_ids
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 return res
 
