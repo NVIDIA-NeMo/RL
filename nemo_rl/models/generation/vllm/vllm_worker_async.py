@@ -146,10 +146,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 print("hit in model post init", self.required_prefix_token_ids)
                 # Penguin specific processing. This is just how Penguin returns the extra token information.
                 if self.required_prefix_token_ids is None:
-                    print("hit before messages", [dir(m) for m in self.messages])
+                    print("hit before messages", [m.keys() for m in self.messages])
                     for message in reversed(self.messages):
-                        if hasattr(message, "prompt_token_ids"):
-                            self.required_prefix_token_ids = message.prompt_token_ids + message.generation_token_ids
+                        if "prompt_token_ids" in message:
+                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
                             break
 
                 return super().model_post_init(context)
