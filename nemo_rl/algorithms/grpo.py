@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import warnings
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -66,7 +65,7 @@ from nemo_rl.utils.logger import (
     print_message_log_samples,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.timer import NullTimer, TimeoutChecker, Timer
 
 # ===============================================================================
 # Configuration
@@ -450,13 +449,9 @@ def refit_policy_generation(
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
+    timer = timer if timer is not None else NullTimer()
+
+    with timer.time("prepare_for_generation/transfer_and_update_weights"):
         # update weights
         update_success = False
         if colocated_inference:
@@ -471,10 +466,16 @@ def refit_policy_generation(
             )
             # do update
             for keys in grouped_param_keys:
-                ipc_handles = policy.get_weights_ipc_handles(keys)
-                update_success = policy_generation.update_weights_from_ipc_handles(
-                    ipc_handles
-                )
+                with timer.time(
+                    "prepare_for_generation/transfer_and_update_weights/get_weights_ipc_handles"
+                ):
+                    ipc_handles = policy.get_weights_ipc_handles(keys)
+                with timer.time(
+                    "prepare_for_generation/transfer_and_update_weights/update_weights_from_ipc_handles"
+                ):
+                    update_success = policy_generation.update_weights_from_ipc_handles(
+                        ipc_handles
+                    )
                 if not update_success:
                     break
         else:
