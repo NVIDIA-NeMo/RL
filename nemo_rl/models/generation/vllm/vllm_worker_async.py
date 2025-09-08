@@ -135,8 +135,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_modules=None,
         )
 
+
+        class NeMoRLOpenAIChatRequestMixin:
+            def model_post_init(self, context):
+                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                if self.required_prefix_token_ids is None:
+                    for message in reversed(self.messages):
+                        if "prompt_token_ids" in message:
+                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
+                            break
+
+                return super().model_post_init(context)
+
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(self, request: NeMoRLChatCompletionRequest, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
+            async def _preprocess_chat(self, request: NeMoRLOpenAIChatRequestMixin, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
                 # res is conversation, [request_prompt], [engine_prompt]
                 res = await super()._preprocess_chat(request, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt, continue_final_message, tool_dicts, documents, chat_template_kwargs, tool_parser, truncate_prompt_tokens, add_special_tokens)
 
@@ -154,17 +166,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 return res
-
-        class NeMoRLOpenAIChatRequestMixin:
-            def model_post_init(self, context):
-                # Penguin specific processing. This is just how Penguin returns the extra token information.
-                if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
-                            break
-
-                return super().model_post_init(context)
 
 
         ########################################
