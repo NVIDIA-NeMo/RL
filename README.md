@@ -46,26 +46,25 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ✅ _Available now_ | 🔜 _Coming in v0.4_
 
-- ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support and Ray-based infrastructure.
-- ✅ **Environment Support** - Support for multi-environment training.
-- ✅ **Learning Algorithms** - GRPO (Group Relative Policy Optimization), SFT (Supervised Fine-Tuning), and DPO (Direct Preference Optimization).
-- ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
-- ✅ **(even) Larger Model Support with Long(er) Sequences** - Advanced parallelisms with Megatron Core (TP/PP/CP/SP/EP).
+- ✅ **Distributed Training** - Ray-based infrastructure.
+- ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Environment Isolation** - Dependency isolation between components.
-- ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
+- ✅ **Learning Algorithms** - GRPO , SFT , and DPO.
+- ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
+- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
+- ✅ **(even) Larger Model Support with Long(er) Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
 - ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models (Megatron)
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
+- ✅ **Fast Generation** - vLLM backend for optimized inference.
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
 
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
+- 🔜 **Megatron Inference** - Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
 - 🔜 **Low Prcesion Support** - FP8 generation and traianing support for megatron models.
 - 🔜 **Multi Moldal Support** - Vision Lanaguge model and Video support.
+- 🔜 **DAPO**
+- 🔜 **AsyncRL**
 
 ## Table of Contents
   - [Prerequisites](#prerequisites)
