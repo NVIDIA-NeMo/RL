@@ -63,7 +63,9 @@ For detailed information on backend selection, configuration, and examples, see 
 
 
 - 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
+- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
+- 🔜 **Low Prcesion Support** - FP8 generation and traianing support for megatron models.
+- 🔜 **Multi Moldal Support** - Vision Lanaguge model and Video support.
 
 ## Table of Contents
   - [Prerequisites](#prerequisites)
