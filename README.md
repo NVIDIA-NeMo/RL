@@ -46,6 +46,18 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ✅ _Available now_ | 🔜 _Coming in v0.4_
 
+- 🔜 **Megatron Inference** - Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
+- 🔜 **Async RL** - Ssupport for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
+- 🔜 **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path.
+- 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
+- 🔜 **Improved Large MoE Performance** - Improve Megatron-core training performance and generation performance.
+- 🔜 **End-to-end FP8 Low Precision training** - Support for Megatron-core FP8 training and FP8 VLLM generation.
+- 🔜 **Megatron-Bridge Integration** - Integrate Megatron-Bridge to enable training features from Megatron-Core.
+- 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
+- 🔜 **New Models** - gpt-oss.
+- 🔜 **Expand Algorithms** - DAPO, GSPO.
+- 🔜 **GB200** - Add container support for GB200.
+- 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
@@ -58,16 +70,9 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
 - ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
 
-
-- 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **Megatron Inference** - Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
-- 🔜 **Low Precision Support** - FP8 generation and training support for megatron models.
-- 🔜 **Multi Moldal Support** - Vision Lanaguge model and Video support.
-- 🔜 **DAPO**
-- 🔜 **AsyncRL**
-
 ## Table of Contents
   - [Prerequisites](#prerequisites)
+  - [Quick Start](#quick-start)
   - Support Matrix
 
     <p></p>
@@ -89,6 +94,53 @@ For detailed information on backend selection, configuration, and examples, see 
   - [Citation](#citation)
   - [Contributing](#contributing)
   - [Licenses](#licenses)
+
+## Quick Start
+
+Use this quick start to get going with either the Native PyTorch DTensor or Megatron-Core training backends. 
+
+> [!NOTE]
+> Both training backends are independent — you can install and use either one on its own.
+
+For more examples and setup details, continue to the [Prerequisites](#prerequisites) section.
+
+<table style="border-collapse:collapse; width:100%; table-layout:fixed;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Native PyTorch (DTensor)</th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Megatron Core</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td colspan="2" style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Clone and create the environment</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+cd nemo-rl
+uv venv</code></pre>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;"></td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Megatron-only prerequisites</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git submodule update --init --recursive</code></pre>
+        <em>Note:</em> If you previously ran without the Megatron backend, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Run GRPO (DTensor)</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo_math.py</code></pre>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Run GRPO (Megatron)</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo_math.py &#92;
+--config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Prerequisites
 
