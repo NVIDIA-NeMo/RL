@@ -23,7 +23,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
-from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import FLOPSConfig, llama, qwen2, qwen3
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -41,7 +41,7 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
 
 
 def convert_config_to_flops_config(
-    model_name: str, config: PretrainedConfig
+    config: PretrainedConfig
 ) -> tuple[FLOPSConfig, Callable]:
     """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula."""
     if isinstance(config, Qwen2Config):
@@ -74,7 +74,7 @@ def convert_config_to_flops_config(
             query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
-        ), llama3 if "llama-3" in model_name.lower() else llama2
+        ), llama
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
@@ -109,7 +109,7 @@ class FLOPTracker:
 
     @classmethod
     def from_config(cls, model_name: str, config: PretrainedConfig) -> "FLOPTracker":
-        flops_config, flops_formula = convert_config_to_flops_config(model_name, config)
+        flops_config, flops_formula = convert_config_to_flops_config(config)
         return cls(
             model_name=model_name, base_config=flops_config, flops_formula=flops_formula
         )
