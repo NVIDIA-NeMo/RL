@@ -132,20 +132,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
 
-                # Check if there are 0-dimensional tensors
-                has_zero_dim = any(tensor.ndim == 0 for tensor in list_of_tensors)
-                if has_zero_dim:
-                    # For 0-dimensional tensors, stack directly
-                    tensor_or_list = torch.stack(list_of_tensors)
-                else:
-                    # Original processing logic
-                    list_of_tensors = [
-                        row.flatten() for tensor in list_of_tensors for row in tensor
-                    ]
-                    # TODO: can we avoid padding locally then padding globally?
-                    tensor_or_list = torch.nn.utils.rnn.pad_sequence(
-                        list_of_tensors, batch_first=True, padding_value=pad_value
-                    )
+                list_of_tensors = [
+                    row.flatten() for tensor in list_of_tensors for row in tensor
+                ]
+                # TODO: can we avoid padding locally then padding globally?
+                tensor_or_list = torch.nn.utils.rnn.pad_sequence(
+                    list_of_tensors, batch_first=True, padding_value=pad_value
+                )
             else:
                 raise NotImplementedError(
                     (

@@ -38,7 +38,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "batch_size": 32,
     "checkpoint_path": None,
     "max_model_len": MAX_MODEL_LEN,
-    "resources": {"gpus_per_node": 1, "num_nodes": 2},
+    "resources": {"gpus_per_node": 1, "num_nodes": 1},
     "reward_model_cfg": {
         "enabled": True,
         "reward_model_type": "bradley_terry",
