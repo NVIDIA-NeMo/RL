@@ -527,7 +527,7 @@ def get_formatted_message_log(
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
-        
+
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
             message_log_strs[: i + 1],
             add_generation_prompt=add_generation_prompt and message["role"] == "user",
@@ -535,15 +535,17 @@ def get_formatted_message_log(
             add_special_tokens=False,
             tools=tools if tools is not None else task_data_spec.tools,
         )
-        
+
         # Debug: Print complete conversation after apply_chat_template (only once for the full conversation)
-        if i == len(message_log_strs) - 1 and not hasattr(get_formatted_message_log, '_debug_printed'):
+        if i == len(message_log_strs) - 1 and not hasattr(
+            get_formatted_message_log, "_debug_printed"
+        ):
             get_formatted_message_log._debug_printed = True
-            print("\n" + "="*80)
+            print("\n" + "=" * 80)
             print("DEBUG: Complete conversation after apply_chat_template:")
-            print("-"*80)
+            print("-" * 80)
             print(formatted_message)
-            print("="*80 + "\n")
+            print("=" * 80 + "\n")
 
         ## get the length of the previous message, excluding the eos token (if present)
         prev_message_len_no_eos: int = get_first_index_that_differs(
