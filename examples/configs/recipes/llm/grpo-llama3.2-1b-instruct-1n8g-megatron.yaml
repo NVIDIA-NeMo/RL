@@ -2,11 +2,13 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 1
+  max_num_epochs: 1
   max_num_steps: 500
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
@@ -85,7 +87,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 50
       lr_warmup_init: 5.0e-7
 
@@ -123,6 +125,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.6
       max_model_len: 512
       enforce_eager: False

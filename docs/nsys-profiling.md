@@ -6,7 +6,7 @@ NeMo RL supports Nsight profiling for Ray workers through environment variable p
 
 ## Prerequisites
 
-* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#:~:text=Ubuntu%20(minimal%20setup%20for%20containers)).
+* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation)).
 
 **Note: If you're using NeMo RL containers, `nsys` is already installed.**
 
@@ -91,7 +91,7 @@ If you are not using model parallelism in Vllm, you should directly refer to `vl
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
-**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent `$SLURM_JOB_ID-logs/ray` directory.
+**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent directory. The header node's files will be synced to ``$SLURM_JOB_ID-logs/ray`, and other nodes' files will be synced to `$SLURM_JOB_ID-logs/ray/$node_ip/` where `$node_ip` is the IP address of the node.
 
 ## Analyze Profile Files
 

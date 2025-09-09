@@ -61,6 +61,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -172,6 +173,7 @@ def get_basic_megatron_test_config(
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "apply_rope_fusion": True,
+            "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,

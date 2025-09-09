@@ -76,6 +76,7 @@ Actual token ids: {actual_token_ids}"""
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.config import CompilationConfig

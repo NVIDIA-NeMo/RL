@@ -54,6 +54,7 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    clear_cache_every_n_steps: null
 
   dynamic_batching:
     enabled: false
@@ -138,9 +139,8 @@ policy:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
-      lr_decay_style: "linear"
-      lr_decay_iters: 1000000000
-      lr_warmup_iters: 2
+      lr_decay_style: "constant"
+      lr_warmup_iters: 1
       lr_warmup_init: 0.00000001
 
     distributed_data_parallel_config:
@@ -151,9 +151,22 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
     
 data:
-  dataset_name: "HelpSteer3"
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
+
+  dataset_name: HelpSteer3
+  # You can use custom preference datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: PreferenceDataset
+  #     train_data_path: <LocalPathToTrainingDataset>
+  #     val_data_paths:
+  #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #       ...
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #   ...
+
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running

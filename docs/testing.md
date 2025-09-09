@@ -30,6 +30,42 @@ uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only
 uv run --extra mcore --group test bash tests/run_unit.sh --mcore-only --hf-gated
 ```
 
+### Experimental: Faster local test iteration with pytest-testmon
+
+We support `pytest-testmon` to speed up local unit test runs by re-running only impacted tests. This works for both regular in-process code and out-of-process `@ray.remote` workers via a lightweight, test-only selection helper.
+
+Usage:
+```sh
+# Re-run only impacted unit tests
+uv run --group test pytest --testmon tests/unit
+
+# You can also combine with markers/paths
+uv run --group test pytest --hf-gated --testmon tests/unit/models/policy/test_dtensor_worker.py
+```
+
+What to expect:
+- On the first run in a fresh workspace, testmon may run a broader set (or deselect everything if nothing was executed yet) to build its dependency cache.
+- On subsequent runs, editing non-remote code narrows selection to only the tests that import/use those modules.
+- Editing code inside `@ray.remote` actors also retriggers impacted tests. We maintain a static mapping from test modules to transitive `nemo_rl` modules they import and intersect that with changed files when `--testmon` is present.
+- After a successful impacted run, a second `--testmon` invocation (with no further edits) will deselect all tests.
+- Running `pytest` with `-k some_substring_in_test_name` will always run tests that match even if `--testmon` is passed.
+
+Limitations and tips:
+- Selection is based on Python imports and file mtimes; non-Python assets (YAML/JSON/shell) are not tracked. When editing those, re-run target tests explicitly.
+- The remote-aware selection uses a conservative static import map (no dynamic import resolution). If a test loads code dynamically that isn’t visible via imports, you may need to run it explicitly once to seed the map.
+- The helper is test-only and does not alter library behavior. It activates automatically when you pass `--testmon`.
+
+Refreshing remote-selection artifacts
+-------------------------------------
+If you change test layout or significantly refactor imports, the remote-selection artifacts may become stale.
+To rebuild them, delete the following files at the repo root and re-run with `--testmon` to seed again:
+
+```sh
+# At the root of nemo-rl
+rm .nrl_remote_map.json .nrl_remote_state.json
+```
+
+
 ### Run Unit Tests in a Hermetic Environment
 
 For environments lacking necessary dependencies (e.g., `gcc`, `nvcc`)
