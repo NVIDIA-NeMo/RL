@@ -35,8 +35,6 @@ project-includes = [
     "examples/searchR1/data/searchr1_download.py",
     "examples/searchR1/environment/search.py",
     "examples/searchR1/environment/utils.py",
-    "examples/searchR1/retrieval/retrieval_server.py",
-    "examples/searchR1/run_grpo_searchr1.py",
     "nemo_rl/algorithms/__init__.py",
     "nemo_rl/algorithms/interfaces.py",
     "nemo_rl/algorithms/utils.py",

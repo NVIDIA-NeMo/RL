@@ -17,7 +17,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, NotRequired, Optional, Tuple, TypedDict, cast
 
 import ray
 import requests
@@ -38,25 +38,24 @@ INITIAL_RETRY_DELAY = 1
 
 
 class SearchEnvConfig(TypedDict):
-    num_workers: int = 1
-    topk: int = 3
-    search_url: str = "http://localhost:8000/retrieve"
-    timeout: float = DEFAULT_TIMEOUT
-    max_turns: int = 10
+    topk: int
+    search_url: str
+    max_turns: int
+    timeout: NotRequired[int]
 
 
 class SearchEnvMetadata(TypedDict):
     ground_truth: str
-    num_turns: int = 0
+    num_turns: int
 
 
 class SearchWorkerResult(TypedDict):
-    observation: str
+    observation: dict
     reward: float
     done: bool
-    error: Optional[str]
+    error: str | None
     metadata: SearchEnvMetadata
-    answer: Optional[str]
+    answer: str | None
 
 
 def _call_search_api(
@@ -187,10 +186,13 @@ class SearchWorker:
     def __init__(self, cfg: SearchEnvConfig):
         self.url = cfg["search_url"]
         self.max_turns = cfg["max_turns"]
+        self.timeout = cfg.get("timeout", DEFAULT_TIMEOUT)
 
     def search(self, query: str) -> str:
         """Call the search API with a single query."""
-        api_response, error_msg = _call_search_api(self.url, query)
+        api_response, error_msg = _call_search_api(
+            self.url, query, timeout=self.timeout
+        )
         result_text = json.dumps(
             {"result": "Search request failed or timed out after retries."}
         )
@@ -236,7 +238,7 @@ class SearchWorker:
         else:
             return 0.0
 
-    def _parse_action(self, action: str) -> List[str] | None:
+    def _parse_action(self, action: str) -> str | None:
         """Parse the action from the message."""
         match = None
         if "<search>" in action and "</search>" in action:
@@ -266,7 +268,8 @@ class SearchWorker:
                 answer=answer,
             )
         try:
-            query = self._parse_action(log[-1]["content"])
+            response = cast(str, log[-1]["content"])
+            query = self._parse_action(response)
             if query:
                 obs = self.search(query)
             else:
@@ -282,7 +285,7 @@ class SearchWorker:
                 "content": "<information>" + obs + "</information>",
             }
         else:
-            new_msg = {"role": "user", "content": "<error>" + error + "</error>"}
+            new_msg = {"role": "user", "content": "<error>" + str(error) + "</error>"}
 
         new_metadata = metadata.copy()
         new_metadata["num_turns"] += 1
@@ -303,7 +306,6 @@ class SearchEnv(EnvironmentInterface[SearchEnvMetadata]):
 
     def __init__(self, cfg: SearchEnvConfig):
         self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
         self.worker = SearchWorker(cfg)
 
     def step(  # type: ignore[override]
@@ -326,14 +328,17 @@ class SearchEnv(EnvironmentInterface[SearchEnvMetadata]):
         rewards = torch.tensor(rewards).cpu()
         dones = torch.tensor(dones).cpu()
         answers = [result["answer"] for result in results]
+        stop_strings = cast(
+            list[list[str] | None],
+            [["</search>", "</answer>", "</think>"]] * len(observations),
+        )
 
         return EnvironmentReturn(
             observations=observations,
             rewards=rewards,
             terminateds=dones,
             metadata=metadata,
-            next_stop_strings=[["</search>", "</answer>", "</think>"]]
-            * len(observations),
+            next_stop_strings=stop_strings,
             answers=answers,
         )
 

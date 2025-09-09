@@ -177,7 +177,7 @@ def main():
         config["env"],
         tokenizer,
         config["data"]["train_data_path"],
-        config["data"]["valid_data_path"],
+        config["data"]["val_data_path"],
     )
 
     (

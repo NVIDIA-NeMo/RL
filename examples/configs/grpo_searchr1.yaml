@@ -2,7 +2,6 @@ defaults: "grpo_math_1B_megatron.yaml"
 
 env:
   search:
-    num_workers: 1
     search_url: "http://localhost:8000/retrieve"
     max_turns: 10
 
