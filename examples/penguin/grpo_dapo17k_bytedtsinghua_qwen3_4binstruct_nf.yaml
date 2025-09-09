@@ -8,6 +8,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: true
+  overlong_filtering: false
   max_val_samples: 960  # BytedTsinghua uses 30 examples in AIME24 * 32 generations each.
   val_batch_size: ${grpo.max_val_samples}
   seed: 42
