@@ -58,7 +58,6 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **New Models** - gpt-oss.
 - 🔜 **Expand Algorithms** - DAPO, GSPO.
 - 🔜 **GB200** - Add container support for GB200.
-- 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
