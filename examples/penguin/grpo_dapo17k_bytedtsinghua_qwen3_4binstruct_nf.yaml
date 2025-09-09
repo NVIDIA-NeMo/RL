@@ -207,7 +207,6 @@ env:
           judge_model_server:
             name: openai_model
           should_use_judge: false
-  init_sleep_time: 30
 
 logger:
   log_dir: "logs"  # Base directory for all logs

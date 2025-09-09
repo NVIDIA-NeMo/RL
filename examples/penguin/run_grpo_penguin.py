@@ -18,7 +18,6 @@ import pprint
 import json
 from typing import Optional
 from itertools import chain, repeat
-from time import sleep
 
 from omegaconf import OmegaConf
 
@@ -169,11 +168,6 @@ def main() -> None:
     ).remote(penguin_config)
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
-
-    # TODO: Eventually there will be a better way to check if the servers have spun up on Penguin side.
-    sleep_time = int(master_config["env"].get("init_sleep_time", 30))  # 30s default.
-    print(f"Sleeping {sleep_time}s to let Penguin environments spin up.")
-    sleep(sleep_time)
 
     grpo_train(
         policy,
