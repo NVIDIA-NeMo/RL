@@ -279,37 +279,22 @@ class DTensorPolicyWorkerV2:
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-        # For FSDP2 compatibility, we need to support HSDP structure
-        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
-        dp_replicate_size = 1
-        dp_shard_size = dp_size
+        # TODO: add ep_size
+        ep_size = 4
 
-        # Create device mesh with HSDP structure for FSDP2 compatibility
-        device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (dp_replicate_size, dp_shard_size, cp_size, tp_size),
-            mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
-        )
+        self.dp_size = dp_size
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+        self.ep_size = ep_size
 
-        # Create flattened submeshes for different use cases
-        # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
-        device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
-
-        # Flatten dp_shard + cp for FSDP2 sharding
-        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
-
-        # Flatten dp_replicate + dp_shard + cp for gradient operations
-        device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
-
+        device_mesh = self._create_device_mesh()
+               
         # Store mesh references for backward compatibility
         self.dp_cp_mesh = device_mesh["dp_cp"]
         self.dp_mesh = device_mesh["dp"]
         self.tp_mesh = device_mesh["tp"]
         self.cp_mesh = device_mesh["cp"]
-
-        self.dp_size = dp_size
-        self.tp_size = tp_size
-        self.cp_size = cp_size
+        self.ep_mesh = device_mesh["ep"] if self.ep_size > 1 else None
         self.device_mesh = device_mesh
 
         # ------------------------------------------------
@@ -335,6 +320,8 @@ class DTensorPolicyWorkerV2:
             dp_replicate_mesh_name="dp_replicate",
             dp_shard_cp_mesh_name="dp_shard_cp",
             tp_mesh_name="tp",
+            ep_mesh_name="ep" if self.ep_size > 1 else None,
+            ep_shard_axis_names=("dp",),
         )
 
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
@@ -435,6 +422,94 @@ class DTensorPolicyWorkerV2:
         )
         self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
 
+    def _create_device_mesh(self) -> torch.distributed.device_mesh.DeviceMesh:
+        # For FSDP2 compatibility, we need to support HSDP structure
+        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
+        dp_replicate_size = 1
+
+        dims = []
+        names = []
+
+        # Refer to https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L69
+        if self.ep_size > 1:
+            assert self.tp_size == 1 and self.cp_size == 1 , "Can't enable EP with other parallel modes together."
+            dp_shard_mod_ep_size = self.dp_size // self.ep_size
+            dp_shard_in_ep_size = self.ep_size
+            for d, name in zip (
+                [dp_replicate_size,
+                dp_shard_mod_ep_size,
+                dp_shard_in_ep_size,
+                self.cp_size,
+                self.tp_size,
+                ],
+                [
+                    "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"]):
+                    dims.append(d)
+                    names.append(name)
+        else:
+            for d, name in zip (
+                [dp_replicate_size,
+                self.dp_size,                
+                self.cp_size,
+                self.tp_size,
+                ],
+                [
+                    "dp_replicate", "dp_shard", "cp", "tp"]):
+                    dims.append(d)
+                    names.append(name)
+
+        # Create device mesh with HSDP structure for FSDP2 compatibility
+        device_mesh = torch.distributed.device_mesh.init_device_mesh(
+            "cuda",
+            dims,
+            mesh_dim_names=names,
+        )
+
+        if self.ep_size > 1:
+            dp_mesh_dim_names = []
+            # Mesh for param sharding
+            dp_shard_cp_mesh_dim_names = []
+            # Mesh for loss all-reduce
+            dp_cp_mesh_dim_names = []
+            # Mesh for ep
+            ep_mesh_dim_names = []
+
+            dp_mesh_dim_names.append("dp_replicate")
+            dp_cp_mesh_dim_names.append("dp_replicate")
+
+            # dp_shard_mod_ep is always needed, even if it's 1
+            dp_mesh_dim_names.append("dp_shard_mod_ep")
+            dp_shard_cp_mesh_dim_names.append("dp_shard_mod_ep")
+            dp_cp_mesh_dim_names.append("dp_shard_mod_ep")
+
+            dp_mesh_dim_names.append("dp_shard_in_ep")
+            dp_shard_cp_mesh_dim_names.append("dp_shard_in_ep")
+            dp_cp_mesh_dim_names.append("dp_shard_in_ep")
+            ep_mesh_dim_names.append("dp_shard_in_ep")
+
+            if self.cp_size > 1:
+                dp_shard_cp_mesh_dim_names.append("cp")
+                dp_cp_mesh_dim_names.append("cp")
+                ep_mesh_dim_names.append("cp")
+
+            device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+            device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
+            device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+            device_mesh[tuple(ep_mesh_dim_names)]._flatten(mesh_dim_name="ep")
+
+        else:
+            # Create flattened submeshes for different use cases
+            # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
+            device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
+
+            # Flatten dp_shard + cp for FSDP2 sharding
+            device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
+
+            # Flatten dp_replicate + dp_shard + cp for gradient operations
+            device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
+
+        return device_mesh
+
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
@@ -461,6 +536,9 @@ class DTensorPolicyWorkerV2:
     def get_gpu_info(self) -> dict[str, Any]:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
+    
+    def _should_remove_flash_attn_kwargs(self, vlm_kwargs: dict[str, Any]) -> bool:
+        return self._is_reward_model or len(vlm_kwargs) > 0 or self.model.config.architectures[0] == "DeepseekV3ForCausalLM"
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -664,14 +742,8 @@ class DTensorPolicyWorkerV2:
                                 **vlm_kwargs,
                             )
 
-                            if self._is_reward_model:
-                                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
-                                # Note that it should be empty anyway since sequence packing
-                                # is not supported for reward models.
+                            if self._should_remove_flash_attn_kwargs(vlm_kwargs):
                                 assert not flash_attn_kwargs
-                                del model_args["flash_attn_kwargs"]
-                            # remove flash_attn_kwargs if there are multimodal kwargs
-                            if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
                             outputs = self.model(**model_args)
@@ -980,7 +1052,9 @@ class DTensorPolicyWorkerV2:
                             flash_attn_kwargs=flash_attn_kwargs,
                             **vlm_kwargs,
                         )
-                        if len(vlm_kwargs) > 0:
+
+                        if self._should_remove_flash_attn_kwargs(vlm_kwargs):
+                            assert not flash_attn_kwargs
                             del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)

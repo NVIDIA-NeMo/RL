@@ -259,7 +259,10 @@ log-sync-sidecar() {
 }
 log-sync-sidecar &
 
-# Patch nsight.py before starting Ray head
+# Patch nsight.py before starting 
+echo $PWD
+uv sync --reinstall
+uv run which python
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
 cat <<EOFINNER | tee /launch-head.sh
@@ -362,6 +365,8 @@ log-sync-sidecar() {
 log-sync-sidecar &
 
 # Patch nsight.py before starting Ray worker
+uv sync --reinstall
+uv run which python
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
 cat <<EOFINNER | tee /launch-worker.sh
