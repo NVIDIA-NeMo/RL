@@ -81,7 +81,7 @@ def llama2(config: FLOPSConfig):
             12
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
+            + (6 * config.enc_seq_len / config.hs)
             + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
@@ -99,7 +99,7 @@ def llama3(config: FLOPSConfig):
             12
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
+            + (6 * config.enc_seq_len / config.hs)
             + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
