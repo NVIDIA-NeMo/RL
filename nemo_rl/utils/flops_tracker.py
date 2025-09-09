@@ -41,7 +41,7 @@ def get_default_hf_config(model_name: str) -> PretrainedConfig:
 
 
 def convert_config_to_flops_config(
-    config: PretrainedConfig
+    config: PretrainedConfig,
 ) -> tuple[FLOPSConfig, Callable]:
     """Convert a pretrained config to a tuple containing a FLOPSConfig and a flops formula."""
     if isinstance(config, Qwen2Config):

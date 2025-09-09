@@ -68,6 +68,7 @@ def gpt3(config: FLOPSConfig):
         6 * config.gbs * config.enc_seq_len * config.hs * config.vocab_size
     )
 
+
 def llama(config: FLOPSConfig):
     """Model FLOPs for llama3 family."""
     return (
