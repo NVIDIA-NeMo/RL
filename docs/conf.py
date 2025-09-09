@@ -108,11 +108,17 @@ html_theme_options = {
 html_extra_path = ["project.json", "versions1.json"]
 
 
+# Github links are now getting rate limited from the Github Actions
+linkcheck_ignore = [
+    ".*github\\.com.*",
+    ".*githubusercontent\\.com.*",
+]
+
+
 def _convert_gh_admonitions(
     app: Sphinx, relative_path: Path, parent_docname: str, contents: list[str]
 ) -> None:
     """Supporting rendering GitHub alerts correctly.
-
     # https://github.com/executablebooks/MyST-Parser/issues/845
     """
     _github_admonitions = {

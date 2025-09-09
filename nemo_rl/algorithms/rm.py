@@ -26,7 +26,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss_functions import (
     PreferenceLoss,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
@@ -172,7 +172,7 @@ def setup(
                 ],
                 add_loss_mask=False,
             ),
-            drop_last=True,
+            drop_last=False,
         )
         for k, v in val_dataset.items()
     }
@@ -195,6 +195,18 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            rm_config["max_num_steps"],
+            rm_config["max_num_epochs"] * len(train_dataloader),
+        )
+        ## NOTE: we double the train_iters because effective batch size is doubled
+        ## for (chosen, rejected) pairs
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters * 2
+        if "scheduler" in policy_config["megatron_cfg"]:
+            for k in policy_config["megatron_cfg"]["scheduler"]:
+                if "iters" in k:
+                    policy_config["megatron_cfg"]["scheduler"][k] *= 2
     policy = Policy(
         cluster=cluster,
         config=policy_config,
@@ -307,14 +319,20 @@ def validate_one_dataset(
         dict_val_metrics = defaultdict(list)
         num_valid_batches = 0
         for batch_idx, val_batch in enumerate(val_dataloader):
+            # When running validation with drop_last=False, we might end up with a partial batch.
+            # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
+            if val_batch.size < val_batch_size * 2:
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                val_batch = maybe_pad_last_batch(val_batch, dp_size, val_mbs * 2)
+
             ## just run model fwd
             val_results = policy.train(
                 val_batch,
                 loss_fn,
                 eval_mode=True,
-                ## NOTE: we double the batch size here because each preference example corresponds to a pair of
-                ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                gbs=val_batch_size * 2,
+                gbs=val_batch.size,
+                # NOTE: we double the batch size because each preference example corresponds to a pair of
+                # examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
                 mbs=val_mbs * 2,
             )
 
