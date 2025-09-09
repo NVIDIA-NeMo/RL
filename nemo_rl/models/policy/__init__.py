@@ -27,12 +27,14 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: NotRequired[int]
     context_parallel_size: NotRequired[int]
     custom_parallel_plan: NotRequired[str]
+    clear_cache_every_n_steps: NotRequired[int]
 
 
 class SequencePackingConfig(TypedDict):
     enabled: bool
     train_mb_tokens: int
-    logprob_mb_tokens: int
+    # Not required because some algorithms like SFT don't calculate log probs
+    logprob_mb_tokens: NotRequired[int]
     algorithm: str
 
 

@@ -58,6 +58,7 @@ from megatron.bridge.training.utils.train_utils import (
     reduce_max_stat_across_model_parallel_group,
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.custom_fsdp import (
@@ -512,8 +513,8 @@ class MegatronPolicyWorker:
             )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(
-            pretrained_run_config, mode=0
-        )  # strict loading
+            pretrained_run_config, mode=InstantiationMode.STRICT
+        )
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
 
@@ -607,6 +608,12 @@ class MegatronPolicyWorker:
             fully_parallel_load=True,  # Enable fully parallel load
             load_rng=False,
         )
+
+        assert "train_iters" in self.cfg["megatron_cfg"], (
+            "train_iters must be set in megatron_cfg. For an example, see "
+            "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
+        )
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
@@ -614,7 +621,9 @@ class MegatronPolicyWorker:
             train=TrainingConfig(
                 micro_batch_size=1,  # ignored
                 global_batch_size=self.cfg["train_global_batch_size"],  # ignored
-                train_iters=1000,  # Default value for inference
+                train_iters=self.cfg["megatron_cfg"][
+                    "train_iters"
+                ],  # Set by algorithm setup
             ),
             optimizer=OptimizerConfig(
                 **self.cfg["megatron_cfg"]["optimizer"],

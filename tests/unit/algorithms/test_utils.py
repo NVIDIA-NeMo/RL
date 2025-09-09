@@ -15,9 +15,11 @@
 from datetime import datetime
 
 import pytest
+import torch
 
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.utils import get_tokenizer, maybe_pad_last_batch
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.fixture
@@ -130,3 +132,83 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     formatted = tokenizer.apply_chat_template(conversation_messages, tokenize=False)
     expected = get_format_with_simple_role_header(conversation_messages)
     assert formatted == expected
+
+
+def test_maybe_pad_last_batch():
+    """Test maybe_pad_last_batch function for various scenarios"""
+    # Test case 1: No padding needed
+    batch_size = 8
+    dp_size = 2
+    mbs = 2
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.randn(batch_size, 10),
+            "input_lengths": torch.randint(1, 10, (batch_size,)),
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones(batch_size, 10),
+            "reference_policy_logprobs": torch.randn(batch_size, 10),
+        }
+    )
+
+    result = maybe_pad_last_batch(batch, dp_size, mbs)
+
+    # Should not be padded since 8 is divisible by (2 * 2) = 4
+    assert result["input_ids"].shape[0] == batch_size
+    assert result["input_lengths"].shape[0] == batch_size
+    assert result["sample_mask"].shape[0] == batch_size
+    assert result["token_mask"].shape[0] == batch_size
+    assert result["reference_policy_logprobs"].shape[0] == batch_size
+
+    # Test case 2: Padding needed
+    batch_size = 7
+    dp_size = 2
+    mbs = 2
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.randn(batch_size, 10),
+            "input_lengths": torch.randint(1, 10, (batch_size,)),
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones(batch_size, 10),
+            "reference_policy_logprobs": torch.randn(batch_size, 10),
+        }
+    )
+
+    result = maybe_pad_last_batch(batch, dp_size, mbs)
+
+    # Should be padded to 8 (next multiple of 4)
+    expected_size = 8
+    assert result["input_ids"].shape[0] == expected_size
+    assert result["input_lengths"].shape[0] == expected_size
+    assert result["sample_mask"].shape[0] == expected_size
+    assert result["token_mask"].shape[0] == expected_size
+    assert result["reference_policy_logprobs"].shape[0] == expected_size
+
+    # Check that sample_mask padding is zeros
+    assert torch.allclose(
+        result["sample_mask"][-1], torch.zeros_like(batch["sample_mask"][-1])
+    )
+
+    # Test case 3: Batch without optional fields
+    batch_size = 5
+    dp_size = 3
+    mbs = 2
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.randn(batch_size, 10),
+            "input_lengths": torch.randint(1, 10, (batch_size,)),
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+
+    result = maybe_pad_last_batch(batch, dp_size, mbs)
+
+    # Should be padded to 6 (next multiple of 3 * 2 = 6)
+    expected_size = 6
+    assert result["input_ids"].shape[0] == expected_size
+    assert result["input_lengths"].shape[0] == expected_size
+    assert result["sample_mask"].shape[0] == expected_size
+    assert "token_mask" not in result
+    assert "reference_policy_logprobs" not in result

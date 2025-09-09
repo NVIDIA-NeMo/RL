@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import math
 import random
 import warnings
 from functools import wraps
@@ -265,3 +267,62 @@ def get_tokenizer(
         processor.name_or_path = tokenizer.name_or_path
 
     return tokenizer if processor is None else processor
+
+
+def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+    """Pads the given batch so that its size is divisible by (mbs * dp_size).
+
+    Args:
+        batch (dict): The batch to pad.
+        dp_size (int): Data parallel size.
+        mbs (int): Micro batch size.
+
+    Returns:
+        dict: The padded batch.
+    """
+    min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
+    if min_padding > 0:
+        print(f"Padding last validation batch with {min_padding} padding samples")
+        # Pad input_ids
+        batch["input_ids"] = torch.cat(
+            [
+                batch["input_ids"],
+                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
+            ]
+        )
+        # Pad input_lengths
+        batch["input_lengths"] = torch.cat(
+            [
+                batch["input_lengths"],
+                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
+            ]
+        )
+        if "token_mask" in batch:
+            # Pad token_mask
+            batch["token_mask"] = torch.cat(
+                [
+                    batch["token_mask"],
+                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
+                ]
+            )
+        # Pad sample_mask
+        batch["sample_mask"] = torch.cat(
+            [
+                batch["sample_mask"],
+                torch.zeros_like(batch["sample_mask"][-1])
+                .unsqueeze(0)
+                .repeat(min_padding),
+            ]
+        )
+
+        if "reference_policy_logprobs" in batch:
+            # Pad reference_policy_logprobs
+            batch["reference_policy_logprobs"] = torch.cat(
+                [
+                    batch["reference_policy_logprobs"],
+                    batch["reference_policy_logprobs"][-1]
+                    .unsqueeze(0)
+                    .repeat(min_padding, 1),
+                ]
+            )
+    return batch

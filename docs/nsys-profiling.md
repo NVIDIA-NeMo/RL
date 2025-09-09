@@ -6,7 +6,7 @@ NeMo RL supports Nsight profiling for Ray workers through environment variable p
 
 ## Prerequisites
 
-* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#:~:text=Ubuntu%20(minimal%20setup%20for%20containers)).
+* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation)).
 
 **Note: If you're using NeMo RL containers, `nsys` is already installed.**
 
