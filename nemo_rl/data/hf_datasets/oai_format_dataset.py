@@ -50,11 +50,37 @@ class OpenAIFormatDataset:
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
-        train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
-        val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
+        
+        try:
+            # Try the original approach first (faster and more standard)
+            train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
+            val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
 
-        formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-        formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+            formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
+            formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+            
+            print(f"Loaded dataset using standard approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})")
+            
+        except (TypeError, ValueError, Exception) as e:
+            # Fallback to streaming approach if schema issues occur
+            # This handles cases with heterogeneous tool arguments (e.g., varying is_input field)
+            print(f"Standard loading failed with {type(e).__name__}, falling back to streaming approach...")
+            print(f"This typically happens with heterogeneous tool argument schemas.")
+            
+            # Use streaming=True to bypass schema validation
+            train_original_dataset = load_dataset("json", data_files=train_ds_path, streaming=True)["train"]
+            val_original_dataset = load_dataset("json", data_files=val_ds_path, streaming=True)["train"]
+
+            # Map the streaming datasets
+            formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
+            formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+            
+            # Convert to regular datasets
+            from datasets import Dataset
+            formatted_train_dataset = Dataset.from_list(list(formatted_train_dataset))
+            formatted_val_dataset = Dataset.from_list(list(formatted_val_dataset))
+            
+            print(f"Loaded dataset using streaming approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})")
 
         self.formatted_ds = {
             "train": formatted_train_dataset,
