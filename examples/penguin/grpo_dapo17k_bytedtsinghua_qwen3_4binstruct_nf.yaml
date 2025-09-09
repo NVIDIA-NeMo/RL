@@ -36,7 +36,7 @@ policy:
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: ${grpo.num_prompts_per_step}  # Match the num prompts per step
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
