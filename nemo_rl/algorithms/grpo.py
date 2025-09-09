@@ -611,7 +611,7 @@ def grpo_train(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
                     flush=True,
                 )
-                with timer.time("prepare_for_generation"):
+                with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             policy, policy_generation, colocated_inference, timer=timer
