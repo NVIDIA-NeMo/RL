@@ -26,8 +26,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
-from nemo_rl.data.hf_datasets.skywork import SkyworkOR1Dataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.hf_datasets.skywork import SkyworkOR1Dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -149,9 +149,7 @@ def setup_data(
         )
         data: Any = DeepScalerDataset(seed=seed)
     elif data_config["dataset_name"] == "Skywork-OR1":
-        print(
-            "Loading Skywork/Skywork-OR1-RL-Data for training and validation"
-        )
+        print("Loading Skywork/Skywork-OR1-RL-Data for training and validation")
         data: Any = SkyworkOR1Dataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")

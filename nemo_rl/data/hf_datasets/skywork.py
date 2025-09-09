@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-
 from typing import Any
 
 from datasets import Dataset, load_dataset
@@ -37,10 +36,12 @@ def format_math(data: dict[str, str | float | int]) -> dict[str, list[Any] | str
         "task_name": "math",
     }
 
+
 def format_data(data: dict[str, str | float | int]) -> dict[str, list[Any] | str]:
     data["problem"] = data["prompt"][0]["content"]
     data["answer"] = json.loads(data["reward_model"]["ground_truth"])[0]
     return data
+
 
 def prepare_skywork_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     """Load and split the Skywork-OR1 dataset into train and test sets."""

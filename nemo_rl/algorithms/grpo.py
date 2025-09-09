@@ -688,12 +688,14 @@ def grpo_train(
 
             print("▶ Computing logprobs...")
             with timer.time("policy_and_reference_logprobs"):
-                fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
-                reference_logprobs = policy.get_reference_policy_logprobs(train_data)[
+                fprop_logprobs, inf_metrics = policy.get_logprobs(train_data)
+                reference_logprobs, ref_inf_metrics = (
+                    policy.get_reference_policy_logprobs(train_data)
+                )
+                train_data["prev_logprobs"] = fprop_logprobs["logprobs"]
+                train_data["reference_policy_logprobs"] = reference_logprobs[
                     "reference_logprobs"
                 ]
-                train_data["prev_logprobs"] = fprop_logprobs
-                train_data["reference_policy_logprobs"] = reference_logprobs
 
             print("▶ Preparing for training...")
             with timer.time("training_prep"):
@@ -820,6 +822,8 @@ def grpo_train(
             else:
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
+        metrics.update(inf_metrics)
+        metrics.update({f"{k}_ref": v for k, v in ref_inf_metrics.items()})
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
         # track example with high token mult prob error above 1.05

@@ -123,6 +123,7 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
+from nemo_rl.utils.metrics import get_and_clear_hacky_global_metrics
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -890,6 +891,9 @@ class MegatronPolicyWorker:
                     data_iterator_len = local_gbs // mbs
 
                 rerun_state_machine = get_rerun_state_machine()
+
+                # just to clear the metrics from the previous step
+                _ = get_and_clear_hacky_global_metrics()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
                     self.model.zero_grad_buffer()
@@ -917,6 +921,9 @@ class MegatronPolicyWorker:
                         forward_only=eval_mode,
                         do_not_average_loss=True,
                     )
+
+                    num_steps = len(losses_reduced)
+                    model_metrics = get_and_clear_hacky_global_metrics()
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -1178,6 +1185,7 @@ class MegatronPolicyWorker:
             micro_batch_size = logprob_batch_size
 
         forward_backward_func = get_forward_backward_func()
+        _ = get_and_clear_hacky_global_metrics()
         list_of_logprobs = forward_backward_func(
             forward_step_func=forward_step_fn,
             data_iterator=mb_iterator,
@@ -1208,7 +1216,18 @@ class MegatronPolicyWorker:
             )
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        metrics = {}
+
+        model_metrics = get_and_clear_hacky_global_metrics()
+        for k, v in model_metrics.items():
+            num_layers = len(v) // len(list_of_logprobs)
+            outputs = (
+                torch.as_tensor(v, dtype=torch.float32).view(num_layers, -1).mean(-1)
+            )
+            metrics.update({f"{k}_{i}": v for i, v in enumerate(outputs.tolist())})
+
+        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu"), metrics
 
     @contextmanager
     def use_reference_model(self):
@@ -1275,13 +1294,13 @@ class MegatronPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
-            reference_logprobs = self.get_logprobs(
+            reference_logprobs, model_metrics = self.get_logprobs(
                 data=data, micro_batch_size=micro_batch_size
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
-        return return_data
+        return return_data, model_metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(

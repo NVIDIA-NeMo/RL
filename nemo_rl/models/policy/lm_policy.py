@@ -255,8 +255,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "pipeline_parallel",
             ],
         )
+        outputs = self.worker_group.get_all_worker_results(futures)
+        logprobs = [item[0] for item in outputs]
+
+        # make sure it's replicated on all ranks TODO: is this actually on rank 0?
+        inf_metrics = outputs[0][1]
+
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures)
+            logprobs
         )
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
@@ -264,7 +270,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
-        return logprobs
+        return logprobs, inf_metrics
 
     def get_reference_policy_logprobs(
         self,
@@ -318,10 +324,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             ],
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
-        logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
-            BatchedDataDict.from_batches(
-                self.worker_group.get_all_worker_results(futures)
-            )
+        outputs = self.worker_group.get_all_worker_results(futures)
+        logprobs = [item[0] for item in outputs]
+
+        # make sure it's replicated on all ranks TODO: is this actually on rank 0?
+        inf_metrics = outputs[0][1]
+
+        logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
+            logprobs
         )
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
@@ -329,7 +339,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
 
-        return logprobs
+        return logprobs, inf_metrics
 
     def train(
         self,
