@@ -45,7 +45,7 @@ class SearchEnvConfig(TypedDict):
 
 
 class SearchEnvMetadata(TypedDict):
-    ground_truth: str
+    ground_truth: dict
     num_turns: int
 
 
@@ -231,7 +231,7 @@ class SearchWorker:
         msg = log[-1]["content"]
         return "<answer>" in msg and "</answer>" in msg
 
-    def _get_reward(self, answer: str | None, ground_truth: str, done: bool) -> float:
+    def _get_reward(self, answer: str | None, ground_truth: dict, done: bool) -> float:
         """Get the reward for the search. If not done, return 0.0."""
         if done:
             return compute_score(answer, ground_truth)

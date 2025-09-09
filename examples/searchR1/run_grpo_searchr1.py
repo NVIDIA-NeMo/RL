@@ -58,8 +58,8 @@ def parquet_data_processor(
 ) -> DatumSpec:
     message_logs = list(datum_dict["prompt"])
     message_logs = message_logs[1:]  # neglect the system prompt
-    for idx, message in enumerate(message_logs):
-        last_message = idx == len(message_logs) - 1
+    for i, message in enumerate(message_logs):
+        last_message = i == len(message_logs) - 1
         content = tokenizer.apply_chat_template(
             [message],
             tokenize=False,

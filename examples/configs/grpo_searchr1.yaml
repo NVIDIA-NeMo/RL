@@ -26,7 +26,7 @@ policy:
 
 data:
   train_data_path: "examples/searchR1/data/searchR1/train.parquet"
-  valid_data_path: "examples/searchR1/data/searchR1/validation.parquet"
+  val_data_path: "examples/searchR1/data/searchR1/validation.parquet"
 
 cluster:
   gpus_per_node: 8
