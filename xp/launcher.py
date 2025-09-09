@@ -21,12 +21,12 @@ from typing import Any, Dict, List, Tuple, Optional
 import yaml
 
 
-# Environment variables
-ACCOUNT = os.environ["ACCOUNT"]
-PARTITION = os.environ["PARTITION"]
-LOG_DIR = os.environ["LOG"] + "/nemo-rl"
-WORKSPACE = os.environ["WORKSPACE"]
-CONTAINER = os.environ["CON"] + "/nemo_rl_base.sqsh"
+# Environment variables (optional for local runs)
+ACCOUNT = os.environ.get("ACCOUNT", "default_account")
+PARTITION = os.environ.get("PARTITION", "default_partition")
+LOG_DIR = os.environ.get("LOG", "./logs") + "/nemo-rl"
+WORKSPACE = os.environ.get("WORKSPACE", os.getcwd())
+CONTAINER = os.environ.get("CON", ".") + "/nemo_rl_base.sqsh"
 MOUNTS = f"/lustre:/lustre,{WORKSPACE}:/workspace"
 
 def parse_args():
@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--mounts", type=str, default=MOUNTS, help="Mounts to use")
     parser.add_argument("--jobname", type=str, default=None, help="Base name for the job")
     parser.add_argument("--dry", action="store_true", help="Print commands without executing them")
+    parser.add_argument("--local", action="store_true", help="Run experiments locally using 'uv run' (debug mode - only runs first parameter combination)")
     parser.add_argument("--chain", type=int, default=1, help="Number of jobs per sweep configuration to chain together")
     args, extra_args = parser.parse_known_args()
     return args, extra_args
@@ -261,6 +262,66 @@ def format_parameter_override(param_dict: Dict[str, Any]) -> str:
     return " ".join(overrides)
 
 
+def launch_experiment_local(
+    script: str,
+    config: Optional[str],
+    param_overrides: str,
+    job_name: str,
+    dry_run: bool = False,
+    extra_args: List[str] = None,
+) -> Tuple[str, Optional[str]]:
+    """Launch a single experiment locally using uv run."""
+    # Construct the command
+    command = f"uv run {script}"
+    if config:
+        command += f" --config {config}"
+    
+    # Set local log directory
+    log_dir = os.path.join("./logs", job_name)
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    
+    # Parse extra arguments into overrides
+    all_args = list(extra_args) if extra_args else []
+    default_args = [
+        f"logger.log_dir={log_dir}",
+        "logger.wandb_enabled=False",  # Disable wandb for local runs
+        f"checkpointing.checkpoint_dir={checkpoint_dir}",
+        "cluster.num_nodes=1"  # Always use 1 node for local
+    ]
+    all_args.extend(default_args)
+    extra_overrides = parse_extra_args(all_args)
+    
+    # If we have parameter overrides, parse them and merge with extra overrides
+    if param_overrides:
+        # Split the param_overrides string into key-value pairs
+        param_dict = {}
+        for param in param_overrides.split():
+            if '=' in param:
+                key, value = param.split('=', 1)
+                # Remove quotes if present
+                value = value.strip("'")
+                param_dict[key] = value
+        
+        # Update with extra overrides (they take precedence)
+        param_dict.update(extra_overrides)
+        command += " " + format_parameter_override(param_dict)
+    elif extra_overrides:
+        # If no param_overrides but we have extra_overrides, use those
+        command += " " + format_parameter_override(extra_overrides)
+    
+    if dry_run:
+        return command, None
+    else:
+        # Create log directory
+        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Run the command locally
+        print(f"Running locally: {command}")
+        result = subprocess.run(command, shell=True)
+        return command, "local" if result.returncode == 0 else "failed"
+
+
 def launch_experiment(
     script: str,
     config: Optional[str],
@@ -403,17 +464,30 @@ def main():
     # Determine the number of nodes after potentially getting config_path from sweep
     num_nodes = get_num_nodes(config_path, args.nodes)
     
-    # Print header
-    mode = "DRY RUN" if args.dry else "SUBMITTING"
-    total_jobs = len(param_combinations) * args.chain
-    print(f"\n=== {mode} - Experiments ===")
-    print(f"Parameter combinations: {len(param_combinations)}")
-    print(f"Jobs per chain: {args.chain}")
-    print(f"Total jobs: {total_jobs}\n")
+    # For local runs, only use the first parameter combination for debugging
+    if args.local:
+        param_combinations = param_combinations[:1]
+        if len(param_combinations) > 1:
+            print("WARNING: --local flag detected. Running only the first parameter combination for debugging.\n")
     
-    if args.chain > 1:
-        print("NOTE: Jobs in each chain will run sequentially using Slurm singleton dependency.")
-        print("Chains for different parameter combinations will run in parallel.\n")
+    # Print header
+    if args.local:
+        mode = "DRY RUN (LOCAL)" if args.dry else "RUNNING LOCALLY"
+        total_jobs = len(param_combinations)  # No chains for local runs
+        print(f"\n=== {mode} - Experiments ===")
+        print(f"Parameter combinations: {len(param_combinations)}")
+        print(f"Total jobs: {total_jobs} (local debug mode)\n")
+    else:
+        mode = "DRY RUN" if args.dry else "SUBMITTING"
+        total_jobs = len(param_combinations) * args.chain
+        print(f"\n=== {mode} - Experiments ===")
+        print(f"Parameter combinations: {len(param_combinations)}")
+        print(f"Jobs per chain: {args.chain}")
+        print(f"Total jobs: {total_jobs}\n")
+        
+        if args.chain > 1:
+            print("NOTE: Jobs in each chain will run sequentially using Slurm singleton dependency.")
+            print("Chains for different parameter combinations will run in parallel.\n")
     
     # Launch experiments
     job_counter = 0
@@ -437,42 +511,68 @@ def main():
         # Shared log directory for all jobs in this chain
         log_dir_name = shared_job_name
         
-        # Submit all jobs in this chain
-        for chain_idx in range(args.chain):
-            # Use singleton dependency for jobs after the first in the chain
-            dependency = "singleton" if chain_idx > 0 else None
-            
-            # Launch experiment
-            cmd, job_id = launch_experiment(
+        if args.local:
+            # For local runs, don't use chains - just run once
+            cmd, job_id = launch_experiment_local(
                 script=script_path,
                 config=config_path,
                 param_overrides=param_overrides,
-                nodes=num_nodes,
-                time=args.time,
-                account=args.account,
-                partition=args.partition,
-                container=args.container,
-                mounts=args.mounts,
-                job_name=shared_job_name,  # Same name for all jobs in chain
+                job_name=shared_job_name,
                 dry_run=args.dry,
                 extra_args=extra_args,
-                dependency=dependency,
-                log_dir_name=log_dir_name,
             )
             
             # Print experiment info
             print_experiment_info(
-                job_name=f"{shared_job_name}_chain{chain_idx+1}" if args.chain > 1 else shared_job_name,
+                job_name=shared_job_name,
                 params=params,
                 cmd=cmd,
                 job_id=job_id,
                 dry_run=args.dry,
-                dependency=dependency,
+                dependency=None,
             )
             
             job_counter += 1
+        else:
+            # Submit all jobs in this chain
+            for chain_idx in range(args.chain):
+                # Use singleton dependency for jobs after the first in the chain
+                dependency = "singleton" if chain_idx > 0 else None
+                
+                # Launch experiment
+                cmd, job_id = launch_experiment(
+                    script=script_path,
+                    config=config_path,
+                    param_overrides=param_overrides,
+                    nodes=num_nodes,
+                    time=args.time,
+                    account=args.account,
+                    partition=args.partition,
+                    container=args.container,
+                    mounts=args.mounts,
+                    job_name=shared_job_name,  # Same name for all jobs in chain
+                    dry_run=args.dry,
+                    extra_args=extra_args,
+                    dependency=dependency,
+                    log_dir_name=log_dir_name,
+                )
+                
+                # Print experiment info
+                print_experiment_info(
+                    job_name=f"{shared_job_name}_chain{chain_idx+1}" if args.chain > 1 else shared_job_name,
+                    params=params,
+                    cmd=cmd,
+                    job_id=job_id,
+                    dry_run=args.dry,
+                    dependency=dependency,
+                )
+                
+                job_counter += 1
     
-    print(f"{total_jobs} jobs submitted: {len(param_combinations)} sweeps, with chain size {args.chain}.")
+    if args.local:
+        print(f"{total_jobs} experiments run locally: {len(param_combinations)} parameter combination(s).")
+    else:
+        print(f"{total_jobs} jobs submitted: {len(param_combinations)} sweeps, with chain size {args.chain}.")
 
 
 if __name__ == "__main__":
