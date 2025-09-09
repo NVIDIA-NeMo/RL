@@ -26,8 +26,7 @@ What you can expect:
 - **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
-Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/euronymous-aithal-patch-1/docs/design-docs) for more details on the architecture and design philosophy.
-
+Please refer to our [design documents](docs/design-docs/) for more details on the architecture and design philosophy.
 ### Training Backends
 NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
 
