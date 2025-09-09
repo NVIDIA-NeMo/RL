@@ -36,8 +36,15 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
+
+        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
+        if llm_kwargs.get("compilation_config", None):
+            llm_kwargs["compilation_config"] = CompilationConfig(
+                **llm_kwargs["compilation_config"]
+            )
 
         self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
 

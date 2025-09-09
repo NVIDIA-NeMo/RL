@@ -37,6 +37,11 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
 }
 
+# Configuration keys that are allowed to be added to base configs during testing
+# These keys may exist in recipe configs but not in base configs, so we need to
+# manually add them to avoid merge conflicts during config validation
+ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.generation.vllm_kwargs"]
+
 
 @pytest.fixture
 def nightly_test_suite():
@@ -262,6 +267,18 @@ def test_all_recipes_can_merge_configs_with_base_config(
         recipe_yaml_path = os.path.join(recipes_dir, recipe_yaml)
         recipe_config = load_config(recipe_yaml_path)
         OmegaConf.set_struct(recipe_config, True)
+
+        # Work around ALLOWED_ADDITIONAL_CONFIG_KEYS by manually adding allowed keys to the base config
+        # This prevents merge conflicts when recipe configs contain keys not present in base configs
+        for key in ALLOWED_ADDITIONAL_CONFIG_KEYS:
+            if OmegaConf.select(recipe_config, key):
+                OmegaConf.update(
+                    base_config,
+                    key,
+                    OmegaConf.select(recipe_config, key),
+                    force_add=True,
+                )
+
         # This will raise a error if the config can't be merged
         print(f"Merging {recipe_yaml} with {base_yaml}")
         merged_config = OmegaConf.merge(base_config, recipe_config)
