@@ -45,7 +45,11 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.quantization.fp8 import FP8Config
+from nemo_automodel.components.quantization.fp8 import (
+    apply_fp8_to_model,
+    build_fp8_config,
+    verify_fp8_conversion,
+)
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -170,11 +174,6 @@ class DTensorPolicyWorkerV2:
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
         # Load FP8 config from nemo-automodel's definition
-        self.fp8_config = (
-            FP8Config(**self.cfg["dtensor_cfg"]["fp8"])
-            if "fp8" in self.cfg["dtensor_cfg"]
-            else None
-        )
 
         model_config = AutoConfig.from_pretrained(
             model_name,
@@ -234,6 +233,8 @@ class DTensorPolicyWorkerV2:
                 config=model_config,
                 use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
+                use_liger_kernel=False,
+                # quantization_config=self.fp8_config,
             )
 
             full_state_dict = model.state_dict()
@@ -260,6 +261,14 @@ class DTensorPolicyWorkerV2:
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
+
+            if "fp8" in self.cfg["dtensor_cfg"]:
+                fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
+                self.model = apply_fp8_to_model(self.model, config=fp8_config)
+                results = verify_fp8_conversion(self.model)
+                print(f"[Rank {self.rank}] Model FP8 results: {results['success']}")
+
+        print(f"[Rank {self.rank}] Model data type: {self.model.dtype}")
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
