@@ -17,8 +17,8 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
 import pytest
 
 @pytest.mark.parametrize("model_name, gbs, seqlen, expected_flops", [
-    ("meta-llama/Llama-2-7b-hf", 128, 4096, 1.92e16),
-    ("meta-llama/Llama-2-13b-hf", 128, 4096, 3.66e16),
+    ("meta-llama/Llama-2-7b-hf", 128, 4096, 2.25e16),
+    ("meta-llama/Llama-2-13b-hf", 128, 4096, 4.17e16),
     ("meta-llama/Llama-2-70b-hf", 128, 4096, 2.25e17),
 
     ("meta-llama/Meta-Llama-3-8B", 128, 8192, 5.31e16),

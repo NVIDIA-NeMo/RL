@@ -59,7 +59,7 @@ def convert_config_to_flops_config(
             layers=config.num_hidden_layers,
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
-            query_groups=config.num_attention_heads / config.num_key_value_heads,
+            query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
             # for non-MoE models, we use the intermediate size as the ffn hidden size
             moe_ffn_hidden_size=config.intermediate_size,
@@ -71,7 +71,7 @@ def convert_config_to_flops_config(
             hs=config.hidden_size,
             layers=config.num_hidden_layers,
             ffn_hs=config.intermediate_size,
-            query_groups=config.num_attention_heads / config.num_key_value_heads,
+            query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
         ), llama3 if "llama-3" in model_name.lower() else llama2
