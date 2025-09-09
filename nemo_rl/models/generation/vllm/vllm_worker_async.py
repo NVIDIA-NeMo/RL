@@ -57,14 +57,24 @@ Reference token ids: {reference_token_ids}
 Actual token ids: {actual_token_ids}"""
 
     # Now we want to try to find the subsequence of actual_token_ids that corresponds to reference_str
-    # Since tokenizers are trained to encode text in the least number of tokens, it's a fair assumption that the
-    # tokens output by the model to represent the reference str is lessthan or equal to the number of tokens
-    # that tokenization needed to represent the reference str
+    # Our first guess is just the prefix in actual_token_ids of length reference_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
+    # If there are a lot, this will be a poor guess. If there aren't that many this is a good guess.
     candidate_token_ids = actual_token_ids[:len(reference_token_ids)]
     candidate_str = tokenizer.decode(candidate_token_ids)
-    while candidate_str != reference_str and len(candidate_str) > len(reference_str):
-        candidate_token_ids.pop()
-        candidate_str = tokenizer.decode(candidate_token_ids)
+
+    # If it's longer, we remove
+    if len(candidate_str) > len(reference_str):
+        while candidate_str != reference_str and len(candidate_str) > len(reference_str) and candidate_token_ids:
+            candidate_token_ids.pop()
+            candidate_str = tokenizer.decode(candidate_token_ids)
+    # If it's shorter we append
+    elif len(candidate_str) < len(reference_str):
+        while candidate_str != reference_str and len(candidate_str) < len(reference_str) and len(candidate_token_ids) < len(actual_token_ids) - 1:
+            candidate_token_ids.append(actual_token_ids[len(candidate_token_ids)])
+            candidate_str = tokenizer.decode(candidate_token_ids)
+    # If it's equal we should not need to do any modification. The assert below will directly error out.
+    else:
+        pass
 
     assert candidate_str == reference_str
 
