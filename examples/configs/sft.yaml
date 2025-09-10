@@ -140,6 +140,7 @@ data:
   dataset_name: "squad"
   # You can use custom response datasets for training and validation. For example:
   #   data:
+  #     dataset_name: ResponseDataset
   #     train_data_path: <LocalPathToTrainingDataset>
   #     val_data_path: <LocalPathToValidationDataset>
   #     input_key: <QuestionKey>, default is "input"

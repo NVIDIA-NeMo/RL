@@ -31,7 +31,7 @@ from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 def load_response_dataset(data_config, seed: int = 42):
     """Loads response dataset."""
-    dataset_name = data_config["dataset_name"] if "dataset_name" in data_config else ""
+    dataset_name = data_config["dataset_name"]
 
     # TODO @yukih: remove duplicated dataset_name (openmathinstruct2, clevr_cogent)
     # for sft training
@@ -86,7 +86,7 @@ def load_response_dataset(data_config, seed: int = 42):
             split=data_config["split"],
         )
     # fall back to load from JSON file
-    else:
+    elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
             raise ValueError(
                 "train_data_path is required when dataset_name is not one of the built-ins."
@@ -104,6 +104,12 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset = ResponseDataset(
             train_data_path=data_config["train_data_path"],
             **extra_kwargs,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported {dataset_name=}. "
+            "Please either use a built-in dataset "
+            "or set dataset_name=ResponseDataset to load from local JSONL file or Hugging Face."
         )
 
     return base_dataset

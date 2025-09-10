@@ -43,6 +43,7 @@ By default, NeMo RL has support for [OpenMathInstruct-2](../../nemo_rl/data/data
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
+  dataset_name: ResponseDataset
   train_data_path: <LocalPathToTrainingDataset>
   val_data_path: <LocalPathToValidationDataset>
   input_key: <QuestionKey>, default is "input"
