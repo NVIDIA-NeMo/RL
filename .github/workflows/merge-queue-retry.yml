@@ -36,6 +36,8 @@ jobs:
       - name: Check dequeue reason and retry count
         id: check_retry
         if: github.event.reason == 'CI_TIMEOUT'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
 
@@ -62,22 +64,22 @@ jobs:
             echo "should_retry=false" >> $GITHUB_OUTPUT
             echo "❌ Max retries ($MAX_RETRIES) reached for PR #${PR_NUMBER}"
           fi
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
 
       - name: Add retry comment
         if: steps.check_retry.outputs.should_retry == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
           RETRY_COUNT=${{ steps.check_retry.outputs.retry_count }}
 
           gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
             -f body="🔄 Auto-retry attempt ${RETRY_COUNT}: PR was removed from merge queue, automatically requeuing..."
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
 
       - name: Requeue Pull Request
         if: steps.check_retry.outputs.should_retry == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
           PR_NODE_ID="${{ github.event.pull_request.node_id }}"
@@ -92,35 +94,25 @@ jobs:
             https://api.github.com/graphql)
 
           if echo "$GRAPHQL_RESPONSE" | jq -e '.data.enqueuePullRequest' > /dev/null; then
-            echo "PR #${PR_NUMBER} has been successfully requeued using GraphQL API"
-          else
-            echo "GraphQL enqueue failed, falling back to gh CLI method..."
-            echo "GraphQL response: $GRAPHQL_RESPONSE"
-
-            # Fallback: Enable auto-merge for the PR (this adds it back to merge queue)
-            gh pr merge $PR_NUMBER --auto --merge
-
-            echo "PR #${PR_NUMBER} has been requeued using gh CLI fallback"
+            echo "PR #${PR_NUMBER} has been successfully requeued"
           fi
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
 
       - name: Max retries reached comment
         if: steps.check_retry.outputs.should_retry == 'false'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
 
           gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
             -f body="⚠️ Maximum auto-retry attempts reached. PR was removed from merge queue multiple times. Please investigate the issue and manually requeue if needed."
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
 
       - name: Notify on failure
         if: failure()
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
 
           gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
             -f body="❌ Auto-retry failed due to an error in the workflow. Please manually requeue the PR."
-        env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
