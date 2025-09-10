@@ -109,6 +109,8 @@ class RewardModelEnvironment(EnvironmentInterface):
         self.config["max_grad_norm"] = None
         # Reward model environment is always using DTensor
         self.config["dtensor_cfg"]["enabled"] = True
+        self.config["dtensor_cfg"]["cpu_offload"] = False
+        self.config["dtensor_cfg"]["activation_checkpointing"] = False
 
         self.task_data_spec = TaskDataSpec(
             task_name="reward_model_env",
