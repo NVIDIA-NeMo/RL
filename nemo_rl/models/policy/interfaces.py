@@ -94,6 +94,13 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
+        pass
+
+    @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         pass
 

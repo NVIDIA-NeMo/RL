@@ -190,12 +190,6 @@ class RewardModelEnvironment(EnvironmentInterface):
             pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
         )
 
-        max_model_len = self.config["max_model_len"]
-        if input_lengths.max().item() > max_model_len:
-            print(
-                f"⚠️  Truncating sequences from {input_lengths.max().item()} to {max_model_len}"
-            )
-
         # Create data in the format expected by DTensorRewardModelWorker
         reward_data = BatchedDataDict[GenerationDatumSpec](
             {

@@ -1227,7 +1227,7 @@ class DTensorPolicyWorkerV2:
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
-                    context_parallel_ctx = self.create_context_parallel_ctx(
+                    context_parallel_ctx = create_context_parallel_ctx(
                         cp_mesh=self.cp_mesh,
                         cp_buffers=cp_buffers,
                         cp_seq_dims=[sequence_dim] * len(cp_buffers),
