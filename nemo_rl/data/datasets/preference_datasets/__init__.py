@@ -33,7 +33,9 @@ def load_preference_dataset(data_config):
     # fall back to load from JSON file
     elif dataset_name == "BinaryPreferenceDataset":
         if "train_data_path" not in data_config:
-            raise ValueError("train_data_path is required for dataset_type='binary'.")
+            raise ValueError(
+                "train_data_path is required for dataset_name=BinaryPreferenceDataset."
+            )
         extra_kwargs = get_extra_kwargs(
             data_config,
             [
@@ -51,7 +53,9 @@ def load_preference_dataset(data_config):
         )
     elif dataset_name == "PreferenceDataset":
         if "train_data_path" not in data_config:
-            raise ValueError("train_data_path is required for dataset_type='ranked'.")
+            raise ValueError(
+                "train_data_path is required for dataset_name=PreferenceDataset."
+            )
         extra_kwargs = get_extra_kwargs(
             data_config,
             [
