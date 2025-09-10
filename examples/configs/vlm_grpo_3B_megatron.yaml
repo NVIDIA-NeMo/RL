@@ -27,7 +27,7 @@ policy:
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: False # TODO: check sequence packing support for VLM
+    enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
