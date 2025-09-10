@@ -41,7 +41,7 @@ def _maybe_correct_merged_tokens(
     """
     This is a subroutine used inside the vLLM Chat Completion server. Some environments (namely Penguin) require an OpenAI compatible server endpoint rather than an inference engine handle. This is fine for the most part, but it may cause issues when the environment is used as a part of training.
 
-    RL training frameworks train models on token IDs, but the OpenAI compatible server communicates in what is basically de-tokenized text. When multiple model calls are made to the OpenAI compatible server in a single trajectory, model generations in previous model calls may be re-tokenized to something that is different than what was generated. This is not too big of an issue (that we know of) at inference time, but the log probs the model produces are different enough for the differently re-tokenized generation result that it causes the training to be off policy. Off policy isn't necessarily a bad thing in isolation, but this source of off-policyness may cause unexpected issues if not properly accounted for.
+    RL training frameworks train models on token IDs, but the OpenAI compatible server communicates in what is basically de-tokenized text. When multiple model calls are made to the OpenAI compatible server in a single trajectory, model generations in previous model calls may be re-tokenized to something that is different than what was generated. This is not too big of an issue (that we know of) at inference time, but the log probs the model produces are different enough for the differently re-tokenized generation result that it causes the training to be off policy. Off policy isn't necessarily a bad thing in isolation, but this source of off-policyness may cause unexpected issues if not properly accounted for. It also mis-aligns the token ID sequences across model calls, which feels very strange during training.
 
     Thus, in this function we attempt to correct any minor re-tokenization errors in an effort to stay on-policy as possible. We require the tokenizer, the ground truth reference token ids taken directly from previous model calls, and the re-tokenized actual token ids.
 
@@ -61,7 +61,7 @@ def _maybe_correct_merged_tokens(
     if not reference_token_ids:
         return actual_token_ids
 
-    # No merges
+    # No re-tokenization errors
     if reference_token_ids == actual_token_ids[:len(reference_token_ids)]:
         return actual_token_ids
 
