@@ -42,7 +42,7 @@ policy:
   generation_batch_size: 32 # Only used when generating using HF backend
   max_total_sequence_length: 32768
   precision: "bfloat16"
-  logprob_chunk_size: 512
+  logprob_chunk_size: 1024
 
   dtensor_cfg:
     _v2: false
