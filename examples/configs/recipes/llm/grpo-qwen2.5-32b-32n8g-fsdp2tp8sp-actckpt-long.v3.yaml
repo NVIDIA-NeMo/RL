@@ -1,133 +1,57 @@
+defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
-  max_rollout_turns: 1
-  max_num_epochs: 1
   max_num_steps: 20
-  normalize_rewards: true
-  use_leave_one_out_baseline: true
-  val_period: 10
-  val_at_start: false
-  max_val_samples: 256
-  val_batch_size: 256
-  seed: 42
-  overlong_filtering: false
-loss_fn:
-  reference_policy_kl_penalty: 0.01
-  ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
-  ratio_clip_c: null
-  use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
-  token_level_loss: true
 checkpointing:
-  enabled: true
   checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
-  metric_name: val_reward
-  higher_is_better: true
-  keep_top_k: 3
-  save_period: 10
-  checkpoint_must_save_by: null
 policy:
   model_name: Qwen/Qwen2.5-32B
   tokenizer:
     name: Qwen/Qwen2.5-32B
-  train_global_batch_size: 512
   train_micro_batch_size: 1
-  generation_batch_size: 32
   logprob_batch_size: 2
   max_total_sequence_length: 16384
-  precision: bfloat16
   dtensor_cfg:
-    enabled: true
-    cpu_offload: false
     sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 8
-    context_parallel_size: 1
-    custom_parallel_plan: null
   dynamic_batching:
-    enabled: True
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    sequence_length_round: 64
+    enabled: true
   sequence_packing:
     enabled: false
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
   make_sequence_length_divisible_by: 8
-  max_grad_norm: 1
   optimizer:
-    name: torch.optim.AdamW
     kwargs:
-      lr: 3e-07
-      weight_decay: 0.01
-      betas:
-        - 0.9
-        - 0.999
-      eps: 1e-08
-      foreach: false
-      fused: false
+      lr: 3.0e-07
   scheduler:
-    - name: torch.optim.lr_scheduler.LinearLR
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1
-        total_iters: 13
-    - name: torch.optim.lr_scheduler.ConstantLR
-      kwargs:
-        factor: 1
-        total_iters: 10000000000
-    - milestones:
-        - 13
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1
+      total_iters: 13
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1
+      total_iters: 10000000000
+  - milestones:
+    - 13
   generation:
-    backend: vllm
     max_new_tokens: 16384
-    temperature: 1
-    top_p: 1
-    top_k: null
     stop_token_ids:
-      - 151643
-    stop_strings: null
+    - 151643
     vllm_cfg:
-      async_engine: false
-      precision: ${policy.precision}
       tensor_parallel_size: 4
-      pipeline_parallel_size: 1
-      enable_expert_parallel: false
-      gpu_memory_utilization: 0.6
       max_model_len: 16384
-      enforce_eager: False
-    colocated:
-      enabled: true
-      resources:
-        gpus_per_node: null
-        num_nodes: null
 data:
   max_input_seq_length: 16384
-  prompt_file: examples/prompts/cot.txt
-  system_prompt_file: null
-  dataset_name: OpenMathInstruct-2
-  shuffle: true
-env:
-  math:
-    num_workers: 8
 logger:
   log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
-  num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
-  mlflow_enabled: false
-  monitor_gpus: true
   wandb:
     project: nemo-rl
     name: grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt-long
-  tensorboard: {}
-  gpu_monitoring:
-    collection_interval: 10
-    flush_interval: 10
 cluster:
   gpus_per_node: 8
   num_nodes: 32
