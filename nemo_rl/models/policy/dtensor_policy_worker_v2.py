@@ -166,6 +166,23 @@ class DTensorPolicyWorkerV2:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        if cp_size > 1 and self.enable_seq_packing:
+            raise ValueError(
+                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+        dp_size = world_size // tp_size // cp_size
+        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
+        assert world_size == dp_size * tp_size * cp_size, (
+            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
+        )
+
+        if sequence_parallel_enabled and tp_size == 1:
+            print(
+                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
+            )
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -215,12 +232,24 @@ class DTensorPolicyWorkerV2:
 
         full_state_dict = None
         model_state_dict_keys = None
+        use_liger_kernel = self.cfg["dtensor_cfg"].get("use_liger_kernel", False)
+
+        # Check for incompatible configuration: liger-kernel doesn't support context parallel yet
+        if use_liger_kernel and cp_size > 1:
+            raise ValueError(
+                f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                "Liger-kernel doesn't support context parallel yet. "
+                "Please either set use_liger_kernel=False or context_parallel_size=1."
+            )
+
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
+                use_liger_kernel=use_liger_kernel,
+                attn_implementation=model_config._attn_implementation,
                 config=model_config,
                 use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
@@ -236,38 +265,19 @@ class DTensorPolicyWorkerV2:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
-            # so we need to set it to None if sequence packing is disabled
+            # NeMoAutoModelForCausalLM exposes attn_implementation in the from_config method and
+            # sets flash_attention_2 by default so we need to set it model_config._attn_implementation
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
-                use_liger_kernel=False,
+                attn_implementation=model_config._attn_implementation,
+                use_liger_kernel=use_liger_kernel,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
-
-        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
-        if cp_size > 1 and self.enable_seq_packing:
-            raise ValueError(
-                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-            )
-        dp_size = world_size // tp_size // cp_size
-        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
-        assert world_size == dp_size * tp_size * cp_size, (
-            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
-        )
-
-        if sequence_parallel_enabled and tp_size == 1:
-            print(
-                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
-            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
