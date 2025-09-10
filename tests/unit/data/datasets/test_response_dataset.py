@@ -57,6 +57,7 @@ def test_dataset_initialization(sample_data):
     # load the dataset
     train_path, val_path = sample_data
     data_config = {
+        "dataset_name": "ResponseDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
     }
@@ -73,6 +74,7 @@ def test_custom_keys(sample_data):
     # load the dataset
     train_path, val_path = sample_data
     data_config = {
+        "dataset_name": "ResponseDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "input_key": "question",
@@ -90,6 +92,7 @@ def test_message_formatting(sample_data):
     # load the dataset
     train_path, val_path = sample_data
     data_config = {
+        "dataset_name": "ResponseDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "input_key": "question",

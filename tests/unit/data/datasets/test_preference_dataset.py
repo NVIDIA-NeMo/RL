@@ -22,7 +22,7 @@ from nemo_rl.data.datasets import load_preference_dataset
 
 
 @pytest.fixture
-def mock_rank_data():
+def mock_preference_data():
     """Create temporary preference dataset files with sample data."""
     preference_data = [
         {
@@ -78,10 +78,13 @@ def mock_rank_data():
         os.unlink(preference_path)
 
 
-def test_rank_dataset_initialization(mock_rank_data):
+def test_preference_dataset_initialization(mock_preference_data):
     """Test that PreferenceDataset initializes correctly with valid data files."""
     # Load the dataset
-    data_config = {"train_data_path": mock_rank_data, "dataset_type": "rank"}
+    data_config = {
+        "dataset_name": "PreferenceDataset",
+        "train_data_path": mock_preference_data,
+    }
     dataset = load_preference_dataset(data_config)
 
     # Verify dataset initialization
@@ -92,10 +95,13 @@ def test_rank_dataset_initialization(mock_rank_data):
     assert len(dataset.formatted_ds["train"]) == 2
 
 
-def test_rank_dataset_data_format(mock_rank_data):
+def test_preference_dataset_data_format(mock_preference_data):
     """Test that PreferenceDataset correctly loads and formats the data."""
     # Load the dataset
-    data_config = {"train_data_path": mock_rank_data, "dataset_type": "rank"}
+    data_config = {
+        "dataset_name": "PreferenceDataset",
+        "train_data_path": mock_preference_data,
+    }
     dataset = load_preference_dataset(data_config)
 
     # Verify data format
@@ -121,7 +127,7 @@ def test_rank_dataset_data_format(mock_rank_data):
 
 
 @pytest.fixture
-def mock_chosen_rejected_data():
+def mock_binary_preference_data():
     """Create temporary chosen_rejected dataset files with sample data."""
     train_data = [
         {
@@ -163,12 +169,12 @@ def mock_chosen_rejected_data():
     os.unlink(val_path)
 
 
-def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
+def test_binary_preference_dataset_initialization(mock_binary_preference_data):
     """Test that PreferenceDataset initializes correctly with valid data files."""
     # Load the dataset
-    train_path, val_path = mock_chosen_rejected_data
+    train_path, val_path = mock_binary_preference_data
     data_config = {
-        "dataset_type": "binary",
+        "dataset_name": "BinaryPreferenceDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "prompt_key": "prompt",
@@ -188,11 +194,11 @@ def test_chosen_rejected_dataset_initialization(mock_chosen_rejected_data):
     assert len(dataset.formatted_ds["validation"]) == 1
 
 
-def test_chosen_rejected_dataset_invalid_files():
+def test_binary_preference_dataset_invalid_files():
     """Test that PreferenceDataset raises appropriate errors with invalid files."""
     with pytest.raises(FileNotFoundError):
         data_config = {
-            "dataset_type": "binary",
+            "dataset_name": "BinaryPreferenceDataset",
             "train_data_path": "nonexistent.json",
             "val_data_path": "nonexistent.json",
             "prompt_key": "prompt",
@@ -202,12 +208,12 @@ def test_chosen_rejected_dataset_invalid_files():
         load_preference_dataset(data_config)
 
 
-def test_chosen_rejected_dataset_data_format(mock_chosen_rejected_data):
+def test_binary_preference_dataset_data_format(mock_binary_preference_data):
     """Test that PreferenceDataset correctly formats the data."""
     # Load the dataset
-    train_path, val_path = mock_chosen_rejected_data
+    train_path, val_path = mock_binary_preference_data
     data_config = {
-        "dataset_type": "binary",
+        "dataset_name": "BinaryPreferenceDataset",
         "train_data_path": train_path,
         "val_data_path": val_path,
         "prompt_key": "prompt",
