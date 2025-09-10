@@ -292,7 +292,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly set this to -1.
+            # Right now we explicitly assert set this to -1.
+            assert request.top_k in (None, -1), (
+                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+            )
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
