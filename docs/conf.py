@@ -22,7 +22,7 @@
 
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Any
 
 import git
@@ -119,6 +119,7 @@ def _convert_gh_admonitions(
     app: Sphinx, relative_path: Path, parent_docname: str, contents: list[str]
 ) -> None:
     """Supporting rendering GitHub alerts correctly.
+
     # https://github.com/executablebooks/MyST-Parser/issues/845
     """
     _github_admonitions = {
@@ -168,25 +169,63 @@ class _GitHubLinkTransform(Transform):
 
     default_priority = 500  # type: ignore[bad-override]
 
+    @staticmethod
+    def _get_github_source_url(repo: git.Repo) -> PosixPath:
+        # Find out which remote GitHub repo should be the source.
+        if "origin" in repo.remotes:
+            url = repo.remotes.origin.url
+        elif len(repo.remotes) == 1:
+            url = repo.remotes[0].url
+        else:
+            raise ValueError(
+                "Cannot determine which remote repo on GitHub this local repo is from."
+            )
+        # Canonicalize the URL.
+        if url.startswith("git@github.com:"):
+            url = url.replace("git@github.com:", "https://github.com/", 1)
+        if url.endswith(".git"):
+            url = url[: -len(".git")]
+        return PosixPath(url)
+
     def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
-        repo = git.Repo(search_parent_directories=True)
-        origin_url = repo.remotes.origin.url
-        if origin_url.startswith("git@github.com:"):
-            origin_url = origin_url.replace("git@github.com:", "https://github.com/", 1)
-        if origin_url.endswith(".git"):
-            origin_url = origin_url[: -len(".git")]
-        blob = f"blob/{repo.head.object.hexsha}"
+        try:
+            local_repo = git.Repo(search_parent_directories=True)
+            remote_repo_url = self._get_github_source_url(local_repo)
+        except Exception:
+            # Cannot figure out which source url it should be; leave links as-is.
+            return
+        if local_repo.working_tree_dir is None:
+            # If the local repo is a bare repo, the method below won't work.
+            return
+        wt_dir = local_repo.working_tree_dir
+
         for node in self.document.traverse(addnodes.download_reference):
-            # `node["refdoc"]` would be, e.g., "guides/grpo". Therefore, `md_dir` would
-            # be, e.g., `"docs/guides"`.
-            # Avoid using `os.path` or `pathlib` for path manipulation because, well,
-            # what if we try to build the docs on Windows?
-            md_dir = "/".join(["docs"] + node["refdoc"].split("/")[:-1])
-            # `file_path` would be `"docs/grpo/../../examples/run_grpo_math.py"`.
-            file_path = "/".join((md_dir, node["reftarget"]))
-            # `refuri` would be `"https://github.com/NVIDIA-NeMo/RL/blob/<commit sha>/docs/guides/../../examples/run_grpo_math.py"`.
-            refuri = "/".join((origin_url, blob, file_path))
-            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
+            md_dir = Path(node["refdoc"]).parent
+            dst_path = md_dir / Path(node["reftarget"])
+            try:
+                dst_path = dst_path.resolve(strict=True)
+            except OSError:
+                # If the path doesn't exist or a symlink loop is encountered.
+                continue
+            if dst_path.is_file():
+                kind = "blob"
+            elif dst_path.is_dir():
+                kind = "tree"
+            else:
+                # Cannot figure out what type of thing this path is pointing to.
+                continue
+            refuri = (
+                remote_repo_url
+                / PosixPath(kind)
+                / PosixPath(local_repo.head.object.hexsha)
+                / dst_path.relative_to(wt_dir).as_posix()
+            )
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=str(refuri))
+            # Preserve styling and title if present.
+            if "classes" in node:
+                new_node["classes"] = list(node["classes"])
+            if "title" in node:
+                new_node["title"] = node["title"]
             if node.children:
                 new_node += node.children
             node.replace_self(new_node)
