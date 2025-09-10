@@ -136,7 +136,7 @@ data:
   #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
   #       ...
   #     train_split: <TrainSplit>, default is "train"
-  #     val_split: <ValSplit>, default is "train"
+  #     val_split: <ValSplit>, default is None
   #   2. chosen - rejected format
   #   data:
   #     dataset_type: "binary"
@@ -146,7 +146,7 @@ data:
   #     chosen_key: <ChosenKey>, default is "chosen"
   #     rejected_key: <RejectedKey>, default is "rejected"
   #     train_split: <TrainSplit>, default is "train"
-  #     val_split: <ValSplit>, default is "train"
+  #     val_split: <ValSplit>, default is None
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/rm.md#datasets for more details.
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
