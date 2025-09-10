@@ -96,7 +96,7 @@ By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/pre
 We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
-  dataset_type: "rank"
+  preference_dataset_type: "ranked"
   train_data_path: <LocalPathToTrainingDataset>
   # multiple validation sets is supported
   val_data_paths:
@@ -109,7 +109,7 @@ data:
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_type: "binary"
+  preference_dataset_type: "binary"
   train_data_path: <LocalPathToTrainingDataset>
   val_data_path: <LocalPathToValidationDataset>
   prompt_key: <PromptKey>, default is "prompt"
