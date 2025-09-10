@@ -109,7 +109,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 50
       lr_warmup_init: 1.9999e-6
 
@@ -123,8 +123,20 @@ policy:
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "HelpSteer3"
   shuffle: true
+
+  dataset_name: HelpSteer3
+  # You can use custom preference datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: PreferenceDataset
+  #     train_data_path: <LocalPathToTrainingDataset>
+  #     val_data_paths:
+  #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #       ...
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #   ...
 
 logger:
   log_dir: "logs"  # Base directory for all logs

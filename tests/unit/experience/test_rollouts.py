@@ -212,6 +212,7 @@ base_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
         "max_model_len": 2048,
         "disable_log_stats": True,
         "disable_log_requests": True,
@@ -779,65 +780,25 @@ def test_run_async_penguin_rollout(
             "min_turns_per_sample": 2,
             "median_turns_per_sample": 2.5,
             "stddev_turns_per_sample": 0.7071067811865476,
-            "histogram_turns_per_sample": {
-                "table": None,
-                "spec": {
-                    "spec_name": "wandb/histogram/v0",
-                    "fields": {"value": "turns_per_sample"},
-                    "string_fields": {"title": "turns_per_sample"},
-                    "key": "",
-                    "panel_type": "Vega2",
-                    "split_table": False,
-                },
-            },
+            "histogram_turns_per_sample": None,
             "mean_total_tokens_per_sample": 6261.0,
             "max_total_tokens_per_sample": 8398,
             "min_total_tokens_per_sample": 4124,
             "median_total_tokens_per_sample": 6261.0,
             "stddev_total_tokens_per_sample": 3022.174382791304,
-            "histogram_total_tokens_per_sample": {
-                "table": None,
-                "spec": {
-                    "spec_name": "wandb/histogram/v0",
-                    "fields": {"value": "total_tokens_per_sample"},
-                    "string_fields": {"title": "total_tokens_per_sample"},
-                    "key": "",
-                    "panel_type": "Vega2",
-                    "split_table": False,
-                },
-            },
+            "histogram_total_tokens_per_sample": None,
             "mean_gen_tokens_per_sample": 3147.0,
             "max_gen_tokens_per_sample": 5303,
             "min_gen_tokens_per_sample": 991,
             "median_gen_tokens_per_sample": 3147.0,
             "stddev_gen_tokens_per_sample": 3049.044440476393,
-            "histogram_gen_tokens_per_sample": {
-                "table": None,
-                "spec": {
-                    "spec_name": "wandb/histogram/v0",
-                    "fields": {"value": "gen_tokens_per_sample"},
-                    "string_fields": {"title": "gen_tokens_per_sample"},
-                    "key": "",
-                    "panel_type": "Vega2",
-                    "split_table": False,
-                },
-            },
+            "histogram_gen_tokens_per_sample": None,
             "mean_total_reward": 0.0,
             "max_total_reward": 0.0,
             "min_total_reward": 0.0,
             "median_total_reward": 0.0,
             "stddev_total_reward": 0.0,
-            "histogram_total_reward": {
-                "table": None,
-                "spec": {
-                    "spec_name": "wandb/histogram/v0",
-                    "fields": {"value": "total_reward"},
-                    "string_fields": {"title": "total_reward"},
-                    "key": "",
-                    "panel_type": "Vega2",
-                    "split_table": False,
-                },
-            },
+            "histogram_total_reward": None,
         },
     }
 
@@ -850,14 +811,13 @@ def test_run_async_penguin_rollout(
 
         for key in d["rollout_metrics"]:
             if key.startswith("histogram_"):
-                d["rollout_metrics"][key]["table"] = None
+                d["rollout_metrics"][key] = None
 
         return {
             "final_batch": final_batch,
             "rollout_metrics": d["rollout_metrics"],
         }
 
-    print(_standardize(actual_result))
     assert _standardize(expected_result) == _standardize(actual_result)
 
     """

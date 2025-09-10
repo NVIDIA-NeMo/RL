@@ -3,11 +3,13 @@ grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 8
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  overlong_filtering: false
   max_val_samples: 480
   val_batch_size: 32
   seed: 42
@@ -100,6 +102,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: True

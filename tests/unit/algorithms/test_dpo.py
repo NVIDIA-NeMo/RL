@@ -14,14 +14,31 @@
 
 from unittest.mock import MagicMock
 
+import numpy as np
 import torch
 
 from nemo_rl.algorithms.dpo import add_ref_logprobs_to_data
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.named_sharding import NamedSharding
 
 
 class MockPolicy:
     def __init__(self, logprobs):
         self.logprobs = logprobs
+        self.sharding_annotations = NamedSharding(
+            layout=np.arange(2).reshape(
+                1,  # PP
+                -1,  # DP
+                1,  # CP
+                1,  # TP
+            ),
+            names=[
+                "pipeline_parallel",
+                "data_parallel",
+                "context_parallel",
+                "tensor_parallel",
+            ],
+        )
 
     def get_reference_policy_logprobs(self, batch, micro_batch_size):
         return {"reference_logprobs": self.logprobs}
@@ -30,7 +47,7 @@ class MockPolicy:
 def test_add_logprobs_to_batch():
     """Test that add_ref_logprobs_to_data correctly adds reference policy logprobs to batches."""
     # Create mock data
-    batch_size = 2
+    batch_size = 8
     seq_len = 4
     vocab_size = 16
 
@@ -45,7 +62,7 @@ def test_add_logprobs_to_batch():
 
     # Create a mock dataloader that yields our mock batch
     mock_dataloader = MagicMock()
-    mock_dataloader.__iter__.return_value = iter([mock_batch])
+    mock_dataloader.__iter__.return_value = iter([BatchedDataDict(mock_batch)])
 
     # Create a mock policy that returns our mock logprobs
     mock_policy = MockPolicy(mock_logprobs)

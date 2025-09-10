@@ -36,6 +36,9 @@ class PenguinConfig(TypedDict):
 @ray.remote
 class PenguinWorker:
     def __init__(self, cfg: PenguinConfig, nemo_rl_openai_base_url: str):
+        from asyncio import _get_running_loop
+        print("first thing in init", _get_running_loop())
+
         self.cfg = cfg
 
         self.nemo_rl_openai_base_url = nemo_rl_openai_base_url
@@ -63,6 +66,7 @@ class PenguinWorker:
         }
 
         self.rh = RunHelper()
+        print("before rh.start", _get_running_loop())
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
                 dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "penguin_env.yaml",

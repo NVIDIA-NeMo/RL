@@ -1,4 +1,5 @@
 grpo:
+  max_num_epochs: 1
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
@@ -7,6 +8,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: true
+  overlong_filtering: false
   max_val_samples: 960  # BytedTsinghua uses 30 examples in AIME24 * 32 generations each.
   val_batch_size: ${grpo.max_val_samples}
   seed: 42
@@ -34,7 +36,7 @@ policy:
   model_name: "Qwen/Qwen3-4B-Instruct-2507"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: ${grpo.num_prompts_per_step}  # Match the num prompts per step
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
   logprob_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -51,6 +53,7 @@ policy:
     tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
+    empty_cache_every_n_steps: null
   
   megatron_cfg:
     enabled: false
@@ -168,6 +171,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false
@@ -207,7 +211,6 @@ env:
           judge_model_server:
             name: openai_model
           should_use_judge: false
-  init_sleep_time: 30
 
 logger:
   log_dir: "logs"  # Base directory for all logs

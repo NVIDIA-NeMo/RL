@@ -168,7 +168,7 @@ jobs:
   sphinx-build:
     needs: [pre-flight]
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.48.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
