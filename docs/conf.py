@@ -223,7 +223,7 @@ class _GitHubLinkTransform(Transform):
                     urllib.parse.quote(dst_path.relative_to(wt_dir).as_posix()),
                 )
             )
-            new_node = nodes.reference(rawsource=node.rawsource, refuri=str(refuri))
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
             # Preserve styling and title if present.
             if "classes" in node:
                 new_node["classes"] = list(node["classes"])
