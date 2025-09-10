@@ -575,7 +575,7 @@ class DTensorPolicyWorkerV2:
                     iterator_len = batch.size // mbs
 
                 empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
-                    "empty_cache_every_n_steps"
+                    "clear_cache_every_n_steps"
                 )
                 if empty_cache_steps:
                     warnings.warn(
