@@ -61,7 +61,7 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.custom_fsdp import (
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
 from megatron.core.inference.engines import (
@@ -250,6 +250,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
@@ -263,6 +266,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router._maintain_float32_expert_bias()
@@ -1164,16 +1170,24 @@ class MegatronPolicyWorker:
                 input_ids = data_dict["input_ids"]
                 input_ids_cp_sharded = input_ids
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                    input_ids, 0, False, False, False
+                    data=input_ids,
+                    eod_token=0,  # used for loss_mask, which we don't use
+                    pad_token=0,  # used for loss_mask, which we don't use
+                    reset_position_ids=False,
+                    reset_attention_mask=False,
+                    eod_mask_loss=False,
+                    pad_mask_loss=False,
                 )
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
 
+            multimodal_data = data_dict.get_multimodal_dict(as_tensors=True, device=input_ids.device)
             output_tensor = model(
-                input_ids_cp_sharded,
-                position_ids,
-                attention_mask,
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
+                **multimodal_data,
             )
 
             # Apply temperature scaling to logits for training
