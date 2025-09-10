@@ -104,7 +104,7 @@ We provide [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_data
       <NameOfValidationDataset>: <LocalPathToValidationDataset1>
       <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
     train_split: <TrainSplit>, default is "train"
-    val_split: <ValSplit>, default is "train"
+    val_split: <ValSplit>, default is None
   ```
 - chosen - rejected format
   ```yaml
@@ -116,7 +116,7 @@ We provide [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_data
     chosen_key: <ChosenKey>, default is "chosen"
     rejected_key: <RejectedKey>, default is "rejected"
     train_split: <TrainSplit>, default is "train"
-    val_split: <ValSplit>, default is "train"
+    val_split: <ValSplit>, default is None
   ```
 
 Please note:

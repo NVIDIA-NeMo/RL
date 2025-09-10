@@ -21,7 +21,7 @@ class PreferenceDataset:
     """Dataset class for preference data which can be loaded from a JSON file.
 
     This class handles loading of preference data for DPO and RM training.
-    The input JSON files should contain examples with the either of the following structures:
+    The input JSONL files should contain valid JSON objects formatted like this:
     {
         "context": list of dicts, # The prompt message (including previous turns, if any)
         "completions": list of dicts, # The list of completions
@@ -35,7 +35,7 @@ class PreferenceDataset:
         train_data_path: Path to the JSON file containing training data
         val_data_path: Path to the JSON file containing validation data
         train_split: Split name for the training data, default is "train"
-        val_split: Split name for the validation data, default is "train"
+        val_split: Split name for the validation data, default is None
     """
 
     def __init__(
@@ -43,7 +43,7 @@ class PreferenceDataset:
         train_data_path: str,
         val_data_path: Optional[str] = None,
         train_split: str = "train",
-        val_split: str = "train",
+        val_split: Optional[str] = None,
     ):
         # load from json file or huggingface
         train_ds = load_dataset_from_path(train_data_path, train_split)

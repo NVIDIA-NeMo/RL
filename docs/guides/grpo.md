@@ -48,7 +48,7 @@ data:
   input_key: <QuestionKey>, default is "input"
   output_key: <AnswerKey>, default is "output"
   train_split: <TrainSplit>, default is "train"
-  val_split: <ValSplit>, default is "train"
+  val_split: <ValSplit>, default is None
 ```
 
 #### Common Data Format

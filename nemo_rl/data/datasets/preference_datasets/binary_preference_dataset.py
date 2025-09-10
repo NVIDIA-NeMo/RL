@@ -43,7 +43,7 @@ class BinaryPreferenceDataset:
     This class handles loading of preference data for DPO and RM training.
     This format will be converted to the rank format through the `to_preference_data_format` function.
 
-    The input JSON files should contain examples with the following structures:
+    The input JSONL files should contain valid JSON objects formatted like this:
     {
         prompt_key: str,    # The input prompt/context
         chosen_key: str,    # The preferred/winning response
@@ -57,7 +57,7 @@ class BinaryPreferenceDataset:
         chosen_key: Key for the preferred/winning response, default is "chosen"
         rejected_key: Key for the non-preferred/losing response, default is "rejected"
         train_split: Split name for the training data, default is "train"
-        val_split: Split name for the validation data, default is "train"
+        val_split: Split name for the validation data, default is None
     """
 
     def __init__(
@@ -68,7 +68,7 @@ class BinaryPreferenceDataset:
         chosen_key: str = "chosen",
         rejected_key: str = "rejected",
         train_split: str = "train",
-        val_split: str = "train",
+        val_split: Optional[str] = None,
     ):
         self.prompt_key = prompt_key
         self.chosen_key = chosen_key

@@ -22,7 +22,7 @@ class ResponseDataset:
     """Dataset class for response data which can be loaded from a JSON file.
 
     This class handles loading of response data for SFT and RL training.
-    The input JSON files should contain examples with the following structure:
+    The input JSONL files should contain valid JSON objects formatted like this:
     {
         input_key: str,     # The input prompt/context
         output_key: str,    # The output response/answer
@@ -34,7 +34,7 @@ class ResponseDataset:
         input_key: Key for the input text
         output_key: Key for the output text
         train_split: Split name for the training data, default is "train"
-        val_split: Split name for the validation data, default is "train"
+        val_split: Split name for the validation data, default is None
     """
 
     def __init__(
@@ -44,7 +44,7 @@ class ResponseDataset:
         input_key: str = "input",
         output_key: str = "output",
         train_split: str = "train",
-        val_split: str = "train",
+        val_split: Optional[str] = None,
     ):
         self.input_key = input_key
         self.output_key = output_key

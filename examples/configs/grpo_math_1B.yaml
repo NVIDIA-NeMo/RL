@@ -212,7 +212,7 @@ data:
   #     input_key: <QuestionKey>, default is "input"
   #     output_key: <AnswerKey>, default is "output"
   #     train_split: <TrainSplit>, default is "train"
-  #     val_split: <ValSplit>, default is "train"
+  #     val_split: <ValSplit>, default is None
   # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
 
 env:
