@@ -159,7 +159,7 @@ data:
   # You can use custom preference datasets for training and validation. For example:
   # 1. PreferenceDataset
   #   data:
-  #     dataset_type: "rank"
+  #     preference_dataset_type: "ranked"
   #     train_data_path: <LocalPathToTrainingDataset>
   #     val_data_paths:
   #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
@@ -168,7 +168,7 @@ data:
   #     val_split: <ValSplit>, default is None
   # 2. BinaryPreferenceDataset
   #   data:
-  #     dataset_type: "binary"
+  #     preference_dataset_type: "binary"
   #     train_data_path: <LocalPathToTrainingDataset>
   #     val_data_path: <LocalPathToValidationDataset>
   #     prompt_key: <PromptKey>, default is "prompt"
