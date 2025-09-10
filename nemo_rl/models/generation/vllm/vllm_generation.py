@@ -169,7 +169,8 @@ class VllmGeneration(GenerationInterface):
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        self._post_init()
+        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
+        self.dp_openai_server_base_urls = self._post_init()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size

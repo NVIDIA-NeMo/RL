@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from copy import deepcopy
+from pathlib import Path
+from time import sleep
 
 import pytest
 import ray
+import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -26,6 +30,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _maybe_correct_merged_tokens,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1037,6 +1044,223 @@ def test_vllm_generate_text(cluster, tokenizer):
 
     # Clean up
     vllm_generation.shutdown()
+
+
+def configure_http_server_config(tokenizer) -> VllmConfig:
+    # Create separate configs for each policy
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(
+        generation_config, tokenizer, is_eval=True
+    )
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    return generation_config
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    # Take a short nap for the server to spinup. Maybe there is a better way to do this?
+    sleep(3)
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    actual_result = response.json()
+
+    # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
+    expected_result = {
+        "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
+        "object": "chat.completion",
+        "created": 1756421711,
+        "model": "Qwen/Qwen3-0.6B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>",
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning_content": None,
+                },
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:151667",
+                            "logprob": -0.00023779425828251988,
+                            "bytes": [60, 116, 104, 105, 110, 107, 62],
+                            "top_logprobs": [],
+                        }
+                    ]
+                },
+                "finish_reason": "length",
+                "stop_reason": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "kv_transfer_params": None,
+    }
+
+    def _standardize(d: dict) -> dict:
+        d = deepcopy(d)
+        d.pop("id")
+        d.pop("created")
+        # We don't want to implicate log prob accuracy in this test.
+        d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        return d
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that tokenization route works
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Clean up
+    vllm_generation.shutdown()
+
+    # We should not be able to connect after shutdown
+    with pytest.raises(requests.ConnectionError):
+        requests.post(
+            url=f"{base_urls[0]}/chat/completions",
+            json=dict(
+                messages=[
+                    {"role": "user", "content": "count to 5"},
+                ],
+                temperature=0.0,
+                logprobs=True,
+                return_tokens_as_token_ids=True,
+                max_tokens=1,
+            ),
+        )
+
+
+def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+
+    # [26951, 3834] and [94224] both detokenize to " skinny"
+    # Test super simple example of correcting the merged tokens
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[94224],
+    )
+    expected_result = [26951, 3834]
+    assert expected_result == actual_result
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[61830, 65],
+        actual_token_ids=[2435, 20828],
+    )
+    expected_result = [61830, 65]
+    assert expected_result == actual_result
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[758, 12601],
+        actual_token_ids=[89038],
+    )
+    expected_result = [758, 12601]
+    assert expected_result == actual_result
+
+    # Test no-op
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[26951, 3834],
+    )
+    expected_result = [26951, 3834]
+
+    # Test sanity failure assert
+    with pytest.raises(
+        AssertionError, match="Found a non-monotonically increasing trajectory"
+    ):
+        _maybe_correct_merged_tokens(
+            tokenizer=tokenizer,
+            reference_token_ids=[26951, 26951, 26951, 26951],
+            actual_token_ids=[26951, 26951, 3834, 3834, 3834],
+        )
+
+    test_data_fpath = Path(__file__).with_name(
+        "maybe_correct_merged_tokens_test_data.json"
+    )
+    with test_data_fpath.open() as f:
+        test_data = json.load(f)
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=test_data["seen_token_ids"],
+        actual_token_ids=test_data["output_prompt_token_ids"],
+    )
+    expected_result = test_data["expected_output"]
+    assert expected_result == actual_result
 
 
 @pytest.mark.timeout(180)
