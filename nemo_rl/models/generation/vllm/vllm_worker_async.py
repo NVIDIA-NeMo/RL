@@ -96,6 +96,9 @@ Actual token ids: {actual_token_ids}"""
     else:
         pass
 
+    # If we break above, it must be that we either found a correct match or that we didn't find a valid match
+    # e.g. in cases where there is some token merging that occurs at the very end of the reference_token_ids
+    # We scream loudly here.
     assert candidate_str == reference_str
 
     return reference_token_ids + actual_token_ids[len(candidate_token_ids):]
