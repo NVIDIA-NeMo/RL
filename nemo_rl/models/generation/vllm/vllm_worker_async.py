@@ -16,7 +16,7 @@ import asyncio
 import gc
 import uuid
 import threading
-from typing import Any, AsyncGenerator, cast
+from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -141,7 +141,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 self._setup_vllm_server()
             )
 
-    async def post_init_async(self):
+    async def post_init_async(self) -> Optional[str]:
         self.vllm_device_ids = await self.report_device_id_async()
         return self.base_url
 

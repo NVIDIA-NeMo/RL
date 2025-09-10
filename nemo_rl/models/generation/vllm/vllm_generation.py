@@ -312,7 +312,7 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _post_init(self):
+    def _post_init(self) -> list[Optional[str]]:
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
