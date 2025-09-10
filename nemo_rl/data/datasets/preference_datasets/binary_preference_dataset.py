@@ -38,10 +38,10 @@ def to_preference_data_format(
 
 
 class BinaryPreferenceDataset:
-    """Dataset class for chosen-rejected preference data which can be loaded from a JSON file.
+    """Dataset class for binary preference data which can be loaded from a JSON file.
 
     This class handles loading of preference data for DPO and RM training.
-    This format will be converted to the rank format through the `to_preference_data_format` function.
+    It will be converted to the format of PreferenceDataset through the `to_preference_data_format` function.
 
     The input JSONL files should contain valid JSON objects formatted like this:
     {
@@ -82,7 +82,7 @@ class BinaryPreferenceDataset:
             val_ds = None
 
         # format the dataset
-        # convert chosen - rejected format to rank format
+        # convert to PreferenceDataset format
         train_ds = train_ds.map(
             to_preference_data_format,
             fn_kwargs={

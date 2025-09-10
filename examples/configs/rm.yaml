@@ -128,18 +128,18 @@ data:
 
   dataset_name: HelpSteer3
   # You can use custom preference datasets for training and validation. For example:
-  #   1. rank format
+  #   1. PreferenceDataset
   #   data:
-  #     dataset_type: "rank" # PreferenceDataset will be used
+  #     dataset_type: "rank"
   #     train_data_path: <LocalPathToTrainingDataset>
   #     val_data_paths:
   #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
   #       ...
   #     train_split: <TrainSplit>, default is "train"
   #     val_split: <ValSplit>, default is None
-  #   2. chosen - rejected format
+  #   2. BinaryPreferenceDataset
   #   data:
-  #     dataset_type: "binary" # BinaryPreferenceDataset will be used
+  #     dataset_type: "binary"
   #     train_data_path: <LocalPathToTrainingDataset>
   #     val_data_path: <LocalPathToValidationDataset>
   #     prompt_key: <PromptKey>, default is "prompt"
