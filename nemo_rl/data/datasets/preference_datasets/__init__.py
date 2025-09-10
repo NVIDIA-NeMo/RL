@@ -33,6 +33,8 @@ def load_preference_dataset(data_config):
         base_dataset = Tulu3PreferenceDataset()
     # fall back to load from JSON file
     elif dataset_type == "binary":
+        if "train_data_path" not in data_config:
+            raise ValueError("train_data_path is required for dataset_type='binary'.")
         extra_kwargs = get_extra_kwargs(
             data_config,
             [
@@ -49,6 +51,8 @@ def load_preference_dataset(data_config):
             **extra_kwargs,
         )
     elif dataset_type == "rank":
+        if "train_data_path" not in data_config:
+            raise ValueError("train_data_path is required for dataset_type='rank'.")
         extra_kwargs = get_extra_kwargs(
             data_config,
             [
@@ -63,9 +67,8 @@ def load_preference_dataset(data_config):
         )
     else:
         raise ValueError(
-            f"Invalid dataset name: {dataset_name} and dataset type: {dataset_type}. "
-            "Please either provide a dataset name in [HelpSteer3, Tulu3Preference] which we supported by default, "
-            "or a dataset type in [binary, rank] to load from JSON file or Hugging Face."
+            f"Unsupported {dataset_name=} and {dataset_type=}. "
+            "Please set dataset_name in {'HelpSteer3','Tulu3Preference'} or dataset_type in {'binary','rank'}."
         )
 
     return base_dataset

@@ -87,6 +87,10 @@ def load_response_dataset(data_config, seed: int = 42):
         )
     # fall back to load from JSON file
     else:
+        if "train_data_path" not in data_config:
+            raise ValueError(
+                "train_data_path is required when dataset_name is not one of the built-ins."
+            )
         extra_kwargs = get_extra_kwargs(
             data_config,
             [
