@@ -22,7 +22,8 @@
 
 import os
 import sys
-from pathlib import Path, PosixPath
+import urllib.parse
+from pathlib import Path
 from typing import Any
 
 import git
@@ -170,7 +171,7 @@ class _GitHubLinkTransform(Transform):
     default_priority = 500  # type: ignore[bad-override]
 
     @staticmethod
-    def _get_github_source_url(repo: git.Repo) -> PosixPath:
+    def _get_github_source_url(repo: git.Repo) -> str:
         # Find out which remote GitHub repo should be the source.
         if "origin" in repo.remotes:
             url = repo.remotes.origin.url
@@ -185,7 +186,7 @@ class _GitHubLinkTransform(Transform):
             url = url.replace("git@github.com:", "https://github.com/", 1)
         if url.endswith(".git"):
             url = url[: -len(".git")]
-        return PosixPath(url)
+        return url
 
     def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
         try:
@@ -214,11 +215,13 @@ class _GitHubLinkTransform(Transform):
             else:
                 # Cannot figure out what type of thing this path is pointing to.
                 continue
-            refuri = (
-                remote_repo_url
-                / PosixPath(kind)
-                / PosixPath(local_repo.head.object.hexsha)
-                / dst_path.relative_to(wt_dir).as_posix()
+            refuri = "/".join(
+                (
+                    remote_repo_url.rstrip("/"),
+                    kind,
+                    local_repo.head.object.hexsha,
+                    urllib.parse.quote(dst_path.relative_to(wt_dir).as_posix()),
+                )
             )
             new_node = nodes.reference(rawsource=node.rawsource, refuri=str(refuri))
             # Preserve styling and title if present.
