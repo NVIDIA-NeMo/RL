@@ -17,6 +17,7 @@ policy:
     cpu_offload: true
     sequence_parallel: true
     activation_checkpointing: true
+    _v2: false
   sequence_packing:
     enabled: false
   optimizer:
