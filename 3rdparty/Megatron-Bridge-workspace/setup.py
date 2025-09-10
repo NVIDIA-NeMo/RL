@@ -45,7 +45,7 @@ CACHED_DEPENDENCIES = [
     "tiktoken>=0.9.0",
     "tqdm>=4.67.1",
     "hydra-core>1.3,<=1.3.2",
-    "megatron-core[dev,mlm]>=0.14.0a0,<0.16.0",
+    "megatron-core>=0.14.0a0,<0.15.0",
     "nvidia-modelopt[torch,onnx]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0; sys_platform != 'darwin'",
     "transformer-engine[pytorch]>=2.5.0a0,<2.6.0; sys_platform != 'darwin'",
