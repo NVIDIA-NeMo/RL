@@ -93,31 +93,31 @@ DPO training supports only two completions (where the lowest rank is preferred a
 
 By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) and [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) classes that are compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
-- rank format
-  ```yaml
-  data:
-    dataset_type: "rank" # PreferenceDataset will be used
-    train_data_path: <LocalPathToTrainingDataset>
-    # multiple validation sets is supported
-    val_data_paths:
-      <NameOfValidationDataset>: <LocalPathToValidationDataset1>
-      <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
-    train_split: <TrainSplit>, default is "train"
-    val_split: <ValSplit>, default is None
-  ```
-- chosen - rejected format
-  ```yaml
-  data:
-    dataset_type: "binary" # BinaryPreferenceDataset will be used
-    train_data_path: <LocalPathToTrainingDataset>
-    val_data_path: <LocalPathToValidationDataset>
-    prompt_key: <PromptKey>, default is "prompt"
-    chosen_key: <ChosenKey>, default is "chosen"
-    rejected_key: <RejectedKey>, default is "rejected"
-    train_split: <TrainSplit>, default is "train"
-    val_split: <ValSplit>, default is None
-  ```
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+```yaml
+data:
+  dataset_type: "rank"
+  train_data_path: <LocalPathToTrainingDataset>
+  # multiple validation sets is supported
+  val_data_paths:
+    <NameOfValidationDataset>: <LocalPathToValidationDataset1>
+    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+  train_split: <TrainSplit>, default is "train"
+  val_split: <ValSplit>, default is None
+```
+
+We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
+```yaml
+data:
+  dataset_type: "binary"
+  train_data_path: <LocalPathToTrainingDataset>
+  val_data_path: <LocalPathToValidationDataset>
+  prompt_key: <PromptKey>, default is "prompt"
+  chosen_key: <ChosenKey>, default is "chosen"
+  rejected_key: <RejectedKey>, default is "rejected"
+  train_split: <TrainSplit>, default is "train"
+  val_split: <ValSplit>, default is None
+```
 
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
