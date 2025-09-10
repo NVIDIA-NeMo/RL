@@ -30,9 +30,6 @@ jobs:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
 
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Check dequeue reason and retry count
         id: check_retry
         if: github.event.reason == 'CI_TIMEOUT'
