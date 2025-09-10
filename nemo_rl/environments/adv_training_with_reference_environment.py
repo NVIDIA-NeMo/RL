@@ -97,9 +97,7 @@ class AsyncVLLMWorker:
                 logging.warning(f"Worker could not create HF cache directory {hf_home_cache_path}: {e}. "
                                  "This might lead to download issues if the default cache is not writable.")
 
-        # It's critical that download_dir is set for vLLM if HF_HOME is being customized,
-        # or if there are any doubts about vLLM picking up the environment variable.
-        # Also add ignore_patterns to prevent issues with problematic aux files.
+
         engine_args = AsyncEngineArgs(
             model=model_name,
             tensor_parallel_size=tensor_parallel_size,
@@ -111,6 +109,7 @@ class AsyncVLLMWorker:
             trust_remote_code=True, # Required for models with custom code like GenRM
             **engine_kwargs
         )
+
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         
         # Load tokenizer for chat template functionality
@@ -122,7 +121,7 @@ class AsyncVLLMWorker:
         
         logging.info(f"AsyncVLLMWorker initialized with model: {model_name}")
     
-    async def get_response(self, request_id: str, messages: List[Dict[str, str]], metadata: LLMJudgeEnvironmentMetadata, sampling_params_dict: dict) -> str:
+    async def get_response(self, request_id: str, messages: List[Dict[str, str]], metadata: LLMJudgeEnvironmentMetadata, sampling_params_dict: dict, system_prompt: Optional[str] = None) -> str:
         """Generate response from conversation messages.
         
         Args:
@@ -130,10 +129,15 @@ class AsyncVLLMWorker:
             messages: List of conversation messages in OpenAI format [{"role": "user", "content": "..."}, ...]
             metadata: Environment metadata
             sampling_params_dict: Sampling parameters for generation
+            system_prompt: Optional system prompt to prepend to conversation
             
         Returns:
             Tuple of (request_id, generated_text)
         """
+        # Add system prompt if provided
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
+        
         # Apply chat template to format the conversation
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages,
@@ -155,82 +159,24 @@ class AsyncVLLMWorker:
 
         return request_id, final_output.outputs[0].text.strip()
         
-    async def judge(
-        self,
-        request_id: str,
-        question: str,
-        attacker_response: str,
-        metadata: LLMJudgeEnvironmentMetadata,
-        sampling_params_dict: dict,
-    ) -> Tuple[str, float]:
-        """
-        Judges a single response using the LLM.
-
-        Args:
-            request_id: A unique ID for this generation request.
-            question: The question string.
-            response_to_judge: The assistant's response string.
-            metadata: Metadata containing reference answer and criteria.
-            sampling_params_dict: Dictionary to initialize vllm.SamplingParams.
-
-        Returns:
-            Tuple of (request_id, score)
-        """
-
-        response_to_judge = attacker_response.split("</prompt>")[0].strip().split("<prompt>")[-1].strip()
-        # Prioritize metadata's judge_prompt_template, then default
-        # Note that if you want to use a custom judge_prompt_template, you may need to change the verdict extraction logic accordingly
-        current_judge_prompt = self.DEFAULT_JUDGE_PROMPT_TEMPLATE
-        
-        prompt = current_judge_prompt.format(
-            prompt=attacker_response,
-        )
-        logging.info(f"Target Model Prompt: {prompt}")
-
-        sampling_params = self.SamplingParams(**sampling_params_dict)
-        
-        results_generator = self.engine.generate(prompt, sampling_params, request_id)
-        
-        final_output = None
-        async for request_output in results_generator:
-            final_output = request_output
-        
-        score = 0.0
-        if final_output and not final_output.finished:
-            logging.info(f"Request {request_id} did not finish within the token limit, but we will score it anyway. Output: {final_output}")
-        elif final_output:
-            generated_text = final_output.outputs[0].text.strip()
-            generated_text_lower = generated_text.lower()
-
-            has_yes = "yes" in generated_text_lower
-
-            if has_yes:
-                score = 1.0
-                logging.info(f"Parsed 'yes' for request {request_id}. Score: {score}. Output: '{generated_text}'")
-            else:
-                score = 0.0
-                logging.info(f"No 'yes' found in {request_id}. Score: {score}. Output: '{generated_text}'")
-            
-        else:
-            logging.warning(f"No output received from LLM for request {request_id}.")
-
-        return request_id, score
 
 
 @ray.remote
-class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
+class AdvTrainingWithReferenceEnvironment(EnvironmentInterface):
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM # The environment actor itself uses system python
 
     def __init__(self, cfg: LLMJudgeAsyncConfig):
         self.cfg = cfg
         self.num_target_workers = cfg["target_model"]["num_workers"]
+        self.num_reference_workers = cfg["reference_model"]["num_workers"]
         self.num_judge_workers = cfg["judge_model"]["num_workers"]
         
         target_tensor_parallel_size = cfg["target_model"]["tensor_parallel_size"]
+        reference_tensor_parallel_size = cfg["reference_model"]["tensor_parallel_size"]
         judge_tensor_parallel_size = cfg["judge_model"]["tensor_parallel_size"]
 
         # Initialize conversation logging
-        self.log_conversations = cfg.get("log_conversations", False)
+        self.log_conversations = cfg.get("log_conversations", True)
         self.log_dir = None
         self.step_counter = 0
         
@@ -254,6 +200,7 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
             "WANDB_API_KEY",
             "HUGGINGFACE_HUB_DISABLE_XET",  # Often set to "1" to bypass xet errors.
             "HF_TOKEN",
+            "VLLM_USE_V1",  # vLLM v0.10.1+ V1 engine control
         ]:
             if key in os.environ:
                 env_vars_to_pass[key] = os.environ[key]
@@ -269,6 +216,8 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         single_gpu_workers = 0
         if target_tensor_parallel_size == 1:
             single_gpu_workers += self.num_target_workers
+        if reference_tensor_parallel_size == 1:
+            single_gpu_workers += self.num_reference_workers
         if judge_tensor_parallel_size == 1:
             single_gpu_workers += self.num_judge_workers
             
@@ -341,6 +290,51 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         self._actor_id_prefix = str(uuid.uuid4())[:8] # Unique prefix for this actor instance
 
         #########################################################
+        #                       Reference Workers                    
+        #########################################################
+
+        print(f"Using py_executable: {AsyncVLLMWorker.DEFAULT_PY_EXECUTABLE}")
+        print(f"Using env_vars: {env_vars_to_pass}")
+        print(f"Using tensor_parallel_size: {reference_tensor_parallel_size}")
+        print(f"Using num_workers: {self.num_reference_workers}")
+
+        reference_worker_options = {
+            "runtime_env": {
+                "py_executable": AsyncVLLMWorker.DEFAULT_PY_EXECUTABLE,
+                "env_vars": env_vars_to_pass,
+            },
+            "num_gpus": reference_tensor_parallel_size,
+        }
+
+        self.reference_workers = []
+        print(f"Creating {self.num_reference_workers} AsyncVLLMWorker actors.")
+        for i in range(self.num_reference_workers):
+            if reference_tensor_parallel_size == 1:
+                # Reference workers use placement groups AFTER target workers (only if target workers also use TP=1)
+                target_workers_using_pg = self.num_target_workers if target_tensor_parallel_size == 1 else 0
+                pg_index = (target_workers_using_pg + i) % len(placement_groups)
+                pg = placement_groups[pg_index]
+                scheduling_kwargs = dict(
+                    scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    )
+                )
+            else:
+                # No placement group – let Ray handle multi-GPU allocation.
+                # TODO @yashaswikarnati: improve with custom scheduling strategy
+                scheduling_kwargs = {}
+            worker = AsyncVLLMWorker.options(
+                **reference_worker_options,
+                **scheduling_kwargs,
+            ).remote(
+                model_name=cfg["reference_model"]["model_name"],
+                tensor_parallel_size=cfg["reference_model"]["tensor_parallel_size"],
+                gpu_memory_utilization=cfg["reference_model"].get("gpu_memory_utilization", 0.85),
+                max_model_len=cfg["reference_model"].get("max_model_len", 40000),
+            )
+            self.reference_workers.append(worker)
+
+        #########################################################
         #                       Judge Workers                    
         #########################################################
 
@@ -361,9 +355,10 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         print(f"Creating {self.num_judge_workers} AsyncVLLMWorker actors.")
         for i in range(self.num_judge_workers):
             if judge_tensor_parallel_size == 1:
-                # Judge workers use placement groups AFTER target workers (only if target workers also use TP=1)
+                # Judge workers use placement groups AFTER target and reference workers
                 target_workers_using_pg = self.num_target_workers if target_tensor_parallel_size == 1 else 0
-                pg_index = (target_workers_using_pg + i) % len(placement_groups)
+                reference_workers_using_pg = self.num_reference_workers if reference_tensor_parallel_size == 1 else 0
+                pg_index = (target_workers_using_pg + reference_workers_using_pg + i) % len(placement_groups)
                 pg = placement_groups[pg_index]
                 scheduling_kwargs = dict(
                     scheduling_strategy=ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
@@ -387,7 +382,7 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         #########################################################
 
     def shutdown(self):
-        for worker in self.target_workers + self.judge_workers:
+        for worker in self.target_workers + self.reference_workers + self.judge_workers:
             ray.kill(worker)
         if self.virtual_cluster is not None:
             self.virtual_cluster.shutdown()
@@ -419,14 +414,17 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         if individual_match:
             individual_section_text = individual_match.group(1).strip()
             individual_boxed_content = extract_answer_from_box(individual_section_text)
-            if individual_boxed_content:
-                try:
-                    individual_score = float(individual_boxed_content)
-                except ValueError:
-                    individual_score = 5.1
-                    logging.warning(f"Could not parse individual scores: {individual_boxed_content}")
-            return individual_score
-        return 5.0
+            if individual_boxed_content and ',' in individual_boxed_content:
+                # Individual scores: "2, 4"
+                parts = individual_boxed_content.split(',')
+                if len(parts) == 2:
+                    try:
+                        individual_scores = (float(parts[0].strip()), float(parts[1].strip()))
+                        return individual_scores
+                    except ValueError:
+                        logging.warning(f"Could not parse individual scores: {individual_boxed_content}")
+
+        return 0, 0
 
     def step(
         self,
@@ -454,14 +452,19 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
                 }]
             )
 
+        #########################################################
+        #                       Target Responses                    
+        #########################################################
+
         futures = []
         
         # Prepare target sampling parameters from target model config
         target_sampling_params = {
             "temperature": self.cfg["target_model"].get("temperature", 0.0),
-            "max_tokens": self.cfg["target_model"].get("max_tokens", 8192),
+            "max_tokens": self.cfg["target_model"].get("max_tokens", 512),
             "stop": self.cfg["target_model"].get("stop", None),
         }
+        system_prompt = self.cfg["target_model"].get("system_prompt", None)
 
         # For each batch, loop through each conversation and send it to a target worker asynchronously
         for i, (prompt, single_metadata) in enumerate(zip(generated_prompts, metadata)):
@@ -474,6 +477,7 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
 
             future = self.target_workers[worker_idx].get_response.remote(
                 request_id, prompt, single_metadata, current_target_params,
+                system_prompt,
             )
             futures.append(future)
         
@@ -486,6 +490,43 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         print("length of target_responses: ", len(target_responses))
         print("length of generated_prompts: ", len(generated_prompts))
 
+
+        #########################################################
+        #                       Reference Responses                    
+        #########################################################
+
+        reference_futures = []
+        
+        # Prepare reference sampling parameters from reference model config
+        reference_sampling_params = {
+            "temperature": self.cfg["reference_model"].get("temperature", 0.0),
+            "max_tokens": self.cfg["reference_model"].get("max_tokens", 512),
+            "stop": self.cfg["reference_model"].get("stop", None),
+        }
+        reference_system_prompt = self.cfg["reference_model"].get("system_prompt", None)
+
+        # For each batch, loop through each conversation and send it to a reference worker asynchronously
+        for i, (prompt, single_metadata) in enumerate(zip(generated_prompts, metadata)):
+            # Generate a unique request ID for vLLM for this specific call to reference
+            request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_ref_{i}"
+            
+            worker_idx = i % self.num_reference_workers # Simple round-robin
+            
+            current_reference_params = reference_sampling_params.copy()
+
+            future = self.reference_workers[worker_idx].get_response.remote(
+                request_id, prompt, single_metadata, current_reference_params,
+                reference_system_prompt,
+            )
+            reference_futures.append(future)
+        
+        self._request_counter += 1 # Increment for the next step call
+
+        reference_responses: List[Tuple[str, float]] = ray.get(reference_futures)
+
+        reference_responses = [reference_response for _, reference_response in reference_responses]
+
+        print("length of reference_responses: ", len(reference_responses))
         
         
         
@@ -495,7 +536,9 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         judge_prompts = []
         for i, target_response in enumerate(target_responses):
             print(f"Generated Prompt: {generated_prompts[i]}")
-            print(f"Target Response: {target_response}")
+            print(f"Target Response: {target_response}")    
+            print(f"Reference Response: {reference_responses[i]}")
+
             judge_prompts.append(
                 [
                     {
@@ -505,6 +548,10 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
                     {
                         "role": "response_1",
                         "content": target_response,
+                    },
+                    {
+                        "role": "response_2",
+                        "content": reference_responses[i],
                     }
                 ]
             )
@@ -512,18 +559,19 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         # Prepare judge sampling parameters from judge model config
         judge_sampling_params = {
             "temperature": self.cfg["judge_model"].get("temperature", 0.0),
-            "max_tokens": self.cfg["judge_model"].get("max_tokens", 16384),  # Judges typically need more tokens
+            "max_tokens": self.cfg["judge_model"].get("max_tokens", 2048),  # Judges typically need more tokens
             "stop": self.cfg["judge_model"].get("stop", None),
         }
+        judge_system_prompt = self.cfg["judge_model"].get("system_prompt", None)
         
         judge_futures = []  # Create a new futures list for judge workers
         for i, prompt in enumerate(judge_prompts):
-            request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_{i}"
+            request_id = f"env_{self._actor_id_prefix}_step_{self._request_counter}_judge_{i}"
             worker_idx = i % self.num_judge_workers
             
             current_judge_params = judge_sampling_params.copy()
             
-            future = self.judge_workers[worker_idx].get_response.remote(request_id, prompt, metadata[i], current_judge_params)
+            future = self.judge_workers[worker_idx].get_response.remote(request_id, prompt, metadata[i], current_judge_params, judge_system_prompt)
             judge_futures.append(future)
         
         judge_responses: List[Tuple[str, float]] = ray.get(judge_futures)
@@ -535,9 +583,9 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
         
         rewards = []
         for i, judge_response in enumerate(judge_responses):
-            score = self.extract_score(judge_response)
-            print(f"Score: {score}")
-            rewards.append(score)
+            score1, score2 = self.extract_score(judge_response)
+            print(f"Score: {score1}, {score2}")
+            rewards.append(score2 - score1)
             
             print(f"Reward for {i}: {rewards[-1]}")
             print(f"Judge Prompt: {judge_prompts[i]}")
@@ -547,7 +595,7 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
 
         observations = [{"role": "environment", "content": f"Environment: Response = {target_response}"} for target_response in target_responses]
         
-        rewards_tensor = -1 * torch.tensor(rewards, dtype=torch.float32).cpu()
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32).cpu()
         terminateds_tensor = torch.ones_like(rewards_tensor).cpu()
         
         next_stop_strings = [None] * len(message_log_batch) 
@@ -558,6 +606,7 @@ class DoubleLLMJudgeAsyncEnvironment(EnvironmentInterface):
                 "input_conversations": message_log_batch,
                 "generated_prompts": generated_prompts,
                 "target_responses": target_responses,
+                "reference_responses": reference_responses,
                 "judge_prompts": judge_prompts,
                 "judge_responses": judge_responses,
                 "rewards": rewards,
