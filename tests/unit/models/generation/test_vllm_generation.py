@@ -1071,6 +1071,9 @@ def test_vllm_http_server(cluster, tokenizer):
         "Tensor parallel size should be 1 to get expected output"
     )
 
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
     # Create vLLM generation
     vllm_generation = VllmGeneration(cluster, generation_config)
 
@@ -1082,8 +1085,8 @@ def test_vllm_http_server(cluster, tokenizer):
         messages=[
             {"role": "user", "content": "count to 5"},
         ],
-        # Set to greedy for test reproducibility.
-        temperature=0.0,
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
         # We want to test the actual train flow and how this is used. So we need to get logprobs here.
         logprobs=True,
         return_tokens_as_token_ids=True,
