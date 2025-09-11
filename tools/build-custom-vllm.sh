@@ -29,7 +29,7 @@ GIT_URL=${1:-$DEFAULT_GIT_URL}
 BRANCH=${2:-$DEFAULT_BRANCH}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 export VLLM_COMMIT=${3:-$DEFAULT_VLLM_COMMIT}
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${DEFAULT_VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
