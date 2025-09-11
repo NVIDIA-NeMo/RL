@@ -18,18 +18,14 @@ set -eou pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
-# Default values
-DEFAULT_GIT_URL="https://github.com/terrykong/vllm.git"
-DEFAULT_BRANCH="terryk/demo-custom-vllm"
-# git merge-base --fork-point origin/main tags/v0.10.0
-DEFAULT_VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70 # use full commit hash from the main branch
 
 # Parse command line arguments
-GIT_URL=${1:-$DEFAULT_GIT_URL}
-BRANCH=${2:-$DEFAULT_BRANCH}
+GIT_URL=${1:-https://github.com/terrykong/vllm.git}
+GIT_REF=${2:-terryk/demo-custom-vllm}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
-export VLLM_COMMIT=${3:-$DEFAULT_VLLM_COMMIT}
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+# This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
+VLLM_WHEEL_COMMIT=${3:-d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70}  # use full commit hash from the main branch
+export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
@@ -39,13 +35,15 @@ fi
 
 echo "Building vLLM from:"
 echo "  Vllm Git URL: $GIT_URL"
-echo "  Vllm Branch: $BRANCH"
+echo "  Vllm Git ref: $GIT_REF"
+echo "  Vllm Wheel commit: $VLLM_WHEEL_COMMIT"
+echo "  Vllm Wheel location: $VLLM_PRECOMPILED_WHEEL_LOCATION"
 
 # Clone the repository
 echo "Cloning repository..."
 git clone "$GIT_URL" "$BUILD_DIR"
 cd "$BUILD_DIR"
-git checkout "$BRANCH"
+git checkout "$GIT_REF"
 
 # Create a new Python environment using uv
 echo "Creating Python environment..."
@@ -145,15 +143,19 @@ PY
 uv pip install setuptools_scm
 uv lock
 
+# Write to a file that a docker build will use to set the necessary env vars
+cat <<EOF >$BUILD_DIR/nemo-rl.env
+export VLLM_GIT_REF=$GIT_REF
+export VLLM_PRECOMPILED_WHEEL_LOCATION=$VLLM_PRECOMPILED_WHEEL_LOCATION
+EOF
+
 cat <<EOF
 [INFO] pyproject.toml updated. NeMo RL is now configured to use the local vLLM at 3rdparty/vllm.
 [INFO] Verify this new vllm version by running:
 
-VLLM_COMMIT=$VLLM_COMMIT \\
 VLLM_PRECOMPILED_WHEEL_LOCATION=$VLLM_PRECOMPILED_WHEEL_LOCATION \\
   uv run --extra vllm vllm serve Qwen/Qwen3-0.6B
 
 [INFO] For more information on this custom install, visit https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
-[IMPORTANT] Remember to set the shell variables 'VLLM_COMMIT' and 'VLLM_PRECOMPILED_WHEEL_LOCATION' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
+[IMPORTANT] Remember to set the shell variable 'VLLM_PRECOMPILED_WHEEL_LOCATION' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
 EOF
-

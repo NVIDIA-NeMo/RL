@@ -15,12 +15,6 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
 FROM ${BASE_IMAGE} AS base
 
-# Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
-ARG VLLM_COMMIT
-ARG VLLM_PRECOMPILED_WHEEL_LOCATION
-ENV VLLM_COMMIT=${VLLM_COMMIT}
-ENV VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION}
-
 # It is more convenient for users to run as root
 USER root
 

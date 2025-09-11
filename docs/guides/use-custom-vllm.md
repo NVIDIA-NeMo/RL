@@ -7,22 +7,18 @@ This guide explains how to use your own version of vLLM while leveraging a pre-c
 Clone your vLLM fork and build it using the provided script. For example:
 
 ```sh
-# Usage: bash tools/build-custom-vllm.sh <GIT_URL> <GIT_BRANCH> <VLLM_PRECOMILED_WHEEL_COMMI_FROM_MAINT>
+# Usage: bash tools/build-custom-vllm.sh <GIT_URL> <GIT_REF> <VLLM_WHEEL_COMMIT>
 bash tools/build-custom-vllm.sh https://github.com/terrykong/vllm.git terryk/demo-custom-vllm d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70
 
 # [INFO] pyproject.toml updated. NeMo RL is now configured to use the local vLLM at 3rdparty/vllm.
 # [INFO] Verify this new vllm version by running:
-# 
-# VLLM_COMMIT=a3319f4f04fbea7defe883e516df727711e516cd \
-# VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/a3319f4f04fbea7defe883e516df727711e516cd/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl \
+#
+# VLLM_PRECOMPILED_WHEEL_LOCATION=http://.....whl \
 #   uv run --extra vllm vllm serve Qwen/Qwen3-0.6B
-# 
+#
 # [INFO] For more information on this custom install, visit https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
-# [IMPORTANT] Remember to set the shell variable 'export VLLM_USE_PRECOMPILED=1' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
+# [IMPORTANT] Remember to set the shell variable 'VLLM_PRECOMPILED_WHEEL_LOCATION' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
 ```
-
-Make note of the `VLLM_COMMIT` and `VLLM_PRECOMPILED_WHEEL_LOCATION` since you will have to set those
-in your shell environment.
 
 This script does the following:
 1. Clones the `vllm` you specify at a particular branch.
@@ -47,15 +43,19 @@ If you don't see the log message `Hi! If you see this...`, it's because this mes
 
 ## Running NeMo RL Apps with Custom vLLM
 
-To ensure that vllm doesn't try to re-compile, you must run with `VLLM_COMMIT` and `VLLM_PRECOMPILED_WHEEL_LOCATION` set in the environment:
+To ensure the custom vLLM install is setup properly in NeMo RL applications, always run the following before anything:
 
 ```sh
-# (copied from build-custom-vllm.sh) Ensure's vllm doesn't try to recompile c++ source
-export VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70
+# Ensures vLLM uses the precompiled wheel and avoids recompiling C++ sources
 export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
-# Ensures worker venvs are rebuilt to use the custom vllm. Otherwise it will use the cached version in the cached venvs
+# Ensures worker venvs are rebuilt to use the custom vLLM. Otherwise it may use the cached version in cached venvs
 export NRL_FORCE_REBUILD_VENVS=true
+# This isn't necessary if you only do `uv run foobar.py`, but may be needed if you switching between optional extras `uv run --extra vllm foobar.py`. If you are unsure if you need this, it's safer to include it.
+uv pip install setuptools_scm
+```
 
+Then run your application:
+```sh
 uv run examples/run_grpo_math.py
 ```
 
@@ -66,14 +66,12 @@ Using a custom vllm may require you to rebuild the docker image. The two most co
 1. The `ray` version was changed, so you **must** rebuild the image to allow `ray.sub` to start the ray cluster with the same version as the application.
 2. Many dependencies changed and add a large overhead when `NRL_FORCE_REBUILD_VENVS=true` is set to rebuild venvs, so you wish to cache the dependencies in the image to avoid re-build/re-pulling wheels.
 
-For convenience, you can build the image and set `VLLM_COMMIT` and `VLLM_PRECOMPILED_WHEEL_LOCATION` as
-env vars to avoid the application needing to set them.
+For convenience, you can have the image build your custom vLLM by running the same script inside the Docker build.
+Pass `--build-arg BUILD_CUSTOM_VLLM=1` to enable this path; the build will create `3rdparty/vllm` and source `3rdparty/vllm/nemo-rl.env` automatically.
 
 ```sh
-# Replace VLLM_COMMIT and VLLM_PRECOMPILED_WHEEL_LOCATION with the values output from build-custom-vllm.sh
 docker buildx build \
-  --build-arg VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70 \
-  --build-arg VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl \
+  --build-arg BUILD_CUSTOM_VLLM=1 \
   --target release \
   --build-context nemo-rl=. \
   -f docker/Dockerfile \
