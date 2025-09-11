@@ -169,7 +169,8 @@ class VllmGeneration(GenerationInterface):
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        self._post_init()
+        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
+        self.dp_openai_server_base_urls = self._post_init()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
@@ -311,7 +312,7 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _post_init(self):
+    def _post_init(self) -> list[Optional[str]]:
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
