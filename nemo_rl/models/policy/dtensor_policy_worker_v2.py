@@ -256,11 +256,11 @@ class DTensorPolicyWorkerV2:
                 torch_dtype=str(model_config.torch_dtype),
             )
 
-            if "fp8" in self.cfg["dtensor_cfg"]:
-                fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
-                self.model = apply_fp8_to_model(self.model, config=fp8_config)
-                results = verify_fp8_conversion(self.model)
-                print(f"[Rank {self.rank}] Model FP8 results: {results['success']}")
+        if "fp8" in self.cfg["dtensor_cfg"]:
+            fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
+            self.model = apply_fp8_to_model(self.model, config=fp8_config)
+            results = verify_fp8_conversion(self.model)
+            print(f"[Rank {self.rank}] Model FP8 results: {results['success']}")
 
         print(f"[Rank {self.rank}] Model data type: {self.model.dtype}")
 
