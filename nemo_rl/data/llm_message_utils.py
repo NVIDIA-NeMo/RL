@@ -426,6 +426,9 @@ def get_images_from_message(message: dict[str, Any]) -> list[Any]:
     """Get all images from a message log item."""
     if isinstance(message["content"], str):
         return []
+    # Handle None or missing content (e.g., assistant messages with only tool_calls)
+    if message.get("content") is None:
+        return []
     # iterate over the content list
     images = []
     for item in message["content"]:
@@ -443,6 +446,7 @@ def get_formatted_message_log(
     add_bos_token: bool = True,
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
+    tools: Optional[list[dict[str, Any]]] = None,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -453,6 +457,7 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
+        tools: Optional list of tool/function definitions to pass to the chat template. Default: None
 
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
@@ -522,12 +527,25 @@ def get_formatted_message_log(
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
+
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
             message_log_strs[: i + 1],
             add_generation_prompt=add_generation_prompt and message["role"] == "user",
             tokenize=False,
             add_special_tokens=False,
+            tools=tools if tools is not None else task_data_spec.tools,
         )
+
+        # Debug: Print complete conversation after apply_chat_template (only once for the full conversation)
+        if i == len(message_log_strs) - 1 and not hasattr(
+            get_formatted_message_log, "_debug_printed"
+        ):
+            get_formatted_message_log._debug_printed = True
+            print("\n" + "=" * 80)
+            print("DEBUG: Complete conversation after apply_chat_template:")
+            print("-" * 80)
+            print(formatted_message)
+            print("=" * 80 + "\n")
 
         ## get the length of the previous message, excluding the eos token (if present)
         prev_message_len_no_eos: int = get_first_index_that_differs(
@@ -599,6 +617,9 @@ def get_formatted_message_log(
 
         # format content correctly
         if isinstance(message["content"], str):
+            new_message["content"] = message_chunk
+        elif message["content"] is None:
+            # Handle None content, this is a case where the assistant message has only tool_calls
             new_message["content"] = message_chunk
         else:
             # format the content list of new message the same way as the original message but replace the text with the new message chunk

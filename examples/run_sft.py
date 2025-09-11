@@ -73,6 +73,7 @@ def sft_preprocessor(
         add_bos_token=add_bos,
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)
@@ -127,8 +128,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
             data_config["train_data_path"],
             data_config["val_data_path"],
             data_config["chat_key"],
-            data_config["system_key"],
-            data_config["system_prompt"],
+            data_config.get("system_key", None),
+            data_config.get("system_prompt", None),
+            data_config.get("tool_key", "tools"),
         )
     elif data_cls == "clevr_cogent":
         from nemo_rl.data.hf_datasets.clevr import format_clevr_cogent_dataset
