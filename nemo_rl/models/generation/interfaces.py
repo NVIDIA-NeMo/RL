@@ -110,6 +110,7 @@ class GenerationConfig(TypedDict):
     model_name: str
     stop_token_ids: List[int]
     pad_token_id: int
+    logits_processors: Optional[List[str]]  # List of logits processor class names or import paths
 
 
 def configure_generation_config(

@@ -107,6 +107,10 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    logits_processors:
+      max_thinking_tokens: 128
+      #think_end_token_ids: [1885, 74045, 1062] # </think> for nano v2
+      think_end_token_ids: [98526, 7274, 3930, 13, 220, 151668] # Reached thinking limit. </think> for Qwen3
     vllm_cfg:
       precision: ${policy.precision}
       tensor_parallel_size: 1

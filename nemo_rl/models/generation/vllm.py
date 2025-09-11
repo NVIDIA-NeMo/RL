@@ -15,6 +15,7 @@
 import gc
 import os
 from typing import List, Optional, TypedDict, Union
+from transformers import AutoTokenizer
 
 import ray
 import torch
@@ -32,6 +33,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.custom_logits_processors import  ThinkingBudgetLogitsProcessor
 from nemo_rl.models.huggingface.common import ModelFlag
 
 
@@ -214,6 +216,14 @@ class VllmGenerationWorker:
         """Check if the worker is alive."""
         return True
 
+    def _create_logits_processors(self, logits_processors):
+        """Create logits processors from configuration."""
+        # you can pass an arbitrary list of token ids to to end the thinking section.
+        max_tokens = logits_processors.get("max_thinking_tokens", 64)
+        think_end_token_ids = logits_processors.get("think_end_token_ids", [1885, 74045, 1062]) # </think>
+        thinking_processor = ThinkingBudgetLogitsProcessor(think_max_tokens=max_tokens, think_end_token_ids=think_end_token_ids)
+        return [thinking_processor]
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -280,6 +290,10 @@ class VllmGenerationWorker:
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+        
+        # Create custom logits processors
+        logits_processors = self._create_logits_processors(self.cfg["logits_processors"])
+        
         sampling_params = self.SamplingParams(
             temperature=self.cfg["temperature"] if not greedy else 0,
             top_p=self.cfg["top_p"],
@@ -290,11 +304,12 @@ class VllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            logits_processors=logits_processors if logits_processors else None,
         )
 
         # Generate outputs
         outputs = self.llm.generate(prompts, sampling_params)
-
+        
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
@@ -397,6 +412,10 @@ class VllmGenerationWorker:
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+        
+        # Create custom logits processors
+        logits_processors = self._create_logits_processors()
+        
         sampling_params = self.SamplingParams(
             temperature=self.cfg["temperature"] if not greedy else 0,
             top_p=self.cfg["top_p"],
@@ -405,6 +424,7 @@ class VllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            logits_processors=logits_processors if logits_processors else None,
         )
 
         # Generate outputs
