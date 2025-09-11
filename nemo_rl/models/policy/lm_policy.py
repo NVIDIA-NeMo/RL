@@ -42,6 +42,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_default_hf_config,
@@ -75,7 +76,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = "megatron_cfg" in config and config["megatron_cfg"]["enabled"]
+        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        if megatron_enable and dtensor_enable:
+            raise ValueError(
+                "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
+                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
         if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
@@ -86,13 +93,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            assert config["dtensor_cfg"]["enabled"], (
-                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
-            )
+            if not dtensor_enable:
+                raise ValueError(
+                    "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                )
 
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
-            use_v2 = config["dtensor_cfg"].get("_v2", False)
+            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
@@ -588,14 +596,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "save_checkpoint",
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            tokenizer_path=tokenizer_path,
-        )
+        # Only pass checkpointing_cfg for DTensor v2
+        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+
+        if use_v2:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+            )
+        else:
+            if (
+                checkpointing_cfg is not None
+                and checkpointing_cfg.get("model_save_format") == "safetensors"
+            ):
+                raise ValueError(
+                    "safetensors is only supported with DTensorPolicyWorkerV2 (_v2=true)."
+                )
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
         ray.get(futures)
 
     def shutdown(self) -> bool:
