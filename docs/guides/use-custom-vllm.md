@@ -74,7 +74,7 @@ env vars to avoid the application needing to set them.
 docker buildx build \
   --build-arg VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70 \
   --build-arg VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl \
-  --target release\
+  --target release \
   --build-context nemo-rl=. \
   -f docker/Dockerfile \
   --tag <registry>/nemo-rl:latest \
