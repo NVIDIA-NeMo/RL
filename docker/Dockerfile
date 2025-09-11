@@ -61,6 +61,8 @@ WORKDIR /opt/nemo-rl
 # setting these to 1.
 ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
+# Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
+ARG BUILD_CUSTOM_VLLM
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -76,9 +78,14 @@ EOF
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN <<"EOF" bash -exu
+if [[ -n "${BUILD_CUSTOM_VLLM}" ]]; then
+    bash tools/build-custom-vllm.sh
+    source 3rdparty/vllm/nemo-rl.env
+fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
