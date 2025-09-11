@@ -34,6 +34,12 @@ class ReferenceLogprobOutputSpec(TypedDict):
     reference_logprobs: torch.Tensor
 
 
+class ScoreOutputSpec(TypedDict):
+    """scores: Tensor of scores."""
+
+    scores: torch.Tensor
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -85,6 +91,13 @@ class PolicyInterface(ABC):
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
         """
+        pass
+
+    @abstractmethod
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
         pass
 
     @abstractmethod
