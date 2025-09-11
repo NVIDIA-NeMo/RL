@@ -58,3 +58,26 @@ export NRL_FORCE_REBUILD_VENVS=true
 
 uv run examples/run_grpo_math.py
 ```
+
+## Re-building the NeMo RL Docker Image
+
+Using a custom vllm may require you to rebuild the docker image. The two most common reasons are:
+
+1. The `ray` version was changed, so you **must** rebuild the image to allow `ray.sub` to start the ray cluster with the same version as the application.
+2. Many dependencies changed and add a large overhead when `NRL_FORCE_REBUILD_VENVS=true` is set to rebuild venvs, so you wish to cache the dependencies in the image to avoid re-build/re-pulling wheels.
+
+For convenience, you can build the image and set `VLLM_COMMIT` and `VLLM_PRECOMPILED_WHEEL_LOCATION` as
+env vars to avoid the application needing to set them.
+
+```sh
+# Replace VLLM_COMMIT and VLLM_PRECOMPILED_WHEEL_LOCATION with the values output from build-custom-vllm.sh
+docker buildx build \
+  --build-arg VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70 \
+  --build-arg VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl \
+  --target release\
+  --build-context nemo-rl=. \
+  -f docker/Dockerfile \
+  --tag <registry>/nemo-rl:latest \
+  --push \
+  .
+```
