@@ -58,7 +58,7 @@ find requirements/ -name "*.txt" -type f -exec sed -i 's/#.*$//' {} \; 2>/dev/nu
 find requirements/ -name "*.txt" -type f -exec sed -i '/^[[:space:]]*$/d' {} \; 2>/dev/null || true
 # Replace xformers==.* (but preserve any platform markers at the end)
 # NOTE: that xformers is bumped from 0.0.30 to 0.0.31 to work with torch==2.7.1. This version may need to change to change when we upgrade torch.
-find requirements/ -name "*.txt" -type f -exec sed -i -E 's/^(xformers)==[^;[:space:]]*/\1==0.0.31/' {} \; 2>/dev/null || true
+find requirements/ -name "*.txt" -type f -exec sed -i -E 's/^(xformers)==[^;[:space:]]*/\1==0.0.32.post1/' {} \; 2>/dev/null || true
 
 uv run --no-project use_existing_torch.py
 
@@ -66,7 +66,7 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.7.1 --torch-backend=cu128
+uv pip install torch==2.8.0 --torch-backend=cu128
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."
