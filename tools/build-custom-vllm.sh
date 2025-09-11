@@ -18,15 +18,27 @@ set -eoux pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default values
-DEFAULT_GIT_URL="https://github.com/terrykong/vllm.git"
-DEFAULT_BRANCH="terryk/demo-custom-vllm"
-DEFAULT_VLLM_COMMIT=a3319f4f04fbea7defe883e516df727711e516cd # use full commit hash from the main branch
+#DEFAULT_GIT_URL="https://github.com/terrykong/vllm.git"
+#DEFAULT_BRANCH="ssm-fp32-exp-v1"
+# DEFAULT_GIT_URL="https://github.com/vegaluisjose/vllm.git"
+# DEFAULT_BRANCH="rl-nemotron-h"
+
+DEFAULT_GIT_URL="https://github.com/yfw/vllm.git"
+DEFAULT_BRANCH="rl-nemotron-h-0.10.0"
+
+# DEFAULT_VLLM_COMMIT=a3319f4f04fbea7defe883e516df727711e516cd # use full commit hash from the main branch
+DEFAULT_VLLM_COMMIT=6d8d0a24c02bfd84d46b3016b865a44f048ae84b # use full commit hash from the main branch
 
 # Parse command line arguments
 GIT_URL=${1:-$DEFAULT_GIT_URL}
 BRANCH=${2:-$DEFAULT_BRANCH}
 export VLLM_COMMIT=${3:-$DEFAULT_VLLM_COMMIT}
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${DEFAULT_VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+# export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${DEFAULT_VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${DEFAULT_VLLM_COMMIT}/vllm-0.10.0-cp38-abi3-manylinux1_x86_64.whl"
+
+# https://wheels.vllm.ai/6d8d0a24c02bfd84d46b3016b865a44f048ae84b/vllm-0.10.0-cp38-abi3-manylinux1_x86_64.whl
+
+
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
@@ -61,7 +73,7 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.7.0 --torch-backend=cu128
+uv pip install torch==2.7.1 --torch-backend=cu128
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."

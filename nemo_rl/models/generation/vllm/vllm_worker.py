@@ -333,6 +333,14 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+        if "enable_prefix_caching" in self.cfg["vllm_cfg"]:
+            # Some models like Nemotron-H do not yet support prefix caching
+            print(f"Overriding enable_prefix_caching from {enable_prefix_caching} (default based on compute capability) to {self.cfg['vllm_cfg']['enable_prefix_caching']}")
+            enable_prefix_caching = self.cfg["vllm_cfg"]["enable_prefix_caching"]
+
+        # TODO:  enable_block_reuse=False self.llm = LLM(model=path, tensor_parallel_size=tp, pytorch_backend_config=pytorch_config, kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7, enable_block_reuse=False))
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -369,7 +377,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=enable_prefix_caching,
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],

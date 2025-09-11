@@ -29,6 +29,7 @@ class VllmSpecificArgs(TypedDict):
     load_format: NotRequired[str]
     precision: NotRequired[str]
     enforce_eager: NotRequired[bool]
+    enable_prefix_caching: NotRequired[bool]  # Overrides the default value which is inferred by compute capability
 
 
 class VllmConfig(GenerationConfig):

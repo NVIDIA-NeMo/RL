@@ -1001,7 +1001,7 @@ class DTensorPolicyWorker:
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
                     attention_mask_input_all_ones = torch.ones(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                        input_ids.shape, dtype=torch.long, device=input_ids.device
                     )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
