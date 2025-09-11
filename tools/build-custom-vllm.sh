@@ -154,6 +154,6 @@ VLLM_PRECOMPILED_WHEEL_LOCATION=$VLLM_PRECOMPILED_WHEEL_LOCATION \\
   uv run --extra vllm vllm serve Qwen/Qwen3-0.6B
 
 [INFO] For more information on this custom install, visit https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
-[IMPORTANT] Remember to set the shell variable 'export VLLM_USE_PRECOMPILED=1' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
+[IMPORTANT] Remember to set the shell variables 'VLLM_COMMIT' and 'VLLM_PRECOMPILED_WHEEL_LOCATION' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
 EOF
 
