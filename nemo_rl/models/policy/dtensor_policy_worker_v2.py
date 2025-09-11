@@ -84,10 +84,11 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.utils.native_checkpoint import (
+from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -1433,11 +1434,30 @@ class DTensorPolicyWorkerV2:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        if checkpointing_cfg is None:
+            raise ValueError(
+                "checkpointing_cfg must be provided when saving checkpoint"
+            )
+
+        # Extract only the checkpointing configuration keys that exist
+        checkpoint_kwargs = {
+            key: value
+            for key, value in checkpointing_cfg.items()
+            if key
+            in {
+                "model_save_format",
+                "save_consolidated",
+                "is_peft",
+                "peft_config",
+            }
+        }
+
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1446,10 +1466,13 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            **checkpoint_kwargs,
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model."""
         load_checkpoint(
