@@ -606,6 +606,10 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
+    if "fp8" in master_config["policy"]["dtensor_cfg"]:
+        print("Setting make_sequence_length_divisible_by to 16 for FP8 training")
+        master_config["policy"]["make_sequence_length_divisible_by"] = 16
+
     # Run validation at the start if configured
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
