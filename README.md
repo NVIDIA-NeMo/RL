@@ -76,11 +76,10 @@ What you can expect:
 
 Clone **NeMo RL**.
 ```sh
-git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules 
-# by running (This is not necessary if you are using the pure Pytorch/DTensor path):
+# If you are already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -127,7 +126,7 @@ bash tools/build-flash-attn-in-uv-cache.sh
 > The NeMo RL Dockerfile will warm the uv cache with flash-attn.
 > See https://docs.nvidia.com/nemo/rl/latest/docker.html for instructions if you are looking for the NeMo RL container.
 
-If sucessful, you should see `✅ flash-attn successfully added to uv cache`.
+If successful, you should see `✅ flash-attn successfully added to uv cache`.
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 > [!NOTE]
