@@ -72,7 +72,7 @@ ENV UV_LINK_MODE=copy
 RUN <<"EOF" bash -exu
 uv venv ${UV_PROJECT_ENVIRONMENT}
 
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
+VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.8.0 psutil ninja --torch-backend=cu128
 VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
 EOF
 

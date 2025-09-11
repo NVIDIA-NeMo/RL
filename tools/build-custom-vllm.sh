@@ -20,11 +20,11 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 
 # Parse command line arguments
-GIT_URL=${1:-https://github.com/terrykong/vllm.git}
-GIT_REF=${2:-terryk/demo-custom-vllm}
+GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
+GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 # This commit was chosen as one close to the v0.10 release: git merge-base --fork-point origin/main tags/v0.10.0
-VLLM_WHEEL_COMMIT=${3:-d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70}  # use full commit hash from the main branch
+VLLM_WHEEL_COMMIT=${3:-862f2ef893d9751db0a92bd2d4ae0e3d9677872f}  # use full commit hash from the main branch
 export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_WHEEL_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
