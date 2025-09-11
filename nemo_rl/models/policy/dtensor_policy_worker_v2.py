@@ -214,6 +214,7 @@ class DTensorPolicyWorkerV2:
             model_class = resolve_model_class(model_config.model_type)
 
         full_state_dict = None
+        model_state_dict_keys = None
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
@@ -225,6 +226,8 @@ class DTensorPolicyWorkerV2:
             )
 
             full_state_dict = model.state_dict()
+            # Store the original model state dict keys before any parallelization
+            model_state_dict_keys = list(full_state_dict.keys())
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
@@ -349,6 +352,11 @@ class DTensorPolicyWorkerV2:
                 broadcast_from_rank0=True,
             ),
         )
+
+        # Broadcast model state dict keys to all ranks and store as instance variable
+        keys_to_broadcast = [model_state_dict_keys]
+        torch.distributed.broadcast_object_list(keys_to_broadcast, src=0)
+        self.model_state_dict_keys = keys_to_broadcast[0]
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
@@ -1466,6 +1474,7 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_state_dict_keys=self.model_state_dict_keys,
             **checkpoint_kwargs,
         )
 
