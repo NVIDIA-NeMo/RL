@@ -47,6 +47,9 @@ git checkout "$GIT_REF"
 
 # Create a new Python environment using uv
 echo "Creating Python environment..."
+# Pop the project environment set by user to not interfere with the one we create for the vllm repo
+OLD_UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT
+unset UV_PROJECT_ENVIRONMENT
 uv venv
 
 # Remove all comments from requirements files to prevent use_existing_torch.py from incorrectly removing xformers
@@ -67,7 +70,6 @@ uv pip install torch==2.8.0 --torch-backend=cu128
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."
-#uv pip install --no-build-isolation -e .
 uv pip install --no-build-isolation -e .
 
 echo "Build completed successfully!"
@@ -83,6 +85,12 @@ fi
 
 cd "$REPO_ROOT"
 
+export UV_PROJECT_ENVIRONMENT=$OLD_UV_PROJECT_ENVIRONMENT
+if [[ -n "$UV_PROJECT_ENVIRONMENT" ]]; then
+    # We optionally set this if the project environment is outside of the project directory.
+    # If we do not set this then uv pip install commands will fail
+    export VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
+fi
 # Use tomlkit via uv to idempotently update pyproject.toml
 uv run --no-project --with tomlkit python - <<'PY'
 from pathlib import Path
