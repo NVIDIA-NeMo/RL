@@ -165,6 +165,7 @@ def get_basic_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
