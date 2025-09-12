@@ -28,6 +28,7 @@ class DTensorConfig(TypedDict):
     context_parallel_size: NotRequired[int]
     custom_parallel_plan: NotRequired[str]
     clear_cache_every_n_steps: NotRequired[int]
+    use_liger_kernel: NotRequired[bool]
 
 
 class SequencePackingConfig(TypedDict):

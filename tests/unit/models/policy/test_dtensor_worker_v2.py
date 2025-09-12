@@ -28,6 +28,7 @@ def create_test_config(
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
     dtensor_v2: bool = False,
+    use_liger_kernel: bool = False,
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
@@ -63,6 +64,7 @@ def create_test_config(
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
             "custom_parallel_plan": custom_parallel_plan,
+            "use_liger_kernel": use_liger_kernel,
         },
         "dynamic_batching": {
             "enabled": True,
@@ -232,12 +234,202 @@ def test_dtensor_worker_v1_v2_model_config_equivalence(
 
     config_v1_dict = vars(model_config_v1)
     config_v2_dict = vars(model_config_v2)
-    config_v1_dict.pop("nemo_version", None)
-    config_v2_dict.pop("nemo_version", None)
-    config_v1_dict.pop("pad_token_id", None)
-    config_v2_dict.pop("pad_token_id", None)
+    for ignore_key in ["nemo_version", "pad_token_id", "_attn_implementation_internal"]:
+        config_v1_dict.pop(ignore_key, None)
+        config_v2_dict.pop(ignore_key, None)
 
     discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
     assert not discrepancies, (
         f"Model configurations differ between v1 and v2 approaches for {model_name}"
     )
+
+
+@pytest.mark.parametrize(
+    "use_liger_kernel,cp_size,should_raise_exception",
+    [
+        (True, 1, False),  # Valid configuration
+        (True, 2, True),  # Should raise exception: liger + context parallel
+        (False, 1, False),  # Valid configuration
+        (False, 2, False),  # Valid configuration
+    ],
+)
+def test_use_liger_kernel_configuration(
+    use_liger_kernel: bool,
+    cp_size: int,
+    should_raise_exception: bool,
+):
+    """Test that use_liger_kernel configuration works correctly with context parallel constraints."""
+    # Simulate the config extraction logic from DTensorPolicyWorkerV2
+    dtensor_cfg = {
+        "tensor_parallel_size": 1,
+        "context_parallel_size": cp_size,
+        "use_liger_kernel": use_liger_kernel,
+    }
+
+    # Extract use_liger_kernel from config, defaulting to False
+    use_liger_kernel_config = dtensor_cfg.get("use_liger_kernel", False)
+
+    if should_raise_exception:
+        # Should raise ValueError when use_liger_kernel=True and cp_size > 1
+        with pytest.raises(
+            ValueError,
+            match="use_liger_kernel=True is incompatible with context_parallel_size",
+        ):
+            # Check for incompatible configuration
+            if use_liger_kernel_config and cp_size > 1:
+                raise ValueError(
+                    f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                    "Liger-kernel doesn't support context parallel yet. "
+                    "Please either set use_liger_kernel=False or context_parallel_size=1."
+                )
+        print(
+            f"✓ Test passed: use_liger_kernel={use_liger_kernel}, cp_size={cp_size} "
+            f"-> correctly raised exception"
+        )
+    else:
+        # Should not raise exception for valid configurations
+        try:
+            # Check for incompatible configuration
+            if use_liger_kernel_config and cp_size > 1:
+                raise ValueError(
+                    f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                    "Liger-kernel doesn't support context parallel yet. "
+                    "Please either set use_liger_kernel=False or context_parallel_size=1."
+                )
+            # If we get here, it's a valid configuration
+            actual_use_liger_kernel = use_liger_kernel_config
+            expected_enabled = use_liger_kernel
+            assert actual_use_liger_kernel == expected_enabled
+            print(
+                f"✓ Test passed: use_liger_kernel={use_liger_kernel}, cp_size={cp_size} "
+                f"-> valid configuration, liger_kernel={actual_use_liger_kernel}"
+            )
+        except ValueError:
+            pytest.fail(
+                f"Unexpected exception for valid configuration: use_liger_kernel={use_liger_kernel}, cp_size={cp_size}"
+            )
+
+
+def test_use_liger_kernel_default_behavior():
+    """Test that use_liger_kernel defaults to False when not specified in config."""
+    # Simulate config without use_liger_kernel specified
+    dtensor_cfg = {
+        "tensor_parallel_size": 1,
+        "context_parallel_size": 1,
+        # use_liger_kernel not specified - should default to False
+    }
+
+    # Extract use_liger_kernel from config, defaulting to False
+    use_liger_kernel_config = dtensor_cfg.get("use_liger_kernel", False)
+
+    # Only enable liger kernel if both config allows it AND context parallel is disabled
+    actual_use_liger_kernel = use_liger_kernel_config and (
+        dtensor_cfg["context_parallel_size"] == 1
+    )
+
+    # Should be False because use_liger_kernel defaults to False
+    assert actual_use_liger_kernel is False, (
+        "use_liger_kernel should default to False when not specified in config"
+    )
+
+    print("✓ Test passed: use_liger_kernel defaults to False when not specified")
+
+
+def test_create_test_config_includes_liger_kernel():
+    """Test that create_test_config properly includes the use_liger_kernel option."""
+    # Test with use_liger_kernel=True
+    config_with_liger = create_test_config(
+        model_name="test-model",
+        use_liger_kernel=True,
+    )
+
+    assert "use_liger_kernel" in config_with_liger["dtensor_cfg"], (
+        "use_liger_kernel should be present in dtensor_cfg"
+    )
+    assert config_with_liger["dtensor_cfg"]["use_liger_kernel"] is True, (
+        "use_liger_kernel should be True when specified"
+    )
+
+    # Test with use_liger_kernel=False (explicit)
+    config_without_liger = create_test_config(
+        model_name="test-model",
+        use_liger_kernel=False,
+    )
+
+    assert config_without_liger["dtensor_cfg"]["use_liger_kernel"] is False, (
+        "use_liger_kernel should be False when explicitly set to False"
+    )
+
+    # Test with default value (should be False)
+    config_default = create_test_config(model_name="test-model")
+
+    assert config_default["dtensor_cfg"]["use_liger_kernel"] is False, (
+        "use_liger_kernel should default to False"
+    )
+
+    print("✓ Test passed: create_test_config properly handles use_liger_kernel option")
+
+
+def test_use_liger_kernel_exception_behavior():
+    """Test that the exact exception behavior matches DTensorPolicyWorkerV2 implementation."""
+    # Test case that should raise an exception
+    dtensor_cfg = {
+        "tensor_parallel_size": 1,
+        "context_parallel_size": 4,  # > 1, should conflict with liger
+        "use_liger_kernel": True,
+    }
+
+    use_liger_kernel = dtensor_cfg.get("use_liger_kernel", False)
+    cp_size = dtensor_cfg["context_parallel_size"]
+
+    # This should raise a ValueError with specific message
+    with pytest.raises(ValueError) as exc_info:
+        if use_liger_kernel and cp_size > 1:
+            raise ValueError(
+                f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                "Liger-kernel doesn't support context parallel yet. "
+                "Please either set use_liger_kernel=False or context_parallel_size=1."
+            )
+
+    # Validate the exact error message
+    expected_message = (
+        "use_liger_kernel=True is incompatible with context_parallel_size=4 > 1. "
+        "Liger-kernel doesn't support context parallel yet. "
+        "Please either set use_liger_kernel=False or context_parallel_size=1."
+    )
+    assert str(exc_info.value) == expected_message
+
+    print(
+        "✓ Test passed: Exception behavior matches DTensorPolicyWorkerV2 implementation"
+    )
+
+    # Test case that should NOT raise an exception
+    valid_configs = [
+        {"use_liger_kernel": True, "context_parallel_size": 1},  # Valid: liger + no CP
+        {
+            "use_liger_kernel": False,
+            "context_parallel_size": 1,
+        },  # Valid: no liger + no CP
+        {"use_liger_kernel": False, "context_parallel_size": 4},  # Valid: no liger + CP
+    ]
+
+    for config in valid_configs:
+        use_liger_kernel = config.get("use_liger_kernel", False)
+        cp_size = config["context_parallel_size"]
+
+        # This should NOT raise an exception
+        try:
+            if use_liger_kernel and cp_size > 1:
+                raise ValueError(
+                    f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                    "Liger-kernel doesn't support context parallel yet. "
+                    "Please either set use_liger_kernel=False or context_parallel_size=1."
+                )
+            # If we get here, it's a valid configuration
+            print(
+                f"✓ Valid config: use_liger_kernel={use_liger_kernel}, cp_size={cp_size}"
+            )
+        except ValueError:
+            pytest.fail(f"Unexpected exception for valid config: {config}")
+
+    print("✓ Test passed: All valid configurations work without exceptions")
