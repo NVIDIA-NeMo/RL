@@ -34,6 +34,13 @@ class ReferenceLogprobOutputSpec(TypedDict):
     reference_logprobs: torch.Tensor
 
 
+class TopkLogitsOutputSpec(TypedDict):
+    """Per-position top-k logits and corresponding global token indices."""
+
+    topk_logits: torch.Tensor  # [B, S-1, k]
+    topk_indices: torch.Tensor  # [B, S-1, k]
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -64,6 +71,18 @@ class PolicyInterface(ABC):
         Returns:
             BatchedDataDict containing:
                 - logprobs: Tensor of logprobs of actions
+        """
+        pass
+
+    @abstractmethod
+    def get_topk_logits(
+        self, data: BatchedDataDict[GenerationDatumSpec], k: int
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get per-position top-k logits and global indices for a batch of inputs.
+
+        Notes:
+            - Aligns to next-token positions → returns S-1 positions.
+            - Implementations may restrict support (e.g., no CP/packed at first).
         """
         pass
 
