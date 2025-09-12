@@ -18,6 +18,9 @@ import os
 from typing import Any, Optional
 
 import torch
+from nemo_automodel.components.checkpoint._backports.filesystem import (
+    SerializationFormat,
+)
 
 # Apply torch backports for compatibility with torch==2.7.1
 from nemo_automodel.components.checkpoint._torch_backports import apply_patches
@@ -82,6 +85,7 @@ def save_checkpoint(
     is_peft: bool = False,
     peft_config: Optional[Any] = None,
     save_consolidated: bool = False,
+    model_state_dict_keys: Optional[list[str]] = None,
 ) -> None:
     """Save a checkpoint of the model and optionally optimizer state.
 
@@ -96,8 +100,15 @@ def save_checkpoint(
         model_save_format: Format for saving model ("torch_save" or "safetensors")
         is_peft: Whether the model uses PEFT
         peft_config: PEFT configuration if is_peft is True
+        save_consolidated: Whether to save consolidated checkpoints (for HF compatibility)
+        model_state_dict_keys: Copy of the model state dict keys before any parallelization.
+                             If None, will be extracted from the model's current state dict.
     """
     # Create checkpoint config
+
+    # Extract model state dict keys if not provided
+    if model_state_dict_keys is None:
+        model_state_dict_keys = list(model.state_dict().keys())
 
     valid_formats = {"safetensors", "torch_save"}
     if model_save_format not in valid_formats:
@@ -121,6 +132,7 @@ def save_checkpoint(
         model_repo_id="",
         save_consolidated=save_consolidated,
         is_peft=is_peft,
+        model_state_dict_keys=model_state_dict_keys,
     )
 
     # Save model using nemo-automodel API
@@ -166,28 +178,20 @@ def load_checkpoint(
         optimizer: Optional optimizer to load state into
         scheduler: Optional scheduler to load state into
         optimizer_path: Path to load optimizer state from (required if optimizer provided)
-        model_save_format: Format model was saved in ("torch_save" or "safetensors")
-        is_peft: Whether the model uses PEFT
     """
     print(f"Loading weights from {weights_path}")
 
     model_save_format, is_peft = detect_checkpoint_format(weights_path)
-    checkpoint_config = CheckpointingConfig(
-        enabled=True,
-        checkpoint_dir=os.path.dirname(weights_path),
-        model_save_format=model_save_format,
-        model_cache_dir="",  # Not used for basic loading
-        model_repo_id="",  # Not used for basic loading
-        save_consolidated=False,  # Keep original behavior
-        is_peft=is_peft,
-    )
 
     try:
+        format_enum = SerializationFormat[model_save_format.upper()]
+
         # Load model using nemo-automodel API
         load_model(
             model=model,
-            weights_path=weights_path,
-            checkpoint_config=checkpoint_config,
+            model_path=weights_path,
+            model_save_format=format_enum,
+            is_peft=is_peft,
         )
     except FileNotFoundError as e:
         msg = (
