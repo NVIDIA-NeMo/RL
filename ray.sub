@@ -5,7 +5,7 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
-#SBATCH --dependency=singleton
+# SBATCH --dependency=singleton
 #SBATCH --gres=gpu:8
 
 
@@ -101,6 +101,9 @@ head_cmd=$(cat <<EOF
 touch $LOG_DIR/STARTED_RAY_HEAD
 env
 
+# for ether0 environment
+apt-get update && apt-get install -y libxrender1 libxext6
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -140,6 +143,7 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    --system-config='{"worker_register_timeout_seconds": 300}' \
     \
     --block
 EOFINNER
@@ -168,6 +172,9 @@ for ((i = 0; i < SLURM_JOB_NUM_NODES; i++)); do
     
   worker_cmd=$(cat <<EOF
 env
+
+# for ether0 environment  
+apt-get update && apt-get install -y libxrender1 libxext6
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process

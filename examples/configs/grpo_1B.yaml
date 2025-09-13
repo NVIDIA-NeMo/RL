@@ -181,6 +181,10 @@ env:
   ifeval:
     num_workers: 8
     enable: false
+  ether0: 
+    enable: false
+    num_workers: 8
+    # task_filter: ["functional-group", "retro-synthesis", "molecule-completion"]
 
 logger:
   log_dir: "logs"  # Base directory for all logs

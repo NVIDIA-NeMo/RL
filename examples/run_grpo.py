@@ -29,6 +29,7 @@ from nemo_rl.environments.ifeval_environment import IFEvalEnvironment
 from nemo_rl.environments.llm_judge_async_environment import LLMJudgeAsyncEnvironment
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.environments.genrm_pairwise_environment import GenRMPairwiseEnvironment
+from nemo_rl.environments.ether0_environment import Ether0Environment
 from nemo_rl.models.generation.interfaces import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -51,6 +52,7 @@ def parse_args():
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
     print("\n▶ Setting up data...")
+    print(f"Environment configs: {env_configs}")
     val_ds = None
 
     train_ds = JsonlinesDataset(
@@ -126,6 +128,16 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
             },
         ).remote(env_configs["genrm_pairwise"])
         task_to_env["rlhf_genrm"] = genrm_pairwise_env
+
+    if "ether0" in env_configs and env_configs["ether0"]["enable"]:
+        print(f"### Setting up ether0 environment with config: {env_configs['ether0']}")
+        ether0_env = Ether0Environment.options(
+            runtime_env={
+                "py_executable": Ether0Environment.DEFAULT_PY_EXECUTABLE,
+                "env_vars": dict(os.environ),
+            }
+        ).remote(env_configs["ether0"])
+        task_to_env["ether0"] = ether0_env
 
     return train_ds, val_ds, task_to_env, task_to_env
 

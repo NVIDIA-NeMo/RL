@@ -29,6 +29,7 @@ dependencies = [
     "hydra-core",
     "debugpy>=1.8.0",
     "jsonlines",
+    "ether0 @ file:///lustre/fsw/portfolios/llmservice/users/cmunley/ether0",
 ]
 
 [tool.setuptools]
@@ -48,6 +49,10 @@ ifeval = [
     "langdetect",
     "nltk==3.9.1",
     "immutabledict",
+]
+
+ether0 = [
+    "ether0 @ file:///lustre/fsw/portfolios/llmservice/users/cmunley/ether0",
 ]
 
 [dependency-groups]

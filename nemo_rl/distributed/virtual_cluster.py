@@ -48,6 +48,10 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and ifeval dependencies.
     IFEVAL = "uv run --locked --extra ifeval"
 
+    # Use NeMo-RL direct dependencies and ether0 dependencies.
+    # note - apt-get container workaround in ray.sub 
+    ETHER0 = "uv run --extra ether0"
+
 
 @ray.remote
 def _get_node_ip_and_free_port():
@@ -78,6 +82,15 @@ def init_ray(log_dir: Optional[str] = None):
         "env_vars": dict(os.environ),  # Pass thru all user environment variables
         "working_dir": git_root,
         "py_executable": PY_EXECUTABLES.SYSTEM,
+        "excludes": [ # tmp workaround
+            "*.jsonl", 
+            "*.json", 
+            "results/", 
+            "logs/", 
+            "__pycache__/", 
+            ".git/",
+            "future_house_*.jsonl",  
+        ],
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
