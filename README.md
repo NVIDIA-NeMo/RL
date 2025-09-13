@@ -4,32 +4,88 @@
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
+
+<details>
+<summary>Previous News</summary>
+
 * [5/14/2025] [Reproduce DeepscaleR with NeMo RL!](docs/guides/grpo-deepscaler.md)
 * [5/14/2025] [Release v0.2.1!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.2.1)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1o14sO0gj_Tl_ZXGsoYip3C0r5ofkU1Ey?usp=sharing) to get a head start on your experimentation.
 
+</details>
+
+## Overview
+
+**Nemo RL** is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for Multimodal models(LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+
+What you can expect:
+- **Flexibility** with a modular design that allows easy integration and customization.
+- **Efficient resource management using Ray**, enabling scalable and flexible deployment across different hardware configurations.
+- **Hackable** with native Pytorch only paths for quick research prototypes.
+- **High-performance with Megatron Core**, supporting various parallelism techniques for large models and large context lengths.
+- **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
+- **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
+
+Please refer to our [design documents](docs/design-docs/) for more details on the architecture and design philosophy.
+### Training Backends
+NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
+
+- **DTensor** - PyTorch's next-generation distributed training with improved memory efficiency (Pytorch native TP, SP, PP, CP, FSDP2)
+- [**Megatron**](https://github.com/NVIDIA-NeMo/Megatron-Bridge) - NVIDIA's high-performance training framework for scaling to large models with 6D parallelisms
+
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
+
+### Generation Backends
+NeMo RL supports multiple generation/rollout backends to accommodate different model sizes and hardware configurations:
+
+- [**vLLM**](https://github.com/vllm-project/vllm) - A high-throughput and memory-efficient popular inference and serving engine 
+- [**Megatron**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference) - High-performance Megatron native inference backend which eliminates weight conversion between training <> inference
+
+For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](docs/design-docs/generation.md).
+
+## Features
+
+✅ _Available now_ | 🔜 _Coming in v0.4_
+
+- 🔜 **Megatron Inference** - Megatron Inference for fast day-0 support for new megatron models (avoid weight conversion).
+- 🔜 **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO.
+- 🔜 **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path.
+- 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
+- 🔜 **Improved Large MoE Performance** - Improve Megatron-core training performance and generation performance.
+- 🔜 **End-to-end FP8 Low Precision training** - Support for Megatron-core FP8 training and FP8 VLLM generation.
+- 🔜 **Megatron-Bridge Integration** - Integrate Megatron-Bridge to enable training features from Megatron-Core.
+- 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
+- 🔜 **New Models** - gpt-oss.
+- 🔜 **Expand Algorithms** - DAPO, GSPO.
+- 🔜 **GB200** - Add container support for GB200.
+- ✅ **Distributed Training** - Ray-based infrastructure.
+- ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
+- ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
+- ✅ **Learning Algorithms** - GRPO/GSPO , SFT , and DPO.
+- ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
+- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
+- ✅ **(even) Larger Model Support with Long(er) Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
+- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models (Megatron)
+- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
+- ✅ **Fast Generation** - vLLM backend for optimized inference.
+- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+
 ## Table of Contents
-<!-- markdown all in one -->
-- [Nemo RL: A Scalable and Efficient Post-Training Library](#nemo-rl-a-scalable-and-efficient-post-training-library)
-  - [📣 News](#-news)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
   - [Prerequisites](#prerequisites)
-  - [Training Backends](#training-backends)
-  - [GRPO](#grpo)
-    - [GRPO Single Node](#grpo-single-node)
-    - [GRPO Multi-node](#grpo-multi-node)
-      - [GRPO Qwen2.5-32B](#grpo-qwen25-32b)
-      - [GRPO Multi-Turn](#grpo-multi-turn)
-  - [Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)
-    - [SFT Single Node](#sft-single-node)
-    - [SFT Multi-node](#sft-multi-node)
-  - [DPO](#dpo)
-    - [DPO Single Node](#dpo-single-node)
-    - [DPO Multi-node](#dpo-multi-node)
-  - [RM](#rm)
-    - [RM Single Node](#rm-single-node)
-    - [RM Multi-node](#rm-multi-node)
+  - [Quick Start](#quick-start)
+  - Support Matrix
+
+    <p></p>
+    
+    |Algorithms|Single Node|Multi-node|
+    |-|-|-|
+    |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
+    |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
+    |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
+    |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
+
+    <p></p>
+
   - [Evaluation](#evaluation)
     - [Convert Model Format (Optional)](#convert-model-format-optional)
     - [Run Evaluation](#run-evaluation)
@@ -39,38 +95,52 @@
   - [Contributing](#contributing)
   - [Licenses](#licenses)
 
-**Nemo RL** is a scalable and efficient post-training library designed for models ranging from 1 GPU to thousands, and from tiny to over 100 billion parameters.
+## Quick Start
 
-What you can expect:
+Use this quick start to get going with either the Native PyTorch DTensor or Megatron-Core training backends. 
 
-- **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
-- **High-performance implementation with Megatron Core**, supporting various parallelism techniques for large models (>100B) and large context lengths.
-- **Efficient resource management using Ray**, enabling scalable and flexible deployment across different hardware configurations.
-- **Flexibility** with a modular design that allows easy integration and customization.
-- **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
+> [!NOTE]
+> Both training backends are independent — you can install and use either one on its own.
 
-## Features
+For more examples and setup details, continue to the [Prerequisites](#prerequisites) section.
 
-✅ _Available now_ | 🔜 _Coming in v0.4_
-
-- ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
-- ✅ **Distributed Training** - Fully Sharded Data Parallel (FSDP2) support and Ray-based infrastructure.
-- ✅ **Environment Support** - Support for multi-environment training.
-- ✅ **Learning Algorithms** - GRPO (Group Relative Policy Optimization), SFT (Supervised Fine-Tuning), and DPO (Direct Preference Optimization).
-- ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Large Model Support** - Native PyTorch support for models up to 70B parameters.
-- ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for efficient training.
-- ✅ **(even) Larger Model Support with Long(er) Sequences** - Advanced parallelisms with Megatron Core (TP/PP/CP/SP/EP).
-- ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Environment Isolation** - Dependency isolation between components.
-- ✅ **Megatron Inference** - (static) Megatron Inference for day-0 support for new megatron models.
-- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models
-- ✅ **Sequence Packing** - Sequence packing in both DTensor and MCore for huge training perf gains
-
-
-- 🔜 **Improved Native Performance** - Improve training time for Native Pytorch Models.
-- 🔜 **Megatron Inference** - (dynamic) Megatron Inference for fast day-0 support for new megatron models.
+<table style="border-collapse:collapse; width:100%; table-layout:fixed;">
+  <thead>
+    <tr>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Native PyTorch (DTensor)</th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Megatron Core</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td colspan="2" style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Clone and create the environment</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+cd nemo-rl
+uv venv</code></pre>
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;"></td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Megatron-only prerequisites</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git submodule update --init --recursive</code></pre>
+        <em>Note:</em> If you previously ran without the Megatron backend, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
+      </td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Run GRPO (DTensor)</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo_math.py</code></pre>
+      </td>
+      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
+        <strong>Run GRPO (Megatron)</strong>
+        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run examples/run_grpo_math.py &#92;
+--config examples/configs/grpo_math_1B_megatron.yaml</code></pre>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Prerequisites
 
@@ -137,14 +207,6 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 > - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
-## Training Backends
-
-NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
-
-- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency
-- **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters)
-
-The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
 
 ## GRPO
 
