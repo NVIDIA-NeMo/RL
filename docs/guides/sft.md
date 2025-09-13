@@ -73,16 +73,16 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
 
 By default, NeMo RL has support for [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py) and [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) datasets. All of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
 ```yaml
 data:
   dataset_name: ResponseDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_path: <LocalPathToValidationDataset>
+  train_data_path: <PathToTrainingDataset>
+  val_data_path: <PathToValidationDataset>
   input_key: <QuestionKey>, default is "input"
   output_key: <AnswerKey>, default is "output"
-  train_split: <TrainSplit>, default is "train"
-  val_split: <ValSplit>, default is None
+  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
+  val_split: <ValSplit>, used for HuggingFace datasets, default is None
 ```
 
 Adding a new dataset is a straightforward process.

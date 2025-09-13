@@ -17,7 +17,7 @@ import os
 from typing import Optional, Union
 
 import torch
-from datasets import load_dataset
+from datasets import DatasetDict, load_dataset
 from PIL import Image
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -76,6 +76,9 @@ def load_dataset_from_path(data_path: str, data_split: Optional[str] = "train"):
 
     if data_split:
         raw_dataset = raw_dataset[data_split]
+    # if the dataset doesn't contain split, load_dataset will use "train" as default
+    elif isinstance(raw_dataset, DatasetDict) and "train" in raw_dataset:
+        raw_dataset = raw_dataset["train"]
 
     return raw_dataset
 

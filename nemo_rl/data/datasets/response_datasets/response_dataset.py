@@ -33,8 +33,8 @@ class ResponseDataset:
         val_data_path: Path to the JSON file containing validation data
         input_key: Key for the input text
         output_key: Key for the output text
-        train_split: Split name for the training data, default is "train"
-        val_split: Split name for the validation data, default is None
+        train_split: Split name for the training data, used for HuggingFace datasets, default is None
+        val_split: Split name for the validation data, used for HuggingFace datasets, default is None
     """
 
     def __init__(
@@ -43,7 +43,7 @@ class ResponseDataset:
         val_data_path: Optional[str] = None,
         input_key: str = "input",
         output_key: str = "output",
-        train_split: str = "train",
+        train_split: Optional[str] = None,
         val_split: Optional[str] = None,
     ):
         self.input_key = input_key
