@@ -93,30 +93,30 @@ DPO training supports only two completions (where the lowest rank is preferred a
 
 By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
   dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>
   # multiple validation sets is supported
   val_data_paths:
-    <NameOfValidationDataset>: <LocalPathToValidationDataset1>
-    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
-  train_split: <TrainSplit>, default is "train"
-  val_split: <ValSplit>, default is None
+    <NameOfValidationDataset>: <PathToValidationDataset1>
+    <NameOfValidationDataset2>: <PathToValidationDataset2>
+  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
+  val_split: <ValSplit>, used for HuggingFace datasets, default is None
 ```
 
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
   dataset_name: BinaryPreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_path: <LocalPathToValidationDataset>
+  train_data_path: <PathToTrainingDataset>
+  val_data_path: <PathToValidationDataset>
   prompt_key: <PromptKey>, default is "prompt"
   chosen_key: <ChosenKey>, default is "chosen"
   rejected_key: <RejectedKey>, default is "rejected"
-  train_split: <TrainSplit>, default is "train"
-  val_split: <ValSplit>, default is None
+  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
+  val_split: <ValSplit>, used for HuggingFace datasets, default is None
 ```
 
 Please note:

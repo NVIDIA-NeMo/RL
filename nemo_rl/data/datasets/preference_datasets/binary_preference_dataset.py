@@ -56,8 +56,8 @@ class BinaryPreferenceDataset:
         prompt_key: Key for the input prompt/context, default is "prompt"
         chosen_key: Key for the preferred/winning response, default is "chosen"
         rejected_key: Key for the non-preferred/losing response, default is "rejected"
-        train_split: Split name for the training data, default is "train"
-        val_split: Split name for the validation data, default is None
+        train_split: Split name for the training data, used for HuggingFace datasets, default is None
+        val_split: Split name for the validation data, used for HuggingFace datasets, default is None
     """
 
     def __init__(
@@ -67,7 +67,7 @@ class BinaryPreferenceDataset:
         prompt_key: str = "prompt",
         chosen_key: str = "chosen",
         rejected_key: str = "rejected",
-        train_split: str = "train",
+        train_split: Optional[str] = None,
         val_split: Optional[str] = None,
     ):
         self.prompt_key = prompt_key

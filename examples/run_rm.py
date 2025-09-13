@@ -69,7 +69,7 @@ def rm_preprocessor(
         rejected_completion = datum_dict["completions"][0]
     else:
         raise NotImplementedError(
-            "Ties are not supported yet. You can use the following command to filter out ties: `cat <LocalPathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
         )
 
     messages_chosen = datum_dict["context"] + chosen_completion["completion"]
