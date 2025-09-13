@@ -34,7 +34,7 @@ def format_ether0(data, task_filter: Optional[List[str]] = None):
         print(f"Warning: Failed to parse solution for {data['id']}")
         return None
     
-    problem_with_instruction = problem + "\n\nYOU MUST PROVE YOUR FINAL ANSWER INSIDE \\boxed{}."
+    problem_with_instruction = problem + "\n\nYou must prove your final answer inside \\boxed{}."
     
     return {
         "messages": [
@@ -63,7 +63,7 @@ def main():
         "--input_file",
         type=str,
         required=True,
-        help="Input jsonlines file (e.g., future_house_train.jsonl)",
+        help="Input jsonlines file",
     )
     parser.add_argument(
         "--output_file", 
@@ -82,7 +82,7 @@ def main():
         "--max_samples",
         type=int,
         default=None,
-        help="Maximum number of samples to convert (for testing)",
+        help="Maximum number of samples to convert",
     )
 
     args = parser.parse_args()
