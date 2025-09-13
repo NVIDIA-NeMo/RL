@@ -55,15 +55,21 @@ class ThinkingBudgetLogitsProcessor:
             think_end_token_id: List of Token IDs to force when think_max_tokens is reached.
         """
         self.think_max_tokens = think_max_tokens
-        self.grace = int(1.15 * think_max_tokens)
         self.think_end_token_ids = think_end_token_ids
         self.len_think_end_ids = len(think_end_token_ids)
         self.start_of_end = False
         self.end_of_end = False
+        # grace period
+        grace = int(0.15 * think_max_tokens)
+        if grace < 500:
+            grace = 500
+        if grace > 1000:
+            grace = 1000
+        self.grace = grace + think_max_tokens
+
         print(f"thinking max tokens is {self.think_max_tokens}")
         print(f"grace period is {self.grace}")
         print(f"thinking eos is is {self.think_end_token_ids}")
-
 
     def __call__(self, input_ids: List[int], logits: torch.Tensor) -> torch.Tensor:
         """
@@ -80,12 +86,14 @@ class ThinkingBudgetLogitsProcessor:
             """
             start the end thinking process because we are past the grace period
             """
+            print("grace period over...")
             self.start_of_end = True
 
         if len(input_ids) > self.think_max_tokens and input_ids[-1] in NEWLINE_TOKENS and not self.start_of_end:
             """
             start the end thinking process because we are past the budget and found a newline token
             """
+            print("new line token after max thinking...")
             self.start_of_end = True
 
         if self.start_of_end and not self.end_of_end:
