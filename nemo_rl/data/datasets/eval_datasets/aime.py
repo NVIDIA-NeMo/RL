@@ -12,36 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local math dataset."""
+"""AIME dataset."""
 
 from typing import Any, Literal, Optional
 
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 
 from nemo_rl.data import processors
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
-class LocalMathDataset:
+class AIMEDataset:
     def __init__(
         self,
-        data_paths: str | list[str],
-        problem_key: str,
-        solution_key: str,
-        name: str,
-        split: Optional[str] = None,
-        file_format: Literal["csv", "json"] = "csv",
+        variant: Literal["2024", "2025"] = "2025",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
-        ds = load_dataset(file_format, data_files=data_paths)
-        if split is not None:
-            ds = ds[split]
-        self._problem_key = problem_key
-        self._solution_key = solution_key
+        if variant == "2024":
+            ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+            self.input_key = "problem"
+        elif variant == "2025":
+            ds0 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+            ds1 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+            ds = concatenate_datasets([ds0, ds1])
+            self.input_key = "question"
+        else:
+            raise ValueError(f"Invalid variant for aime dataset: aime{variant}")
+
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
-            task_name=name,
+            task_name=f"aime{variant}",
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
         )
@@ -49,6 +50,6 @@ class LocalMathDataset:
 
     def _rekey(self, data: dict[str, Any]):
         return {
-            "problem": data[self._problem_key],
-            "expected_answer": data[self._solution_key],
+            "problem": data[self.input_key],
+            "expected_answer": data["answer"],
         }

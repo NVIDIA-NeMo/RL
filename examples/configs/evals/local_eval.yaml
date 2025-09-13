@@ -6,9 +6,8 @@ generation:
 
 data:
   prompt_file: "examples/prompts/cot.txt"
-  dataset_name: "local"
+  dataset_name: "https://openaipublic.blob.core.windows.net/simple-evals/math_500_test.csv"
   problem_key: "Question"
   solution_key: "Answer"
   split: "train"
-  data_paths: "https:\/\/openaipublic.blob.core.windows.net\/simple-evals\/math_500_test.csv"
   file_format: "csv"

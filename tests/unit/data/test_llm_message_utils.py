@@ -20,7 +20,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
-from nemo_rl.data.hf_datasets import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     _validate_tensor_consistency,
