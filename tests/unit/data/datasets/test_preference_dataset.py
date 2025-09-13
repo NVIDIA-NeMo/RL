@@ -150,23 +150,24 @@ def mock_binary_preference_data():
         }
     ]
 
-    train_ctx = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-    val_ctx = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as train_file:
         json.dump(train_data, train_file)
         train_path = train_file.name
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as val_file:
         json.dump(val_data, val_file)
         val_path = val_file.name
-    yield train_path, val_path
-    # Cleanup
-    os.unlink(train_path)
-    os.unlink(val_path)
+
+    try:
+        yield train_path, val_path
+    finally:
+        # Cleanup
+        os.unlink(train_path)
+        os.unlink(val_path)
 
 
 def test_binary_preference_dataset_initialization(mock_binary_preference_data):
