@@ -1,0 +1,109 @@
+# Async GRPO Algorithm Configuration
+defaults: "grpo_math_1B.yaml"
+
+# Async-specific settings
+async_grpo:
+  enabled: true        # Enable async training
+  max_trajectory_age_steps: 1  # Allow trajectories from the last 4 training steps
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_steps: 1000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 10
+  val_at_start: false
+  max_val_samples: 256
+  val_batch_size: 256
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  train_micro_batch_size: 4
+  generation_batch_size: 32
+  logprob_batch_size: 4
+  max_total_sequence_length: 512
+  precision: "bfloat16"
+  fsdp_offload_enabled: false
+  activation_checkpointing_enabled: false
+
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: True
+
+  sequence_packing:
+    enabled: False
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      # Enable async engine for better concurrency
+      async_engine: true
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+# Data configuration
+data:
+  dataset_name: "OpenMathInstruct-2"
+  subset: "train"
+  limit: 1000  # For faster testing
+  val_limit: 100
+  val_subset: "test"
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  prompt_file: "examples/prompts/cot.txt"
+  system_prompt_file: null
+  add_system_prompt: false
+
+# Environment configuration  
+env:
+  math:
+    cfg:
+      num_workers: 4
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/async_grpo_importance_sampling"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 3
+  wandb_enabled: true
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "async-grpo-dev"
+    name: "async-grpo-math"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10 
+ 
