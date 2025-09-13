@@ -22,6 +22,15 @@
 
 import os
 import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+import git
+from docutils import nodes
+from docutils.transforms import Transform
+from sphinx import addnodes
+from sphinx.application import Sphinx
 
 project = "NeMo-RL"
 copyright = "2025, NVIDIA Corporation"
@@ -99,16 +108,6 @@ html_theme_options = {
 }
 html_extra_path = ["project.json", "versions1.json"]
 
-# -- Supporting rendering GitHub alerts correctly ----------------------------
-# https://github.com/executablebooks/MyST-Parser/issues/845
-
-_GITHUB_ADMONITIONS = {
-    "> [!NOTE]": "note",
-    "> [!TIP]": "tip",
-    "> [!IMPORTANT]": "important",
-    "> [!WARNING]": "warning",
-    "> [!CAUTION]": "caution",
-}
 
 # Github links are now getting rate limited from the Github Actions
 linkcheck_ignore = [
@@ -117,7 +116,20 @@ linkcheck_ignore = [
 ]
 
 
-def convert_gh_admonitions(app, relative_path, parent_docname, contents):
+def _convert_gh_admonitions(
+    app: Sphinx, relative_path: Path, parent_docname: str, contents: list[str]
+) -> None:
+    """Supporting rendering GitHub alerts correctly.
+
+    # https://github.com/executablebooks/MyST-Parser/issues/845
+    """
+    _github_admonitions = {
+        "> [!NOTE]": "note",
+        "> [!TIP]": "tip",
+        "> [!IMPORTANT]": "important",
+        "> [!WARNING]": "warning",
+        "> [!CAUTION]": "caution",
+    }
     # loop through content lines, replace github admonitions
     for i, orig_content in enumerate(contents):
         orig_line_splits = orig_content.split("\n")
@@ -125,11 +137,11 @@ def convert_gh_admonitions(app, relative_path, parent_docname, contents):
         for j, line in enumerate(orig_line_splits):
             # look for admonition key
             line_roi = line.lstrip()
-            for admonition_key in _GITHUB_ADMONITIONS:
+            for admonition_key in _github_admonitions:
                 if line_roi.startswith(admonition_key):
                     line = line.replace(
                         admonition_key,
-                        "```{" + _GITHUB_ADMONITIONS[admonition_key] + "}",
+                        "```{" + _github_admonitions[admonition_key] + "}",
                     )
                     # start replacing quotes in subsequent lines
                     replacing = True
@@ -153,5 +165,75 @@ def convert_gh_admonitions(app, relative_path, parent_docname, contents):
         contents[i] = "\n".join(orig_line_splits)
 
 
-def setup(app):
-    app.connect("include-read", convert_gh_admonitions)
+class _GitHubLinkTransform(Transform):
+    """Converting the relative path to a file in a Markdown to the URL of that file on GitHub."""
+
+    default_priority = 500  # type: ignore[bad-override]
+
+    @staticmethod
+    def _get_github_source_url(repo: git.Repo) -> str:
+        # Find out which remote GitHub repo should be the source.
+        if "origin" in repo.remotes:
+            url = repo.remotes.origin.url
+        elif len(repo.remotes) == 1:
+            url = repo.remotes[0].url
+        else:
+            raise ValueError(
+                "Cannot determine which remote repo on GitHub this local repo is from."
+            )
+        # Canonicalize the URL.
+        if url.startswith("git@github.com:"):
+            url = url.replace("git@github.com:", "https://github.com/", 1)
+        if url.endswith(".git"):
+            url = url[: -len(".git")]
+        return url
+
+    def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
+        try:
+            local_repo = git.Repo(search_parent_directories=True)
+            remote_repo_url = self._get_github_source_url(local_repo)
+        except Exception:
+            # Cannot figure out which source url it should be; leave links as-is.
+            return
+        if local_repo.working_tree_dir is None:
+            # If the local repo is a bare repo, the method below won't work.
+            return
+        wt_dir = local_repo.working_tree_dir
+
+        for node in self.document.traverse(addnodes.download_reference):
+            md_dir = Path(node["refdoc"]).parent
+            dst_path = md_dir / Path(node["reftarget"])
+            try:
+                dst_path = dst_path.resolve(strict=True)
+            except OSError:
+                # If the path doesn't exist or a symlink loop is encountered.
+                continue
+            if dst_path.is_file():
+                kind = "blob"
+            elif dst_path.is_dir():
+                kind = "tree"
+            else:
+                # Cannot figure out what type of thing this path is pointing to.
+                continue
+            refuri = "/".join(
+                (
+                    remote_repo_url.rstrip("/"),
+                    kind,
+                    local_repo.head.object.hexsha,
+                    urllib.parse.quote(dst_path.relative_to(wt_dir).as_posix()),
+                )
+            )
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
+            # Preserve styling and title if present.
+            if "classes" in node:
+                new_node["classes"] = list(node["classes"])
+            if "title" in node:
+                new_node["title"] = node["title"]
+            if node.children:
+                new_node += node.children
+            node.replace_self(new_node)
+
+
+def setup(app: Sphinx) -> None:
+    app.add_transform(_GitHubLinkTransform)
+    app.connect("include-read", _convert_gh_admonitions)

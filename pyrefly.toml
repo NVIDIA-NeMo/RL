@@ -14,6 +14,8 @@ replace-imports-with-any = [
     "megatron.*",
     "ray.*",
     "numpy.*",
+    "sphinx.*",
+    "docutils.*",
 ]
 project-includes = [
     # TODO: enable these once we have 100 correctness
