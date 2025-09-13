@@ -126,8 +126,8 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     data = load_preference_dataset(data_config)
     train_dataset = data.formatted_ds["train"]
     val_dataset = data.formatted_ds["validation"]
-    if train_dataset:
-        print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
+
+    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
     if val_dataset:
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 

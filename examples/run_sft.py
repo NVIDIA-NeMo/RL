@@ -117,10 +117,6 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
 
         datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
 
-    train_dataset = data.formatted_ds["train"]
-    val_dataset = data.formatted_ds["validation"]
-    sft_task_spec = data.task_spec
-
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,
