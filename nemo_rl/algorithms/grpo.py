@@ -955,9 +955,7 @@ def validate(
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        mean_reward = sum(total_rewards) / len(total_rewards)
-        max_reward = 4.0  # TODO: Make this configurable based on environment
-        accuracy = mean_reward / max_reward  # Normalize to 0-1 scale
+        accuracy = sum(total_rewards) / len(total_rewards)
         avg_length = sum(total_lengths) / len(total_lengths)
 
         val_metrics = {

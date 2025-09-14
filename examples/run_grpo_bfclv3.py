@@ -55,6 +55,7 @@ class JsonlinesDataset:
     tokenizer: AutoTokenizer
     max_seq_length: int
     filter_long_samples: bool = False
+    duplication_factor: int = 1
 
     def __post_init__(self):
         self.data = self._load_data()
@@ -67,6 +68,12 @@ class JsonlinesDataset:
             print(f"found {len(idx_to_ignore)} long samples to ignore on dataset init")
 
         self.data = [item for i, item in enumerate(self.data) if i not in idx_to_ignore]
+        
+        # Duplicate data if duplication_factor > 1
+        if self.duplication_factor > 1:
+            original_data = self.data.copy()
+            self.data = original_data * self.duplication_factor
+            print(f"Duplicated data {self.duplication_factor}x: {len(original_data)} -> {len(self.data)} samples")
 
     def _load_data(self):
         with jsonlines.open(self.jsonl_path, "r") as reader:
@@ -160,6 +167,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
         tokenizer,
         max_seq_length=data_config["max_input_seq_length"],
         filter_long_samples=data_config["train"]["filter_long_samples"],
+        duplication_factor=5,  # Duplicate each sample 3x
     )
     val_ds = JsonlinesDataset(
         data_config["val"]["jsonl_path"],
@@ -167,6 +175,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
         tokenizer,
         max_seq_length=data_config["max_input_seq_length"],
         filter_long_samples=data_config["val"]["filter_long_samples"],
+        duplication_factor=3,  # No duplication for validation
     )
 
     task_to_env = {}

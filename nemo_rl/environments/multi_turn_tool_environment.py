@@ -54,6 +54,10 @@ class ToolManager:
         "GorillaFileSystem": "nemo_rl.environments.tools.gorilla_file_system",
         "TicketAPI": "nemo_rl.environments.tools.ticket_api",
         "TwitterAPI": "nemo_rl.environments.tools.twitter_api",
+        "MathAPI": "nemo_rl.environments.tools.math_api",
+        "VehicleControlAPI": "nemo_rl.environments.tools.vehicle_control",
+        "TradingBot": "nemo_rl.environments.tools.trading_bot",
+        "MessageAPI": "nemo_rl.environments.tools.message_api",
     }
     
     def initialize_tools(self, tool_names: List[str], initial_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,7 +146,6 @@ class ToolManager:
 
 class RewardCalculator:
     """Calculates rewards for turns."""
-    
     def calculate_reward(self, metadata: MultiTurnToolMetadata, is_final_turn: bool) -> float:
         """Calculate reward for current turn."""
         
@@ -165,8 +168,7 @@ class RewardCalculator:
 
         state_score = 0.0
         # compute state score only on final turn
-        if is_final_turn:
-            state_score = self._compare_tool_states(
+        state_score = self._compare_tool_states(
                 metadata["model_tool_instances"],
                 metadata["gt_tool_instances"],
                 used_tools,
@@ -189,7 +191,7 @@ class RewardCalculator:
         """Compare states for the specified subset of tools."""
 
         if not tool_subset:
-            return 1.0  # nothing to compare yet
+            return 0.0  # nothing to compare yet
 
         total_tools = len(tool_subset)
         matching_tools = 0
@@ -219,7 +221,8 @@ class RewardCalculator:
             if states_match:
                 matching_tools += 1
         
-        return matching_tools / total_tools if total_tools > 0 else 1.0
+        return matching_tools / total_tools if total_tools > 0 else 0.0
+    
     
     def _compare_tool_calls(
         self,
@@ -228,7 +231,8 @@ class RewardCalculator:
         turn_index: int,
     ) -> float:
         """Return 1.0 if the model's calls for ``turn_index`` exactly match ground truth, else 0.0."""
-
+        print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
+        
         # Guard against out-of-range indices or missing data.
         if (
             turn_index >= len(gt_calls)
@@ -253,6 +257,7 @@ class RewardCalculator:
         total_unique = len(model_set.union(gt_set))
 
         return correct_calls / total_unique
+
 
 @ray.remote
 class MultiTurnToolEnvironment(EnvironmentInterface):
@@ -425,21 +430,26 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             # Generate observation
             observation = self._get_next_observation(tool_results, sample_metadata)
             
-            # Calculate reward
             is_final_turn = not should_continue
+            if is_final_turn:
+                print(f"final turn {sample_metadata['current_turn']}")
+                print(f"message log {message_log}")
+            
+            # Use new per-turn partial reward function  
             state_score, call_score = self.reward_calculator.calculate_reward(sample_metadata, is_final_turn)
-            reward = 0.5 * state_score + 1 * call_score
+            reward = (0.5 * state_score + 0.5 * call_score) / sample_metadata["max_turns"]
+            print(f"reward {reward}", "state_score", state_score, "call_score", call_score)
             sample_metadata["turn_metadata"][sample_metadata["current_turn"]] = {}
             sample_metadata["turn_metadata"][sample_metadata["current_turn"]].update({
                 "state_score": state_score,
-                "call_score": call_score,
+                "call_score": call_score, 
                 "turn_success": turn_success,
                 "tool_results": tool_results,
             })
             # Update for next turn
             if should_continue:
                 sample_metadata["current_turn"] += 1
-                
+                print(sample_metadata["current_turn"],"current turn")
                 terminateds.append(False)
                 next_stop_strings.append(None)
             else:
