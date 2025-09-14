@@ -50,6 +50,10 @@ from nemo_automodel.components.quantization.fp8 import (
     build_fp8_config,
     verify_fp8_conversion,
 )
+from nemo_automodel.components.utils.compile_utils import (
+    build_compile_config,
+    compile_model,
+)
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -262,7 +266,13 @@ class DTensorPolicyWorkerV2:
                 torch_dtype=str(model_config.torch_dtype),
             )
 
-        if "fp8" in self.cfg["dtensor_cfg"]:
+        if (
+            "fp8" in self.cfg["dtensor_cfg"]
+            and self.cfg["dtensor_cfg"]["fp8"]["enabled"]
+        ):
+            assert self.cfg["make_sequence_length_divisible_by"] == 16, (
+                "make_sequence_length_divisible_by must be 16 for FP8 training, but got {self.cfg['make_sequence_length_divisible_by']}"
+            )
             fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
             self.model = apply_fp8_to_model(self.model, config=fp8_config)
             results = verify_fp8_conversion(self.model)
@@ -407,6 +417,13 @@ class DTensorPolicyWorkerV2:
             self.reference_model_state_dict = get_cpu_state_dict(
                 self.model.state_dict().items(), pin_memory=True
             )
+
+        if (
+            "compile" in self.cfg["dtensor_cfg"]
+            and self.cfg["dtensor_cfg"]["compile"]["enabled"]
+        ):
+            compile_config = build_compile_config(self.cfg["dtensor_cfg"]["compile"])
+            self.model = compile_model(self.model, compile_config)
 
         if init_optimizer:
             optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
