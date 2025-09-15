@@ -71,6 +71,9 @@ class PenguinWorker:
             )
         )
 
+    def health_check(self) -> bool:
+        return True
+
     async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
         from penguin.server_utils import ServerClient, BaseServerConfig
 
@@ -154,7 +157,10 @@ class Penguin(EnvironmentInterface):
             self.workers.append(worker)
 
             # We block and wait for each worker to initialize before continuing
-            ray.get(worker)
+            ray.get(worker.health_check.remote())
+
+    def health_check(self) -> bool:
+        return True
 
     async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
         # For now, we enforce that the total number of examples in the batch is divisible by the number of workers.

@@ -168,7 +168,7 @@ def main() -> None:
         }
     ).remote(penguin_config)
     # Blocking wait for penguin to spin up
-    ray.get(penguin)
+    ray.get(penguin.health_check.remote())
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
