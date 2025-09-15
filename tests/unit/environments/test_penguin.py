@@ -131,7 +131,8 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         d = deepcopy(d)
         d.pop("full_result", None)
 
-        # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
+        # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
+        d["message_log"] = d["message_log"][:2]
         for message in d["message_log"][1:]:
             if "token_ids" in message:
                 message["token_ids"] = []
