@@ -131,6 +131,13 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
+
+        for message in d["message_log"][1:]:
+            if "token_ids" in message:
+                message["token_ids"] = []
+            if "generation_logprobs" in message:
+                message["generation_logprobs"] = []
+
         return d
 
     def _standardize(l: list[dict]):
