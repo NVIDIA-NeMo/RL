@@ -818,6 +818,11 @@ def test_run_async_penguin_rollout(
             "rollout_metrics": d["rollout_metrics"],
         }
 
+    # TODO remove this
+    with open("temp_test_run_async_penguin_rollout.json", "w") as f:
+        import json
+        json.dump({"expected": _standardize(expected_result), "actual": _standardize(actual_result)})
+
     assert _standardize(expected_result) == _standardize(actual_result)
 
     """
