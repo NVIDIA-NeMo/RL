@@ -17,10 +17,10 @@
 # @nvidia-nemo/rl_reviewers_perf
 
 # Catch-all if not defined
-* @nvidia-nemo/rl-maintainers
+* @nvidia-nemo/rl_maintainers
 
 # Codeowners
-/.github/CODEOWNERS @nvidia-nemo/rl-maintainers
+/.github/CODEOWNERS @nvidia-nemo/rl_maintainers
 
 # CI/Test
 /.github/ @nvidia-nemo/rl_reviewers_ci
