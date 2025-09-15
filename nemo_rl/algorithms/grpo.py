@@ -13,8 +13,10 @@
 # limitations under the License.
 import gc
 import os
+import re
 import time
 import warnings
+from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -692,6 +694,40 @@ def grpo_train(
                 reference_logprobs, ref_inf_metrics = (
                     policy.get_reference_policy_logprobs(train_data)
                 )
+                policy_expert_idx = np.stack(inf_metrics.pop("expert_ids"))
+                ref_expert_idx = np.stack(ref_inf_metrics.pop("expert_ids"))
+                pattern = r"^(.+?)_(\d+)$"
+
+                accumulated_inf_metrics = defaultdict(list)
+                for k, v in inf_metrics.items():
+                    match = re.match(pattern, k)
+                    name = match.group(1)
+                    layer_num = match.group(2)
+
+                    accumulated_inf_metrics[name].append(v)
+
+                accumulated_ref_inf_metrics = defaultdict(list)
+                for k, v in ref_inf_metrics.items():
+                    match = re.match(pattern, k)
+                    name = match.group(1)
+                    layer_num = match.group(2)
+
+                    accumulated_ref_inf_metrics[name].append(v)
+
+                inf_metrics = {
+                    k: float(np.mean(v)) for k, v in accumulated_inf_metrics.items()
+                }
+                ref_inf_metrics = {
+                    k: float(np.mean(v)) for k, v in accumulated_ref_inf_metrics.items()
+                }
+
+                inf_metrics["expert_id_diffs"] = (
+                    policy_expert_idx != ref_expert_idx
+                ).sum()
+                inf_metrics["percent_expert_id_diffs"] = (
+                    policy_expert_idx != ref_expert_idx
+                ).mean()
+
                 train_data["prev_logprobs"] = fprop_logprobs["logprobs"]
                 train_data["reference_policy_logprobs"] = reference_logprobs[
                     "reference_logprobs"

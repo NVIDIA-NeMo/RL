@@ -1221,11 +1221,16 @@ class MegatronPolicyWorker:
 
         model_metrics = get_and_clear_hacky_global_metrics()
         for k, v in model_metrics.items():
-            num_layers = len(v) // len(list_of_logprobs)
-            outputs = (
-                torch.as_tensor(v, dtype=torch.float32).view(num_layers, -1).mean(-1)
-            )
-            metrics.update({f"{k}_{i}": v for i, v in enumerate(outputs.tolist())})
+            if "expert_ids" in k:
+                metrics[k] = v
+            else:
+                num_layers = len(v) // len(list_of_logprobs)
+                outputs = (
+                    torch.as_tensor(v, dtype=torch.float32)
+                    .view(num_layers, -1)
+                    .mean(-1)
+                )
+                metrics.update({f"{k}_{i}": v for i, v in enumerate(outputs.tolist())})
 
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu"), metrics
 
