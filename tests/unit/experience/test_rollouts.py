@@ -767,6 +767,7 @@ def test_run_async_penguin_rollout(
         max_rollout_turns=None,
     )
     actual_result = asdict(actual_result)
+    actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
     expected_result = {
         "final_batch": {
