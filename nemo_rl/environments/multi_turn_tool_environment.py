@@ -231,7 +231,7 @@ class RewardCalculator:
         turn_index: int,
     ) -> float:
         """Return 1.0 if the model's calls for ``turn_index`` exactly match ground truth, else 0.0."""
-        print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
+        # print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
         
         # Guard against out-of-range indices or missing data.
         if (
@@ -433,12 +433,12 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             is_final_turn = not should_continue
             if is_final_turn:
                 print(f"final turn {sample_metadata['current_turn']}")
-                print(f"message log {message_log}")
+                # print(f"message log {message_log}")  # REMOVED: Too memory intensive
             
             # Use new per-turn partial reward function  
             state_score, call_score = self.reward_calculator.calculate_reward(sample_metadata, is_final_turn)
             reward = (0.5 * state_score + 0.5 * call_score) / sample_metadata["max_turns"]
-            print(f"reward {reward}", "state_score", state_score, "call_score", call_score)
+            # print(f"reward {reward}", "state_score", state_score, "call_score", call_score)
             sample_metadata["turn_metadata"][sample_metadata["current_turn"]] = {}
             sample_metadata["turn_metadata"][sample_metadata["current_turn"]].update({
                 "state_score": state_score,
@@ -449,7 +449,7 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             # Update for next turn
             if should_continue:
                 sample_metadata["current_turn"] += 1
-                print(sample_metadata["current_turn"],"current turn")
+                # print(sample_metadata["current_turn"],"current turn")
                 terminateds.append(False)
                 next_stop_strings.append(None)
             else:
