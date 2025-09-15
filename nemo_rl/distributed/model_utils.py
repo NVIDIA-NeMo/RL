@@ -54,7 +54,7 @@ def _compute_distributed_log_softmax(
         group=group,
     )
 
-    return vocab_parallel_logits - sum_exp_logits.log().to(dtype)
+    return vocab_parallel_logits - sum_exp_logits.log().to(dtype=dtype)
 
 
 @torch.no_grad()
@@ -99,9 +99,9 @@ def _compute_distributed_log_softmax_and_softmax(
 
     probs = vocab_parallel_exp_logits
     del vocab_parallel_exp_logits
-    probs = probs / sum_exp_logits.to(dtype)
+    probs = probs / sum_exp_logits.to(dtype=dtype)
 
-    log_probs = vocab_parallel_logits - sum_exp_logits.log().to(dtype)
+    log_probs = vocab_parallel_logits - sum_exp_logits.log().to(dtype=dtype)
 
     return log_probs, probs
 
@@ -146,7 +146,7 @@ def _compute_distributed_softmax(
         group=group,
     )
 
-    return vocab_parallel_exp_logits / sum_exp_logits.to(dtype)
+    return vocab_parallel_exp_logits / sum_exp_logits.to(dtype=dtype)
 
 
 class DistributedLogprob(torch.autograd.Function):
