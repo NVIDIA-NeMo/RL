@@ -811,25 +811,14 @@ def test_run_async_penguin_rollout(
         final_batch["length"] = final_batch["length"].tolist()
 
         for key in d["rollout_metrics"]:
-            if key.startswith("histogram_"):
+            # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
+            if key.endswith("total_tokens_per_sample") or key.endswith("gen_tokens_per_sample"):
                 d["rollout_metrics"][key] = None
 
         return {
             "final_batch": final_batch,
             "rollout_metrics": d["rollout_metrics"],
         }
-
-    # TODO remove this
-    with open("temp_test_run_async_penguin_rollout.json", "w") as f:
-        import json
-
-        json.dump(
-            {
-                "expected": _standardize(expected_result),
-                "actual": _standardize(actual_result),
-            },
-            f,
-        )
 
     assert _standardize(expected_result) == _standardize(actual_result)
 

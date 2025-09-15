@@ -46,7 +46,6 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):
     setup_qwen3_penguin_config(master_config, penguin_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
-    generation_config["temperature"] = 0.0
 
     vllm_generation = VllmGeneration(cluster, generation_config)
 
@@ -132,6 +131,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         d = deepcopy(d)
         d.pop("full_result", None)
 
+        # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
         for message in d["message_log"][1:]:
             if "token_ids" in message:
                 message["token_ids"] = []
@@ -142,10 +142,5 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
 
     def _standardize(l: list[dict]):
         return list(map(_standardize_single_result, l))
-
-    # TODO remove this
-    with open("temp_test_penguin_sanity.json", "w") as f:
-        import json
-        json.dump({"expected": _standardize(expected_result), "actual": _standardize(actual_result)}, f)
 
     assert _standardize(expected_result) == _standardize(actual_result)
