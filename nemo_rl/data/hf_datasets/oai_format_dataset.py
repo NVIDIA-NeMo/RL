@@ -12,11 +12,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import json
+from typing import Any, Callable, Union
 
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
+
+
+class PreservingDataset:
+    """A dataset wrapper that preserves original dict structure without None-filling.
+
+    Unlike HuggingFace's Dataset class which enforces schema uniformity across all samples
+    (filling missing keys with None), this class maintains the exact structure of each sample.
+    This is critical for heterogeneous data like tool calls where different samples may have
+    different argument structures.
+    """
+
+    def __init__(self, data: list[dict[str, Any]]):
+        """Initialize the dataset with a list of dictionaries.
+
+        Args:
+            data: List of dictionary samples, each can have different keys
+        """
+        self.data = data
+        self.features = None  # For compatibility with HF Dataset interface
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(
+        self, idx: Union[int, slice, list]
+    ) -> Union[dict[str, Any], list[dict[str, Any]]]:
+        """Support integer indexing, slicing, and list indexing."""
+        if isinstance(idx, slice):
+            return [self.data[i] for i in range(*idx.indices(len(self.data)))]
+        elif isinstance(idx, int):
+            # Handle negative indices
+            if idx < 0:
+                idx = len(self.data) + idx
+            if idx < 0 or idx >= len(self.data):
+                raise IndexError(
+                    f"Index {idx} out of range for dataset of size {len(self.data)}"
+                )
+            return self.data[idx]
+        elif isinstance(idx, list):
+            return [self.data[i] for i in idx]
+        else:
+            raise TypeError(
+                f"Indices must be integers, slices, or lists, not {type(idx)}"
+            )
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def map(self, function: Callable, *args, **kwargs) -> "PreservingDataset":
+        """Apply a function to each sample in the dataset.
+
+        Args:
+            function: Function to apply to each sample
+            with_indices: If True, pass index as second argument to function
+
+        Returns:
+            New PreservingDataset with transformed samples
+        """
+        if kwargs.get("with_indices", False):
+            mapped_data = [function(item, i) for i, item in enumerate(self.data)]
+        else:
+            mapped_data = [function(item) for item in self.data]
+        return PreservingDataset(mapped_data)
 
 
 class OpenAIFormatDataset:
@@ -66,33 +130,34 @@ class OpenAIFormatDataset:
             )
 
         except (TypeError, ValueError, Exception) as e:
-            # Fallback to streaming approach if schema issues occur
-            # This handles cases with heterogeneous tool arguments (e.g., varying is_input field)
+            # Fallback to custom loading for heterogeneous schemas
+            # When tool calls have varying argument structures across samples,
+            # HuggingFace's Dataset.from_list would add None values for missing keys.
+            # We use PreservingDataset to maintain exact structure.
             print(
-                f"Standard loading failed with {type(e).__name__}, falling back to streaming approach..."
+                f"Standard loading failed with {type(e).__name__}, using PreservingDataset..."
             )
-            print("This typically happens with heterogeneous tool argument schemas.")
+            print(
+                "This preserves heterogeneous tool argument schemas without None-filling."
+            )
 
-            # Use streaming=True to bypass schema validation
-            train_original_dataset = load_dataset(
-                "json", data_files=train_ds_path, streaming=True
-            )["train"]
-            val_original_dataset = load_dataset(
-                "json", data_files=val_ds_path, streaming=True
-            )["train"]
+            # Load JSON files directly
+            with open(train_ds_path, "r") as f:
+                train_data = [json.loads(line) for line in f]
 
-            # Map the streaming datasets
-            formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-            formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+            with open(val_ds_path, "r") as f:
+                val_data = [json.loads(line) for line in f]
 
-            # Convert to regular datasets
-            from datasets import Dataset
+            # Apply transformations
+            formatted_train_data = [self.add_messages_key(item) for item in train_data]
+            formatted_val_data = [self.add_messages_key(item) for item in val_data]
 
-            formatted_train_dataset = Dataset.from_list(list(formatted_train_dataset))
-            formatted_val_dataset = Dataset.from_list(list(formatted_val_dataset))
+            # Use PreservingDataset to maintain exact structure
+            formatted_train_dataset = PreservingDataset(formatted_train_data)
+            formatted_val_dataset = PreservingDataset(formatted_val_data)
 
             print(
-                f"Loaded dataset using streaming approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+                f"Loaded dataset (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
             )
 
         self.formatted_ds = {
