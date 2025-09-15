@@ -19,22 +19,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Default values
-DEFAULT_GIT_URL="https://github.com/terrykong/vllm.git"
-DEFAULT_BRANCH="terryk/demo-custom-vllm"
+DEFAULT_GIT_URL="https://github.com/yfw/vllm.git"
+DEFAULT_BRANCH="rl-nemotron-h-0.10.2"
 # git merge-base --fork-point origin/main tags/v0.10.0
-DEFAULT_VLLM_COMMIT=d8ee5a2ca4c73f2ce5fdc386ce5b4ef3b6e6ae70 # use full commit hash from the main branch
+DEFAULT_VLLM_COMMIT=26b999c71ab28ae9708329003007979530638f79 # use full commit hash from the main branch
 
 # Parse command line arguments
 GIT_URL=${1:-$DEFAULT_GIT_URL}
 BRANCH=${2:-$DEFAULT_BRANCH}
 # NOTE: VLLM_USE_PRECOMPILED=1 didn't always seem to work since the wheels were sometimes built against an incompatible torch/cuda combo.
 export VLLM_COMMIT=${3:-$DEFAULT_VLLM_COMMIT}
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${DEFAULT_VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+export VLLM_PRECOMPILED_WHEEL_LOCATION="https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-0.10.2-cp38-abi3-manylinux1_x86_64.whl"
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
   echo "[ERROR] $BUILD_DIR already exists. Please remove or move it before running this script."
-  exit 1 
+  exit 1
 fi
 
 echo "Building vLLM from:"
@@ -51,26 +51,18 @@ git checkout "$BRANCH"
 echo "Creating Python environment..."
 uv venv
 
-# Remove all comments from requirements files to prevent use_existing_torch.py from incorrectly removing xformers
-echo "Removing comments from requirements files..."
-find requirements/ -name "*.txt" -type f -exec sed -i 's/#.*$//' {} \; 2>/dev/null || true
-find requirements/ -name "*.txt" -type f -exec sed -i '/^[[:space:]]*$/d' {} \; 2>/dev/null || true
-# Replace xformers==.* (but preserve any platform markers at the end)
-# NOTE: that xformers is bumped from 0.0.30 to 0.0.31 to work with torch==2.7.1. This version may need to change to change when we upgrade torch.
-find requirements/ -name "*.txt" -type f -exec sed -i -E 's/^(xformers)==[^;[:space:]]*/\1==0.0.31/' {} \; 2>/dev/null || true
-
-uv run --no-project use_existing_torch.py
-
 # Install dependencies
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.7.1 --torch-backend=cu128
+uv pip install torch==2.8.0 --torch-backend=cu128
 
 # Install vLLM using precompiled wheel
 echo "Installing vLLM with precompiled wheel..."
 #uv pip install --no-build-isolation -e .
-uv pip install --no-build-isolation -e .
+# uv pip install --no-build-isolation -e .
+# uv pip install --no-build-isolation -e .
+uv pip install -e .
 
 echo "Build completed successfully!"
 echo "The built vLLM is available in: $BUILD_DIR"

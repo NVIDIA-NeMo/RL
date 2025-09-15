@@ -284,12 +284,16 @@ class DTensorPolicyWorkerV2:
         dp_replicate_size = 1
         dp_shard_size = dp_size
 
+        # torch uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500), but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
+        prev_local_rank = os.environ['LOCAL_RANK']
+        os.environ['LOCAL_RANK'] = "0"
         # Create device mesh with HSDP structure for FSDP2 compatibility
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda",
             (dp_replicate_size, dp_shard_size, cp_size, tp_size),
             mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
         )
+        os.environ['LOCAL_RANK'] = prev_local_rank
 
         # Create flattened submeshes for different use cases
         # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
