@@ -20,6 +20,7 @@ import torch
 
 from ether0.rewards import EVAL_FUNCTIONS
 from ether0.model_prompts import extract_answer_loose
+from ether0.data import get_problem_category
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
@@ -207,7 +208,7 @@ class Ether0Environment(EnvironmentInterface):
         if problem_types:
             rewards_by_type = defaultdict(list)
             for reward, ptype in zip(rewards, problem_types):
-                main_task = ptype.split('/')[0] if isinstance(ptype, str) else str(ptype)
+                main_task = get_problem_category(ptype)
                 rewards_by_type[main_task].append(reward.item())
             
             for task, task_rewards in rewards_by_type.items():
