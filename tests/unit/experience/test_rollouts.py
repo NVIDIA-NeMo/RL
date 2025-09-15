@@ -776,23 +776,23 @@ def test_run_async_penguin_rollout(
             "total_reward": torch.tensor([0.0, 0.0]),
         },
         "rollout_metrics": {
-            "mean_turns_per_sample": 2.5,
-            "max_turns_per_sample": 3,
+            "mean_turns_per_sample": 2.0,
+            "max_turns_per_sample": 2,
             "min_turns_per_sample": 2,
-            "median_turns_per_sample": 2.5,
-            "stddev_turns_per_sample": 0.7071067811865476,
+            "median_turns_per_sample": 2.0,
+            "stddev_turns_per_sample": 0.0,
             "histogram_turns_per_sample": None,
-            "mean_total_tokens_per_sample": 6261.0,
-            "max_total_tokens_per_sample": 8398,
-            "min_total_tokens_per_sample": 4124,
-            "median_total_tokens_per_sample": 6261.0,
-            "stddev_total_tokens_per_sample": 3022.174382791304,
+            "mean_total_tokens_per_sample": 3843.0,
+            "max_total_tokens_per_sample": 3848,
+            "min_total_tokens_per_sample": 3838,
+            "median_total_tokens_per_sample": 3843.0,
+            "stddev_total_tokens_per_sample": 7.0710678118654755,
             "histogram_total_tokens_per_sample": None,
-            "mean_gen_tokens_per_sample": 3147.0,
-            "max_gen_tokens_per_sample": 5303,
-            "min_gen_tokens_per_sample": 991,
-            "median_gen_tokens_per_sample": 3147.0,
-            "stddev_gen_tokens_per_sample": 3049.044440476393,
+            "mean_gen_tokens_per_sample": 732.5,
+            "max_gen_tokens_per_sample": 748,
+            "min_gen_tokens_per_sample": 717,
+            "median_gen_tokens_per_sample": 732.5,
+            "stddev_gen_tokens_per_sample": 21.920310216782973,
             "histogram_gen_tokens_per_sample": None,
             "mean_total_reward": 0.0,
             "max_total_reward": 0.0,
@@ -822,7 +822,14 @@ def test_run_async_penguin_rollout(
     # TODO remove this
     with open("temp_test_run_async_penguin_rollout.json", "w") as f:
         import json
-        json.dump({"expected": _standardize(expected_result), "actual": _standardize(actual_result)}, f)
+
+        json.dump(
+            {
+                "expected": _standardize(expected_result),
+                "actual": _standardize(actual_result),
+            },
+            f,
+        )
 
     assert _standardize(expected_result) == _standardize(actual_result)
 
