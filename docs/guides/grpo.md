@@ -252,6 +252,7 @@ We roughly approximate the entropy of the LLM's distribution throughout training
 $$
 E_{s \sim \pi_{\text{inference}}(x)}[-\frac{\pi_{\text{training}}(x)}{\pi_{\text{inference}}(x)}log(\pi_{\text{training}}(x))]
 $$
+
 using the rollouts in each training global batch as Monte-Carlo samples. The ratio of $\pi$ is in the formula to importance-correct for the mismatch between the policy over the course of training in a singular GRPO step and the inference framework.
 
 We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough monte-carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo-Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo-RL).

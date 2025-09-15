@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pprint
+import time
 
 import pytest
 import ray
@@ -712,3 +713,113 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
     torch.testing.assert_close(mbs1_pg_loss, mbs2_pg_loss, rtol=1e-5, atol=1e-5)
 
     policy_mbs2.worker_group.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_v1_policy_flops_range_check(
+    tiny_llama_model_path, two_gpu_virtual_cluster, use_v2
+):
+    """Test that the returned FLOPS is within a reasonable range using dtensor backend.
+
+    Performs 2 warmup iterations and measures FLOPS for the next 3 iterations.
+    """
+    batch_size = 8
+    seq_len = 128
+    vocab_size = 32000
+
+    # Create dtensor v1 config with default settings
+    config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
+
+    # Update config for FLOPS testing with larger batch and sequence length
+    config["train_global_batch_size"] = batch_size
+    config["train_micro_batch_size"] = (
+        batch_size  # Use full batch size for single microbatch
+    )
+
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    policy = Policy(
+        cluster=two_gpu_virtual_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Create test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+
+    # Create loss function
+    loss_fn = SimpleLoss()
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Perform 2 warmup iterations
+        print("Performing warmup iterations...")
+        for warmup_step in range(2):
+            results = policy.train(data, loss_fn)
+
+        # Measure FLOPS on the third iteration
+        print("Measuring FLOPS on 3 iterations...")
+        time_begin = time.time()
+        for train_step in range(3):
+            results = policy.train(data, loss_fn)
+        runtime_sec = time.time() - time_begin
+
+        # Check if FLOPS tracking is available
+        if policy.flops_tracker is not None:
+            assert "total_flops" in results, (
+                "Training results should contain 'total_flops'"
+            )
+            total_flops = results["total_flops"]
+
+            assert isinstance(total_flops, (int, float)), (
+                "total_flops should be numeric"
+            )
+            assert total_flops > 0, "total_flops should be positive"
+
+            total_tflops = total_flops / 1e12 / 3
+            print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
+
+            flop_count_total = total_flops * runtime_sec
+            assert 1e9 < flop_count_total < 5e10, (
+                "Total FLOPS should be within 1e9 and 5e10"
+            )
+
+            if "theoretical_tflops" in results:
+                theoretical_tflops = results["theoretical_tflops"]
+                assert isinstance(theoretical_tflops, (int, float)), (
+                    "theoretical_tflops should be numeric"
+                )
+                assert theoretical_tflops > 0, "theoretical_tflops should be positive"
+
+                utilization = total_tflops / theoretical_tflops
+                print(f"Theoretical TFLOPS: {theoretical_tflops:.2f}")
+                print(f"Model utilization: {utilization * 100:.2f}%")
+
+                assert utilization <= 1.0, (
+                    f"Model utilization {utilization * 100:.2f}% should not exceed 100%"
+                )
+        else:
+            print("FLOPS tracker not available, skipping FLOPS range check")
+            pytest.skip("FLOPS tracker not supported for this model configuration")
+
+    finally:
+        policy.shutdown()

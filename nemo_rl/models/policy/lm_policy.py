@@ -404,10 +404,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
-            aggregated_results["num_ranks"] = len(results)
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
 
             try:
-                aggregated_results["theoretical_tflops"] = sum(
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
                     get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
                     for r in results
                 )

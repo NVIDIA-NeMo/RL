@@ -49,6 +49,7 @@ CACHED_DEPENDENCIES = [
     "nvidia-modelopt[torch,onnx]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "nvidia-resiliency-ext>=0.4.0a0,<0.5.0; sys_platform != 'darwin'",
     "transformer-engine[pytorch]>=2.5.0a0,<2.6.0; sys_platform != 'darwin'",
+    "filelock",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject

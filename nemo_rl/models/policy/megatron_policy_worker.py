@@ -234,6 +234,7 @@ def setup_megatron_model(
         make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
         // cfg.model.tensor_model_parallel_size,
         tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
+        trust_remote_code=True,
     )
     if not cfg.model.vocab_size:
         cfg.model.vocab_size = cfg.tokenizer.padded_vocab_size
@@ -568,6 +569,7 @@ class MegatronPolicyWorker:
             "moe_router_bias_update_rate"
         ]
 
+        model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
             model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
 
@@ -773,6 +775,7 @@ class MegatronPolicyWorker:
             tensor_model_parallel_size=self.cfg["megatron_cfg"][
                 "tensor_model_parallel_size"
             ],
+            trust_remote_code=True,
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
