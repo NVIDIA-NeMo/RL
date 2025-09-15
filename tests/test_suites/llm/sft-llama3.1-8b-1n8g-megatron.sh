@@ -4,10 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=250
+STEPS_PER_RUN=25
 MAX_STEPS=250
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=90
+NUM_MINUTES=15
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
