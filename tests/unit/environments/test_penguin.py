@@ -46,6 +46,7 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):
     setup_qwen3_penguin_config(master_config, penguin_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
+    generation_config["temperature"] = 0.0
 
     vllm_generation = VllmGeneration(cluster, generation_config)
 
