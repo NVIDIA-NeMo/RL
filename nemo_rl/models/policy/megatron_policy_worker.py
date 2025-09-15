@@ -130,6 +130,74 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+# Get the repository root by going up four directories from this file
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+DEBUG_PATH = os.path.join(REPO_DIR, "memory_leak", "mbridge")
+os.makedirs(DEBUG_PATH, exist_ok=True)
+def log_memory_detailed(f, stage, device_idx=0):
+    """Detailed memory logging to understand what's happening"""
+    allocated = torch.cuda.memory_allocated(device_idx) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device_idx) / (1024**3)
+    max_allocated = torch.cuda.max_memory_allocated(device_idx) / (1024**3)
+    max_reserved = torch.cuda.max_memory_reserved(device_idx) / (1024**3)
+    total = torch.cuda.get_device_properties(device_idx).total_memory / (1024**3)
+    free = total - reserved
+    
+    # Count tensors more carefully
+    tensor_count_cuda = 0
+    tensor_count_cpu = 0
+    memory_cuda = 0.0
+    memory_cpu = 0.0
+    
+    try:
+        for obj in gc.get_objects():
+            if isinstance(obj, torch.Tensor):
+                if obj.is_cuda:
+                    tensor_count_cuda += 1
+                    try:
+                        memory_cuda += obj.numel() * obj.element_size()
+                    except (TypeError, ValueError, RuntimeError):
+                        print(f"Error calculating memory for tensor: {obj}")
+                else:
+                    tensor_count_cpu += 1
+                    try:
+                        memory_cpu += obj.numel() * obj.element_size()
+                    except (TypeError, ValueError, RuntimeError):
+                        print(f"Error calculating memory for tensor: {obj}")
+    except (TypeError, ValueError, RuntimeError, AttributeError):
+        print(f"Error calculating memory for tensor: {obj}")
+    
+    # Ensure values are valid floats
+    try:
+        memory_cuda = float(memory_cuda) / (1024**3)
+    except (TypeError, ValueError):
+        memory_cuda = 0.0
+        
+    try:
+        memory_cpu = float(memory_cpu) / (1024**3)
+    except (TypeError, ValueError):
+        memory_cpu = 0.0
+    
+    f.write(f"\n{'='*60}\n")
+    f.write(f"MEMORY REPORT - {stage}\n")
+    f.write(f"{'='*60}\n")
+    f.write(f"GPU Memory:\n")
+    f.write(f"  Allocated: {allocated:.2f} GB ({allocated/total*100:.1f}%)\n")
+    f.write(f"  Reserved:  {reserved:.2f} GB\n")
+    f.write(f"  Max Allocated: {max_allocated:.2f} GB\n")
+    f.write(f"  Max Reserved:  {max_reserved:.2f} GB\n")
+    f.write(f"  Total: {total:.2f} GB\n")
+    f.write(f"  Free: {free:.2f} GB\n")
+    f.write(f"\nTensor Counts:\n")
+    f.write(f"  tensors_on_cpu: {tensor_count_cpu}\n")
+    f.write(f"  tensors_on_cuda:0: {tensor_count_cuda}\n")
+    f.write(f"  memory_on_cpu: {memory_cpu:.2f} GB\n")
+    f.write(f"  memory_on_cuda:0: {memory_cuda:.2f} GB\n")
+    f.write(f"{'='*60}\n\n")
+    f.flush()
+
+    return log_memory_detailed
+
 
 def broadcast_object_across_pp_ranks(obj):
     """Broadcast an object across pipeline parallel ranks.
@@ -1701,7 +1769,7 @@ class MegatronPolicyWorker:
         torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
+    def offload_before_refit(self, prefix: str = ""):
         """Offload the optimizer and buffers to the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -1738,17 +1806,16 @@ class MegatronPolicyWorker:
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
+        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
+            msg = log_memory_detailed(f, f"{prefix + '_' if prefix else '' }end_of_function_offload_before_refit")
+            print(msg, flush=True)
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        # Offload as much as possible on the CPU
-        self.model = self.move_model(self.model, "cpu")
-        self.model.eval()
-        torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
 
+        # move the held gather buffer before since self._held_gather_buffer might hold different objects between branches
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
@@ -1756,12 +1823,24 @@ class MegatronPolicyWorker:
         gc.collect()
         torch.cuda.empty_cache()
 
+        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
+            msg = log_memory_detailed(f, "begin_of_function_offload_after_refit")
+            print(msg, flush=True)
+        # Offload as much as possible on the CPU
+        self.model = self.move_model(self.model, "cpu")
+        self.model.eval()
+        torch.randn(1).cuda()  # wake up torch allocator
+        self.offload_before_refit(prefix="inside_offload_after_refit")  # rerun the old offload function
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
             f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
+        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
+            msg = log_memory_detailed(f, f"end_of_function_offload_after_refit")
+            print(msg, flush=True)
 
     @torch.no_grad()
     def move_model(
