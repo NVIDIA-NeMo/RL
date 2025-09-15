@@ -45,12 +45,19 @@ def pytest_addoption(parser):
         default=False,
         help="Run ONLY mcore tests (combine with --hf-gated to include mcore+hf_gated tests)",
     )
+    parser.addoption(
+        "--automodel",
+        action="store_true",
+        default=False,
+        help="Include tests that require the automodel extra",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     """Modify test collection to skip tests based on markers unless explicitly requested."""
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
+    run_automodel = config.getoption("--automodel")
     marker_expr = config.getoption("-m", default="")
 
     # If user specified -m marker expressions, still prioritize run_first tests
@@ -73,16 +80,30 @@ def pytest_collection_modifyitems(config, items):
             and not item.get_closest_marker("hf_gated")
         ]
     elif run_hf_gated:
-        # Configuration 2: Default tests + hf_gated tests, excluding mcore
-        new_items = [item for item in items if not item.get_closest_marker("mcore")]
+        # Configuration 2: Default tests + hf_gated tests, excluding mcore and automodel
+        new_items = [
+            item
+            for item in items
+            if not item.get_closest_marker("mcore")
+            and not item.get_closest_marker("automodel")
+        ]
     else:
-        # Configuration 1: Default only - exclude both hf_gated and mcore
+        # Configuration 1: Default only - exclude hf_gated, mcore, and automodel
         new_items = [
             item
             for item in items
             if not item.get_closest_marker("hf_gated")
             and not item.get_closest_marker("mcore")
+            and not item.get_closest_marker("automodel")
         ]
+
+    # Add automodel tests if explicitly requested
+    if run_automodel:
+        automodel_items = [
+            item for item in items if item.get_closest_marker("automodel")
+        ]
+        # Remove duplicates by converting to set and back
+        new_items = list(set(new_items + automodel_items))
 
     # Ensure run_first tests are prioritized
     new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)

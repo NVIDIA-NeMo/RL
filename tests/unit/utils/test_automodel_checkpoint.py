@@ -19,6 +19,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+# Skip entire module if nemo_automodel is not available
+pytest_plugins = []
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.utils.automodel_checkpoint import (
     detect_checkpoint_format,
     load_checkpoint,
@@ -59,6 +66,7 @@ def mock_optimizer():
     return torch.optim.Adam(model.parameters())
 
 
+@pytest.mark.automodel
 class TestDetectCheckpointFormat:
     """Test the detect_checkpoint_format function."""
 
@@ -172,6 +180,7 @@ class TestDetectCheckpointFormat:
 
     """Test the save_checkpoint function."""
 
+    @pytest.mark.automodel
     @patch("nemo_rl.utils.automodel_checkpoint.save_model")
     @patch("nemo_rl.utils.automodel_checkpoint.save_optimizer")
     def test_save_model_only(self, mock_save_optimizer, mock_save_model, mock_model):
@@ -202,6 +211,7 @@ class TestDetectCheckpointFormat:
             # Verify optimizer saving was not called
             mock_save_optimizer.assert_not_called()
 
+    @pytest.mark.automodel
     @patch("nemo_rl.utils.automodel_checkpoint.save_model")
     @patch("nemo_rl.utils.automodel_checkpoint.save_optimizer")
     def test_save_with_optimizer(
@@ -234,6 +244,7 @@ class TestDetectCheckpointFormat:
             assert opt_call_args[1]["model"] is mock_model
             assert opt_call_args[1]["weights_path"] == optimizer_path
 
+    @pytest.mark.automodel
     @patch("nemo_rl.utils.automodel_checkpoint.save_model")
     def test_save_with_tokenizer(self, mock_save_model, mock_model):
         """Test saving with tokenizer."""
@@ -278,6 +289,7 @@ def check_dict_equality(dict1, dict2):
             assert dict1[k] == dict2[k]
 
 
+@pytest.mark.automodel
 class TestSaveLoadIntegration:
     """Integration tests that actually save and load checkpoints."""
 
