@@ -118,15 +118,9 @@ For more examples and setup details, continue to the [Prerequisites](#prerequisi
         <strong>Clone and create the environment</strong>
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
 cd nemo-rl
+git submodule update --init --recursive
 uv venv</code></pre>
-      </td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;"></td>
-      <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <strong>Megatron-only prerequisites</strong>
-        <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">git submodule update --init --recursive</code></pre>
-        <em>Note:</em> If you previously ran without the Megatron backend, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
+        <em>Note:</em> If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting <code>NRL_FORCE_REBUILD_VENVS=true</code>. See <a href="#tips-and-tricks">Tips and Tricks</a>.
       </td>
     </tr>
     <tr>
