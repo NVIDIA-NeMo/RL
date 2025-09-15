@@ -95,6 +95,9 @@ openai_model:
         }
     ).remote(config)
 
+    # Blocking wait for penguin to spin up
+    ray.get(penguin.health_check.remote())
+
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
