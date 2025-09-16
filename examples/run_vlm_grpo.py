@@ -200,7 +200,7 @@ def hf_data_processor(
 
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
         # Treat truncated messages as text only
         vllm_kwargs = {
             "vllm_content": None,
