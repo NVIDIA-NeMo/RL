@@ -65,6 +65,7 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -273,10 +274,12 @@ class DTensorPolicyWorkerV2:
             assert self.cfg["make_sequence_length_divisible_by"] == 16, (
                 "make_sequence_length_divisible_by must be 16 for FP8 training, but got {self.cfg['make_sequence_length_divisible_by']}"
             )
-            fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
-            self.model = apply_fp8_to_model(self.model, config=fp8_config)
+            self.fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
+            self.model = apply_fp8_to_model(self.model, config=self.fp8_config)
             results = verify_fp8_conversion(self.model)
             print(f"[Rank {self.rank}] Model FP8 results: {results['success']}")
+        else:
+            self.fp8_config = None
 
         print(f"[Rank {self.rank}] Model data type: {self.model.dtype}")
 
@@ -847,6 +850,14 @@ class DTensorPolicyWorkerV2:
 
                     # Update parameters
                     self.optimizer.step()
+
+                if (
+                    self.fp8_config
+                    and self.fp8_config.enabled
+                    and self.fp8_config.precompute_float8_dynamic_scale_for_fsdp
+                    and self.dp_size > 1
+                ):
+                    precompute_float8_dynamic_scale_for_fsdp(self.model)
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
