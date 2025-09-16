@@ -59,6 +59,8 @@ def _maybe_correct_merged_tokens(
 
     The goal of this subroutine is to find the prefix in actual_token_ids that corresponds to the de-tokenized text of reference_token_ids.
     The idea of this subroutine implementation is to just de-tokenize subsequences of actual_token_ids (called candidate_token_ids) until the de-tokenized text matches the de-tokenized text of reference_token_ids.
+
+    TODO When NeMo RL supports training image generation models, we want to revisit and possibly update this function. This issue occurs when the model generates tokens that are de-tokenized into text or images, and then re-tokenized into tokens. So if there is a situation like that with images and image tokenization is non-unique, then we will need to uppdate this function.
     """
     if not reference_token_ids:
         return actual_token_ids
