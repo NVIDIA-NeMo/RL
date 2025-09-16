@@ -20,7 +20,7 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
-    expert_parallel_size: bool
+    expert_parallel_size: int
     gpu_memory_utilization: float
     max_model_len: int
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used

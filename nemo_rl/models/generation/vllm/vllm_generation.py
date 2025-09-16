@@ -58,7 +58,13 @@ class VllmGeneration(GenerationInterface):
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
-        self.dp_size = cluster.world_size() // self.tp_size // self.pp_size
+        self.model_parallel_size = self.tp_size * self.pp_size
+
+        assert cluster.world_size() % self.model_parallel_size == 0, (
+            "World size must be a multiple of model parallel size. "
+            f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
+        )
+        self.dp_size = cluster.world_size() // self.model_parallel_size
         self.vllm_dp_size = self.ep_size // self.tp_size
 
         if self.pp_size > 1:
@@ -123,7 +129,6 @@ class VllmGeneration(GenerationInterface):
             ),
             names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
         )
-        self.model_parallel_size = self.tp_size * self.pp_size
 
         # non-colocated needs to use PACK strategy to avoid uneven node_bundles
         # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
