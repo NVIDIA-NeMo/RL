@@ -98,7 +98,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Quick Start
 
-Use this quick start to get going with either the Native PyTorch DTensor or Megatron-Core training backends. 
+Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends. 
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
