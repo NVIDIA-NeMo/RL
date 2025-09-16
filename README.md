@@ -62,7 +62,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
-- ✅ **Learning Algorithms** - GRPO/GSPO , SFT , and DPO.
+- ✅ **Learning Algorithms** - GRPO/GSPO, SFT, and DPO.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
 - ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
