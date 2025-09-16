@@ -21,13 +21,13 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "setuptools",
     "ninja",  # for flash-attn parallel build
-    "torch==2.7.0",
+    "torch==2.5.1",
     "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
     # vllm<0.10.0 and transformers>=4.54.0 has a conflict
     # Remove this once we upgrade vllm to >=0.10.0
-    "transformers>=4.51.0,<4.54.0",
+    "transformers==4.46.2",
     "wandb",
     "numpy",
     "datasets>=4.0.0",
@@ -81,7 +81,7 @@ mcore = [
 # This is a default group so that we install these even with bare `uv sync`
 build = [
     # Build requirement for TE
-    "torch==2.7.0",
+    "torch==2.5.1",
     # Build requirement for TE
     "setuptools",
     "packaging",
