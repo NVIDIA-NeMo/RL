@@ -66,7 +66,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
 - ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training.
 - ✅ **(even) Larger Model Support with Long(er) Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP).
-- ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models (Megatron)
+- ✅ **MoE Models** - Support for DeepSeekV3 and Qwen-3 MoE models (Megatron).
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
 - ✅ **Hugging Face Integration** - Works with 1B to 70B models (Qwen, Llama).
