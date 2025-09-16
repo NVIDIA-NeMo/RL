@@ -69,7 +69,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **MoE Models** - Support for DeepseekV3 and Qwen-3 MoE models (Megatron)
 - ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **HuggingFace Integration** - Works with 1-70B models (Qwen, Llama).
+- ✅ **Hugging Face Integration** - Works with 1B to 70B models (Qwen, Llama).
 
 ## Table of Contents
   - [Prerequisites](#prerequisites)
