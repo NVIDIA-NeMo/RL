@@ -72,7 +72,7 @@ def load_preference_dataset(data_config):
         raise ValueError(
             f"Unsupported {dataset_name=}. "
             "Please either set dataset_name in {'HelpSteer3', 'Tulu3Preference'} to use a built-in dataset "
-            "or set dataset_name in {'PreferenceDataset', 'BinaryPreferenceDataset'} to load from local JSONL file or Hugging Face."
+            "or set dataset_name in {'PreferenceDataset', 'BinaryPreferenceDataset'} to load from local JSONL file or HuggingFace."
         )
 
     return base_dataset

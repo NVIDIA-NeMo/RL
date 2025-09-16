@@ -109,7 +109,7 @@ def load_response_dataset(data_config, seed: int = 42):
         raise ValueError(
             f"Unsupported {dataset_name=}. "
             "Please either use a built-in dataset "
-            "or set dataset_name=ResponseDataset to load from local JSONL file or Hugging Face."
+            "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
         )
 
     return base_dataset
