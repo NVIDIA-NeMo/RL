@@ -1306,8 +1306,14 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, 
         max_tokens=1,
     )
 
-    # Take a short nap for the server to spinup. Maybe there is a better way to do this?
-    sleep(3)
+    # Wait for server to spin up
+    while True:
+        try:
+            requests.get(base_urls[0], timeout=5)
+            # We don't check the status code since there may not be a route at /
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+            pass
 
     # Check that the re-tokenized ids are the same with the reference and different without the reference.
     # WITHOUT reference token IDs
