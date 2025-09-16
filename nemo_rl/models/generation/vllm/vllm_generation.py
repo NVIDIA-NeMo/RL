@@ -82,7 +82,8 @@ class VllmGeneration(GenerationInterface):
                 # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
                 assert not self.cfg["vllm_cfg"]["async_engine"], (
                     "vLLM async_engine has some issues when using DP inside vLLM. "
-                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`."
+                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
                 )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
