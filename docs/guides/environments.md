@@ -1,10 +1,10 @@
 # Environments
 
-GRPO supports various types of environments for different tasks. Each environment provides a standardized interface for reward computation and evaluation.
+GRPO supports several examples of environments for different tasks. Each environment provides a standardized interface for reward computation and evaluation.
 
 ## Math Environment
 
-The Math Environment is designed for mathematical reasoning tasks. It evaluates responses to math problems and provides rewards based on correctness.
+The Math Environment is designed for mathematical reasoning tasks. It evaluates responses to math problems using `math-verify` and provides rewards based on correctness.
 
 **Key Features:**
 - Evaluates mathematical reasoning
@@ -41,6 +41,8 @@ code_env = CodeEnvironment.remote(env_config)
 **Configuration:**
 - `num_workers`: Number of parallel workers for code execution
 - `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn)
+
+We’re tracking an end-to-end example of this environment in [#858](https://github.com/NVIDIA-NeMo/RL/issues/858). Add a 👍 to show your interest.
 
 ## Reward Model Environment
 

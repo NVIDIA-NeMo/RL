@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 import ray
 import torch
@@ -29,7 +29,11 @@ from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluste
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.vllm import VllmConfig
-from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.lm_policy import (
+    DynamicBatchingConfig,
+    Policy,
+    SequencePackingConfig,
+)
 
 
 class RewardModelEnvironmentConfig(TypedDict):
@@ -60,9 +64,9 @@ class RewardModelEnvironmentConfig(TypedDict):
     checkpoint_path: str
     logprob_batch_size: int
     resources: Dict[str, Any]
-    dtensor_cfg: Optional[Dict[str, Any]] = None
-    dynamic_batching: Optional[Dict[str, Any]] = {"enabled": False}
-    sequence_packing: Optional[Dict[str, Any]] = {"enabled": False}
+    dtensor_cfg: Optional[Dict[str, Any]]
+    dynamic_batching: DynamicBatchingConfig = {"enabled": False}
+    sequence_packing: NotRequired[SequencePackingConfig] = {"enabled": False}
     max_grad_norm: Optional[float] = None
     generation: Optional[VllmConfig] = None
 

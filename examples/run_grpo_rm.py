@@ -104,20 +104,11 @@ def setup_data(
     )
     task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
 
-    # Reward model environment uses the same python environment as the policy worker
-    is_v2 = (
-        "dtensor_cfg" in env_configs["reward_model"]
-        and "_v2" in env_configs["reward_model"]["dtensor_cfg"]
-        and env_configs["reward_model"]["dtensor_cfg"]["_v2"]
-    )
-    reward_model_py_executable_class = (
-        "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
-        if is_v2
-        else "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-    )
     reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
-            "py_executable": get_actor_python_env(reward_model_py_executable_class),
+            "py_executable": get_actor_python_env(
+                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
+            ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
     ).remote(env_configs["reward_model"])
