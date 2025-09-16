@@ -98,12 +98,18 @@ class ToolManager:
                 if isinstance(tool_calls_raw, list):
                     for item in tool_calls_raw:
                         if isinstance(item, dict):
-                            tool_calls.append(item)
+                            # Validate tool call format
+                            validated_item = self._validate_tool_call_format(item)
+                            if validated_item:
+                                tool_calls.append(validated_item)
                         elif isinstance(item, str):
                             try:
                                 parsed_item = json.loads(item)
                                 if isinstance(parsed_item, dict):
-                                    tool_calls.append(parsed_item)
+                                    # Validate tool call format
+                                    validated_item = self._validate_tool_call_format(parsed_item)
+                                    if validated_item:
+                                        tool_calls.append(validated_item)
                             except json.JSONDecodeError:
                                 # Skip malformed entries; they'll be handled later.
                                 continue
@@ -112,9 +118,43 @@ class ToolManager:
                 return []
         return []
 
+    def _validate_tool_call_format(self, tool_call: Dict[str, Any]) -> Dict[str, Any] | None:
+        """Validate and normalize tool call format."""
+        if not isinstance(tool_call, dict):
+            return None
+        
+        # Ensure 'name' field exists and is a string
+        name = tool_call.get('name')
+        if name is None:
+            return None
+        
+        # Convert name to string if it's not already
+        if not isinstance(name, str):
+            if isinstance(name, list) and len(name) > 0:
+                name = str(name[0]) if name[0] is not None else ''
+            else:
+                name = str(name) if name is not None else ''
+        
+        # Ensure 'args' field exists and is a dict
+        args = tool_call.get('args', {})
+        if not isinstance(args, dict):
+            args = {}
+        
+        return {'name': name, 'args': args}
+
     def execute_tool_call(self, tool_call: Dict[str, Any], tools: Dict[str, Any]) -> Tuple[str, bool]:
         """Execute a single tool call."""
         func_name = tool_call.get('name', '')
+        
+        # Validate func_name is a string (handle cases where it might be a list or other type)
+        if not isinstance(func_name, str):
+            if isinstance(func_name, list) and len(func_name) > 0:
+                # If it's a list, take the first element if it's a string
+                func_name = str(func_name[0]) if func_name[0] is not None else ''
+            else:
+                # Convert other types to string or use empty string as fallback
+                func_name = str(func_name) if func_name is not None else ''
+        
         args = tool_call.get('args', {})
         
         # Build method-to-tool mapping for explicit tool selection
@@ -129,16 +169,20 @@ class ToolManager:
                     method_to_tool[method_name] = (tool_name, tool_instance)
         
         # Execute the method call
-        if func_name in method_to_tool:
-            tool_name, tool_instance = method_to_tool[func_name]
-            try:
-                method = getattr(tool_instance, func_name)
-                result = method(**args)
-                result_str = str(result) if result is not None else "Success"
-                return f"[{tool_name}.{func_name}] {result_str}", True
-            except Exception as e:
-                return f"[{tool_name}.{func_name}] Error: {str(e)}", False
-        return f"Tool function '{func_name}' not found in any tool", False
+        try:
+            if func_name in method_to_tool:
+                tool_name, tool_instance = method_to_tool[func_name]
+                try:
+                    method = getattr(tool_instance, func_name)
+                    result = method(**args)
+                    result_str = str(result) if result is not None else "Success"
+                    return f"[{tool_name}.{func_name}] {result_str}", True
+                except Exception as e:
+                    return f"[{tool_name}.{func_name}] Error: {str(e)}", False
+            return f"Tool function '{func_name}' not found in any tool", False
+        except TypeError as e:
+            # Handle unhashable type errors (e.g., if func_name is still not a proper string)
+            return f"Invalid tool function name format: {str(e)}", False
 
 
 
@@ -231,7 +275,7 @@ class RewardCalculator:
         turn_index: int,
     ) -> float:
         """Return 1.0 if the model's calls for ``turn_index`` exactly match ground truth, else 0.0."""
-        # print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
+        print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
         
         # Guard against out-of-range indices or missing data.
         if (

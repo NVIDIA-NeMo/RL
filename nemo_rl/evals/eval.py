@@ -171,7 +171,7 @@ def setup(
 # ===============================================================================
 
 
-def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, threshold: float = 1.0) -> float:
+def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> float:
     """Evaluate pass@k score using an unbiased estimator.
 
     Reference: https://github.com/huggingface/evaluate/blob/32546aafec25cdc2a5d7dd9f941fc5be56ba122f/metrics/code_eval/code_eval.py#L198-L213
@@ -179,7 +179,6 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, thresh
         rewards: Tensor of shape (batch_size * num_tests_per_prompt)
         num_tests_per_prompt: int (number of test samples per prompt)
         k: int (pass@k value)
-        threshold: float (minimum reward value to consider as "correct", default=1.0)
 
     Returns:
         pass_k_score: float
@@ -192,12 +191,14 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int, thresh
         return float(1.0 - torch.prod(1.0 - k / torch.arange(n - c + 1, n + 1)).item())
 
     # rewards is a 1d tensor of size (batch_size * num_tests_per_prompt)
+    print("rewards", rewards)
     group_rewards = rewards.split(num_tests_per_prompt)
     pass_k_score = 0.0
     for group_reward in group_rewards:
         # Convert continuous rewards to binary based on threshold
-        correct_mask = group_reward >= threshold
-        num_correct = correct_mask.sum().item()  # Count of samples above threshold
+        num_correct = group_reward.sum().item() 
+        print("num_correct", num_correct)
+        print("group_reward", group_reward)
         pass_k_score += eval_single_chunk(num_tests_per_prompt, num_correct, k)
 
     return pass_k_score
@@ -408,7 +409,7 @@ async def _run_env_eval_impl(
             #print("prompts", prompts[0])
             #print("outputs", outputs[0])
             #print("message_log", batch["message_log"][0])
-            #print("rewards", rewards[0])
+            print("rewards", rewards[0])
             print("length of rewards", len(rewards))
         else:
             # Original single-turn evaluation logic
@@ -463,11 +464,11 @@ async def _run_env_eval_impl(
             )
         num_greater_than_one = (rewards > 1).sum().item()
         print("Number of samples > 1:", num_greater_than_one)
+        accuracy = sum(rewards) / len(rewards)
+        print("accuracy", accuracy)
         # update stats
         if metric == "pass@k":
-            # Get threshold from config, default to 1.0 for backwards compatibility
-            threshold = eval_config.get("pass_k_threshold", 1.0)
-            score += eval_pass_k(rewards, num_tests_per_prompt, 1.0, threshold)
+            score += eval_pass_k(rewards, num_tests_per_prompt, 1.0)
         elif metric == "cons@k":
             extracted_answers = env_return.answers
             score += eval_cons_k(

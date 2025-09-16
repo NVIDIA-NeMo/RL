@@ -5,6 +5,7 @@ grpo:
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_steps: 1000000
   normalize_rewards: true
+  overlong_filtering: false
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
