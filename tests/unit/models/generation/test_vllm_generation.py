@@ -1321,8 +1321,9 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
     assert expected_result == actual_result
 
     # WITH reference token IDs
-    initial_tokenized_query_ids = [151644, 872, 198, *initial_tokenized_ids, 151645, 198, 151644, 77091, 198]
-    body_with_reference_token_ids = body | {"required_prefix_token_ids": initial_tokenized_ids}
+    initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
+    initial_tokenized_query_ids = [*initial_tokenized_query_ids_prefix, 151645, 198, 151644, 77091, 198]
+    body_with_reference_token_ids = body | {"required_prefix_token_ids": initial_tokenized_query_ids_prefix}
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids)
     actual_result = response.json()
     expected_result = {
