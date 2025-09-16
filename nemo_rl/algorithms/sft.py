@@ -234,6 +234,9 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
+        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
+            "val_dataloader is None, so dpo.val_period must be 0"
+        )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
@@ -578,6 +581,8 @@ def sft_train(
             current_step += 1
             total_steps += 1
 
+            if should_save_by_timeout:
+                return
             if total_steps >= master_config["sft"]["max_num_steps"]:
                 return
 
