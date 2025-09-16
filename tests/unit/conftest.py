@@ -57,7 +57,8 @@ def pytest_collection_modifyitems(config, items):
     """Modify test collection to skip tests based on markers unless explicitly requested."""
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
-    run_automodel = config.getoption("--automodel")
+    run_automodel_only = config.getoption("--automodel-only")
+    assert run_mcore_only ^ run_automodel_only, f"--mcore-only and --automodel-only are mutually exclusive markers"
     marker_expr = config.getoption("-m", default="")
 
     # If user specified -m marker expressions, still prioritize run_first tests
