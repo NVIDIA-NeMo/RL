@@ -21,7 +21,7 @@
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
 - **Efficient resource management using Ray**, enabling scalable and flexible deployment across different hardware configurations.
-- **Hackable** with native Pytorch only paths for quick research prototypes.
+- **Hackable** with native PyTorch-only paths for quick research prototypes.
 - **High-performance with Megatron Core**, supporting various parallelism techniques for large models and large context lengths.
 - **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
