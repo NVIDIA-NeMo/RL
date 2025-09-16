@@ -1063,6 +1063,16 @@ def configure_http_server_config(tokenizer) -> VllmConfig:
     return generation_config
 
 
+def _wait_for_vllm_http_server_spinup(base_url: str):
+    while True:
+        try:
+            requests.get(base_url, timeout=5)
+            # We don't check the status code since there may not be a route at /
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+            pass
+
+
 def test_vllm_http_server(cluster, tokenizer):
     """Test that vLLM http server works."""
 
@@ -1098,8 +1108,7 @@ def test_vllm_http_server(cluster, tokenizer):
         max_tokens=1,
     )
 
-    # Take a short nap for the server to spinup. Maybe there is a better way to do this?
-    sleep(3)
+    _wait_for_vllm_http_server_spinup(base_urls[0])
 
     # Generate and check result
     response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
@@ -1306,14 +1315,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, 
         max_tokens=1,
     )
 
-    # Wait for server to spin up
-    while True:
-        try:
-            requests.get(base_urls[0], timeout=5)
-            # We don't check the status code since there may not be a route at /
-            break
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
-            pass
+    _wait_for_vllm_http_server_spinup(base_urls[0])
 
     # Check that the re-tokenized ids are the same with the reference and different without the reference.
     # WITHOUT reference token IDs
@@ -1384,10 +1386,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, 
     ):
         pass
 
-    # TODO remove
-    print(generate_result)
-
-    generate_generated_token_id = generate_result["output_ids"][0][0].item()
+    generate_generated_token_id = generate_result["output_ids"][0][len(initial_tokenized_query_ids)].item()
 
     assert vllm_http_server_generated_token_id == generate_generated_token_id
 
