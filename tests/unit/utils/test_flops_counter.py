@@ -26,8 +26,12 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
         ("meta-llama/Meta-Llama-3-8B", 128, 8192, 5.31e16),
         ("meta-llama/Llama-3.1-70B-Instruct", 128, 8192, 4.71e17),
         ("meta-llama/Llama-3.1-405B-Instruct", 128, 8192, 2.65e18),
+        ("meta-llama/Llama-4-Scout-17B-16E", 128, 8192, 1.14e17),
+        ("meta-llama/Llama-4-Maverick-17B-128E", 128, 8192, 1.14e17),
         ("Qwen/Qwen3-30B-A3B", 128, 4096, 9.37e15),
         ("Qwen/Qwen3-235B-A22B", 128, 4096, 6.21e16),
+        ("mistralai/Mixtral-8x7B-v0.1", 128, 4096, 4.18e16),
+        ("mistralai/Mixtral-8x22B-v0.1", 128, 65536, 3.1e18),
     ],
 )
 def test_flops_counter(model_name, gbs, seqlen, expected_flops):
@@ -37,5 +41,5 @@ def test_flops_counter(model_name, gbs, seqlen, expected_flops):
 
     # check within 5% relative difference
     assert abs(flops_tracker.total_flops - expected_flops) / expected_flops <= 0.05, (
-        f"Expected {expected_flops} flops, got {flops_tracker.total_flops}"
+        f"{model_name}: Expected {expected_flops} flops, got {flops_tracker.total_flops}"
     )

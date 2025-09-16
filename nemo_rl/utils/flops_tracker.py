@@ -20,12 +20,14 @@ from packaging.version import Version as PkgVersion
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.llama4.configuration_llama4 import Llama4Config
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
-from nemo_rl.utils.flops_formulas import FLOPSConfig, llama, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import FLOPSConfig, llama, llama4, qwen2, qwen3, mixtral
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -54,7 +56,7 @@ def convert_config_to_flops_config(
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
         ), qwen2
-    elif isinstance(config, (Qwen3Config, Qwen3MoeConfig)):
+    elif isinstance(config, Qwen3Config):
         return FLOPSConfig(
             gbs=0,
             hs=config.hidden_size,
@@ -67,6 +69,18 @@ def convert_config_to_flops_config(
             moe_ffn_hidden_size=config.intermediate_size,
             moe_router_topk=1,
         ), qwen3
+    elif isinstance(config, Qwen3MoeConfig):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            query_groups=config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            moe_router_topk=config.num_experts_per_tok,
+        ), qwen3
     elif isinstance(config, LlamaConfig):
         return FLOPSConfig(
             gbs=0,
@@ -77,6 +91,28 @@ def convert_config_to_flops_config(
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
         ), llama
+    elif isinstance(config, Llama4Config):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.text_config.hidden_size,
+            layers=config.text_config.num_hidden_layers,
+            ffn_hs=config.text_config.intermediate_size_mlp,
+            query_groups=config.text_config.num_key_value_heads,
+            attention_heads=config.text_config.num_attention_heads,
+            vocab_size=config.text_config.vocab_size,
+            moe_router_topk=1,
+        ), llama4
+    elif isinstance(config, MixtralConfig):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            query_groups=config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            moe_router_topk=config.num_experts_per_tok,
+        ), mixtral
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
