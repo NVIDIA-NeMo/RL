@@ -67,6 +67,32 @@ env_config = {
 
 reward_env = RewardModelEnvironment.remote(env_config)
 ```
+
+### Resource Allocation in GRPO Training
+
+In GRPO training, resources are allocated across three main components:
+
+- **Policy Actor**: The trained model
+- **Generation Actor**: Used for generating responses during rollouts (can be colocated with policy or on separate nodes/gpus)
+- **Reward Model Environment Actor**: Evaluates generated responses and computes rewards
+
+The resource allocation logic works as follows:
+
+**Single Node Setup (`num_nodes: 1`):**
+- All components share the same node
+- GPUs are divided between policy training, generation, and reward model
+- Example: 
+    1. Policy and generation colocated: 8 GPUs total = 4 for colocted policy and generation + 4 for reward model
+    2. Policy and generation non-colocated: 8 GPUs total = 2 for policy + 2 for generation + 4 for reward model
+
+**Multi-Node Setup (`num_nodes > 1`):**
+- Policy training, generation, and reward model environment can be distributed across different nodes
+- Reward model gets dedicated resources as specified in `env.reward_model.resources`
+- Generation gets dedicated resources as specified in `policy.generation.colocated.resources`
+- Remaining nodes are allocated to policy training
+
+In the future, the resource control part will be refactored to enable fine-grained resource configuration for each actor. For detailed resource management and optimization strategies, see [#1100](https://github.com/NVIDIA-NeMo/RL/issues/1100).
+
 ### Complete GRPO Training with Reward Model Environments
 
 See [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) for a complete example of using the reward model environment with GRPO training.
