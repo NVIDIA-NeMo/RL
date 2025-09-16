@@ -1069,7 +1069,11 @@ def _wait_for_vllm_http_server_spinup(base_url: str):
             requests.get(base_url, timeout=5)
             # We don't check the status code since there may not be a route at /
             break
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            Exception,
+        ):
             pass
 
 
@@ -1276,7 +1280,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
 
 
 @pytest.mark.asyncio
-async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokenizer):
+async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
+    cluster, tokenizer
+):
     """Test that vLLM http server works."""
 
     generation_config = configure_http_server_config(tokenizer)
@@ -1386,7 +1392,9 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, 
     ):
         pass
 
-    generate_generated_token_id = generate_result["output_ids"][0][len(initial_tokenized_query_ids)].item()
+    generate_generated_token_id = generate_result["output_ids"][0][
+        len(initial_tokenized_query_ids)
+    ].item()
 
     assert vllm_http_server_generated_token_id == generate_generated_token_id
 
