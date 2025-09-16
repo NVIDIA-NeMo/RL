@@ -185,10 +185,20 @@ class AdvTrainingWithReferenceEnvironment(EnvironmentInterface):
             self.log_dir = Path(log_dir)
             self.log_dir.mkdir(parents=True, exist_ok=True)
             
-            # Create timestamped subdirectory for this environment instance
-            timestamp = uuid.uuid4().hex[:8]
-            self.env_log_dir = self.log_dir / f"env_{timestamp}"
-            self.env_log_dir.mkdir(exist_ok=True)
+            # Use the provided log_dir directly for step logs; do not create a UUID subdirectory
+            self.env_log_dir = self.log_dir
+
+            # Initialize step counter from existing step logs if present
+            try:
+                existing_steps = []
+                for step_file in self.env_log_dir.glob("step_*.json"):
+                    match = re.search(r"step_(\\d+)\\.json$", step_file.name)
+                    if match:
+                        existing_steps.append(int(match.group(1)))
+                if len(existing_steps) > 0:
+                    self.step_counter = max(existing_steps) + 1
+            except Exception as e:
+                logging.warning(f"Could not infer step counter from existing logs in {self.env_log_dir}: {e}")
             
             logging.info(f"Environment logging enabled. Logs will be saved to: {self.env_log_dir}")
 
@@ -423,7 +433,6 @@ class AdvTrainingWithReferenceEnvironment(EnvironmentInterface):
                         return individual_scores
                     except ValueError:
                         logging.warning(f"Could not parse individual scores: {individual_boxed_content}")
-
         return 0, 0
 
     def step(
@@ -601,6 +610,7 @@ class AdvTrainingWithReferenceEnvironment(EnvironmentInterface):
         next_stop_strings = [None] * len(message_log_batch) 
 
         # Log conversation data
+
         if self.log_conversations:
             step_data = {
                 "input_conversations": message_log_batch,
