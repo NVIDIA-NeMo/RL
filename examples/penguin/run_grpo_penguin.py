@@ -20,6 +20,7 @@ from typing import Optional
 from itertools import chain, repeat
 
 from omegaconf import OmegaConf
+import ray
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup, _should_use_penguin
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -166,6 +167,8 @@ def main() -> None:
             ),
         }
     ).remote(penguin_config)
+    # Blocking wait for penguin to spin up
+    ray.get(penguin.health_check.remote())
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 

@@ -95,6 +95,9 @@ openai_model:
         }
     ).remote(config)
 
+    # Blocking wait for penguin to spin up
+    ray.get(env.health_check.remote())
+
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
@@ -127,6 +130,15 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
+
+        # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
+        d["message_log"] = d["message_log"][:2]
+        for message in d["message_log"][1:]:
+            if "token_ids" in message:
+                message["token_ids"] = []
+            if "generation_logprobs" in message:
+                message["generation_logprobs"] = []
+
         return d
 
     def _standardize(l: list[dict]):
