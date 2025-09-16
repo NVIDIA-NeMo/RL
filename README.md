@@ -54,7 +54,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **End-to-end FP8 Low Precision training** - Support for Megatron-core FP8 training and FP8 VLLM generation.
-- 🔜 **Megatron-Bridge Integration** - Integrate Megatron-Bridge to enable training features from Megatron-Core.
+- 🔜 **Megatron Bridge Integration** - Integrate Megatron Bridge to enable training features from Megatron Core.
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
 - 🔜 **New Models** - gpt-oss.
 - 🔜 **Expand Algorithms** - DAPO, GSPO.
