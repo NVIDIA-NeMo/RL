@@ -36,9 +36,10 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 class Ether0EnvConfig(TypedDict):
     num_workers: int
+    max_concurrency: Optional[int]
 
 
-class Ether0EnvironmentMetadata(TypedDict):
+class Ether0EnvMetadata(TypedDict):
     reward_function_info: Dict[str, str]  # Contains fxn_name, answer_info, problem_type
     problem_type: str
     ideal_answer: Optional[str]
@@ -46,7 +47,7 @@ class Ether0EnvironmentMetadata(TypedDict):
 
 
 @ray.remote
-class Ether0EvaluatorWorker:
+class Ether0EvalWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.ETHER0
 
     def __init__(self):
@@ -55,7 +56,7 @@ class Ether0EvaluatorWorker:
     def evaluate_responses(
         self, 
         responses: List[str], 
-        metadata_list: List[Ether0EnvironmentMetadata]
+        metadata_list: List[Ether0EnvMetadata]
     ) -> List[Tuple[float, str]]:
         """Use ether0 reward functions.
         
@@ -109,9 +110,9 @@ class Ether0Environment(EnvironmentInterface):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
         self.workers = [
-            Ether0EvaluatorWorker.options(
+            Ether0EvalWorker.options(
                 runtime_env={
-                    "py_executable": Ether0EvaluatorWorker.DEFAULT_PY_EXECUTABLE,
+                    "py_executable": Ether0EvalWorker.DEFAULT_PY_EXECUTABLE,
                     "excludes": ["*.jsonl", "*.json", "results/", "logs/", "__pycache__/", ".git/"]
                 }
             ).remote()
@@ -125,13 +126,13 @@ class Ether0Environment(EnvironmentInterface):
     def step(
         self,
         message_log_batch: List[List[Dict[str, str]]],
-        metadata: List[Ether0EnvironmentMetadata],
+        metadata: List[Ether0EnvMetadata],
     ) -> EnvironmentReturn:
-        """Runs a step in the ether0 environment.
+        """Run batch of steps
 
         Args:
             message_log_batch: List[List[Dict[str, str]]]. A batch of OpenAI-API-like message logs.
-            metadata: List[Ether0EnvironmentMetadata]. Contains reward function info for evaluation.
+            metadata: List[Ether0EnvMetadata]. Contains reward function info for evaluation.
 
         Returns:
             EnvironmentReturn: A tuple containing observations, metadata, stop strings, rewards, and terminateds.

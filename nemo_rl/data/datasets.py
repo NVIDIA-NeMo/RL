@@ -62,17 +62,22 @@ class JsonlinesDataset:
 
     def __getitem__(self, idx: int) -> DatumSpec:
         data = self.data[idx]
-        # support single turn for now
-        assert len(data["messages"]) == 1
-        single_message = data["messages"][0]
+        if isinstance(data["messages"][0], list):
+            # messages is a list of conversations
+            assert len(data["messages"]) == 1
+            single_message = data["messages"][0]
+        else:
+            # messages is a flat list of messages (system/user/assistant)
+            single_message = data["messages"]
 
         message_log = []
 
         # this will also contain system prompt
         user_message = {"role": "user"}
 
+        extra_env_info = None
         for m in single_message:
-            if m["role"] == "user":
+            if m["role"] == "user" and "metadata" in m:
                 # need to be deepcopy to avoid overwriting the original metadata
                 extra_env_info = deepcopy(m["metadata"])
 
@@ -100,8 +105,8 @@ class JsonlinesDataset:
             "extra_env_info": extra_env_info,
             "loss_multiplier": 1.0,
             "idx": idx,
-            "task_name": data["task_name"],
-            "dataset": data["dataset"],
+            "task_name": data.get("task_name", "sft"),
+            "dataset": data.get("dataset", "unknown"),
         }
 
         return output

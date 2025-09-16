@@ -130,8 +130,10 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
         task_to_env["rlhf_genrm"] = genrm_pairwise_env
 
     if "ether0" in env_configs and env_configs["ether0"]["enable"]:
-        print(f"### Setting up ether0 environment with config: {env_configs['ether0']}")
+        max_concurrency = env_configs["ether0"].get("max_concurrency", 16)
+
         ether0_env = Ether0Environment.options(
+            max_concurrency=max_concurrency,
             runtime_env={
                 "py_executable": Ether0Environment.DEFAULT_PY_EXECUTABLE,
                 "env_vars": dict(os.environ),
