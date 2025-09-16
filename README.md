@@ -155,8 +155,8 @@ git submodule update --init --recursive
 # You will have to run the full `git submodule update --init --recursive` command in these situations.
 ```
 
-If you are using the Megatron backend on bare-metal (outside of a container), you may
-need to install the cudnn headers as well. Here is how you can check as well as install them:
+If you are using the Megatron backend on bare metal (outside of a container), you may
+need to install the cuDNN headers as well. Here is how you check and install them:
 ```sh
 # Check if you have libcudnn installed
 dpkg -l | grep cudnn.*cuda
@@ -180,7 +180,7 @@ sudo apt-get install libibverbs-dev
 For faster setup and environment isolation, we use [uv](https://docs.astral.sh/uv/).
 Follow [these instructions](https://docs.astral.sh/uv/getting-started/installation/) to install uv.
 
-Then, initialize NeMo RL project virtual environment via:
+Then, initialize the NeMo RL project virtual environment via:
 ```sh
 uv venv
 ```
@@ -193,7 +193,7 @@ If working outside a container, it can help to build [flash-attn](https://github
 bash tools/build-flash-attn-in-uv-cache.sh
 ```
 > [!NOTE]
-> On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache dir making subsequent installs much quicker.
+> On the first install, `flash-attn` can take a while to install (~45min with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache directory, making subsequent installs much quicker.
 
 > [!TIP]
 > The NeMo RL Dockerfile will warm the uv cache with flash-attn.
@@ -205,14 +205,14 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > [!NOTE]
 > - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
 >   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo_math.py`
-> - Ensure you have the necessary CUDA drivers and PyTorch installed compatible with your hardware.
+> - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
 > - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
 
 ## GRPO
 
-We have a reference GRPO experiment config set up trained for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+We provide a reference GRPO configuration for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
 You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
 
@@ -233,7 +233,7 @@ uv run python examples/run_grpo_math.py \
   cluster.gpus_per_node=8
 ```
 
-You can override any of the parameters listed in the yaml configuration file. For example,
+You can override any of the parameters listed in the YAML configuration file. For example,
 
 ```sh
 uv run python examples/run_grpo_math.py \
@@ -367,7 +367,7 @@ The default DPO experiment is configured to run on a single GPU. To launch the e
 uv run python examples/run_dpo.py
 ```
 
-This trains `Llama3.2-1B-Instruct` on one GPU.
+This trains `Llama3.2-1B-Instruct` on 1 GPU.
 
 If you have access to more GPUs, you can update the experiment accordingly. To run on 8 GPUs, we update the cluster configuration and switch to an 8B Llama3.1 Instruct model:
 
@@ -425,7 +425,7 @@ The default RM experiment is configured to run on a single GPU. To launch the ex
 uv run python examples/run_rm.py
 ```
 
-This trains a RM based on `meta-llama/Llama-3.2-1B-Instruct` on one GPU.
+This trains a RM based on `meta-llama/Llama-3.2-1B-Instruct` on 1 GPU.
 
 If you have access to more GPUs, you can update the experiment accordingly. To run on 8 GPUs, we update the cluster configuration:
 
@@ -463,7 +463,7 @@ We provide evaluation tools to assess model capabilities.
 
 ### Convert Model Format (Optional)
 
-If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
+If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
 
 ```sh
 # Example for a GRPO checkpoint at step 170
@@ -473,7 +473,7 @@ uv run python examples/converters/convert_dcp_to_hf.py \
     --hf-ckpt-path results/grpo/hf
 ```
 
-If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires mcore, so make sure to launch with the mcore extra:
+If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires Megatron Core, so make sure you launch with the mcore extra:
 
 ```sh
 # Example for a GRPO checkpoint at step 170
@@ -489,13 +489,13 @@ For an in-depth explanation of checkpointing, refer to the [Checkpointing docume
 
 ### Run Evaluation
 
-Run evaluation script with converted model:
+Run the evaluation script with the converted model:
 
 ```sh
 uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
 ```
 
-Run evaluation script with custom settings:
+Run the evaluation script with custom settings:
 
 ```sh
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
@@ -525,7 +525,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   ModuleNotFoundError: No module named 'megatron'
   ```
   
-  If you see this error, there is likely an issue with your virtual environments. To fix this, first intialize the submodules:
+  If you see this error, there is likely an issue with your virtual environments. To fix this, first initialize the submodules:
 
   ```sh
   git submodule update --init --recursive
@@ -543,7 +543,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   at **either** one of the following places:
   1. Launch training with:
   ```sh
-  # This will globally apply to all ray actors
+  # This will globally apply to all Ray actors
   PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
   ```
   2. Make the change more permanently by adding this flag in the training configuration:
