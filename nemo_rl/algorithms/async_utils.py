@@ -120,10 +120,14 @@ class ReplayBuffer:
 
     def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, max_age_steps: int) -> Optional[dict[str, Any]]:
 
+        #! This is wrong logic. We need to do
+
+        #current_weight_version - max_age_steps rather than using min_valid_version. Because min_valid_version has that max(0, ...)
+
         intended_indices = [
                 i
                 for i, v in enumerate(self.trajectory_versions)
-                if v == min_valid_version
+                if v == current_weight_version - max_age_steps
         ]
 
         #! These indices have to be selected because its their last chance.
@@ -133,7 +137,7 @@ class ReplayBuffer:
         #! If this is the last chance to pick them and there are more than num_prompt_groups then this is a problem and we should raise an error. This is a problem becaue next step we will have old trajectories in the buffer which will raise an error
         if len(intended_indices) > num_prompt_groups:
 
-            raise ValueError(f"There are {len(intended_indices)} minimum {min_valid_version} trajectories intended for current step {current_weight_version}. This is not possible since we can only select {num_prompt_groups}")
+            raise ValueError(f"There are {len(intended_indices)} minimum {current_weight_version - max_age_steps} trajectories intended for current step {current_weight_version}. This is not possible since we can only select {num_prompt_groups}")
 
         #! So len(intended_indices) has to <= num_prompt_groups.
         selected: list[int] = list(intended_indices)
@@ -147,7 +151,11 @@ class ReplayBuffer:
             groups_with_min_current_weight_version = [i for i,v in enumerate(self.trajectory_versions) if v == min_current_weight_version]
             num_groups_with_min_current_weight_version = len(groups_with_min_current_weight_version)
 
-            step_until_all_have_to_go = min_valid_version + max_age_steps
+
+            #If I was made using current_weight_version, Then I have to go till current_weight_version + max_age_steps
+
+            # step_until_all_have_to_go = min_valid_version + max_age_steps
+            step_until_all_have_to_go = current_weight_version + max_age_steps
 
             #! Assume all future steps pick the same minimum trajectory. Calculate how many at minimum need to be picked now.
 
