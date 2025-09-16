@@ -1266,7 +1266,8 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     assert expected_result == actual_result
 
 
-def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokenizer):
+@pytest.mark.asyncio
+async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokenizer):
     """Test that vLLM http server works."""
 
     generation_config = configure_http_server_config(tokenizer)
@@ -1367,14 +1368,16 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
     )
 
-    generate_result = vllm_generation.generate(
-        data=BatchedDataDict[GenerationDatumSpec](
+    async for _, generate_result in vllm_generation.generate_async(
+        BatchedDataDict[GenerationDatumSpec](
             {
                 "input_ids": torch.tensor([initial_tokenized_query_ids]),
                 "input_lengths": torch.tensor([len(initial_tokenized_query_ids)]),
             }
         )
-    )
+    ):
+        pass
+
     generate_generated_token_id = generate_result["output_ids"][0][0].item()
 
     assert vllm_http_server_generated_token_id == generate_generated_token_id
