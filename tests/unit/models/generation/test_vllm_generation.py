@@ -1378,6 +1378,9 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, 
     ):
         pass
 
+    # TODO remove
+    print(generate_result)
+
     generate_generated_token_id = generate_result["output_ids"][0][0].item()
 
     assert vllm_http_server_generated_token_id == generate_generated_token_id
