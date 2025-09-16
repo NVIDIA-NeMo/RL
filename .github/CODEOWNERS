@@ -19,9 +19,6 @@
 # Catch-all if not defined
 * @nvidia-nemo/rl_maintainers
 
-# Codeowners
-/.github/CODEOWNERS @nvidia-nemo/rl_maintainers
-
 # CI/Test
 /.github/ @nvidia-nemo/rl_reviewers_ci
 /tests/ @nvidia-nemo/rl_reviewers_ci
@@ -58,3 +55,6 @@
 /3rdparty/Megatron-LM-workspace/ @nvidia-nemo/rl_reviewers_mcore
 /3rdparty/Megatron-Bridge-workspace/ @nvidia-nemo/rl_reviewers_mcore
 /ray.sub @nvidia-nemo/rl_reviewers_infra
+
+# Codeowners
+/.github/CODEOWNERS @nvidia-nemo/rl_maintainers
