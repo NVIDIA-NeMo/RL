@@ -814,6 +814,10 @@ def test_run_async_penguin_rollout(
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
             if key.endswith("total_tokens_per_sample") or key.endswith("gen_tokens_per_sample"):
                 d["rollout_metrics"][key] = None
+            
+            # Histograms are objects.
+            if key.startswith("histogram_"):
+                d["rollout_metrics"][key] = None
 
         return {
             "final_batch": final_batch,
