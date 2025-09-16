@@ -71,6 +71,12 @@ policy:
       force_recompute_fp8_weight_in_bwd: true
       filter_fqns: ["lm_head"]
       emulate: false  # Set to true for testing on older GPUs without native FP8 support
+    compile:
+      enabled: true
+      mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
+      fullgraph: false
+      dynamic: false  # Set to false for better performance with fixed shapes
+      backend: null  # Use default backend (inductor)
 
   
   megatron_cfg:
