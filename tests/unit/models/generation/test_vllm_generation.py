@@ -1396,6 +1396,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         len(initial_tokenized_query_ids)
     ].item()
 
+    # We just check the first token here to check the alignment
     assert vllm_http_server_generated_token_id == generate_generated_token_id
 
     # Clean up
