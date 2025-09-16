@@ -58,7 +58,9 @@ def pytest_collection_modifyitems(config, items):
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
     run_automodel_only = config.getoption("--automodel-only")
-    assert not (run_mcore_only and run_automodel_only), "--mcore-only and --automodel-only are mutually exclusive"
+    assert not (run_mcore_only and run_automodel_only), (
+        "--mcore-only and --automodel-only are mutually exclusive"
+    )
     marker_expr = config.getoption("-m", default="")
 
     # If user specified -m marker expressions, still prioritize run_first tests
@@ -72,7 +74,9 @@ def pytest_collection_modifyitems(config, items):
     # Filter by hf_gated marker
     if not run_hf_gated:
         # Exclude hf_gated tests unless explicitly requested
-        new_items = [item for item in new_items if not item.get_closest_marker("hf_gated")]
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("hf_gated")
+        ]
 
     # Filter by mcore marker
     if run_mcore_only:
@@ -88,7 +92,9 @@ def pytest_collection_modifyitems(config, items):
         new_items = [item for item in items if item.get_closest_marker("automodel")]
     else:
         # Exclude automodel tests by default
-        new_items = [item for item in new_items if not item.get_closest_marker("automodel")]
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("automodel")
+        ]
 
     # Ensure run_first tests are prioritized
     new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
