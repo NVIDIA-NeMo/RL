@@ -514,7 +514,7 @@ class MegatronPolicyWorker:
             )
 
         cfg_from_pretrained = ConfigContainer.from_yaml(
-            pretrained_run_config, mode=InstantiationMode.LENIENT
+            pretrained_run_config, mode=InstantiationMode.STRICT
         )
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
