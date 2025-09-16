@@ -33,6 +33,7 @@ class DataConfig(TypedDict):
     download_dir: NotRequired[str]
     train_data_path: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
+    num_workers: NotRequired[int]
 
 
 class MathDataConfig(DataConfig):
