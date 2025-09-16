@@ -29,12 +29,12 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _maybe_correct_merged_tokens,
-)
-from nemo_rl.models.generation.interfaces import (
-    GenerationDatumSpec,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -1315,16 +1315,37 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
     expected_result = {
         "count": 9,
         "max_model_len": 1024,
-        "tokens": [151644, 872, 198, *re_tokenized_ids, 151645, 198, 151644, 77091, 198],
+        "tokens": [
+            151644,
+            872,
+            198,
+            *re_tokenized_ids,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
         "token_strs": None,
     }
     assert expected_result == actual_result
 
     # WITH reference token IDs
     initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
-    initial_tokenized_query_ids = [*initial_tokenized_query_ids_prefix, 151645, 198, 151644, 77091, 198]
-    body_with_reference_token_ids = body | {"required_prefix_token_ids": initial_tokenized_query_ids_prefix}
-    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids)
+    initial_tokenized_query_ids = [
+        *initial_tokenized_query_ids_prefix,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
+    body_with_reference_token_ids = body | {
+        "required_prefix_token_ids": initial_tokenized_query_ids_prefix
+    }
+    response = requests.post(
+        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+    )
     actual_result = response.json()
     expected_result = {
         "count": 10,
@@ -1335,10 +1356,16 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
     assert expected_result == actual_result
 
     # Generate and check result
-    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids)
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+    )
     vllm_http_server_result = response.json()
-    vllm_http_server_generated_token = vllm_http_server_result["choices"][0]["logprobs"]["content"][0]
-    vllm_http_server_generated_token_id = int(vllm_http_server_generated_token["token"].removeprefix("token_id:"))
+    vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
+        "logprobs"
+    ]["content"][0]
+    vllm_http_server_generated_token_id = int(
+        vllm_http_server_generated_token["token"].removeprefix("token_id:")
+    )
 
     generate_result = vllm_generation.generate(
         data=BatchedDataDict[GenerationDatumSpec](
