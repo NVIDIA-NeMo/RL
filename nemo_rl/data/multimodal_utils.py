@@ -31,7 +31,7 @@ class PackedTensor:
 
     def __init__(
         self,
-        tensors: Union[torch.Tensor, list[Optional[torch.Tensor]]],
+        tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
     ) -> None:
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
@@ -49,7 +49,7 @@ class PackedTensor:
             )
         self.dim_to_pack = dim_to_pack
 
-    def as_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:
+    def as_tensor(self, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
         if device is not None:
             # Move only non-None tensors to device, preserve Nones
             for i, item in enumerate(self.tensors):
