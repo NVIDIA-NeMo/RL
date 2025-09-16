@@ -14,14 +14,14 @@
 
 import asyncio
 import gc
-import uuid
 import threading
+import uuid
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 import uvicorn
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
@@ -141,8 +141,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 self._setup_vllm_server()
             )
 
-    async def post_init_async(self) -> Optional[str]:
+    async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":

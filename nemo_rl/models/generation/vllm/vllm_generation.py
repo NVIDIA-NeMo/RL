@@ -169,8 +169,10 @@ class VllmGeneration(GenerationInterface):
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
+        self._post_init()
+
         # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
-        self.dp_openai_server_base_urls = self._post_init()
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
@@ -312,7 +314,21 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
-    def _post_init(self) -> list[Optional[str]]:
+    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return [None]  # Not applicable since this is sync
+
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results
+
+    def _post_init(self):
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
