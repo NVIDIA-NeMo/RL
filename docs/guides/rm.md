@@ -86,26 +86,26 @@ We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets
 ```yaml
 data:
   dataset_name: PreferenceDataset
-  train_data_path: <PathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
   # multiple validation sets is supported
   val_data_paths:
     <NameOfValidationDataset>: <PathToValidationDataset1>
     <NameOfValidationDataset2>: <PathToValidationDataset2>
-  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
-  val_split: <ValSplit>, used for HuggingFace datasets, default is None
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
 
 We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
   dataset_name: BinaryPreferenceDataset
-  train_data_path: <PathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
   val_data_path: <PathToValidationDataset>
   prompt_key: <PromptKey>, default is "prompt"
   chosen_key: <ChosenKey>, default is "chosen"
   rejected_key: <RejectedKey>, default is "rejected"
-  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
-  val_split: <ValSplit>, used for HuggingFace datasets, default is None
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
 
 Please note:

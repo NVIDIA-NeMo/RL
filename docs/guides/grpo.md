@@ -44,12 +44,12 @@ We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/res
 ```yaml
 data:
   dataset_name: ResponseDataset
-  train_data_path: <PathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
   val_data_path: <PathToValidationDataset>
   input_key: <QuestionKey>, default is "input"
   output_key: <AnswerKey>, default is "output"
-  train_split: <TrainSplit>, used for HuggingFace datasets, default is None
-  val_split: <ValSplit>, used for HuggingFace datasets, default is None
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
 
 #### Common Data Format
