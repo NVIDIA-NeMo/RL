@@ -105,6 +105,12 @@ sudo apt-get update
 sudo apt-get install cudnn-cuda-12
 ```
 
+If you encounter problems when installing vllm's dependency deep_ep on bare-metal (outside of a container), you may need to install libibverbs-dev as well. Here is how you can install it:
+```sh
+sudo apt-get update
+sudo apt-get install libibverbs-dev
+```
+
 For faster setup and environment isolation, we use [uv](https://docs.astral.sh/uv/).
 Follow [these instructions](https://docs.astral.sh/uv/getting-started/installation/) to install uv.
 
