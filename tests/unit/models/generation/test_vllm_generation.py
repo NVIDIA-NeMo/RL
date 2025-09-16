@@ -33,6 +33,9 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _maybe_correct_merged_tokens,
 )
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1261,6 +1264,95 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     )
     expected_result = test_data["expected_output"]
     assert expected_result == actual_result
+
+
+def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    detokenized_str = " Skinny"
+    initial_tokenized_ids = [26951, 3834]
+    re_tokenized_ids = [94224]
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": detokenized_str},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    # Take a short nap for the server to spinup. Maybe there is a better way to do this?
+    sleep(3)
+
+    # Check that the re-tokenized ids are the same with the reference and different without the reference.
+    # WITHOUT reference token IDs
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_retokenized_ids = [151644, 872, 198, *re_tokenized_ids, 151645, 198, 151644, 77091, 198]
+    expected_result = {
+        "count": 9,
+        "max_model_len": 1024,
+        "tokens": expected_retokenized_ids,
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # WITH reference token IDs
+    body_with_reference_token_ids = body | {"required_prefix_token_ids": initial_tokenized_ids}
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids)
+    actual_result = response.json()
+    expected_result = {
+        "count": 10,
+        "max_model_len": 1024,
+        "tokens": [151644, 872, 198, *initial_tokenized_ids, 151645, 198, 151644, 77091, 198],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids)
+    vllm_http_server_result = response.json()
+    vllm_http_server_generated_token = vllm_http_server_result["choices"][0]["logprobs"]["content"][0]
+    vllm_http_server_generated_token_id = int(vllm_http_server_generated_token["token"].removeprefix("token_id:"))
+
+    generate_result = vllm_generation.generate(
+        data=BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": torch.tensor([expected_retokenized_ids]),
+                "input_lengths": torch.tensor([len(expected_retokenized_ids)]),
+            }
+        )
+    )
+    generate_generated_token_id = generate_result["output_ids"][0][0].item()
+
+    assert vllm_http_server_generated_token_id == generate_generated_token_id
+
+    # Clean up
+    vllm_generation.shutdown()
 
 
 @pytest.mark.timeout(180)
