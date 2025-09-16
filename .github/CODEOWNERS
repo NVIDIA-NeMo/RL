@@ -47,6 +47,7 @@
 /nemo_rl/models/megatron/ @nvidia-nemo/rl_reviewers_mcore
 /nemo_rl/models/policy/dtensor* @nvidia-nemo/rl_reviewers_automodel
 /nemo_rl/models/policy/megatron* @nvidia-nemo/rl_reviewers_mcore
+/nemo_rl/utils/flop* @nvidia-nemo/rl_reviewers_perf
 
 # Infra, tooling, and docs
 /docker/ @nvidia-nemo/rl_reviewers_infra
