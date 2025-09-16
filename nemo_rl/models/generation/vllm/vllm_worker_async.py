@@ -21,6 +21,7 @@ from typing import Any, AsyncGenerator, Optional, cast
 import ray
 import torch
 import uvicorn
+from fastapi import FastAPI
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -147,12 +148,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
-    def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
-        import threading
+    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from typing import List, Optional, Union
 
-        import uvicorn
-        from fastapi import FastAPI, Request
+        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.openai.api_server import (
             BaseModelPath,
@@ -168,14 +167,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
-
-        base_url = f"http://{node_ip}:{free_port}/v1"
-        print(f"Starting server on {base_url}")
-
-        app = FastAPI()
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -363,9 +354,29 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
 
+        return app
+
+    def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        import threading
+
+        import uvicorn
+        from fastapi import FastAPI
+
+        # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
+        # e.g. last-run middleware.
+        app = FastAPI()
+
+        app = self._setup_vllm_openai_api_server(app)
+
         ########################################
         # Server spinup
         ########################################
+
+        node_ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
+
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
 
         config = uvicorn.Config(
             app,
