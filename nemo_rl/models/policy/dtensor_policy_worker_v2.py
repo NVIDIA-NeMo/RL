@@ -222,7 +222,6 @@ class DTensorPolicyWorkerV2:
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
                 config=model_config,
-                attn_implementation=model_config._attn_implementation,
                 use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
             )
@@ -237,9 +236,14 @@ class DTensorPolicyWorkerV2:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
+            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
+            # so we need to set it to None if sequence packing is disabled
+            # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
-                attn_implementation=model_config._attn_implementation,
+                attn_implementation="flash_attention_2"
+                if self.enable_seq_packing
+                else None,
                 use_liger_kernel=False,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
