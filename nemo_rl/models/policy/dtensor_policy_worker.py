@@ -672,7 +672,7 @@ class DTensorPolicyWorker:
 
                             attention_mask = torch.ones(
                                 (batch_size, seq_len),
-                                dtype=torch.long,
+                                dtype=torch.bool,
                                 device=input_ids.device,
                             )
                             position_ids = torch.arange(
@@ -982,7 +982,7 @@ class DTensorPolicyWorker:
                 else:
                     # Create post_attention_mask for right-padded data for masking token after forwarding.
                     post_attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
@@ -995,16 +995,15 @@ class DTensorPolicyWorker:
                     ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
-                    with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        # DTensor requires the casual attention kernel to hit,
-                        # yet our attention mask above is not always all 1s
-                        # this is fine because we mask with the actual attention mask
-                        # later, but for input it has to be all 1s
-                        attention_mask = torch.ones(
-                            (batch_size, seq_len),
-                            dtype=torch.long,
-                            device=input_ids.device,
-                        )
+                    # DTensor requires the casual attention kernel to hit,
+                    # yet our attention mask above is not always all 1s
+                    # this is fine because we mask with the actual attention mask
+                    # later, but for input it has to be all 1s
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:
