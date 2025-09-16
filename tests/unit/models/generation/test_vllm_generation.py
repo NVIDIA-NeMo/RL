@@ -1312,23 +1312,23 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
     # WITHOUT reference token IDs
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
     actual_result = response.json()
-    expected_retokenized_ids = [151644, 872, 198, *re_tokenized_ids, 151645, 198, 151644, 77091, 198]
     expected_result = {
         "count": 9,
         "max_model_len": 1024,
-        "tokens": expected_retokenized_ids,
+        "tokens": [151644, 872, 198, *re_tokenized_ids, 151645, 198, 151644, 77091, 198],
         "token_strs": None,
     }
     assert expected_result == actual_result
 
     # WITH reference token IDs
+    initial_tokenized_query_ids = [151644, 872, 198, *initial_tokenized_ids, 151645, 198, 151644, 77091, 198]
     body_with_reference_token_ids = body | {"required_prefix_token_ids": initial_tokenized_ids}
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids)
     actual_result = response.json()
     expected_result = {
         "count": 10,
         "max_model_len": 1024,
-        "tokens": [151644, 872, 198, *initial_tokenized_ids, 151645, 198, 151644, 77091, 198],
+        "tokens": initial_tokenized_query_ids,
         "token_strs": None,
     }
     assert expected_result == actual_result
@@ -1342,8 +1342,8 @@ def test_vllm_http_server_correct_merged_tokens_matches_baseline(cluster, tokeni
     generate_result = vllm_generation.generate(
         data=BatchedDataDict[GenerationDatumSpec](
             {
-                "input_ids": torch.tensor([expected_retokenized_ids]),
-                "input_lengths": torch.tensor([len(expected_retokenized_ids)]),
+                "input_ids": torch.tensor([initial_tokenized_query_ids]),
+                "input_lengths": torch.tensor([len(initial_tokenized_query_ids)]),
             }
         )
     )
