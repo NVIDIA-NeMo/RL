@@ -40,7 +40,7 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class RMSaveState(TypedDict):
@@ -305,6 +305,9 @@ def validate_one_dataset(
 ):
     """Run validation on one validation dataset."""
     if val_dataloader is None:
+        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
+            "val_dataloader is None, so dpo.val_period must be 0"
+        )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
@@ -426,7 +429,11 @@ def rm_train(
 ):
     # Run basic rm training
     timer = Timer()
-
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
     if rm_save_state is None:
         rm_save_state = _default_rm_save_state()
         current_epoch = 0
@@ -512,13 +519,21 @@ def rm_train(
                     )
 
                 ## Checkpointing
+                timeout.mark_iteration()
+
                 rm_save_state["consumed_samples"] += master_config["policy"][
                     "train_global_batch_size"
                 ]
-                if master_config["checkpointing"]["enabled"] and (
+
+                should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
+                )
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
                 ):
                     ## +1 because step is 0-indexed
                     rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
@@ -615,6 +630,8 @@ def rm_train(
             current_step += 1
             total_steps += 1
 
+            if should_save_by_timeout:
+                return
             if (
                 master_config["rm"]["max_num_steps"] != -1
                 and total_steps >= master_config["rm"]["max_num_steps"]

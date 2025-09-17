@@ -82,6 +82,7 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
 
