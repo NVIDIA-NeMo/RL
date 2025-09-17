@@ -222,7 +222,10 @@ def setup_qwen3_penguin_config(config, tokenizer):
         {%- else %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}"""
-    assert to_replace in chat_template
+    if to_replace not in chat_template:
+        print("WARNING: If you are using a Qwen3 Thinking model, please note that the reasoning truncation over multiple turns is NOT removed from the chat template. If you are not using a Qwen3 Thinking model, you can disregard this message.")
+        return
+
     chat_template = chat_template.replace(
         to_replace,
         r"""        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}""",
