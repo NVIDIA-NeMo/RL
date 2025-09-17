@@ -15,10 +15,9 @@
 name: "Merge Queue Auto-Retry"
 
 on:
-  push:
-  # pull_request:
-  #   types:
-  #     - dequeued
+  pull_request:
+    types:
+      - dequeued
 
 jobs:
   requeue-pr:
@@ -31,56 +30,56 @@ jobs:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
 
-      # - name: Check dequeue reason and retry count
-      #   id: check_retry
-      #   if: github.event.reason == 'CI_TIMEOUT'
-      #   env:
-      #     GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-      #   run: |
-      #     PR_NUMBER=${{ github.event.pull_request.number }}
-
-      #     # Debug: Show all comments first
-      #     echo "=== All PR Comments ==="
-      #     gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-      #       --jq '.[] | {id: .id, created_at: .created_at, body: .body[:100]}'
-
-      #     echo "=== Filtering for retry comments ==="
-
-      #     # Get the current number of retry attempts from PR comments
-      #     RETRY_COUNT=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-      #       --jq '[.[] | select(.body | contains("Auto-retry attempt")) | .body] | length')
-
-      #     echo "Current retry count: $RETRY_COUNT"
-
-      #     MAX_RETRIES=3
-
-      #     if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
-      #       echo "should_retry=true" >> $GITHUB_OUTPUT
-      #       echo "retry_count=$((RETRY_COUNT + 1))" >> $GITHUB_OUTPUT
-      #       echo "✅ Will retry (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
-      #     else
-      #       echo "should_retry=false" >> $GITHUB_OUTPUT
-      #       echo "❌ Max retries ($MAX_RETRIES) reached for PR #${PR_NUMBER}"
-      #     fi
-
-      # - name: Add retry comment
-      #   if: steps.check_retry.outputs.should_retry == 'true'
-      #   env:
-      #     GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-      #   run: |
-      #     PR_NUMBER=${{ github.event.pull_request.number }}
-      #     RETRY_COUNT=${{ steps.check_retry.outputs.retry_count }}
-
-      #     gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-      #       -f body="🔄 Auto-retry attempt ${RETRY_COUNT}: PR was removed from merge queue, automatically requeuing..."
-
-      - name: Requeue Pull Request
-        # if: steps.check_retry.outputs.should_retry == 'true'
+      - name: Check dequeue reason and retry count
+        id: check_retry
+        if: github.event.reason == 'CI_TIMEOUT'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
-          PR_NUMBER="1111"
-          PR_NODE_ID="PR_kwDOOJjv8s6nvYsV"
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          # Debug: Show all comments first
+          echo "=== All PR Comments ==="
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | {id: .id, created_at: .created_at, body: .body[:100]}'
+
+          echo "=== Filtering for retry comments ==="
+
+          # Get the current number of retry attempts from PR comments
+          RETRY_COUNT=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.body | contains("Auto-retry attempt")) | .body] | length')
+
+          echo "Current retry count: $RETRY_COUNT"
+
+          MAX_RETRIES=3
+
+          if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
+            echo "should_retry=true" >> $GITHUB_OUTPUT
+            echo "retry_count=$((RETRY_COUNT + 1))" >> $GITHUB_OUTPUT
+            echo "✅ Will retry (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+          else
+            echo "should_retry=false" >> $GITHUB_OUTPUT
+            echo "❌ Max retries ($MAX_RETRIES) reached for PR #${PR_NUMBER}"
+          fi
+
+      - name: Add retry comment
+        if: steps.check_retry.outputs.should_retry == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          RETRY_COUNT=${{ steps.check_retry.outputs.retry_count }}
+
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="🔄 Auto-retry attempt ${RETRY_COUNT}: PR was removed from merge queue, automatically requeuing..."
+
+      - name: Requeue Pull Request
+        if: steps.check_retry.outputs.should_retry == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          PR_NODE_ID="${{ github.event.pull_request.node_id }}"
 
           echo "Requeuing PR #${PR_NUMBER}..."
 
@@ -91,20 +90,22 @@ jobs:
             -d "{\"query\": \"mutation { enqueuePullRequest(input: {pullRequestId: \\\"${PR_NODE_ID}\\\"}) { clientMutationId } }\"}" \
             https://api.github.com/graphql)
 
-          echo "GRAPHQL_RESPONSE: $GRAPHQL_RESPONSE"
           if echo "$GRAPHQL_RESPONSE" | jq -e '.data.enqueuePullRequest' > /dev/null; then
             echo "PR #${PR_NUMBER} has been successfully requeued"
+          else
+            echo "❌ Failed to enqueue PR #${PR_NUMBER}. GraphQL response for debugging:"
+            echo "$GRAPHQL_RESPONSE"
           fi
 
-      # - name: Max retries reached comment
-      #   if: steps.check_retry.outputs.should_retry == 'false'
-      #   env:
-      #     GH_TOKEN: ${{ steps.generate_token.outputs.token }}
-      #   run: |
-      #     PR_NUMBER=${{ github.event.pull_request.number }}
+      - name: Max retries reached comment
+        if: steps.check_retry.outputs.should_retry == 'false'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
 
-      #     gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-      #       -f body="⚠️ Maximum auto-retry attempts reached. PR was removed from merge queue multiple times. Please investigate the issue and manually requeue if needed."
+          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            -f body="⚠️ Maximum auto-retry attempts reached. PR was removed from merge queue multiple times. Please investigate the issue and manually requeue if needed."
 
       - name: Notify on failure
         if: failure()
