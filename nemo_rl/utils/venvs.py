@@ -188,21 +188,23 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     # Return mapping from node IP to venv python path
     return paths[0]
 
+
 def patch_transformers_module_dir(env_vars: dict[str, str]):
-    """
-    Updates the PYTHONPATH in the given env_vars to include downloaded Transformers modules.
-    
+    """Updates the PYTHONPATH in the given env_vars to include downloaded Transformers modules.
+
     Some models, such as `moonshotai/Moonlight-16B-A3B`, may raise
     `ModuleNotFoundError: No module named 'transformers_modules'` during
     tokenizer deserialization when passed to a `Policy` object. This patch
     prevents that error.
-    
+
     Assumption: the cache directory is shared across virtual environments.
     """
     from transformers.utils.hub import TRANSFORMERS_CACHE
 
-    module_dir =  os.path.join(TRANSFORMERS_CACHE, ".." , "modules")
-    assert os.path.exists(module_dir), f"TRANSFORMERS_CACHE is not set or does not exist: {module_dir}"
+    module_dir = os.path.join(TRANSFORMERS_CACHE, "..", "modules")
+    assert os.path.exists(module_dir), (
+        f"TRANSFORMERS_CACHE is not set or does not exist: {module_dir}"
+    )
     if "PYTHONPATH" not in env_vars:
         env_vars["PYTHONPATH"] = module_dir
     else:
