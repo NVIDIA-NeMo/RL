@@ -33,6 +33,10 @@ class DataConfig(TypedDict):
     download_dir: NotRequired[str]
     train_data_path: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
+    # Number of data loader workers.
+    # Set to 8 or 10 for large batches to improve loading speed.
+    # This saturates CPU threads without consuming too much memory
+    # 10 is safe for most scenarios.
     num_workers: NotRequired[int]
 
 
