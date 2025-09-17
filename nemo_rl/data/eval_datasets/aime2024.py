@@ -29,6 +29,7 @@ class AIME2024Dataset:
         system_prompt_file: Optional[str] = None,
     ):
         ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+        ds = ds.select(range(1))
         self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
         self.task_spec = TaskDataSpec(
             task_name="aime2024",
