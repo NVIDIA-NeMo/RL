@@ -21,13 +21,20 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama4.configuration_llama4 import Llama4Config
+from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
-from nemo_rl.utils.flops_formulas import FLOPSConfig, llama, llama4, qwen2, qwen3, mixtral
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    llama,
+    llama4,
+    mixtral,
+    qwen2,
+    qwen3,
+)
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
