@@ -15,10 +15,13 @@
 import asyncio
 import gc
 import uuid
-from typing import Any, AsyncGenerator, cast
+from typing import Any, AsyncGenerator, Optional, cast
+import threading
 
 import ray
 import torch
+from fastapi import FastAPI
+import uvicorn
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -129,39 +132,34 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self.vllm_device_ids = await self.report_device_id_async()
         return self.base_url
 
-    def _setup_vllm_server(self) -> None:
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self.base_url
+
+    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from typing import List, Optional, Union
 
-        import threading
-
-        from fastapi import FastAPI, Request
+        from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
-
-        import uvicorn
-
-        from vllm.entrypoints.openai.api_server import OpenAIServingModels, OpenAIServingChat, OpenAIServingTokenization, BaseModelPath
+        from vllm.entrypoints.openai.api_server import (
+            BaseModelPath,
+            OpenAIServingChat,
+            OpenAIServingModels,
+            OpenAIServingTokenization,
+        )
         from vllm.entrypoints.openai.protocol import (
             ChatCompletionRequest,
-            ErrorResponse,
             ChatCompletionResponse,
+            ErrorResponse,
             TokenizeChatRequest,
             TokenizeCompletionRequest,
             TokenizeResponse,
-            ChatCompletionMessageParam,
         )
-        from vllm.entrypoints.chat_utils import CustomChatCompletionMessageParam
-
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
-
-        base_url = f"http://{node_ip}:{free_port}/v1"
-        print(f"Starting server on {base_url}")
-
-        app = FastAPI()
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
-        base_model_paths = [BaseModelPath(name=model_config.model, model_path=model_config.model)]
+        base_model_paths = [
+            BaseModelPath(name=model_config.model, model_path=model_config.model)
+        ]
 
         openai_serving_models = OpenAIServingModels(
             engine_client=engine_client,
@@ -170,27 +168,60 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             lora_modules=None,
         )
 
-
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
                 # Penguin specific processing. This is just how Penguin returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
                         if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = message["prompt_token_ids"] + message["generation_token_ids"]
+                            self.required_prefix_token_ids = (
+                                message["prompt_token_ids"]
+                                + message["generation_token_ids"]
+                            )
                             break
 
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(self, request: NeMoRLOpenAIChatRequestMixin, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt = True, continue_final_message = False, tool_dicts = None, documents = None, chat_template_kwargs = None, tool_parser = None, truncate_prompt_tokens = None, add_special_tokens = False):
+            async def _preprocess_chat(
+                self,
+                request: NeMoRLOpenAIChatRequestMixin,
+                tokenizer,
+                messages,
+                chat_template,
+                chat_template_content_format,
+                add_generation_prompt=True,
+                continue_final_message=False,
+                tool_dicts=None,
+                documents=None,
+                chat_template_kwargs=None,
+                tool_parser=None,
+                truncate_prompt_tokens=None,
+                add_special_tokens=False,
+            ):
                 # res is conversation, [request_prompt], [engine_prompt]
-                res = await super()._preprocess_chat(request, tokenizer, messages, chat_template, chat_template_content_format, add_generation_prompt, continue_final_message, tool_dicts, documents, chat_template_kwargs, tool_parser, truncate_prompt_tokens, add_special_tokens)
+                res = await super()._preprocess_chat(
+                    request,
+                    tokenizer,
+                    messages,
+                    chat_template,
+                    chat_template_content_format,
+                    add_generation_prompt,
+                    continue_final_message,
+                    tool_dicts,
+                    documents,
+                    chat_template_kwargs,
+                    tool_parser,
+                    truncate_prompt_tokens,
+                    add_special_tokens,
+                )
 
                 if request.required_prefix_token_ids is None:
                     return res
 
-                engine_prompt = res[2][0]  # We need to modify engine_prompt.prompt_token_ids
+                engine_prompt = res[2][
+                    0
+                ]  # We need to modify engine_prompt.prompt_token_ids
 
                 final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
@@ -202,15 +233,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 return res
 
-
         ########################################
         # /v1/chat/completions endpoint
         ########################################
 
         # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > ChatCompletionRequest
-        class NeMoRLChatCompletionRequest(NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest):
+        class NeMoRLChatCompletionRequest(
+            NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
+        ):
             required_prefix_token_ids: Optional[List[int]] = None
-
 
         # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
@@ -222,7 +253,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             chat_template=None,
             chat_template_content_format="auto",
         )
-        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
+            "http_server_serving_chat_kwargs", dict()
+        )
         openai_serving_chat = NeMoRLOpenAIServingChat(
             engine_client,
             model_config,
@@ -232,11 +265,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
 
         generation_config = self.cfg
+
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
-        async def create_chat_completion(request: NeMoRLChatCompletionRequest, raw_request: Request):
+        async def create_chat_completion(
+            request: NeMoRLChatCompletionRequest, raw_request: Request
+        ):
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly set this to -1.
+            # Right now we explicitly assert set this to -1.
+            assert request.top_k in (None, -1), (
+                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+            )
             request.top_k = -1
 
             # The request sampling params need to exactly match those as are set in NeMo RL.
@@ -244,11 +283,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
-            generator = await openai_serving_chat.create_chat_completion(request, raw_request)
+            generator = await openai_serving_chat.create_chat_completion(
+                request, raw_request
+            )
 
             if isinstance(generator, ErrorResponse):
-                return JSONResponse(content=generator.model_dump(),
-                                    status_code=generator.code)
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.code
+                )
 
             elif isinstance(generator, ChatCompletionResponse):
                 return JSONResponse(content=generator.model_dump())
@@ -260,13 +302,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ########################################
 
         # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
-        class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest):
+        class NeMoRLTokenizeChatRequest(
+            NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
+        ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        NeMoRLTokenizeRequest = Union[TokenizeCompletionRequest, NeMoRLTokenizeChatRequest]
+        NeMoRLTokenizeRequest = Union[
+            TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
+        ]
 
         # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
-        class NeMoRLOpenAIServingTokenization(NeMoRLOpenAIServingMixin, OpenAIServingTokenization):
+        class NeMoRLOpenAIServingTokenization(
+            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
+        ):
             pass
 
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
@@ -275,22 +323,47 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             openai_serving_models,
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs["chat_template_content_format"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
         )
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
-            generator = await openai_serving_tokenization.create_tokenize(request, raw_request)
+            generator = await openai_serving_tokenization.create_tokenize(
+                request, raw_request
+            )
 
             if isinstance(generator, ErrorResponse):
-                return JSONResponse(content=generator.model_dump(),
-                                    status_code=generator.code)
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.code
+                )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        return app
+
+    def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        import threading
+
+        import uvicorn
+        from fastapi import FastAPI
+
+        # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
+        # e.g. last-run middleware.
+        app = FastAPI()
+
+        app = self._setup_vllm_openai_api_server(app)
 
         ########################################
         # Server spinup
         ########################################
+
+        node_ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
+
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
 
         config = uvicorn.Config(
             app,
