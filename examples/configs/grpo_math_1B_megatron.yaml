@@ -4,6 +4,7 @@ defaults: "grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
+  max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -88,6 +89,7 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     
@@ -119,7 +121,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 13
       lr_warmup_init: 5.0e-7
 

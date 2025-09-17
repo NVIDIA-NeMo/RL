@@ -14,12 +14,67 @@
 
 import importlib
 import os
-from typing import Any
+from typing import Any, Dict
 
 import torch
-from transformers import AutoConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForTextToWaveform,
+)
+
+# Try to import nemo_automodel classes, fallback to None if not available
+try:
+    from nemo_automodel.components._transformers.auto_model import (
+        NeMoAutoModelForCausalLM,
+        NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForTextToWaveform,
+    )
+
+    NEMO_AUTOMODEL_AVAILABLE = True
+except ImportError:
+    # nemo_automodel is not installed, classes will be None
+    NeMoAutoModelForCausalLM = None  # type: ignore
+    NeMoAutoModelForImageTextToText = None  # type: ignore
+    NeMoAutoModelForTextToWaveform = None  # type: ignore
+    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+# an automodel factory for loading the huggingface models from correct class
+
+AUTOMODEL_FACTORY: Dict[str, Any] = {
+    "qwen2_5_vl": AutoModelForImageTextToText,
+    "qwen2_vl": AutoModelForImageTextToText,
+    "qwen2_5_omni": AutoModelForTextToWaveform,
+    "llava": AutoModelForImageTextToText,
+    "internvl": AutoModelForImageTextToText,
+    "gemma3": AutoModelForImageTextToText,
+    "smolvlm": AutoModelForImageTextToText,
+    "mistral3": AutoModelForImageTextToText,
+    "llama4": AutoModelForImageTextToText,
+}
+
+if NEMO_AUTOMODEL_AVAILABLE:
+    AUTOMODEL_FACTORY = {
+        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "llava": NeMoAutoModelForImageTextToText,
+        "internvl": NeMoAutoModelForImageTextToText,
+        "gemma3": NeMoAutoModelForImageTextToText,
+        "smolvlm": NeMoAutoModelForImageTextToText,
+        "mistral3": NeMoAutoModelForImageTextToText,
+        "llama4": NeMoAutoModelForImageTextToText,
+    }
+
+
+def resolve_model_class(model_name: str) -> Any:
+    """Resolve the appropriate model class for a given model name."""
+    if NEMO_AUTOMODEL_AVAILABLE:
+        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -138,49 +193,6 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         )
 
     return overwrite_dict
-
-
-def configure_expandable_segments() -> None:
-    """Configure expandable_segments on Hopper and newer architectures (compute capability 9.x+).
-
-    This helps with memory allocation but causes crashes on Ampere GPUs, so we only enable it
-    on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
-    """
-    compute_capability = torch.cuda.get_device_properties(0).major
-
-    if compute_capability >= 9:  # Hopper+
-        existing_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-
-        # Check if expandable_segments is already configured
-        if "expandable_segments" in existing_conf:
-            print(f"expandable_segments already configured: {existing_conf}")
-            # Already configured, don't override
-            return
-
-        # Add expandable_segments to existing configuration
-        if existing_conf:
-            # Append to existing configuration
-            new_conf = f"{existing_conf},expandable_segments:True"
-        else:
-            # Set new configuration
-            new_conf = "expandable_segments:True"
-
-        print(f"Setting PYTORCH_CUDA_ALLOC_CONF to {new_conf}")
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_conf
-
-    else:
-        ## make sure that expandable_segments is not set to True
-        if "expandable_segments" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
-            conf_items = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
-            for item in conf_items:
-                if item.strip().startswith("expandable_segments"):
-                    key_value = item.split(":")
-                    if len(key_value) == 2 and key_value[1].strip().lower() == "true":
-                        raise RuntimeError(
-                            "expandable_segments is enabled in PYTORCH_CUDA_ALLOC_CONF, "
-                            "but this is not supported on architectures older than Hopper (compute capability < 9). "
-                            "Please set expandable_segments to False."
-                        )
 
 
 def configure_dynamo_cache() -> None:

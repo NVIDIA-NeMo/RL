@@ -15,6 +15,8 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
+uv run tests/unit/prepare_unit_test_assets.py
+
 cd /opt/nemo-rl
 uv run --no-sync bash -x ./tests/run_unit.sh unit/models/policy/ --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 

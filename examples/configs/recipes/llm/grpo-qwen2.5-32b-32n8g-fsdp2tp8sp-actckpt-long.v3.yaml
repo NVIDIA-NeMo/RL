@@ -2,6 +2,7 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_rollout_turns: 1
+  max_num_epochs: 1
   max_num_steps: 20
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -10,6 +11,7 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  overlong_filtering: false
 loss_fn:
   reference_policy_kl_penalty: 0.01
   ratio_clip_min: 0.2
@@ -94,6 +96,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
+      enable_expert_parallel: false
       gpu_memory_utilization: 0.6
       max_model_len: 16384
       enforce_eager: False

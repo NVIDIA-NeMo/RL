@@ -31,8 +31,8 @@ maybe_gres_arg() {
   # Check if any nodes in the partition have GRES configured
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
-    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d: -f2) ]]; then
+    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
       echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
@@ -59,18 +59,28 @@ DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
 METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 
 # Ports for the head node
-PORT=${PORT:-54258}
+PORT=${PORT:-54514}
 RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 
+# Setting ulimit is recommended by ray best practices page
+# @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
+# It's session based and won't affect the system outside the script
+# Ensure that the soft limit isn't above the hard limit
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+  echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
+fi
+
 # On our clusters, the largest port range on an idle worker appeared between 52369-64607
 # (not including the other ports set by this script). So this range is chosen to be
 # somewhere in the middle
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54257}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
@@ -118,13 +128,66 @@ CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 
 num_retries=3
 
+# Track backgrounded srun client PIDs for head and workers
+declare -A SRUN_PIDS
+
+# Verify all backgrounded srun client processes are still alive; exit fast if any died
+check_srun_processes() {
+  for name in "${!SRUN_PIDS[@]}"; do
+    pid="${SRUN_PIDS[$name]}"
+    # Check if the process is still running
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] Background srun '$name' died (pid=$pid). Could be a failure in startup or an issue with the node preventing the srun to start. Attempting to exit." >&2
+      # Signal sidecars inside containers to terminate ASAP
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+  done
+}
+
 # Getting the node names and IP addresses in the SLURM allocation
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
 ip_addresses_array=()
 
 for node in $nodes; do
-    ip_address=$(host $node | awk '/has address/ { print $4 }')
+    # Try multiple methods to get IP address - ENHANCED VERSION v2.0
+    echo "[DEBUG] Resolving hostname: $node using enhanced resolution methods"
+    ip_address=""
+    
+    # Method 1: Try host command
+    echo "[DEBUG] Method 1: host command"
+    ip_address=$(host $node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
+    echo "[DEBUG] host result: '$ip_address'"
+    
+    # Method 2: If host fails, try getent
+    if [[ -z "$ip_address" ]]; then
+        echo "[DEBUG] Method 2: getent hosts"
+        ip_address=$(getent hosts $node 2>/dev/null | awk '{ print $1 }' | head -1 || true)
+        echo "[DEBUG] getent result: '$ip_address'"
+    fi
+    
+    # Method 3: If getent fails, try nslookup
+    if [[ -z "$ip_address" ]]; then
+        echo "[DEBUG] Method 3: nslookup"
+        ip_address=$(nslookup $node 2>/dev/null | awk '/^Address: / { print $2 }' | head -1 || true)
+        echo "[DEBUG] nslookup result: '$ip_address'"
+    fi
+    
+    # Method 4: If all DNS methods fail, try ping to extract IP
+    if [[ -z "$ip_address" ]]; then
+        echo "[DEBUG] Method 4: ping"
+        ip_address=$(ping -c 1 $node 2>/dev/null | grep "PING" | sed 's/.*(\([^)]*\)).*/\1/' || true)
+        echo "[DEBUG] ping result: '$ip_address'"
+    fi
+    
+    # If still no IP, use the hostname itself (might work if it's already an IP or resolvable)
+    if [[ -z "$ip_address" ]]; then
+        echo "[WARNING] Could not resolve IP for $node, using hostname as fallback"
+        ip_address=$node
+    fi
+    
+    echo "[INFO] Node: $node -> IP: $ip_address"
     # Add the IP address to the array
     ip_addresses_array+=("$ip_address")
 done
@@ -232,6 +295,7 @@ exit 1
 EOF
 )
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
 
 NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
@@ -266,6 +330,37 @@ monitor-sidecar() {
 }
 monitor-sidecar &
 
+# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
+log-sync-sidecar() {
+  set +x
+  if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
+    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
+    return
+  fi
+  mkdir -p $LOG_DIR/ray/$node_i
+  while true; do
+    sleep $RAY_LOG_SYNC_FREQUENCY
+    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in /tmp/ray/session_[0-9]*/; do
+        if [[ -d "\$session_dir/logs" ]]; then
+          session_name=\$(basename "\$session_dir")
+          mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
+          if command -v rsync > /dev/null 2>&1; then
+            rsync -ahP "\$session_dir/logs/" $LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
+          else
+            cp -r "\$session_dir/logs" $LOG_DIR/ray/$node_i/\$session_name/
+          fi
+        fi
+      done
+    fi
+    if [[ -f "$LOG_DIR/ENDED" ]]; then
+      echo "Log sync sidecar terminating..."
+      break
+    fi
+  done
+}
+log-sync-sidecar &
+
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
@@ -298,11 +393,12 @@ exit 1
 EOF
 )
   srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  SRUN_PIDS["ray-worker-$i"]=$!
   sleep 3
 done
 
 # Then we wait here for the file to be created by the head node container
-while ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do 
+while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do
   echo "[INFO][$(date)] Waiting for head node container to start..."
   sleep 2
 done
@@ -327,9 +423,10 @@ extract_worker_units() {
 while true; do
   worker_units=$(extract_worker_units)
   echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
-  if [ "$worker_units" -eq "$NUM_ACTORS" ]; then
+  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
     break
   fi
+  check_srun_processes
   sleep 2
 done
 
@@ -338,7 +435,7 @@ echo "All workers connected!"
 # We can now launch a job on this cluster
 # We do so by launching a driver process on the physical node that the head node is on
 # This driver process is responsible for launching a job on the Ray cluster
-CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID --json | jq -r '.jobs[].current_working_directory')
+CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
   srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else

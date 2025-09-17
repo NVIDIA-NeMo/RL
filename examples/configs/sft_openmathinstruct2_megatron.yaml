@@ -1,0 +1,151 @@
+# SFT Algorithm Configuration
+defaults: sft_openmathinstruct2.yaml
+
+sft:
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  val_period: 500
+  val_batches: 4
+  val_global_batch_size: 128
+  val_micro_batch_size: 1
+  val_at_start: true
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_openmathinstruct2"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 100
+  save_period: 500
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B"
+  tokenizer:
+    name: meta-llama/Llama-3.1-8B-Instruct
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    activation_checkpointing: false
+    context_parallel_size: 1
+    distributed_data_parallel_config:
+      average_in_collective: true
+      data_parallel_sharding_strategy: optim_grads_params
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+    empty_unused_memory_level: 1
+    enabled: true
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    optimizer:
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1.0e-8
+      bf16: true
+      clip_grad: 0
+      fp16: false
+      lr: 0.00002
+      min_lr: 0.00002
+      optimizer: adam
+      params_dtype: bfloat16
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: false #true ## TODO: precision aware optim not working with fp8. Is this expected?
+      weight_decay: 0.01
+
+      ## recently introduced, our current mcore commit doesn't have this
+      #fp8_recipe: delayed
+
+    pipeline_dtype: bfloat16
+    pipeline_model_parallel_size: 1
+    scheduler:
+      end_weight_decay: 0.01
+      lr_decay_iters: 1000
+      lr_decay_style: constant
+      lr_warmup_init: 0.00001999999
+      lr_warmup_iters: 1
+      start_weight_decay: 0.01
+      weight_decay_incr_style: constant
+    sequence_parallel: false
+    tensor_model_parallel_size: 4 ## TODO: should not need this large TP size
+
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
+
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+
+    ## fp8 training currently not supported
+    #fp8_cfg:
+    #  enabled: true
+    #  fp8: hybrid
+    #  fp8_recipe: delayed
+    #  fp8_param: true # false gives the following error: "RuntimeError: /TransformerEngine/transformer_engine/common/gemm/cublaslt_gemm.cu:116 in function CanonicalizeGemmInput: Assertion failed: !is_fp8_dtype(ret.Atype). Input A is missing column-wise usage"
+    #  fp8_dot_product_attention: false #true
+    #  fp8_multi_head_attention: false #true
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    sequence_length_round: 64
+
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${mul:16, ${policy.megatron_cfg.tensor_model_parallel_size}}
+  max_grad_norm: null
+
+  optimizer: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "openmathinstruct2"
+  prompt_file: examples/prompts/math.txt
+  split: "train_1M"
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: true
+  output_key: 'generated_solution'
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "sft-openmathinstruct-megatron"
+    name: "llama8b"
+  tensorboard:
+    log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "openmathinstruct-nemorl-1M_train"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
+                                                  

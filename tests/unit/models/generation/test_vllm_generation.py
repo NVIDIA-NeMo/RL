@@ -39,7 +39,13 @@ basic_vllm_test_config: VllmConfig = {
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
-    "temperature": 0.8,
+    # Set temperature=1.0 to ensure consistent probability scaling when comparing vLLM and HF policy outputs.
+    # Note: greedy=True is only used in tests for deterministic behavior and not used in the real training.
+    # In vLLM, enabling greedy=True disables temperature scaling (temperature is overridden to None).
+    # The HF policy worker does not currently support greedy=True for get_logprobs.
+    # Using temperature=1.0 allows us to meaningfully test the average probability multiplicative error between the two implementations,
+    # while still maintaining the deterministic behavior.
+    "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
     "stop_token_ids": None,
@@ -48,6 +54,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -158,7 +165,9 @@ def get_basic_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -302,17 +311,6 @@ def test_input_data(tokenizer):
     )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 def test_vllm_missing_required_config_key(cluster):
     """Test that an assertion error is raised when a required config key is missing."""
     # Create a config missing a required key by removing 'model_name'
@@ -335,6 +333,43 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+def test_vllm_top_p_top_k_validation(cluster):
+    """Test that top_p and top_k validation works correctly with threshold-based logic."""
+    # Test that values above thresholds are allowed
+    config_above_thresholds = deepcopy(basic_vllm_test_config)
+    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
+    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
+
+    # Should not raise an error
+    try:
+        VllmGeneration(cluster, config_above_thresholds)
+        print("Successfully initialized with top_p=0.99 and top_k=8000")
+    except Exception as e:
+        pytest.fail(f"Should not raise error with values above thresholds: {e}")
+
+    # Test that values below thresholds are rejected
+    config_below_thresholds = deepcopy(basic_vllm_test_config)
+    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_below_thresholds)
+
+    error_message = str(excinfo.value)
+    assert "top_p sampling with values < 0.99 is not supported" in error_message
+    print(f"Successfully caught low top_p value with error: {error_message}")
+
+    # Test that low top_k values are rejected
+    config_low_top_k = deepcopy(basic_vllm_test_config)
+    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_low_top_k)
+
+    error_message = str(excinfo.value)
+    assert "top_k sampling with values < 8000 is not supported" in error_message
+    print(f"Successfully caught low top_k value with error: {error_message}")
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
@@ -624,7 +659,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
 
 async def run_hf_train_process(
-    lm_policy, vllm_policy, tokenizer, async_engine, colocated
+    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
 ):
     """Validates that the two policies can work together.
 
@@ -730,7 +765,14 @@ async def run_hf_train_process(
         )
 
         print(f"Average probability multiplicative error: {avg_prob_mult_error}")
-        assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
+        if vllm_precision == "fp8":
+            assert avg_prob_mult_error <= 1.080, (
+                "vLLM and HF logprobs should closely match"
+            )
+        else:
+            assert avg_prob_mult_error <= 1.043, (
+                "vLLM and HF logprobs should closely match"
+            )
 
         # Step 2: Prepare simplified training data (smaller and with padding removed to prevent OOM)
         # Use a very small sequence for training to ensure it works
@@ -797,16 +839,33 @@ async def run_hf_train_process(
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
-    cluster, tokenizer, async_engine, cpu_offload
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(cluster, vllm_config)
     vllm_policy.finish_generation()
@@ -824,17 +883,33 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, True)
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+    )
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("async_engine", "cpu_offload"), [(True, False), (False, True)]
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
-    policy_cluster_separate, tokenizer, async_engine, cpu_offload
+    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
 ):
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
 
@@ -842,6 +917,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     print("Creating vLLM policy...")
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config["colocated"]["enabled"] = False
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
@@ -867,7 +943,9 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
-    await run_hf_train_process(lm_policy, vllm_policy, tokenizer, async_engine, False)
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
+    )
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
@@ -964,16 +1042,27 @@ def test_vllm_generate_text(cluster, tokenizer):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
+
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     from nemo_rl.models.policy.lm_policy import Policy
 
     # Create configs
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
@@ -1342,13 +1431,22 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
     This test validates that vLLM and Megatron policies can work together.
     """
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
@@ -1364,6 +1462,7 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
