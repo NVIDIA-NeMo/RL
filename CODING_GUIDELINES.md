@@ -10,7 +10,7 @@ Note: This repository is Python-first. Prefer the Python guidelines in this docu
 
 ## uv Guidelines
 
-#### Use uv run instead of python
+### Use uv run instead of python
 
 Use `uv run` to execute scripts, rather than activating a virtual environment and calling `python` directly.
 
@@ -30,37 +30,15 @@ uv run examples/run_grpo_math.py
 Exception: `Dockerfile.ngc_pytorch` is exempt from this rule.
 
 ## Python Coding Guidelines
-#### Python Standard
+### Python Standard
 1. The code developed for NeMo RL should conform to Python 3.12+.
 
-#### Indentation
+### Indentation
 1. Indent code with 4 spaces. Do not use tabs.
 
-#### Imports
-1. Always maintain the namespace when importing, even if only one class or function from a module is used.
+### Naming
 
-For example instead of:
-
-```python
-from package.subpackage.foo import SomeClass
-SomeClass()
-```
-or
-```python
-import package
-package.subpackage.foo.SomeClass()
-```
-
-Do:
-
-```python
-from package.subpackage import foo
-foo.SomeClass()
-```
-
-#### Naming
-
-##### Identifier Format
+#### Identifier Format
 1. Files
 - snake_case: `some_file.py`
 
@@ -80,35 +58,21 @@ foo.SomeClass()
 6. Constants
 - upper snake_case: `MY_CONSTANT = ...`
 
-##### Identifier Guidelines
+#### Identifier Guidelines
 1. Avoid shadowing variables declared in an outer scope.
 2. Initialize all externally visible memberes of a class in the constructor.
 
-#### Comments
+### Comments
 
 1. For interfaces that may be used outside a file, prefer docstrings over comments.
 2. Comments should be reserved for code within a function, or interfaces that are local to a file.
+3. If a piece of code is commented out, there should be a comment around that piece of code describing it's usage and why it's commented out. Otherwise that is a debug comment and it should be removed before merging
 
-#### Docstring Syntax
-##### Classes and Functions
+### Docstring Syntax
+#### Classes and Functions
 Use the [Google style](https://google.github.io/styleguide/pyguide.html), which can be parsed by Sphinx.
 
-#####  Attributes and Variables
-Attributes and variables can be documented inline. Attribute docstrings will be rendered under the docstring for the class. For example:
-```python
-class MyClass:
-    """
-    Description of the class.
-    """
-    def __init__(self):
-        self.x = 5
-        """<type>: Description of 'x'"""
-
-y = 2
-"""<type>: Description of 'y'"""
-```
-
-#### Avoid Reflection
+### Avoid Reflection
 Avoid using reflection when functionality can be easily achieved without reflection.
 
 For example, instead of:
@@ -126,7 +90,7 @@ def make_complex(x, y):
     return {'x': x, 'y': y}
 ```
 
-#### Error Handling
+### Error Handling
 1. When using try-except blocks, limit the except to the smallest set of errors possible.
 
 For example, instead of:
@@ -172,9 +136,42 @@ else:
     f.read()
 ```
 
+### Configuration Defaults
+
+- **YAML is the single source of truth for defaults.** Do not set non-`None` defaults in the code for configuration values. The loaded YAML (and any user overrides) must supply required values.
+- **Access config directly and expect presence.** For required attributes, write code like `policy_cfg["precision"]` and assume it is present. Do not introduce hidden defaults deep in the code (e.g., defaulting `policy.precision` to `"bfloat16"`).
+- **Express optionality via `TypedDict`.** Use `typing.NotRequired` to mark optional attributes. Optional attributes may be absent/`None`; code may check for their presence.
+- **Where defaults live.** Exemplar configs under `examples/configs/*.yaml` include documented defaults. Recipe YAMLs under `examples/configs/recipes/**/*.yaml` are runnable snapshots and may omit documentation.
+- **Additions must be documented.** When adding a new config key to a `TypedDict` subclass, document the key’s purpose, valid values/types, and recommended default (if applicable), and reflect the default in the exemplar YAMLs under `examples/configs/*.yaml`.
+- **Rationale.** Centralizing defaults in YAML avoids surprising behavior and makes value provenance clear.
+
+Forbidden patterns:
+
+```python
+# Hidden default in code
+precision = policy_cfg.get("precision", "bfloat16")
+
+# Function parameter defaulting a config value
+def build_policy(policy_cfg, precision: str = "bfloat16"):
+    ...
+```
+
+Preferred patterns:
+
+```python
+# Required attribute: expect it to come from YAML or user override
+precision: str = policy_cfg["precision"]
+
+# Optional attribute: check for presence
+if "milestones" in scheduler_cfg:
+    configure_milestones(scheduler_cfg["milestones"])
+```
+
+See also: [TypedDict and Configuration Defaults](docs/design-docs/design-and-philosophy.md#typeddict-and-configuration-defaults).
+
 ## Doc Guidelines
 
-#### Ensure docs/index.md is up to date
+### Ensure docs/index.md is up to date
 
 When a new markdown doc is added under `docs/**/*.md` or a markdown file is renamed, ensure that `docs/index.md` is updated and the document appears in the most appropriate section.
 
