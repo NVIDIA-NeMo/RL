@@ -169,8 +169,7 @@ class VllmGeneration(GenerationInterface):
 
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
-        self.dp_openai_server_base_urls = self._post_init()
+        self._post_init()
 
         # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
         self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
