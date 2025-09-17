@@ -251,7 +251,6 @@ class DTensorPolicyWorkerV2:
                 use_liger_kernel=use_liger_kernel,
                 attn_implementation=model_config._attn_implementation,
                 config=model_config,
-                use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
             )
 
