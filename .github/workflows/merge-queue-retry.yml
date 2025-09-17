@@ -95,6 +95,7 @@ jobs:
           else
             echo "❌ Failed to enqueue PR #${PR_NUMBER}. GraphQL response for debugging:"
             echo "$GRAPHQL_RESPONSE"
+            exit 1
           fi
 
       - name: Max retries reached comment
