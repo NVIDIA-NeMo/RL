@@ -79,8 +79,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          PR_NODE_ID="${{ github.event.pull_request.node_id }}"
+          PR_NUMBER="1111"
+          PR_NODE_ID="PR_kwDOOJjv8s6nvYsV"
 
           echo "Requeuing PR #${PR_NUMBER}..."
 
