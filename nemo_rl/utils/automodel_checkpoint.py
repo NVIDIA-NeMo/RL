@@ -38,6 +38,24 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 apply_patches()
 
 
+def _infer_checkpoint_root(weights_path: str) -> str:
+    """Infer checkpoint root directory from weights path.
+
+    When weights_path ends with "…/weights/model", we need the parent of
+    the weights directory (the checkpoint root), not the weights directory itself.
+
+    Args:
+        weights_path: Path to model weights (e.g., "/path/to/policy/weights/model")
+
+    Returns:
+        str: Checkpoint root directory (e.g., "/path/to/policy")
+    """
+    weights_dir = os.path.dirname(weights_path)
+    if weights_dir.endswith("weights"):
+        return os.path.dirname(weights_dir)
+    return weights_dir
+
+
 def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
     """Detect model save format and PEFT status from checkpoint directory.
 
@@ -126,7 +144,7 @@ def save_checkpoint(
 
     checkpoint_config = CheckpointingConfig(
         enabled=True,
-        checkpoint_dir=os.path.dirname(weights_path),
+        checkpoint_dir=_infer_checkpoint_root(weights_path),
         model_save_format=model_save_format,
         model_cache_dir="",
         model_repo_id="",
