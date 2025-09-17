@@ -145,7 +145,6 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
 
     # ==========================
     #      Checkpointing
