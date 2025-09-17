@@ -84,10 +84,11 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.utils.native_checkpoint import (
+from nemo_rl.utils.automodel_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -165,6 +166,23 @@ class DTensorPolicyWorkerV2:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
+        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        if cp_size > 1 and self.enable_seq_packing:
+            raise ValueError(
+                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
+            )
+        dp_size = world_size // tp_size // cp_size
+        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
+        assert world_size == dp_size * tp_size * cp_size, (
+            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
+        )
+
+        if sequence_parallel_enabled and tp_size == 1:
+            print(
+                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
+            )
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -213,17 +231,32 @@ class DTensorPolicyWorkerV2:
             model_class = resolve_model_class(model_config.model_type)
 
         full_state_dict = None
+        model_state_dict_keys = None
+        use_liger_kernel = self.cfg["dtensor_cfg"].get("use_liger_kernel", False)
+
+        # Check for incompatible configuration: liger-kernel doesn't support context parallel yet
+        if use_liger_kernel and cp_size > 1:
+            raise ValueError(
+                f"use_liger_kernel=True is incompatible with context_parallel_size={cp_size} > 1. "
+                "Liger-kernel doesn't support context parallel yet. "
+                "Please either set use_liger_kernel=False or context_parallel_size=1."
+            )
+
         if self.rank == 0:
             print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
             model = model_class.from_pretrained(
                 model_name,
                 device_map="cpu",  # load weights onto CPU initially
                 trust_remote_code=True,
+                use_liger_kernel=use_liger_kernel,
+                attn_implementation=model_config._attn_implementation,
                 config=model_config,
                 torch_dtype=str(model_config.torch_dtype),
             )
 
             full_state_dict = model.state_dict()
+            # Store the original model state dict keys before any parallelization
+            model_state_dict_keys = list(full_state_dict.keys())
             del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
@@ -231,37 +264,19 @@ class DTensorPolicyWorkerV2:
         # The actual weights will be broadcast from rank 0.
 
         with init_empty_weights():
-            # NeMoAutoModelForCausalLM uses flash_attention_2 by default
-            # so we need to set it to None if sequence packing is disabled
+            # NeMoAutoModelForCausalLM exposes attn_implementation in the from_config method and
+            # sets flash_attention_2 by default so we need to set it model_config._attn_implementation
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
+                attn_implementation=model_config._attn_implementation,
+                use_liger_kernel=use_liger_kernel,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
-
-        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
-        if cp_size > 1 and self.enable_seq_packing:
-            raise ValueError(
-                "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
-            )
-        dp_size = world_size // tp_size // cp_size
-        sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
-        assert world_size == dp_size * tp_size * cp_size, (
-            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
-        )
-
-        if sequence_parallel_enabled and tp_size == 1:
-            print(
-                "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
-            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
@@ -348,6 +363,11 @@ class DTensorPolicyWorkerV2:
                 broadcast_from_rank0=True,
             ),
         )
+
+        # Broadcast model state dict keys to all ranks and store as instance variable
+        keys_to_broadcast = [model_state_dict_keys]
+        torch.distributed.broadcast_object_list(keys_to_broadcast, src=0)
+        self.model_state_dict_keys = keys_to_broadcast[0]
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
@@ -1433,11 +1453,30 @@ class DTensorPolicyWorkerV2:
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model.
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        if checkpointing_cfg is None:
+            raise ValueError(
+                "checkpointing_cfg must be provided when saving checkpoint"
+            )
+
+        # Extract only the checkpointing configuration keys that exist
+        checkpoint_kwargs = {
+            key: value
+            for key, value in checkpointing_cfg.items()
+            if key
+            in {
+                "model_save_format",
+                "save_consolidated",
+                "is_peft",
+                "peft_config",
+            }
+        }
+
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -1446,10 +1485,14 @@ class DTensorPolicyWorkerV2:
             optimizer_path=optimizer_path,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
+            model_state_dict_keys=self.model_state_dict_keys,
+            **checkpoint_kwargs,
         )
 
     def load_checkpoint(
-        self, weights_path: str, optimizer_path: Optional[str] = None
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model."""
         load_checkpoint(
