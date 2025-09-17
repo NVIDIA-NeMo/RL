@@ -27,7 +27,6 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -129,11 +128,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
-        from vllm.config import CompilationConfig
 
         # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
-            llm_kwargs["compilation_config"] = CompilationConfig(**llm_kwargs["compilation_config"])
+            llm_kwargs["compilation_config"] = CompilationConfig(
+                **llm_kwargs["compilation_config"]
+            )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
@@ -146,7 +146,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
-        return self.base_url
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
