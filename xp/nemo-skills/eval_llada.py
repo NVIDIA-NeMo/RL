@@ -118,13 +118,13 @@ def create_parser():
     parser.add_argument(
         "--steps",
         type=int,
-        default=128,
+        default=256,
         help="LLaDA diffusion steps (1-512, higher = better quality but slower)"
     )
     parser.add_argument(
         "--block-length",
         type=int,
-        default=32,
+        default=8,
         help="LLaDA block length for semi-autoregressive generation"
     )
     parser.add_argument(
