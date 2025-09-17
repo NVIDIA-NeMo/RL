@@ -29,11 +29,8 @@ from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluste
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.vllm import VllmConfig
-from nemo_rl.models.policy.lm_policy import (
-    DynamicBatchingConfig,
-    Policy,
-    SequencePackingConfig,
-)
+from nemo_rl.models.policy import DynamicBatchingConfig, SequencePackingConfig
+from nemo_rl.models.policy.lm_policy import Policy
 
 
 class RewardModelEnvironmentConfig(TypedDict):
