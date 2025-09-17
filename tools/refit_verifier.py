@@ -210,6 +210,7 @@ def setup_configs(args, tokenizer):
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "pipeline_dtype": "bfloat16",
             "freeze_moe_router": False,
             "apply_rope_fusion": False,

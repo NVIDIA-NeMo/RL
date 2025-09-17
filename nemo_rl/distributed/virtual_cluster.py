@@ -66,14 +66,14 @@ def _get_node_ip_and_free_port() -> tuple[str, int]:
     return _get_node_ip_local(), _get_free_port_local()
 
 
-def _get_node_ip_local() -> str:  # pragma: no cover
+def _get_node_ip_local() -> str:
     # Get the IP address of the current node
     node_ip = ray._private.services.get_node_ip_address()
 
     return node_ip
 
 
-def _get_free_port_local() -> int:  # pragma: no cover
+def _get_free_port_local() -> int:
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
