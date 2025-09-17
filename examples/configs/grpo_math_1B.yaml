@@ -54,7 +54,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
   
@@ -230,5 +230,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 2
+  gpus_per_node: 1
   num_nodes: 1
