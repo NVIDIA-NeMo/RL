@@ -54,6 +54,7 @@ class ReplayBuffer:
         self.sampler_fns = {
             "fifo": self.fifo_sample,
             "mixed": self.mixed_sample,
+            "reward_sample_min_max": self.reward_sample_min_max,
         }
         
 
@@ -87,7 +88,7 @@ class ReplayBuffer:
             return "success"
 
 
-    def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
+    def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, **kwargs) -> Optional[dict[str, Any]]:
 
 
         intended_indices = [
@@ -116,9 +117,9 @@ class ReplayBuffer:
             f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
         )
 
-        return selected
+        return {"selected": selected, "removed": None}
 
-    def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
+    def mixed_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int,**kwargs) -> Optional[dict[str, Any]]:
 
         #! This is the old logic. There is one issue is that we might have older versions than even min_valid_version, so we need to take all of them up
 
@@ -164,9 +165,50 @@ class ReplayBuffer:
 
         print(f"   ✅ Mixed selection done: {len(selected)} total (intended={len(last_chance_indices)}, mixed_in={len(selected) - len(last_chance_indices)})")
 
-        return selected
+        return {"selected": selected, "removed": None}
 
 
+    def reward_sample_min_max(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, **kwargs) -> Optional[dict[str, Any]]:
+
+        #! In FIFO manner find the indices that are eligible based on the min_reward and max_reward
+        
+        min_reward_sample = kwargs.get("min_reward_sample", 0.0)
+        max_reward_sample = kwargs.get("max_reward_sample", 1.0)
+
+        #! First find all eligible indices
+        intended_indices = [
+            i
+            for i, v in enumerate(self.trajectory_versions) if v["avg_reward"] >= min_reward_sample and v["avg_reward"] <= max_reward_sample
+        ]
+
+        print(
+            f"   🎯 Found {len(intended_indices)} trajectories eligible for current step {current_weight_version}"
+        )
+
+        # Stall training if we don't have enough trajectories intended for this step
+        if len(intended_indices) < num_prompt_groups:
+            print(
+                f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories eligible for step {current_weight_version}, but only {len(intended_indices)} eligible trajectories are ready"
+            )
+            print(
+                f"   ⏸️ Training will wait for remaining {num_prompt_groups - len(intended_indices)} eligible trajectories to be generated"
+            )
+            return None
+
+        # Select exactly the trajectories intended for this step (FIFO within same target)
+        selected: list[int] = intended_indices[:num_prompt_groups]
+        print(
+            f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+        )
+
+        #! We need to remove all the indices that we went over but were not eligible
+        max_index = max(selected)
+        remove_indices = [i for i in range(max_index) if i not in selected]
+
+        #! In both fifo & mixed, we never threw out any trajectories. So we could just return the selected indices and remove them in the sample(...) function. But here we throw out both selected + any trajectories that were before it
+
+        return {"selected": selected, "removed": remove_indices}
+        
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
@@ -191,6 +233,7 @@ class ReplayBuffer:
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
+        **kwargs,
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
@@ -270,8 +313,11 @@ class ReplayBuffer:
             #---
             #valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: 
             #---
+            sample_result = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version, **kwargs)
 
-            selected = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version)
+
+            selected = sample_result["selected"]
+            removed = sample_result["removed"]
 
             if selected is None:
                 return None
@@ -292,11 +338,18 @@ class ReplayBuffer:
 
             sampled_items = [self.trajectories[i] for i in selected]
 
-            # Remove selected items in reverse order to maintain correct indices
-            for idx in sorted(selected, reverse=True):
-                self.trajectory_versions.pop(idx)
-                self.target_weight_versions.pop(idx)
-                self.trajectories.pop(idx)
+            # Remove selected items in reverse order to maintain correct indices. If remove is None or empty list then use the default selected indices.
+            if removed is not None and len(removed) > 0: 
+                for idx in sorted(removed, reverse=True):
+                    self.trajectory_versions.pop(idx)
+                    self.target_weight_versions.pop(idx)
+                    self.trajectories.pop(idx)
+            else:
+                for idx in sorted(selected, reverse=True):
+                    self.trajectory_versions.pop(idx)
+                    self.target_weight_versions.pop(idx)
+                    self.trajectories.pop(idx)
+
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
@@ -714,9 +767,18 @@ class AsyncTrajectoryCollector:
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
 
+            try:
+                group_rewards = final_batch_cpu["total_reward"]
+                avg_reward = float(group_rewards.float().mean().item())
+            except Exception:
+                # Be conservative if structure is unexpected
+                avg_reward = 0.0
+
+
             trajectory_group = {
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
+                "avg_reward": avg_reward,
                 "timestamp": time.time(),
             }
 
