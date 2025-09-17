@@ -107,6 +107,7 @@ class ClippedPGLossFn(LossFunction):
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
         ]
+        self.scale_no_clip = cfg.get("scale_no_clip", False)
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(
             "sequence_level_importance_ratios",
@@ -236,11 +237,14 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
+        if self.scale_no_clip:
+            clip_loss = -advantages * ratios_clamped.detach() * curr_logprobs
+        else:
+            loss1 = -advantages * ratios
+            loss2 = -advantages * ratios_clamped
 
-        # Determine which value to use for clipping (max for pessimistic estimate)
-        clip_loss = torch.max(loss1, loss2)
+            # Determine which value to use for clipping (max for pessimistic estimate)
+            clip_loss = torch.max(loss1, loss2)
 
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:

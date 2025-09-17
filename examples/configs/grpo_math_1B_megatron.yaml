@@ -21,6 +21,7 @@ loss_fn:
   use_importance_sampling_correction: false
   token_level_loss: true
   ratio_clip_c: null
+  scale_no_clip: false
 
 checkpointing:
   enabled: false
