@@ -90,10 +90,12 @@ class DistributedLogprob(torch.autograd.Function):
             op=torch.distributed.ReduceOp.SUM,
             group=group,
         )
+        ctx.group = group
 
         if not inference_only:
             # only save for backward when we have inference only=False
-            ctx.save_for_backward(softmax_output, target_mask, masked_target)
+            #ctx.save_for_backward(softmax_output, target_mask, masked_target)
+            ctx.save_for_backward(vocab_parallel_logits, target_mask, masked_target)
 
         return log_probs
 
@@ -103,7 +105,13 @@ class DistributedLogprob(torch.autograd.Function):
         *grad_outputs: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
-        softmax, target_mask, masked_target = ctx.saved_tensors
+        # softmax, target_mask, masked_target = ctx.saved_tensors
+        vocab_parallel_logits, target_mask, masked_target = ctx.saved_tensors
+        vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
+
+        log_probs = _compute_distributed_log_softmax(vocab_parallel_logits, group=ctx.group)
+        softmax = log_probs.exp()
+
 
         if softmax.ndim == 3:
             B, S, V = softmax.shape
