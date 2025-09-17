@@ -186,6 +186,11 @@ def load_checkpoint(
     try:
         format_enum = SerializationFormat[model_save_format.upper()]
 
+        # append /model to the weights_path if it doesn't exist
+        # TODO: remove this once nemo-automodel is updated
+        if not weights_path.endswith("/model"):
+            weights_path = os.path.join(weights_path, "model")
+
         # Load model using nemo-automodel API
         load_model(
             model=model,
