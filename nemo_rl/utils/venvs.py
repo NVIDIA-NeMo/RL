@@ -188,8 +188,6 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     # Return mapping from node IP to venv python path
     return paths[0]
 
-# Need to set PYTHONPATH to include transformers downloaded modules.
-# Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
     """
     Updates the PYTHONPATH in the given env_vars to include downloaded Transformers modules.
