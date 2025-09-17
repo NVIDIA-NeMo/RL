@@ -92,7 +92,7 @@ class CheckpointManager:
             config (CheckpointingConfig)
         """
         self.checkpoint_dir = Path(config["checkpoint_dir"])
-        self.metric_name = config["metric_name"]
+        self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
 
@@ -202,18 +202,17 @@ class CheckpointManager:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
             try:
-                metric_name = (
-                    self.metric_name
-                )  # Type checker hint - capture the non-None value
                 # sort by metric value first, then by step number (for equal metrics, prefer more recent)
                 if self.higher_is_better:
                     # For higher_is_better=True: higher metric values first, then higher step numbers
                     checkpoint_history.sort(
-                        key=lambda x: (x[2][metric_name], x[0]), reverse=True
+                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
                     )
                 else:
                     # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                    checkpoint_history.sort(key=lambda x: (x[2][metric_name], -x[0]))
+                    checkpoint_history.sort(
+                        key=lambda x: (x[2][self.metric_name], -x[0])
+                    )
             except KeyError:
                 warnings.warn(
                     f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
@@ -250,9 +249,8 @@ class CheckpointManager:
             )
             return self.get_latest_checkpoint_path()
 
-        metric_name = self.metric_name  # Type checker hint - capture the non-None value
         checkpoint_history.sort(
-            key=lambda x: x[2][metric_name], reverse=self.higher_is_better
+            key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
         )
         return str(checkpoint_history[0][1])
 
