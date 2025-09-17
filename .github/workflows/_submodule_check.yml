@@ -47,56 +47,56 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
-      
+
       - name: Fetch target branch reference
         run: |
           git fetch origin ${{ inputs.base_ref }}
-      
+
       - name: Check submodule fast-forward status
         id: check
         shell: bash -x -e {0}
         run: |
           echo "Checking submodules are fast-forwarded..."
-          
+
           # Get current submodule status
           echo "Current submodule status:"
           git submodule status
-          
+
           failed=0
           changed=0
           success_body=""
           failed_body=""
-          
+
           # Process each submodule from git submodule status
           while read -r line; do
             # Extract commit and path from: " <commit> <path> (<branch_info>)"
             current_commit=$(echo "$line" | awk '{print $1}' | sed 's/^[+-]//')
             submodule_path=$(echo "$line" | awk '{print $2}')
-            
+
             if [[ -z "$current_commit" ]] || [[ -z "$submodule_path" ]]; then
               continue
             fi
-            
+
             submodule_name=$(basename "$submodule_path")
             echo ""
             echo "Checking $submodule_name at $submodule_path"
             echo "Current commit: $current_commit"
-            
+
             # Get target branch commit for this submodule
             target_commit=$(git ls-tree origin/${{ inputs.base_ref }} "$submodule_path" | awk '{print $3}')
-            
+
             if [[ -z "$target_commit" ]]; then
               echo "✅ $submodule_name: New submodule being added (not present in ${{ inputs.base_ref }} branch)"
               changed=1
               success_body+="$submodule_name: ✅ New submodule being added"$'\n'
               continue
             fi
-            
+
             echo "Target commit:  $target_commit"
-            
+
             # Analyze the relationship between target and current commits
             cd "$submodule_path"
-            
+
             # Check if this is a shallow repository and unshallow if needed
             if git rev-parse --is-shallow-repository >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
               echo "📦 $submodule_name: Detected shallow clone, fetching full history..."
@@ -104,7 +104,7 @@ jobs:
                 echo "⚠️  Warning: Failed to unshallow repository. Ancestry checks may be limited."
               }
             fi
-            
+
             # Get GitHub repository URL for comment
             remote_url=$(git remote get-url origin 2>/dev/null || echo "")
             if [[ "$remote_url" == *.git ]]; then
@@ -112,12 +112,12 @@ jobs:
             else
               github_repo="$remote_url"
             fi
-            
+
             # Case 1: Same commit
             if [[ "$current_commit" = "$target_commit" ]]; then
               echo "✅ $submodule_name: PR branch matches ${{ inputs.base_ref }} branch (same commit)"
               # No change, so don't add to changed count or comment
-              
+
             # Case 2: Check if target commit is an ancestor of current commit (current is fast-forward)
             elif git merge-base --is-ancestor "$target_commit" "$current_commit" 2>/dev/null; then
               echo "✅ $submodule_name: PR branch is ahead of ${{ inputs.base_ref }} branch (fast-forward)"
@@ -125,7 +125,7 @@ jobs:
               git log --oneline --graph "$target_commit".."$current_commit" 2>/dev/null || echo "   (Unable to show progression - possibly shallow clone)"
               changed=1
               success_body+="$submodule_name: ✅ PR branch is ahead of ${{ inputs.base_ref }} branch (fast-forward)"$'\n'
-              
+
             # Case 3: Check if current commit is an ancestor of target commit (current is behind)
             elif git merge-base --is-ancestor "$current_commit" "$target_commit" 2>/dev/null; then
               echo "❌ $submodule_name: PR branch is BEHIND ${{ inputs.base_ref }} branch"
@@ -139,11 +139,12 @@ jobs:
                 failed_body+="   TARGET (${{ inputs.base_ref }} branch): $github_repo/commits/$target_commit/"$'\n'
                 failed_body+="   CURRENT (PR #${{ inputs.pr_number }} from ${{ inputs.head_ref }}): $github_repo/commits/$current_commit/"$'\n\n'
               fi
-              
+
             else
               # Case 4: Commits have diverged or have no common ancestor
+              echo "Checking if commits have diverged or have no common ancestor"
               common_ancestor=$(git merge-base "$target_commit" "$current_commit" 2>/dev/null)
-              
+
               if [ -n "$common_ancestor" ]; then
                 echo "❌ $submodule_name: Commits have DIVERGED from a common ancestor"
                 echo "   This indicates parallel development - manual merge may be required"
@@ -193,9 +194,9 @@ jobs:
               fi
             fi
             cd "$GITHUB_WORKSPACE"
-            
+
           done < <(git submodule status)
-          
+
           # Set outputs
           echo "failed=$failed" >> $GITHUB_OUTPUT
           echo "changed=$changed" >> $GITHUB_OUTPUT
@@ -213,42 +214,47 @@ jobs:
             echo "$comment_body" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           fi
-          
+
           if [[ $failed -eq 1 ]]; then
             echo ""
             echo "❌ One or more submodules are not fast-forwarded"
             echo "Please ensure submodule commits are fast-forwards of the ${{ inputs.base_ref }} branch"
             exit 1
           fi
-          
+
           echo ""
           echo "✅ All submodules are properly fast-forwarded"
 
-  comment:
-    name: Comment on PR
+  create_artifact:
+    name: Create Comment Artifact
     needs: [check]
     runs-on: ubuntu-latest
     if: always() && needs.check.outputs.changed == '1'
     steps:
-      - name: Comment on PR
+      - name: Create comment file
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
+
             const failed = '${{ needs.check.outputs.failed }}' === '1';
-            const title = failed ? 
-              '## ❌ Submodule Fast-Forward Check Failed' : 
+            const title = failed ?
+              '## ❌ Submodule Fast-Forward Check Failed' :
               '## ✅ Submodule Fast-Forward Check Results';
-            
+
             const commentBody = `${title}
-            
+
             **Check based on commit:** ${{ inputs.head_sha }} (PR #${{ inputs.pr_number }} from \`${{ inputs.head_ref }}\`)
-            
+
             ${{ needs.check.outputs.comment_body }}
             ${failed ? 'Please ensure all submodule commits are fast-forwards of the ${{ inputs.base_ref }} branch before merging.' : 'All submodule changes look good! ✨'}`;
-            
-            await github.rest.issues.createComment({
-              issue_number: ${{ inputs.pr_number }},
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: commentBody
-            }); 
+
+            fs.writeFileSync('comment.txt', commentBody);
+            console.log('Comment body written to comment.txt');
+
+      - name: Upload comment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: submodule-check
+          path: comment.txt
+          retention-days: 1

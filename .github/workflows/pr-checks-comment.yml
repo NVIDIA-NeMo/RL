@@ -1,0 +1,40 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Automodel Integration and Submodule Checks"
+
+on:
+  pull_request_target:
+
+jobs:
+
+  submodule-check-comment:
+    name: Post submodule check comment
+    uses: ./.github/workflows/_pr_comment.yml
+    with:
+      pr_number: "${{ github.event.number }}"
+      artifact_name: submodule-check
+      head_sha: "${{ github.event.pull_request.head.sha }}"
+      max_retries: 30
+      sleep_duration: 10
+
+  automodel-integration-comment:
+    name: Post automodel integration comment
+    uses: ./.github/workflows/_pr_comment.yml
+    with:
+      pr_number: "${{ github.event.number }}"
+      artifact_name: automodel-integration-check
+      head_sha: "${{ github.event.pull_request.head.sha }}"
+      max_retries: 30
+      sleep_duration: 10
