@@ -39,6 +39,8 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -184,7 +186,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
+      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,

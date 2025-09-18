@@ -360,8 +360,10 @@ class RayVirtualCluster:
     def node_count(self) -> int:
         return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
 
-    def get_master_address_and_port(self) -> tuple[str, int]:
-        """Gets the master address and port for the distributed training setup.
+    def get_available_address_and_port(
+        self, pg_idx: int, bundle_idx: int
+    ) -> tuple[str, int]:
+        """Gets an available address and port for the given placement group index and bundle index.
 
         Returns:
             Tuple of (address, port)
@@ -370,15 +372,19 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # Use the first bundle of the first placement group
-        # This works for both unified PG and per-node PGs
-        pg = self.get_placement_groups()[0]
+        # Get the placement group
+        placement_groups = self.get_placement_groups()
+        if len(placement_groups) == 1:
+            pg = placement_groups[0]
+        else:
+            pg = placement_groups[pg_idx]
+
         if pg.bundle_specs:
-            # Launch port finder on the first bundle of this placement group
+            # Launch port finder on the given bundle of this placement group
             addr, port = ray.get(
                 _get_node_ip_and_free_port.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=0
+                        placement_group=pg, placement_group_bundle_index=bundle_idx
                     ),
                     # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
                     num_cpus=0,
@@ -386,7 +392,17 @@ class RayVirtualCluster:
             )
             return addr, port
 
-        raise RuntimeError("No valid placement groups found to get master address")
+        raise RuntimeError(
+            "No valid placement groups found to get available address and port"
+        )
+
+    def get_master_address_and_port(self) -> tuple[str, int]:
+        """Gets the master address and port for the distributed training setup.
+
+        Returns:
+            Tuple of (address, port)
+        """
+        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
