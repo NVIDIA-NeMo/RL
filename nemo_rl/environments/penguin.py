@@ -21,7 +21,6 @@ import torch
 from tqdm.auto import tqdm
 
 from nemo_rl.data.datasets import DatumSpec
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
@@ -33,16 +32,18 @@ class PenguinConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
 
 
-@ray.remote
-class PenguinWorker:
-    def __init__(self, cfg: PenguinConfig, nemo_rl_openai_base_url: str):
+@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+class Penguin(EnvironmentInterface):
+    """
+    This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray.
+    So there is still one source of truth for resource management in NeMo RL.
+    """
+    def __init__(self, cfg: PenguinConfig):
         self.cfg = cfg
 
-        self.nemo_rl_openai_base_url = nemo_rl_openai_base_url
         self.node_ip = _get_node_ip_local()
         self.head_server_port = _get_free_port_local()
 
-        # TODO we should probably rename this somehow to penguin. But that is a lot of work...
         from omegaconf import DictConfig
         from penguin.cli import RunHelper, GlobalConfigDictParserConfig
         from penguin.server_utils import HEAD_SERVER_KEY_NAME
@@ -54,7 +55,7 @@ class PenguinWorker:
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
-        initial_global_config_dict["policy_base_url"] = self.nemo_rl_openai_base_url
+        initial_global_config_dict["policy_base_url"] = self.cfg.base_urls
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
@@ -73,6 +74,12 @@ class PenguinWorker:
 
     def health_check(self) -> bool:
         return True
+
+    async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
+        penguin_results = await self._call_penguin_for_rollouts(penguin_examples)
+
+        nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
+        return nemo_rl_results
 
     async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
         from penguin.server_utils import ServerClient, BaseServerConfig
@@ -133,62 +140,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "full_result": penguin_result,
         }
 
-    async def run_rollouts(self, examples: list[dict]) -> list[dict]:
-        penguin_results = await self._call_penguin_for_rollouts(examples)
-
-        nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
-        return nemo_rl_results
-
-
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class Penguin(EnvironmentInterface):
-    """
-    This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray.
-    So there is still one source of truth for resource management in NeMo RL.
-    """
-    def __init__(self, cfg: PenguinConfig):
-        self.cfg = cfg
-
-        self.workers = []
-        for base_url in self.cfg["base_urls"]:
-            worker = PenguinWorker.options(  # type: ignore # (decorated with @ray.remote)
-                runtime_env={"py_executable": PY_EXECUTABLES.PENGUIN}
-            ).remote(self.cfg, base_url)
-            self.workers.append(worker)
-
-            # We block and wait for each worker to initialize before continuing
-            ray.get(worker.health_check.remote())
-
-    def health_check(self) -> bool:
-        return True
-
-    async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        # For now, we enforce that the total number of examples in the batch is divisible by the number of workers.
-        # This just makes the batching logic below easier.
-        assert len(penguin_examples) % len(self.workers) == 0
-
-        batch_size = len(penguin_examples) // len(self.workers)
-
-        futures = []
-        for start_idx, worker in zip(range(0, len(penguin_examples), batch_size), self.workers):
-            this_batch_penguin_examples = penguin_examples[start_idx: start_idx + batch_size]
-            future = worker.run_rollouts.remote(this_batch_penguin_examples)
-            futures.append(future)
-
-        batched_results = await tqdm.gather(*futures, desc="Running DP rollouts")
-        results = []
-        for result in batched_results:
-            results.extend(result)
-
-        return results
-
     def shutdown(self) -> None:
-        for start_task in self.start_tasks:
-            ray.cancel(start_task)
-
-        # shutdown all workers
-        for worker in self.workers:
-            ray.kill(worker)
+        self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since Penguin will handle the rollouts entirely.
