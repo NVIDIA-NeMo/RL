@@ -117,6 +117,33 @@ Example with `max_trajectory_age_steps: 1`:
 5. **Repeat**: Process continues with updated weights
 
 
+### Architecture Diagram
+
+The following sequence diagram illustrates the interactions between the three main components:
+
+```mermaid
+sequenceDiagram
+    participant Training as Training Loop
+    participant Collector as Trajectory Collector
+    participant Buffer as Replay Buffer
+    
+    Note over Training, Buffer: Startup
+    Training->>Collector: Start generation
+    Training->>Buffer: Initialize
+    
+    Note over Training, Buffer: Main Loop
+    loop Async Training
+        par Background Generation
+            Collector->>Buffer: Store trajectories
+        and Training Steps
+            Training->>Buffer: Sample trajectories
+            Buffer-->>Training: Return valid data
+            Training->>Training: Update policy weights
+            Training->>Collector: Sync new weights
+        end
+    end
+```
+
 ## Usage Tips
 
 1. **Buffer Sizing**: The replay buffer size is automatically calculated as:
