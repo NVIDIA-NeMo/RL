@@ -14,6 +14,7 @@ env:
     resources:
       gpus_per_node: 1
       num_nodes: 1
+    # TODO: Mcore path support https://github.com/NVIDIA-NeMo/RL/issues/1154
     dtensor_cfg:
       _v2: true
       enabled: true
@@ -21,6 +22,17 @@ env:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      cpu_offload: false
+      activation_checkpointing: false
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+    dynamic_batching:
+      enabled: false
+    sequence_packing:
+      enabled: false
+    max_grad_norm: null
+    
 
 cluster:
   gpus_per_node: 2
