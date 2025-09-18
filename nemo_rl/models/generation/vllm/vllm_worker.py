@@ -132,6 +132,14 @@ class BaseVllmGenerationWorker:
         self.cfg = config
 
         self.model_name = self.cfg["model_name"]
+
+        ## use the bf16 version of the model rather than the quantized version
+        ## megatron --> hf export is done in bf16 so this ensures the vllm
+        ## model is compatible with megatron
+        if "openai/gpt-oss" in self.model_name:
+            size = self.model_name.split("-")[-1]
+            self.model_name = f"unsloth/gpt-oss-{size}-BF16"
+
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.enable_expert_parallel = self.cfg["vllm_cfg"]["enable_expert_parallel"]
@@ -702,6 +710,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
                 )
 
+            #print(f'{ipc_handles=}')
             if self.tensor_parallel_size == 1:
                 # UniProcExecutor
                 assert len(self.vllm_device_ids) == 1
