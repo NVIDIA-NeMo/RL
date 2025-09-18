@@ -137,7 +137,7 @@ data:
   add_eos: true
   add_generation_prompt: false
   shuffle: true
-  num_workers: 2
+  num_workers: 1
 
   ## unused with squad dataset
   prompt_file: null
