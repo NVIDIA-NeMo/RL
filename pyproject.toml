@@ -88,6 +88,10 @@ mcore = [
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.7.4.post1",
+    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+    "mamba-ssm",
+    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
+    "causal-conv1d",
 ]
 
 [dependency-groups]
@@ -148,7 +152,7 @@ triton = [
   { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "08e5fee24bdc3bebce262e8e44bfed3ff640443c" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "08e5fee24bdc3bebce262e8e44bfed3ff640443c" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" }
 vllm = {path = "3rdparty/vllm", editable = true}  # <-- ADD AN ENTRY
 

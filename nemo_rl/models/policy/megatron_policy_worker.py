@@ -74,6 +74,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.mamba import MambaModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -252,7 +253,7 @@ def setup_megatron_model(
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
                 for layer in model_module.decoder.layers:
-                    if hasattr(layer.mlp, "router"):
+                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
         # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
@@ -265,7 +266,7 @@ def setup_megatron_model(
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
                 for layer in model_module.decoder.layers:
-                    if hasattr(layer.mlp, "router"):
+                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router._maintain_float32_expert_bias()
 
         pre_wrap_hook.extend([freeze_moe_router, re_enable_float32_expert_bias])
@@ -683,6 +684,11 @@ class MegatronPolicyWorker:
                 self.megatron_cfg.param_sync_func = self.megatron_cfg.param_sync_func[0]
 
         self.model = self.model[0]  # Get the first model from the list
+
+        if isinstance(self.model, MambaModel):
+            assert not self.cfg["sequence_packing"]["enabled"], (
+                "Sequence packing is not supported for Mamba models. Please disable sequence packing."
+            )
 
         if init_reference_model:
             self.model = self.move_model(self.model, "cpu")
@@ -1178,11 +1184,15 @@ class MegatronPolicyWorker:
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
 
+            additional_kwargs = {}
+            if packed_seq_params is not None:
+                additional_kwargs["packed_seq_params"] = packed_seq_params
+
             output_tensor = model(
                 input_ids_cp_sharded,
                 position_ids,
                 attention_mask,
-                packed_seq_params=packed_seq_params,
+                **additional_kwargs,
             )
 
             # Apply temperature scaling to logits for training
