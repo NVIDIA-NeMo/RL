@@ -399,10 +399,6 @@ class DTensorPolicyWorkerV2:
         )
 
         print(f"[Rank {self.rank}] Loading state dict done.")
-        for k, v in self.model.named_parameters():
-            print(
-                f"Model param {k}: {v.shape}, {v.dtype}, {v.placements if isinstance(v, DTensor) else None}"
-            )
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
