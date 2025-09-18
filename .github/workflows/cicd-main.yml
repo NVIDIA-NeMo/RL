@@ -153,6 +153,7 @@ jobs:
     needs: [pre-flight]
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
     with:
+      runner: self-hosted-nemo-rl
       build-ref: ${{ github.sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
@@ -170,7 +171,7 @@ jobs:
       matrix:
         include:
           - script: Docs_Tests
-            runner: self-hosted-azure
+            runner: self-hosted-nemo-rl
     needs: [pre-flight, build-container]
     if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
@@ -192,11 +193,11 @@ jobs:
       matrix:
         include:
           - script: L0_Unit_Tests_Generation
-            runner: self-hosted-azure
+            runner: self-hosted-nemo-rl
           - script: L0_Unit_Tests_Policy
-            runner: self-hosted-azure
+            runner: self-hosted-nemo-rl
           - script: L0_Unit_Tests_Other
-            runner: self-hosted-azure
+            runner: self-hosted-nemo-rl
     needs: [pre-flight, build-container, cicd-doc-tests]
     if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
     runs-on: ${{ matrix.runner }}
