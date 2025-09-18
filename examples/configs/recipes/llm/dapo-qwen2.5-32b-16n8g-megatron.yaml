@@ -1,0 +1,197 @@
+# DAPO Algorithm Configuration
+grpo:
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 16
+  dapo_batch_multiplier: 3 # Multiplier for dataloader batch size calculation (dapo_batch_multiplier × num_prompts_per_step). Following DAPO dynamic sampling, the actual training batch size equals num_prompts_per_step × num_generations_per_prompt.
+  max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_steps: 500 #10000
+  normalize_rewards: true
+  use_leave_one_out_baseline: false # <-- verl doesn't have a concept of LOOB
+  val_period: 40
+  val_at_start: false
+  max_val_samples: 960 # BytedTsinghua-SIA/AIME-2024 has 960 samples
+  val_batch_size: 960
+  seed: 42
+  use_dynamic_sampling: true
+  max_num_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    correct: 1.0
+    incorrect: -1.0
+  ## TODO: make sure penalty is only applied on the generation
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 4096
+    overlong_buffer_penalty: 1.0
+    max_response_length: 20480 # 16384 + overlong_buffer_length. This is the maximum number of tokens that the model can generate.
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10 #null
+  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/dapo-qwen2.5-32b-rs"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 5
+  save_period: 5
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "Qwen/Qwen2.5-32B"
+  tokenizer:
+    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 32 # Only used when generating using HF backend
+  logprob_batch_size: 1 #4
+  max_total_sequence_length: 22528 # 16384 + overlong_buffer_length + max_input_seq_length
+  precision: "bfloat16"
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+
+  dynamic_batching:
+    enabled: False
+
+  sequence_packing:
+    enabled: true #False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer: null
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 20480 # 16384 + overlong_buffer_length. This is the number of tokens that vLLM generates
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_model_len: ${policy.max_total_sequence_length} # This is same as max_total_sequence_length
+      enforce_eager: True
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
+
+data:
+  max_input_seq_length: 2048 # DAPO paper has max input_prompt length of 2048
+  prompt_file: null
+  system_prompt_file: null
+  dataset_name: "DAPOMath17K"
+  shuffle: true
+
+env:
+  math:
+    num_workers: 16
+    use_dapo_math_verifier: true
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "dapo-dev"
+    name: "dapo-dev-logger"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "dapo-dev"
+    run_name: "dapo-dev-logger"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
