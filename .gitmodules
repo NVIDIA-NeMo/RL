@@ -16,5 +16,5 @@
 [submodule "3rdparty/Penguin-workspace/Penguin"]
 	path = 3rdparty/Penguin-workspace/Penguin
 	url = https://github.com/NVIDIA-NeMo/Gym
-	branch = bxyu/propogate-token-ids
+	branch = main
 	shallow = true
