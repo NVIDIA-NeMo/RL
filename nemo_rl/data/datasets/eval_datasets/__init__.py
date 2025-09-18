@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.data.eval_datasets.aime2024 import AIME2024Dataset
-from nemo_rl.data.eval_datasets.aime2025 import AIME2025Dataset
-from nemo_rl.data.eval_datasets.gpqa import GPQADataset
-from nemo_rl.data.eval_datasets.local_math_dataset import LocalMathDataset
-from nemo_rl.data.eval_datasets.math import MathDataset
-from nemo_rl.data.eval_datasets.mmlu import MMLUDataset
-from nemo_rl.data.eval_datasets.mmlu_pro import MMLUProDataset
+from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
+from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
+from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
+from nemo_rl.data.datasets.eval_datasets.math import MathDataset
+from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
+from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
 
 
 def load_eval_dataset(data_config):
     """Loads evaluation dataset."""
     dataset_name = data_config["dataset_name"]
+
+    # mmlu
     if dataset_name.startswith("mmlu") and dataset_name != "mmlu_pro":
         if dataset_name == "mmlu":
             base_dataset = MMLUDataset(
@@ -37,16 +38,25 @@ def load_eval_dataset(data_config):
                 prompt_file=data_config["prompt_file"],
                 system_prompt_file=data_config["system_prompt_file"],
             )
+    elif dataset_name == "mmlu_pro":
+        base_dataset = MMLUProDataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    # aime
     elif dataset_name == "aime2024":
-        base_dataset = AIME2024Dataset(
+        base_dataset = AIMEDataset(
+            variant="2024",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
     elif dataset_name == "aime2025":
-        base_dataset = AIME2025Dataset(
+        base_dataset = AIMEDataset(
+            variant="2025",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    # gpqa
     elif dataset_name == "gpqa":
         base_dataset = GPQADataset(
             variant="main",
@@ -59,11 +69,7 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    elif dataset_name == "mmlu_pro":
-        base_dataset = MMLUProDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
+    # math
     elif dataset_name == "math":
         base_dataset = MathDataset(
             variant="math_test",
@@ -76,10 +82,11 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    elif dataset_name == "local":
+    # fall back to local dataset
+    else:
+        print(f"Loading dataset from {dataset_name}...")
         base_dataset = LocalMathDataset(
-            name=dataset_name,
-            data_paths=data_config["data_paths"],
+            data_path=dataset_name,
             problem_key=data_config["problem_key"],
             solution_key=data_config["solution_key"],
             file_format=data_config["file_format"],
@@ -87,14 +94,12 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
-    else:
-        raise ValueError(f"Unknown dataset {dataset_name}.")
+
     return base_dataset
 
 
 __all__ = [
-    "AIME2024Dataset",
-    "AIME2025Dataset",
+    "AIMEDataset",
     "GPQADataset",
     "LocalMathDataset",
     "MathDataset",

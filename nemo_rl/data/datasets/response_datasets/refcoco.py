@@ -23,7 +23,7 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm  # Using tqdm for progress bar, install with: pip install tqdm
 
-from nemo_rl.data.hf_datasets.clevr import pil_to_base64
+from nemo_rl.data.datasets.utils import pil_to_base64
 from nemo_rl.data.interfaces import TaskDataSpec
 
 

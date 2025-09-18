@@ -26,15 +26,16 @@ sys.path.append("/".join(abspath.split("/")[:-4]))
 from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.eval_datasets import (
-    AIME2024Dataset,
-    AIME2025Dataset,
+from nemo_rl.data.datasets.eval_datasets import (
+    AIMEDataset,
     GPQADataset,
     MathDataset,
     MMLUDataset,
 )
-from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
-from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.datasets.response_datasets import (
+    DeepScalerDataset,
+    OpenMathInstruct2Dataset,
+)
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import math_data_processor
 from nemo_rl.models.policy import TokenizerConfig
@@ -154,11 +155,10 @@ def system_prompt_file(request):
 @pytest.mark.parametrize(
     "dataset_cls",
     [
-        MMLUDataset,
+        AIMEDataset,
         GPQADataset,
         MathDataset,
-        AIME2024Dataset,
-        AIME2025Dataset,
+        MMLUDataset,
     ],
 )
 @pytest.mark.parametrize(

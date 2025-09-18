@@ -627,7 +627,7 @@ class DTensorPolicyWorkerV2:
 
                             attention_mask = torch.ones(
                                 (batch_size, seq_len),
-                                dtype=torch.long,
+                                dtype=torch.bool,
                                 device=input_ids.device,
                             )
                             position_ids = torch.arange(
@@ -935,13 +935,13 @@ class DTensorPolicyWorkerV2:
                         input_lengths=input_lengths,
                     )
                 else:
-                    # Create attention mask for right-padded data
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    # Create post_attention_mask for right-padded data for masking token after forwarding.
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
-                        attention_mask[i, :length] = 1
+                        post_attention_mask[i, :length] = 1
 
                     # explicitly create position ids for the input, otherwise the sharding
                     # for DTensor will be incorrect
@@ -950,13 +950,14 @@ class DTensorPolicyWorkerV2:
                     ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
                     # DTensor requires the casual attention kernel to hit,
                     # yet our attention mask above is not always all 1s
                     # this is fine because we mask with the actual attention mask
                     # later, but for input it has to be all 1s
-                    attention_mask_input_all_ones = torch.ones(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
                     )
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
@@ -985,7 +986,7 @@ class DTensorPolicyWorkerV2:
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
-                            attention_mask=attention_mask_input_all_ones,
+                            attention_mask=attention_mask,
                             position_ids=position_ids,
                             use_cache=False,
                             flash_attn_kwargs=flash_attn_kwargs,
@@ -1106,7 +1107,7 @@ class DTensorPolicyWorkerV2:
 
                 if not self.enable_seq_packing:
                     # Apply mask to zero out padding tokens logprobs
-                    token_logprobs = token_logprobs * attention_mask
+                    token_logprobs = token_logprobs * post_attention_mask
                 else:
                     # For packed sequences, unpack logprobs
                     unpacked_logprobs = torch.zeros(

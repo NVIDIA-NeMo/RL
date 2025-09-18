@@ -15,10 +15,8 @@
 
 import pytest
 
-from nemo_rl.data.hf_datasets.tulu3 import (
-    Tulu3PreferenceDataset,
-    to_preference_data_format,
-)
+from nemo_rl.data.datasets.preference_datasets import Tulu3PreferenceDataset
+from nemo_rl.data.datasets.preference_datasets.tulu3 import to_preference_data_format
 
 
 @pytest.fixture(scope="module")

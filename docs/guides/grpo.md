@@ -36,6 +36,22 @@ To support this, we need to know:
 * Which data should go to which environments
 * How to prepare the data from your dataset into a form we can use
 
+#### Dataset
+
+By default, NeMo RL has support for [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py) and [DeepScaler](../../nemo_rl/data/datasets/response_datasets/deepscaler.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with jsonl-formatted response datasets for loading datasets from local path or HuggingFace. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
+```yaml
+data:
+  dataset_name: ResponseDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  val_data_path: <PathToValidationDataset>
+  input_key: <QuestionKey>, default is "input"
+  output_key: <AnswerKey>, default is "output"
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+```
+
 #### Common Data Format
 
 We define a [DatumSpec](../../nemo_rl/data/interfaces.py) that holds all relevant information for each training example:
