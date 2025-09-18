@@ -4,8 +4,8 @@ grpo:
   num_prompts_per_step: 16
   num_generations_per_prompt: 8
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-  max_num_steps: 100
-  num_epochs: 50
+  max_num_steps: 10000
+  max_num_epochs: 50
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5
@@ -15,14 +15,14 @@ grpo:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "/raid/slikhite/results-2/grpo"
+  checkpoint_dir: "/raid/slikhite/results-4/grpo"
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
   save_period: 5
 
 policy:
-  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  model_name: "/raid/slikhite/results/grpo/hf"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 32
@@ -55,7 +55,7 @@ data:
   train:
     shuffle: False
     seed: 420 # unused if shuffle is False
-    jsonl_path: '/workspace/bfcl_data_preprocessing/BFCL_v3_multi_turn_formatted.jsonl'
+    jsonl_path: '/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_formatted.jsonl'
 
     # checks if it's too long on init
     filter_long_samples: true
@@ -64,7 +64,7 @@ data:
   val:
     shuffle: False
     seed: 420 # unused if shuffle is False
-    jsonl_path: '/workspace/bfcl_data_preprocessing/BFCL_v3_multi_turn_formatted.jsonl'
+    jsonl_path: '/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_formatted.jsonl'
     drop_last: False
     # checks if it's too long on init
     filter_long_samples: true

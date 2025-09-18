@@ -37,6 +37,12 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 
+# Global thresholds for top_k and top_p validation.
+# While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
+# See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
+TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
+TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
+
 
 class VllmGeneration(GenerationInterface):
     def __init__(
@@ -53,6 +59,33 @@ class VllmGeneration(GenerationInterface):
             assert self.cfg["vllm_cfg"]["async_engine"], (
                 "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
                 "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
+            )
+
+        # Validate sampling parameters early to avoid resource allocation with unsupported configs.
+        # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
+        # However, we allow values above certain thresholds for token filtering purposes.
+        top_k: int | None = self.cfg.get("top_k")
+        if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
+            raise ValueError(
+                (
+                    f"top_k sampling with values < {TOP_K_THRESHOLD} is not supported because the vLLM V1 engine "
+                    "does not return logprobs after top_k filtering. Values >= {TOP_K_THRESHOLD} are allowed "
+                    "for token filtering purposes. If you understand the implications and still want to use "
+                    f"a lower top_k value, please manually comment out this check. Got top_k={top_k}. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
+                )
+            )
+
+        top_p: float = self.cfg.get("top_p", 1.0)
+        if top_p < TOP_P_THRESHOLD:
+            raise ValueError(
+                (
+                    f"top_p sampling with values < {TOP_P_THRESHOLD} is not supported because the vLLM V1 engine "
+                    "does not return logprobs after top_p filtering. Values >= {TOP_P_THRESHOLD} are allowed "
+                    "for token filtering purposes. If you understand the implications and still want to use "
+                    f"a lower top_p value, please manually comment out this check. Got top_p={top_p}. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/69 for more details."
+                )
             )
 
         # Ensure all required VllmConfig fields are present
@@ -137,6 +170,9 @@ class VllmGeneration(GenerationInterface):
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
         self._post_init()
+
+        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
@@ -273,6 +309,20 @@ class VllmGeneration(GenerationInterface):
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results
+
+    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return [None]  # Not applicable since this is sync
+
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         # Wait for all futures to complete
         results = ray.get(futures)

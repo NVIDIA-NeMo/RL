@@ -103,17 +103,6 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
-  submodule-check:
-    name: Check submodule fast-forward
-    needs: [pre-flight]
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/_submodule_check.yml
-    with:
-      base_ref: ${{ github.base_ref }}
-      head_ref: ${{ github.head_ref }}
-      pr_number: ${{ github.event.number }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
-
   lint-check:
     name: Lint check
     needs: [pre-flight]
@@ -157,7 +146,7 @@ jobs:
   sphinx-build:
     needs: [pre-flight]
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.48.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
@@ -256,6 +245,7 @@ jobs:
       - pre-flight
       - lint-check
       - sphinx-build
+      - build-container
       - cicd-doc-tests
       - cicd-unit-tests
       - cicd-functional-tests
@@ -272,6 +262,7 @@ jobs:
                 (
                   needs.pre-flight.outputs.test_level != 'none' &&
                   needs.sphinx-build.result == 'success' &&
+                  needs.build-container.result == 'success' &&
                   (
                     (
                       (needs.cicd-doc-tests.result == 'skipped' || needs.cicd-doc-tests.result == 'success') &&

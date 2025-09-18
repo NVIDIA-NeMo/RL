@@ -45,6 +45,8 @@ policy:
   precision: "bfloat16"
 
   dtensor_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf
     enabled: true
     cpu_offload: False
     sequence_parallel: false
@@ -52,6 +54,7 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    clear_cache_every_n_steps: null
 
   dynamic_batching:
     enabled: false
@@ -106,6 +109,7 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     
@@ -136,9 +140,8 @@ policy:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
-      lr_decay_style: "linear"
-      lr_decay_iters: 1000000000
-      lr_warmup_iters: 2
+      lr_decay_style: "constant"
+      lr_warmup_iters: 1
       lr_warmup_init: 0.00000001
 
     distributed_data_parallel_config:
@@ -149,16 +152,30 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
     
 data:
-  dataset_name: "HelpSteer3"
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
+
+  dataset_name: HelpSteer3
+  # You can use custom preference datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: PreferenceDataset
+  #     train_data_path: <LocalPathToTrainingDataset>
+  #     val_data_paths:
+  #       <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
+  #       ...
+  # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
+  #   checkpointing:
+  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #   ...
+
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
+
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
-  num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
+  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb:
     project: "dpo-dev"
     name: "dpo"

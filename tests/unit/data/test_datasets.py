@@ -16,13 +16,13 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.datasets import dpo_collate_fn
+from nemo_rl.data.datasets import preference_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def test_dpo_collate_fn():
-    """Test that dpo_collate_fn correctly processes DPO training data."""
+def test_preference_collate_fn():
+    """Test that preference_collate_fn correctly processes preference data."""
     # Create mock tokenizer
     mock_tokenizer = MagicMock()
     mock_tokenizer.pad_token_id = 0
@@ -93,9 +93,12 @@ def test_dpo_collate_fn():
         ),
     ]
 
-    # Call dpo_collate_fn
-    train_data = dpo_collate_fn(
-        data_batch, mock_tokenizer, make_sequence_length_divisible_by=16
+    # Call preference_collate_fn
+    train_data = preference_collate_fn(
+        data_batch,
+        mock_tokenizer,
+        make_sequence_length_divisible_by=16,
+        add_loss_mask=True,
     )
 
     # Verify the output structure

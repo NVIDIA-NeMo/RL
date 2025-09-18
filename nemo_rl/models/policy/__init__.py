@@ -19,18 +19,22 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class DTensorConfig(TypedDict):
     enabled: bool
+    env_vars: NotRequired[dict[str, str]]
+    _v2: NotRequired[bool]
     cpu_offload: NotRequired[bool]
     sequence_parallel: NotRequired[bool]
     activation_checkpointing: NotRequired[bool]
     tensor_parallel_size: NotRequired[int]
     context_parallel_size: NotRequired[int]
     custom_parallel_plan: NotRequired[str]
+    clear_cache_every_n_steps: NotRequired[int]
 
 
 class SequencePackingConfig(TypedDict):
     enabled: bool
     train_mb_tokens: int
-    logprob_mb_tokens: int
+    # Not required because some algorithms like SFT don't calculate log probs
+    logprob_mb_tokens: NotRequired[int]
     algorithm: str
 
 
@@ -80,6 +84,7 @@ class MegatronDDPConfig(TypedDict):
 
 class MegatronConfig(TypedDict):
     enabled: bool
+    env_vars: NotRequired[dict[str, str]]
     empty_unused_memory_level: int
     activation_checkpointing: bool
     converter_type: str

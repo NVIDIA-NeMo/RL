@@ -13,13 +13,11 @@
 # limitations under the License.
 import os
 import tempfile
+import time
 from typing import Optional
 
 import pytest
 import torch
-
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
@@ -98,8 +96,10 @@ def create_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "apply_rope_fusion": True,
             "defer_fp32_logits": defer_fp32_logits,
+            "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -397,9 +397,9 @@ def test_megatron_policy_training(training_setup):
         # we don't always require theoretical_tflops since the data about the GPU
         # is not always available.
         if "theoretical_tflops" in results:
-            assert "theoretical_tflops" in results and isinstance(
-                results["theoretical_tflops"], (int, float)
-            ), "training backend should report theoretical_tflops"
+            assert isinstance(results["theoretical_tflops"], (int, float)), (
+                "training backend should report theoretical_tflops"
+            )
             assert results["theoretical_tflops"] > 0, (
                 "theoretical_tflops should be positive"
             )
@@ -504,7 +504,7 @@ def generation_setup(request, tiny_llama_model_path):
             cluster.shutdown()
 
 
-@pytest.mark.skip(reason="Skipping megatorn generation tests for now")
+@pytest.mark.skip(reason="Skipping megatron generation tests for now")
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
     "generation_setup",
@@ -1811,3 +1811,113 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     print(
         "✓ SUCCESS: CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing"
     )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_policy_flops_range_check(tiny_llama_model_path):
+    """Test that the returned FLOPS is within a reasonable range using default config.
+
+    Performs 2 warmup iterations and measures FLOPS on the third iteration.
+    """
+    num_gpus = 1
+    batch_size = 8
+    seq_len = 128
+    vocab_size = 32000
+
+    # Create cluster and policy with default config
+    cluster = RayVirtualCluster(
+        name="test-flops-tracker",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # Use the default config function
+    config = create_megatron_test_config(tiny_llama_model_path)
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    policy = Policy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Create test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+
+    # Create loss function
+    loss_fn = SimpleLoss()
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Perform 2 warmup iterations
+        print("Performing warmup iterations...")
+        for warmup_step in range(2):
+            results = policy.train(data, loss_fn)
+
+        # Measure FLOPS on the third iteration
+        print("Measuring FLOPS on third iteration...")
+        time_begin = time.time()
+        results = policy.train(data, loss_fn)
+        runtime_sec = time.time() - time_begin
+
+        # Check if FLOPS tracking is available
+        if policy.flops_tracker is not None:
+            assert "total_flops" in results, (
+                "Training results should contain 'total_flops'"
+            )
+            total_flops = results["total_flops"]
+
+            assert isinstance(total_flops, (int, float)), (
+                "total_flops should be numeric"
+            )
+            assert total_flops > 0, "total_flops should be positive"
+
+            total_tflops = total_flops / 1e12
+            print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
+
+            flop_count_total = total_flops * runtime_sec
+            assert 1e9 < flop_count_total < 5e10, (
+                "Total FLOPS should be within 1e9 and 5e10"
+            )
+
+            if "theoretical_tflops" in results:
+                theoretical_tflops = results["theoretical_tflops"]
+                assert isinstance(theoretical_tflops, (int, float)), (
+                    "theoretical_tflops should be numeric"
+                )
+                assert theoretical_tflops > 0, "theoretical_tflops should be positive"
+
+                utilization = total_tflops / theoretical_tflops
+                print(f"Theoretical TFLOPS: {theoretical_tflops:.2f}")
+                print(f"Model utilization: {utilization * 100:.2f}%")
+
+                assert utilization <= 1.0, (
+                    f"Model utilization {utilization * 100:.2f}% should not exceed 100%"
+                )
+        else:
+            print("FLOPS tracker not available, skipping FLOPS range check")
+            pytest.skip("FLOPS tracker not supported for this model configuration")
+
+    finally:
+        policy.shutdown()
+        cluster.shutdown()

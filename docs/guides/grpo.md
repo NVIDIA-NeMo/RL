@@ -187,6 +187,44 @@ By multiplying the first term of the loss function by the importance weights $\f
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
+#### Overlong Filtering (overlong_filtering)
+
+When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
+
+The implementation modifies the loss calculation as follows:
+
+For each sample $i$ in the batch:
+
+$$
+\text{truncated}_i = \begin{cases} 
+1 & \text{if sample } i \text{ reached max length without EOS} \\ 
+0 & \text{otherwise} 
+\end{cases}
+$$
+
+The sample mask becomes (let m_i denote the sample mask and ℓ_i denote the loss multiplier):
+
+$$
+m_i = \ell_i \cdot (1 - \text{truncated}_i)
+$$
+
+This results in the effective loss:
+
+$$
+L_{\text{effective}} = \sum_{i} m_i \cdot L_i
+$$
+
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
+
+Configuration:
+```yaml
+grpo:
+  overlong_filtering: false  # default
+```
+
+Set to `true` when training on tasks where truncation at max sequence length is expected (e.g., long-form reasoning, mathematical proofs).
+
+
 ## Metrics ({wandb, tb}_name)
 We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
@@ -214,6 +252,7 @@ We roughly approximate the entropy of the LLM's distribution throughout training
 $$
 E_{s \sim \pi_{\text{inference}}(x)}[-\frac{\pi_{\text{training}}(x)}{\pi_{\text{inference}}(x)}log(\pi_{\text{training}}(x))]
 $$
+
 using the rollouts in each training global batch as Monte-Carlo samples. The ratio of $\pi$ is in the formula to importance-correct for the mismatch between the policy over the course of training in a singular GRPO step and the inference framework.
 
 We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough monte-carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo-Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo-RL).

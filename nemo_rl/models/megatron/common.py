@@ -16,6 +16,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.state import GlobalState
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -26,7 +27,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from nemo.tron.state import GlobalState
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -260,6 +260,7 @@ def forward_step_arbitrary_loss(
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_full_seq_to: Optional[int] = None,
     cp_normalize: bool = True,
+    policy_cfg: Optional[dict] = None,
 ):
     """Forward training step with support for packed sequences and context parallelism.
 
@@ -273,6 +274,7 @@ def forward_step_arbitrary_loss(
         pack_sequences (bool): Whether to pack sequences for efficiency
         seq_length_key (Optional[str]): Key in data_dict containing actual sequence lengths
         cp_normalize (bool): Whether to normalize the loss by the cp_size
+        policy_cfg (Optional[dict]): Policy configuration containing generation parameters
 
     Notes on packed sequences with context parallelism (CP):
         - When CP > 1, each sequence is padded to a multiple of (cp_size * 2)
@@ -331,7 +333,13 @@ def forward_step_arbitrary_loss(
         else:
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                input_ids, 0, False, False, False
+                data=input_ids,
+                eod_token=0,  # used for loss_mask, which we don't use
+                pad_token=0,  # used for loss_mask, which we don't use
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
             )
 
     with straggler_timer:
@@ -341,6 +349,15 @@ def forward_step_arbitrary_loss(
             attention_mask,
             packed_seq_params=packed_seq_params,
         )
+
+        # Apply temperature scaling to logits for training
+        # This matches the dtensor worker's _apply_temperature_scaling in the train method
+        if (
+            policy_cfg is not None
+            and "generation" in policy_cfg
+            and policy_cfg["generation"] is not None
+        ):
+            output_tensor.div_(policy_cfg["generation"]["temperature"])
 
         # Unpack the output tensor if we did packed sequences
         if pack_sequences and packed_seq_params is not None:
