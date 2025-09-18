@@ -2883,7 +2883,9 @@ automodel = [
     { name = "vllm" },
 ]
 mcore = [
+    { name = "causal-conv1d" },
     { name = "flash-attn" },
+    { name = "mamba-ssm" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "transformer-engine", extra = ["pytorch"] },
@@ -2937,6 +2939,7 @@ requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "blobfile" },
     { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=08e5fee24bdc3bebce262e8e44bfed3ff640443c" },
+    { name = "causal-conv1d", marker = "extra == 'mcore'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=08e5fee24bdc3bebce262e8e44bfed3ff640443c" },
     { name = "causal-conv1d", marker = "extra == 'vllm'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=08e5fee24bdc3bebce262e8e44bfed3ff640443c" },
     { name = "colored", specifier = "==2.2.3" },
     { name = "cuda-python", marker = "extra == 'vllm'" },
@@ -2947,6 +2950,7 @@ requires-dist = [
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
+    { name = "mamba-ssm", marker = "extra == 'mcore'", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
     { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=6b32be06d026e170b3fdaf3ae6282c5a6ff57b06" },
     { name = "math-verify" },
     { name = "matplotlib" },
@@ -6256,6 +6260,7 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7d/0a/278d7bbf454f7de5322a5007427eed3e8b34ed6c2802491b56bbdfd7bbb4/vllm-0.10.2.tar.gz", hash = "sha256:57608f44cf61f5d80fb182c98e06e524cb2925bb528258a7b247c8e43a52d13e", size = 10908356, upload-time = "2025-09-13T23:00:34.918Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/1a/365479f413e7408b314c0237d6c929569874d5c002bc7c8b5a7fbf40c7d9/vllm-0.10.2-cp38-abi3-manylinux1_x86_64.whl", hash = "sha256:e0cba6110483d9bf25c4402d8655cf78d366dd13e4155210980cc3480ed98b7b", size = 436413211, upload-time = "2025-09-13T23:00:25.278Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/29/b02687cb515be113a9fe188271b119a37178e9feefeb9c9b23dac87144e4/vllm-0.10.2-cp38-abi3-manylinux2014_aarch64.whl", hash = "sha256:b011a55544c0e7a8b6d247da1585b1d073bbb8dc4981d576559784ea2d3fafa1", size = 399379773, upload-time = "2025-09-16T00:29:34.059Z" },
 ]
 
 [[package]]
