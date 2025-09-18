@@ -27,7 +27,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
@@ -42,21 +41,22 @@ class ReplayBuffer:
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int, sampler_type: str = "fifo"):
+    def __init__(self, max_size: int, master_config: MasterConfig):
         self.max_size = max_size
         self.trajectories = []
-        self.trajectory_versions = []  # weight-version used for generation
-        self.target_weight_versions = []  # weight-version this trajectory is targeted for
+        # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
+        self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
+        self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
+
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
 
-        self.sampler_type = sampler_type
+        self.master_config = master_config # We are passing it twice once in ReplayBuffer and once in AsyncTrajectoryCollector
         self.sampler_fns = {
             "fifo": self.fifo_sample,
             "mixed": self.mixed_sample,
-            "reward_sample_min_max": self.reward_sample_min_max,
+            "reward_min_max": self.reward_sample_min_max,
         }
-        
 
     def push_with_wait_signal(
         self,
@@ -86,6 +86,7 @@ class ReplayBuffer:
                 f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
             )
             return "success"
+
 
 
     def fifo_sample(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, **kwargs) -> Optional[dict[str, Any]]:
@@ -168,17 +169,20 @@ class ReplayBuffer:
         return {"selected": selected, "removed": None}
 
 
-    def reward_sample_min_max(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int, **kwargs) -> Optional[dict[str, Any]]:
+    def reward_sample_min_max(self, valid_indices: list[int], num_prompt_groups: int, current_weight_version: int,  min_valid_version: int) -> Optional[dict[str, Any]]:
 
         #! In FIFO manner find the indices that are eligible based on the min_reward and max_reward
-        
-        min_reward_sample = kwargs.get("min_reward_sample", 0.0)
-        max_reward_sample = kwargs.get("max_reward_sample", 1.0)
+
+        async_cfg = self.master_config.get("grpo", {}).get(
+                            "async_grpo", {}
+        )
+        min_reward_sample = async_cfg.get("min_reward_sample", 0.0)
+        max_reward_sample = async_cfg.get("max_reward_sample", 1.0)
 
         #! First find all eligible indices
         intended_indices = [
             i
-            for i, v in enumerate(self.trajectory_versions) if v["avg_reward"] >= min_reward_sample and v["avg_reward"] <= max_reward_sample
+            for i, v in enumerate(self.trajectory_versions) if self.trajectories[i]["avg_reward"] >= min_reward_sample and self.trajectories[i]["avg_reward"] <= max_reward_sample
         ]
 
         print(
@@ -203,12 +207,19 @@ class ReplayBuffer:
 
         #! We need to remove all the indices that we went over but were not eligible
         max_index = max(selected)
+
+        print(f"max_index = {max_index}")
+
         remove_indices = [i for i in range(max_index) if i not in selected]
 
         #! In both fifo & mixed, we never threw out any trajectories. So we could just return the selected indices and remove them in the sample(...) function. But here we throw out both selected + any trajectories that were before it
 
+        print(
+            f"🗑️ Removing {len(remove_indices)} trajectories that were not eligible: {remove_indices}"
+        )
+
         return {"selected": selected, "removed": remove_indices}
-        
+    
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
@@ -233,14 +244,13 @@ class ReplayBuffer:
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
-        **kwargs,
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
         Only returns trajectories with target_weight_version == current_weight_version.
         If insufficient trajectories are available, returns None to stall training
         until the remaining trajectories are generated. This ensures no trajectory
-        loses its "last chance" to be used for its intended training step.
+        loses its last chance to be used for its intended training step.
 
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
@@ -251,21 +261,19 @@ class ReplayBuffer:
 
             total_trajectories = len(self.trajectories)
             print("🔍 ReplayBuffer sampling debug:")
-            print(
-                f"   current_weight_version={current_weight_version}, max_age_steps={max_age_steps}"
-            )
-            print(f"   trajectory_versions={self.trajectory_versions}")
+            print(f"   {current_weight_version=}, {max_age_steps=}")
+            print(f"   {self.trajectory_versions=}")
 
             # For debugging: check for unexpected old trajectories
             from collections import Counter
 
             version_counts = Counter(self.trajectory_versions)
-            print(f"   version_counts: {version_counts}")
+            print(f"   {version_counts=}")
 
             # Compute minimum valid version based on age window
             # max_age_steps=1 means trajectories from the last 1 step are valid
             min_valid_version = max(0, current_weight_version - max_age_steps)
-            print(f"   min_valid_version={min_valid_version}")
+            print(f"min_valid_version = {min_valid_version=}")
 
             # Check for unexpected old trajectories
             old_trajectories = [
@@ -278,13 +286,6 @@ class ReplayBuffer:
                 print(f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}")
 
             # Filter for valid trajectories without modifying the buffer
-            
-            #! valid indices might be different based on the sampler type. Because in mixed-old sometimes we can have trajectories older than min_valid_version
-
-
-            
-            
-            
             valid_indices = [
                 i
                 for i, v in enumerate(self.trajectory_versions)
@@ -304,17 +305,12 @@ class ReplayBuffer:
                 )
                 return None
 
-
-
             # Only select trajectories intended for the current training step
             # This ensures no trajectory loses its "last chance" to be used for its intended step
-
-
-            #---
-            #valid_indices: list[int], num_prompt_groups: int, current_weight_version: int, min_valid_version: 
-            #---
-            sample_result = self.sampler_fns[self.sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version, **kwargs)
-
+            async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
+            sampler_type = async_cfg.get("sampler_type", "fifo")
+            
+            sample_result = self.sampler_fns[sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version)
 
             selected = sample_result["selected"]
             removed = sample_result["removed"]
@@ -338,8 +334,8 @@ class ReplayBuffer:
 
             sampled_items = [self.trajectories[i] for i in selected]
 
-            # Remove selected items in reverse order to maintain correct indices. If remove is None or empty list then use the default selected indices.
-            if removed is not None and len(removed) > 0: 
+            # Remove selected items in reverse order to maintain correct indices
+            if removed is not None and len(removed) > 0:
                 for idx in sorted(removed, reverse=True):
                     self.trajectory_versions.pop(idx)
                     self.target_weight_versions.pop(idx)
@@ -404,8 +400,6 @@ class AsyncTrajectoryCollector:
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
 
-        # Note: Generation tracking is now done via replay buffer target weight counts
-
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version = None
 
@@ -413,21 +407,10 @@ class AsyncTrajectoryCollector:
         self._generation_limit_cleared = _threading.Event()
         self._generation_limit_cleared.set()  # Start in cleared state
 
-        # Check if we should use async rollouts
-        self._use_async_rollouts = False
-        if (
-            hasattr(policy_generation, "cfg")
-            and "vllm_cfg" in policy_generation.cfg
-            and policy_generation.cfg["vllm_cfg"].get("async_engine", False)
-        ):
-            self._use_async_rollouts = True
-            print(
-                "Trajectory collector: Detected vLLM async engine; enabling async rollouts in collector"
-            )
-
         # Track threads
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
+
         # Limit in-flight generator requests to num_prompts_per_step
         max_inflight = int(self.master_config["grpo"]["num_prompts_per_step"]) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
@@ -438,10 +421,23 @@ class AsyncTrajectoryCollector:
         self._generating_targets: set[int] = set()
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
-        """Calculate target weight versions for given generation weight version."""
-        max_trajectory_age = self.master_config["async_grpo"][
-            "max_trajectory_age_steps"
-        ]
+        """Calculate target weight versions for given generation weight version.
+
+        The list of versions returned enumerate the possible version a generation
+        server can target. These versions are looped over to see what training
+        step they can target. If all target versions are exhausted, this generation
+        server will remain idle until the next weight update.
+
+        Example:
+        generation_weight_version = 10
+        max_trajectory_age_steps = 4
+
+        Returns:
+            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+        """
+        # Read async config strictly from grpo.async_grpo
+        async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
+        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
@@ -476,14 +472,6 @@ class AsyncTrajectoryCollector:
 
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
-
-        # # Clear old target weight reservations since weight has advanced
-        # with self._generation_check_lock:
-        #     if self._generating_targets:
-        #         print(
-        #             f"🧹 Clearing {len(self._generating_targets)} old target weight reservations"
-        #         )
-        #         self._generating_targets.clear()
 
         # Resume collection if it was paused due to generation limits
         was_paused = not self._generation_limit_cleared.is_set()
@@ -551,9 +539,10 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = self.master_config["async_grpo"][
-                            "max_trajectory_age_steps"
-                        ]
+                        async_cfg = self.master_config.get("grpo", {}).get(
+                            "async_grpo", {}
+                        )
+                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
                         target_weights = [
                             self.current_weight_version + i
                             for i in range(max_trajectory_age)
@@ -621,6 +610,9 @@ class AsyncTrajectoryCollector:
                     )
                     self._refit_pause_cleared.wait()
 
+                    # After refit finishes if weight version has updated, reflect that in the new trajectories
+                    generation_weight_version = self.current_weight_version
+
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
@@ -670,6 +662,9 @@ class AsyncTrajectoryCollector:
         print("⏸️ New generation starts paused")
 
         # Wait for all pending generations to complete
+        # Note that is suboptimal for async performance and will be fixed in a follow-up PR where two more options will be added:
+        # 1. Pause the generations at their current decoding step, update the weights and continue with decoding.
+        # 2. Stop the current generations, store in a buffer and resume them in next iteration with new weights.
         self.wait_for_pending_generations()
 
         elapsed = time.time() - start_time
@@ -710,14 +705,6 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
-    def stop(self) -> None:
-        """Stop trajectory collection."""
-        self.running = False
-        # Signal all events to wake up any waiting threads so they can exit cleanly
-        self._manual_pause_cleared.set()
-        self._generation_limit_cleared.set()
-        self._refit_pause_cleared.set()
-
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
@@ -733,35 +720,16 @@ class AsyncTrajectoryCollector:
     ) -> None:
         try:
             # Run rollout for this prompt group
-            if self._use_async_rollouts:
-                # Async engine supports concurrent generation; avoid locking
-                final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config["policy"][
-                        "max_total_sequence_length"
-                    ],
-                    max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
-            else:
-                # Fallback to sync rollout; serialize access to generation
-                with self._pg_lock:
-                    final_batch, rollout_metrics = run_multi_turn_rollout(
-                        policy_generation=self.policy_generation,
-                        input_batch=repeated_batch,
-                        tokenizer=self.tokenizer,
-                        task_to_env=self.task_to_env,
-                        max_seq_len=self.master_config["policy"][
-                            "max_total_sequence_length"
-                        ],
-                        max_rollout_turns=self.master_config["grpo"][
-                            "max_rollout_turns"
-                        ],
-                        greedy=False,
-                    )
+            # Async engine supports concurrent generation; avoid locking
+            final_batch, rollout_metrics = run_async_multi_turn_rollout(
+                policy_generation=self.policy_generation,
+                input_batch=repeated_batch,
+                tokenizer=self.tokenizer,
+                task_to_env=self.task_to_env,
+                max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
+                greedy=False,
+            )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
@@ -771,9 +739,9 @@ class AsyncTrajectoryCollector:
                 group_rewards = final_batch_cpu["total_reward"]
                 avg_reward = float(group_rewards.float().mean().item())
             except Exception:
+                print(f"🔍 Error in calculating avg_reward: {e}")
                 # Be conservative if structure is unexpected
                 avg_reward = 0.0
-
 
             trajectory_group = {
                 "batch": final_batch_cpu,
@@ -843,4 +811,6 @@ class AsyncTrajectoryCollector:
             try:
                 self._inflight_sema.release()
             except Exception:
-                pass
+                import traceback
+
+                traceback.print_exc()
