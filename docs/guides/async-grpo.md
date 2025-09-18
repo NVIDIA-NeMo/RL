@@ -1,9 +1,10 @@
-# Async GRPO
+# Train with Async GRPO
 
 Async GRPO is an asynchronous training mode that allows trajectory generation and policy training to run concurrently, improving GPU utilization and throughput compared to synchronous GRPO.
 
-## Configuration
+## Configure Async GRPO
 
+This section covers how to configure async GRPO by modifying your settings and includes a complete example configuration.
 ### Enable Async GRPO
 
 To use async GRPO, make these configuration changes:
@@ -38,7 +39,7 @@ policy:
 ```yaml
 grpo:
   async_grpo:
-    max_trajectory_age_steps: 1  # Maximum age in training steps for trajectories
+    max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
 ```
 
 ### Complete Example Config
@@ -69,7 +70,7 @@ cluster:
 ```
 
 ## Implementation Structure
-
+This section covers the internal architecture of async GRPO and includes detailed explanations of how the core components interact.
 ### Core Components
 
 The async GRPO implementation consists of three main components:
@@ -153,4 +154,4 @@ sequenceDiagram
 
 2. **Age Limits**: Start with `max_trajectory_age_steps: 1` and increase if needed for higher throughput
 
-3. **Resource Allocation**: Ensure sufficient GPU memory for both training and generation clusters
+3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
