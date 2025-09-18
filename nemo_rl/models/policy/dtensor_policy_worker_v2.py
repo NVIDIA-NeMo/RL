@@ -1207,19 +1207,20 @@ class DTensorPolicyWorkerV2:
                     )
                 else:
                     # Create attention mask for right-padded data
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
-                        attention_mask[i, :length] = 1
+                        post_attention_mask[i, :length] = 1
                     position_ids = torch.arange(
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
-                    attention_mask_input_all_ones = torch.ones(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
                     )
                 context_parallel_ctx = None
                 if self.cp_size > 1:

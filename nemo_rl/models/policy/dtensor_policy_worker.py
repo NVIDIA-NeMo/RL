@@ -1201,7 +1201,7 @@ class DTensorPolicyWorker:
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
         self.model.eval()
-        print("Begin to batch datas")
+
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
@@ -1225,6 +1225,7 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(global_batch_size)
                 iterator_len = data.size // global_batch_size
+
             step = 0
             all_rm_scores = []
             for batch_idx, generate_batch in enumerate(
@@ -1251,20 +1252,22 @@ class DTensorPolicyWorker:
                     )
                 else:
                     # Create attention mask for right-padded data
-                    attention_mask = torch.zeros(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
-                        attention_mask[i, :length] = 1
+                        post_attention_mask[i, :length] = 1
                     position_ids = torch.arange(
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
 
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
-                    attention_mask_input_all_ones = torch.ones(
-                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
                     )
+
                 context_parallel_ctx = None
                 if self.cp_size > 1:
                     seq_index = torch.arange(seq_len, device=input_ids.device).repeat(

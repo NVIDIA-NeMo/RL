@@ -98,6 +98,33 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(f"📋 Received config: {config}")
 
         self.config = config
+
+        assert self.config["reward_model_cfg"]["enabled"], (
+            "Please set reward_model_cfg.enabled = True in the reward model environment config to enable reward model."
+        )
+        assert (
+            self.config["reward_model_cfg"]["reward_model_type"] == "bradley_terry"
+        ), (
+            "Reward model environment currently only support with Bradley-Terry reward model."
+        )
+        assert not self.config["dynamic_batching"]["enabled"], (
+            "Dynamic batching is currently not supported with reward model environment."
+        )
+        assert not self.config["sequence_packing"]["enabled"], (
+            "Sequence packing is currently not supported with reward model environment."
+        )
+        assert self.config["dtensor_cfg"]["enabled"], (
+            "Reward model environment currently only support with DTensor. You can show your interest in mcore path by upvoting on https://github.com/NVIDIA-NeMo/RL/issues/1154"
+        )
+        assert self.config["max_grad_norm"] == None, (
+            "Max grad norm must be None in reward model environment."
+        )
+        assert not self.config["dtensor_cfg"]["cpu_offload"], (
+            "CPU offload is currently not supported with reward model environment."
+        )
+        assert not self.config["dtensor_cfg"]["activation_checkpointing"], (
+            "Activation checkpointing is currently not supported with reward model environment."
+        )
         # Add values for reward model cfg. reward_model_cfg must be enabled in reward model environment config.
         self.config.setdefault("reward_model_cfg", {})
         self.config["reward_model_cfg"]["enabled"] = True
