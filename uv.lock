@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
@@ -1522,6 +1522,17 @@ wheels = [
 ]
 
 [[package]]
+name = "grouped-gemm"
+version = "1.1.4"
+source = { git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4#172fada89fa7364fe5d026b3a0dfab58b591ffdd" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "numpy" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+]
+
+[[package]]
 name = "grpcio"
 version = "1.74.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2349,6 +2360,21 @@ requires-dist = [
 ]
 
 [[package]]
+name = "megatron-fsdp"
+version = "0.1.0rc2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/48/6d6fef0f1c26b90e018d933f07bf1c4b55d2743f7f63c283159250949f66/megatron_fsdp-0.1.0rc2.tar.gz", hash = "sha256:d4c5482ebaa52557a23b3887dfafcc542625564fa848518476fd9209a9f18f94", size = 72027, upload-time = "2025-09-15T04:16:41.792Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/2d/f99a7f9ff5cc89ff6c6158023491931ef9f8cf0681e5d01280c5fb7c561b/megatron_fsdp-0.1.0rc2-py3-none-any.whl", hash = "sha256:5410a8447c62c5edeec6d7f799661b7b7bc4db0dabd4eeafd187c1f121a3a7c2", size = 75936, upload-time = "2025-09-15T04:16:40.472Z" },
+]
+
+[[package]]
 name = "mistral-common"
 version = "1.8.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2728,6 +2754,7 @@ dependencies = [
     { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "datasets" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "megatron-fsdp" },
     { name = "pybind11" },
     { name = "pyyaml" },
     { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
@@ -2741,6 +2768,9 @@ dependencies = [
 [package.optional-dependencies]
 fa = [
     { name = "flash-attn" },
+]
+moe = [
+    { name = "transformer-engine", extra = ["pytorch"] },
 ]
 vlm = [
     { name = "backoff" },
@@ -2789,6 +2819,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", specifier = "==0.5.8" },
+    { name = "megatron-fsdp" },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
@@ -2802,11 +2833,12 @@ requires-dist = [
     { name = "torchao" },
     { name = "torchcodec", marker = "extra == 'vlm'" },
     { name = "torchdata" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'moe'", specifier = "==2.5.0" },
     { name = "transformers", specifier = "<=4.55.4" },
     { name = "transformers", marker = "extra == 'vlm'", specifier = "<=4.55.4" },
     { name = "wandb" },
 ]
-provides-extras = ["vlm", "fa"]
+provides-extras = ["vlm", "fa", "moe"]
 
 [package.metadata.requires-dev]
 build = [
@@ -2877,9 +2909,13 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d" },
+    { name = "deep-ep" },
+    { name = "deep-gemm" },
     { name = "flash-attn" },
+    { name = "grouped-gemm" },
     { name = "mamba-ssm" },
     { name = "nemo-automodel" },
+    { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
 mcore = [
@@ -2944,11 +2980,14 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
+    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
+    { name = "deep-gemm", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
+    { name = "grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
     { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
@@ -2979,6 +3018,7 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.5.0" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.5.0" },
     { name = "transformers", specifier = ">=4.51.0,<4.54.0" },
     { name = "triton", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu128" },
