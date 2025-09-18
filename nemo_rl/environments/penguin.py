@@ -55,7 +55,7 @@ class Penguin(EnvironmentInterface):
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
-        initial_global_config_dict["policy_base_url"] = self.cfg.base_urls
+        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
