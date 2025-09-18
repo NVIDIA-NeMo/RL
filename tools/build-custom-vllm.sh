@@ -20,9 +20,9 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Default values
 DEFAULT_GIT_URL="https://github.com/yfw/vllm.git"
-DEFAULT_BRANCH="rl-nemotron-h-0.10.2"
+DEFAULT_BRANCH="v0.10.2-base"
 # git merge-base --fork-point origin/main tags/v0.10.0
-DEFAULT_VLLM_COMMIT=26b999c71ab28ae9708329003007979530638f79 # use full commit hash from the main branch
+DEFAULT_VLLM_COMMIT=e017120ed146cc3069d18428322d67881cb95e67 # use full commit hash from the main branch
 
 # Parse command line arguments
 GIT_URL=${1:-$DEFAULT_GIT_URL}
@@ -61,8 +61,8 @@ uv pip install torch==2.8.0 --torch-backend=cu128
 echo "Installing vLLM with precompiled wheel..."
 #uv pip install --no-build-isolation -e .
 # uv pip install --no-build-isolation -e .
-# uv pip install --no-build-isolation -e .
-uv pip install -e .
+uv pip install --no-build-isolation -e .
+# uv pip install -e .
 
 echo "Build completed successfully!"
 echo "The built vLLM is available in: $BUILD_DIR"
