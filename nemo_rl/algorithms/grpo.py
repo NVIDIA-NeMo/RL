@@ -618,6 +618,8 @@ def grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
                     else:
+                        if colocated_inference:
+                            policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
 
                 with timer.time("generation"):
@@ -770,6 +772,8 @@ def grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
                     else:
+                        if colocated_inference:
+                            policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
