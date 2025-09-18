@@ -99,7 +99,11 @@ def mock_components():
             },
             "train_micro_batch_size": 1,
         },
-        "checkpointing": {"enabled": False},
+        "checkpointing": {
+            "enabled": False,
+            "checkpoint_must_save_by": None,
+            "save_period": 10,
+        },
     }
 
     return {

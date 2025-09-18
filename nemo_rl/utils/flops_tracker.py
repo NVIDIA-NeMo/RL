@@ -20,6 +20,7 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
@@ -52,7 +53,7 @@ def convert_config_to_flops_config(
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
         ), qwen2
-    elif isinstance(config, Qwen3MoeConfig):
+    elif isinstance(config, (Qwen3Config, Qwen3MoeConfig)):
         return FLOPSConfig(
             gbs=0,
             hs=config.hidden_size,

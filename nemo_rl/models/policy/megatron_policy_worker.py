@@ -61,7 +61,7 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.custom_fsdp import (
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
 from megatron.core.inference.engines import (
@@ -234,6 +234,7 @@ def setup_megatron_model(
         make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by
         // cfg.model.tensor_model_parallel_size,
         tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
+        trust_remote_code=True,
     )
     if not cfg.model.vocab_size:
         cfg.model.vocab_size = cfg.tokenizer.padded_vocab_size
@@ -562,6 +563,7 @@ class MegatronPolicyWorker:
             "moe_router_bias_update_rate"
         ]
 
+        model_cfg.moe_permute_fusion = self.cfg["megatron_cfg"]["moe_permute_fusion"]
         if "layernorm_epsilon" in self.cfg["megatron_cfg"]:
             model_cfg.layernorm_epsilon = self.cfg["megatron_cfg"]["layernorm_epsilon"]
 
@@ -767,6 +769,7 @@ class MegatronPolicyWorker:
             tensor_model_parallel_size=self.cfg["megatron_cfg"][
                 "tensor_model_parallel_size"
             ],
+            trust_remote_code=True,
         )
         self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
@@ -1164,7 +1167,13 @@ class MegatronPolicyWorker:
                 input_ids = data_dict["input_ids"]
                 input_ids_cp_sharded = input_ids
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                    input_ids, 0, False, False, False
+                    data=input_ids,
+                    eod_token=0,  # used for loss_mask, which we don't use
+                    pad_token=0,  # used for loss_mask, which we don't use
+                    reset_position_ids=False,
+                    reset_attention_mask=False,
+                    eod_mask_loss=False,
+                    pad_mask_loss=False,
                 )
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
