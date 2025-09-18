@@ -14,13 +14,18 @@
 
 import asyncio
 import gc
+import threading
 import uuid
-from typing import Any, AsyncGenerator, cast
+from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
+import uvicorn
+from fastapi import FastAPI
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -29,6 +34,90 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+
+def _maybe_correct_merged_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    reference_token_ids: list[int],
+    actual_token_ids: list[int],
+) -> list[int]:
+    """This is a subroutine used inside the vLLM Chat Completion server. Some environments (namely Penguin) require an OpenAI compatible server endpoint rather than an inference engine handle. This is fine for the most part, but it may cause issues when the environment is used as a part of training.
+
+    RL training frameworks train models on token IDs, but the OpenAI compatible server communicates in what is basically de-tokenized text. When multiple model calls are made to the OpenAI compatible server in a single trajectory, model generations in previous model calls may be re-tokenized to something that is different than what was generated. This is not too big of an issue (that we know of) at inference time, but the log probs the model produces are different enough for the differently re-tokenized generation result that it causes the training to be off policy. Off policy isn't necessarily a bad thing in isolation, but this source of off-policyness may cause unexpected issues if not properly accounted for. It also mis-aligns the token ID sequences across model calls, which feels very strange during training.
+
+    Thus, in this function we attempt to correct any minor re-tokenization errors in an effort to stay on-policy as possible. We require the tokenizer, the ground truth reference token ids taken directly from previous model calls, and the re-tokenized actual token ids.
+
+    In other words, for the current model call:
+    - reference_token_ids = all_prefill_so_far + new_generation
+        - all_prefill_so_far: the last model call model engine input token ids. Literally what the model sees during the last generation call.
+        - new_generation: the last model call model engine generated token ids. Literally what the model generates during the last generation call.
+    - actual_token_ids = all_prefill_so_far_maybe_diff_tokenization + new_generation_maybe_diff_tokenization + tool_response_or_user + assistant_generation_prompt
+        - all_prefill_so_far_maybe_diff_tokenization: the re-tokenized version of all_prefill_so_far. Since the token IDs in all_prefill_so_far were de-tokenized and returned as OpenAI schema, they must be re-tokenized for the current model call, which means that it may differ from all_prefill_so_far
+        - new_generation_maybe_diff_tokenization: analogous version of all_prefill_so_far_maybe_diff_tokenization for new_generation
+        - tool_response_or_user: some returned user or tool message. It doesn't matter that this is tokenized here since it has never been tokenized before. However, at the next model call, this will become part of the all_prefill_so_far.
+        - assistant_generation_prompt: a common sequence of tokens to instruct the model to generate an assistant response.
+
+    The goal of this subroutine is to find the prefix in actual_token_ids that corresponds to the de-tokenized text of reference_token_ids.
+    The idea of this subroutine implementation is to just de-tokenize subsequences of actual_token_ids (called candidate_token_ids) until the de-tokenized text matches the de-tokenized text of reference_token_ids.
+
+    TODO When NeMo RL supports training image generation models, we want to revisit and possibly update this function. This issue occurs when the model generates tokens that are de-tokenized into text or images, and then re-tokenized into tokens. So if there is a situation like that with images and image tokenization is non-unique, then we will need to uppdate this function.
+    """
+    if not reference_token_ids:
+        return actual_token_ids
+
+    # No re-tokenization errors
+    if reference_token_ids == actual_token_ids[: len(reference_token_ids)]:
+        return actual_token_ids
+
+    reference_str, actual_str = tokenizer.batch_decode(
+        [reference_token_ids, actual_token_ids]
+    )
+
+    # For now, if a trajectory is not monotonically increasing, we assert.
+    # Eventually when we support non-monotonic training, we need to update this logic
+    assert (
+        reference_str == actual_str[: len(reference_str)]
+    ), f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
+Reference str: {reference_str}
+Actual str: {actual_str}
+
+Reference token ids: {reference_token_ids}
+Actual token ids: {actual_token_ids}"""
+
+    # Now we want to try to find the subsequence of actual_token_ids that corresponds to reference_str
+    # Our first guess is just the prefix in actual_token_ids of length reference_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
+    # If there are a lot, this will be a poor guess. If there aren't that many this is a good guess.
+    candidate_token_ids = actual_token_ids[: len(reference_token_ids)]
+    candidate_str = tokenizer.decode(candidate_token_ids)
+
+    # If it's longer, we remove
+    if len(candidate_str) > len(reference_str):
+        while (
+            candidate_str != reference_str
+            and len(candidate_str) > len(reference_str)
+            and candidate_token_ids
+        ):
+            candidate_token_ids.pop()
+            candidate_str = tokenizer.decode(candidate_token_ids)
+    # If it's shorter we append
+    elif len(candidate_str) < len(reference_str):
+        while (
+            candidate_str != reference_str
+            and len(candidate_str) < len(reference_str)
+            and len(candidate_token_ids) < len(actual_token_ids) - 1
+        ):
+            candidate_token_ids.append(actual_token_ids[len(candidate_token_ids)])
+            candidate_str = tokenizer.decode(candidate_token_ids)
+    # If it's equal we should not need to do any modification. The assert below will directly error out.
+    else:
+        pass
+
+    # If we break above, it must be that we either found a correct match or that we didn't find a valid match
+    # e.g. in cases where there is some token merging that occurs at the very end of the reference_token_ids
+    # We scream loudly here.
+    assert candidate_str == reference_str
+
+    return reference_token_ids + actual_token_ids[len(candidate_token_ids) :]
 
 
 @ray.remote(
@@ -46,10 +135,262 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 **llm_kwargs["compilation_config"]
             )
 
-        self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+
+        self.server_thread, self.base_url, self.http_server = None, None, None
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self.server_thread, self.base_url, self.http_server = (
+                self._setup_vllm_server()
+            )
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self.base_url
+
+    def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+        from typing import List, Optional, Union
+
+        from fastapi import Request
+        from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.openai.api_server import (
+            BaseModelPath,
+            OpenAIServingChat,
+            OpenAIServingModels,
+            OpenAIServingTokenization,
+        )
+        from vllm.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            ChatCompletionResponse,
+            ErrorResponse,
+            TokenizeChatRequest,
+            TokenizeCompletionRequest,
+            TokenizeResponse,
+        )
+
+        engine_client = self.llm
+        model_config = self.llm_async_engine_args.create_model_config()
+        base_model_paths = [
+            BaseModelPath(name=model_config.model, model_path=model_config.model)
+        ]
+
+        openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,
+            model_config=model_config,
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
+
+        class NeMoRLOpenAIChatRequestMixin:
+            def model_post_init(self, context):
+                # Penguin specific processing. This is just how Penguin returns the extra token information.
+                if self.required_prefix_token_ids is None:
+                    for message in reversed(self.messages):
+                        if "prompt_token_ids" in message:
+                            self.required_prefix_token_ids = (
+                                message["prompt_token_ids"]
+                                + message["generation_token_ids"]
+                            )
+                            break
+
+                return super().model_post_init(context)
+
+        class NeMoRLOpenAIServingMixin:
+            async def _preprocess_chat(
+                self,
+                request: NeMoRLOpenAIChatRequestMixin,
+                tokenizer,
+                messages,
+                chat_template,
+                chat_template_content_format,
+                add_generation_prompt=True,
+                continue_final_message=False,
+                tool_dicts=None,
+                documents=None,
+                chat_template_kwargs=None,
+                tool_parser=None,
+                truncate_prompt_tokens=None,
+                add_special_tokens=False,
+            ):
+                # res is conversation, [request_prompt], [engine_prompt]
+                res = await super()._preprocess_chat(
+                    request,
+                    tokenizer,
+                    messages,
+                    chat_template,
+                    chat_template_content_format,
+                    add_generation_prompt,
+                    continue_final_message,
+                    tool_dicts,
+                    documents,
+                    chat_template_kwargs,
+                    tool_parser,
+                    truncate_prompt_tokens,
+                    add_special_tokens,
+                )
+
+                if request.required_prefix_token_ids is None:
+                    return res
+
+                engine_prompt = res[2][
+                    0
+                ]  # We need to modify engine_prompt.prompt_token_ids
+
+                final_prompt_token_ids = _maybe_correct_merged_tokens(
+                    tokenizer=tokenizer,
+                    reference_token_ids=request.required_prefix_token_ids,
+                    actual_token_ids=engine_prompt["prompt_token_ids"],
+                )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                return res
+
+        ########################################
+        # /v1/chat/completions endpoint
+        ########################################
+
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > ChatCompletionRequest
+        class NeMoRLChatCompletionRequest(
+            NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
+        ):
+            required_prefix_token_ids: Optional[List[int]] = None
+
+        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
+            pass
+
+        serving_chat_default_kwargs = dict(
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+        serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
+            "http_server_serving_chat_kwargs", dict()
+        )
+        openai_serving_chat = NeMoRLOpenAIServingChat(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            return_tokens_as_token_ids=True,
+            **serving_chat_kwargs,
+        )
+
+        generation_config = self.cfg
+
+        # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
+        @app.post("/v1/chat/completions")
+        async def create_chat_completion(
+            request: NeMoRLChatCompletionRequest, raw_request: Request
+        ):
+            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+            # Right now we explicitly assert set this to -1.
+            assert request.top_k in (None, -1), (
+                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+            )
+            request.top_k = -1
+
+            # The request sampling params need to exactly match those as are set in NeMo RL.
+            # If they do not match, the inference will be off policy and destroy training stability.
+            assert request.temperature == generation_config["temperature"]
+            assert request.top_p == generation_config["top_p"]
+
+            generator = await openai_serving_chat.create_chat_completion(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.code
+                )
+
+            elif isinstance(generator, ChatCompletionResponse):
+                return JSONResponse(content=generator.model_dump())
+
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+
+        ########################################
+        # /tokenize endpoint
+        ########################################
+
+        # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
+        class NeMoRLTokenizeChatRequest(
+            NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
+        ):
+            required_prefix_token_ids: Optional[List[int]] = None
+
+        NeMoRLTokenizeRequest = Union[
+            TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
+        ]
+
+        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
+        class NeMoRLOpenAIServingTokenization(
+            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
+        ):
+            pass
+
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+            engine_client,
+            model_config,
+            openai_serving_models,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+        )
+
+        @app.post("/tokenize")
+        async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            generator = await openai_serving_tokenization.create_tokenize(
+                request, raw_request
+            )
+
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(), status_code=generator.code
+                )
+            elif isinstance(generator, TokenizeResponse):
+                return JSONResponse(content=generator.model_dump())
+
+        return app
+
+    def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        import threading
+
+        import uvicorn
+        from fastapi import FastAPI
+
+        # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
+        # e.g. last-run middleware.
+        app = FastAPI()
+
+        app = self._setup_vllm_openai_api_server(app)
+
+        ########################################
+        # Server spinup
+        ########################################
+
+        node_ip = _get_node_ip_local()
+        free_port = _get_free_port_local()
+
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        print(f"Starting server on {base_url}")
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=free_port,
+        )
+        server = uvicorn.Server(config=config)
+
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        return thread, base_url, server
 
     async def init_collective_async(
         self, rank_prefix: int, ip: str, port: int, world_size: int
@@ -561,6 +902,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
+
+            if self.server_thread is not None:
+                from threading import Thread
+
+                from uvicorn import Server
+
+                self.http_server: Server
+                self.server_thread: Thread
+
+                self.http_server.should_exit = True
+                self.server_thread.join()
 
             return True
         except Exception as e:
