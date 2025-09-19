@@ -312,11 +312,11 @@ class ReplayBuffer:
             
             sample_result = self.sampler_fns[sampler_type](valid_indices, num_prompt_groups, current_weight_version, min_valid_version)
 
+            if sample_result is None:
+                return None
+
             selected = sample_result["selected"]
             removed = sample_result["removed"]
-
-            if selected is None:
-                return None
 
             from collections import Counter
 
