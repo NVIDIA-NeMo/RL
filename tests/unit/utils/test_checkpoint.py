@@ -176,6 +176,24 @@ def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     assert Path(latest_path).name == f"step_{max(steps)}"
 
 
+def test_get_latest_checkpoint_path_with_suffixes(checkpoint_manager, checkpoint_dir):
+    """Test that having step_*-hf dirs alongside step_* checkpoints doesn't crash."""
+    # Create a checkpoint
+    step = 1
+    training_info = {"loss": 0.5}
+    tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+    checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Create pseudo-converted checkpoint folder
+    (checkpoint_dir / "step_1-hf").mkdir()
+
+    # Get latest checkpoint path
+    latest_path = checkpoint_manager.get_latest_checkpoint_path()
+
+    # Verify the -hf suffix didn't affect the get_latest_checkpoint func
+    assert Path(latest_path).name == "step_1"
+
+
 def test_load_training_metadata(checkpoint_manager, checkpoint_dir):
     # Create a checkpoint
     step = 1
