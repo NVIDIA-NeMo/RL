@@ -36,4 +36,4 @@ policy.train_micro_batch_size: [4]
 policy.max_total_sequence_length: [1024]
 
 # Learning rate
-policy.optimizer.kwargs.lr: [1e-5, 1e-6]
+policy.optimizer.kwargs.lr: [3e-5]
