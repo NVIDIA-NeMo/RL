@@ -13,6 +13,10 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -21,6 +25,8 @@ loss_fn:
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
+  # Async GRPO requires importance sampling correction enabled
+  # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
   sequence_level_importance_ratios: false
   token_level_loss: true
