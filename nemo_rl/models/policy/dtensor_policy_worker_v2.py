@@ -180,6 +180,8 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
+        # model_config.num_hidden_layers = 20
+
         self._is_reward_model = (
             "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
         )
@@ -684,6 +686,9 @@ class DTensorPolicyWorkerV2:
                             # remove flash_attn_kwargs if there are multimodal kwargs
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
+                            
+                            if 'flash_attn_kwargs' in model_args:
+                                del model_args['flash_attn_kwargs']
 
                             outputs = self.model(**model_args)
 
@@ -994,6 +999,9 @@ class DTensorPolicyWorkerV2:
                         )
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
+
+                        if 'flash_attn_kwargs' in model_args:
+                            del model_args['flash_attn_kwargs']
 
                         outputs = self.model(**model_args)
 
