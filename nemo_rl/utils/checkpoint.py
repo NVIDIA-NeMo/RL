@@ -245,6 +245,8 @@ class CheckpointManager:
         """
         # find checkpoint directory with highest step number
         step_dirs = glob.glob(str(self.checkpoint_dir / "step_*"))
+        # filter the list from suffixes like step_10-hf
+        step_dirs = [x for x in step_dirs if Path(x).name.split("_")[1].isdigit()]
         step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
         if len(step_dirs) == 0:
             return None

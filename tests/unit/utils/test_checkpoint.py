@@ -176,9 +176,8 @@ def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     assert Path(latest_path).name == f"step_{max(steps)}"
 
 
-def test_get_latest_checkpoint_path_alongside_pseudo_converted(
-    checkpoint_manager, checkpoint_dir
-):
+def test_get_latest_checkpoint_path_with_suffixes(checkpoint_manager, checkpoint_dir):
+    """Test that having step_*-hf dirs alongside step_* checkpoints doesn't crash."""
     # Create a checkpoint
     step = 1
     training_info = {"loss": 0.5}
