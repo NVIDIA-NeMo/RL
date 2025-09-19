@@ -166,7 +166,7 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(
             f"✅ Tokenizer initialized with pad_token_id: {self.tokenizer.pad_token_id}"
         )
-
+        self.reward_model_policy = None
         self.reward_model_policy = Policy(
             cluster=self.virtual_cluster,
             config=self.config,
