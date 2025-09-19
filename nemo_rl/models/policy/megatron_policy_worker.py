@@ -1304,12 +1304,12 @@ class MegatronPolicyWorker:
                 # if isinstance(item, torch.Tensor):
                 # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
 
-                # - self.model is the original reference_model, now on CUDA
-                # - self.reference_model is the original model, now on CPU
-
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
                     torch.cuda.empty_cache()
+
+                # - self.model is the original reference_model, now on CUDA
+                # - self.reference_model is the original model, now on CPU
                 yield
 
             finally:
@@ -1319,7 +1319,7 @@ class MegatronPolicyWorker:
                 # if isinstance(item, torch.Tensor):
                 # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
                 # self.model.state_dict()[name] = item
-
+                
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -1746,7 +1746,7 @@ class MegatronPolicyWorker:
                     if torch.is_tensor(v) and v.is_cuda:
                         # Move the tensor to CPU and update the state dictionary
                         state[k] = v.to("cpu")
-
+        
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             gc.collect()
             torch.cuda.empty_cache()
@@ -1772,10 +1772,11 @@ class MegatronPolicyWorker:
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
-
+        
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             gc.collect()
             torch.cuda.empty_cache()
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
