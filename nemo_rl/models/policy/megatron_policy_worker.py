@@ -1319,7 +1319,7 @@ class MegatronPolicyWorker:
                 # if isinstance(item, torch.Tensor):
                 # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
                 # self.model.state_dict()[name] = item
-                
+
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -1746,7 +1746,7 @@ class MegatronPolicyWorker:
                     if torch.is_tensor(v) and v.is_cuda:
                         # Move the tensor to CPU and update the state dictionary
                         state[k] = v.to("cpu")
-        
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             gc.collect()
             torch.cuda.empty_cache()
@@ -1772,7 +1772,7 @@ class MegatronPolicyWorker:
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
-        
+
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             gc.collect()
             torch.cuda.empty_cache()
