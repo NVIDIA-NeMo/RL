@@ -1,4 +1,4 @@
-# Environments
+# Environments for GRPO Training
 
 GRPO supports several examples of environments for different tasks. Each environment provides a standardized interface for reward computation and evaluation.
 
@@ -6,12 +6,12 @@ GRPO supports several examples of environments for different tasks. Each environ
 
 The Math Environment is designed for mathematical reasoning tasks. It evaluates responses to math problems using `math-verify` and provides rewards based on correctness.
 
-**Key Features:**
+### Key Features
 - Evaluates mathematical reasoning
 - Supports multiple mathematical domains
 - Provides detailed feedback on solution correctness
 
-**Usage:**
+### Usage
 ```python
 from nemo_rl.environments.math_environment import MathEnvironment
 
@@ -26,7 +26,7 @@ math_env = MathEnvironment.remote(env_config)
 
 The Code Environment is designed for code generation and execution tasks. It provides a sandboxed environment for executing Python code and evaluating the results.
 
-**Usage:**
+### Usage
 ```python
 from nemo_rl.environments.code_environment import CodeEnvironment
 
@@ -38,7 +38,7 @@ env_config = {
 code_env = CodeEnvironment.remote(env_config)
 ```
 
-**Configuration:**
+### Configuration
 - `num_workers`: Number of parallel workers for code execution
 - `terminate_on_evaluation`: Whether to terminate after code execution (True for single-turn, False for multi-turn)
 
@@ -48,7 +48,7 @@ We’re tracking an end-to-end example of this environment in [#858](https://git
 
 The Reward Model Environment uses pre-trained reward models to score conversation quality. 
 
-**Usage:**
+### Usage
 ```python
 from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 
@@ -73,19 +73,19 @@ reward_env = RewardModelEnvironment.remote(env_config)
 In GRPO training, resources are allocated across three main components:
 
 - **Policy Actor**: The trained model
-- **Generation Actor**: Used for generating responses during rollouts (can be colocated with policy or on separate nodes/gpus)
+- **Generation Actor**: Used for generating responses during rollouts (can be colocated with policy or on separate nodes/GPUs).
 - **Reward Model Environment Actor**: Evaluates generated responses and computes rewards
 
 The resource allocation logic works as follows:
 
-**Single Node Setup (`num_nodes: 1`):**
+#### Single-Node Setup (`num_nodes: 1`)
 - All components share the same node
 - GPUs are divided between policy training, generation, and reward model
 - Example: 
-    1. Policy and generation colocated: 8 GPUs total = 4 for colocted policy and generation + 4 for reward model
+    1. Policy and generation colocated: 8 GPUs total = 4 for colocated policy and generation + 4 for reward model
     2. Policy and generation non-colocated: 8 GPUs total = 2 for policy + 2 for generation + 4 for reward model
 
-**Multi-Node Setup (`num_nodes > 1`):**
+#### Multi-Node Setup (`num_nodes > 1`)
 - Policy training, generation, and reward model environment can be distributed across different nodes
 - Reward model gets dedicated resources as specified in `env.reward_model.resources`
 - Generation gets dedicated resources as specified in `policy.generation.colocated.resources`
