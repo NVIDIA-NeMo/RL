@@ -94,7 +94,6 @@ class TaskDataProcessFnCallable(Protocol):
         datum_dict: dict[str, Any],
         task_data_spec: TaskDataSpec,
         tokenizer: TokenizerType,
-        chat_template_kwargs: dict[str, Any],
         max_seq_length: int | None,
         idx: int,
     ) -> DatumSpec:

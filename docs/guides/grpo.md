@@ -97,8 +97,7 @@ Then, you can set the data up as follows:
 
 ```python
 base_dataset = load_dataset("json", data_files=data_config["dataset_name"])["train"]
-tokenizer = AutoTokenizer.from_pretrained(policy_config["model_name"])
-chat_template_kwargs = {}
+tokenizer = get_tokenizer(tokenizer_config)
 
 task_data_processors = defaultdict(lambda: (math_task_spec, math_data_processor))
 task_data_processors["math"] = (math_task_spec, math_data_processor)
@@ -108,7 +107,6 @@ math_env = MathEnvironment.remote(env_configs["math"]) # ray remote actor
 dataset = AllTaskProcessedDataset(
     base_dataset,
     tokenizer,
-    chat_template_kwargs,
     math_task_spec,
     task_data_processors,
     max_seq_length=data_config["max_input_seq_length"],

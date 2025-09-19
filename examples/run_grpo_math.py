@@ -69,7 +69,6 @@ def hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
-    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
@@ -88,7 +87,6 @@ def hf_data_processor(
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
-        **chat_template_kwargs,
     )
 
     user_message["token_ids"] = tokenizer(
@@ -162,7 +160,6 @@ def setup_data(
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
-        tokenizer_config.get("chat_template_kwargs", {}),
         math_task_spec,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
@@ -173,7 +170,6 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
-            tokenizer_config.get("chat_template_kwargs", {}),
             math_task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],

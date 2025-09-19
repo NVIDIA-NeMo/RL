@@ -29,7 +29,6 @@ def math_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
-    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
@@ -66,7 +65,6 @@ def math_data_processor(
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
-        **chat_template_kwargs,
     )
     user_message["token_ids"] = tokenizer(
         message, return_tensors="pt", add_special_tokens=False
@@ -117,7 +115,6 @@ def multichoice_qa_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
-    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
@@ -159,7 +156,6 @@ def multichoice_qa_processor(
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
-        **chat_template_kwargs,
     )
     user_message["token_ids"] = tokenizer(
         message, return_tensors="pt", add_special_tokens=False

@@ -439,7 +439,6 @@ def get_images_from_message(message: dict[str, Any]) -> list[Any]:
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
-    chat_template_kwargs: dict[str, Any],
     task_data_spec: TaskDataSpec,
     add_bos_token: bool = True,
     add_eos_token: bool = True,
@@ -450,7 +449,6 @@ def get_formatted_message_log(
     Args:
         message_log: List of message dicts with 'role' and 'content' keys
         tokenizer: Tokenizer for converting text to token IDs
-        chat_template_kwargs: chat template keyword arguments.
         task_data_spec: Task spec for this dataset.
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
@@ -529,7 +527,6 @@ def get_formatted_message_log(
             add_generation_prompt=add_generation_prompt and message["role"] == "user",
             tokenize=False,
             add_special_tokens=False,
-            **chat_template_kwargs,
         )
 
         ## get the length of the previous message, excluding the eos token (if present)

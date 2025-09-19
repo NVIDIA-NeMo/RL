@@ -55,7 +55,6 @@ def sft_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer,
-    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
     add_bos: bool = True,
@@ -71,7 +70,6 @@ def sft_preprocessor(
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,
-        chat_template_kwargs,
         task_data_spec,
         add_bos_token=add_bos,
         add_eos_token=add_eos,
@@ -128,7 +126,6 @@ def setup_data(
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,
-        tokenizer_config.get("chat_template_kwargs", {}),
         sft_task_spec,
         partial(
             sft_preprocessor,
@@ -143,7 +140,6 @@ def setup_data(
     val_dataset = AllTaskProcessedDataset(
         val_dataset,
         tokenizer,
-        tokenizer_config.get("chat_template_kwargs", {}),
         sft_task_spec,
         partial(
             sft_preprocessor,

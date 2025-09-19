@@ -74,7 +74,6 @@ def setup_data(
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
-        chat_template_kwargs=tokenizer_config.get("chat_template_kwargs", {}),
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
         max_seq_length=data_config["max_input_seq_length"],

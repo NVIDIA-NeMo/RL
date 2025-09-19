@@ -53,7 +53,6 @@ def dpo_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer,
-    chat_template_kwargs: dict[str, Any],
     max_seq_length: int,
     idx: int,
 ) -> DatumSpec:
@@ -127,10 +126,10 @@ def dpo_preprocessor(
     messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 
     message_log_chosen = get_formatted_message_log(
-        messages_chosen, tokenizer, chat_template_kwargs, task_data_spec
+        messages_chosen, tokenizer, task_data_spec
     )
     message_log_rejected = get_formatted_message_log(
-        messages_rejected, tokenizer, chat_template_kwargs, task_data_spec
+        messages_rejected, tokenizer, task_data_spec
     )
 
     length_chosen = sum(len(m["token_ids"]) for m in message_log_chosen)
@@ -183,7 +182,6 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,
-        tokenizer_config.get("chat_template_kwargs", {}),
         dpo_task_spec,
         dpo_preprocessor,
         max_seq_length=data_config["max_input_seq_length"],
