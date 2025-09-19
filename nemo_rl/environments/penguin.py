@@ -96,6 +96,7 @@ class Penguin(EnvironmentInterface):
             )
             for row in examples
         ]
+
         results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
         return [r.json() for r in results]
 
