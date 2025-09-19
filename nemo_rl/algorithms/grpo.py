@@ -70,6 +70,14 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+class AsyncGRPOConfig(TypedDict):
+    enabled: bool
+    # Maximum trajectory age in training steps for samples drawn from the
+    # async replay buffer. Trajectories older than this are excluded during
+    # sampling; buffer sizing also scales with this value.
+    max_trajectory_age_steps: int
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -83,6 +91,7 @@ class GRPOConfig(TypedDict):
     val_at_start: bool
     max_val_samples: int
     seed: int
+    async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
 
 

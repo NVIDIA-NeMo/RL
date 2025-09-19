@@ -245,12 +245,12 @@ def main() -> None:
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     # Check if async mode is enabled
-    async_config = config["grpo"].get("async_grpo", {})
-    if async_config and async_config.get("enabled", False):
+    if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
         from nemo_rl.algorithms.grpo import async_grpo_train
 
         print("🚀 Running async GRPO training")
 
+        async_config = config["grpo"]["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,
@@ -265,7 +265,7 @@ def main() -> None:
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config.get("max_trajectory_age_steps", 1),
+            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
         )
     else:
         print("🚀 Running synchronous GRPO training")
