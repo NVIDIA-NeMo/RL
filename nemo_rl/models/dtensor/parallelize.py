@@ -409,6 +409,10 @@ def _parallelize_model(
         layers: torch.nn.ModuleList = model.model.transformer.blocks
         num_attention_heads = model.model.config.n_heads
         num_key_value_heads = model.model.config.n_kv_heads
+    elif "nvidia/Nemotron-Diffusion-Research-4B-v0" in str(model_cls):
+        layers: torch.nn.ModuleList = model.encoder.layers  
+        num_attention_heads = model.config.num_attention_heads
+        num_key_value_heads = model.config.num_key_value_heads
     else:
         layers: torch.nn.ModuleList = model.model.layers  # type: ignore
         num_attention_heads = model.config.num_attention_heads
