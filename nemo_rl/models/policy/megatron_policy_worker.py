@@ -19,6 +19,7 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
+import math
 
 import ray
 import torch
@@ -592,6 +593,24 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
+        self.fp8_cfg = fp8_cfg
+        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+            try:
+                model_cfg.fp8 = fp8_cfg["fp8"]
+                model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
+                model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            except KeyError as e:
+                raise KeyError(f"Missing key in fp8_cfg: {e}")
+            if (
+                model_cfg.tensor_model_parallel_size > 1
+                and model_cfg.fp8_recipe == "blockwise"
+                and model_cfg.fp8_param
+            ):
+                raise ValueError(
+                    "There is a known issue with FP8 blockwise recipe and tensor model parallel size > 1 when fp8_param is True. "
+                    "Please set fp8_param to False or use tensorwise recipe instead. (https://github.com/NVIDIA-NeMo/RL/issues/1164)"
+                )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -942,6 +961,9 @@ class MegatronPolicyWorker:
                     tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                     pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                    if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                        # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                        pad_factor = math.lcm(16, pad_factor)
                     if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
                         _, pad_full_seq_to = (
                             batch.get_microbatch_iterator_for_packable_sequences_len()
@@ -1147,6 +1169,9 @@ class MegatronPolicyWorker:
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                    # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                    pad_factor = math.lcm(16, pad_factor)
                 (
                     input_ids,
                     input_ids_cp_sharded,

@@ -131,6 +131,12 @@ def create_megatron_test_config(
                 "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": True,
+            },
         },
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
@@ -335,6 +341,7 @@ def training_setup(request):
             {"activation_checkpointing": True},
         ),
         (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
     ],
     indirect=True,
     ids=[
@@ -345,6 +352,7 @@ def training_setup(request):
         "2gpu_dp2_llama_bf16",
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
+        "2gpu_tp2_llama_fp8",
     ],
 )
 def test_megatron_policy_training(training_setup):
