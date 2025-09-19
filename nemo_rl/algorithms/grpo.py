@@ -1202,7 +1202,7 @@ def async_grpo_train(
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size,
+        max_size=optimal_buffer_size, master_config = master_config
     )
     
     _tc_py_exec = get_actor_python_env(
