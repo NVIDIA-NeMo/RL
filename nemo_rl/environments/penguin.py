@@ -90,20 +90,14 @@ class Penguin(EnvironmentInterface):
         )
         server_client = ServerClient.load_from_global_config(head_server_config)
 
-        async def _sorted_task_wrapper(i: int, row: dict) -> tuple[int, dict]:
-            res = await server_client.post(
+        tasks = [
+            server_client.post(
                 server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
             )
-            res = res.json()
-            return i, res
-
-        tasks = [_sorted_task_wrapper(i, row) for i, row in enumerate(examples)]
-        results: list[tuple[int, dict]] = []
-        for completed_task in tqdm.as_completed(tasks, desc="Collecting Penguin rollouts"):
-            result: tuple[int, dict] = await completed_task
-            results.append(result)
-
-        return [r for _, r in sorted(results, key=lambda t: t[0])]
+            for row in examples
+        ]
+        results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
+        return [r.json() for r in results]
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
         nemo_rl_message_log = []
