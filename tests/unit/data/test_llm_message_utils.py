@@ -20,6 +20,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
@@ -91,9 +92,12 @@ def raw_chat_message_log() -> list[LLMMessageLogType]:
     ]
 
 
-def qwen3_message_log(enable_thinking: bool) -> list[LLMMessageLogType]:
+def qwen3_message_log(
+    model_name: str, enable_thinking: bool
+) -> tuple[list[LLMMessageLogType], list[str]]:
     """Helper function for Qwen3 message logs."""
-    return [
+    # input data for test
+    input_data = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello!"},
         {
@@ -103,6 +107,35 @@ def qwen3_message_log(enable_thinking: bool) -> list[LLMMessageLogType]:
             else "Hi there!",
         },
     ]
+
+    # use a tokenizer directly from HuggingFace to prepare expected result
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    assert tokenizer.bos_token is None
+
+    # get expected result
+    ## result is equivalent to if we apply chat template to the full message log,
+    expected_text_string = tokenizer.apply_chat_template(
+        [input_data[:2]],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        enable_thinking=enable_thinking,
+    )[0]
+
+    delimiter = "<|im_end|>\n"
+    split_text = expected_text_string.split(delimiter, 1)
+    expected_text = []
+    for i in range(len(split_text)):
+        if i == len(split_text) - 1:
+            expected_text.append(split_text[i])
+        else:
+            expected_text.append(split_text[i] + delimiter)
+
+    ## separately handle the last message because of the generation prompt
+    formatted_assistant_message = input_data[2]["content"] + delimiter
+    expected_text.append(formatted_assistant_message)
+
+    return input_data, expected_text
 
 
 @pytest.fixture
@@ -408,7 +441,6 @@ def test_get_formatted_message_log_models(
     result = get_formatted_message_log(
         chat_log,
         tokenizer,
-        {},
         task_data_spec,
         add_generation_prompt=add_generation_prompt,
     )
@@ -466,50 +498,30 @@ def test_get_formatted_message_log_models(
             assert normalize(actual_concat) == normalize(expected_concat)
 
 
-@pytest.mark.parametrize(
-    "enable_thinking",
-    [True, False],
-)
-def test_get_formatted_message_log_add_generation_prompt_qwen3_enable_thinking(
+@pytest.mark.parametrize("enable_thinking", [True, False])
+def test_get_formatted_message_log_qwen3_enable_thinking(
     enable_thinking,
 ) -> None:
-    ## test using a tokenizer that does not have a bos token
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-    assert tokenizer.bos_token is None
+    model_name = "Qwen/Qwen3-8B"
 
-    ## get expected result
-    ## result is equivalent to if we apply chat template to the full message log,
-    ## remove the trailing newline, and then partition by the delimiter
-    ## Separately handle the last message because of the generation prompt
-    expected_text_string = tokenizer.apply_chat_template(
-        [qwen3_message_log(enable_thinking)[:2]],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-        enable_thinking=enable_thinking,
-    )[0]
+    # setup test data
+    input_data, expected_text = qwen3_message_log(model_name, enable_thinking)
 
-    delimiter = "<|im_end|>\n"
-    split_text = expected_text_string.split(delimiter, 1)
-    expected_text = []
-    for i in range(len(split_text)):
-        if i == len(split_text) - 1:
-            expected_text.append(split_text[i])
-        else:
-            expected_text.append(split_text[i] + delimiter)
+    # setup tokenizer
+    tokenizer_config = {
+        "name": model_name,
+        "chat_template": "default",
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    tokenizer = get_tokenizer(tokenizer_config)
 
-    formatted_assistant_message = (
-        qwen3_message_log(enable_thinking)[2]["content"] + tokenizer.eos_token
-    )
-    expected_text.append(formatted_assistant_message)
-
+    # get actual result
     task_data_spec = TaskDataSpec(
         task_name="test",
     )
     result = get_formatted_message_log(
-        qwen3_message_log(enable_thinking),
+        input_data,
         tokenizer,
-        dict(enable_thinking=enable_thinking),
         task_data_spec,
         add_generation_prompt=True,
     )
@@ -537,7 +549,6 @@ def test_formatted_message_log_empty_message():
         get_formatted_message_log(
             message_log,
             tokenizer,
-            {},
             task_data_spec,
             add_bos_token=False,
             add_eos_token=False,
