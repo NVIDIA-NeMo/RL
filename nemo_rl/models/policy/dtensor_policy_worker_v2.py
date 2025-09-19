@@ -239,7 +239,6 @@ class DTensorPolicyWorkerV2:
                 config=model_config,
                 use_liger_kernel=False,
                 torch_dtype=str(model_config.torch_dtype),
-                use_liger_kernel=False,
                 # quantization_config=self.fp8_config,
             )
 
@@ -263,7 +262,6 @@ class DTensorPolicyWorkerV2:
                 if self.enable_seq_packing
                 else None,
                 use_liger_kernel=False,
-                fp8_config=self.fp8_config,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
