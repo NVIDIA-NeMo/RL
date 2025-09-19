@@ -200,6 +200,7 @@ def main(is_vlm: bool = False):
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     sft_train(
         policy,
         train_dataloader,
