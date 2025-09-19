@@ -105,11 +105,7 @@ class AllTaskProcessedDataset:
             task_data_processor = self.task_data_processors
 
         datum_spec = task_data_processor(
-            entry,
-            task_data_spec,
-            self.tokenizer,
-            self.max_seq_length,
-            idx,
+            entry, task_data_spec, self.tokenizer, self.max_seq_length, idx
         )
 
         # Check the first processed item for BOS token assertion

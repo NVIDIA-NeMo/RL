@@ -38,7 +38,6 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -121,7 +120,6 @@ def hf_data_processor(
 
 def setup_data(
     tokenizer: TokenizerType,
-    tokenizer_config: TokenizerConfig,
     data_config: DataConfig,
     env_configs: dict[str, Any],
     seed: int,
@@ -217,8 +215,7 @@ def main() -> None:
     init_ray()
 
     # setup tokenizer
-    tokenizer_config = config["policy"]["tokenizer"]
-    tokenizer = get_tokenizer(tokenizer_config)
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
     )
@@ -232,13 +229,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(
-        tokenizer,
-        tokenizer_config,
-        config["data"],
-        config["env"],
-        config["grpo"]["seed"],
-    )
+    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
 
     (
         policy,

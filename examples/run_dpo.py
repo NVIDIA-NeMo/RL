@@ -177,8 +177,7 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
 
     dpo_task_spec = data.task_spec
 
-    tokenizer_config = policy_config["tokenizer"]
-    tokenizer = get_tokenizer(tokenizer_config)
+    tokenizer = get_tokenizer(policy_config["tokenizer"])
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,

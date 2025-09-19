@@ -28,7 +28,6 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -97,12 +96,7 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(
-    tokenizer: AutoTokenizer,
-    tokenizer_config: TokenizerConfig,
-    data_config: DataConfig,
-    seed: int,
-):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
 
     # load dataset
@@ -186,15 +180,14 @@ def main(is_vlm: bool = False):
     init_ray()
 
     # setup tokenizer (or processor)
-    tokenizer_config = config["policy"]["tokenizer"]
-    tokenizer = get_tokenizer(tokenizer_config, get_processor=is_vlm)
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
 
     # setup data
     (
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, tokenizer_config, config["data"], config["sft"]["seed"])
+    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
 
     (
         policy,
