@@ -127,8 +127,8 @@ jobs:
 
           API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_REF" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
 
-          COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.behind_by')
-          COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
+          COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
+          COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.behind_by')
           STATUS=$(echo "$API_RESPONSE" | jq -r '.status')
 
           echo "Comparison status: $STATUS"
