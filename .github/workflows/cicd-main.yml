@@ -137,7 +137,7 @@ jobs:
             echo "Please rebase or merge the latest changes from $TARGET_BRANCH into your PR."
             exit 1
           else
-            echo "✅ PR is acceptably fresh ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
+            echo "✅ PR is acceptably up-to-date ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
           fi
 
   lint-check:
@@ -280,7 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
-      - commit-freshness-check
+      - pr-branch-up-to-date-check
       - lint-check
       - sphinx-build
       - build-container
@@ -295,7 +295,7 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
-              (needs.commit-freshness-check.result == 'skipped' || needs.commit-freshness-check.result == 'success') &&
+              pr-branch-up-to-date-check.result == 'success' &&
               (
                 needs.pre-flight.outputs.test_level == 'none' ||
                 (
