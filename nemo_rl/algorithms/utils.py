@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import math
 import random
 import warnings
 from functools import wraps
@@ -18,9 +20,13 @@ from typing import Optional
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 
-from nemo_rl.data import hf_datasets
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 
 
@@ -144,7 +150,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
+def get_tokenizer(
+    tokenizer_config: TokenizerConfig, get_processor: bool = False
+) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
     This function initializes a tokenizer from the Hugging Face transformers library
@@ -160,6 +168,7 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+        get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
         PreTrainedTokenizerBase: The configured tokenizer instance
@@ -198,19 +207,42 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
         Using custom chat template
         >>> formatted = tokenizer.apply_chat_template(messages, tokenize=False)
         >>> assert formatted == " START: You are a helpful AI assistant. END. START: Hello! END."
+
+        >>> # Requesting a processor (for multimodal models like Qwen-VL)
+        >>> config = {"name": "Qwen/Qwen2.5-VL-3B-Instruct"}
+        >>> processor = get_tokenizer(config, get_processor=True)
+        No chat template provided, using tokenizer's default
+        >>> messages = [
+        ...     {"role": "system", "content": "You are a helpful AI assistant."},
+        ...     {"role": "user", "content": "Hello!"}
+        ... ]
+        >>> formatted = processor.tokenizer.apply_chat_template(messages, tokenize=False)
+        >>> assert formatted == AutoTokenizer.from_pretrained(
+        ...     "Qwen/Qwen2.5-VL-3B-Instruct", trust_remote_code=True
+        ... ).apply_chat_template(messages, tokenize=False)
+        >>> assert processor.pad_token_id == processor.tokenizer.pad_token_id
+        >>>
         ```
     """
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_config["name"], trust_remote_code=True
-    )
+    processor = None
+
+    if get_processor:
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_config["name"], trust_remote_code=True
+        )
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = (
-                hf_datasets.COMMON_CHAT_TEMPLATES.passthrough_prompt_response
-            )
+            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         else:
@@ -219,4 +251,76 @@ def get_tokenizer(tokenizer_config: TokenizerConfig) -> PreTrainedTokenizerBase:
     else:
         print("No chat template provided, using tokenizer's default")
 
-    return tokenizer
+    # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
+    # However, the dataloader needs the processor for multimodal data preprocessing, so the processor is needed for the dataloader (only tokenizer is NOT enough).
+    # Inheriting special keys from the tokenizer is a minimal change that doesn't disturb the rest of the SFT pipeline
+    if processor is not None:
+        processor.pad_token = tokenizer.pad_token
+        processor.eos_token = tokenizer.eos_token
+        processor.bos_token = tokenizer.bos_token
+        processor.pad_token_id = tokenizer.pad_token_id
+        processor.eos_token_id = tokenizer.eos_token_id
+        processor.bos_token_id = tokenizer.bos_token_id
+        # copy name_or_path from tokenizer to processor for logging
+        processor.name_or_path = tokenizer.name_or_path
+
+    return tokenizer if processor is None else processor
+
+
+def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+    """Pads the given batch so that its size is divisible by (mbs * dp_size).
+
+    Args:
+        batch (dict): The batch to pad.
+        dp_size (int): Data parallel size.
+        mbs (int): Micro batch size.
+
+    Returns:
+        dict: The padded batch.
+    """
+    min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
+    if min_padding > 0:
+        print(f"Padding last validation batch with {min_padding} padding samples")
+        # Pad input_ids
+        batch["input_ids"] = torch.cat(
+            [
+                batch["input_ids"],
+                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
+            ]
+        )
+        # Pad input_lengths
+        batch["input_lengths"] = torch.cat(
+            [
+                batch["input_lengths"],
+                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
+            ]
+        )
+        if "token_mask" in batch:
+            # Pad token_mask
+            batch["token_mask"] = torch.cat(
+                [
+                    batch["token_mask"],
+                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
+                ]
+            )
+        # Pad sample_mask
+        batch["sample_mask"] = torch.cat(
+            [
+                batch["sample_mask"],
+                torch.zeros_like(batch["sample_mask"][-1])
+                .unsqueeze(0)
+                .repeat(min_padding),
+            ]
+        )
+
+        if "reference_policy_logprobs" in batch:
+            # Pad reference_policy_logprobs
+            batch["reference_policy_logprobs"] = torch.cat(
+                [
+                    batch["reference_policy_logprobs"],
+                    batch["reference_policy_logprobs"][-1]
+                    .unsqueeze(0)
+                    .repeat(min_padding, 1),
+                ]
+            )
+    return batch

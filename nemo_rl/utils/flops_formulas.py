@@ -69,25 +69,7 @@ def gpt3(config: FLOPSConfig):
     )
 
 
-def llama2(config: FLOPSConfig):
-    """Model FLOPs for llama2 family."""
-    return (
-        config.gbs
-        * config.enc_seq_len
-        * config.layers
-        * config.hs
-        * config.hs
-        * (
-            12
-            + (12 * config.query_groups / config.attention_heads)
-            + (18 * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
-            + (6 * config.vocab_size / (config.layers * config.hs))
-        )
-    )
-
-
-def llama3(config: FLOPSConfig):
+def llama(config: FLOPSConfig):
     """Model FLOPs for llama3 family."""
     return (
         config.gbs
@@ -99,7 +81,7 @@ def llama3(config: FLOPSConfig):
             12
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
+            + (6 * config.enc_seq_len / config.hs)
             + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )

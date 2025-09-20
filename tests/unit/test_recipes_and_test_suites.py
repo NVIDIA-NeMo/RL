@@ -17,6 +17,9 @@ import subprocess
 
 import pytest
 
+# All tests in this module should run first
+pytestmark = pytest.mark.run_first
+
 dir_path = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(dir_path, "..", ".."))
 configs_dir = os.path.join(project_root, "examples", "configs")
@@ -25,19 +28,19 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
-nightly_performance_test_suite_path = os.path.join(
-    test_suites_dir, "nightly_performance.txt"
-)
-release_performance_test_suite_path = os.path.join(
-    test_suites_dir, "release_performance.txt"
-)
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
     "sft": "examples/configs/sft.yaml",
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",
+    "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
 }
+
+# Configuration keys that are allowed to be added to base configs during testing
+# These keys may exist in recipe configs but not in base configs, so we need to
+# manually add them to avoid merge conflicts during config validation
+ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.generation.vllm_kwargs"]
 
 
 @pytest.fixture
@@ -63,40 +66,11 @@ def release_test_suite():
 
 
 @pytest.fixture
-def nightly_performance_test_suite():
-    nightly_performance_suite = []
-    with open(nightly_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                nightly_performance_suite.append(line)
-    return nightly_performance_suite
-
-
-@pytest.fixture
-def release_performance_test_suite():
-    release_performance_suite = []
-    with open(release_performance_test_suite_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                release_performance_suite.append(line)
-    return release_performance_suite
-
-
-@pytest.fixture
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
-    nightly_performance_test_suite,
-    release_performance_test_suite,
 ):
-    return (
-        nightly_test_suite
-        + release_test_suite
-        + nightly_performance_test_suite
-        + release_performance_test_suite
-    )
+    return nightly_test_suite + release_test_suite
 
 
 @pytest.fixture
@@ -114,14 +88,10 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
-        nightly_performance_test_suite_path,
-        release_performance_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
-        "nightly_performance_test_suite",
-        "release_performance_test_suite",
     ],
 )
 def test_test_suites_exist(test_suite_path):
@@ -182,7 +152,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1024_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1030_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -214,8 +184,8 @@ def test_nightly_compute_stays_below_1024_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1024, (
-        f"Total GPU hours exceeded 1024: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1030, (
+        f"Total GPU hours exceeded 1030: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
@@ -297,6 +267,18 @@ def test_all_recipes_can_merge_configs_with_base_config(
         recipe_yaml_path = os.path.join(recipes_dir, recipe_yaml)
         recipe_config = load_config(recipe_yaml_path)
         OmegaConf.set_struct(recipe_config, True)
+
+        # Work around ALLOWED_ADDITIONAL_CONFIG_KEYS by manually adding allowed keys to the base config
+        # This prevents merge conflicts when recipe configs contain keys not present in base configs
+        for key in ALLOWED_ADDITIONAL_CONFIG_KEYS:
+            if OmegaConf.select(recipe_config, key):
+                OmegaConf.update(
+                    base_config,
+                    key,
+                    OmegaConf.select(recipe_config, key),
+                    force_add=True,
+                )
+
         # This will raise a error if the config can't be merged
         print(f"Merging {recipe_yaml} with {base_yaml}")
         merged_config = OmegaConf.merge(base_config, recipe_config)

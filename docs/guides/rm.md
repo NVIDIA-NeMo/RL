@@ -21,4 +21,93 @@ The default YAML config shares the same base template as the SFT config but incl
 
 ## Datasets
 
-By default, NeMo RL supports the `HelpSteer3` dataset. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+Each RM dataset class is expected to have the following attributes:
+1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
+```json
+{
+  "context": [], // list of dicts - The prompt message (including previous turns, if any)
+  "completions": [ // list of dicts — The list of completions
+    {
+      "rank": 0, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    },
+    {
+      "rank": 1, // int — The rank of the completion (lower rank is preferred)
+      "completion": [] // list of dicts — The completion message(s)
+    }
+  ]
+}
+```
+2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
+
+Currently, RM training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
+```json
+{
+    "context": [
+        {
+            "role": "user",
+            "content": "What's the capital of France?"
+        },
+        {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        },
+        {
+            "role": "user",
+            "content": "Thanks! And what's the capital of Germany?"
+        }
+    ],
+    "completions": [
+        {
+            "rank": 0,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Berlin."
+                }
+            ]
+        },
+        {
+            "rank": 1,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Munich."
+                }
+            ]
+        }
+    ]
+}
+```
+
+By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace.. You can modify your config as follows to use such a custom preference dataset:
+```yaml
+data:
+  dataset_name: PreferenceDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  # multiple validation sets is supported
+  val_data_paths:
+    <NameOfValidationDataset>: <PathToValidationDataset1>
+    <NameOfValidationDataset2>: <PathToValidationDataset2>
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+```
+
+We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
+```yaml
+data:
+  dataset_name: BinaryPreferenceDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  val_data_path: <PathToValidationDataset>
+  prompt_key: <PromptKey>, default is "prompt"
+  chosen_key: <ChosenKey>, default is "chosen"
+  rejected_key: <RejectedKey>, default is "rejected"
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+```
+
+Please note:
+- If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
+- If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.

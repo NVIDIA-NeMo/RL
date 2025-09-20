@@ -45,43 +45,59 @@ def pytest_addoption(parser):
         default=False,
         help="Run ONLY mcore tests (combine with --hf-gated to include mcore+hf_gated tests)",
     )
+    parser.addoption(
+        "--automodel-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY automodel tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     """Modify test collection to skip tests based on markers unless explicitly requested."""
     run_hf_gated = config.getoption("--hf-gated")
     run_mcore_only = config.getoption("--mcore-only")
+    run_automodel_only = config.getoption("--automodel-only")
+    assert not (run_mcore_only and run_automodel_only), (
+        "--mcore-only and --automodel-only are mutually exclusive"
+    )
     marker_expr = config.getoption("-m", default="")
 
-    # If user specified -m marker expressions, let pytest handle everything normally
+    # If user specified -m marker expressions, still prioritize run_first tests
     if marker_expr:
+        items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
         return
 
-    # Filter tests based on the desired configurations
-    new_items = []
+    # Start with all items and apply filters sequentially
+    new_items = list(items)
 
-    if run_mcore_only and run_hf_gated:
-        # Configuration 4: Only mcore tests, including ones with hf_gated
-        new_items = [item for item in items if item.get_closest_marker("mcore")]
-    elif run_mcore_only:
-        # Configuration 3: Only mcore tests, excluding ones with hf_gated
+    # Filter by hf_gated marker
+    if not run_hf_gated:
+        # Exclude hf_gated tests unless explicitly requested
         new_items = [
-            item
-            for item in items
-            if item.get_closest_marker("mcore")
-            and not item.get_closest_marker("hf_gated")
+            item for item in new_items if not item.get_closest_marker("hf_gated")
         ]
-    elif run_hf_gated:
-        # Configuration 2: Default tests + hf_gated tests, excluding mcore
-        new_items = [item for item in items if not item.get_closest_marker("mcore")]
+
+    # Filter by mcore marker
+    if run_mcore_only:
+        # Include only mcore tests
+        new_items = [item for item in new_items if item.get_closest_marker("mcore")]
     else:
-        # Configuration 1: Default only - exclude both hf_gated and mcore
+        # Exclude mcore tests by default
+        new_items = [item for item in new_items if not item.get_closest_marker("mcore")]
+
+    # Filter by automodel marker
+    if run_automodel_only:
+        # Include only automodel tests
+        new_items = [item for item in items if item.get_closest_marker("automodel")]
+    else:
+        # Exclude automodel tests by default
         new_items = [
-            item
-            for item in items
-            if not item.get_closest_marker("hf_gated")
-            and not item.get_closest_marker("mcore")
+            item for item in new_items if not item.get_closest_marker("automodel")
         ]
+
+    # Ensure run_first tests are prioritized
+    new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
 
     # Update the items list in-place
     items[:] = new_items
@@ -575,4 +591,50 @@ def tiny_gemma3_model_path():
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
     del model, tokenizer
+    yield model_path
+
+
+def _build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
+    import shutil
+
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    config = AutoConfig.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+    config.hybrid_override_pattern = "M*-"
+    config.num_hidden_layers = 3
+    config.intermediate_size = 32
+    config.hidden_size = 256
+    config.num_attention_heads = 8
+    config.mamba_num_heads = 8
+    config.num_key_value_heads = 8
+    config.n_groups = 1
+
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+
+
+@pytest.fixture(scope="session")
+def tiny_nemotron5_h_model_path():
+    """Fixture that returns a path to a tiny nemotron model with a dummy tokenizer.
+
+    If the asset hasn't been prepared by the prepare script, skip the tests that require it.
+    """
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_nemotron5_h_with_nemotron_tokenizer"
+    )
+
+    config_file = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_file):
+        pytest.skip(
+            "Tiny Nemotron-H test asset not prepared. Run `uv run tests/unit/prepare_unit_test_assets.py` first."
+        )
+
     yield model_path

@@ -26,7 +26,8 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import MathDataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, eval_collate_fn
+from nemo_rl.data.collate_fn import eval_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -485,6 +486,7 @@ def _print_results(
     dataset_name = os.path.basename(master_config["data"]["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
     max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
+    seed = master_config["eval"]["seed"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]
     top_k = generation_config["top_k"]
@@ -492,7 +494,7 @@ def _print_results(
 
     print("\n" + "=" * 60)
     print(f"{model_name=} {dataset_name=}")
-    print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=}\n")
+    print(f"{max_new_tokens=} {temperature=} {top_p=} {top_k=} {seed=}\n")
     print(f"metric={metric[:-1]}{k_value} {num_tests_per_prompt=}\n")
     print(f"score={average_score:.4f} ({score}/{dataset_size})")
     print("=" * 60 + "\n")

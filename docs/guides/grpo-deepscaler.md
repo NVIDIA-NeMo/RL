@@ -35,10 +35,16 @@ Throughout training, the checkpoints of the model will be saved to the `results`
 uv run examples/run_eval.py \
     generation.model_name=results/grpo-deepscaler-1.5b-8K/step_240/hf \
     data.prompt_file=examples/prompts/cot.txt \
-    generation.vllm_cfg.max_model_len=32768
+    generation.vllm_cfg.max_model_len=32768 \
+    generation.vllm_cfg.enforce_eager=True \
+    generation.temperature=1.0
 ```
 
 Use `generation.model_name` to specify the path to the Hugging Face checkpoint. In addition, we use AIME24 as the validation dataset and calculate pass@1 on it throughout training.
+
+> [!NOTE]
+> AIME24 only has 30 examples so the accuracy can be very noisy.
+> To reduce the variance consider runing `run_eval.py` with `eval.num_tests_per_prompt=16`.
 
 ## Evaluation Results
 Using the above instructions to train DeepSeek-R1-Distill-Qwen-1.5B on the DeepScaleR dataset, we can track the model's performance on the AIME24 benchmark throughout training. The following plot shows the evaluation metrics as training progresses:

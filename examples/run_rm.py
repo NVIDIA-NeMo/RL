@@ -23,8 +23,9 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.rm import MasterConfig, rm_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig, hf_datasets
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
+from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -56,12 +57,23 @@ def rm_preprocessor(
     idx: int,
 ) -> DatumSpec:
     """Process a datum dictionary for RM training."""
-    messages_chosen = datum_dict["prompt"] + [
-        {"role": "assistant", "content": datum_dict["chosen_response"]}
-    ]
-    messages_rejected = datum_dict["prompt"] + [
-        {"role": "assistant", "content": datum_dict["rejected_response"]}
-    ]
+    assert len(datum_dict["completions"]) == 2, (
+        "RM training supports only two completions"
+    )
+    # Lower rank is preferred
+    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][0]
+        rejected_completion = datum_dict["completions"][1]
+    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][1]
+        rejected_completion = datum_dict["completions"][0]
+    else:
+        raise NotImplementedError(
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+        )
+
+    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
+    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 
     message_log_chosen = get_formatted_message_log(
         messages_chosen, tokenizer, task_data_spec
@@ -109,18 +121,16 @@ def rm_preprocessor(
 
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
-    data_cls = data_config["dataset_name"]
 
-    if data_cls == "HelpSteer3":
-        data = hf_datasets.HelpSteer3Dataset()
-    else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
-    )
-
+    # load dataset
+    data = load_preference_dataset(data_config)
     train_dataset = data.formatted_ds["train"]
     val_dataset = data.formatted_ds["validation"]
+
+    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
+    if val_dataset:
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
+
     rm_task_spec = data.task_spec
 
     train_dataset = AllTaskProcessedDataset(
@@ -131,13 +141,42 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    val_dataset = AllTaskProcessedDataset(
-        val_dataset,
-        tokenizer,
-        rm_task_spec,
-        rm_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    # TODO @yukih: unify the code when support multiple datasets for other algorithms
+    if "val_data_paths" in data_config and data_config["val_data_paths"]:
+        val_dataset = {}
+
+        assert isinstance(data_config["val_data_paths"], dict), (
+            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
+        )
+        val_data_paths = data_config["val_data_paths"]
+
+        for val_dataset_name, val_dataset_path in val_data_paths.items():
+            assert val_dataset_name not in val_dataset
+            val_data = PreferenceDataset(val_dataset_path)
+            print(
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
+            )
+            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
+                val_data.formatted_ds["train"],
+                tokenizer,
+                val_data.task_spec,
+                rm_preprocessor,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+    else:
+        val_dataset = (
+            {
+                "default": AllTaskProcessedDataset(
+                    val_dataset,
+                    tokenizer,
+                    rm_task_spec,
+                    rm_preprocessor,
+                    max_seq_length=data_config["max_input_seq_length"],
+                )
+            }
+            if val_dataset
+            else {}
+        )
 
     return train_dataset, val_dataset, rm_task_spec
 

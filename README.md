@@ -76,11 +76,10 @@ What you can expect:
 
 Clone **NeMo RL**.
 ```sh
-git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are using the Megatron backend, download the pinned versions of Megatron-LM and NeMo submodules 
-# by running (This is not necessary if you are using the pure Pytorch/DTensor path):
+# If you are already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -101,8 +100,16 @@ dpkg -l | grep cudnn.*cuda
 # As an example, these are the "Linux Ubuntu 20.04 x86_64" instructions
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
+# sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
+# sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
+```
+
+If you encounter problems when installing vllm's dependency deep_ep on bare-metal (outside of a container), you may need to install libibverbs-dev as well. Here is how you can install it:
+```sh
 sudo apt-get update
-sudo apt-get install cudnn-cuda-12
+sudo apt-get install libibverbs-dev
 ```
 
 For faster setup and environment isolation, we use [uv](https://docs.astral.sh/uv/).
@@ -127,7 +134,7 @@ bash tools/build-flash-attn-in-uv-cache.sh
 > The NeMo RL Dockerfile will warm the uv cache with flash-attn.
 > See https://docs.nvidia.com/nemo/rl/latest/docker.html for instructions if you are looking for the NeMo RL container.
 
-If sucessful, you should see `✅ flash-attn successfully added to uv cache`.
+If successful, you should see `✅ flash-attn successfully added to uv cache`.
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 > [!NOTE]
@@ -471,6 +478,24 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
   ```sh
   NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
+  ```
+
+- Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
+  If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  at **either** one of the following places:
+  1. Launch training with:
+  ```sh
+  # This will globally apply to all ray actors
+  PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
+  ```
+  2. Make the change more permanently by adding this flag in the training configuration:
+  ```yaml
+  policy:
+    # ...
+    dtensor_cfg:
+      env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
   ```
 
 ## Citation
