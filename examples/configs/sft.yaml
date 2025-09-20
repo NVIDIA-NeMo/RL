@@ -136,6 +136,7 @@ data:
   add_eos: true
   add_generation_prompt: false
   shuffle: true
+  num_workers: 1
 
   dataset_name: "squad"
   # You can use custom response datasets for training and validation. For example:
