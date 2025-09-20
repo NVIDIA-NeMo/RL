@@ -111,37 +111,34 @@ jobs:
     env:
       MAX_COMMITS_BEHIND: 10
     steps:
-      - name: Checkout repository with full history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Check how many commits behind target branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
         run: |
-          # Get the target branch name (e.g., 'main')
-          TARGET_BRANCH="${{ github.base_ref }}"
-          PR_BRANCH="${{ github.head_ref }}"
-          PR_SHA="${{ github.event.pull_request.head.sha }}"
-
-          echo "Target branch: $TARGET_BRANCH"
-          echo "PR branch: $PR_BRANCH"
-          echo "PR SHA: $PR_SHA"
-          echo "Current HEAD: $(git rev-parse HEAD)"
+          echo "Repository: $REPO"
+          echo "Base branch: $BASE_REF (SHA: $BASE_SHA)"
+          echo "PR head: $HEAD_LABEL (SHA: $HEAD_SHA)"
           echo "Maximum commits behind allowed: $MAX_COMMITS_BEHIND"
 
-          # Fetch the target branch and the actual PR branch head
-          git fetch origin "$TARGET_BRANCH"
-          git fetch origin "$PR_BRANCH"
+          # Use GitHub API to compare commits
+          API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_SHA" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
 
-          # Count commits that are in target branch but not in the actual PR head
-          COMMITS_BEHIND=$(git rev-list --count "$PR_SHA..origin/$TARGET_BRANCH")
+          COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.behind_by')
+          COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
+          STATUS=$(echo "$API_RESPONSE" | jq -r '.status')
 
-          echo "PR head ($PR_SHA) is $COMMITS_BEHIND commits behind $TARGET_BRANCH"
+          echo "Comparison status: $STATUS"
+          echo "PR is $COMMITS_BEHIND commits behind and $COMMITS_AHEAD commits ahead of $BASE_REF"
 
           # Check if we're behind by more than the allowed number
           if [ "$COMMITS_BEHIND" -gt "$MAX_COMMITS_BEHIND" ]; then
-            echo "❌ ERROR: This PR is $COMMITS_BEHIND commits behind $TARGET_BRANCH, which exceeds the maximum allowed ($MAX_COMMITS_BEHIND commits)."
-            echo "Please rebase or merge the latest changes from $TARGET_BRANCH into your PR branch."
+            echo "❌ ERROR: This PR is $COMMITS_BEHIND commits behind $BASE_REF, which exceeds the maximum allowed ($MAX_COMMITS_BEHIND commits)."
+            echo "Please rebase or merge the latest changes from $BASE_REF into your PR branch."
             exit 1
           else
             echo "✅ PR is acceptably fresh ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
@@ -302,7 +299,7 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
-              needs.pr-branch-up-to-date-check.result == 'success' &&
+              (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
                 needs.pre-flight.outputs.test_level == 'none' ||
                 (
