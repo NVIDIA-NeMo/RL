@@ -19,6 +19,7 @@ import warnings
 from typing import Any
 
 from omegaconf import OmegaConf
+from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.dpo import MasterConfig, dpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -28,7 +29,6 @@ from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
@@ -163,7 +163,7 @@ def dpo_preprocessor(
     return output
 
 
-def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
 
     # load dataset
@@ -177,7 +177,6 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
 
     dpo_task_spec = data.task_spec
 
-    tokenizer = get_tokenizer(policy_config["tokenizer"])
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
         tokenizer,
@@ -223,7 +222,7 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
             else {}
         )
 
-    return train_dataset, val_dataset, tokenizer, dpo_task_spec
+    return train_dataset, val_dataset, dpo_task_spec
 
 
 def main():
@@ -256,10 +255,16 @@ def main():
 
     init_ray()
 
+    # setup tokenizer
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+
     # setup data
-    train_dataset, val_dataset, tokenizer, dpo_task_spec = setup_data(
-        config["data"], config["policy"]
-    )
+    (
+        train_dataset,
+        val_dataset,
+        dpo_task_spec,
+    ) = setup_data(tokenizer, config["data"])
+
     (
         policy,
         cluster,
@@ -271,6 +276,7 @@ def main():
         dpo_save_state,
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
+
     dpo_train(
         policy,
         train_dataloader,
