@@ -20,12 +20,12 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.datasets.response_datasets import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
+from nemo_rl.data.processors import math_hf_data_processor
 from nemo_rl.models.policy import TokenizerConfig
 
 # Test configuration
@@ -55,9 +55,9 @@ def create_dataloader(
     )
 
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (math_task_spec, hf_data_processor))
+        defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, hf_data_processor)
+    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         dataset=data.formatted_ds["train"].select(range(1000)),
