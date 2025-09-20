@@ -295,7 +295,7 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
-              pr-branch-up-to-date-check.result == 'success' &&
+              needs.pr-branch-up-to-date-check.result == 'success' &&
               (
                 needs.pre-flight.outputs.test_level == 'none' ||
                 (
