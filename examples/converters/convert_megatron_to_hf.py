@@ -19,8 +19,16 @@ import yaml
 from nemo_rl.models.megatron.community_import import export_model_from_megatron
 
 """ NOTE: this script requires mcore. Make sure to launch with the mcore extra:
+
+Option 1 - Using config file:
 uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
   --config <path_to_ckpt>/config.yaml \
+  --megatron-ckpt-path <path_to_ckpt>/policy/weights/iter_xxxxx \
+  --hf-ckpt-path <path_to_save_hf_ckpt>
+
+Option 2 - Using HF model name directly:
+uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
+  --hf-model <hf_model_name> \
   --megatron-ckpt-path <path_to_ckpt>/policy/weights/iter_xxxxx \
   --hf-ckpt-path <path_to_save_hf_ckpt>
 """
@@ -38,6 +46,12 @@ def parse_args():
         help="Path to config.yaml file in the checkpoint directory",
     )
     parser.add_argument(
+        "--hf-model",
+        type=str,
+        default=None,
+        help="HuggingFace model name to use directly (alternative to --config)",
+    )
+    parser.add_argument(
         "--megatron-ckpt-path",
         type=str,
         default=None,
@@ -49,6 +63,10 @@ def parse_args():
     # Parse known args for the script
     args = parser.parse_args()
 
+    # Validate that either config or hf_model is provided, but not both (XOR)
+    if not (bool(args.config) ^ bool(args.hf_model)):
+        parser.error("Exactly one of --config or --hf-model must be provided.")
+
     return args
 
 
@@ -56,17 +74,22 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+    if args.config:
+        # Load model and tokenizer names from config file and populate args
+        with open(args.config, "r") as f:
+            config = yaml.safe_load(f)
 
-    model_name = config["policy"]["model_name"]
-    tokenizer_name = config["policy"]["tokenizer"]["name"]
+        args.hf_model = config["policy"]["model_name"]
+        args.hf_tokenizer = config["policy"]["tokenizer"]["name"]
+    else:
+        # Use the provided hf_model name for both model and tokenizer
+        args.hf_tokenizer = args.hf_model
 
     export_model_from_megatron(
-        hf_model_name=model_name,
+        hf_model_name=args.hf_model,
         input_path=args.megatron_ckpt_path,
         output_path=args.hf_ckpt_path,
-        hf_tokenizer_path=tokenizer_name,
+        hf_tokenizer_path=args.hf_tokenizer,
     )
 
 

@@ -105,10 +105,6 @@ def export_model_from_megatron(
         )
 
     bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
-    megatron_model = bridge.load_megatron_model(input_path)
-    bridge.save_hf_pretrained(megatron_model, output_path)
-
-    # resetting mcore state
-    import megatron.core.rerun_state_machine
-
-    megatron.core.rerun_state_machine.destroy_rerun_state_machine()
+    bridge.export_ckpt(
+        megatron_path=input_path, hf_path=output_path, show_progress=True
+    )
