@@ -1,0 +1,148 @@
+distillation:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 100
+  val_batch_size: 32
+  val_period: 10
+  val_at_start: false
+  max_val_samples: 256
+  topk_logits_k: 64
+  seed: 42
+
+loss_fn:
+  temperature: 1.0
+  kl_type: "reverse"
+  mixed_kl_weight: 0.5
+  zero_outside_topk: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/distillation-qwen3-32b-to-8b-base"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+
+policy: &POLICY_BASE
+  model_name: "Qwen/Qwen3-8B-Base"
+  tokenizer:
+    name: ${..model_name}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  precision: "bfloat16"
+  
+  dtensor_cfg: &DTENSOR_BASE
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 2
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: 2
+  max_grad_norm: 1.0
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 2.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${..max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${...precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      enable_expert_parallel: false
+      gpu_memory_utilization: 0.6
+      max_model_len: ${...max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      distributed_executor_backend: null
+
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+teacher:
+  <<: *POLICY_BASE
+  model_name: "Qwen/Qwen3-32B"
+  dtensor_cfg:
+    <<: *DTENSOR_BASE
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  prompt_file: "examples/prompts/cot.txt"
+  system_prompt_file: null
+  dataset_name: "DeepScaler"
+  shuffle: true
+
+env:
+  math:
+    num_workers: 8
+
+logger:
+  log_dir: "logs/distillation-qwen3-32b-to-8b-base"
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "nemo-rl"
+    name: "distillation-qwen3-32b-to-8b-base"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
