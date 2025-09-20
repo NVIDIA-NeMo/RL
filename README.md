@@ -100,8 +100,10 @@ dpkg -l | grep cudnn.*cuda
 # As an example, these are the "Linux Ubuntu 20.04 x86_64" instructions
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-sudo apt-get install cudnn-cuda-12
+sudo apt update
+sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
+# sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
+# sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
 ```
 
 If you encounter problems when installing vllm's dependency deep_ep on bare-metal (outside of a container), you may need to install libibverbs-dev as well. Here is how you can install it:
