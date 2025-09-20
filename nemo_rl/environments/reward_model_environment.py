@@ -340,20 +340,20 @@ class RewardModelEnvironment(EnvironmentInterface):
             The environment will also automatically call this method in its destructor,
             but it's recommended to call it explicitly for better resource management.
         """
-        if self.reward_model_policy is not None:
+        if (
+            hasattr(self, "reward_model_policy")
+            and self.reward_model_policy is not None
+        ):
             try:
                 self.reward_model_policy.shutdown()
             except Exception as e:
                 print(f"Warning: Error shutting down reward model policy: {e}")
             self.reward_model_policy = None
-
-        if self.virtual_cluster is not None:
             try:
                 self.virtual_cluster.shutdown()
             except Exception as e:
                 print(f"Warning: Error shutting down virtual cluster: {e}")
             self.virtual_cluster = None
-        ray.actor.exit_actor()
 
     def __del__(self):
         """Destructor that ensures proper cleanup when the object is garbage collected.
@@ -364,4 +364,3 @@ class RewardModelEnvironment(EnvironmentInterface):
         management.
         """
         self.shutdown()
-        ray.actor.exit_actor()
