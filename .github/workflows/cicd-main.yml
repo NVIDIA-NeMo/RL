@@ -325,12 +325,6 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "$TEST_LEVEL" == "none" ]]; then
-            echo "No tests were run, passing gate" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
   Coverage:
