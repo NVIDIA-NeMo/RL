@@ -103,6 +103,43 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
+  pr-branch-up-to-date-check:
+    name: Check if PR branch is up to date
+    needs: [pre-flight]
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    env:
+      MAX_COMMITS_BEHIND: 10
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check how many commits behind target branch
+        run: |
+          # Get the target branch name (e.g., 'main')
+          TARGET_BRANCH="${{ github.base_ref }}"
+          PR_BRANCH="${{ github.head_ref }}"
+
+          echo "Target branch: $TARGET_BRANCH"
+          echo "PR branch: $PR_BRANCH"
+          echo "Maximum commits behind allowed: $MAX_COMMITS_BEHIND"
+
+          git fetch origin "$TARGET_BRANCH"
+          COMMITS_BEHIND=$(git rev-list --count "HEAD..origin/$TARGET_BRANCH")
+
+          echo "PR is $COMMITS_BEHIND commits behind $TARGET_BRANCH"
+
+          # Check if we're behind by more than the allowed number
+          if [ "$COMMITS_BEHIND" -gt "$MAX_COMMITS_BEHIND" ]; then
+            echo "❌ ERROR: This PR is $COMMITS_BEHIND commits behind $TARGET_BRANCH, which exceeds the maximum allowed ($MAX_COMMITS_BEHIND commits)."
+            echo "Please rebase or merge the latest changes from $TARGET_BRANCH into your PR."
+            exit 1
+          else
+            echo "✅ PR is acceptably fresh ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
+          fi
+
   lint-check:
     name: Lint check
     needs: [pre-flight]
@@ -243,6 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - commit-freshness-check
       - lint-check
       - sphinx-build
       - build-container
@@ -257,6 +295,7 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
+              (needs.commit-freshness-check.result == 'skipped' || needs.commit-freshness-check.result == 'success') &&
               (
                 needs.pre-flight.outputs.test_level == 'none' ||
                 (
