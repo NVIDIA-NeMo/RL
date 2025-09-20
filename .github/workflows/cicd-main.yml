@@ -125,8 +125,7 @@ jobs:
           echo "PR head: $HEAD_LABEL (SHA: $HEAD_SHA)"
           echo "Maximum commits behind allowed: $MAX_COMMITS_BEHIND"
 
-          # Use GitHub API to compare commits
-          API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_SHA" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
+          API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_REF" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
 
           COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.behind_by')
           COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
