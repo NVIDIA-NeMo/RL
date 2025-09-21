@@ -1,0 +1,15 @@
+defaults: "examples/penguin/grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
+
+grpo:
+  val_period: 1
+  num_prompts_per_step: 1024
+
+policy:
+  # Here, we use the Deepseek R1 train efficiency batching optimization
+  # We generate one massive batch of rollouts and then take up to 16 steps off policy in one "grpo iteration"
+  # Our base batch size is grpo.num_prompts_per_step = 64 and grpo.num_generations_per_prompt = 16, which yields a total of 1024 prompts.
+  # That's why the train_global_batch_size is 1024.
+  # But since we want to take up to 16 steps off policy, our actual grpo.num_prompts_per_step must be set to 16 times higher than it actually is
+  # So the input grpo.num_prompts_per_step = 64 * 16 = 1024.
+  # The grpo.num_prompts_per_step policy.train_global_batch_size and are NOT always equal, they just happen to be in this case since that's how the math works out.
+  train_global_batch_size: 1024
