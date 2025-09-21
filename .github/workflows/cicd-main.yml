@@ -340,7 +340,7 @@ jobs:
     steps:
       - name: Send Slack notification
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
         run: |
           MESSAGE='{
             "blocks": [
