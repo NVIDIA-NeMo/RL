@@ -30,6 +30,7 @@ class PenguinConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    total_num_rollouts: int
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -56,6 +57,11 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+
+        # Set the connection configuration since we know the full batch size ahead-of-time.
+        initial_global_config_dict["global_aiohttp_connector_limit"] = cfg["total_num_rollouts"]
+        assert cfg["total_num_rollouts"] % len(self.cfg["base_urls"]), f"Total number of rollouts ({cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {

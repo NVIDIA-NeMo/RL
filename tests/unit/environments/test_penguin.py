@@ -86,6 +86,7 @@ openai_model:
         model_name=penguin_vllm_generation.cfg["model_name"],
         base_urls=penguin_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        total_num_rollouts=1024,  # Idk, just some medium ish number for use in tests. If need be, this can be bumped up.
     )
     env = Penguin.options(
         runtime_env={
