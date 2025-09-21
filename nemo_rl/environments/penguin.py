@@ -47,7 +47,8 @@ class Penguin(EnvironmentInterface):
 
         from omegaconf import DictConfig
         from penguin.cli import RunHelper, GlobalConfigDictParserConfig
-        from penguin.server_utils import HEAD_SERVER_KEY_NAME
+        from penguin.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from penguin.rollout_collection import RolloutCollectionHelper
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
@@ -84,33 +85,23 @@ Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances
             )
         )
 
+        # Setup for rollout collection
+        self.head_server_config = BaseServerConfig(
+            host=self.node_ip,
+            port=self.head_server_port,
+        )
+        self.rch = RolloutCollectionHelper()
+
     def health_check(self) -> bool:
         return True
 
     async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        penguin_results = await self._call_penguin_for_rollouts(penguin_examples)
+        penguin_results = await self.rch.run_examples(
+            examples=penguin_examples, head_server_config=self.head_server_config
+        )
 
         nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
         return nemo_rl_results
-
-    async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
-        from penguin.server_utils import ServerClient, BaseServerConfig
-
-        head_server_config = BaseServerConfig(
-            host=self.node_ip,
-            port=self.head_server_port,
-        )
-        server_client = ServerClient.load_from_global_config(head_server_config)
-
-        async def _post_subroutine(row: dict) -> dict:
-            res = await server_client.post(
-                server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
-            )
-            return await res.json()
-
-        return await tqdm.gather(
-            *map(_post_subroutine, examples), desc="Collecting Penguin rollouts"
-        )
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
         nemo_rl_message_log = []
