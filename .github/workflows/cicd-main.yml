@@ -336,11 +336,11 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'success' }}
+    if: ${{ always() && needs.CI_QA_Gate.result == 'success' }}
     steps:
       - name: Send Slack notification
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_GITHUB_CI_WEBHOOK }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
         run: |
           MESSAGE_TEXT="🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: \`${{ github.sha }}\`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
 
