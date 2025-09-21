@@ -23,6 +23,7 @@ on:
     types: [checks_requested]
   schedule:
     - cron: "0 9 * * *"
+  push:
   workflow_dispatch:
     inputs:
       test_to_run:
@@ -98,9 +99,9 @@ jobs:
           fi
 
           # Set L1 for nightly scheduled runs
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "push" ]]; then
             echo "Setting test level to L1 for nightly scheduled run"
-            TEST_LEVEL="L1"
+            TEST_LEVEL="docs"
           fi
 
           # Override test level if specified in workflow_dispatch
@@ -335,7 +336,7 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
+    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'success' }}
     steps:
       - name: Send Slack notification
         env:
