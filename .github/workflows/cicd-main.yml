@@ -336,6 +336,7 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
+    environment: main
     if: ${{ always() && needs.CI_QA_Gate.result == 'success' }}
     steps:
       - name: Send Slack notification
