@@ -59,9 +59,13 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
         # Set the connection configuration since we know the full batch size ahead-of-time.
-        initial_global_config_dict["global_aiohttp_connector_limit"] = cfg["total_num_rollouts"]
-        assert cfg["total_num_rollouts"] % len(self.cfg["base_urls"]), f"Total number of rollouts ({cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
+        initial_global_config_dict["global_aiohttp_connector_limit"] = self.cfg["total_num_rollouts"]
+        assert self.cfg["total_num_rollouts"] % len(self.cfg["base_urls"]), f"Total number of rollouts ({self.cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = self.cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
+        print(
+            f"""Penguin was configured with max rollouts {self.cfg['total_num_rollouts']}, so the `global_aiohttp_connector_limit` has been set to the same {self.cfg['total_num_rollouts']}.
+Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances, and each instance will receive {self.cfg['total_num_rollouts']} // {len(self.cfg['base_urls'])} = {initial_global_config_dict['global_aiohttp_connector_limit_per_host']} examples. `global_aiohttp_connector_limit_per_host` has been set to the same {initial_global_config_dict['global_aiohttp_connector_limit_per_host']}."""
+        )
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
