@@ -13,3 +13,8 @@ policy:
   # So the input grpo.num_prompts_per_step = 64 * 16 = 1024.
   # The grpo.num_prompts_per_step policy.train_global_batch_size and are NOT always equal, they just happen to be in this case since that's how the math works out.
   train_global_batch_size: 1024
+
+checkpointing:
+  # Since we are doing larger batch rollouts, it's even more important that we stay efficient.
+  # Normally we don't need to set this since we checkpoint every step, but now we are checkpointing only every "16 steps".
+  checkpoint_must_save_by: "00:03:45:00"
