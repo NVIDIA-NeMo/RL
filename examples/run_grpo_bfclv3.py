@@ -81,61 +81,37 @@ class JsonlinesDataset:
         data = self.data[idx]
         # support single turn for now
         assert len(data["messages"]) == 1
+
         single_message = data["messages"][0]
 
         message_log = []
 
-        # Extract system and user prompts separately
-        system_prompt = ""
-        user_prompt = ""
-        extra_env_info = {}
-        
+        # this will also contain system prompt
+        user_message = {"role": "user"}
+
         for m in single_message:
-            if m["role"] == "system":
-                system_prompt = m["content"]
-                # Create system message entry for message_log
-                sys_message = {"role": "system", "content": system_prompt}
-                sys_content = self.tokenizer.apply_chat_template(
-                    [sys_message],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    add_special_tokens=False,
-                )
-                sys_message["token_ids"] = self.tokenizer.apply_chat_template(
-                    [sys_message],
-                    tokenize=True,
-                    add_generation_prompt=False,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )[0]
-                sys_message["content"] = sys_content
-                message_log.append(sys_message)
-                
-            elif m["role"] == "user":
-                user_prompt = m["content"]
+            if m["role"] == "user":
                 # need to be deepcopy to avoid overwriting the original metadata
-                if "metadata" in m:
-                    extra_env_info = deepcopy(m["metadata"])
-                
-                # Create user message entry for message_log
-                user_message = {"role": "user", "content": user_prompt}
-                user_content = self.tokenizer.apply_chat_template(
-                    [user_message],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    add_special_tokens=False,
-                )
-                user_message["token_ids"] = self.tokenizer.apply_chat_template(
-                    [user_message],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )[0]
-                user_message["content"] = user_content
-                message_log.append(user_message)
+                extra_env_info = deepcopy(m["metadata"])
+
+        message = self.tokenizer.apply_chat_template(
+            single_message,
+            tokenize=False,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )
+        user_message["token_ids"] = self.tokenizer.apply_chat_template(
+            single_message,
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )[0]
+        user_message["content"] = message
+        message_log.append(user_message)
 
         length = sum(len(m["token_ids"]) for m in message_log)
+  
         #print("message log ", message_log)
         output = {
             "message_log": message_log,
@@ -145,8 +121,8 @@ class JsonlinesDataset:
             "idx": idx,
             "task_name": data["task_name"],
             "dataset": data["dataset"],
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
+            # "system_prompt": system_prompt,
+            # "user_prompt": user_prompt,
         }
 
         return output

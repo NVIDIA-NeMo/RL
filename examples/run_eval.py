@@ -65,15 +65,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
         rekeyed_ds = base_dataset.data
     #print(rekeyed_ds)
 
-    if env_configs["math"]["enable"]:
-        env = MathEnvironment.options(
-            runtime_env={
-                "py_executable": get_actor_python_env(
-                    "nemo_rl.environments.math_environment.MathEnvironment"
-                )
-            }
-        ).remote(env_configs["math"])
-    elif env_configs["bfcl_multiturn"]["enable"]:
+    if env_configs["bfcl_multiturn"]["enable"]:
         env = MultiTurnToolEnvironment.options(
             runtime_env={
                 "py_executable": get_actor_python_env(
