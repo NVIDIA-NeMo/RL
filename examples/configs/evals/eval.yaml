@@ -5,7 +5,6 @@ eval:
   seed: 42
   k_value: 1
   save_path: null # Path to save evaluation results and configuration of the evaluation. Set to null to disable saving. Example: "results/eval_output" or "/path/to/evaluation_results"
-  pass_k_threshold: 1.2 # Optional: minimum reward value to consider as "correct" for pass@k metric (default: 1.0)
 
 generation:
   backend: "vllm" # only vllm is supported for evaluation
@@ -48,9 +47,8 @@ data:
 
 env:
   math:
-    enable: false
     num_workers: 8
 
 cluster:
-  gpus_per_node: 2
+  gpus_per_node: 1
   num_nodes: 1
