@@ -321,6 +321,12 @@ def validate_one_dataset(
 
         dict_val_metrics = defaultdict(list)
         num_valid_batches = 0
+        # Prepare JSONL dump path
+        dump_dir = Path(master_config["logger"]["log_dir"]) / "validation"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_fp = dump_dir / f"{dataset_name}_pairs_step_{step}.jsonl"
+        import json as _json
+        fout = open(dump_fp, "w")
         for batch_idx, val_batch in enumerate(val_dataloader):
             # When running validation with drop_last=False, we might end up with a partial batch.
             # In this case, we pad the batch to the next multiple of micro_batch_size * dp_size.
@@ -352,8 +358,182 @@ def validate_one_dataset(
 
                 num_valid_batches += 1
 
+                # Emit JSONL per-pair entries with explicit idx→reward alignment
+                # Prefer worker-returned per-sample idx ordering when available
+                per_pair_chosen = (
+                    val_results["all_mb_metrics"].get("per_pair_reward_chosen") or []
+                )
+                per_pair_rejected = (
+                    val_results["all_mb_metrics"].get("per_pair_reward_rejected") or []
+                )
+                per_sample_idx = val_results["all_mb_metrics"].get("per_sample_idx") or []
+                per_sample_rewards = val_results["all_mb_metrics"].get("per_sample_rewards") or []
+                per_sample_raw = val_results["all_mb_metrics"].get("per_sample_raw_logits") or []
+                per_sample_is_chosen = val_results["all_mb_metrics"].get("per_sample_is_chosen") or []
+                per_sample_mask = val_results["all_mb_metrics"].get("per_sample_mask") or []
+                # Flatten helpers
+                def _flat(x):
+                    out = []
+                    for v in x:
+                        if hasattr(v, "tolist"):
+                            out.extend(v.tolist())
+                        elif isinstance(v, (list, tuple)):
+                            out.extend(list(v))
+                        else:
+                            out.append(v)
+                    return out
+                per_pair_chosen = _flat(per_pair_chosen)
+                per_pair_rejected = _flat(per_pair_rejected)
+                per_sample_idx = _flat(per_sample_idx)
+                per_sample_rewards = _flat(per_sample_rewards)
+                per_sample_raw = _flat(per_sample_raw)
+                per_sample_is_chosen = _flat(per_sample_is_chosen)
+                per_sample_mask = _flat(per_sample_mask)
+
+                # Build idx->(chosen,rejected) map using per_sample_idx order if available
+                idx_to_rewards: dict[int, tuple[float,float]] = {}
+                idx_to_source: dict[int, str] = {}
+                if per_sample_idx and per_sample_rewards and len(per_sample_rewards) == len(per_sample_idx):
+                    # Build per-pair rewards without assuming strict adjacency, using is_chosen flags when available
+                    tmp: dict[int, dict[str, float]] = {}
+                    for pos, (idx_val_raw, reward_val) in enumerate(zip(per_sample_idx, per_sample_rewards)):
+                        # Skip masked/padded samples
+                        if per_sample_mask and pos < len(per_sample_mask):
+                            try:
+                                if float(per_sample_mask[pos]) <= 0:
+                                    continue
+                            except Exception:
+                                pass
+                        try:
+                            idx_val = int(idx_val_raw)
+                        except Exception:
+                            continue
+                        is_chosen = None
+                        if per_sample_is_chosen and pos < len(per_sample_is_chosen):
+                            try:
+                                is_chosen = int(per_sample_is_chosen[pos])
+                            except Exception:
+                                is_chosen = None
+                        entry = tmp.setdefault(idx_val, {})
+                        if is_chosen == 1:
+                            entry["chosen"] = float(reward_val)
+                        elif is_chosen == 0:
+                            entry["rejected"] = float(reward_val)
+                        else:
+                            # Fallback to parity if flags missing
+                            if (pos % 2) == 0:
+                                entry.setdefault("chosen", float(reward_val))
+                            else:
+                                entry.setdefault("rejected", float(reward_val))
+                    for idx_val, parts in tmp.items():
+                        if "chosen" in parts and "rejected" in parts:
+                            idx_to_rewards[idx_val] = (parts["chosen"], parts["rejected"])  # type: ignore[index]
+                            idx_to_source[idx_val] = "per_sample"
+                elif per_sample_idx and len(per_sample_idx) % 2 == 0 and len(per_pair_chosen) * 2 == len(per_sample_idx):
+                    for p, i in enumerate(range(0, len(per_sample_idx), 2)):
+                        idx_val = int(per_sample_idx[i])
+                        rw_c = float(per_pair_chosen[p]) if p < len(per_pair_chosen) else None
+                        rw_r = float(per_pair_rejected[p]) if p < len(per_pair_rejected) else None
+                        if rw_c is not None and rw_r is not None:
+                            idx_to_rewards[idx_val] = (rw_c, rw_r)
+                            idx_to_source[idx_val] = "per_pair"
+                else:
+                    # Fallback: rely on current batch idx ordering
+                    idx_seq = val_batch["idx"]
+                    pair_indices = []
+                    for i in range(0, len(idx_seq), 2):
+                        try:
+                            pair_indices.append(int(idx_seq[i]))
+                        except Exception:
+                            continue
+                    for p, idx_val in enumerate(pair_indices):
+                        rw_c = float(per_pair_chosen[p]) if p < len(per_pair_chosen) else None
+                        rw_r = float(per_pair_rejected[p]) if p < len(per_pair_rejected) else None
+                        if rw_c is not None and rw_r is not None:
+                            idx_to_rewards[idx_val] = (rw_c, rw_r)
+                            idx_to_source[idx_val] = "fallback"
+
+                # Helper to extract formatted text and token ids stored by preprocessor in dataset items
+                # These are not in the collated tensors; recover from message logs present in batch
+                msg_logs = val_batch["message_log"]
+                flat_ids_batch = val_batch.get("input_ids")
+                flat_lens_batch = val_batch.get("input_lengths")
+                # Recompute pair indices from current batch message logs
+                batch_pair_indices = []
+                idx_seq_batch = val_batch["idx"]
+                for i in range(0, len(idx_seq_batch), 2):
+                    try:
+                        batch_pair_indices.append(int(idx_seq_batch[i]))
+                    except Exception:
+                        continue
+                for pair_i, global_idx in enumerate(batch_pair_indices):
+                    # For each pair, the interleaved positions are 2*pair_i and 2*pair_i+1
+                    pos_c = 2 * pair_i
+                    pos_r = 2 * pair_i + 1
+                    # Extract rendered strings as concatenation of per-message content
+                    def _concat_content(ml):
+                        parts = []
+                        for m in ml:
+                            c = m.get("content")
+                            if isinstance(c, str):
+                                parts.append(c)
+                            elif isinstance(c, list):
+                                # multimodal: extract text items
+                                for item in c:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        parts.append(item.get("text", ""))
+                        return "".join(parts)
+                    ml_c = msg_logs[pos_c]
+                    ml_r = msg_logs[pos_r]
+                    text_c = _concat_content(ml_c)
+                    text_r = _concat_content(ml_r)
+                    # Flatten token ids
+                    ids_c = [int(t) for m in ml_c for t in m.get("token_ids", []).tolist()]
+                    ids_r = [int(t) for m in ml_r for t in m.get("token_ids", []).tolist()]
+                    # Rewards (aligned by idx when available)
+                    rw_c, rw_r = idx_to_rewards.get(global_idx, (None, None))
+                    # Extract exact flat input_ids slices used in forward for chosen/rejected
+                    flat_ids_c = None
+                    flat_ids_r = None
+                    if flat_ids_batch is not None and flat_lens_batch is not None:
+                        try:
+                            Lc = int(flat_lens_batch[pos_c])
+                            Lr = int(flat_lens_batch[pos_r])
+                            flat_ids_c = [int(t) for t in flat_ids_batch[pos_c, :Lc].detach().cpu().tolist()]
+                            flat_ids_r = [int(t) for t in flat_ids_batch[pos_r, :Lr].detach().cpu().tolist()]
+                        except Exception:
+                            flat_ids_c = None
+                            flat_ids_r = None
+                    rec = {
+                        "dataset": dataset_name,
+                        "batch_id": batch_idx,
+                        "within_batch_pair_index": pair_i,
+                        "pair_index": global_idx,
+                        "applyChatTemplate_chosen": text_c,
+                        "applyChatTemplate_rejected": text_r,
+                        "token_ids_chosen": ids_c,
+                        "token_ids_rejected": ids_r,
+                        # Exact model inputs used (trimmed to true lengths)
+                        "flat_input_ids_chosen": flat_ids_c,
+                        "flat_input_ids_rejected": flat_ids_r,
+                        "reward_chosen": rw_c,
+                        "reward_rejected": rw_r,
+                        "reward_delta": (None if (rw_c is None or rw_r is None) else float(rw_c - rw_r)),
+                        "debug_reward_source": idx_to_source.get(global_idx, None),
+                        # Optional diagnostics
+                        "per_sample_rewards": per_sample_rewards if per_sample_rewards else None,
+                        "per_sample_raw_logits": per_sample_raw if per_sample_raw else None,
+                    }
+                    fout.write(_json.dumps(rec) + "\n")
+
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
+
+        try:
+            fout.close()
+            print(f"  ✓ Wrote validation dump to {dump_fp}")
+        except Exception:
+            pass
 
         if num_valid_batches > 0:
             sum_num_valid_samples = sum(dict_val_metrics["num_valid_samples"])

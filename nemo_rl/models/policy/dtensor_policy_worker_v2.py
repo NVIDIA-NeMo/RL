@@ -614,11 +614,10 @@ class DTensorPolicyWorkerV2:
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.long,
-                                device=input_ids.device,
-                            )
+                            # Build attention mask from true input lengths to avoid attending into padding
+                            input_lengths = mb.get("input_lengths").cuda()
+                            arange_row = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+                            attention_mask = (arange_row < input_lengths.unsqueeze(1)).to(dtype=torch.long)
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
@@ -670,6 +669,9 @@ class DTensorPolicyWorkerV2:
                                 # is not supported for reward models.
                                 assert not flash_attn_kwargs
                                 del model_args["flash_attn_kwargs"]
+                                # Align with HF semantics for classification models: let model derive position_ids
+                                if "position_ids" in model_args:
+                                    del model_args["position_ids"]
                             # remove flash_attn_kwargs if there are multimodal kwargs
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
@@ -683,6 +685,8 @@ class DTensorPolicyWorkerV2:
                             logits = outputs.logits
                         del outputs
 
+                        # Stash raw logits before any scaling for diagnostics
+                        raw_logits_for_diag = logits
                         # Apply temperature scaling
                         logits = self._apply_temperature_scaling(logits)
 
@@ -742,6 +746,21 @@ class DTensorPolicyWorkerV2:
                         else:
                             loss_fn_ = loss_fn
 
+                        # For reward models, capture per-sample rewards before loss
+                        per_sample_rewards_list = None
+                        per_sample_raw_logits_list = None
+                        if self._is_reward_model:
+                            try:
+                                per_sample_rewards_list = (
+                                    logits.squeeze(-1).detach().float().cpu().tolist()
+                                )
+                                per_sample_raw_logits_list = (
+                                    raw_logits_for_diag.squeeze(-1).detach().float().cpu().tolist()
+                                )
+                            except Exception:
+                                per_sample_rewards_list = None
+                                per_sample_raw_logits_list = None
+
                         loss, loss_metrics = loss_fn_(
                             logits,
                             mb,
@@ -750,12 +769,55 @@ class DTensorPolicyWorkerV2:
                         )
                         del logits
 
+                        # Attach per-sample rewards and idx for logging/JSONL alignment
+                        try:
+                            if per_sample_rewards_list is not None:
+                                loss_metrics["per_sample_rewards"] = per_sample_rewards_list
+                            if per_sample_raw_logits_list is not None:
+                                loss_metrics["per_sample_raw_logits"] = per_sample_raw_logits_list
+                            # attach simple attention mask sums for diagnostics
+                            try:
+                                loss_metrics["per_sample_attn_sum"] = attention_mask.sum(dim=1).detach().cpu().tolist()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                        # Always attach idx order for this microbatch if available
+                        if "idx" in mb:
+                            try:
+                                loss_metrics["per_sample_idx"] = (
+                                    mb["idx"].detach().cpu().tolist()
+                                    if hasattr(mb["idx"], "detach")
+                                    else list(mb["idx"])
+                                )
+                                # Also attach a per-sample flag indicating chosen (1) vs rejected (0)
+                                try:
+                                    mb_len = len(loss_metrics["per_sample_idx"])  # type: ignore[index]
+                                    loss_metrics["per_sample_is_chosen"] = [1 if (p % 2 == 0) else 0 for p in range(mb_len)]
+                                except Exception:
+                                    pass
+                                # And attach the per-sample mask to identify padded/dummy samples
+                                try:
+                                    if "sample_mask" in mb:
+                                        mask = mb["sample_mask"]
+                                        if hasattr(mask, "detach"):
+                                            mask = mask.detach().cpu().tolist()
+                                        loss_metrics["per_sample_mask"] = list(mask)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
                         # skip the update for dummy batches
                         if mb_idx < iterator_len:
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
                             for k in loss_metrics.keys():
-                                loss_metrics[k] /= num_global_batches
+                                v = loss_metrics[k]
+                                # Some metrics (e.g., per-pair lists) are sequences and shouldn't be divided
+                                if isinstance(v, (list, tuple)):
+                                    continue
+                                loss_metrics[k] = v / num_global_batches
                             num_valid_samples = loss_metrics["num_valid_samples"]
                             loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                             loss_metrics["global_valid_seqs"] = global_valid_seqs.item()

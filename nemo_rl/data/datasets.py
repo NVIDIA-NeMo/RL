@@ -299,6 +299,10 @@ def preference_collate_fn(
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
 
+    # Carry through original message logs and indices for downstream logging/debugging
+    data["message_log"] = batch["message_log"]
+    data["idx"] = batch["idx"]
+
     return data
 
 

@@ -114,6 +114,23 @@ def rm_preprocessor(
         "extra_env_info": None,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
+        # For debugging/validation dumps
+        "formatted_text_chosen": "".join(
+            [m.get("content", "") for m in message_log_chosen]
+        ),
+        "formatted_text_rejected": "".join(
+            [m.get("content", "") for m in message_log_rejected]
+        ),
+        "token_ids_chosen": [
+            int(t)
+            for m in message_log_chosen
+            for t in m["token_ids"].tolist()
+        ],
+        "token_ids_rejected": [
+            int(t)
+            for m in message_log_rejected
+            for t in m["token_ids"].tolist()
+        ],
     }
     return output
 

@@ -525,12 +525,18 @@ class PreferenceLoss(LossFunction):
         ## divide by 2 because we're summing over (chosen, rejected) pairs
         num_valid_samples = sample_mask.sum() / 2
 
+        # Prepare per-pair raw rewards (for debugging/validation dumps)
+        rewards_chosen_vec, rewards_rejected_vec = self.split_output_tensor(rewards)
+
         return preference_loss, {
             "loss": preference_loss.item(),
             "accuracy": accuracy.item(),
             "rewards_chosen_mean": rewards_chosen_mean.item(),
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
+            # raw per-pair rewards as Python floats
+            "per_pair_reward_chosen": rewards_chosen_vec.detach().float().cpu().tolist(),
+            "per_pair_reward_rejected": rewards_rejected_vec.detach().float().cpu().tolist(),
         }
 
 
