@@ -60,7 +60,7 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
         # Set the connection configuration since we know the full batch size ahead-of-time.
-        assert self.cfg["total_num_rollouts"] % len(self.cfg["base_urls"]), f"Total number of rollouts ({self.cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
+        assert self.cfg["total_num_rollouts"] % len(self.cfg["base_urls"]) == 0, f"Total number of rollouts ({self.cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
 
         initial_global_config_dict["global_aiohttp_connector_limit"] = self.cfg["total_num_rollouts"]
         initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = self.cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
