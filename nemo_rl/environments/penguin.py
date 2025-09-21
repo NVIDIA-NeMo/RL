@@ -90,15 +90,15 @@ class Penguin(EnvironmentInterface):
         )
         server_client = ServerClient.load_from_global_config(head_server_config)
 
-        tasks = [
-            server_client.post(
+        async def _post_subroutine(row: dict) -> dict:
+            res = await server_client.post(
                 server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
             )
-            for row in examples
-        ]
+            return await res.json()
 
-        results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
-        return [r.json() for r in results]
+        return await tqdm.gather(
+            *map(_post_subroutine, examples), desc="Collecting Penguin rollouts"
+        )
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
         nemo_rl_message_log = []
