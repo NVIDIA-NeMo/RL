@@ -97,7 +97,6 @@ jobs:
             TEST_LEVEL="none"
           fi
 
-          # Set L1 for nightly scheduled runs
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             echo "Setting test level to L1 for nightly scheduled run"
             TEST_LEVEL="L1"
