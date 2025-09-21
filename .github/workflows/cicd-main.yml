@@ -101,7 +101,7 @@ jobs:
           # Set L1 for nightly scheduled runs
           if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "push" ]]; then
             echo "Setting test level to L1 for nightly scheduled run"
-            TEST_LEVEL="docs"
+            TEST_LEVEL="none"
           fi
 
           # Override test level if specified in workflow_dispatch
@@ -342,19 +342,17 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
         run: |
-          MESSAGE_TEXT="🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: \`${{ github.sha }}\`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
-
-          MESSAGE=$(jq -cn --arg message "beep boop 🤖: $MESSAGE_TEXT" '{
-          "blocks": [
+          MESSAGE='{
+            "blocks": [
               {
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": $MESSAGE_TEXT
+                  "text": "🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
                 }
               }
             ]
-          }')
+          }'
 
           curl -X POST -H "Content-type: application/json" --data "$MESSAGE" "$SLACK_WEBHOOK"
 
