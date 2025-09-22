@@ -39,7 +39,6 @@ from nemo_automodel.components.distributed.grad_utils import (
 )
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
-    unshard_fsdp2_model,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -179,6 +178,10 @@ class DTensorPolicyWorkerV2:
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
+        )
+
+        self.model_use_attention_interface = self.check_model_use_attention_interface(
+            model_name
         )
 
         self._is_reward_model = (
@@ -467,6 +470,14 @@ class DTensorPolicyWorkerV2:
     def is_alive(self) -> bool:
         return True
 
+    def check_model_use_attention_interface(self, model_name: str) -> bool:
+        model_config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+
+        return getattr(model_config, "_attn_implementation", "eager") == "eager"
+
     def reset_peak_memory_stats(self) -> None:
         torch.cuda.reset_peak_memory_stats()
 
@@ -686,6 +697,12 @@ class DTensorPolicyWorkerV2:
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
+                            if (
+                                not self.model_use_attention_interface
+                                and "flash_attn_kwargs" in model_args
+                            ):
+                                del model_args["flash_attn_kwargs"]
+
                             outputs = self.model(**model_args)
 
                         # Get logprobs
@@ -879,7 +896,7 @@ class DTensorPolicyWorkerV2:
         all_log_probs = []
         self.model.eval()
 
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -995,6 +1012,12 @@ class DTensorPolicyWorkerV2:
                             **vlm_kwargs,
                         )
                         if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        if (
+                            not self.model_use_attention_interface
+                            and "flash_attn_kwargs" in model_args
+                        ):
                             del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)
