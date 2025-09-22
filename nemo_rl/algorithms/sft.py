@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import os
 import warnings
 from pathlib import Path
@@ -192,8 +193,10 @@ def setup(
     # ==========================
     #       Loss Function
     # ==========================
-    if is_mdlm:
+    if is_mdlm and not is_dqwn:
         loss_fn = MDLMCrossEntropyLoss()
+    elif is_dqwn:
+        loss_fn = functools.partial(NLLLoss(), mdlm_loss=True)
     else:
         loss_fn = NLLLoss()
 
@@ -270,9 +273,7 @@ def validate(
                 cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
                 val_data: BatchedDataDict = BatchedDataDict(
                     {
-                                "target_ids": cat_and_padded["token_ids"][:, 1:],   # very unsure about this 
                         "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
-                        "noise_mask": cat_and_padded["noise_mask"],
                         "p_mask": cat_and_padded["p_mask"],
                         "input_lengths": input_lengths,
                         "token_mask": cat_and_padded["noise_mask"],
@@ -455,9 +456,7 @@ def sft_train(
                         cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
-                                "target_ids": cat_and_padded["token_ids"][:, 1:],   # very unsure about this 
                                 "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
-                                "noise_mask": cat_and_padded["noise_mask"],
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,
                                 "token_mask": cat_and_padded["noise_mask"],

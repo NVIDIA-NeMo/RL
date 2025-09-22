@@ -727,9 +727,9 @@ class DTensorPolicyWorker:
 
                                 model_args = {
                                     **model_args, 
-                                    "masked_indices": mb["noise_mask"],
+                                    "masked_indices": mb["token_mask"],
                                     "p_mask": mb["p_mask"],
-                                    "labels": mb["target_ids"],
+                                    "labels": mb["input_ids"],
                                 }
 
                             if self._is_reward_model:

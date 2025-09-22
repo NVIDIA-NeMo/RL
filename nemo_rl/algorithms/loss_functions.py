@@ -319,6 +319,7 @@ class NLLLoss(LossFunction):
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         dpo_loss: bool = False,
+        mdlm_loss: bool = False,
         dpo_average_log_probs: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
@@ -366,6 +367,9 @@ class NLLLoss(LossFunction):
             loss = -torch.sum(token_logprobs * mask, dim=-1)
             if dpo_average_log_probs:
                 loss = loss / num_unmasked_tokens.clamp(min=1)
+        elif mdlm_loss:
+            p_mask = data["p_mask"][:, 1:]
+            loss = -masked_mean(token_logprobs / p_mask, mask)
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
