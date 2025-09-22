@@ -267,7 +267,7 @@ def validate(
             is_dqwn = master_config["policy"].get("is_dqwn", False)
 
             if is_dqwn:
-                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, policy.model.mask_token_id)
+                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
                 val_data: BatchedDataDict = BatchedDataDict(
                     {
                         "target_ids": cat_and_padded["token_ids"],
@@ -280,7 +280,7 @@ def validate(
                     }
                 )
             elif is_mdlm:
-                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, tokenizer.mask_token_id)
+                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=tokenizer.mask_token_id)
                 val_data: BatchedDataDict = BatchedDataDict(
                     {
                         "target_ids": cat_and_padded["token_ids"],
@@ -452,7 +452,7 @@ def sft_train(
                     )
 
                     if is_dqwn:
-                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, policy.model.mask_token_id)
+                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "target_ids": cat_and_padded["token_ids"],
