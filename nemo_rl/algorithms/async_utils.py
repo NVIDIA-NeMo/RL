@@ -32,7 +32,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 TokenizerType = PreTrainedTokenizerBase
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class ReplayBuffer:
     """Replay buffer storing per-prompt groups.
 
@@ -235,7 +235,7 @@ class ReplayBuffer:
             self.target_weight_versions.clear()
 
 
-@ray.remote
+@ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
 
