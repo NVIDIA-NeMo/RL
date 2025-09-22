@@ -266,13 +266,25 @@ def validate(
             is_mdlm = master_config["policy"].get("is_mdlm", False)
             is_dqwn = master_config["policy"].get("is_dqwn", False)
 
-            if is_mdlm:
-                target_ids = cat_and_padded["token_ids"].clone()
+            if is_dqwn:
+                cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, policy.model.mask_token_id)
+                val_data: BatchedDataDict = BatchedDataDict(
+                    {
+                        "target_ids": cat_and_padded["token_ids"],
+                        "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
+                        "noise_mask": cat_and_padded["noise_mask"],
+                        "p_mask": cat_and_padded["p_mask"],
+                        "input_lengths": input_lengths,
+                        "token_mask": cat_and_padded["token_loss_mask"],
+                        "sample_mask": val_batch["loss_multiplier"],
+                    }
+                )
+            elif is_mdlm:
                 cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, tokenizer.mask_token_id)
                 val_data: BatchedDataDict = BatchedDataDict(
                     {
-                        "target_ids": target_ids,
-                        "input_ids": cat_and_padded["token_ids"],
+                        "target_ids": cat_and_padded["token_ids"],
+                        "input_ids": cat_and_padded["noisy_token_ids"],
                         "noise_mask": cat_and_padded["noise_mask"],
                         "p_mask": cat_and_padded["p_mask"],
                         "input_lengths": input_lengths,
