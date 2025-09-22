@@ -1,6 +1,6 @@
 # An in-depth Walkthrough of GRPO in NeMo RL
 
-This guide details the Group Relative Policy Optimization(GRPO) implementation within NeMo RL. We'll walk through essential aspects including data handling, policy model training, fast generation, and the specifics of the GRPO loss function and its enhancements. 
+This guide details the Group Relative Policy Optimization (GRPO) implementation within NeMo RL. We'll walk through essential aspects including data handling, policy model training, fast generation, and the specifics of the GRPO loss function and its enhancements.
 
 ## Quickstart: Launch a GRPO Run
 
@@ -71,7 +71,7 @@ class DatumSpec(TypedDict):
 
 We refer to each distinct environment your model aims to optimize against as a "task." For example, you might define tasks like "math" or "code."
 
-For each task, you should provide a data processor that reads from your dataset and returns a [DatumSpec](../../nemo_rl/data/interfaces.py)
+For each task, you should provide a data processor that reads from your dataset and returns a [DatumSpec](../../nemo_rl/data/interfaces.py).
 
 ```python
 def my_data_processor(
@@ -83,9 +83,9 @@ def my_data_processor(
 ) -> DatumSpec:
 ```
 
-We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py)
+We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py).
 
-#### Putting it all together
+#### Putting It All Together
 
 GRPO expects datasets to have the following form:
 
@@ -115,6 +115,12 @@ dataset = AllTaskProcessedDataset(
 
 Ensure you provide a mapping of tasks to their processors so the dataset knows which processor to use when handling samples.
 
+## Environments
+
+GRPO supports various types of environments for different tasks, including **[Math](../../nemo_rl/environments/math_environment.py)**, **[Code](../../nemo_rl/environments/code_environment.py)**, and **[Reward Model](../../nemo_rl/environments/reward_model_environment.py)** environments. Each environment provides a standardized interface for reward computation and evaluation, enabling consistent training across diverse domains.
+
+For more information about environments, see the [Environments Guide](environments.md).
+
 ## Policy Model
 
 We define a {py:class}`PolicyInterface]() <nemo_rl.models.interfaces>` that contains everything you need to train a Policy model.
@@ -125,7 +131,7 @@ This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_gro
 
 We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class right now.
 
-The function [grpo_train](../../nemo_rl/algorithms/grpo.py) contains the core GRPO training loop.
+The function, [grpo_train](../../nemo_rl/algorithms/grpo.py), contains the core GRPO training loop.
 
 ## Performance Optimizations
 
@@ -147,7 +153,7 @@ where:
 - $\beta$ is the KL penalty coefficient
 - $\pi_{\text{ref}}$ is the reference policy
 
-Also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
+It also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
 imposes an additional upper bound on the probability ratio when advantages are negative.
 This prevents excessive policy updates. $rA \ll 0$ -> $cA$(clipped).
 The loss function is modified to the following when A_t < 0:
@@ -161,11 +167,11 @@ where:
     usually set as 3 empirically
 - $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has change
 
-### Improvements to the GRPO loss formulation for stability and accuracy
+### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
-#### On-Policy KL Approximation (use_on_policy_kl_approximation)
+#### On-Policy KL Approximation
 
-In practice, we calculate the KL divergence using the estimator from Schulman 2020 (http://joschu.net/blog/kl-approx.html), which is unbiased and guaranteed to be positive.
+This feature is controlled by the parameter `use_on_policy_kl_approximation`. It enables the use of an estimator for KL divergence based on [Schulman (2020)](http://joschu.net/blog/kl-approx.html), which is both unbiased and guaranteed to be positive.
 
 $$
 D_{\text{KL}} (\pi_\theta || \pi_\text{ref}) \approx E_{x \sim \pi_{\theta}} \Big[ \frac{\pi_\text{ref}(x)}{\pi_\theta(x)} - \log \frac{\pi_\text{ref}(x)}{\pi_\theta(x)} - 1 \Big]
@@ -185,8 +191,8 @@ $$
 To enable the on-policy KL approximation, set the config `use_on_policy_kl_approximation=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
-#### Importance Sampling Correction (use_importance_sampling_correction)
-The policy we use to draw samples, $\pi_{\theta_{\text{old}}}$, is used in both the inference framework and the training framework. To account for this distinction, we refer to the inference framework policy as $\pi_{\text{inference}}$ and the training framework policy as $\pi_{\text{training}}$. As noted in [Adding New Models](../adding-new-models.md#understand-discrepancies-between-backends), it is possible for the token probabilities from $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to have discrepancies (from numerics, precision differences, bugs, etc.), leading to off-policy samples. We can correct for this by introducing importance weights between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to the first term of the loss function. 
+#### Importance Sampling Correction
+This feature is controlled by the parameter `use_importance_sampling_correction`. It applies importance sampling to adjust for discrepancies between the behavior policy and the target policy, improving the accuracy of off-policy estimates. The policy we use to draw samples, $\pi_{\theta_{\text{old}}}$, is used in both the inference framework and the training framework. To account for this distinction, we refer to the inference framework policy as $\pi_{\text{inference}}$ and the training framework policy as $\pi_{\text{training}}$. As noted in [Adding New Models](../adding-new-models.md#understand-discrepancies-between-backends), it is possible for the token probabilities from $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to have discrepancies (from numerics, precision differences, bugs, etc.), leading to off-policy samples. We can correct for this by introducing importance weights between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to the first term of the loss function. 
 
 Let $f_\theta(x) = \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big)$ represent the first term of loss function. Then,
 
@@ -203,9 +209,9 @@ By multiplying the first term of the loss function by the importance weights $\f
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
-#### Overlong Filtering (overlong_filtering)
+#### Overlong Filtering
 
-When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
+This feature is controlled by the parameter `overlong_filtering`. It filters out sequences that exceed a predefined maximum length, helping maintain computational efficiency and model stability. When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
 
 The implementation modifies the loss calculation as follows:
 
@@ -232,20 +238,19 @@ $$
 
 where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
 
-Configuration:
+To configure:
 ```yaml
 grpo:
   overlong_filtering: false  # default
 ```
 
-Set to `true` when training on tasks where truncation at max sequence length is expected (e.g., long-form reasoning, mathematical proofs).
+Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+## Metrics
+This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-## Metrics ({wandb, tb}_name)
-We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
-
-### Multiplicative Token Probability Error (token_mult_prob_error)
-This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
+### Multiplicative Token Probability Error
+This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
 
 $$
 \text{token-mult-prob-error} = \frac{1}{n}\sum_{i=1}^{n\text{(tokens)}}\exp\left(\left\|\text{log-train-fwk}_i - \text{logprobs-inference-fwk}_i\right\|\right)
@@ -253,25 +258,27 @@ $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepencies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If very spiky, it can indicate a bug in the inference framework or buggy weight refitting.
 
-### Sampling Importance Ratio (sampling_importance_ratio)
-Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
+### Sampling Importance Ratio
+This feature is controlled by the parameter `sampling_importance_ratio`. It adjusts the weighting of samples based on the ratio between the target policy and the behavior policy, helping to correct for distributional shift in off-policy learning. Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
 
 This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi_{\text{training}}(t)) - \text{log}(\pi_{\text{inference}}(t)))$
 
-Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error-token_mult_prob_error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error instead of loosely the variance as it does not take the absolute value of the error. With some noise, this should hover around 1.
+Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error instead of loosely the variance as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction-use_importance_sampling_correction) is enabled.
+This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
 
-### Entropy (approx_entropy)
-We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
+### Entropy
+This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
 
 $$
 E_{s \sim \pi_{\text{inference}}(x)}[-\frac{\pi_{\text{training}}(x)}{\pi_{\text{inference}}(x)}log(\pi_{\text{training}}(x))]
 $$
 
-using the rollouts in each training global batch as Monte-Carlo samples. The ratio of $\pi$ is in the formula to importance-correct for the mismatch between the policy over the course of training in a singular GRPO step and the inference framework.
+This expectation is estimated using the rollouts in each global training batch as Monte Carlo samples. The ratio of $\pi$ values in the formula serves to importance-correct for the mismatch between the training policy during a single GRPO step and the inference-time policy used to sample states.
 
-We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough monte-carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo-Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo-RL).
+We use this to track if our models are entropy-collapsing too quickly during training (as is quite common). This is a pretty rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (WIP efficient calculation in NeMo RL).
+
+
 
 
 ## Evaluate the Trained Model

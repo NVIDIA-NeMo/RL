@@ -1,0 +1,39 @@
+# GRPO Algorithm Configuration
+defaults: "grpo_math_1B.yaml"
+
+env:
+  reward_model:  
+    enabled: true
+    model_name: "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+    tokenizer:
+      name: ${env.reward_model.model_name}
+    precision: "bfloat16"
+    batch_size: ${policy.train_micro_batch_size}
+    checkpoint_path: null
+    max_model_len: 2048
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
+    # TODO: Mcore path support https://github.com/NVIDIA-NeMo/RL/issues/1154
+    dtensor_cfg:
+      _v2: true
+      enabled: true
+      sequence_parallel: false
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      custom_parallel_plan: null
+      cpu_offload: false
+      activation_checkpointing: false
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+    dynamic_batching:
+      enabled: false
+    sequence_packing:
+      enabled: false
+    max_grad_norm: null
+    
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1
