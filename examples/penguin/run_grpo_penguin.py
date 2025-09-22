@@ -159,7 +159,6 @@ def main() -> None:
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
         initial_global_config_dict=config["env"]["penguin"],
-        total_num_rollouts=config["grpo"]["num_generations_per_prompt"] * config["grpo"]["num_prompts_per_step"],
     )
     penguin = Penguin.options(
         runtime_env={
