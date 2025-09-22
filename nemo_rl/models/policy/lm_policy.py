@@ -77,8 +77,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        megatron_enable = "megatron_cfg" in config and config["megatron_cfg"]["enabled"]
+        dtensor_enable = "dtensor_cfg" in config and config["dtensor_cfg"]["enabled"]
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -101,7 +101,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
-            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
+            use_v2 = config["dtensor_cfg"]["_v2"]
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
@@ -646,9 +646,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> None:
         """Save a checkpoint of the model."""
         # Only pass checkpointing_cfg for DTensor v2
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+        use_dtensor = "dtensor_cfg" in self.cfg and self.cfg["dtensor_cfg"]["enabled"]
+        use_dtensor_v2 = use_dtensor and self.cfg["dtensor_cfg"]["_v2"]
 
-        if use_v2:
+        if use_dtensor_v2:
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
