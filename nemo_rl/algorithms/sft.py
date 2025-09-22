@@ -439,8 +439,11 @@ def sft_train(
                         # we train on padding tokens as well similar to LLaDA and SMDM
                         #pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 1}
 
-                        # turn off eos training 
-                        pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 0}
+                        # train on eos tokens as well 
+                        pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 1}
+                        if is_dqwn:
+                            # deactivate eos/pad tokens
+                            pad_value_dict["token_loss_mask"] = 0
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
 
