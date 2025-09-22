@@ -9,26 +9,26 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5
-  val_at_start: true
+  val_at_start: false
   max_val_samples: 64
   val_batch_size: 64
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "/raid/slikhite/results-4/grpo"
+  checkpoint_dir: "/raid/slikhite/results-5/grpo"
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
   save_period: 5
 
 policy:
-  model_name: "/raid/slikhite/results/grpo/hf"
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 32
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
-  logprob_batch_size: 2
+  logprob_batch_size: 1
   max_total_sequence_length: 8192
   precision: "bfloat16"
   fsdp_offload_enabled: true
@@ -55,7 +55,7 @@ data:
   train:
     shuffle: False
     seed: 420 # unused if shuffle is False
-    jsonl_path: '/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_formatted.jsonl'
+    jsonl_path: '/workspace/bfcl_data_preprocessing/dataset/BFCL_v3_multi_turn_train_new.jsonl'
 
     # checks if it's too long on init
     filter_long_samples: true
@@ -64,11 +64,10 @@ data:
   val:
     shuffle: False
     seed: 420 # unused if shuffle is False
-    jsonl_path: '/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_formatted.jsonl'
+    jsonl_path: '/workspace/bfcl_data_preprocessing/dataset/BFCL_v3_multi_turn_val_new.jsonl'
     drop_last: False
     # checks if it's too long on init
     filter_long_samples: true
-
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
 
 env:

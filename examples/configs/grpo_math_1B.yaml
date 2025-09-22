@@ -6,7 +6,6 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
-  overlong_filtering: false
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
@@ -36,7 +35,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512

@@ -2,15 +2,14 @@
 defaults: "eval.yaml"
 
 generation:
-  model_name: "Qwen/Qwen2.5-32B-Instruct"
+  model_name: "/raid/slikhite/results-8/hf"
   vllm_cfg:
     max_model_len: 8192    
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
 
 data:
-  prompt_file: "examples/prompts/bfcl_multiturn.txt"
   dataset_name: "bfcl_multiturn"
-  dataset_path: "/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_val_new.jsonl"
+  dataset_path: "/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_val_final.jsonl"
 
 env:
   bfcl_multiturn:

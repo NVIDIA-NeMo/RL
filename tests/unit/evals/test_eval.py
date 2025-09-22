@@ -69,35 +69,6 @@ def test_eval_pass_k_multiple_groups():
     assert isinstance(average_score, float)
     assert average_score == pytest.approx(expected, rel=1e-6)
 
-
-def test_eval_pass_k_with_threshold():
-    """Test pass@k with custom threshold for continuous rewards."""
-    # Test case: rewards [3.5, 1.5, 0.5] with threshold=2.0
-    # Only the first sample (3.5) should be considered "correct"
-    rewards = torch.tensor([3.5, 1.5, 0.5])
-    num_tests_per_prompt = 3
-    threshold = 2.0
-    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=1, threshold=threshold)
-    average_score = score / (len(rewards) / num_tests_per_prompt)
-    expected = 1 / 3  # Only 1 out of 3 samples is above threshold
-    assert isinstance(average_score, float)
-    assert average_score == pytest.approx(expected, rel=1e-6)
-
-
-def test_eval_pass_k_high_rewards():
-    """Test pass@k with high continuous rewards."""
-    # Test case: rewards up to 4.0, threshold=1.0 (default)
-    rewards = torch.tensor([4.0, 2.5, 0.8, 1.2])
-    num_tests_per_prompt = 4
-    score = eval_pass_k(rewards, num_tests_per_prompt=num_tests_per_prompt, k=2)  # pass@2
-    average_score = score / (len(rewards) / num_tests_per_prompt)
-    # 3 out of 4 samples are >= 1.0, so pass@2 should be high
-    # With 3 correct out of 4, pass@2 = 1 - C(1,2)/C(4,2) = 1 - 0/6 = 1.0
-    expected = 1.0
-    assert isinstance(average_score, float)
-    assert average_score == pytest.approx(expected, rel=1e-6)
-
-
 def test_eval_cons_k_basic():
     """Test basic cons@k evaluation."""
     rewards = torch.tensor([1.0, 0.0, 1.0])

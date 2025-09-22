@@ -50,7 +50,6 @@ class EvalConfig(TypedDict):
     seed: int
     k_value: int
     save_path: str | None
-    pass_k_threshold: NotRequired[float]  # Optional: minimum reward value to consider as "correct" for pass@k
 
 
 class MasterConfig(TypedDict):
@@ -195,7 +194,6 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
     group_rewards = rewards.split(num_tests_per_prompt)
     pass_k_score = 0.0
     for group_reward in group_rewards:
-        # Convert continuous rewards to binary based on threshold
         num_correct = group_reward.sum().item() 
         print("num_correct", num_correct)
         print("group_reward", group_reward)
@@ -316,7 +314,6 @@ async def _run_env_eval_impl(
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     k_value = eval_config["k_value"]
 
-    # List to collect evaluation data for parquet file
     evaluation_data = []
 
     # Check if multi-turn evaluation should be used
@@ -332,12 +329,8 @@ async def _run_env_eval_impl(
         if use_multiturn:
             print('use_multiturn')
             print("env", env)
-            # Use multi-turn rollout functions (like in validate function)
             if tokenizer is None:
                 raise ValueError("tokenizer is required for multi-turn evaluation (bfcl_multiturn)")
-            
-            # Set up task_to_env mapping
-            # Extract unique task names from the batch and map them all to the provided env
             unique_task_names = set()
             if "task_name" in batch:
                 unique_task_names.update(batch["task_name"])
@@ -355,11 +348,8 @@ async def _run_env_eval_impl(
             # Get rollout parameters from config
             max_rollout_turns = master_config["env"]["bfcl_multiturn"].get("max_turns", 999999)
             print('max_rollout_turns', max_rollout_turns)
-            # Determine max_seq_len - try different config paths
             max_seq_len = None
-            if "policy" in master_config and "max_total_sequence_length" in master_config["policy"]:
-                max_seq_len = master_config["policy"]["max_total_sequence_length"]
-            elif "generation" in master_config and "vllm_cfg" in master_config["generation"]:
+            if "generation" in master_config and "vllm_cfg" in master_config["generation"]:
                 max_seq_len = master_config["generation"]["vllm_cfg"].get("max_model_len", 8192)
             else:
                 max_seq_len = 8192  # fallback
@@ -406,9 +396,6 @@ async def _run_env_eval_impl(
                         print("correct")
                 prompts.append("\n".join(initial_content))
                 outputs.append(final_response)
-            #print("prompts", prompts[0])
-            #print("outputs", outputs[0])
-            #print("message_log", batch["message_log"][0])
             print("rewards", rewards[0])
             print("length of rewards", len(rewards))
         else:
@@ -462,13 +449,12 @@ async def _run_env_eval_impl(
                     "sample_index": len(evaluation_data),
                 }
             )
-        num_greater_than_one = (rewards > 1).sum().item()
-        print("Number of samples > 1:", num_greater_than_one)
+
         accuracy = sum(rewards) / len(rewards)
         print("accuracy", accuracy)
         # update stats
         if metric == "pass@k":
-            score += eval_pass_k(rewards, num_tests_per_prompt, 1.0)
+            score += eval_pass_k(rewards, num_tests_per_prompt, k_value)
         elif metric == "cons@k":
             extracted_answers = env_return.answers
             score += eval_cons_k(

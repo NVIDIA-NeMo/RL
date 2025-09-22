@@ -59,10 +59,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
-    if hasattr(base_dataset, "rekeyed_ds"):
-        rekeyed_ds = base_dataset.rekeyed_ds
-    else:
-        rekeyed_ds = base_dataset.data
+    rekeyed_ds = base_dataset.rekeyed_ds
     #print(rekeyed_ds)
 
     if env_configs["bfcl_multiturn"]["enable"]:
