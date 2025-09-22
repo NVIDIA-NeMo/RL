@@ -73,6 +73,7 @@ def sft_preprocessor(
         add_bos_token=add_bos,
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)

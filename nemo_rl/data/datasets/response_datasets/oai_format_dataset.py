@@ -12,11 +12,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import json
+from typing import Any, Callable, Union
 
 from datasets import load_dataset
 
 from nemo_rl.data.interfaces import TaskDataSpec
+
+
+class PreservingDataset:
+    """A dataset wrapper that preserves original dict structure without None-filling.
+
+    Unlike HuggingFace's Dataset class which enforces schema uniformity across all samples
+    (filling missing keys with None), this class maintains the exact structure of each sample.
+    This is critical for heterogeneous data like tool calls where different samples may have
+    different argument structures.
+    """
+
+    def __init__(self, data: list[dict[str, Any]]):
+        """Initialize the dataset with a list of dictionaries.
+
+        Args:
+            data: List of dictionary samples, each can have different keys
+        """
+        self.data = data
+        self.features = None  # For compatibility with HF Dataset interface
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(
+        self, idx: Union[int, slice, list]
+    ) -> Union[dict[str, Any], list[dict[str, Any]]]:
+        """Support integer indexing, slicing, and list indexing."""
+        if isinstance(idx, slice):
+            return [self.data[i] for i in range(*idx.indices(len(self.data)))]
+        elif isinstance(idx, int):
+            # Handle negative indices
+            if idx < 0:
+                idx = len(self.data) + idx
+            if idx < 0 or idx >= len(self.data):
+                raise IndexError(
+                    f"Index {idx} out of range for dataset of size {len(self.data)}"
+                )
+            return self.data[idx]
+        elif isinstance(idx, list):
+            return [self.data[i] for i in idx]
+        else:
+            raise TypeError(
+                f"Indices must be integers, slices, or lists, not {type(idx)}"
+            )
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def map(self, function: Callable, *args, **kwargs) -> "PreservingDataset":
+        """Apply a function to each sample in the dataset.
+
+        Args:
+            function: Function to apply to each sample
+            with_indices: If True, pass index as second argument to function
+
+        Returns:
+            New PreservingDataset with transformed samples
+        """
+        if kwargs.get("with_indices", False):
+            mapped_data = [function(item, i) for i, item in enumerate(self.data)]
+        else:
+            mapped_data = [function(item) for item in self.data]
+        return PreservingDataset(mapped_data)
 
 
 class OpenAIFormatDataset:
@@ -44,15 +108,57 @@ class OpenAIFormatDataset:
         chat_key: str = "messages",
         system_key: str | None = None,
         system_prompt: str | None = None,
+        tool_key: str | None = "tools",
     ):
         self.chat_key = chat_key
         self.system_key = system_key
         self.system_prompt = system_prompt
-        train_original_dataset = load_dataset("json", data_files=train_ds_path)["train"]
-        val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
+        self.tool_key = tool_key
 
-        formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
-        formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+        try:
+            # Try the original approach first (faster and more standard)
+            train_original_dataset = load_dataset("json", data_files=train_ds_path)[
+                "train"
+            ]
+            val_original_dataset = load_dataset("json", data_files=val_ds_path)["train"]
+
+            formatted_train_dataset = train_original_dataset.map(self.add_messages_key)
+            formatted_val_dataset = val_original_dataset.map(self.add_messages_key)
+
+            print(
+                f"Loaded dataset using standard approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+            )
+
+        except (TypeError, ValueError, Exception) as e:
+            # Fallback to custom loading for heterogeneous schemas
+            # When tool calls have varying argument structures across samples,
+            # HuggingFace's Dataset.from_list would add None values for missing keys.
+            # We use PreservingDataset to maintain exact structure.
+            print(
+                f"Standard loading failed with {type(e).__name__}, using PreservingDataset..."
+            )
+            print(
+                "This preserves heterogeneous tool argument schemas without None-filling."
+            )
+
+            # Load JSON files directly
+            with open(train_ds_path, "r") as f:
+                train_data = [json.loads(line) for line in f]
+
+            with open(val_ds_path, "r") as f:
+                val_data = [json.loads(line) for line in f]
+
+            # Apply transformations
+            formatted_train_data = [self.add_messages_key(item) for item in train_data]
+            formatted_val_data = [self.add_messages_key(item) for item in val_data]
+
+            # Use PreservingDataset to maintain exact structure
+            formatted_train_dataset = PreservingDataset(formatted_train_data)
+            formatted_val_dataset = PreservingDataset(formatted_val_data)
+
+            print(
+                f"Loaded dataset (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+            )
 
         self.formatted_ds = {
             "train": formatted_train_dataset,
@@ -75,4 +181,10 @@ class OpenAIFormatDataset:
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
         assert messages[-1]["role"] == "assistant"
-        return {"messages": messages}
+
+        # Preserve tools if they exist in the data
+        result = {"messages": messages}
+        if self.tool_key and self.tool_key in example:
+            result["tools"] = example[self.tool_key]
+
+        return result
