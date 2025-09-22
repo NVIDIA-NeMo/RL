@@ -25,6 +25,13 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.training import fault_tolerance
+
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
 from megatron.bridge.training.checkpointing import (
     checkpoint_exists,
     init_checkpointing_context,
@@ -47,10 +54,7 @@ from megatron.bridge.training.initialize import (
     set_jit_fusion_options,
 )
 from megatron.bridge.training.optim import setup_optimizer
-from megatron.bridge.training.setup import (
-    HAVE_FSDP2,
-    _update_model_config_funcs,
-)
+from megatron.bridge.training.setup import _update_model_config_funcs
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.train_utils import (
@@ -756,6 +760,7 @@ class MegatronPolicyWorker:
         )
 
         from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
+        from megatron.bridge.training.setup import _validate_and_set_vocab_size
 
         tokenizer_config = TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
@@ -771,7 +776,10 @@ class MegatronPolicyWorker:
             ],
             trust_remote_code=True,
         )
-        self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
+        self.final_padded_vocab_size, _ = _validate_and_set_vocab_size(
+            model_vocab_size=self.megatron_cfg.model.vocab_size,
+            tokenizer_vocab_size=self.megatron_tokenizer.vocab_size,
+        )
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
             hf_model_name, trust_remote_code=True
