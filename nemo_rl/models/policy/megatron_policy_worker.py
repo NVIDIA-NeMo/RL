@@ -1304,8 +1304,9 @@ class MegatronPolicyWorker:
                 # if isinstance(item, torch.Tensor):
                 # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 # - self.model is the original reference_model, now on CUDA
                 # - self.reference_model is the original model, now on CPU
@@ -1319,8 +1320,9 @@ class MegatronPolicyWorker:
                 # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
                 # self.model.state_dict()[name] = item
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 ## re-enable overlap param gather after weight swap
                 if self.should_disable_forward_pre_hook:
@@ -1714,7 +1716,8 @@ class MegatronPolicyWorker:
                     if torch.is_tensor(v) and not v.is_cuda:
                         state[k] = v.to("cuda")
 
-        torch.cuda.empty_cache()
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+            torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
@@ -1744,8 +1747,9 @@ class MegatronPolicyWorker:
                         # Move the tensor to CPU and update the state dictionary
                         state[k] = v.to("cpu")
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -1769,8 +1773,9 @@ class MegatronPolicyWorker:
             del self._held_gather_buffer
             self._held_gather_buffer = None
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
