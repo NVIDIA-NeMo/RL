@@ -455,12 +455,12 @@ def sft_train(
                         cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
-                                "target_ids": cat_and_padded["token_ids"],
+                                "target_ids": cat_and_padded["token_ids"][:, 1:],   # very unsure about this 
                                 "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
                                 "noise_mask": cat_and_padded["noise_mask"],
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,
-                                "token_mask": cat_and_padded["token_loss_mask"],
+                                "token_mask": cat_and_padded["noise_mask"],
                                 "sample_mask": batch["loss_multiplier"],
                             }
                         )
