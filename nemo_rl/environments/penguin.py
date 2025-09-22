@@ -58,7 +58,7 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = initial_global_config_dict.get("global_aiohttp_connector_limit_per_host") or 256
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = initial_global_config_dict.get("global_aiohttp_connector_limit_per_host") or 1024
         initial_global_config_dict["global_aiohttp_connector_limit"] = initial_global_config_dict["global_aiohttp_connector_limit_per_host"] * len(self.cfg['base_urls'])
 
         print(
