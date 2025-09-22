@@ -440,7 +440,7 @@ def sft_train(
                         #pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 1}
 
                         # turn off eos training 
-                        pad_value_dict = {"token_ids": tokenizer.mask_token_id, "token_loss_mask": 0}
+                        pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 0}
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
 
