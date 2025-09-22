@@ -21,6 +21,8 @@ on:
     types: [labeled, opened, synchronize, reopened]
   merge_group:
     types: [checks_requested]
+  schedule:
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       test_to_run:
@@ -93,6 +95,11 @@ jobs:
           else
             # Skip tests by default for non-labeled PRs
             TEST_LEVEL="none"
+          fi
+
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "Setting test level to L1 for nightly scheduled run"
+            TEST_LEVEL="L1"
           fi
 
           # Override test level if specified in workflow_dispatch
@@ -322,6 +329,31 @@ jobs:
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
+
+  notify-nightly-failure:
+    name: Notify nightly test failure
+    runs-on: ubuntu-latest
+    needs: [CI_QA_Gate]
+    environment: main
+    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
+        run: |
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" "$SLACK_WEBHOOK"
 
   Coverage:
     runs-on: ubuntu-latest
