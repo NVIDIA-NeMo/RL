@@ -39,6 +39,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 def _maybe_correct_merged_tokens(
     tokenizer: PreTrainedTokenizerBase,
     reference_token_ids: list[int],
+    actual_corresponding_token_ids: list[int],
     actual_token_ids: list[int],
 ) -> list[int]:
     """This is a subroutine used inside the vLLM Chat Completion server. Some environments (namely Penguin) require an OpenAI compatible server endpoint rather than an inference engine handle. This is fine for the most part, but it may cause issues when the environment is used as a part of training.
