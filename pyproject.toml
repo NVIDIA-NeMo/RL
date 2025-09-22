@@ -102,7 +102,8 @@ mcore = [
     "flash-attn==2.7.4.post1",
 ]
 adk = [
-    "google-adk",
+    "google-adk==1.14.1",
+    "google-genai==1.38.0"
 ]
 
 [dependency-groups]
