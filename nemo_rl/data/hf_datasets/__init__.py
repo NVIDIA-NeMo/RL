@@ -14,6 +14,7 @@
 
 from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.hf_datasets.clevr import CLEVRCoGenTDataset
+from nemo_rl.data.hf_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.hf_datasets.dpo import DPODataset
 from nemo_rl.data.hf_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.hf_datasets.oai_format_dataset import OpenAIFormatDataset
@@ -35,6 +36,7 @@ __all__ = [
     "PreferenceDataset",
     "PromptResponseDataset",
     "SquadDataset",
+    "DAPOMath17KDataset",
     "Tulu3PreferenceDataset",
     "COMMON_CHAT_TEMPLATES",
     "CLEVRCoGenTDataset",

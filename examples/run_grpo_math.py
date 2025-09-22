@@ -25,6 +25,7 @@ from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.hf_datasets.dapo_math import DAPOMath17KDataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import (
@@ -81,7 +82,9 @@ def hf_data_processor(
     message_log: LLMMessageLogType = []
     user_message = {
         "role": "user",
-        "content": task_data_spec.prompt.format(problem),
+        "content": task_data_spec.prompt.format(problem)
+        if task_data_spec.prompt
+        else problem,
     }
     message: list[str] = tokenizer.apply_chat_template(  # type: ignore
         [user_message],
@@ -147,6 +150,11 @@ def setup_data(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         data: Any = DeepScalerDataset(seed=seed)
+    elif data_config["dataset_name"] == "DAPOMath17K":
+        print(
+            "Loading BytedTsinghua-SIA/DAPO-Math-17k for training and AIME 2024 for validation"
+        )
+        data: Any = DAPOMath17KDataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
