@@ -41,6 +41,8 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int):
+        if max_size <= 0:
+            raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
         self.trajectories = []
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
