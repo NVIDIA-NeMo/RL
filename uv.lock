@@ -2940,6 +2940,7 @@ dev = [
     { name = "types-requests" },
 ]
 docs = [
+    { name = "gitpython" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
     { name = "sphinx" },
@@ -3030,6 +3031,7 @@ dev = [
     { name = "types-requests" },
 ]
 docs = [
+    { name = "gitpython", specifier = ">=3.1.45" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
     { name = "sphinx" },

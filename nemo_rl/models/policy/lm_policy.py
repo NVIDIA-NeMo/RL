@@ -41,6 +41,7 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
@@ -471,6 +472,51 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if missing_keys:
             raise ValueError(
                 f"Missing required keys for GenerationOutputSpec: {missing_keys}"
+            )
+
+        return result
+
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
+        # Verify input data is right-padded
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "score",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={},
+        )
+
+        result: BatchedDataDict[ScoreOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+        )
+        required_keys = [
+            "scores",
+        ]
+        missing_keys = [key for key in required_keys if key not in result]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for ScoreOutputSpec: {missing_keys}"
             )
 
         return result

@@ -75,6 +75,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -842,6 +843,7 @@ class DTensorPolicyWorkerV2:
 
             return metrics
 
+    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
@@ -1140,6 +1142,132 @@ class DTensorPolicyWorkerV2:
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
 
+        return return_data
+
+    # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
+    def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        global_batch_size = min(self.cfg["batch_size"], data.size)
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+        self.model.eval()
+        print("Begin to batch datas")
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(global_batch_size)
+                iterator_len = data.size // global_batch_size
+            step = 0
+            all_rm_scores = []
+            for batch_idx, generate_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                step += 1
+                input_ids = generate_batch.get("input_ids").cuda()
+                input_lengths = generate_batch.get("input_lengths")
+                batch_size, seq_len = input_ids.shape
+                if self.enable_seq_packing:
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Create attention mask for right-padded data
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        # For right-padded sequence, set 1s at the beginning of the sequence
+                        post_attention_mask[i, :length] = 1
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+                with get_train_context(False, False, context_parallel_ctx)():
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                        )
+                        outputs = self.model(**model_args)
+
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+                if isinstance(logits, DTensor):
+                    logits = logits.to(torch.float32)
+                else:
+                    logits = outputs.logits.to(torch.float32)
+
+                rm_scores = to_local_if_dtensor(logits)
+                rm_scores = rm_scores.squeeze(-1)
+                all_rm_scores.append(rm_scores)
+
+        all_rm_scores = torch.cat(all_rm_scores, dim=0)
+        all_rm_scores = all_rm_scores.squeeze(-1).cpu()
+        return_data = BatchedDataDict[ScoreOutputSpec](
+            {
+                "scores": all_rm_scores,
+            }
+        )
         return return_data
 
     @contextmanager

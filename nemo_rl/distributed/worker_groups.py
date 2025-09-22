@@ -493,7 +493,13 @@ class RayWorkerGroup:
                         "AVAILABLE_PORT_LIST": str(available_ports),
                     }
                 )
+                # Remove Ray-specific environment variables, let the worker itself set them.
                 worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+                worker_env_vars.pop("RAY_CLIENT_MODE", None)
+                worker_env_vars.pop("RAY_JOB_ID", None)
+                worker_env_vars.pop("RAY_LD_PRELOAD", None)
+                worker_env_vars.pop("RAY_RAYLET_PID", None)
+                worker_env_vars.pop("RAY_USAGE_STATS_ENABLED", None)
 
                 # Only the first worker in each group gets bundle_indices
                 # This ensures only one worker per group is the model owner
