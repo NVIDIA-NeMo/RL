@@ -30,6 +30,7 @@ class PenguinConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    total_num_rollouts: int
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -46,7 +47,8 @@ class Penguin(EnvironmentInterface):
 
         from omegaconf import DictConfig
         from penguin.cli import RunHelper, GlobalConfigDictParserConfig
-        from penguin.server_utils import HEAD_SERVER_KEY_NAME
+        from penguin.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from penguin.rollout_collection import RolloutCollectionHelper
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
@@ -56,6 +58,17 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+
+        # Set the connection configuration since we know the full batch size ahead-of-time.
+        assert self.cfg["total_num_rollouts"] % len(self.cfg["base_urls"]) == 0, f"Total number of rollouts ({self.cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
+
+        initial_global_config_dict["global_aiohttp_connector_limit"] = self.cfg["total_num_rollouts"]
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = self.cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
+
+        print(
+            f"""Penguin was configured with max rollouts {self.cfg['total_num_rollouts']}, so the `global_aiohttp_connector_limit` has been set to the same {self.cfg['total_num_rollouts']}.
+Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances, and each instance will receive {self.cfg['total_num_rollouts']} // {len(self.cfg['base_urls'])} = {initial_global_config_dict['global_aiohttp_connector_limit_per_host']} examples. `global_aiohttp_connector_limit_per_host` has been set to the same {initial_global_config_dict['global_aiohttp_connector_limit_per_host']}."""
+        )
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
@@ -72,33 +85,23 @@ class Penguin(EnvironmentInterface):
             )
         )
 
+        # Setup for rollout collection
+        self.head_server_config = BaseServerConfig(
+            host=self.node_ip,
+            port=self.head_server_port,
+        )
+        self.rch = RolloutCollectionHelper()
+
     def health_check(self) -> bool:
         return True
 
     async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        penguin_results = await self._call_penguin_for_rollouts(penguin_examples)
+        penguin_results = await self.rch.run_examples(
+            examples=penguin_examples, head_server_config=self.head_server_config
+        )
 
         nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
         return nemo_rl_results
-
-    async def _call_penguin_for_rollouts(self, examples: list[dict]) -> list[dict]:
-        from penguin.server_utils import ServerClient, BaseServerConfig
-
-        head_server_config = BaseServerConfig(
-            host=self.node_ip,
-            port=self.head_server_port,
-        )
-        server_client = ServerClient.load_from_global_config(head_server_config)
-
-        tasks = [
-            server_client.post(
-                server_name=row.pop("agent_ref")["name"], url_path="/run", json=row
-            )
-            for row in examples
-        ]
-
-        results = await tqdm.gather(*tasks, desc="Collecting Penguin rollouts")
-        return [r.json() for r in results]
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
         nemo_rl_message_log = []
