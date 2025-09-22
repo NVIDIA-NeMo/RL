@@ -20,6 +20,12 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional, cast
 
+try:
+    import pynvml
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
+
 import ray
 import torch
 from accelerate import init_empty_weights
@@ -90,7 +96,112 @@ from nemo_rl.utils.automodel_checkpoint import (
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+import humanize
+from tabulate import tabulate
+from torch.distributed.fsdp import fully_shard, FSDPModule
 
+
+def get_gpu_memory_usage() -> int:
+    """Get the GPU memory usage in bytes."""
+    # Prepare data for tabulated output
+    memory_data = []
+    
+    # PyTorch memory statistics
+    allocated_memory = torch.cuda.memory_allocated()
+    reserved_memory = torch.cuda.memory_reserved()
+    
+    memory_data.append(["PyTorch", "Allocated", humanize.naturalsize(allocated_memory)])
+    memory_data.append(["PyTorch", "Reserved", humanize.naturalsize(reserved_memory)])
+    memory_data.append(["PyTorch", "Peak Allocated", humanize.naturalsize(torch.cuda.max_memory_allocated())])
+    
+    # Add nvidia driver memory statistics
+    if PYNVML_AVAILABLE and torch.cuda.is_available():
+        try:
+            pynvml.nvmlInit()
+            device_count = pynvml.nvmlDeviceGetCount()
+            current_device = torch.cuda.current_device()
+            
+            if current_device < device_count:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(current_device)
+                
+                # Get memory info
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                total_memory = mem_info.total
+                used_memory = mem_info.used
+                free_memory = mem_info.free
+                utilization = (used_memory / total_memory) * 100
+                
+                memory_data.append(["NVIDIA Driver", "Total", humanize.naturalsize(total_memory)])
+                memory_data.append(["NVIDIA Driver", "Used", humanize.naturalsize(used_memory)])
+                memory_data.append(["NVIDIA Driver", "Free", humanize.naturalsize(free_memory)])
+                memory_data.append(["NVIDIA Driver", "Utilization", f"{utilization:.1f}%"])
+        except Exception as e:
+            memory_data.append(["Error", "NVIDIA Driver", f"Could not get stats: {e}"])
+    else:
+        if not PYNVML_AVAILABLE:
+            memory_data.append(["Warning", "pynvml", "Not available"])
+        if not torch.cuda.is_available():
+            memory_data.append(["Warning", "CUDA", "Not available"])
+    
+    # Print tabulated output
+    print("\n" + "="*80)
+    print("GPU MEMORY USAGE REPORT")
+    print("="*80)
+    print(tabulate(memory_data, headers=["Source", "Metric", "Value"], tablefmt="grid"))
+    print("="*80 + "\n")
+    
+    return allocated_memory
+
+def model_size_calculator(model: nn.Module, verbose_level: int = 0) -> int:
+    """Calculate the model size in bytes."""
+    sharding_distribution = {}
+    cur_device = None
+    dtype = None
+    
+    def get_tensor_size(name: str, tensor: torch.Tensor|DTensor) -> int:
+        nonlocal cur_device, dtype, sharding_distribution
+        def update_dstribution(div: int, size: int):
+            if div not in sharding_distribution:
+                sharding_distribution[div] = [1, size]
+            else:
+                sharding_distribution[div][0] += 1
+                sharding_distribution[div][1] += size
+
+        cur_size = tensor.numel() * tensor.element_size()    
+        if cur_device is None:
+            cur_device = tensor.device
+        if dtype is None:
+            dtype = tensor.dtype
+
+        if isinstance(tensor, DTensor):
+            div = 1
+            shardings = tensor.device_mesh.mesh.shape
+            if verbose_level >= 2:
+                print(f"name: {name}, shardings: {shardings}, tensor.placements: {tensor.placements}, shape: {tensor.shape}, element_size: {tensor.element_size()}")
+            #print(f"name: {name}, shardings: {shardings}, tensor.placements: {tensor.placements}, shape: {tensor.shape}")
+
+            for index, p in enumerate(tensor.placements):
+                if isinstance(p, Shard):
+                    div *= shardings[index]
+            #print(f"div: {div}")
+            cur_size = tensor.numel() * tensor.element_size() // div
+            update_dstribution(div, cur_size)
+            return cur_size
+        elif isinstance(tensor, torch.Tensor):
+            update_dstribution(1, cur_size)
+            return cur_size
+
+    total_size = sum(get_tensor_size(n, p) for n, p in model.named_parameters())
+    if verbose_level >= 1:
+        print(f"Model Sharding Distribution:")
+        print(f"device: {cur_device}, dtype: {dtype}")
+        origin_size = 0
+        for shards, (count, size) in sharding_distribution.items():
+            print(f"shards: {shards}, count: {count}, size: {humanize.naturalsize(size)}")
+            origin_size += size * shards
+        print(f"origin_size: {humanize.naturalsize(origin_size)}")
+
+    return total_size
 
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
@@ -180,7 +291,7 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
-        # model_config.num_hidden_layers = 20
+        #model_config.num_hidden_layers = 20
 
         self._is_reward_model = (
             "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
@@ -345,6 +456,8 @@ class DTensorPolicyWorkerV2:
             tp_mesh_name="tp",
         )
 
+        print(f"After FSDP2 model size: {humanize.naturalsize(model_size_calculator(self.model, 1))}")
+
         print(f"[Rank {self.rank}] Loading state dict from rank 0...")
         # This will broadcast the state dict from rank 0 to all other ranks
         # and load it into the FSDP model.
@@ -484,6 +597,14 @@ class DTensorPolicyWorkerV2:
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
+
+        # Print rank 0's memory usage
+        if self.rank == 0:
+            print("Get gpu info in train()")
+            get_gpu_memory_usage()
+            print(f"Model size in train(): {humanize.naturalsize(model_size_calculator(self.model, 1))}")
+            
+
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -863,6 +984,12 @@ class DTensorPolicyWorkerV2:
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+
+        # Print rank 0's memory usage# Print rank 0's memory usage
+        if self.rank == 0:
+            print("Get gpu info in get_logprobs()")
+            get_gpu_memory_usage()
+
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -883,6 +1010,10 @@ class DTensorPolicyWorkerV2:
         self.model.eval()
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
+        #with torch.no_grad():
+            if self.rank == 0:
+                print(f"Unshard model size: {humanize.naturalsize(model_size_calculator(self.model, 1))}")
+
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -1000,8 +1131,7 @@ class DTensorPolicyWorkerV2:
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
 
-                        if 'flash_attn_kwargs' in model_args:
-                            del model_args['flash_attn_kwargs']
+                        del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)
 

@@ -1,0 +1,105 @@
+# GRPO Algorithm Configuration
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 200
+
+policy:
+  # model_name: Qwen/Qwen2.5-1.5B
+  # tokenizer:
+  #   name: Qwen/Qwen2.5-1.5B
+  model_name: "/lustre/fsw/portfolios/coreai/users/shashankv/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf"
+  tokenizer:
+    name: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
+  max_total_sequence_length: 1024
+  precision: "bfloat16"
+  train_global_batch_size: 128
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: true
+    context_parallel_size: 1
+    cpu_offload: false
+    enabled: true
+    sequence_parallel: false
+    tensor_parallel_size: 8
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: false
+
+ # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # for more details on dynamic batching and sequence packing.
+  dynamic_batching:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        # The scheduler iteration is per GPRO step and is decoupled with the optimizer step (may be >=1 per GPRO step)
+        total_iters: 13
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [13]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+
+logger:
+  log_dir: "logs"  # Base directory for all logs
+  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  wandb:
+    project: "grpo-nemotron-joyang"
+    name: "grpo-${data.dataset_name}-nemotron-super-49b-tp${policy.dtensor_cfg.tensor_parallel_size}-joyang"
+  tensorboard:
+    log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "openmathinstruct-nemorl-1M_train"
+  gpu_monitoring:
+    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
+    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
