@@ -439,12 +439,12 @@ def sft_train(
                         ],
                     )
 
-                    if is_mdlm:
-                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, tokenizer.mask_token_id)
+                    if is_dqwn:
+                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, policy.model.mask_token_id)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "target_ids": cat_and_padded["token_ids"],
-                                "input_ids": cat_and_padded["noisy_token_ids"],
+                                "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
                                 "noise_mask": cat_and_padded["noise_mask"],
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,
@@ -452,11 +452,12 @@ def sft_train(
                                 "sample_mask": batch["loss_multiplier"],
                             }
                         )
-                    elif is_dqwn:
+                    elif is_mdlm:
+                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, tokenizer.mask_token_id)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "target_ids": cat_and_padded["token_ids"],
-                                "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
+                                "input_ids": cat_and_padded["noisy_token_ids"],
                                 "noise_mask": cat_and_padded["noise_mask"],
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,
