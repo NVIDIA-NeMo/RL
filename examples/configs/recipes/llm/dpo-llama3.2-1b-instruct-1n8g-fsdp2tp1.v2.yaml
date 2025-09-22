@@ -33,6 +33,7 @@ policy:
   max_total_sequence_length: 1024
   precision: "bfloat16"
   dtensor_cfg:
+    _v2: false
     enabled: true
     cpu_offload: False
     sequence_parallel: false

@@ -49,6 +49,7 @@ policy:
   precision: "bfloat16"
 
   dtensor_cfg:
+    _v2: false
     enabled: true
     cpu_offload: true
     sequence_parallel: true

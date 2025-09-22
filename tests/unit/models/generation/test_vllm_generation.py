@@ -104,6 +104,7 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
+        "_v2": True,
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,

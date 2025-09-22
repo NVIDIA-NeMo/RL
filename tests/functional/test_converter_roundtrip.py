@@ -70,6 +70,7 @@ def create_test_config() -> Dict[str, Any]:
             "max_total_sequence_length": 128,
             "precision": "bfloat16",
             "dtensor_cfg": {
+                "_v2": True,
                 "enabled": True,
                 "cpu_offload": False,
                 "sequence_parallel": False,

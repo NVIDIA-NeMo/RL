@@ -55,7 +55,7 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
-            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "_v2": dtensor_v2,
             "enabled": True,
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
