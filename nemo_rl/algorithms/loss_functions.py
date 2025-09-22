@@ -355,7 +355,10 @@ class NLLLoss(LossFunction):
             next_token_logprobs = torch.nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )
-            logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
+            if not mdlm_loss:
+                logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
+            else:
+                logprobs = next_token_logprobs
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
