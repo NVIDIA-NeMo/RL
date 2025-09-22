@@ -1,4 +1,4 @@
-defaults: "examples/penguin/grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
+defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
 
 grpo:
   val_period: 1
