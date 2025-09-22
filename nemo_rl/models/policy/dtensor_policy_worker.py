@@ -212,6 +212,7 @@ class DTensorPolicyWorker:
         )
 
         self._is_mdlm = self.cfg.get("is_mdlm", False)
+        self._is_dqwn = self.cfg.get("is_dqwn", False)
 
         self._is_reward_model = self.cfg.get("reward_model_cfg", {}).get(
             "enabled", False
