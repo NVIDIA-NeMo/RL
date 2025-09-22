@@ -12,7 +12,8 @@ config_path: "examples/configs/sft_mdlm.yaml"
 
 
 # Model configuration
-policy.is_mdlm: [false]   # let's see if things work right out of the box
+policy.is_mdlm: [true]
+policy.is_dqwn: [true]
 policy.model_name: ["nvidia/Nemotron-Diffusion-Research-4B-v0"]
 
 # Data configuration

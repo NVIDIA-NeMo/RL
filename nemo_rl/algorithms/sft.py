@@ -115,6 +115,7 @@ def setup(
 
     # get type of the policy (mdlm or gpt)
     is_mdlm = policy_config.get("is_mdlm", False)
+    is_dqwn = policy_config.get("is_dqwn", False)
 
     # ==========================
     #         Logger
@@ -263,6 +264,7 @@ def validate(
             )
 
             is_mdlm = master_config["policy"].get("is_mdlm", False)
+            is_dqwn = master_config["policy"].get("is_dqwn", False)
 
             if is_mdlm:
                 target_ids = cat_and_padded["token_ids"].clone()
@@ -357,6 +359,7 @@ def sft_train(
 
     # get type of the policy (mdlm or gpt)
     is_mdlm = master_config["policy"].get("is_mdlm", False)
+    is_dqwn = master_config["policy"].get("is_dqwn", False)
 
     if sft_save_state is None:
         sft_save_state = _default_sft_save_state()
@@ -437,12 +440,23 @@ def sft_train(
                     )
 
                     if is_mdlm:
-                        target_ids = cat_and_padded["token_ids"].clone()
                         cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, tokenizer.mask_token_id)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
-                                "target_ids": target_ids,
-                                "input_ids": cat_and_padded["token_ids"],
+                                "target_ids": cat_and_padded["token_ids"],
+                                "input_ids": cat_and_padded["noisy_token_ids"],
+                                "noise_mask": cat_and_padded["noise_mask"],
+                                "p_mask": cat_and_padded["p_mask"],
+                                "input_lengths": input_lengths,
+                                "token_mask": cat_and_padded["token_loss_mask"],
+                                "sample_mask": batch["loss_multiplier"],
+                            }
+                        )
+                    elif is_dqwn:
+                        train_data: BatchedDataDict = BatchedDataDict(
+                            {
+                                "target_ids": cat_and_padded["token_ids"],
+                                "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
                                 "noise_mask": cat_and_padded["noise_mask"],
                                 "p_mask": cat_and_padded["p_mask"],
                                 "input_lengths": input_lengths,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import contextlib
 import gc
 import itertools
@@ -715,6 +716,19 @@ class DTensorPolicyWorker:
                             if self._is_mdlm:
                                 del model_args["position_ids"]
                                 del model_args["flash_attn_kwargs"]
+
+                            if self._is_dqwn:
+                                assert self._is_mdlm, "DiffQwen is only supported for MDLM"
+
+                                del model_args["use_cache"]
+                                # internally uses block diffusion attention mask 
+                                del model_args["attention_mask"]
+
+                                model_args = {
+                                    **model_args, 
+                                    "masked_indices": mb["noise_mask"],
+                                    "labels": mb["target_ids"],
+                                }
 
                             if self._is_reward_model:
                                 # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.

@@ -51,7 +51,8 @@ def prepare_for_mdlm_train_data(cat_and_padded: BatchedDataDict, mask_token_id: 
 
     new_cat_and_padded = BatchedDataDict(
         {
-            "token_ids": noisy_token_ids,
+            "token_ids": token_ids,
+            "noisy_token_ids": noisy_token_ids,
             "token_loss_mask": token_loss_mask,
             "noise_mask": noise_mask,
             "p_mask": p_mask,
