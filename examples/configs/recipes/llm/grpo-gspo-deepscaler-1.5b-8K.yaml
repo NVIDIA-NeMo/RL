@@ -13,6 +13,9 @@ grpo:
   max_val_samples: 480
   val_batch_size: 32
   seed: 42
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
 
 loss_fn:
   reference_policy_kl_penalty: 0.0

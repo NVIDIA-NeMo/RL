@@ -13,6 +13,9 @@ grpo:
   val_batch_size: 32
   seed: 42
   overlong_filtering: false
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
