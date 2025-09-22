@@ -61,7 +61,7 @@ class _UniqueNumbersRunner:
         runner: Any,
         user_id: str,
         log_name_suffix: str = "",
-        dump_folder: str = ADK_LOG_FOLDER,
+        dump_folder: Optional[str] = ADK_LOG_FOLDER,
     ):
         from nemo_rl.environments.simulated_user.adk_utils import (
             extract_conversation_history,
@@ -153,7 +153,7 @@ class _UniqueNumbersRunner:
                     silence=True,
                 )
             )
-            next_meta = {
+            next_meta: UniqueNumbersMetadata = {
                 "numbers": metadata["numbers"],
                 "unique_count": metadata["unique_count"],
                 "turn": turn + 1,
@@ -207,7 +207,7 @@ class _UniqueNumbersRunner:
             return {"role": "user", "content": "<done>"}, reward, True, None, None
 
         # default response
-        next_meta = {
+        next_meta: UniqueNumbersMetadata = {
             "numbers": metadata["numbers"],
             "unique_count": metadata["unique_count"],
             "turn": turn + 1,
@@ -230,7 +230,7 @@ class UniqueNumbersEnv(EnvironmentInterface):
     """Environment where the LLM must deduce the count of unique numbers."""
 
     def __init__(self, cfg: Optional[UniqueNumbersConfig] = None):
-        cfg = cfg or {}
+        cfg = cfg or UniqueNumbersConfig()
         self.min_length = cfg.get("min_length", 3)
         self.max_length = cfg.get("max_length", 7)
         self.default_max_turns = cfg.get("max_turns", 10)
@@ -240,10 +240,10 @@ class UniqueNumbersEnv(EnvironmentInterface):
     def step(
         self,
         message_log_batch: list[LLMMessageLogType],
-        metadata_batch: list[Optional[UniqueNumbersMetadata]],
+        metadata: list[Optional[UniqueNumbersMetadata]],
     ) -> EnvironmentReturn:
         args = []
-        for log, meta in zip(message_log_batch, metadata_batch):
+        for log, meta in zip(message_log_batch, metadata):
             assert meta is not None, "Metadata must not be None for UniqueNumbersEnv."
             assert meta["numbers"] is not None, "Numbers must not be None in metadata."
             assert meta["unique_count"] > 0, (
