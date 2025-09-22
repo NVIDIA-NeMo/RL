@@ -21,6 +21,8 @@ on:
     types: [labeled, opened, synchronize, reopened]
   merge_group:
     types: [checks_requested]
+  schedule:
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       test_to_run:
@@ -95,6 +97,11 @@ jobs:
             TEST_LEVEL="none"
           fi
 
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "Setting test level to L1 for nightly scheduled run"
+            TEST_LEVEL="L1"
+          fi
+
           # Override test level if specified in workflow_dispatch
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "Overriding test level from $TEST_LEVEL to ${{ inputs.test_to_run }}"
@@ -102,6 +109,46 @@ jobs:
           fi
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
+
+  pr-branch-up-to-date-check:
+    name: Check if PR branch is up to date
+    needs: [pre-flight]
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    env:
+      MAX_COMMITS_BEHIND: 10
+    steps:
+      - name: Check how many commits behind target branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+        run: |
+          echo "Repository: $REPO"
+          echo "Base branch: $BASE_REF (SHA: $BASE_SHA)"
+          echo "PR head: $HEAD_LABEL (SHA: $HEAD_SHA)"
+          echo "Maximum commits behind allowed: $MAX_COMMITS_BEHIND"
+
+          API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_REF" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
+
+          COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
+          COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.behind_by')
+          STATUS=$(echo "$API_RESPONSE" | jq -r '.status')
+
+          echo "Comparison status: $STATUS"
+          echo "PR is $COMMITS_BEHIND commits behind and $COMMITS_AHEAD commits ahead of $BASE_REF"
+
+          # Check if we're behind by more than the allowed number
+          if [ "$COMMITS_BEHIND" -gt "$MAX_COMMITS_BEHIND" ]; then
+            echo "❌ ERROR: This PR is $COMMITS_BEHIND commits behind $BASE_REF, which exceeds the maximum allowed ($MAX_COMMITS_BEHIND commits)."
+            echo "Please rebase or merge the latest changes from $BASE_REF into your PR branch."
+            exit 1
+          else
+            echo "✅ PR is acceptably fresh ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
+          fi
 
   lint-check:
     name: Lint check
@@ -185,6 +232,7 @@ jobs:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
           is_doc_test: "true"
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   cicd-unit-tests:
     strategy:
@@ -213,6 +261,7 @@ jobs:
           script: ${{ matrix.script }}
           is_unit_test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   cicd-functional-tests:
     strategy:
@@ -236,6 +285,7 @@ jobs:
         with:
           runner: ${{ runner.name }}
           script: ${{ matrix.script }}
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   CI_QA_Gate:
     name: CI quality check
@@ -243,6 +293,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - pr-branch-up-to-date-check
       - lint-check
       - sphinx-build
       - build-container
@@ -257,6 +308,7 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
+              (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
                 needs.pre-flight.outputs.test_level == 'none' ||
                 (
@@ -279,13 +331,32 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "$TEST_LEVEL" == "none" ]]; then
-            echo "No tests were run, passing gate" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
           test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
+
+  notify-nightly-failure:
+    name: Notify nightly test failure
+    runs-on: ubuntu-latest
+    needs: [CI_QA_Gate]
+    environment: main
+    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
+        run: |
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" "$SLACK_WEBHOOK"
 
   Coverage:
     runs-on: ubuntu-latest

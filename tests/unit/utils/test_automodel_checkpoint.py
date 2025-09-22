@@ -376,7 +376,7 @@ class TestSaveLoadIntegration:
         original_scheduler_state = scheduler.state_dict()
 
         with TemporaryDirectory() as tmp_dir:
-            model_path = os.path.join(tmp_dir, "model_and_optimizer", "model")
+            model_path = os.path.join(tmp_dir, "model_and_optimizer", "model_path")
             optimizer_path = os.path.join(tmp_dir, "model_and_optimizer", "optimizer")
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             os.makedirs(os.path.dirname(optimizer_path), exist_ok=True)

@@ -148,6 +148,7 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config["policy"]
     generation_config = master_config["policy"]["generation"]
+    env_configs = master_config["env"]
     loss_config = master_config["loss_fn"]
     grpo_config = master_config["grpo"]
     data_config = master_config["data"]
@@ -219,14 +220,44 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    reward_model_enabled = (
+        "reward_model" in env_configs and env_configs["reward_model"]["enabled"]
+    )
+
+    total_nodes = cluster_config["num_nodes"]
+    if reward_model_enabled:
+        rm_resource = env_configs["reward_model"]["resources"]
+        rm_nodes = rm_resource["num_nodes"]
+        rm_gpus_per_node = rm_resource["gpus_per_node"]
+    else:
+        rm_nodes = 0
+        rm_gpus_per_node = 0
+
+    if total_nodes == 1:
+        policy_nodes = total_nodes
+    else:
+        policy_nodes = total_nodes - rm_nodes
+        assert policy_nodes > 0, (
+            "policy_nodes must be > 0, but got "
+            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
+        )
 
     if colocated_inference:
+        if total_nodes == 1:
+            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            assert policy_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1, "
+                f"but got {policy_gpus_per_node}."
+            )
+        else:
+            policy_gpus_per_node = cluster_config["gpus_per_node"]
+
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-            * cluster_config["num_nodes"],
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
             use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
+            num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 2,
@@ -234,7 +265,7 @@ def setup(
         train_cluster = cluster
         inference_cluster = cluster
         print(
-            f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
         )
 
@@ -246,27 +277,43 @@ def setup(
 
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = cluster_config["num_nodes"]
+        train_nodes = policy_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if cluster_config["num_nodes"] == 1:
+        if policy_nodes == 1:
+            # When policy_nodes == 1, train and inference are on the same node
             assert inference_gpus_per_node > 0, (
                 "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                "when policy_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_gpus_per_node}."
             )
             assert inference_nodes is None or inference_nodes == 1, (
                 "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
-                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                "when policy_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_nodes}."
             )
+
             inference_nodes = 1
-            train_gpus_per_node -= inference_gpus_per_node
+            # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
+            reward_gpus_to_subtract = (
+                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
+            )
+            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
+            assert train_gpus_per_node > 0, (
+                "No enough GPUs for training, "
+                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
+                + (
+                    f" - rm_gpus_per_node:{rm_gpus_per_node}"
+                    if total_nodes == 1 and reward_model_enabled
+                    else ""
+                )
+            )
         else:
+            # train, inference, and reward model are all on different nodes
             assert inference_nodes > 0, (
                 "policy.generation.colocated.resources.num_nodes must be > 0 "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "

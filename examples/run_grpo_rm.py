@@ -30,12 +30,10 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
 )
 from nemo_rl.data.processors import math_hf_data_processor
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -44,7 +42,13 @@ OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Returns:
+        Tuple of (parsed_args, overrides) where:
+        - parsed_args: Namespace object containing parsed arguments
+        - overrides: List of remaining unparsed arguments (Hydra overrides)
+    """
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -74,8 +78,9 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
-    math_task_spec = TaskDataSpec(
-        task_name="math",
+    task_name = "math"
+    reward_model_task_spec = TaskDataSpec(
+        task_name=task_name,
         prompt_file=data_config["prompt_file"],
         system_prompt_file=data_config["system_prompt_file"],
     )
@@ -85,24 +90,23 @@ def setup_data(
 
     # data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (math_task_spec, math_hf_data_processor))
+        defaultdict(lambda: (reward_model_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
+    task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
 
-    # setup math environment
-    math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
+                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
             ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
-    ).remote(env_configs["math"])
+    ).remote(env_configs["reward_model"])
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
-        math_task_spec,
+        reward_model_task_spec,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -112,15 +116,15 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
-            math_task_spec,
+            reward_model_task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
     else:
         val_dataset = None
 
-    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: math_env)
-    task_to_env["math"] = math_env
+    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: reward_model_env)
+    task_to_env[task_name] = reward_model_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
@@ -131,7 +135,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
+            os.path.dirname(__file__), "configs", "grpo_rm_1B.yaml"
         )
 
     config = load_config(args.config)
@@ -202,6 +206,10 @@ def main() -> None:
         grpo_state,
         master_config,
     )
+
+    for task_name in val_task_to_env.keys():
+        env = val_task_to_env[task_name]
+        env.shutdown.remote()
 
 
 if __name__ == "__main__":
