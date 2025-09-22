@@ -16,6 +16,8 @@ replace-imports-with-any = [
     "numpy.*",
     "sphinx.*",
     "docutils.*",
+    "google.adk.*",
+    "google.genai.*",
 ]
 project-includes = [
     # TODO: enable these once we have 100 correctness
