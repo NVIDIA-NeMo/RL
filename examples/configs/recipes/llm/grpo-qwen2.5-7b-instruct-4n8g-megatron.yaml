@@ -2,11 +2,13 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_rollout_turns: 1
+  max_num_epochs: 1
   max_num_steps: 30
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
+  overlong_filtering: false
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
@@ -56,6 +58,7 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     
@@ -87,7 +90,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 50
       lr_warmup_init: 5.0e-7
 
@@ -145,6 +148,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
+      expert_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: 4096
       enforce_eager: False

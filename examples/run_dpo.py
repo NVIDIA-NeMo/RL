@@ -22,8 +22,9 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.dpo import MasterConfig, dpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig, hf_datasets
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_preference_dataset
+from nemo_rl.data.datasets.preference_datasets import PreferenceDataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -69,9 +70,11 @@ def dpo_preprocessor(
         >>> task_spec = TaskDataSpec(task_name="test_dpo")
         >>>
         >>> datum = {
-        ...     "prompt": "What is 2+2?",
-        ...     "chosen_response": "4",
-        ...     "rejected_response": "5"
+        ...     "context": [{"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
         ... }
         >>>
         >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
@@ -84,11 +87,13 @@ def dpo_preprocessor(
         >>> processed["message_log_rejected"][-1]["content"]
         '5<|eot_id|>'
         >>>
-        >>> # prompt can also be a list with multiple messages
+        >>> # context can also contain multiple turns
         >>> datum = {
-        ...     "prompt": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
-        ...     "chosen_response": "4",
-        ...     "rejected_response": "5"
+        ...     "context": [{"role": "user", "content": "I have a question."}, {"role": "assistant", "content": "Sure!"}, {"role": "user", "content": "What is 2+2?"}],
+        ...     "completions": [
+        ...         {"rank": 0, "completion": [{"role": "assistant", "content": "4"}]},
+        ...         {"rank": 1, "completion": [{"role": "assistant", "content": "5"}]}
+        ...     ]
         ... }
         >>> processed = dpo_preprocessor(datum, task_spec, tokenizer, max_seq_length=128, idx=0)
         >>> len(processed["message_log_chosen"])
@@ -102,36 +107,23 @@ def dpo_preprocessor(
 
         ```
     """
-    if isinstance(datum_dict["prompt"], list):
-        messages_chosen = datum_dict["prompt"].copy()
-        messages_rejected = datum_dict["prompt"].copy()
+    assert len(datum_dict["completions"]) == 2, (
+        "DPO training supports only two completions"
+    )
+    # Lower rank is preferred
+    if datum_dict["completions"][0]["rank"] < datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][0]
+        rejected_completion = datum_dict["completions"][1]
+    elif datum_dict["completions"][0]["rank"] > datum_dict["completions"][1]["rank"]:
+        chosen_completion = datum_dict["completions"][1]
+        rejected_completion = datum_dict["completions"][0]
     else:
-        messages_chosen = [
-            {
-                "role": "user",
-                "content": datum_dict["prompt"],
-            },
-        ]
-        messages_rejected = [
-            {
-                "role": "user",
-                "content": datum_dict["prompt"],
-            },
-        ]
+        raise NotImplementedError(
+            "Ties are not supported yet. You can use the following command to filter out ties: `cat <PathToPreferenceDataset> | jq 'select(.completions[0].rank != .completions[1].rank)'`."
+        )
 
-    messages_chosen.append(
-        {
-            "role": "assistant",
-            "content": datum_dict["chosen_response"],
-        },
-    )
-
-    messages_rejected.append(
-        {
-            "role": "assistant",
-            "content": datum_dict["rejected_response"],
-        },
-    )
+    messages_chosen = datum_dict["context"] + chosen_completion["completion"]
+    messages_rejected = datum_dict["context"] + rejected_completion["completion"]
 
     message_log_chosen = get_formatted_message_log(
         messages_chosen, tokenizer, task_data_spec
@@ -174,21 +166,14 @@ def dpo_preprocessor(
 def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
     print("\n▶ Setting up data...")
 
-    if data_config["dataset_name"] == "HelpSteer3":
-        data = hf_datasets.HelpSteer3Dataset()
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = data.formatted_ds["validation"]
-    elif data_config["dataset_name"] == "Tulu3Preference":
-        data = hf_datasets.Tulu3PreferenceDataset()
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = None
-    else:
-        data = hf_datasets.DPODataset(
-            train_data_path=data_config["train_data_path"],
-            val_data_path=data_config["val_data_path"],
-        )
-        train_dataset = data.formatted_ds["train"]
-        val_dataset = data.formatted_ds["validation"]
+    # load dataset
+    data = load_preference_dataset(data_config)
+    train_dataset = data.formatted_ds["train"]
+    val_dataset = data.formatted_ds["validation"]
+
+    print(f"  ✓ Training dataset loaded with {len(train_dataset)} samples.")
+    if val_dataset:
+        print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
 
     dpo_task_spec = data.task_spec
 
@@ -201,13 +186,41 @@ def setup_data(data_config: DataConfig, policy_config: PolicyConfig):
         max_seq_length=data_config["max_input_seq_length"],
     )
 
-    if val_dataset:
-        val_dataset = AllTaskProcessedDataset(
-            val_dataset,
-            tokenizer,
-            dpo_task_spec,
-            dpo_preprocessor,
-            max_seq_length=data_config["max_input_seq_length"],
+    # TODO @yukih: unify the code when support multiple datasets for other algorithms
+    if "val_data_paths" in data_config and data_config["val_data_paths"]:
+        val_dataset = {}
+
+        assert isinstance(data_config["val_data_paths"], dict), (
+            f"Invalid type for val_data_paths: {type(data_config['val_data_paths'])}. val_data_paths must be a dictionary."
+        )
+        val_data_paths = data_config["val_data_paths"]
+
+        for val_dataset_name, val_dataset_path in val_data_paths.items():
+            assert val_dataset_name not in val_dataset
+            val_data = PreferenceDataset(val_dataset_path)
+            print(
+                f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
+            )
+            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
+                val_data.formatted_ds["train"],
+                tokenizer,
+                val_data.task_spec,
+                dpo_preprocessor,
+                max_seq_length=data_config["max_input_seq_length"],
+            )
+    else:
+        val_dataset = (
+            {
+                "default": AllTaskProcessedDataset(
+                    val_dataset,
+                    tokenizer,
+                    dpo_task_spec,
+                    dpo_preprocessor,
+                    max_seq_length=data_config["max_input_seq_length"],
+                )
+            }
+            if val_dataset
+            else {}
         )
 
     return train_dataset, val_dataset, tokenizer, dpo_task_spec

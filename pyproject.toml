@@ -50,6 +50,7 @@ dependencies = [
     "torchvision>=0.22.0",
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
+    "nvidia-nvshmem-cu12", # for deep_ep build
 ]
 
 [project.optional-dependencies]
@@ -67,6 +68,10 @@ automodel = [
 vllm = [
     "cuda-python",
     "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+    # deep_ep also needs libibverbs-dev
+    # sudo apt-get update
+    # sudo apt-get install libibverbs-dev
+    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
     "vllm==0.10.0",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -82,9 +87,13 @@ mcore = [
     # sudo dpkg -i cuda-keyring_1.1-1_all.deb
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
-    "transformer-engine[pytorch]==2.3.0",
+
+    # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
+    # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
+    # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
+    "transformer-engine[pytorch]==2.5.0",
     "megatron-core",
-    "nemo-tron",
+    "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "vllm==0.10.0",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -117,6 +126,7 @@ docs = [
     "sphinx-copybutton",  # Adds a copy button for code blocks
     "myst_parser",  # For our markdown docs
     "nvidia-sphinx-theme",  # Our NVIDIA theme
+    "gitpython>=3.1.45",  # To git-related information
 ]
 dev = [
     "pre-commit>=4.2.0",
@@ -130,23 +140,26 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "pytest-asyncio",
+    "pytest-testmon",
 ]
 
 [tool.uv.sources]
 megatron-core = { workspace = true }
-nemo-tron = { workspace = true }
 nemo-automodel = { workspace = true }
-# The NeMo Run source to be used by nemo-tron
+megatron-bridge = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
-  { index = "pytorch-cu128" },
+  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu128" },
+  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 triton = [
-  { index = "pytorch-cu128" },
+  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
@@ -154,9 +167,14 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc30
 [tool.uv.workspace]
 members = [
     "3rdparty/Megatron-LM-workspace",
-    "3rdparty/NeMo-workspace",
     "3rdparty/Automodel-workspace/Automodel",
+    "3rdparty/Megatron-Bridge-workspace",
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -164,7 +182,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -196,8 +214,10 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
+    "run_first: marks tests that should run before others",
     "mcore: marks tests that require the mcore extra",
     "hf_gated: marks tests that require HuggingFace token access for gated models",
+    "automodel: marks tests that require the automodel extra",
 ]
 
 [tool.pyrefly]

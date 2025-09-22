@@ -54,6 +54,10 @@ inputs:
     description: "Has Azure credentials"
     required: false
     default: "false"
+  is_fork_pr:
+    description: "Whether this is a pull request from a fork"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -171,6 +175,7 @@ runs:
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
+          ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
           --volume $GITHUB_ACTION_DIR:$GITHUB_ACTION_DIR \
           --volume /mnt/datadrive/TestData/nemo-rl/datasets:/opt/nemo-rl/datasets:ro \

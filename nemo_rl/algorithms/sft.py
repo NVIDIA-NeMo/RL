@@ -24,9 +24,10 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from nemo_rl.algorithms.loss_functions import (
     NLLLoss,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
@@ -150,7 +151,7 @@ def setup(
         batch_size=sft_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=rl_collate_fn,
-        drop_last=True,
+        drop_last=False,
     )
 
     # ==========================
@@ -171,6 +172,12 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            sft_config["max_num_steps"],
+            sft_config["max_num_epochs"] * len(train_dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
     # check if tokenizer is a processor (e.g. for VLMs)
     processor = None
     if not isinstance(tokenizer, PreTrainedTokenizerBase):
@@ -228,6 +235,9 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
+        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
+            "val_dataloader is None, so dpo.val_period must be 0"
+        )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
@@ -240,7 +250,7 @@ def validate(
         # val_total = len(val_dataloader)
 
         val_metrics = {"val_loss": 0.0}
-        num_valid_batches = 0
+        sum_num_valid_tokens = 0
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
@@ -269,13 +279,18 @@ def validate(
 
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+            # When running validation with drop_last=False, we might end up with a partial batch.
+            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
+            if val_data.size < val_batch_size:
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
             ## just run model fwd
             val_results = policy.train(
                 val_data,
                 loss_fn,
                 eval_mode=True,
-                gbs=val_batch_size,
+                gbs=val_data.size,
                 mbs=val_mbs,
             )
 
@@ -285,14 +300,17 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                val_metrics["val_loss"] += float(val_results["loss"])
-                num_valid_batches += 1
+                num_valid_tokens = (
+                    val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
+                ).sum()
+                val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
+                sum_num_valid_tokens += num_valid_tokens
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
-        if num_valid_batches > 0:
-            val_metrics["val_loss"] /= num_valid_batches
+        if sum_num_valid_tokens > 0:
+            val_metrics["val_loss"] /= sum_num_valid_tokens
         else:
             warnings.warn(
                 "No validation metrics were collected."
@@ -306,7 +324,7 @@ def validate(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if num_valid_batches > 0:
+    if sum_num_valid_tokens > 0:
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
@@ -506,6 +524,7 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -564,6 +583,8 @@ def sft_train(
             current_step += 1
             total_steps += 1
 
+            if should_save_by_timeout:
+                return
             if total_steps >= master_config["sft"]["max_num_steps"]:
                 return
 

@@ -159,7 +159,7 @@ MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\
     --nodes=$NUM_NODES \\
     --account=$ACCOUNT \\
-    --job-name=$ACCOUNT:$JOB_NAME \\
+    --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
     --time=0:${NUM_MINUTES}:0 \\
     --gres=gpu:8 \\

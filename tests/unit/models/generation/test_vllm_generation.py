@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import ray
+import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -25,7 +28,13 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _maybe_correct_merged_tokens,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -39,7 +48,13 @@ basic_vllm_test_config: VllmConfig = {
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
-    "temperature": 0.8,
+    # Set temperature=1.0 to ensure consistent probability scaling when comparing vLLM and HF policy outputs.
+    # Note: greedy=True is only used in tests for deterministic behavior and not used in the real training.
+    # In vLLM, enabling greedy=True disables temperature scaling (temperature is overridden to None).
+    # The HF policy worker does not currently support greedy=True for get_logprobs.
+    # Using temperature=1.0 allows us to meaningfully test the average probability multiplicative error between the two implementations,
+    # while still maintaining the deterministic behavior.
+    "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
     "stop_token_ids": None,
@@ -48,6 +63,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -117,6 +133,7 @@ def get_basic_megatron_test_config(
     precision: str = "float32",
     activation_checkpointing: bool = False,
     sequence_parallel: bool = False,
+    empty_unused_memory_level: int = 0,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     # Use the exact same model as vLLM tests for perfect compatibility
@@ -142,7 +159,7 @@ def get_basic_megatron_test_config(
         },
         "megatron_cfg": {
             "enabled": True,
-            "empty_unused_memory_level": 0,
+            "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
             "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
@@ -158,7 +175,9 @@ def get_basic_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -324,6 +343,43 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+def test_vllm_top_p_top_k_validation(cluster):
+    """Test that top_p and top_k validation works correctly with threshold-based logic."""
+    # Test that values above thresholds are allowed
+    config_above_thresholds = deepcopy(basic_vllm_test_config)
+    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
+    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
+
+    # Should not raise an error
+    try:
+        VllmGeneration(cluster, config_above_thresholds)
+        print("Successfully initialized with top_p=0.99 and top_k=8000")
+    except Exception as e:
+        pytest.fail(f"Should not raise error with values above thresholds: {e}")
+
+    # Test that values below thresholds are rejected
+    config_below_thresholds = deepcopy(basic_vllm_test_config)
+    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_below_thresholds)
+
+    error_message = str(excinfo.value)
+    assert "top_p sampling with values < 0.99 is not supported" in error_message
+    print(f"Successfully caught low top_p value with error: {error_message}")
+
+    # Test that low top_k values are rejected
+    config_low_top_k = deepcopy(basic_vllm_test_config)
+    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_low_top_k)
+
+    error_message = str(excinfo.value)
+    assert "top_k sampling with values < 8000 is not supported" in error_message
+    print(f"Successfully caught low top_k value with error: {error_message}")
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
@@ -994,6 +1050,360 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
+def configure_http_server_config(tokenizer) -> VllmConfig:
+    # Create separate configs for each policy
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(
+        generation_config, tokenizer, is_eval=True
+    )
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    return generation_config
+
+
+def _wait_for_vllm_http_server_spinup(base_url: str):
+    while True:
+        try:
+            requests.get(base_url, timeout=5)
+            # We don't check the status code since there may not be a route at /
+            break
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            Exception,
+        ):
+            pass
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    actual_result = response.json()
+
+    # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
+    expected_result = {
+        "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
+        "object": "chat.completion",
+        "created": 1756421711,
+        "model": "Qwen/Qwen3-0.6B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>",
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning_content": None,
+                },
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:151667",
+                            "logprob": -0.00023779425828251988,
+                            "bytes": [60, 116, 104, 105, 110, 107, 62],
+                            "top_logprobs": [],
+                        }
+                    ]
+                },
+                "finish_reason": "length",
+                "stop_reason": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "kv_transfer_params": None,
+    }
+
+    def _standardize(d: dict) -> dict:
+        d = deepcopy(d)
+        d.pop("id")
+        d.pop("created")
+        # We don't want to implicate log prob accuracy in this test.
+        d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        return d
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that tokenization route works
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Clean up
+    vllm_generation.shutdown()
+
+    # We should not be able to connect after shutdown
+    with pytest.raises(requests.ConnectionError):
+        requests.post(
+            url=f"{base_urls[0]}/chat/completions",
+            json=dict(
+                messages=[
+                    {"role": "user", "content": "count to 5"},
+                ],
+                temperature=0.0,
+                logprobs=True,
+                return_tokens_as_token_ids=True,
+                max_tokens=1,
+            ),
+        )
+
+
+def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+
+    # [26951, 3834] and [94224] both detokenize to " skinny"
+    # Test super simple example of correcting the merged tokens
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[94224],
+    )
+    expected_result = [26951, 3834]
+    assert expected_result == actual_result
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[61830, 65],
+        actual_token_ids=[2435, 20828],
+    )
+    expected_result = [61830, 65]
+    assert expected_result == actual_result
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[758, 12601],
+        actual_token_ids=[89038],
+    )
+    expected_result = [758, 12601]
+    assert expected_result == actual_result
+
+    # Test no-op
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=[26951, 3834],
+        actual_token_ids=[26951, 3834],
+    )
+    expected_result = [26951, 3834]
+
+    # Test sanity failure assert
+    with pytest.raises(
+        AssertionError, match="Found a non-monotonically increasing trajectory"
+    ):
+        _maybe_correct_merged_tokens(
+            tokenizer=tokenizer,
+            reference_token_ids=[26951, 26951, 26951, 26951],
+            actual_token_ids=[26951, 26951, 3834, 3834, 3834],
+        )
+
+    test_data_fpath = Path(__file__).with_name(
+        "maybe_correct_merged_tokens_test_data.json"
+    )
+    with test_data_fpath.open() as f:
+        test_data = json.load(f)
+
+    actual_result = _maybe_correct_merged_tokens(
+        tokenizer=tokenizer,
+        reference_token_ids=test_data["seen_token_ids"],
+        actual_token_ids=test_data["output_prompt_token_ids"],
+    )
+    expected_result = test_data["expected_output"]
+    assert expected_result == actual_result
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
+    cluster, tokenizer
+):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    detokenized_str = " Skinny"
+    initial_tokenized_ids = [26951, 3834]
+    re_tokenized_ids = [94224]
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": detokenized_str},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Check that the re-tokenized ids are the same with the reference and different without the reference.
+    # WITHOUT reference token IDs
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 9,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            *re_tokenized_ids,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # WITH reference token IDs
+    initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
+    initial_tokenized_query_ids = [
+        *initial_tokenized_query_ids_prefix,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
+    body_with_reference_token_ids = body | {
+        "required_prefix_token_ids": initial_tokenized_query_ids_prefix
+    }
+    response = requests.post(
+        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+    )
+    actual_result = response.json()
+    expected_result = {
+        "count": 10,
+        "max_model_len": 1024,
+        "tokens": initial_tokenized_query_ids,
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Generate and check result
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+    )
+    vllm_http_server_result = response.json()
+    vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
+        "logprobs"
+    ]["content"][0]
+    vllm_http_server_generated_token_id = int(
+        vllm_http_server_generated_token["token"].removeprefix("token_id:")
+    )
+
+    async for _, generate_result in vllm_generation.generate_async(
+        BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": torch.tensor([initial_tokenized_query_ids]),
+                "input_lengths": torch.tensor([len(initial_tokenized_query_ids)]),
+            }
+        )
+    ):
+        pass
+
+    generate_generated_token_id = generate_result["output_ids"][0][
+        len(initial_tokenized_query_ids)
+    ].item()
+
+    # We just check the first token here to check the alignment
+    assert vllm_http_server_generated_token_id == generate_generated_token_id
+
+    # Clean up
+    vllm_generation.shutdown()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
@@ -1574,7 +1984,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     )
 
     # Megatron config with same model
-    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config = get_basic_megatron_test_config(
+        tp=1, pp=1, precision="float32", empty_unused_memory_level=1
+    )
     megatron_config["model_name"] = model_name
     megatron_config["tokenizer"]["name"] = model_name
 

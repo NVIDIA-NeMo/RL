@@ -87,6 +87,7 @@ policy:
     moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True   
 
@@ -118,7 +119,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 50
       lr_warmup_init: 4.9999e-6
 
@@ -132,11 +133,22 @@ policy:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "squad"
   add_bos: true
   add_eos: true
   add_generation_prompt: false
   shuffle: true
+
+  dataset_name: "squad"
+  # You can use custom response datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: ResponseDataset
+  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  #     val_data_path: <PathToValidationDataset>
+  #     input_key: <QuestionKey>, default is "input"
+  #     output_key: <AnswerKey>, default is "output"
+  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
   ## unused with squad dataset
   prompt_file: null
