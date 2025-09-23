@@ -38,73 +38,121 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 def _maybe_correct_merged_tokens(
     tokenizer: PreTrainedTokenizerBase,
-    reference_token_ids: list[int],
+    model_token_ids: list[int],
     actual_corresponding_token_ids: list[int],
     actual_token_ids: list[int],
 ) -> list[int]:
-    """This is a subroutine used inside the vLLM Chat Completion server. Some environments (namely Penguin) require an OpenAI compatible server endpoint rather than an inference engine handle. This is fine for the most part, but it may cause issues when the environment is used as a part of training.
+    """This is a subroutine used inside the vLLM Chat Completion server.
+    Some environments (namely Penguin) require an OpenAI compatible server
+    endpoint rather than an inference engine handle. This is fine for the most
+    part, but it may cause issues when the environment is used as a part of
+    training.
 
-    RL training frameworks train models on token IDs, but the OpenAI compatible server communicates in what is basically de-tokenized text. When multiple model calls are made to the OpenAI compatible server in a single trajectory, model generations in previous model calls may be re-tokenized to something that is different than what was generated. This is not too big of an issue (that we know of) at inference time, but the log probs the model produces are different enough for the differently re-tokenized generation result that it causes the training to be off policy. Off policy isn't necessarily a bad thing in isolation, but this source of off-policyness may cause unexpected issues if not properly accounted for. It also mis-aligns the token ID sequences across model calls, which feels very strange during training.
+    RL training frameworks train models on token IDs, but the OpenAI compatible
+    server communicates in what is basically de-tokenized text. When multiple
+    model calls are made to the OpenAI compatible server in a single trajectory,
+    model generations in previous model calls may be re-tokenized to something
+    that is different than what was generated. This is not too big of an issue
+    (that we know of) at inference time, but the log probs the model produces
+    are different enough for the differently re-tokenized generation result that
+    it causes the training to be off policy. Off policy isn't necessarily a bad
+    thing in isolation, but this source of off-policyness may cause unexpected
+    issues if not properly accounted for. It also mis-aligns the token ID
+    sequences across model calls, which feels very strange during training.
 
-    Thus, in this function we attempt to correct any minor re-tokenization errors in an effort to stay on-policy as possible. We require the tokenizer, the ground truth reference token ids taken directly from previous model calls, and the re-tokenized actual token ids.
+    Thus, in this function we attempt to correct any minor re-tokenization
+    errors in an effort to stay on-policy as possible. We require the tokenizer,
+    the ground truth model token ids taken directly from previous model
+    calls, and the re-tokenized actual token ids.
 
     In other words, for the current model call:
-    - reference_token_ids = all_prefill_so_far + new_generation
-        - all_prefill_so_far: the last model call model engine input token ids. Literally what the model sees during the last generation call.
-        - new_generation: the last model call model engine generated token ids. Literally what the model generates during the last generation call.
+    - model_token_ids = all_prefill_so_far + new_generation
+        - all_prefill_so_far: the last model call model engine input token ids.
+          Literally what the model sees during the last generation call.
+        - new_generation: the last model call model engine generated token ids.
+          Literally what the model generates during the last generation call.
     - actual_token_ids = all_prefill_so_far_maybe_diff_tokenization + new_generation_maybe_diff_tokenization + tool_response_or_user + assistant_generation_prompt
-        - all_prefill_so_far_maybe_diff_tokenization: the re-tokenized version of all_prefill_so_far. Since the token IDs in all_prefill_so_far were de-tokenized and returned as OpenAI schema, they must be re-tokenized for the current model call, which means that it may differ from all_prefill_so_far
-        - new_generation_maybe_diff_tokenization: analogous version of all_prefill_so_far_maybe_diff_tokenization for new_generation
-        - tool_response_or_user: some returned user or tool message. It doesn't matter that this is tokenized here since it has never been tokenized before. However, at the next model call, this will become part of the all_prefill_so_far.
-        - assistant_generation_prompt: a common sequence of tokens to instruct the model to generate an assistant response.
+        - all_prefill_so_far_maybe_diff_tokenization: the re-tokenized version
+          of all_prefill_so_far.
+          Since the token IDs in all_prefill_so_far were de-tokenized and
+          returned as OpenAI schema, they must be re-tokenized for the current
+          model call, which means that it may differ from all_prefill_so_far
+        - new_generation_maybe_diff_tokenization: analogous version of
+          all_prefill_so_far_maybe_diff_tokenization for new_generation
+        - tool_response_or_user: some returned user or tool message.
+          It doesn't matter that this is tokenized here since it has never been
+          tokenized before. However, at the next model call, this will become
+          part of the all_prefill_so_far.
+        - assistant_generation_prompt: a common sequence of tokens to instruct
+          the model to generate an assistant response.
 
-    The goal of this subroutine is to find the prefix in actual_token_ids that corresponds to the de-tokenized text of reference_token_ids.
-    The idea of this subroutine implementation is to just de-tokenize subsequences of actual_token_ids (called candidate_token_ids) until the de-tokenized text matches the de-tokenized text of reference_token_ids.
+    The goal of this subroutine is to find the prefix in actual_token_ids that
+    corresponds to the de-tokenized text of model_token_ids.
+    The idea of this subroutine implementation is to just de-tokenize
+    subsequences of actual_token_ids (called candidate_token_ids) until the
+    de-tokenized text matches the de-tokenized text of model_token_ids.
 
-    TODO When NeMo RL supports training image generation models, we want to revisit and possibly update this function. This issue occurs when the model generates tokens that are de-tokenized into text or images, and then re-tokenized into tokens. So if there is a situation like that with images and image tokenization is non-unique, then we will need to uppdate this function.
+    TODO When NeMo RL supports training image generation models, we want to
+    revisit and possibly update this function. This issue occurs when the model
+    generates tokens that are de-tokenized into text or images, and then
+    re-tokenized into tokens. So if there is a situation like that with images
+    and image tokenization is non-unique, then we will need to uppdate this
+    function.
     """
-    if not reference_token_ids:
+    if not model_token_ids:
         return actual_token_ids
 
     # No re-tokenization errors
-    if reference_token_ids == actual_token_ids[: len(reference_token_ids)]:
+    if model_token_ids == actual_token_ids[: len(model_token_ids)]:
         return actual_token_ids
 
-    reference_str, actual_str = tokenizer.batch_decode(
-        [reference_token_ids, actual_token_ids]
+    model_str, actual_str = tokenizer.batch_decode(
+        [model_token_ids, actual_token_ids]
     )
 
     # For now, if a trajectory is not monotonically increasing, we assert.
     # Eventually when we support non-monotonic training, we need to update this logic
+
+    # FIXME(peter): this is not going to be correct b/c of e.g. different whitespace inside tool calls.
+
+    if (
+        len(model_str) > len(actual_str) or
+        model_str != actual_str[: len(model_str)]
+    ):
+        eos_token_id = tokenizer.eos_token_id
+        assert eos_token_id is not None
+
+        # TODO(peter)
+
     assert (
-        reference_str == actual_str[: len(reference_str)]
+        model_str == actual_str[: len(model_str)]
     ), f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
-Reference str: {reference_str}
+Model str:  {model_str}
 Actual str: {actual_str}
 
-Reference token ids: {reference_token_ids}
+Model token ids:  {model_token_ids}
 Actual token ids: {actual_token_ids}"""
 
-    # Now we want to try to find the subsequence of actual_token_ids that corresponds to reference_str
-    # Our first guess is just the prefix in actual_token_ids of length reference_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
+    # Now we want to try to find the subsequence of actual_token_ids that corresponds to model_str
+    # Our first guess is just the prefix in actual_token_ids of length model_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
     # If there are a lot, this will be a poor guess. If there aren't that many this is a good guess.
-    candidate_token_ids = actual_token_ids[: len(reference_token_ids)]
+    candidate_token_ids = actual_token_ids[: len(model_token_ids)]
     candidate_str = tokenizer.decode(candidate_token_ids)
 
     # If it's longer, we remove
-    if len(candidate_str) > len(reference_str):
+    if len(candidate_str) > len(model_str):
         while (
-            candidate_str != reference_str
-            and len(candidate_str) > len(reference_str)
+            candidate_str != model_str
+            and len(candidate_str) > len(model_str)
             and candidate_token_ids
         ):
             candidate_token_ids.pop()
             candidate_str = tokenizer.decode(candidate_token_ids)
     # If it's shorter we append
-    elif len(candidate_str) < len(reference_str):
+    elif len(candidate_str) < len(model_str):
         while (
-            candidate_str != reference_str
-            and len(candidate_str) < len(reference_str)
+            candidate_str != model_str
+            and len(candidate_str) < len(model_str)
             and len(candidate_token_ids) < len(actual_token_ids) - 1
         ):
             candidate_token_ids.append(actual_token_ids[len(candidate_token_ids)])
@@ -114,11 +162,11 @@ Actual token ids: {actual_token_ids}"""
         pass
 
     # If we break above, it must be that we either found a correct match or that we didn't find a valid match
-    # e.g. in cases where there is some token merging that occurs at the very end of the reference_token_ids
+    # e.g. in cases where there is some token merging that occurs at the very end of the model_token_ids
     # We scream loudly here.
-    assert candidate_str == reference_str
+    assert candidate_str == model_str
 
-    return reference_token_ids + actual_token_ids[len(candidate_token_ids) :]
+    return model_token_ids + actual_token_ids[len(candidate_token_ids) :]
 
 
 @ray.remote(
@@ -272,7 +320,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
-                    reference_token_ids=request.required_prefix_token_ids,
+                    model_token_ids=request.required_prefix_token_ids,
                     actual_corresponding_token_ids=actual_corresponding_token_ids,
                     actual_token_ids=engine_prompt["prompt_token_ids"],
                 )
