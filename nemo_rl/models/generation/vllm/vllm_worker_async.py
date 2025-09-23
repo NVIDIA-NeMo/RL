@@ -39,6 +39,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 def _maybe_correct_merged_tokens(
     tokenizer: PreTrainedTokenizerBase,
     reference_token_ids: list[int],
+    actual_corresponding_token_ids: list[int],
     actual_token_ids: list[int],
 ) -> list[int]:
     """This is a subroutine used inside the vLLM Chat Completion server. Some environments (namely Penguin) require an OpenAI compatible server endpoint rather than an inference engine handle. This is fine for the most part, but it may cause issues when the environment is used as a part of training.
@@ -234,6 +235,37 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 if request.required_prefix_token_ids is None:
                     return res
 
+                # Find the last assistant message
+                last_assistant_message_idx = None
+                for i in reversed(range(len(messages))):
+                    if message[i]["role"] == "assistant":
+                        last_assistant_message_idx = i
+                        break
+
+                # If there's no assistant message, we don't have any issues.
+                if last_assistant_message_idx is None:
+                    return res
+
+                # Include the last assistant message itself.
+                messages_to_last_assistant_message = messages[:last_assistant_message_idx + 1]
+                # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
+                corresponding_res = await super()._preprocess_chat(
+                    request,
+                    tokenizer,
+                    messages_to_last_assistant_message,
+                    chat_template,
+                    chat_template_content_format,
+                    False,  # add_generation_prompt=False
+                    False,  # continue_final_message=False
+                    tool_dicts,
+                    documents,
+                    chat_template_kwargs,
+                    tool_parser,
+                    truncate_prompt_tokens,
+                    add_special_tokens,
+                )
+                actual_corresponding_token_ids = corresponding_res[2][0]["prompt_token_ids"]
+
                 engine_prompt = res[2][
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
@@ -241,6 +273,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 final_prompt_token_ids = _maybe_correct_merged_tokens(
                     tokenizer=tokenizer,
                     reference_token_ids=request.required_prefix_token_ids,
+                    actual_corresponding_token_ids=actual_corresponding_token_ids,
                     actual_token_ids=engine_prompt["prompt_token_ids"],
                 )
 

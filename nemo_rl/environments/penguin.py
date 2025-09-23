@@ -30,7 +30,6 @@ class PenguinConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
-    total_num_rollouts: int
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -59,15 +58,12 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        # Set the connection configuration since we know the full batch size ahead-of-time.
-        assert self.cfg["total_num_rollouts"] % len(self.cfg["base_urls"]) == 0, f"Total number of rollouts ({self.cfg['total_num_rollouts']}) must be divisible by the number of data-parallel vLLM worker instances ({len(self.cfg['base_urls'])})"
-
-        initial_global_config_dict["global_aiohttp_connector_limit"] = self.cfg["total_num_rollouts"]
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = self.cfg["total_num_rollouts"] // len(self.cfg["base_urls"])
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = initial_global_config_dict.get("global_aiohttp_connector_limit_per_host") or 1024
+        initial_global_config_dict["global_aiohttp_connector_limit"] = initial_global_config_dict["global_aiohttp_connector_limit_per_host"] * len(self.cfg['base_urls'])
 
         print(
-            f"""Penguin was configured with max rollouts {self.cfg['total_num_rollouts']}, so the `global_aiohttp_connector_limit` has been set to the same {self.cfg['total_num_rollouts']}.
-Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances, and each instance will receive {self.cfg['total_num_rollouts']} // {len(self.cfg['base_urls'])} = {initial_global_config_dict['global_aiohttp_connector_limit_per_host']} examples. `global_aiohttp_connector_limit_per_host` has been set to the same {initial_global_config_dict['global_aiohttp_connector_limit_per_host']}."""
+            f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict['global_aiohttp_connector_limit_per_host']}.
+Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg['base_urls'])} * {initial_global_config_dict['global_aiohttp_connector_limit_per_host']} = {initial_global_config_dict['global_aiohttp_connector_limit']}."""
         )
 
         # Head server
