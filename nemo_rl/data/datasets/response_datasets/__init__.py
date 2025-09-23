@@ -26,6 +26,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.vanilla_genrm import VanillaGenRMDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
@@ -85,6 +86,11 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(
             split=data_config["split"],
         )
+    elif dataset_name == "vanilla_genrm":
+        base_dataset: Any = VanillaGenRMDataset(
+            train_data_path=data_config["train_data_path"],
+            val_data_path=data_config.get("val_data_path"),
+        )
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
@@ -125,4 +131,5 @@ __all__ = [
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
+    "VanillaGenRMDataset",
 ]
