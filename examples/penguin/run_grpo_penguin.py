@@ -162,6 +162,7 @@ def main() -> None:
     )
     penguin = Penguin.options(
         num_cpus=16,
+        memory=10 * 1024 * 1024 * 1024,  # 10GB
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.penguin.Penguin"
