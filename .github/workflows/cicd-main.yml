@@ -154,10 +154,10 @@ jobs:
       actions: write
       contents: read
     env:
-      RERUN_LIMIT: 1
+      RERUN_LIMIT: 3
       RERUN_PATTERNS: |
-        FOOBAR=0
-        FOOBAR=[1-2]
+        FOOBAR=1
+        FOOBAR=[2-8]
     steps:
       - name: Download stdout artifact
         uses: actions/download-artifact@v4
