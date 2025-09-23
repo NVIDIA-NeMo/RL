@@ -203,7 +203,7 @@ jobs:
 
           if [ "$matched" = true ]; then
             if [ "${RERUN_LIMIT:-0}" -gt 0 ] && [ "$ATTEMPT" -le "$RERUN_LIMIT" ]; then
-              echo "Requesting rerun of workflow run $GH_RUN_ID (attempt $ATTEMPT <= limit $LIMIT)" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "Requesting rerun of workflow run $GH_RUN_ID (attempt $ATTEMPT <= limit $RERUN_LIMIT)" | tee -a "$GITHUB_STEP_SUMMARY"
               curl -sS -X POST \
                    -H "Accept: application/vnd.github+json" \
                    -H "Authorization: Bearer $GITHUB_TOKEN" \
