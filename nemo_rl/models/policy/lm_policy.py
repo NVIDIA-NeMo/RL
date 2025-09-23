@@ -114,6 +114,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
+        # Validate world_size compatibility with parallelism configuration
+        model_parallel_size = pp_size * cp_size * tp_size
+        actual_world_size = cluster.world_size()
+
+        if actual_world_size < model_parallel_size:
+            raise ValueError(
+                f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
+                f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+
+        if actual_world_size % model_parallel_size != 0:
+            dp_size_float = actual_world_size / model_parallel_size
+            raise ValueError(
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
+                f"Please adjust your cluster size or parallelism parameters."
+            )
+
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
                 pp_size,  # PP
