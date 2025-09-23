@@ -164,6 +164,8 @@ def _replace_prefix_tokens(
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
 ) -> list[int]:
+    if not model_prefix_token_ids:
+        return template_token_ids
     eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None
     model_cut_end = len(model_prefix_token_ids)
@@ -328,20 +330,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
-                if False:
-                    final_prompt_token_ids = _maybe_correct_merged_tokens(
-                        tokenizer=tokenizer,
-                        model_prefix_token_ids=request.required_prefix_token_ids,
-                        actual_corresponding_token_ids=actual_corresponding_token_ids,
-                        actual_token_ids=engine_prompt["prompt_token_ids"],
-                    )
-                else:
-                    final_prompt_token_ids = _replace_prefix_tokens(
-                        tokenizer=tokenizer,
-                        model_prefix_token_ids=request.required_prefix_token_ids,
-                        template_prefix_token_ids=actual_corresponding_token_ids,
-                        template_token_ids=engine_prompt["prompt_token_ids"],
-                    )
+                final_prompt_token_ids = _replace_prefix_tokens(
+                    tokenizer=tokenizer,
+                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
+                    template_token_ids=engine_prompt["prompt_token_ids"],
+                )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
