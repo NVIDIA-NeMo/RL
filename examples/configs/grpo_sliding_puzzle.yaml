@@ -19,7 +19,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 3072
+  max_total_sequence_length: 1024
 
   dtensor_cfg:
     enabled: true
@@ -54,8 +54,8 @@ env:
     cfg:
       game_config:
         size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 15 # Number of random moves to shuffle the solved state
-      max_moves: 50 # Maximum moves allowed per episode
+        shuffle_moves: 10 # Number of random moves to shuffle the solved state
+      max_moves: 30 # Maximum moves allowed per episode
 
 logger:
   log_dir: "logs"  # Base directory for all logs
