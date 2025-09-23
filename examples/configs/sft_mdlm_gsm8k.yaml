@@ -3,7 +3,7 @@ sft:
   ## total number of steps to train will equal
   ## min((max_num_epochs * len(train_dataloader)), max_num_steps)
   max_num_epochs: 100000000000
-  max_num_steps: 100000000000
+  max_num_steps: 2000
 
   val_period: 10
   val_batches: 8
@@ -59,7 +59,7 @@ policy:
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
-      lr: 1.0e-5
+      lr: 1.0e-4  # Set base LR to the peak value we want to reach
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
@@ -69,20 +69,21 @@ policy:
       fused: False
 
   scheduler:
+    # Linear warmup to peak LR (1e-4) in first 5% of training
     - name: "torch.optim.lr_scheduler.LinearLR"
       kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 100
+        start_factor: 0.05  # Start from (0.05 * lr)
+        end_factor: 1.0     # Reach full base LR
+        total_iters: 50    # First 5% of ~2000 steps
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: 1500
-        eta_min: ${mul:${policy.optimizer.kwargs.lr}, 0.1}
+        T_max: 1950         # Remaining 95% of training steps
+        eta_min: ${mul:${policy.optimizer.kwargs.lr}, 0.05}     
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
-        factor: 0.1
+        factor: 1.0
         total_iters: 10000000000
-    - milestones: [100, 1600]
+    - milestones: [50, 2000]
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
