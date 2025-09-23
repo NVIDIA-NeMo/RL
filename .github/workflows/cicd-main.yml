@@ -35,32 +35,6 @@ on:
           - L1
           - L2
         description: Test level to run. docs = doc tests only, L0 = unit/docs/lint, L1 = L0 + functional, L2 = L1 + convergence
-      run_dummy:
-        description: Run dummy echo + after-check flow (for testing reruns)
-        required: false
-        type: boolean
-        default: false
-      dummy_echo:
-        description: Message for dummy job to echo
-        required: false
-        type: string
-        default: "Hello from dummy job"
-      rerun_pattern:
-        description: Regex to search in dummy stdout to trigger rerun
-        required: false
-        type: string
-        default: "RESTART_ME"
-      rerun_limit:
-        description: Max number of reruns to allow (0 = no reruns)
-        required: false
-        type: number
-        default: 1
-      rerun_patterns:
-        description: >-
-          Multiple regexes to trigger rerun (newline or comma separated). Example: "FOOBAR=0,FOOBAR=[1-2]"
-        required: false
-        type: string
-        default: "FOOBAR=0"
   # TODO: Due to limited compute, disabling pushes to main. This is okay to do since we force PRs to be up to date and the CI tests on pull/$PR_NUM/merge
   #push:
   #  branches:
@@ -138,12 +112,12 @@ jobs:
 
   dummy-echo:
     name: Dummy echo job
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_dummy == true }}
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - name: Produce dummy output
         env:
-          ECHO_TEXT: ${{ inputs.dummy_echo }}
+          ECHO_TEXT: "Hello from dummy job"
         run: |
           set -euo pipefail
           epoch=$(date +%s)
@@ -173,12 +147,17 @@ jobs:
 
   dummy-after:
     name: After check and maybe rerun
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.run_dummy == true }}
+    if: ${{ always() && github.event_name == 'pull_request' }}
     needs: [dummy-echo]
     runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
+    env:
+      RERUN_LIMIT: 1
+      RERUN_PATTERNS: |
+        FOOBAR=0
+        FOOBAR=[1-2]
     steps:
       - name: Download stdout artifact
         uses: actions/download-artifact@v4
@@ -193,24 +172,17 @@ jobs:
 
       - name: Check pattern and possibly rerun workflow
         env:
-          PATTERN: ${{ inputs.rerun_pattern }}
-          RERUN_PATTERNS: ${{ inputs.rerun_patterns }}
           ATTEMPT: ${{ github.run_attempt }}
-          LIMIT: ${{ inputs.rerun_limit }}
           GH_REPO: ${{ github.repository }}
           GH_RUN_ID: ${{ github.run_id }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Single pattern: ${PATTERN:-}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Multi patterns raw: ${RERUN_PATTERNS:-}" >> "$GITHUB_STEP_SUMMARY"
+          echo "RERUN_PATTERNS: ${RERUN_PATTERNS:-}" >> "$GITHUB_STEP_SUMMARY"
           echo "Run attempt: $ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
-          echo "Rerun limit: $LIMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rerun limit: ${RERUN_LIMIT:-0}" >> "$GITHUB_STEP_SUMMARY"
           patterns_file=patterns.txt
           : > "$patterns_file"
-          if [ -n "${PATTERN:-}" ]; then
-            printf '%s\n' "$PATTERN" >> "$patterns_file"
-          fi
           if [ -n "${RERUN_PATTERNS:-}" ]; then
             printf '%b' "$RERUN_PATTERNS" | tr ',' '\n' | sed '/^\s*$/d' >> "$patterns_file"
           fi
@@ -230,7 +202,7 @@ jobs:
           fi
 
           if [ "$matched" = true ]; then
-            if [ "${LIMIT:-0}" -gt 0 ] && [ "$ATTEMPT" -le "$LIMIT" ]; then
+            if [ "${RERUN_LIMIT:-0}" -gt 0 ] && [ "$ATTEMPT" -le "$RERUN_LIMIT" ]; then
               echo "Requesting rerun of workflow run $GH_RUN_ID (attempt $ATTEMPT <= limit $LIMIT)" | tee -a "$GITHUB_STEP_SUMMARY"
               curl -sS -X POST \
                    -H "Accept: application/vnd.github+json" \
