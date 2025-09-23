@@ -168,3 +168,93 @@ def multichoice_qa_processor(
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
     return output
+
+
+def vanilla_genrm_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary for vanilla GenRM evaluation tasks.
+
+    The datum_dict should contain:
+    - messages: List of message list containing user prompt for evaluation
+    - metadata inside the user message: Dict containing score_1, score_2, ranking, question_id, etc.
+    """
+    # Extract the messages (should be a list containing a single list of messages)
+    messages_list = datum_dict["messages"]
+
+    # Get the first (and likely only) message list
+    if messages_list and len(messages_list) > 0:
+        messages = messages_list[0]
+    else:
+        raise ValueError("No messages found in datum_dict")
+
+    # Process messages to create message_log
+    message_log: LLMMessageLogType = []
+    metadata = {}
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        # Only process the user message that contains the evaluation prompt
+        if role == "user":
+            # Extract metadata from the user message if present
+            metadata = msg.get("metadata", {})
+
+            # Create tokenized message
+            user_message: dict[str, str | torch.Tensor] = {
+                "role": "user",
+                "content": content,
+            }
+
+            # Apply chat template and tokenize
+            templated_message = tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+                add_special_tokens=False,
+            )
+
+            user_message["token_ids"] = tokenizer(
+                templated_message,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )["input_ids"][0]
+            user_message["content"] = templated_message
+            message_log.append(user_message)
+            break  # We only need the user message for prompting
+
+    # Calculate length
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    # Handle max sequence length
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # Truncate if necessary
+        for msg in message_log:
+            msg["token_ids"] = msg["token_ids"][:max_seq_length]
+        loss_multiplier = 0.0
+
+    # Prepare extra_env_info with metadata for the environment
+    extra_env_info = {
+        "score_1": metadata.get("score_1"),
+        "score_2": metadata.get("score_2"),
+        "ranking": metadata.get("ranking"),
+        "question_id": metadata.get("question_id"),
+        "question": metadata.get("question"),
+    }
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "vanilla_genrm"),
+    }
+
+    return output
