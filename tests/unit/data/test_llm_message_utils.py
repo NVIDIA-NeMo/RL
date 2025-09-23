@@ -20,7 +20,8 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
-from nemo_rl.data.hf_datasets import COMMON_CHAT_TEMPLATES
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     _validate_tensor_consistency,
@@ -89,6 +90,52 @@ def raw_chat_message_log() -> list[LLMMessageLogType]:
         {"role": "user", "content": "Hello!"},
         {"role": "assistant", "content": "Hi there!"},
     ]
+
+
+def qwen3_message_log(
+    model_name: str, enable_thinking: bool
+) -> tuple[list[LLMMessageLogType], list[str]]:
+    """Helper function for Qwen3 message logs."""
+    # input data for test
+    input_data = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"},
+        {
+            "role": "assistant",
+            "content": "<think>\noh wait.\n</think>\n\nHi there!"
+            if enable_thinking
+            else "Hi there!",
+        },
+    ]
+
+    # use a tokenizer directly from HuggingFace to prepare expected result
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    assert tokenizer.bos_token is None
+
+    # get expected result
+    ## result is equivalent to if we apply chat template to the full message log,
+    expected_text_string = tokenizer.apply_chat_template(
+        [input_data[:2]],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        enable_thinking=enable_thinking,
+    )[0]
+
+    delimiter = "<|im_end|>\n"
+    split_text = expected_text_string.split(delimiter, 1)
+    expected_text = []
+    for i in range(len(split_text)):
+        if i == len(split_text) - 1:
+            expected_text.append(split_text[i])
+        else:
+            expected_text.append(split_text[i] + delimiter)
+
+    ## separately handle the last message because of the generation prompt
+    formatted_assistant_message = input_data[2]["content"] + delimiter
+    expected_text.append(formatted_assistant_message)
+
+    return input_data, expected_text
 
 
 @pytest.fixture
@@ -449,6 +496,38 @@ def test_get_formatted_message_log_models(
                 add_special_tokens=False,
             )[0]
             assert normalize(actual_concat) == normalize(expected_concat)
+
+
+@pytest.mark.parametrize("enable_thinking", [True, False])
+def test_get_formatted_message_log_qwen3_enable_thinking(
+    enable_thinking,
+) -> None:
+    model_name = "Qwen/Qwen3-8B"
+
+    # setup test data
+    input_data, expected_text = qwen3_message_log(model_name, enable_thinking)
+
+    # setup tokenizer
+    tokenizer_config = {
+        "name": model_name,
+        "chat_template": "default",
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    tokenizer = get_tokenizer(tokenizer_config)
+
+    # get actual result
+    task_data_spec = TaskDataSpec(
+        task_name="test",
+    )
+    result = get_formatted_message_log(
+        input_data,
+        tokenizer,
+        task_data_spec,
+        add_generation_prompt=True,
+    )
+    actual_text = [m["content"] for m in result]
+
+    assert actual_text == expected_text
 
 
 @pytest.mark.hf_gated

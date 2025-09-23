@@ -15,7 +15,7 @@
 import math
 import random
 import warnings
-from functools import wraps
+from functools import partial, wraps
 from typing import Optional
 
 import numpy as np
@@ -26,7 +26,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from nemo_rl.data import hf_datasets
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 
 
@@ -242,9 +242,7 @@ def get_tokenizer(
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = (
-                hf_datasets.COMMON_CHAT_TEMPLATES.passthrough_prompt_response
-            )
+            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         else:
@@ -252,6 +250,17 @@ def get_tokenizer(
             tokenizer.chat_template = tokenizer_config["chat_template"]
     else:
         print("No chat template provided, using tokenizer's default")
+
+    if (
+        "chat_template_kwargs" in tokenizer_config
+        and tokenizer_config["chat_template_kwargs"] is not None
+    ):
+        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+        tokenizer.apply_chat_template = partial(
+            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+        )
 
     # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
     # However, the dataloader needs the processor for multimodal data preprocessing, so the processor is needed for the dataloader (only tokenizer is NOT enough).
