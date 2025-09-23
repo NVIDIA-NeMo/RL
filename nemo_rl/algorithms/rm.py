@@ -28,10 +28,8 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import (
-    AllTaskProcessedDataset,
-    preference_collate_fn,
-)
+from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -583,6 +581,7 @@ def rm_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             train_dataloader.state_dict(),
