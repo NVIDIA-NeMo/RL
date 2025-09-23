@@ -1,6 +1,8 @@
-# Fast-dLLM Integration
+# Fast-dLLM Integration (LLaDA Models)
 
 The LLaDA OpenAI server has been enhanced with [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM) acceleration, providing significant speedup improvements for LLaDA diffusion model inference through KV caching and parallel decoding optimizations.
+
+**Note:** This document covers Fast-dLLM integration for **LLaDA models only**. Nemotron models use their own built-in diffusion generation methods and do not require Fast-dLLM acceleration.
 
 ## Overview
 

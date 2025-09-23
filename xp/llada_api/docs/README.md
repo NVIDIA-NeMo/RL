@@ -1,17 +1,31 @@
-# LLaDA OpenAI API Server
+# LLaDA/Nemotron OpenAI API Server
 
-This repository provides an OpenAI-compatible API server for LLaDA (Large Language Diffusion Models) with Fast-dLLM acceleration and support for DCP (Distributed Checkpoint) format checkpoints.
+This repository provides an OpenAI-compatible API server for diffusion language models with optimized acceleration and support for DCP (Distributed Checkpoint) format checkpoints.
 
-## What is LLaDA?
+**Supported Models:**
+- **LLaDA** (Large Language Diffusion Models) with Fast-dLLM acceleration
+- **Nemotron** models with native diffusion generation
 
+## Supported Model Types
+
+### LLaDA Models
 LLaDA (Large Language Diffusion Models) is a state-of-the-art approach that applies diffusion processes to language generation. Unlike traditional autoregressive models that generate tokens sequentially, LLaDA uses an iterative diffusion process to refine masked text over multiple steps.
 
-### Key Features of LLaDA:
+**Key Features of LLaDA:**
 - **Diffusion-based generation**: Iteratively refines masked tokens
 - **Parallel generation**: Can generate multiple tokens simultaneously within blocks
 - **Quality control**: More diffusion steps generally lead to higher quality output
 - **Flexible parameters**: Control creativity, guidance, and generation strategy
 - **Fast-dLLM acceleration**: Enhanced performance with KV caching and parallel decoding
+
+### Nemotron Models
+Nemotron models are NVIDIA's diffusion-based language models that use built-in diffusion generation methods. They provide high-quality text generation through iterative refinement.
+
+**Key Features of Nemotron:**
+- **Native diffusion generation**: Uses model's built-in generate method
+- **High-quality output**: Optimized diffusion process for better results
+- **Efficient processing**: Streamlined generation pipeline
+- **Configurable parameters**: Steps, block length, and threshold control
 
 ## Quick Start
 
@@ -41,11 +55,14 @@ For SLURM execution:
 Run the server locally on your machine:
 
 ```bash
-# Easiest: HuggingFace model (from Hub) - no setup required
+# LLaDA model from HuggingFace Hub - no setup required
 ./start_llada_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
 
+# Nemotron model from HuggingFace Hub - no setup required
+./start_llada_server.sh --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
+
 # Local HuggingFace model (if downloaded)
-./start_llada_server.sh --local --model-path /path/to/llada-model
+./start_llada_server.sh --local --model-path /path/to/model
 
 # DCP checkpoint (requires NeMo-RL dependencies)
 uv sync --locked --no-install-project  # First install dependencies
@@ -62,13 +79,16 @@ Run as a SLURM job with GPU resources:
 # Set up environment
 export ACCOUNT=your_slurm_account
 
-# Submit SLURM job with HuggingFace model (local path)
-./start_llada_server.sh --model-path /path/to/llada-model
-
-# Submit SLURM job with HuggingFace model (from Hub)  
+# Submit SLURM job with LLaDA model (from Hub)  
 ./start_llada_server.sh --model-path GSAI-ML/LLaDA-8B-Instruct
 
-# Submit SLURM job with DCP checkpoint (recommended for NeMo-RL users)
+# Submit SLURM job with Nemotron model (from Hub)
+./start_llada_server.sh --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
+
+# Submit SLURM job with local model
+./start_llada_server.sh --model-path /path/to/model
+
+# Submit SLURM job with DCP checkpoint (supports both LLaDA and Nemotron)
 ./start_llada_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # Custom SLURM resources

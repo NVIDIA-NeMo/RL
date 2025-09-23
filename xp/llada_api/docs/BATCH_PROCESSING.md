@@ -1,6 +1,8 @@
-# Batch Processing for LLaDA OpenAI Server
+# Batch Processing for LLaDA/Nemotron OpenAI Server
 
-This document explains how to enable batch processing for your LLaDA OpenAI-compatible server to improve throughput when handling multiple requests from NeMo-Skills evaluations.
+This document explains how to enable batch processing for your diffusion model OpenAI-compatible server to improve throughput when handling multiple requests from NeMo-Skills evaluations.
+
+**Supports both LLaDA and Nemotron models** with automatic model type detection and optimized batch processing for each.
 
 ## 🔍 **Current Limitation**
 
@@ -30,9 +32,16 @@ Use the new `llada_batch_server.py` which provides:
 - **Configurable parameters**: Batch size and wait time
 
 ```bash
-# Start the batch server
+# Start the batch server with LLaDA
 python llada_batch_server.py \
   --model-path GSAI-ML/LLaDA-8B-Instruct \
+  --batch-size 8 \
+  --max-wait-time 0.1 \
+  --port 8000
+
+# Start the batch server with Nemotron
+python llada_batch_server.py \
+  --model-path nvidia/Nemotron-Diffusion-Research-4B-v0 \
   --batch-size 8 \
   --max-wait-time 0.1 \
   --port 8000

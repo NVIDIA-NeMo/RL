@@ -1,6 +1,10 @@
-# LLaDA OpenAI API Server
+# LLaDA/Nemotron OpenAI API Server
 
-This directory contains a complete OpenAI-compatible API server implementation for LLaDA (Large Language Diffusion Models) with full support for DCP (Distributed Checkpoint) format checkpoints and SLURM job submission.
+This directory contains a complete OpenAI-compatible API server implementation for diffusion language models with full support for DCP (Distributed Checkpoint) format checkpoints and SLURM job submission.
+
+**Supported Models:**
+- **LLaDA** (Large Language Diffusion Models) with Fast-dLLM acceleration
+- **Nemotron** models with native diffusion generation
 
 ## Directory Structure
 
@@ -24,8 +28,11 @@ xp/llada_api/
 Use the convenient wrapper scripts from the NeMo-RL project root:
 
 ```bash
-# Batch server (recommended for evaluations)
+# Batch server with LLaDA (recommended for evaluations)
 ./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+
+# Batch server with Nemotron
+./scripts/start_llada_batch_server.sh --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 
 # Streaming server (for real-time responses)
 ./scripts/start_llada_batch_server.sh --local --streaming --model-path GSAI-ML/LLaDA-8B-Instruct
@@ -68,22 +75,27 @@ scripts/connect_to_llada_server.sh --job-id 12345
 ## Features
 
 - **OpenAI API Compatibility**: Drop-in replacement for OpenAI API endpoints
-- **Fast-dLLM Acceleration**: Enhanced performance with KV caching and parallel decoding
-- **DCP Checkpoint Support**: Automatic conversion from DCP to HuggingFace format
+- **Dual Model Support**: Supports both LLaDA and Nemotron diffusion models
+- **Fast-dLLM Acceleration**: Enhanced performance for LLaDA with KV caching and parallel decoding
+- **Native Nemotron Generation**: Uses Nemotron's built-in diffusion generation
+- **DCP Checkpoint Support**: Automatic conversion from DCP to HuggingFace format for both model types
 - **SLURM Integration**: Run as containerized SLURM jobs with GPU resources
 - **Local Execution**: Run directly on your local machine
 - **uv Package Management**: Uses uv for fast, reliable dependency management
-- **LLaDA-Specific Parameters**: Full support for diffusion generation parameters
+- **Batch Processing**: High-throughput batch processing for evaluation workloads
 - **Streaming Support**: Real-time streaming responses
 - **Connection Helpers**: Automatic SSH tunnel setup for SLURM jobs
 - **Comprehensive Examples**: Complete workflow demonstrations
 
 ## Key Components
 
-### 1. Main Server (`llada_openai_server.py`)
-- FastAPI-based OpenAI-compatible API server with Fast-dLLM acceleration
-- Supports both HuggingFace and DCP checkpoint loading
-- Implements LLaDA diffusion generation with KV caching and parallel decoding
+### 1. Main Servers
+- **`llada_openai_server.py`**: Single-request streaming server
+- **`llada_batch_server.py`**: High-throughput batch processing server
+- FastAPI-based OpenAI-compatible API with model-specific optimizations
+- Supports both HuggingFace and DCP checkpoint loading for LLaDA and Nemotron
+- LLaDA: Fast-dLLM acceleration with KV caching and parallel decoding
+- Nemotron: Native diffusion generation using model's built-in methods
 - Includes health checks, error handling, and comprehensive logging
 
 ### 2. Server Launcher (`scripts/start_llada_batch_server.sh`)

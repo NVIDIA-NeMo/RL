@@ -1,15 +1,23 @@
-# LLaDA Batch Server 🚀
+# LLaDA/Nemotron Batch Server 🚀
 
-High-performance batch processing server for LLaDA models with enhanced performance for evaluation workloads.
+High-performance batch processing server for diffusion language models with enhanced performance for evaluation workloads.
+
+**Supports:** LLaDA models with Fast-dLLM acceleration and Nemotron models with native generation.
 
 ## 🎯 Quick Start
 
 ### Option 1: Batch Server (Recommended)
 ```bash
-# Local batch server (fastest for evaluations)
+# Local batch server with LLaDA (fastest for evaluations)
 ./xp/llada_api/scripts/start_llada_batch_server.sh \
   --local \
   --model-path GSAI-ML/LLaDA-8B-Instruct \
+  --batch-size 8
+
+# Local batch server with Nemotron
+./xp/llada_api/scripts/start_llada_batch_server.sh \
+  --local \
+  --model-path nvidia/Nemotron-Diffusion-Research-4B-v0 \
   --batch-size 8
 
 # Then run your evaluations as usual:

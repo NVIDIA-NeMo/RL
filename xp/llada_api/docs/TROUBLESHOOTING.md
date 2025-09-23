@@ -1,6 +1,6 @@
-# LLaDA API Troubleshooting Guide
+# LLaDA/Nemotron API Troubleshooting Guide
 
-Common issues and solutions for the LLaDA OpenAI API server.
+Common issues and solutions for the diffusion language model OpenAI API server (supports both LLaDA and Nemotron models).
 
 ## Import Errors
 
@@ -12,7 +12,11 @@ Common issues and solutions for the LLaDA OpenAI API server.
 
 1. **Easiest**: Use HuggingFace models instead of DCP checkpoints:
    ```bash
+   # LLaDA model
    ./start_llada_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+   
+   # Nemotron model
+   ./start_llada_server.sh --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
    ```
 
 2. **For DCP support**: Install NeMo-RL dependencies:
@@ -39,7 +43,9 @@ Common issues and solutions for the LLaDA OpenAI API server.
 
 **Solutions**:
 - Check your internet connection
-- Verify the model name is correct: `GSAI-ML/LLaDA-8B-Instruct`
+- Verify the model name is correct:
+  - LLaDA: `GSAI-ML/LLaDA-8B-Instruct`
+  - Nemotron: `nvidia/Nemotron-Diffusion-Research-4B-v0`
 - Try with `trust_remote_code=True` (automatically enabled)
 - Check HuggingFace Hub status
 
@@ -50,7 +56,9 @@ Common issues and solutions for the LLaDA OpenAI API server.
 **Solutions**:
 - Verify the path is correct and accessible
 - Use absolute paths instead of relative paths
-- Try a HuggingFace model name instead: `--model-path GSAI-ML/LLaDA-8B-Instruct`
+- Try a HuggingFace model name instead:
+  - LLaDA: `--model-path GSAI-ML/LLaDA-8B-Instruct`
+  - Nemotron: `--model-path nvidia/Nemotron-Diffusion-Research-4B-v0`
 
 ## Dependency Issues
 
@@ -80,7 +88,12 @@ conda install pytorch transformers fastapi uvicorn -c conda-forge -c pytorch
 **Solution**:
 ```bash
 export ACCOUNT=your_slurm_account
+
+# LLaDA model
 ./start_llada_server.sh --model-path GSAI-ML/LLaDA-8B-Instruct
+
+# Nemotron model
+./start_llada_server.sh --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 ```
 
 ### Container or job submission issues
@@ -142,10 +155,18 @@ export ACCOUNT=your_slurm_account
 
 ### Test HuggingFace model loading
 ```bash
+# Test LLaDA model
 python3 -c "
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-print('✅ HuggingFace model loading works')
+print('✅ LLaDA model loading works')
+"
+
+# Test Nemotron model
+python3 -c "
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained('nvidia/Nemotron-Diffusion-Research-4B-v0', trust_remote_code=True)
+print('✅ Nemotron model loading works')
 "
 ```
 
@@ -182,7 +203,11 @@ For troubleshooting, follow this workflow:
 
 1. **Start simple**: Test with HuggingFace model first
    ```bash
+   # Try LLaDA model
    ./start_llada_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
+   
+   # Or try Nemotron model
+   ./start_llada_server.sh --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
    ```
 
 2. **Check basic connectivity**: Test the health endpoint
