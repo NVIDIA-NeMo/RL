@@ -203,13 +203,35 @@ jobs:
 
           if [ "$matched" = true ]; then
             if [ "${RERUN_LIMIT:-0}" -gt 0 ] && [ "$ATTEMPT" -le "$RERUN_LIMIT" ]; then
-              echo "Requesting rerun of workflow run $GH_RUN_ID (attempt $ATTEMPT <= limit $RERUN_LIMIT)" | tee -a "$GITHUB_STEP_SUMMARY"
-              curl -sS -X POST \
+              echo "Attempting to re-run the dummy-echo job (attempt $ATTEMPT <= limit $RERUN_LIMIT)" | tee -a "$GITHUB_STEP_SUMMARY"
+              # Find the job id for the dummy-echo job in this run
+              jobs_json=$(curl -sS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?per_page=100")
+              echo "$jobs_json" > jobs.json
+              job_id=$(jq -r '.jobs[] | select(.name == "Dummy echo job") | .id' jobs.json | head -n1)
+
+              if [ -z "$job_id" ] || [ "$job_id" = "null" ]; then
+                echo "Could not locate job id for 'Dummy echo job'. Available job names:" | tee -a "$GITHUB_STEP_SUMMARY"
+                jq -r '.jobs[].name' jobs.json | sed 's/^/- /' | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              echo "Re-running job id $job_id" | tee -a "$GITHUB_STEP_SUMMARY"
+              # POST to rerun the specific job
+              resp=$(curl -sS -w "\n%{http_code}" -X POST \
                    -H "Accept: application/vnd.github+json" \
                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                   "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/rerun" \
-                   -d '{}'
-              echo "Rerun requested." | tee -a "$GITHUB_STEP_SUMMARY"
+                   "https://api.github.com/repos/$GH_REPO/actions/jobs/$job_id/rerun" \
+                   -d '{}')
+              body=$(echo "$resp" | head -n -1)
+              code=$(echo "$resp" | tail -n1)
+              echo "API status: $code" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "$body" | tee -a "$GITHUB_STEP_SUMMARY"
+              if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+                echo "Job rerun requested successfully." | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "Job rerun request did not succeed (status $code). Most common reason: the workflow run is still in_progress. Once the run completes, rerun endpoints work." | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
             else
               echo "Rerun limit reached or disabled. No rerun will be requested." | tee -a "$GITHUB_STEP_SUMMARY"
             fi
