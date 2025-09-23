@@ -69,21 +69,20 @@ policy:
       fused: False
 
   scheduler:
-    # Linear warmup to peak LR (1e-4) in first 5% of training
     - name: "torch.optim.lr_scheduler.LinearLR"
       kwargs:
         start_factor: 0.05  # Start from (0.05 * lr)
         end_factor: 1.0     # Reach full base LR
-        total_iters: 50    # First 5% of ~2000 steps
+        total_iters: 50     # First 10% of ~500 steps
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: 1950         # Remaining 95% of training steps
+        T_max: 450          # Remaining 95% of training steps
         eta_min: ${mul:${policy.optimizer.kwargs.lr}, 0.05}     
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
-        factor: 1.0
+        factor: 0.05
         total_iters: 10000000000
-    - milestones: [50, 2000]
+    - milestones: [50, 500]
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
