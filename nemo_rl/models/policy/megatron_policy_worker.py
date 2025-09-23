@@ -1545,45 +1545,73 @@ class MegatronPolicyWorker:
             gathered_hf_params: Dictionary of parameter names to tensors
             type_to_total_size: Dictionary mapping dtype to total size
         """
-        packed_tensors = {
-            dtype: torch.empty(
-                total_size,
-                device=next(iter(gathered_hf_params.values())).device,
-                dtype=dtype,
-                requires_grad=False,
+        # Create IPC handles for each parameter
+        tensor_number_threshold = os.getenv(
+            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
+        )  # an arbitrary threshold
+        if len(gathered_hf_params) >= int(tensor_number_threshold):
+            pack_tensor_for_ipc = True
+        else:
+            pack_tensor_for_ipc = False
+
+        if pack_tensor_for_ipc:
+            # Pack tensors in gathered_hf_params into consolidated tensors by dtype
+            # First calculate total size needed for each dtype
+            type_to_total_size = defaultdict(lambda: 0)
+
+            # Record offset of the tensor
+            for key, tensor in gathered_hf_params.items():
+                type_to_total_size[tensor.dtype] += tensor.numel()
+
+            # Allocate consolidated tensors for each dtype
+            packed_tensors = {
+                dtype: torch.empty(
+                    total_size,
+                    device=next(iter(gathered_hf_params.values())).device,
+                    dtype=dtype,
+                    requires_grad=False,
+                )
+                for dtype, total_size in type_to_total_size.items()
+            }
+
+            dtype_to_offset = defaultdict(lambda: 0)
+            # Copy tensors into consolidated buffers
+            for key, tensor in gathered_hf_params.items():
+                dtype = tensor.dtype
+                size = tensor.numel()
+                packed_tensors[dtype][
+                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                ].copy_(tensor.detach().view(-1))
+                dtype_to_offset[dtype] += size
+
+            # Create IPC handles for consolidated tensors
+            all_handles = [
+                (dtype, get_handle_from_tensor(tensor))
+                for dtype, tensor in packed_tensors.items()
+            ]
+
+            # Store reference to prevent garbage collection
+            self._held_gather_buffer = packed_tensors
+
+            serialized = (
+                pack_tensor_for_ipc,
+                all_handles,
+                tuple(gathered_hf_params.keys()),
             )
-            for dtype, total_size in type_to_total_size.items()
-        }
+        else:
+            all_handles = []
+            for key, tensor in gathered_hf_params.items():
+                handle = get_handle_from_tensor(tensor)
+                all_handles.append((key, handle))
+            self._held_gather_buffer = gathered_hf_params
+            serialized = (False, all_handles)
 
-        dtype_to_offset = defaultdict(lambda: 0)
-        # Copy tensors into consolidated buffers
-        for key, tensor in gathered_hf_params.items():
-            dtype = tensor.dtype
-            size = tensor.numel()
-            packed_tensors[dtype][
-                dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-            ].copy_(tensor.detach().view(-1))  # try non_blocking=True ??
-            dtype_to_offset[dtype] += size
-
-        # Create IPC handles for consolidated tensors
-        all_handles = [
-            (dtype, get_handle_from_tensor(tensor))
-            for dtype, tensor in packed_tensors.items()
-        ]
-
-        # Store reference to prevent garbage collection
-        self._held_gather_buffer = packed_tensors
-        serialized = (
-            True,  # pack_tensor_for_ipc
-            all_handles,
-            tuple(gathered_hf_params.keys()),
-        )
-
-        # with torch.profiler.record_function("zmq_send_pyobj"):
-        self.zmq_socket.send_pyobj(serialized)
+        with torch.profiler.record_function("zmq_send_pyobj"):
+            self.zmq_socket.send_pyobj(serialized)
         # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
-        # with torch.profiler.record_function("zmq_recv"):
-        self.zmq_socket.recv()
+        with torch.profiler.record_function("zmq_recv"):
+            self.zmq_socket.recv()
+        return
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/send_weights_ipc_handles")
@@ -1593,10 +1621,9 @@ class MegatronPolicyWorker:
             profiler = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 record_shapes=True,
-                profile_memory=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_new/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1775,7 +1802,7 @@ class MegatronPolicyWorker:
 
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
-            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
+            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "100000"
         )  # an arbitrary threshold
         if len(gathered_hf_params) >= int(tensor_number_threshold):
             pack_tensor_for_ipc = True

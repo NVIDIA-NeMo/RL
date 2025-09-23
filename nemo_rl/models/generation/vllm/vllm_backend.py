@@ -14,6 +14,7 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import os
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 import zmq
@@ -56,6 +57,21 @@ class VllmInternalWorkerExtension:
 
     def update_weights_from_ipc_handles_zmq(self) -> bool:
         """Update weights from IPC ZMQ."""
+        if not hasattr(self, "count_of_function_calls"):
+            self.count_of_function_calls = 0
+        if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
+            profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot/memory_trace_vllm",
+                use_gzip=True,
+            ),
+        )
+
+            profiler.start()
+
         print(f"[VllmInternalWorkerExtension] Updating weights from IPC ZMQ to {self.zmq_address}", flush=True)
         if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
@@ -75,6 +91,10 @@ class VllmInternalWorkerExtension:
             self.socket.send(b"")
             # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
         
+        if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
+            print(f"profiler stop", flush=True)
+            profiler.stop()
+        self.count_of_function_calls += 1
         return True
 
     def report_device_id(self) -> str:
