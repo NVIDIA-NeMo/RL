@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Batch-enabled OpenAI-compatible API server for LLaDA models with Fast-dLLM acceleration.
+Batch-enabled OpenAI-compatible API server for LLaDA and Nemotron models.
 
 This server provides batching capabilities by accumulating incoming requests
-and processing them together using Fast-dLLM's native batch processing.
+and processing them together. Supports both LLaDA models with Fast-dLLM 
+acceleration and Nemotron models with built-in diffusion generation.
 
 Usage:
-    python llada_batch_server.py --model-path /path/to/checkpoint --batch-size 8
+    # For LLaDA models:
+    python llada_batch_server.py --model-path /path/to/llada/checkpoint --batch-size 8
+    python llada_batch_server.py --dcp-path /path/to/llada_dcp --base-model GSAI-ML/LLaDA-8B-Instruct --batch-size 8
+    
+    # For Nemotron models:
+    python llada_batch_server.py --model-path nvidia/Nemotron-Diffusion-Research-4B-v0 --batch-size 8
+    python llada_batch_server.py --dcp-path /path/to/nemotron_dcp --base-model nvidia/Nemotron-Diffusion-Research-4B-v0 --batch-size 8
 """
 
 import argparse
@@ -74,17 +81,24 @@ model = None
 tokenizer = None
 device = None
 model_config = None
+model_type = None  # 'llada' or 'nemotron'
 
 
 def load_model_from_hf(model_path: str):
-    """Load LLaDA model from HuggingFace format (local path or HuggingFace model name)."""
-    global model, tokenizer, device, model_config
+    """Load model from HuggingFace format (supports both LLaDA and Nemotron models)."""
+    global model, tokenizer, device, model_config, model_type
     
     # Determine if this is a local path or HuggingFace model name
     is_local_path = os.path.exists(model_path)
-    model_type = "local path" if is_local_path else "HuggingFace model name"
+    path_type = "local path" if is_local_path else "HuggingFace model name"
     
-    logger.info(f"Loading LLaDA model from {model_type}: {model_path}")
+    # Detect model type based on model path
+    if "nemotron" in model_path.lower() or "Nemotron" in model_path:
+        model_type = "nemotron"
+        logger.info(f"Detected Nemotron model from {path_type}: {model_path}")
+    else:
+        model_type = "llada"
+        logger.info(f"Loading LLaDA model from {path_type}: {model_path}")
     
     try:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -94,40 +108,52 @@ def load_model_from_hf(model_path: str):
         logger.info("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
-        # Load model using Fast-dLLM optimized model if available
+        # Load model based on detected type
         logger.info("Loading model...")
-        if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
-            logger.info("Using Fast-dLLM optimized model class")
-            model = LLaDAModelLM.from_pretrained(
-                model_path, 
-                trust_remote_code=True, 
-                torch_dtype=torch.bfloat16
-            )
-        else:
-            logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+        if model_type == "nemotron":
+            logger.info("Loading Nemotron model with standard AutoModel")
             model = AutoModel.from_pretrained(
                 model_path, 
                 trust_remote_code=True, 
                 torch_dtype=torch.bfloat16
             )
-        
-        model = model.to(device).eval()
+            model = model.to(device).eval()
+        else:
+            # LLaDA model loading
+            if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
+                logger.info("Using Fast-dLLM optimized model class")
+                model = LLaDAModelLM.from_pretrained(
+                    model_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16
+                )
+            else:
+                logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+                model = AutoModel.from_pretrained(
+                    model_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16
+                )
+            model = model.to(device).eval()
         
         # Load config (works with both local paths and HF model names)
         logger.info("Loading model config...")
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        logger.info(f"Model loaded successfully from {model_type}!")
-        logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
+        logger.info(f"Model loaded successfully from {path_type}!")
+        logger.info(f"Model type: {model_type}")
+        if model_type == "llada":
+            logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
+        
         return True
     except Exception as e:
-        logger.error(f"Failed to load model from {model_type} '{model_path}': {e}")
+        logger.error(f"Failed to load model from {path_type} '{model_path}': {e}")
         return False
 
 
-def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/llada_hf_converted"):
-    """Load LLaDA model from DCP checkpoint by converting to HF format first.""" 
-    global model, tokenizer, device, model_config
+def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted"):
+    """Load model from DCP checkpoint by converting to HF format first (supports both LLaDA and Nemotron models).""" 
+    global model, tokenizer, device, model_config, model_type
     
     try:
         from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf, load_checkpoint
@@ -140,7 +166,9 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/ll
         logger.error("For local execution, please:")
         logger.error("1. Set PYTHONPATH to include NeMo-RL: export PYTHONPATH=/path/to/NeMo-RL:$PYTHONPATH")
         logger.error("2. Install NeMo-RL dependencies: uv sync --locked --no-install-project") 
-        logger.error("3. Or use a HuggingFace model instead: --model-path GSAI-ML/LLaDA-8B-Instruct")
+        logger.error("3. Or use a HuggingFace model instead:")
+        logger.error("   - LLaDA: --model-path GSAI-ML/LLaDA-8B-Instruct")
+        logger.error("   - Nemotron: --model-path nvidia/Nemotron-Diffusion-Research-4B-v0")
         return False
     
     logger.info(f"Converting DCP checkpoint to HuggingFace format...")
@@ -184,6 +212,8 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/ll
     except Exception as e:
         logger.error(f"Failed to convert or load DCP checkpoint: {e}")
         return False
+
+
 
 
 @dataclass
@@ -307,7 +337,11 @@ class BatchProcessor:
                 request = batch_req.request
                 
                 # Determine generation algorithm for this request
-                algorithm_name = request.generation_algorithm or "dual_cache"
+                # For Nemotron models, default to "nemotron" algorithm
+                if model_type == "nemotron":
+                    algorithm_name = request.generation_algorithm or "nemotron"
+                else:
+                    algorithm_name = request.generation_algorithm or "dual_cache"
                 
                 # Group by algorithm
                 if algorithm_name not in algorithm_groups:
@@ -349,7 +383,7 @@ class BatchProcessor:
     async def _process_algorithm_group(self, algorithm_name: str, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
         """Process a group of requests that all use the same algorithm."""
         try:
-            # Get the generation algorithm
+            # Get the generation algorithm from registry (works for both LLaDA and Nemotron)
             algorithm = get_algorithm(algorithm_name)
             if algorithm is None:
                 raise RuntimeError(f"Unknown generation algorithm: {algorithm_name}")
@@ -366,11 +400,21 @@ class BatchProcessor:
                 
                 # Format messages into prompt
                 try:
-                    formatted_prompt = tokenizer.apply_chat_template(
-                        [{"role": msg.role, "content": msg.content} for msg in request.messages],
-                        add_generation_prompt=True,
-                        tokenize=False
-                    )
+                    if hasattr(app.state, 'no_chat_template') and app.state.no_chat_template:
+                        # Skip chat template - use raw content from last message
+                        if request.messages:
+                            formatted_prompt = request.messages[-1].content
+                        else:
+                            formatted_prompt = ""
+                        logger.debug(f"Using raw text (no chat template): {formatted_prompt[:100]}...")
+                    else:
+                        # Apply chat template (default behavior)
+                        formatted_prompt = tokenizer.apply_chat_template(
+                            [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                            add_generation_prompt=True,
+                            tokenize=False
+                        )
+                        logger.debug(f"Applied chat template: {formatted_prompt[:100]}...")
                     batch_prompts.append(formatted_prompt)
                     
                     # Store configuration for each request
@@ -448,7 +492,7 @@ class BatchProcessor:
                 if i < len(sample_request.request.messages) - 1:  # Add separator between messages
                     logger.info("    " + "-" * 60)
             
-            # Generate with selected algorithm (batch processing)
+            # Generate using the selected algorithm from the registry
             try:
                 logger.info(f"Using {algorithm.name} generation for {batch_input_ids.shape[0]} requests: {algorithm.description}")
                 
@@ -485,13 +529,14 @@ class BatchProcessor:
                 
             except Exception as e:
                 import traceback
-                logger.error(f"❌ Fast-dLLM batch generation failed with detailed context:")
+                logger.error(f"❌ Batch generation failed with detailed context:")
                 logger.error(f"  Error: {e}")
                 logger.error(f"  Error type: {type(e).__name__}")
+                logger.error(f"  Algorithm: {algorithm.name}")
+                logger.error(f"  Model type: {model_type}")
                 logger.error(f"  batch_input_ids.shape: {batch_input_ids.shape}")
                 logger.error(f"  gen_length: {gen_length}")
                 logger.error(f"  block_length: {block_length}")
-                logger.error(f"  algorithm: {algorithm.name}")
                 logger.error(f"  config: {config}")
                 logger.error(f"  Full traceback:")
                 for line in traceback.format_exc().split('\n'):
@@ -618,8 +663,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="LLaDA Batch OpenAI API",
-    description="Batch-enabled OpenAI-compatible API for LLaDA diffusion language models",
+    title="LLaDA/Nemotron Batch OpenAI API",
+    description="Batch-enabled OpenAI-compatible API for LLaDA and Nemotron diffusion language models",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -676,11 +721,14 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
+        "model_type": model_type,
         "device": device,
         "batch_processor_active": batch_processor is not None,
         "pending_requests": len(batch_processor.pending_requests) if batch_processor else 0,
         "available_generation_algorithms": available_algorithms,
-        "total_generation_algorithms": len(list_algorithms())
+        "total_generation_algorithms": len(list_algorithms()),
+        "default_algorithm": "nemotron" if model_type == "nemotron" else "dual_cache",
+        "chat_template_enabled": not (hasattr(app.state, 'no_chat_template') and app.state.no_chat_template)
     }
 
 @app.get("/batch/stats")
@@ -713,16 +761,16 @@ async def list_generation_algorithms():
     }
 
 def main():
-    global model, tokenizer, device, model_config
+    global model, tokenizer, device, model_config, model_type
     
-    parser = argparse.ArgumentParser(description="LLaDA Batch OpenAI API Server")
+    parser = argparse.ArgumentParser(description="LLaDA/Nemotron Batch OpenAI API Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--model-path", help="Path to HuggingFace model")
-    parser.add_argument("--dcp-path", help="Path to DCP checkpoint")
+    parser.add_argument("--dcp-path", help="Path to DCP checkpoint (supports both LLaDA and Nemotron models)")
     parser.add_argument("--base-model", default="GSAI-ML/LLaDA-8B-Instruct", 
-                       help="Base model name for DCP conversion")
-    parser.add_argument("--temp-dir", default="/tmp/llada_hf_converted",
+                       help="Base model name for DCP conversion (e.g., GSAI-ML/LLaDA-8B-Instruct, nvidia/Nemotron-Diffusion-Research-4B-v0)")
+    parser.add_argument("--temp-dir", default="/tmp/model_hf_converted",
                        help="Temporary directory for DCP conversion")
     parser.add_argument("--batch-size", type=int, default=8, 
                        help="Maximum batch size for processing requests")
@@ -730,6 +778,8 @@ def main():
                        help="Maximum time to wait for batch to fill (seconds)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose debug logging (very verbose, use for troubleshooting)")
+    parser.add_argument("--no-chat-template", action="store_true",
+                       help="Disable chat template application (feed raw text to tokenizer)")
     
     args = parser.parse_args()
     
@@ -762,9 +812,14 @@ def main():
     # Store batch configuration in app state
     app.state.batch_size = args.batch_size
     app.state.max_wait_time = args.max_wait_time
+    app.state.no_chat_template = args.no_chat_template
     
     logger.info(f"Starting batch server on {args.host}:{args.port}")
     logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
+    if args.no_chat_template:
+        logger.info("Chat template disabled - using raw text input")
+    else:
+        logger.info("Chat template enabled (default)")  
     uvicorn.run(app, host=args.host, port=args.port)
 
 if __name__ == "__main__":

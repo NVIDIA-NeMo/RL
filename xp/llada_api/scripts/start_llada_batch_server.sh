@@ -20,6 +20,7 @@ SERVER_MODE="batch"  # "batch" or "streaming"
 BATCH_SIZE=8
 MAX_WAIT_TIME=0.1
 VERBOSE=false
+NO_CHAT_TEMPLATE=false
 
 # Default values - SLURM
 LOCAL_MODE=false
@@ -82,6 +83,7 @@ show_usage() {
     echo "Execution Mode:"
     echo "  --local                 Run locally (default: run as SLURM job)"
     echo "  --verbose               Enable verbose debug logging (helpful for troubleshooting)"
+    echo "  --no-chat-template      Disable chat template application (feed raw text to tokenizer)"
     echo ""
     echo "SLURM Job Options (ignored with --local):"
     echo "  --job-name NAME         SLURM job name (default: $JOB_NAME)"
@@ -116,6 +118,9 @@ show_usage() {
     echo ""
     echo "  # Debug server with verbose logging"
     echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --verbose"
+    echo ""
+    echo "  # Server with raw text input (no chat template)"
+    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --no-chat-template"
     echo ""
     echo "Performance Tips:"
     echo "  • Batch server provides 3-5x speedup for evaluation workloads"
@@ -181,6 +186,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --verbose)
             VERBOSE=true
+            shift 1
+            ;;
+        --no-chat-template)
+            NO_CHAT_TEMPLATE=true
             shift 1
             ;;
         # SLURM options
@@ -317,6 +326,11 @@ fi
 # Add verbose flag if enabled
 if [[ "$VERBOSE" == true ]]; then
     LLADA_ARGS="$LLADA_ARGS --verbose"
+fi
+
+# Add no-chat-template flag if enabled
+if [[ "$NO_CHAT_TEMPLATE" == true ]]; then
+    LLADA_ARGS="$LLADA_ARGS --no-chat-template"
 fi
 
 # Function to run locally

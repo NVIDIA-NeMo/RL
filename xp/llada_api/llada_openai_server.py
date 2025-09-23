@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible API server for LLaDA models with Fast-dLLM acceleration.
+OpenAI-compatible API server for LLaDA and Nemotron models.
 
-This server provides OpenAI API compatibility for LLaDA diffusion language models,
-supporting Fast-dLLM optimizations including KV cache and parallel decoding.
+This server provides OpenAI API compatibility for diffusion language models:
+- LLaDA models with Fast-dLLM optimizations including KV cache and parallel decoding
+- Nemotron models with built-in diffusion generation
 
 Usage:
-    python llada_openai_server.py --model-path /path/to/checkpoint
+    # For LLaDA models:
+    python llada_openai_server.py --model-path /path/to/llada/checkpoint
+    
+    # For Nemotron models:
+    python llada_openai_server.py --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 
-For DCP checkpoints:
+For DCP checkpoints (both LLaDA and Nemotron):
     python llada_openai_server.py --dcp-path /path/to/dcp --base-model GSAI-ML/LLaDA-8B-Instruct
+    python llada_openai_server.py --dcp-path /path/to/nemotron_dcp --base-model nvidia/Nemotron-Diffusion-Research-4B-v0
 """
 
 import argparse
@@ -80,6 +86,7 @@ model = None
 tokenizer = None
 device = None
 model_config = None
+model_type = None  # 'llada' or 'nemotron'
 
 # LLaDA specific constants
 MASK_ID = 126336  # The token id of [MASK] in LLaDA tokenizer
@@ -207,15 +214,23 @@ def generate_with_algorithm(
         raise
 
 
+
+
 def load_model_from_hf(model_path: str):
-    """Load LLaDA model from HuggingFace format (local path or HuggingFace model name)."""
-    global model, tokenizer, device, model_config
+    """Load model from HuggingFace format (supports both LLaDA and Nemotron models)."""
+    global model, tokenizer, device, model_config, model_type
     
     # Determine if this is a local path or HuggingFace model name
     is_local_path = os.path.exists(model_path)
-    model_type = "local path" if is_local_path else "HuggingFace model name"
+    path_type = "local path" if is_local_path else "HuggingFace model name"
     
-    logger.info(f"Loading LLaDA model from {model_type}: {model_path}")
+    # Detect model type based on model path
+    if "nemotron" in model_path.lower() or "Nemotron" in model_path:
+        model_type = "nemotron"
+        logger.info(f"Detected Nemotron model from {path_type}: {model_path}")
+    else:
+        model_type = "llada"
+        logger.info(f"Loading LLaDA model from {path_type}: {model_path}")
     
     try:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -225,47 +240,61 @@ def load_model_from_hf(model_path: str):
         logger.info("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
-        # Load model using Fast-dLLM optimized model if available
+        # Load model based on detected type
         logger.info("Loading model...")
-        if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
-            logger.info("Using Fast-dLLM optimized model class")
-            model = LLaDAModelLM.from_pretrained(
-                model_path, 
-                trust_remote_code=True, 
-                torch_dtype=torch.bfloat16
-            )
-        else:
-            logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+        if model_type == "nemotron":
+            logger.info("Loading Nemotron model with standard AutoModel")
             model = AutoModel.from_pretrained(
                 model_path, 
                 trust_remote_code=True, 
                 torch_dtype=torch.bfloat16
             )
-        
-        model = model.to(device).eval()
+            model = model.to(device).eval()
+        else:
+            # LLaDA model loading
+            if FAST_DLLM_AVAILABLE and LLaDAModelLM is not None:
+                logger.info("Using Fast-dLLM optimized model class")
+                model = LLaDAModelLM.from_pretrained(
+                    model_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16
+                )
+            else:
+                logger.warning("Fast-dLLM not available, falling back to standard AutoModel")
+                model = AutoModel.from_pretrained(
+                    model_path, 
+                    trust_remote_code=True, 
+                    torch_dtype=torch.bfloat16
+                )
+            model = model.to(device).eval()
         
         # Load config (works with both local paths and HF model names)
         logger.info("Loading model config...")
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        logger.info(f"Model loaded successfully from {model_type}!")
-        logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
+        logger.info(f"Model loaded successfully from {path_type}!")
+        logger.info(f"Model type: {model_type}")
+        if model_type == "llada":
+            logger.info(f"Fast-dLLM optimizations: {'enabled' if FAST_DLLM_AVAILABLE else 'disabled'}")
+        
         return True
     except Exception as e:
-        logger.error(f"Failed to load model from {model_type} '{model_path}': {e}")
+        logger.error(f"Failed to load model from {path_type} '{model_path}': {e}")
         return False
 
 
-def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/llada_hf_converted"):
-    """Load LLaDA model from DCP checkpoint by converting to HF format first."""
-    global model, tokenizer, device, model_config
+def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted"):
+    """Load model from DCP checkpoint by converting to HF format first (supports both LLaDA and Nemotron models)."""
+    global model, tokenizer, device, model_config, model_type
     
     if not NEMO_RL_AVAILABLE:
         logger.error("NeMo-RL is not available. DCP checkpoint loading requires nemo_rl.utils.native_checkpoint.")
         logger.error("For local execution, please:")
         logger.error("1. Set PYTHONPATH to include NeMo-RL: export PYTHONPATH=/path/to/NeMo-RL:$PYTHONPATH")
         logger.error("2. Install NeMo-RL dependencies: uv sync --locked --no-install-project") 
-        logger.error("3. Or use a HuggingFace model instead: --model-path GSAI-ML/LLaDA-8B-Instruct")
+        logger.error("3. Or use a HuggingFace model instead:")
+        logger.error("   - LLaDA: --model-path GSAI-ML/LLaDA-8B-Instruct")
+        logger.error("   - Nemotron: --model-path nvidia/Nemotron-Diffusion-Research-4B-v0")
         return False
     
     logger.info(f"Converting DCP checkpoint to HuggingFace format...")
@@ -354,13 +383,23 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
         if i < len(request.messages) - 1:  # Add separator between messages
             logger.info("    " + "-" * 60)
     
-    # Apply chat template
+    # Apply chat template or use raw text
     try:
-        formatted_prompt = tokenizer.apply_chat_template(
-            [{"role": msg.role, "content": msg.content} for msg in request.messages],
-            add_generation_prompt=True,
-            tokenize=False
-        )
+        if hasattr(app.state, 'no_chat_template') and app.state.no_chat_template:
+            # Skip chat template - use raw content from last message
+            if request.messages:
+                formatted_prompt = request.messages[-1].content
+            else:
+                formatted_prompt = ""
+            logger.debug(f"Using raw text (no chat template): {formatted_prompt[:100]}...")
+        else:
+            # Apply chat template (default behavior)
+            formatted_prompt = tokenizer.apply_chat_template(
+                [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                add_generation_prompt=True,
+                tokenize=False
+            )
+            logger.debug(f"Applied chat template: {formatted_prompt[:100]}...")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to format chat template: {e}")
     
@@ -370,24 +409,32 @@ async def generate_chat_completion(request: ChatCompletionRequest) -> Union[Chat
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to tokenize input: {e}")
     
-    # Generate with Fast-dLLM
+    # Generate using the appropriate algorithm from registry
     try:
         gen_length = request.max_tokens or 128
         
-        # Ensure block_length compatibility
-        block_length = min(request.block_length, gen_length)
-        if gen_length % block_length != 0:
-            # Adjust gen_length to be divisible by block_length
-            gen_length = ((gen_length // block_length) + 1) * block_length
-            logger.info(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
+        # Select algorithm based on model type and request
+        if model_type == "nemotron":
+            algorithm_name = request.generation_algorithm or "nemotron"
+            logger.info(f"Using Nemotron generation with algorithm: {algorithm_name}")
+        else:
+            algorithm_name = request.generation_algorithm or "dual_cache"
+            logger.info(f"Using LLaDA generation with algorithm: {algorithm_name}")
+            
+            # Ensure block_length compatibility for LLaDA algorithms
+            block_length = min(request.block_length, gen_length)
+            if gen_length % block_length != 0:
+                # Adjust gen_length to be divisible by block_length
+                gen_length = ((gen_length // block_length) + 1) * block_length
+                logger.info(f"Adjusted gen_length to {gen_length} to be divisible by block_length {block_length}")
         
         output = generate_with_algorithm(
             model=model,
             prompt=input_ids,
-            algorithm_name=request.generation_algorithm,
+            algorithm_name=algorithm_name,
             steps=request.steps,
             gen_length=gen_length,
-            block_length=block_length,
+            block_length=request.block_length,
             temperature=request.temperature,
             remasking=request.remasking,
             threshold=request.threshold,
@@ -505,8 +552,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="LLaDA OpenAI API",
-    description="OpenAI-compatible API for LLaDA diffusion language models",
+    title="LLaDA/Nemotron OpenAI API",
+    description="OpenAI-compatible API for LLaDA and Nemotron diffusion language models",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -569,8 +616,11 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
+        "model_type": model_type,
         "device": device,
         "available_generation_algorithms": available_algorithms,
+        "default_algorithm": "nemotron" if model_type == "nemotron" else "dual_cache",
+        "chat_template_enabled": not (hasattr(app.state, 'no_chat_template') and app.state.no_chat_template),
         "note": "Use 'generation_algorithm' parameter in requests to specify algorithm"
     }
 
@@ -593,15 +643,19 @@ async def list_generation_algorithms():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLaDA OpenAI API Server")
+    global model, tokenizer, device, model_config, model_type
+    
+    parser = argparse.ArgumentParser(description="LLaDA/Nemotron OpenAI API Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--model-path", help="Path to HuggingFace model")
-    parser.add_argument("--dcp-path", help="Path to DCP checkpoint")
+    parser.add_argument("--dcp-path", help="Path to DCP checkpoint (supports both LLaDA and Nemotron models)")
     parser.add_argument("--base-model", default="GSAI-ML/LLaDA-8B-Instruct", 
-                       help="Base model name for DCP conversion")
-    parser.add_argument("--temp-dir", default="/tmp/llada_hf_converted",
+                       help="Base model name for DCP conversion (e.g., GSAI-ML/LLaDA-8B-Instruct, nvidia/Nemotron-Diffusion-Research-4B-v0)")
+    parser.add_argument("--temp-dir", default="/tmp/model_hf_converted",
                        help="Temporary directory for DCP conversion")
+    parser.add_argument("--no-chat-template", action="store_true",
+                       help="Disable chat template application (feed raw text to tokenizer)")
     
     args = parser.parse_args()
     
@@ -624,7 +678,14 @@ def main():
     if not available_algorithms:
         logger.warning("No generation algorithms are available. Check Fast-dLLM installation.")
     
+    # Store configuration in app state
+    app.state.no_chat_template = args.no_chat_template
+    
     logger.info(f"Starting server on {args.host}:{args.port}")
+    if args.no_chat_template:
+        logger.info("Chat template disabled - using raw text input")
+    else:
+        logger.info("Chat template enabled (default)")  
     uvicorn.run(app, host=args.host, port=args.port)
 
 

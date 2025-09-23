@@ -141,6 +141,13 @@ def _register_builtin_algorithms():
         logger.debug("Registered dual cache generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register dual cache generation: {e}")
+    
+    try:
+        from .nemotron import NemotronGeneration
+        register_algorithm(NemotronGeneration(), aliases=['nemotron', 'nemotron_native', 'nemotron_diffusion'])
+        logger.debug("Registered Nemotron generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register Nemotron generation: {e}")
 
 
 # Register built-in algorithms on import
