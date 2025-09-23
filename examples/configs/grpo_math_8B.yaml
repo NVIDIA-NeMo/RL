@@ -4,6 +4,9 @@ defaults: "grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
