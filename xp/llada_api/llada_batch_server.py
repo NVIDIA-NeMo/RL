@@ -92,13 +92,16 @@ def load_model_from_hf(model_path: str):
     is_local_path = os.path.exists(model_path)
     path_type = "local path" if is_local_path else "HuggingFace model name"
     
-    # Detect model type based on model path
-    if "nemotron" in model_path.lower() or "Nemotron" in model_path:
-        model_type = "nemotron"
-        logger.info(f"Detected Nemotron model from {path_type}: {model_path}")
+    # Detect model type based on model path (if not already set by DCP loading)
+    if model_type is None:
+        if "nemotron" in model_path.lower() or "Nemotron" in model_path:
+            model_type = "nemotron"
+            logger.info(f"Detected Nemotron model from {path_type}: {model_path}")
+        else:
+            model_type = "llada"
+            logger.info(f"Loading LLaDA model from {path_type}: {model_path}")
     else:
-        model_type = "llada"
-        logger.info(f"Loading LLaDA model from {path_type}: {model_path}")
+        logger.info(f"Using pre-detected model type '{model_type}' for {path_type}: {model_path}")
     
     try:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -205,6 +208,16 @@ def load_model_from_dcp(dcp_path: str, base_model: str, temp_dir: str = "/tmp/mo
             )
         
         logger.info(f"Conversion completed. Loading from: {hf_path}")
+        
+        # Detect model type from base_model parameter (not converted path)
+        # This is important because the converted path doesn't contain model type info
+        global model_type
+        if "nemotron" in base_model.lower() or "Nemotron" in base_model:
+            model_type = "nemotron"
+            logger.info(f"Detected Nemotron model from base model: {base_model}")
+        else:
+            model_type = "llada"
+            logger.info(f"Detected LLaDA model from base model: {base_model}")
         
         # Now load from HF format
         return load_model_from_hf(hf_path)
