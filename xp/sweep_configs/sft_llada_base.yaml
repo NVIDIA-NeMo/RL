@@ -8,7 +8,7 @@ script_path: "examples/run_sft.py"
 # Optional: Path to the base YAML config file
 # Can be overridden by the --config command-line argument
 # If null and --config is not provided, no base config will be used
-config_path: "examples/configs/sft_mdlm_gsm8k.yaml" 
+config_path: "examples/configs/sft_mdlm.yaml" 
 
 
 # Model configuration
@@ -31,6 +31,6 @@ cluster.num_nodes: [1]
 cluster.gpus_per_node: [8]
 
 # Training configuration
-policy.train_global_batch_size: [64, 128]
-policy.train_micro_batch_size: [4]
-policy.max_total_sequence_length: [256, 512]
+policy.train_global_batch_size: [256, 512]
+policy.train_micro_batch_size: [1]
+policy.max_total_sequence_length: [2048, 4096]
