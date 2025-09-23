@@ -184,10 +184,6 @@ class ToolManager:
             # Handle unhashable type errors (e.g., if func_name is still not a proper string)
             return f"Invalid tool function name format: {str(e)}", False
 
-
-
-
-
 class RewardCalculator:
     """Calculates rewards for turns."""
     def calculate_reward(self, metadata: MultiTurnToolMetadata, is_final_turn: bool) -> float:
@@ -275,7 +271,7 @@ class RewardCalculator:
         turn_index: int,
     ) -> float:
         """Return 1.0 if the model's calls for ``turn_index`` exactly match ground truth, else 0.0."""
-        print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
+        #print(f"model_calls {model_calls}, gt_calls {gt_calls}, turn_index {turn_index}")
         
         # Guard against out-of-range indices or missing data.
         if (
@@ -375,11 +371,9 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             else:
 
                 for tool_call in model_tool_calls:
-                    #print(f"    Executing tool call: {tool_call}")
                     result, success = self.tool_manager.execute_tool_call(
                         tool_call, metadata["model_tool_instances"]
                     )
-                    #print(f"    Result: {result}, Success: {success}")
                     tool_results.append(result)
                     func_name = tool_call.get('name', '')
                     args = tool_call.get('args', {})
@@ -399,9 +393,6 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
                         turn_success = False
                         # Stop on first error
                         break
-        # TODO: ykarnati - both the tool calls might be successful
-        #  but these might be wrong calls.
-        # should we still make the turn success ?
         
         # Execute ground truth calls for this turn
         current_turn = metadata["current_turn"]
@@ -438,7 +429,6 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
         metadata: List[Dict[str, Any]],
     ) -> EnvironmentReturn:
         """Process single turn for each sample in batch."""
-        #print("In environment here ")
         # Initialize or update metadata
         processed_metadata = []
         for meta in metadata:
@@ -456,11 +446,8 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
         next_stop_strings = []
         next_metadata = []
         
-        #print("message log batch in step ", message_log_batch[0])
-        
         for i, (message_log, sample_metadata) in enumerate(zip(message_log_batch, processed_metadata)):
             # Process current turn
-            #print("message log ", message_log)
             tool_results, model_calls, turn_success = self._process_turn(
                 message_log, sample_metadata
             )
@@ -477,7 +464,6 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             is_final_turn = not should_continue
             if is_final_turn:
                 print(f"final turn {sample_metadata['current_turn']}")
-                # print(f"message log {message_log}")  # REMOVED: Too memory intensive
             
             # Use new per-turn partial reward function  
             state_score, call_score = self.reward_calculator.calculate_reward(sample_metadata, is_final_turn)
@@ -493,7 +479,6 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             # Update for next turn
             if should_continue:
                 sample_metadata["current_turn"] += 1
-                # print(sample_metadata["current_turn"],"current turn")
                 terminateds.append(False)
                 next_stop_strings.append(None)
             else:

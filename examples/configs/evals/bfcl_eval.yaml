@@ -2,14 +2,14 @@
 defaults: "eval.yaml"
 
 generation:
-  model_name: "/raid/slikhite/results-8/hf"
+  model_name: "./results/grpo/hf"
   vllm_cfg:
     max_model_len: 8192    
     tensor_parallel_size: 1
 
 data:
   dataset_name: "bfcl_multiturn"
-  dataset_path: "/workspace/slikhite-RL/dataset/BFCL_v3_multi_turn_val_final.jsonl"
+  dataset_path: "/path/to/dataset/BFCL_v3_multi_turn_val_final.jsonl"
 
 env:
   bfcl_multiturn:

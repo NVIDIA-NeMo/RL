@@ -17,7 +17,7 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 import ray
 import torch

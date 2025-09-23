@@ -69,6 +69,7 @@ def test_eval_pass_k_multiple_groups():
     assert isinstance(average_score, float)
     assert average_score == pytest.approx(expected, rel=1e-6)
 
+
 def test_eval_cons_k_basic():
     """Test basic cons@k evaluation."""
     rewards = torch.tensor([1.0, 0.0, 1.0])
