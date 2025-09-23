@@ -639,9 +639,9 @@ class DTensorPolicyWorker:
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
 
-                for mb_idx, mb in enumerate(
-                    itertools.chain(mb_iterator, dummy_iterator)
-                ):
+                iterates = list(mb_iterator)
+
+                for mb_idx, mb in enumerate(itertools.chain(iterates, dummy_iterator)):
                     # Conditioanlly empty cache when sensitive to fragmentation
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
@@ -827,7 +827,11 @@ class DTensorPolicyWorker:
 
                             # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                             # but we want to sum them so we cancel out the average here
-                            loss *= self.dp_size * self.cp_size
+                            if loss_fn.loss_type == LossType.TOKEN_LEVEL:
+                                loss = loss / len(iterates)
+                            else:
+                                loss *= self.dp_size * self.cp_size
+
                             loss.backward()
 
                     if num_valid_samples > 0:

@@ -131,6 +131,10 @@ class ClippedPGLossFn(LossFunction):
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
+        if self.loss_type == LossType.TOKEN_LEVEL:
+            global_valid_toks = None
+            global_valid_seqs = None
+
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
