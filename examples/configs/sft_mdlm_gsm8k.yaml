@@ -73,16 +73,16 @@ policy:
       kwargs:
         start_factor: 0.05  # Start from (0.05 * lr)
         end_factor: 1.0     # Reach full base LR
-        total_iters: 50     # First 10% of ~500 steps
+        total_iters: 100     # First 10% of ~500 steps
     - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        T_max: 450          # Remaining 95% of training steps
+        T_max: 1900          # Remaining 95% of training steps
         eta_min: ${mul:${policy.optimizer.kwargs.lr}, 0.05}     
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
         factor: 0.05
         total_iters: 10000000000
-    - milestones: [50, 500]
+    - milestones: [100, 1900]
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
@@ -167,7 +167,7 @@ logger:
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0  # Number of validation samples to pretty print on terminal
   wandb:
-    project: "mdlm-sft"
+    project: "mdlm-sft-nemorl"
     name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"

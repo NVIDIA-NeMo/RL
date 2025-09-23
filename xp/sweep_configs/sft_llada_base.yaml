@@ -24,7 +24,7 @@ data.val_data_path: ["/workspace/data/gsm8k/test.jsonl"]
 
 # Training steps
 sft.max_num_epochs: [100]
-sft.max_num_steps: [500]
+sft.max_num_steps: [2000]
 
 # Resources
 cluster.num_nodes: [1]
