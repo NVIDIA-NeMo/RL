@@ -38,11 +38,12 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 def _maybe_correct_merged_tokens(
     tokenizer: PreTrainedTokenizerBase,
-    model_token_ids: list[int],
+    model_prefix_token_ids: list[int],
     actual_corresponding_token_ids: list[int],
     actual_token_ids: list[int],
 ) -> list[int]:
     """This is a subroutine used inside the vLLM Chat Completion server.
+
     Some environments (namely Penguin) require an OpenAI compatible server
     endpoint rather than an inference engine handle. This is fine for the most
     part, but it may cause issues when the environment is used as a part of
@@ -66,7 +67,7 @@ def _maybe_correct_merged_tokens(
     calls, and the re-tokenized actual token ids.
 
     In other words, for the current model call:
-    - model_token_ids = all_prefill_so_far + new_generation
+    - model_prefix_token_ids = all_prefill_so_far + new_generation
         - all_prefill_so_far: the last model call model engine input token ids.
           Literally what the model sees during the last generation call.
         - new_generation: the last model call model engine generated token ids.
@@ -87,10 +88,10 @@ def _maybe_correct_merged_tokens(
           the model to generate an assistant response.
 
     The goal of this subroutine is to find the prefix in actual_token_ids that
-    corresponds to the de-tokenized text of model_token_ids.
+    corresponds to the de-tokenized text of model_prefix_token_ids.
     The idea of this subroutine implementation is to just de-tokenize
     subsequences of actual_token_ids (called candidate_token_ids) until the
-    de-tokenized text matches the de-tokenized text of model_token_ids.
+    de-tokenized text matches the de-tokenized text of model_prefix_token_ids.
 
     TODO When NeMo RL supports training image generation models, we want to
     revisit and possibly update this function. This issue occurs when the model
@@ -99,44 +100,32 @@ def _maybe_correct_merged_tokens(
     and image tokenization is non-unique, then we will need to uppdate this
     function.
     """
-    if not model_token_ids:
+    if not model_prefix_token_ids:
         return actual_token_ids
 
     # No re-tokenization errors
-    if model_token_ids == actual_token_ids[: len(model_token_ids)]:
+    if model_prefix_token_ids == actual_token_ids[: len(model_prefix_token_ids)]:
         return actual_token_ids
 
     model_str, actual_str = tokenizer.batch_decode(
-        [model_token_ids, actual_token_ids]
+        [model_prefix_token_ids, actual_token_ids]
     )
 
     # For now, if a trajectory is not monotonically increasing, we assert.
     # Eventually when we support non-monotonic training, we need to update this logic
-
-    # FIXME(peter): this is not going to be correct b/c of e.g. different whitespace inside tool calls.
-
-    if (
-        len(model_str) > len(actual_str) or
-        model_str != actual_str[: len(model_str)]
-    ):
-        eos_token_id = tokenizer.eos_token_id
-        assert eos_token_id is not None
-
-        # TODO(peter)
-
     assert (
         model_str == actual_str[: len(model_str)]
     ), f"""Found a non-monotonically increasing trajectory that is not caused by a token merge on re-tokenization!
 Model str:  {model_str}
 Actual str: {actual_str}
 
-Model token ids:  {model_token_ids}
+Model token ids:  {model_prefix_token_ids}
 Actual token ids: {actual_token_ids}"""
 
     # Now we want to try to find the subsequence of actual_token_ids that corresponds to model_str
-    # Our first guess is just the prefix in actual_token_ids of length model_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
+    # Our first guess is just the prefix in actual_token_ids of length model_prefix_token_ids. How good of a guess this is depends on the distribution of the number of re-tokenization errors.
     # If there are a lot, this will be a poor guess. If there aren't that many this is a good guess.
-    candidate_token_ids = actual_token_ids[: len(model_token_ids)]
+    candidate_token_ids = actual_token_ids[: len(model_prefix_token_ids)]
     candidate_str = tokenizer.decode(candidate_token_ids)
 
     # If it's longer, we remove
@@ -162,11 +151,32 @@ Actual token ids: {actual_token_ids}"""
         pass
 
     # If we break above, it must be that we either found a correct match or that we didn't find a valid match
-    # e.g. in cases where there is some token merging that occurs at the very end of the model_token_ids
+    # e.g. in cases where there is some token merging that occurs at the very end of the model_prefix_token_ids
     # We scream loudly here.
     assert candidate_str == model_str
 
-    return model_token_ids + actual_token_ids[len(candidate_token_ids) :]
+    return model_prefix_token_ids + actual_token_ids[len(candidate_token_ids) :]
+
+
+def _replace_prefix_tokens(
+    tokenizer,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+) -> list[int]:
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id is not None
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids:
+        if model_prefix_token_ids[-1] == eos_token_id:
+            model_cut_end -= 1
+    template_cut_start = -1
+    for pos in reversed(range(len(template_prefix_token_ids))):
+        if template_token_ids[pos] == eos_token_id:
+            template_cut_start = pos
+            break
+    assert template_cut_start >= 0
+    return model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
 
 
 @ray.remote(
@@ -286,7 +296,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Find the last assistant message
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages))):
-                    if message[i]["role"] == "assistant":
+                    if messages[i]["role"] == "assistant":
                         last_assistant_message_idx = i
                         break
 
@@ -318,12 +328,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
-                final_prompt_token_ids = _maybe_correct_merged_tokens(
-                    tokenizer=tokenizer,
-                    model_token_ids=request.required_prefix_token_ids,
-                    actual_corresponding_token_ids=actual_corresponding_token_ids,
-                    actual_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                if False:
+                    final_prompt_token_ids = _maybe_correct_merged_tokens(
+                        tokenizer=tokenizer,
+                        model_prefix_token_ids=request.required_prefix_token_ids,
+                        actual_corresponding_token_ids=actual_corresponding_token_ids,
+                        actual_token_ids=engine_prompt["prompt_token_ids"],
+                    )
+                else:
+                    final_prompt_token_ids = _replace_prefix_tokens(
+                        tokenizer=tokenizer,
+                        model_prefix_token_ids=request.required_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 

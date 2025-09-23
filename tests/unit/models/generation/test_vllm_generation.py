@@ -1224,24 +1224,27 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     # Test super simple example of correcting the merged tokens
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        model_token_ids=[26951, 3834],
+        model_prefix_token_ids=[26951, 3834],
         actual_token_ids=[94224],
+        actual_corresponding_token_ids=[94224],
     )
     expected_result = [26951, 3834]
     assert expected_result == actual_result
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        model_token_ids=[61830, 65],
+        model_prefix_token_ids=[61830, 65],
         actual_token_ids=[2435, 20828],
+        actual_corresponding_token_ids=[2435, 20828],
     )
     expected_result = [61830, 65]
     assert expected_result == actual_result
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        model_token_ids=[758, 12601],
+        model_prefix_token_ids=[758, 12601],
         actual_token_ids=[89038],
+        actual_corresponding_token_ids=[89038],
     )
     expected_result = [758, 12601]
     assert expected_result == actual_result
@@ -1249,8 +1252,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     # Test no-op
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        model_token_ids=[26951, 3834],
+        model_prefix_token_ids=[26951, 3834],
         actual_token_ids=[26951, 3834],
+        actual_corresponding_token_ids=[26951, 3834],
     )
     expected_result = [26951, 3834]
 
@@ -1260,8 +1264,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     ):
         _maybe_correct_merged_tokens(
             tokenizer=tokenizer,
-            model_token_ids=[26951, 26951, 26951, 26951],
+            model_prefix_token_ids=[26951, 26951, 26951, 26951],
             actual_token_ids=[26951, 26951, 3834, 3834, 3834],
+            actual_corresponding_token_ids=[26951, 26951, 3834, 3834, 3834],
         )
 
     test_data_fpath = Path(__file__).with_name(
@@ -1272,8 +1277,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        model_token_ids=test_data["seen_token_ids"],
+        model_prefix_token_ids=test_data["seen_token_ids"],
         actual_token_ids=test_data["output_prompt_token_ids"],
+        actual_corresponding_token_ids=test_data["output_prompt_token_ids"],
     )
     expected_result = test_data["expected_output"]
     assert expected_result == actual_result
@@ -1355,11 +1361,11 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         77091,
         198,
     ]
-    body_with_model_token_ids = body | {
+    body_with_model_prefix_token_ids = body | {
         "required_prefix_token_ids": initial_tokenized_query_ids_prefix
     }
     response = requests.post(
-        url=f"{base_urls[0]}/../tokenize", json=body_with_model_token_ids
+        url=f"{base_urls[0]}/../tokenize", json=body_with_model_prefix_token_ids
     )
     actual_result = response.json()
     expected_result = {
@@ -1372,7 +1378,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     # Generate and check result
     response = requests.post(
-        url=f"{base_urls[0]}/chat/completions", json=body_with_model_token_ids
+        url=f"{base_urls[0]}/chat/completions", json=body_with_model_prefix_token_ids
     )
     vllm_http_server_result = response.json()
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
