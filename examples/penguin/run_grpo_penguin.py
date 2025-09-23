@@ -161,6 +161,7 @@ def main() -> None:
         initial_global_config_dict=config["env"]["penguin"],
     )
     penguin = Penguin.options(
+        num_cpus=16,
         runtime_env={
             "py_executable": get_actor_python_env(
                 "nemo_rl.environments.penguin.Penguin"
