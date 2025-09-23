@@ -1,0 +1,39 @@
+# GRPO Algorithm Configuration
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  val_batch_size: 5
+  max_val_samples: 16
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+policy:
+  model_name: "deepseek-ai/DeepSeek-V3-0324"
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1536
+
+  megatron_cfg:
+    activation_checkpointing: true
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    apply_rope_fusion: false
+    moe_permute_fusion: true
+
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 32
+
+logger:
+  wandb_enabled: false
+  wandb:
+    project: "nemo-rl-grpo-dev-guyueh"
+    name: "grpo_math_deepseekv3_megatron"
+
+cluster:
+  num_nodes: 32
+  gpus_per_node: 8
