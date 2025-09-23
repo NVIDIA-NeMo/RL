@@ -131,7 +131,7 @@ def get_gpu_info(model: torch.nn.Module) -> dict[str, Any]:
     # Get a parameter from the model to verify CUDA device placement
     # This confirms tensors are actually on the appropriate device
     param_info = {}
-    for module_name, module in model.named_modules():
+    for module_name, module in model[0].named_modules():
         for param_name, param in module.named_parameters(recurse=False):
             if param is not None and param.requires_grad:
                 full_name = f"{module_name}.{param_name}"
