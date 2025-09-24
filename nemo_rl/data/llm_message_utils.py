@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import warnings
 from typing import Any, Optional, cast
 
@@ -209,12 +210,17 @@ def batched_message_log_to_flat_message(
     message_log_batch: list[LLMMessageLogType],
     pad_value_dict: Optional[dict[str, int]] = None,
     make_sequence_length_divisible_by: int = 1,
+    pad_block_size: int = 1,
+    pad_block_value_dict: Optional[dict[str, int]] = None,
 ) -> tuple[BatchedDataDict[FlatMessagesType], Tensor]:
     """Process and pad a batch of message logs for model input.
 
     For each message log in the batch:
     1. Converts it to a flat representation using message_log_to_flat_messages
     2. Pads all resulting tensors to the same length for batching
+       - Optionally, applies block-aware padding so each sequence length is first
+         rounded up to the nearest multiple of ``pad_block_size`` using
+         ``pad_block_value_dict``
     3. Returns a BatchedDataDict and sequence lengths tensor
 
     Padding is always applied to the right side of sequences.
@@ -223,6 +229,9 @@ def batched_message_log_to_flat_message(
         message_log_batch: List of LLMMessageLogType (each a conversation with multiple turns)
         pad_value_dict: Dictionary mapping keys to padding values (default is 0)
         make_sequence_length_divisible_by: forces the data to be divisible by this value
+        pad_block_size: Size of the logical padding block. Default: 1 (disabled)
+        pad_block_value_dict: Optional dict mapping keys to block-level padding values. Defaults to
+            the values in pad_value_dict when not provided
 
     Returns:
         BatchedDataDict[FlatMessagesType]: Dictionary containing padded stacked tensors
@@ -266,6 +275,11 @@ def batched_message_log_to_flat_message(
     >>>
     ```
     """
+    if pad_block_size < 1:
+        raise ValueError("pad_block_size must be >= 1")
+    if make_sequence_length_divisible_by < 1:
+        raise ValueError("make_sequence_length_divisible_by must be >= 1")
+
     if not message_log_batch:
         return BatchedDataDict(), torch.empty(0)
 
@@ -276,16 +290,23 @@ def batched_message_log_to_flat_message(
     # Find max length and identify tensor keys
     max_len = 0
     tensor_keys = []
+    block_size = pad_block_size
     for seq in sequenced_lists:
         for key, value in seq.items():
             if isinstance(value, Tensor):
                 tensor_keys.append(key)
-                max_len = max(max_len, value.size(0))
+                value_len = value.size(0)
+                block_aligned_len = (
+                    ((value_len + block_size - 1) // block_size) * block_size
+                    if block_size > 1
+                    else value_len
+                )
+                max_len = max(max_len, block_aligned_len)
 
-    if max_len % make_sequence_length_divisible_by != 0:
-        max_len = (
-            (max_len // make_sequence_length_divisible_by) + 1
-        ) * make_sequence_length_divisible_by
+    alignment = math.lcm(block_size, make_sequence_length_divisible_by)
+
+    if max_len % alignment != 0:
+        max_len = ((max_len + alignment - 1) // alignment) * alignment
 
     # Handle non-tensor case
     if not tensor_keys:
@@ -334,7 +355,28 @@ def batched_message_log_to_flat_message(
 
         # Pad and stack tensors (always right padding)
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
+        block_pad_value = (
+            pad_block_value_dict.get(key, pad_value)
+            if pad_block_value_dict
+            else pad_value
+        )
+
+        block_aligned_tensors: list[Tensor] = []
+        for tensor in filled_values:
+            if block_size > 1:
+                current_len = tensor.size(0)
+                remainder = current_len % block_size
+                if remainder != 0:
+                    target_len = current_len + (block_size - remainder)
+                    tensor = _pad_tensor(
+                        tensor,
+                        target_len,
+                        "right",
+                        block_pad_value,
+                    )
+            block_aligned_tensors.append(tensor)
+
+        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in block_aligned_tensors]
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor

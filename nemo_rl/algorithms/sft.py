@@ -441,11 +441,16 @@ def sft_train(
 
                         # train on eos tokens as well 
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 1}
+                        pad_block_value_dict = None
                         if is_dqwn:
                             # deactivate eos/pad tokens
-                            pad_value_dict["token_loss_mask"] = 0
+                            pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 0}
+                            pad_block_value_dict = {"token_ids": tokenizer.eos_token_id, "token_loss_mask": 1}
+                            pad_block_size = master_config["policy"]["mdlm"]["pad_block_size"]
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
+                        block_pad_value_dict = None
+                        pad_block_size = 1
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
@@ -453,6 +458,8 @@ def sft_train(
                         make_sequence_length_divisible_by=master_config["policy"][
                             "make_sequence_length_divisible_by"
                         ],
+                        pad_block_size=pad_block_size,
+                        pad_block_value_dict=pad_block_value_dict,
                     )
 
                     if is_dqwn:

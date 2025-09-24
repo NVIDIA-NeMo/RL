@@ -132,8 +132,15 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: NotRequired[int]
 
 
+class MDLMConfig(TypedDict):
+    train_block_size: int
+    pad_block_size: int
+
+
 class PolicyConfig(TypedDict):
-    is_mdlm: bool
+    is_mdlm: NotRequired[bool]
+    is_dqwn: NotRequired[bool]
+    mdlm: NotRequired[MDLMConfig]
     model_name: str
     tokenizer: TokenizerConfig
     train_global_batch_size: int

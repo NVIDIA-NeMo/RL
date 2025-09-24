@@ -328,6 +328,60 @@ def test_batch_pad_message_log_custom_pad_value(
     )
 
 
+def test_batch_pad_message_log_block_padding() -> None:
+    """Test batch padding with block-aware padding values."""
+    message_log_batch = [
+        [{"input_ids": torch.tensor([1, 2, 3, 4, 5])}],
+        [{"input_ids": torch.tensor([6, 7, 8, 9])}],
+    ]
+
+    result, input_lengths = batched_message_log_to_flat_message(
+        message_log_batch,
+        pad_value_dict={"input_ids": 0},
+        pad_block_size=4,
+        pad_block_value_dict={"input_ids": -1},
+    )
+
+    assert torch.equal(
+        result["input_ids"],
+        torch.tensor(
+            [
+                [1, 2, 3, 4, 5, -1, -1, -1],
+                [6, 7, 8, 9, 0, 0, 0, 0],
+            ]
+        ),
+    )
+    assert torch.equal(
+        input_lengths,
+        torch.tensor([5, 4], dtype=torch.int32),
+    )
+
+
+def test_batch_pad_message_log_block_alignment() -> None:
+    """Ensure block padding respects make_sequence_length_divisible_by."""
+    message_log_batch = [
+        [{"input_ids": torch.tensor([1, 2, 3, 4, 5, 6, 7])}],
+        [{"input_ids": torch.tensor([8, 9, 10, 11, 12])}],
+    ]
+
+    result, _ = batched_message_log_to_flat_message(
+        message_log_batch,
+        make_sequence_length_divisible_by=6,
+        pad_block_size=4,
+    )
+
+    assert result["input_ids"].shape == (2, 12)
+
+
+def test_batch_pad_message_log_invalid_block_size() -> None:
+    """pad_block_size must be positive."""
+    with pytest.raises(ValueError, match="pad_block_size must be >= 1"):
+        batched_message_log_to_flat_message(
+            [[{"input_ids": torch.tensor([1, 2, 3])}]],
+            pad_block_size=0,
+        )
+
+
 @pytest.mark.hf_gated
 def test_get_formatted_message_log_llama(
     raw_chat_message_log: LLMMessageLogType,

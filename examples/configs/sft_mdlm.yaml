@@ -23,6 +23,12 @@ checkpointing:
 policy:
   is_mdlm: true
   is_dqwn: false
+
+  # MDLM specific configuration goes here.
+  mdlm:
+    train_block_size: 32
+    pad_block_size: ${policy.mdlm.train_block_size}
+
   model_name: "GSAI-ML/LLaDA-8B-Base"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
