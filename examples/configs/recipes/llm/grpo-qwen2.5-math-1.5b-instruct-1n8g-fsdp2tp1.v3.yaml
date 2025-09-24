@@ -12,6 +12,10 @@ grpo:
   val_batch_size: 256
   seed: 42
   overlong_filtering: false
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+
 loss_fn:
   reference_policy_kl_penalty: 0.01
   ratio_clip_min: 0.2
@@ -96,7 +100,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
+      expert_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: 512
       enforce_eager: False

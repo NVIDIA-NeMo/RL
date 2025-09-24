@@ -41,7 +41,9 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_default_hf_config,
@@ -75,7 +77,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = "megatron_cfg" in config and config["megatron_cfg"]["enabled"]
+        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        if megatron_enable and dtensor_enable:
+            raise ValueError(
+                "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
+                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
         if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
@@ -86,13 +94,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            assert config["dtensor_cfg"]["enabled"], (
-                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
-            )
+            if not dtensor_enable:
+                raise ValueError(
+                    "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                )
 
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
-            use_v2 = config["dtensor_cfg"].get("_v2", False)
+            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
                 worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
             else:
@@ -104,6 +113,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+        # Validate world_size compatibility with parallelism configuration
+        model_parallel_size = pp_size * cp_size * tp_size
+        actual_world_size = cluster.world_size()
+
+        if actual_world_size < model_parallel_size:
+            raise ValueError(
+                f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
+                f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+
+        if actual_world_size % model_parallel_size != 0:
+            dp_size_float = actual_world_size / model_parallel_size
+            raise ValueError(
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
+                f"Please adjust your cluster size or parallelism parameters."
+            )
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -467,6 +497,51 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return result
 
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
+        # Verify input data is right-padded
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "score",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={},
+        )
+
+        result: BatchedDataDict[ScoreOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+        )
+        required_keys = [
+            "scores",
+        ]
+        missing_keys = [key for key in required_keys if key not in result]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for ScoreOutputSpec: {missing_keys}"
+            )
+
+        return result
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here
         return True
@@ -588,14 +663,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "save_checkpoint",
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            tokenizer_path=tokenizer_path,
-        )
+        # Only pass checkpointing_cfg for DTensor v2
+        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+
+        if use_v2:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+            )
+        else:
+            if (
+                checkpointing_cfg is not None
+                and checkpointing_cfg.get("model_save_format") == "safetensors"
+            ):
+                raise ValueError(
+                    "safetensors is only supported with DTensorPolicyWorkerV2 (_v2=true)."
+                )
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
         ray.get(futures)
 
     def shutdown(self) -> bool:
