@@ -24,7 +24,8 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.hf_datasets import VanillaGenRMDataset
 from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
@@ -83,7 +84,11 @@ def setup_data(
     )
 
     # Load dataset
-    data: Any = load_response_dataset(data_config, seed)
+    data: Any = VanillaGenRMDataset(
+        train_data_path=data_config["train_data_path"],
+        val_data_path=data_config.get("val_data_path"),
+        task_name="vanilla_genrm",
+    )
 
     # Set up data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
