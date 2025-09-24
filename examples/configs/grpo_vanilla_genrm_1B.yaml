@@ -30,6 +30,7 @@ loss_fn:
   use_importance_sampling_correction: false
   sequence_level_importance_ratios: false
   token_level_loss: true
+  imp_clip_max: null  # Maximum value for importance sampling weight clipping (null to disable)
 
 checkpointing:
   enabled: true

@@ -42,6 +42,8 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    # Maximum value for importance sampling weight clipping (null to disable)
+    imp_clip_max: NotRequired[float]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -113,6 +115,9 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_ratios",
             False,
         )
+        self.imp_clip_max = cfg.get(
+            "imp_clip_max", None
+        )  # Default to None if not specified
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
@@ -274,6 +279,10 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.exp(
                 prev_logprobs - generation_logprobs
             )
+            if self.imp_clip_max is not None:
+                actor_importance_weights_expanded = (
+                    actor_importance_weights_expanded.clamp(0, 1 + self.imp_clip_max)
+                )
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
