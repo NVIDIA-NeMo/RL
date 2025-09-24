@@ -271,7 +271,7 @@ class DTensorPolicyWorkerV2:
             and self.cfg["dtensor_cfg"]["fp8"]["enabled"]
         ):
             assert self.cfg["make_sequence_length_divisible_by"] == 16, (
-                "make_sequence_length_divisible_by must be 16 for FP8 training, but got {self.cfg['make_sequence_length_divisible_by']}"
+                f"make_sequence_length_divisible_by must be 16 for FP8 training, but got {self.cfg['make_sequence_length_divisible_by']}"
             )
             self.fp8_config = build_fp8_config(self.cfg["dtensor_cfg"]["fp8"])
             self.model = apply_fp8_to_model(self.model, config=self.fp8_config)
