@@ -238,7 +238,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Find the last assistant message
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages))):
-                    if message[i]["role"] == "assistant":
+                    if messages[i]["role"] == "assistant":
                         last_assistant_message_idx = i
                         break
 
