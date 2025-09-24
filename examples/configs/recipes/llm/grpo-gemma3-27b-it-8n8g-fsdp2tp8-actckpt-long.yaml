@@ -15,6 +15,7 @@ policy:
   dtensor_cfg:
     activation_checkpointing: true
     tensor_parallel_size: 8
+    _v2: false
   sequence_packing:
     enabled: false
   make_sequence_length_divisible_by: 8
