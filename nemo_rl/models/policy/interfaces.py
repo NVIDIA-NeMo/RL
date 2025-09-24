@@ -136,5 +136,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def send_weights_ipc_handles(self) -> list[ray.ObjectRef]:
+    def send_weights_ipc_handles(self, buffer_size: int) -> list[ray.ObjectRef]:
+        pass
+    
+    @abstractmethod
+    def get_available_buffer_size(self) -> int:
         pass

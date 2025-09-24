@@ -13,7 +13,6 @@
 # limitations under the License.
 import gc
 import os
-import pickle
 import time
 import zmq
 import warnings
@@ -1609,6 +1608,7 @@ class MegatronPolicyWorker:
 
         with torch.profiler.record_function("zmq_send_pyobj"):
             if os.getenv("NRL_PICKLE", "False") == "True":
+                import pickle
                 serialized = pickle.dumps(serialized)
             self.zmq_socket.send_pyobj(serialized)
         # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
@@ -1618,7 +1618,7 @@ class MegatronPolicyWorker:
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/send_weights_ipc_handles")
-    def send_weights_ipc_handles(self) -> None:
+    def send_weights_ipc_handles(self, buffer_size: int) -> None:
         print(f"os.getenv('NRL_PROFILE'): {os.getenv('NRL_PROFILE')}", flush=True)
         if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
             profiler = torch.profiler.profile(
@@ -1637,20 +1637,8 @@ class MegatronPolicyWorker:
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
-        tensor_number_threshold = os.getenv(
-            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
-        )  # an arbitrary threshold
-        from nemo_rl.utils.nvml import get_free_memory_bytes
 
-        # Collect current available memory for refit
-        ## Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        ## Get device free memory using NVML
-        total_available_bytes = get_free_memory_bytes(device_idx)
-        ## default to 20% to get some more speedup than 10%, OOM if set to 30%
-        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
-        total_available_bytes *= float(memory_ratio)
-        total_available_bytes =  8839364608  # hardcoded for testing
+        total_available_bytes = buffer_size
         print(f"[MegatronPolicyWorker] Total available bytes: {total_available_bytes}", flush=True)
         
         hf_params_generator = self.megatron_bridge.export_hf_weights(
@@ -1751,6 +1739,20 @@ class MegatronPolicyWorker:
                 )
             )
         return param_info
+    
+    def get_available_buffer_size(self) -> int:
+        """Get the available buffer size."""
+        from nemo_rl.utils.nvml import get_free_memory_bytes
+
+        # Collect current available memory for refit
+        ## Get current device index from torch
+        device_idx = torch.cuda.current_device()
+        ## Get device free memory using NVML
+        total_available_bytes = get_free_memory_bytes(device_idx)
+        ## default to 20% to get some more speedup than 10%, OOM if set to 30%
+        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
+        total_available_bytes *= float(memory_ratio)
+        return total_available_bytes
 
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_weights_for_ipc")
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:

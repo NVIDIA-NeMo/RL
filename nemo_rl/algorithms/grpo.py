@@ -460,6 +460,10 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
+            if _refit_buffer_size_gb is not None:
+                buffer_size = _refit_buffer_size_gb * (1024**3)
+            else:
+                buffer_size = policy.get_available_buffer_size()
             # get model param keys, which is grouped by size
             # grouped_param_keys = policy.prepare_weights_for_ipc(
             #     _refit_buffer_size_gb=_refit_buffer_size_gb
@@ -477,7 +481,7 @@ def refit_policy_generation(
             #     )
             #     if not update_success:
             #         break
-            futures_train = policy.send_weights_ipc_handles()
+            futures_train = policy.send_weights_ipc_handles(buffer_size=buffer_size)
             futures_inference = policy_generation.update_weights_from_ipc_handles_zmq()
             # wait for all futures to complete
             ray.get(futures_train)

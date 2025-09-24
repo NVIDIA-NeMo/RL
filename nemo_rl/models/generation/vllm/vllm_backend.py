@@ -15,7 +15,6 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import os
-import pickle
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 import zmq
@@ -88,8 +87,82 @@ class VllmInternalWorkerExtension:
                 self.socket.send(b"")
                 break
             if os.getenv("NRL_PICKLE", "False") == "True":
+                import pickle
                 payload = pickle.loads(payload)
-            self.update_weights_from_local_ipc_handles(payload)
+            local_device_ipc_handles = payload
+            try:
+                is_tensor_packed = local_device_ipc_handles[0]
+                if is_tensor_packed:
+                    _, all_handles, list_keys = local_device_ipc_handles
+                else:
+                    _, name_and_handle_list = local_device_ipc_handles
+
+                device_id = self.device.index
+                weights = []
+
+                if is_tensor_packed:
+                    assert self.state_dict_info is not None, (
+                        "state_dict_info is not prepared. "
+                        "Please call prepare_refit_info when initializing the worker."
+                    )
+
+                    # Extract packed tensor from IPC handle
+                    dtype_to_packed_tensor = {}
+                    for dtype, tensor_handle in all_handles:
+                        func = rebuild_cuda_tensor
+                        args = tensor_handle[0]
+                        list_args = list(args)
+                        list_args[6] = device_id
+                        tensor = func(*list_args)
+                        dtype_to_packed_tensor[dtype] = tensor
+
+                    weights = []
+                    dtype_to_offset = defaultdict(lambda: 0)
+                    for key in list_keys:
+                        shape, dtype, size = self.state_dict_info[key]
+                        weights.append(
+                            (
+                                key,
+                                dtype_to_packed_tensor[dtype][
+                                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                                ].view(*shape),
+                            )
+                        )
+                        dtype_to_offset[dtype] += size
+
+                    expected_sizes = {
+                        dtype: tensor.numel()
+                        for dtype, tensor in dtype_to_packed_tensor.items()
+                    }
+                    assert dtype_to_offset == expected_sizes, (
+                        f"Packed tensor size mismatch: expected sizes from keys list {expected_sizes} != actual packed tensor sizes {dtype_to_offset}. "
+                        f"This indicates the keys list order doesn't match the order used when packing tensors."
+                    )
+                else:
+                    # Process each handle to get the tensor
+                    for name, handle in name_and_handle_list:
+                        func = rebuild_cuda_tensor
+                        args = handle[0]
+                        list_args = list(args)
+                        list_args[6] = device_id
+                        tensor = func(*list_args)
+                        weights.append((name, tensor))
+
+                # Load weights into the model
+                from nemo_rl.models.generation import fp8
+
+                if fp8.is_fp8_model(self.model_runner.vllm_config):
+                    # the fp8 load_weights additionally casts bf16 weights into fp8
+                    fp8.load_weights(weights, self.model_runner)
+                else:
+                    self.model_runner.model.load_weights(weights=weights)
+
+            except Exception as e:
+                print(
+                    f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
+                )
+                return False
+
             # torch.cuda.synchronize()
             self.socket.send(b"")
             # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
@@ -98,6 +171,7 @@ class VllmInternalWorkerExtension:
             print(f"profiler stop", flush=True)
             profiler.stop()
         self.count_of_function_calls += 1
+
         return True
 
     def report_device_id(self) -> str:

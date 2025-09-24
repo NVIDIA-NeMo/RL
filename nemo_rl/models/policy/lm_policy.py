@@ -627,12 +627,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         ray.get(futures)
 
     
-    def send_weights_ipc_handles(self) -> list[ray.ObjectRef]:
+    def send_weights_ipc_handles(self, buffer_size: int) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles."""
-        futures = self.worker_group.run_all_workers_single_data("send_weights_ipc_handles")
+        futures = self.worker_group.run_all_workers_single_data("send_weights_ipc_handles", buffer_size=buffer_size)
         return futures
     
     def update_weights_from_ipc_handles_zmq(self) -> list[ray.ObjectRef]:
         """Update the weights from IPC handles."""
         futures = self.worker_group.run_all_workers_single_data("update_weights_from_ipc_handles_zmq")
         return futures
+    
+    def get_available_buffer_size(self) -> int:
+        """Get the available buffer size."""
+        futures = self.worker_group.run_all_workers_single_data("get_available_buffer_size")
+        # Get the minimum available memory from all workers
+        total_available_bytes = min(ray.get(future) for future in futures)
+        return total_available_bytes
