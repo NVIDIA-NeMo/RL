@@ -449,7 +449,7 @@ def sft_train(
                             pad_block_size = master_config["policy"]["mdlm"]["pad_block_size"]
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
-                        block_pad_value_dict = None
+                        pad_block_value_dict = None
                         pad_block_size = 1
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
