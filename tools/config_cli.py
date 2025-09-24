@@ -28,7 +28,7 @@ Subcommands:
   - minimize-check: Same args as `minimize` but only checks if minimization
     would change the file; exits non-zero if changes are needed.
 
-Both commands support printing to stdout or in-place editing of the config file.
+The `expand` and `minimize` commands support printing to stdout or in-place editing of the config file.
 
 Example:
   # Expand a config with a root level "defaults" key to see the full config; print to stdout
