@@ -372,7 +372,7 @@ class NLLLoss(LossFunction):
                 loss = loss / num_unmasked_tokens.clamp(min=1)
         elif mdlm_loss:
             p_mask = data["p_mask"][:, 1:]
-            loss = -masked_mean(token_logprobs / p_mask, mask)
+            loss = -masked_mean(token_logprobs / p_mask, mask, normalization_factor=mask.sum())
         else:
             ## single scalar loss
             ## scale by the total number of tokens in the batch
