@@ -26,7 +26,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: dpo-llama3.1-8b-instruct-4n8g-fsdp2tp1-megatron
+    name: dpo-llama3.1-8b-instruct-4n8g-megatron-tp4.v2
 cluster:
   gpus_per_node: 8
   num_nodes: 4
