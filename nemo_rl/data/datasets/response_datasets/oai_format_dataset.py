@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import warnings
 from typing import Any, Callable, Union
 
 from datasets import load_dataset
@@ -94,11 +95,28 @@ class OpenAIFormatDataset:
             {"role": "assistant", "content": "The capital of France is Paris."}
         ]
     }
-    system_key and system_prompt are optional. If provided, it will be added to the
-    beginning of the dataset.
-    chat_key should be the key of the messages list. Multi-turn conversations are
-    supported.
-    The last message in the conversation must be from the assistant.
+
+    Args:
+        train_ds_path: Path to the training dataset JSON file
+        val_ds_path: Path to the validation dataset JSON file
+        chat_key: Key for the messages list in the dataset (default: "messages")
+        system_key: Optional key for system prompt in the dataset
+        system_prompt: Optional system prompt to add if not in the dataset
+        tool_key: Key for tools in the dataset (default: "tools")
+        use_preserving_dataset: If True, uses PreservingDataset to maintain
+            heterogeneous schemas (e.g., for tool calls with varying argument
+            structures). If False, uses standard HuggingFace dataset loading.
+            Default is False for backward compatibility.
+
+    Notes:
+        - system_key and system_prompt are optional. If provided, it will be added
+          to the beginning of the dataset.
+        - chat_key should be the key of the messages list. Multi-turn conversations
+          are supported.
+        - The last message in the conversation must be from the assistant.
+        - When use_preserving_dataset=True, the dataset preserves the exact structure
+          of each sample without None-filling for missing keys, which is useful for
+          heterogeneous tool argument schemas.
     """
 
     def __init__(
@@ -109,14 +127,15 @@ class OpenAIFormatDataset:
         system_key: str | None = None,
         system_prompt: str | None = None,
         tool_key: str | None = "tools",
+        use_preserving_dataset: bool = False,
     ):
         self.chat_key = chat_key
         self.system_key = system_key
         self.system_prompt = system_prompt
         self.tool_key = tool_key
 
-        try:
-            # Try the original approach first (faster and more standard)
+        if not use_preserving_dataset:
+            # Use the standard HuggingFace approach (faster and more standard)
             train_original_dataset = load_dataset("json", data_files=train_ds_path)[
                 "train"
             ]
@@ -129,16 +148,28 @@ class OpenAIFormatDataset:
                 f"Loaded dataset using standard approach (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
             )
 
-        except (TypeError, ValueError, Exception) as e:
-            # Fallback to custom loading for heterogeneous schemas
-            # When tool calls have varying argument structures across samples,
-            # HuggingFace's Dataset.from_list would add None values for missing keys.
-            # We use PreservingDataset to maintain exact structure.
+            # Warn if tools are present in the dataset
+            if self.tool_key and any(
+                self.tool_key in sample for sample in formatted_train_dataset
+            ):
+                warnings.warn(
+                    "Tools detected in dataset. Set use_preserving_dataset=True to preserve heterogeneous tool schemas. "
+                    "Current mode may add None values for missing tool arguments, making samples invalid.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        else:
+            # Use custom loading for heterogeneous schemas
+            # Issue: When tool calls have varying argument structures across samples,
+            # HuggingFace's Dataset.from_list enforces uniform schema by adding None
+            # values for missing keys. Example:
+            #   Sample 1: {"tools": [{"name": "search", "args": {"query": "x"}}]}
+            #   Sample 2: {"tools": [{"name": "calc", "args": {"expr": "y", "precision": 2}}]}
+            # Standard loading would add "precision: None" to Sample 1 and "query: None" to Sample 2.
+            # PreservingDataset maintains exact structure without None-filling.
             print(
-                f"Standard loading failed with {type(e).__name__}, using PreservingDataset..."
-            )
-            print(
-                "This preserves heterogeneous tool argument schemas without None-filling."
+                "Using PreservingDataset to preserve heterogeneous tool argument schemas without None-filling."
             )
 
             # Load JSON files directly
@@ -157,7 +188,7 @@ class OpenAIFormatDataset:
             formatted_val_dataset = PreservingDataset(formatted_val_data)
 
             print(
-                f"Loaded dataset (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
+                f"Loaded dataset using PreservingDataset (train: {len(formatted_train_dataset)}, val: {len(formatted_val_dataset)})"
             )
 
         self.formatted_ds = {

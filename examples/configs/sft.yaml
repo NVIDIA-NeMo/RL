@@ -164,6 +164,7 @@ data:
   # system_key: null                         # Key for system message (optional)
   # system_prompt: null                      # Default system prompt (optional)
   # tool_key: null                           # Key for tools in the data (optional, defaults to "tools" if not specified)
+  # use_preserving_dataset: false            # If true, uses PreservingDataset to preserve heterogeneous schemas (e.g., tool calls with varying argument structures)
 
 logger:
   log_dir: "logs"  # Base directory for all logs
