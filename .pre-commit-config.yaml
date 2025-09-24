@@ -47,14 +47,16 @@ repos:
         additional_dependencies: []
         minimum_pre_commit_version: "2.9.2"
 
-  # The rationale behind this pre-commit hook is that we want to ensure the config is minimized and matches
-  # what you want merge in early otherwise you risk running one experiment, but when you merge the config
-  # into upstream, you'll merge with the base config and that could be an experiment with different hyperparameters.
-  # Anecdotally, this has been an issue when a SFT recipe runs without a custom chat_template, but when it merges with
-  # the default one, it gets our recommended chat_template which is not what comes from the config.
+  # This pre-commit hook ensures that the config file is minimized and reflects exactly what you
+  # intend to merge. Without it, you might run experiments with one config, but when merging upstream,
+  # the config could silently fall back to the base defaults—resulting in different hyperparameters.
   #
-  # You can disable this pre-commit hook if you find this disruptive, but we will expect that the config
-  # is minimized before accepting the recipe upstream.
+  # For example, we’ve seen cases where an SFT recipe runs without a custom chat_template. When merged,
+  # it unexpectedly picks up the default recommended chat_template from upstream, which doesn’t match
+  # the original experiment setup.
+  #
+  # If this check is disruptive, you can disable the pre-commit hook locally. However, before a recipe
+  # is accepted upstream, we expect the config to be minimized.
   - repo: local
     hooks:
       - id: configs-minimize-check-llm
