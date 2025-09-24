@@ -180,8 +180,8 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
-        self.model_use_attention_interface = self.check_model_use_attention_interface(
-            model_name
+        self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
+            model_config
         )
 
         self._is_reward_model = (
@@ -470,13 +470,16 @@ class DTensorPolicyWorkerV2:
     def is_alive(self) -> bool:
         return True
 
-    def check_model_use_attention_interface(self, model_name: str) -> bool:
-        model_config = AutoConfig.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-        )
+    def check_model_allow_flash_attn_args(self, model_config) -> bool:
+        # Some models doesn't support flash_attn_kwargs
+        # Check nemotron nas.
+        if (
+            model_config.architectures[0] == "DeciLMForCausalLM"
+            and model_config.model_type == "nemotron-nas"
+        ):
+            return False
 
-        return getattr(model_config, "_attn_implementation", "eager") == "eager"
+        return True
 
     def reset_peak_memory_stats(self) -> None:
         torch.cuda.reset_peak_memory_stats()
@@ -698,7 +701,7 @@ class DTensorPolicyWorkerV2:
                                 del model_args["flash_attn_kwargs"]
 
                             if (
-                                not self.model_use_attention_interface
+                                not self.allow_flash_attn_args
                                 and "flash_attn_kwargs" in model_args
                             ):
                                 del model_args["flash_attn_kwargs"]
@@ -1015,7 +1018,7 @@ class DTensorPolicyWorkerV2:
                             del model_args["flash_attn_kwargs"]
 
                         if (
-                            not self.model_use_attention_interface
+                            not self.allow_flash_attn_args
                             and "flash_attn_kwargs" in model_args
                         ):
                             del model_args["flash_attn_kwargs"]
@@ -1181,7 +1184,7 @@ class DTensorPolicyWorkerV2:
                 )
         self.model.eval()
         print("Begin to batch datas")
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
