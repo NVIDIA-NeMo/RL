@@ -15,6 +15,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import os
+import pickle
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 import zmq
@@ -65,7 +66,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0924/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -86,6 +87,8 @@ class VllmInternalWorkerExtension:
                 # torch.cuda.synchronize()
                 self.socket.send(b"")
                 break
+            if os.getenv("NRL_PICKLE", "False") == "True":
+                payload = pickle.loads(payload)
             self.update_weights_from_local_ipc_handles(payload)
             # torch.cuda.synchronize()
             self.socket.send(b"")

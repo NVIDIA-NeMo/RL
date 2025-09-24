@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import os
+import pickle
 import time
 import zmq
 import warnings
@@ -1607,6 +1608,8 @@ class MegatronPolicyWorker:
             serialized = (False, all_handles)
 
         with torch.profiler.record_function("zmq_send_pyobj"):
+            if os.getenv("NRL_PICKLE", "False") == "True":
+                serialized = pickle.dumps(serialized)
             self.zmq_socket.send_pyobj(serialized)
         # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
         with torch.profiler.record_function("zmq_recv"):
@@ -1623,7 +1626,7 @@ class MegatronPolicyWorker:
                 record_shapes=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0924/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1647,6 +1650,7 @@ class MegatronPolicyWorker:
         ## default to 20% to get some more speedup than 10%, OOM if set to 30%
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
+        total_available_bytes =  8839364608  # hardcoded for testing
         print(f"[MegatronPolicyWorker] Total available bytes: {total_available_bytes}", flush=True)
         
         hf_params_generator = self.megatron_bridge.export_hf_weights(
@@ -1802,7 +1806,7 @@ class MegatronPolicyWorker:
 
         # Create IPC handles for each parameter
         tensor_number_threshold = os.getenv(
-            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "100000"
+            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
         )  # an arbitrary threshold
         if len(gathered_hf_params) >= int(tensor_number_threshold):
             pack_tensor_for_ipc = True

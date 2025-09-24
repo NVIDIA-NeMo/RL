@@ -80,7 +80,10 @@ def maybe_gpu_profile_step(policy: ProfilablePolicy, step: int):
 
 
 def wrap_with_nvtx_name(name: str):
-    """A decorator to wrap a function with an NVTX range with the given name."""
+    """A decorator to wrap a function with an NVTX range with the given name.
+    
+    Can be disabled by setting NRL_DISABLE_NVTX=1 environment variable.
+    """
 
     def decorator(func):
         def wrapper(*args, **kwargs):
