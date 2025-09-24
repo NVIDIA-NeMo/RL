@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Benchmark evaluation script using NeMo-Skills with LLaDA model via OpenAI API.
+Benchmark evaluation script using NeMo-Skills with diffusion language models via OpenAI API.
 
-This script evaluates a LLaDA model running on localhost:8000 (OpenAI-compatible API)
+This script evaluates LLaDA or Nemotron models running on localhost:8000 (OpenAI-compatible API)
 on various benchmarks using the NeMo-Skills evaluation framework.
+
+SUPPORTED MODELS:
+- LLaDA models with Fast-dLLM acceleration (generation algorithms: basic, prefix_cache, dual_cache)
+- Nemotron models with native diffusion generation (generation algorithm: nemotron)
 
 IMPORTANT: Parameter Mapping Notes:
 - tokens_to_generate → max_tokens (automatically mapped by NeMo-Skills)
 - top_k is forced to -1 for OpenAI API compatibility
-- LLaDA-specific parameters (steps, block_length, cfg_scale, remasking) are passed 
+- Model-specific parameters (steps, block_length, cfg_scale, remasking, threshold) are passed 
   via NeMo-Skills extra_body mechanism to the OpenAI API
-- Generation algorithm selection (generation_algorithm, threshold, factor) 
-  are passed via NeMo-Skills extra_body mechanism for optimized generation
+- Generation algorithm selection determines which model optimizations are used
 
 Usage:
-    # Default GSM8K evaluation
+    # Default GSM8K evaluation (LLaDA)
     python eval_llada.py
+    
+    # Evaluate with Nemotron model
+    python eval_llada.py --generation-algorithm nemotron --model nemotron-4b
     
     # Evaluate on a different benchmark
     python eval_llada.py --benchmark math:2
@@ -29,16 +35,20 @@ Usage:
     # Different server/model
     python eval_llada.py --server-address http://my-server:8080/v1 --model my-model
     
-    # Custom LLaDA settings
-    python eval_llada.py --steps 128 --cfg-scale 1.5 --remasking random
+    # LLaDA model with custom settings
+    python eval_llada.py --generation-algorithm dual_cache --steps 128 --cfg-scale 1.5 --remasking random
     
-    # Different generation algorithms
+    # LLaDA generation algorithms (Fast-dLLM acceleration)
     python eval_llada.py --generation-algorithm basic           # No caching
     python eval_llada.py --generation-algorithm prefix_cache    # Prefix caching
-    python eval_llada.py --generation-algorithm dual_cache      # Dual caching (default)
+    python eval_llada.py --generation-algorithm dual_cache      # Dual caching (default for LLaDA)
     
-    # Advanced Fast-dLLM settings
-    python eval_llada.py --generation-algorithm dual_cache --threshold 0.8 --factor 2.0
+    # Nemotron native generation
+    python eval_llada.py --generation-algorithm nemotron        # Native Nemotron generation
+    
+    # Advanced settings for specific models
+    python eval_llada.py --generation-algorithm dual_cache --threshold 0.8 --factor 2.0  # LLaDA Fast-dLLM
+    python eval_llada.py --generation-algorithm nemotron --steps 128 --threshold 0.9      # Nemotron native
 """
 
 import os
@@ -49,7 +59,7 @@ from nemo_skills.pipeline.cli import eval, wrap_arguments
 def create_parser():
     """Create argument parser for the evaluation script."""
     parser = argparse.ArgumentParser(
-        description="Evaluate models on various benchmarks using NeMo-Skills with OpenAI-compatible API",
+        description="Evaluate LLaDA/Nemotron diffusion models on various benchmarks using NeMo-Skills with OpenAI-compatible API",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -85,7 +95,7 @@ def create_parser():
     parser.add_argument(
         "--model",
         default="llada-8b-instruct", 
-        help="Model identifier"
+        help="Model identifier (e.g., llada-8b-instruct, nemotron-4b)"
     )
     
     # Inference settings
@@ -114,50 +124,50 @@ def create_parser():
         help="Maximum number of tokens to generate"
     )
     
-    # LLaDA-specific parameters
+    # Diffusion model parameters
     parser.add_argument(
         "--steps",
         type=int,
         default=256,
-        help="LLaDA diffusion steps (1-512, higher = better quality but slower)"
+        help="Diffusion steps (1-512, higher = better quality but slower) - used by both LLaDA and Nemotron"
     )
     parser.add_argument(
         "--block-length",
         type=int,
         default=8,
-        help="LLaDA block length for semi-autoregressive generation"
+        help="Block length for semi-autoregressive generation - used by both LLaDA and Nemotron"
     )
     parser.add_argument(
         "--cfg-scale",
         type=float,
         default=0.0,
-        help="LLaDA classifier-free guidance scale (0.0-3.0)"
+        help="Classifier-free guidance scale (0.0-3.0) - primarily used by LLaDA models"
     )
     parser.add_argument(
         "--remasking",
         default="low_confidence",
         choices=["low_confidence", "random"],
-        help="LLaDA remasking strategy"
+        help="Remasking strategy - primarily used by LLaDA models"
     )
     
     # Generation algorithm selection
     parser.add_argument(
         "--generation-algorithm",
         default="dual_cache",
-        choices=["basic", "prefix_cache", "dual_cache"],
-        help="Generation algorithm to use (basic=no cache, prefix_cache=prefix caching, dual_cache=dual caching)"
+        choices=["basic", "prefix_cache", "dual_cache", "nemotron"],
+        help="Generation algorithm: LLaDA (basic=no cache, prefix_cache=prefix caching, dual_cache=dual caching) or Nemotron (nemotron=native generation)"
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=None,
-        help="Confidence threshold for parallel decoding (e.g., 0.8)"
+        help="Confidence threshold - for LLaDA parallel decoding (e.g., 0.8) or Nemotron generation (e.g., 0.9)"
     )
     parser.add_argument(
         "--factor",
         type=float,
         default=None,
-        help="Factor for dynamic parallel decoding strategy (e.g., 2.0)"
+        help="Factor for LLaDA dynamic parallel decoding strategy (e.g., 2.0) - not used by Nemotron"
     )
     
     # Execution settings
@@ -176,11 +186,23 @@ def create_parser():
 
 
 def main():
-    """Run benchmark evaluation using LLaDA model with configurable settings."""
+    """Run benchmark evaluation using LLaDA or Nemotron models with configurable settings."""
     
     # Parse command line arguments
     parser = create_parser()
     args = parser.parse_args()
+    
+    # Adjust defaults for Nemotron models
+    if args.generation_algorithm == "nemotron":
+        # Suggest better defaults for Nemotron if user hasn't specified custom values
+        if args.model == "llada-8b-instruct":  # Default LLaDA model name
+            print("ℹ️  Note: Using Nemotron algorithm with default LLaDA model name.")
+            print("   Consider using: --model nemotron-4b or similar for clarity.")
+        
+        # Nemotron typically works well with these defaults
+        if not hasattr(args, '_threshold_set') and args.threshold is None:
+            print("ℹ️  Note: Nemotron models typically use threshold=0.9 for good results.")
+            print("   Add --threshold 0.9 to optimize Nemotron generation.")
     
     # Build configuration from parsed arguments
     config = {
@@ -221,7 +243,8 @@ def main():
     # Set default experiment name if not provided
     if config["expname"] is None:
         benchmark_name = args.benchmark.split(":")[0]  # Extract benchmark name (e.g., "gsm8k" from "gsm8k:4")
-        config["expname"] = f"llada-{benchmark_name}-eval"
+        model_type = "nemotron" if config["generation_algorithm"] == "nemotron" else "llada"
+        config["expname"] = f"{model_type}-{benchmark_name}-eval"
     
     # Override with environment variables if needed (for backward compatibility)
     config["output_dir"] = os.environ.get("EVAL_OUTPUT_DIR", config["output_dir"])
@@ -232,7 +255,8 @@ def main():
     
     print("=" * 60)
     benchmark_name = config["benchmarks"].split(":")[0].upper()
-    print(f"{benchmark_name} Evaluation with LLaDA Model")
+    model_type = "Nemotron" if config["generation_algorithm"] == "nemotron" else "LLaDA"
+    print(f"{benchmark_name} Evaluation with {model_type} Model")
     print("=" * 60)
     print(f"Server: {config['server_address']}")
     print(f"Model: {config['model']}")
@@ -241,13 +265,24 @@ def main():
     print(f"Experiment: {config['expname']}")
     print(f"Temperature: {config['temperature']} | Top-p: {config['top_p']} | Top-k: {config['top_k']} (will be set to -1)")
     print(f"Max tokens: {config['tokens_to_generate']}")
-    print(f"LLaDA Steps: {config['steps']} | Block length: {config['block_length']}")
-    print(f"CFG scale: {config['cfg_scale']} | Remasking: {config['remasking']}")
     print(f"Generation Algorithm: {config['generation_algorithm']}")
-    if config['threshold'] is not None:
-        print(f"Fast-dLLM Threshold: {config['threshold']}")
-    if config['factor'] is not None:
-        print(f"Fast-dLLM Factor: {config['factor']}")
+    
+    # Show model-specific parameters
+    if config["generation_algorithm"] == "nemotron":
+        print(f"Nemotron Steps: {config['steps']} | Block length: {config['block_length']}")
+        if config['threshold'] is not None:
+            print(f"Nemotron Threshold: {config['threshold']}")
+        print("CFG scale and remasking: Not used by Nemotron")
+        if config['factor'] is not None:
+            print("⚠️  Factor parameter not used by Nemotron (LLaDA-specific)")
+    else:
+        print(f"LLaDA Steps: {config['steps']} | Block length: {config['block_length']}")
+        print(f"CFG scale: {config['cfg_scale']} | Remasking: {config['remasking']}")
+        if config['threshold'] is not None:
+            print(f"Fast-dLLM Threshold: {config['threshold']}")
+        if config['factor'] is not None:
+            print(f"Fast-dLLM Factor: {config['factor']}")
+    
     if config["max_samples"]:
         print(f"Max samples: {config['max_samples']} (for testing)")
     print("=" * 60)
@@ -283,16 +318,28 @@ def main():
         if config['factor'] is not None:
             generation_args.append(f"++inference.extra_body.factor={config['factor']}")
         
-        print(f"\n🔧 LLaDA generation parameters (via extra_body):")
+        model_type_display = "Nemotron" if config['generation_algorithm'] == "nemotron" else "LLaDA"
+        print(f"\n🔧 {model_type_display} generation parameters (via extra_body):")
         print(f"  steps={config['steps']}")
         print(f"  block_length={config['block_length']}")
-        print(f"  cfg_scale={config['cfg_scale']}")
-        print(f"  remasking={config['remasking']}")
-        print(f"  generation_algorithm={config['generation_algorithm']}")
-        if config['threshold'] is not None:
-            print(f"  threshold={config['threshold']}")
-        if config['factor'] is not None:
-            print(f"  factor={config['factor']}")
+        
+        if config['generation_algorithm'] == "nemotron":
+            print(f"  generation_algorithm={config['generation_algorithm']} (Nemotron native)")
+            if config['threshold'] is not None:
+                print(f"  threshold={config['threshold']} (Nemotron generation threshold)")
+            if config['cfg_scale'] != 0.0 or config['remasking'] != "low_confidence":
+                print("  ⚠️  Note: cfg_scale and remasking are not used by Nemotron")
+            if config['factor'] is not None:
+                print("  ⚠️  Note: factor is not used by Nemotron (LLaDA-specific)")
+        else:
+            print(f"  cfg_scale={config['cfg_scale']}")
+            print(f"  remasking={config['remasking']}")
+            print(f"  generation_algorithm={config['generation_algorithm']} (LLaDA Fast-dLLM)")
+            if config['threshold'] is not None:
+                print(f"  threshold={config['threshold']} (Fast-dLLM parallel decoding)")
+            if config['factor'] is not None:
+                print(f"  factor={config['factor']} (Fast-dLLM dynamic decoding)")
+        
         print("   (Passed via NeMo-Skills extra_body to OpenAI API)")
         
         # Add max_samples if specified
@@ -343,11 +390,14 @@ def main():
     except Exception as e:
         print(f"\nError during evaluation: {e}")
         print("\nTroubleshooting tips:")
-        print("1. Make sure your LLaDA server is running on localhost:8000")
+        print("1. Make sure your diffusion model server (LLaDA/Nemotron) is running on localhost:8000")
         print("2. Test the server with: curl http://localhost:8000/v1/models")
         print("3. Check server logs for any errors")
         print("4. Verify the server is OpenAI-compatible")
-        print("5. For quick testing, use: python eval_llada.py --quick-test")
+        print("5. Verify generation algorithm matches your model type:")
+        print("   - LLaDA models: use --generation-algorithm dual_cache (or basic/prefix_cache)")
+        print("   - Nemotron models: use --generation-algorithm nemotron")
+        print("6. For quick testing, use: python eval_llada.py --quick-test")
         raise
 
 
