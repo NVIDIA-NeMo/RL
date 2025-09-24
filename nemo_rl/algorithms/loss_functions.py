@@ -22,6 +22,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _compute_distributed_entropy,
     from_parallel_logits_to_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -321,6 +322,39 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
+        # Compute actual entropy across all vocab: H(π) = -∑_v π(v) * log(π(v))
+        with torch.no_grad():
+            if vocab_parallel_group is not None:
+                next_token_logits_trimmed = next_token_logits[
+                    :, : data["input_ids"].shape[1] - 1, :
+                ]
+
+                # Compute entropy across all vocabulary shards using distributed computation
+                token_entropy = _compute_distributed_entropy(
+                    next_token_logits_trimmed,
+                    group=vocab_parallel_group,
+                )
+
+                # Apply masking and global reduction
+                seq_entropy = masked_mean(
+                    token_entropy,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                next_token_logits_wo_last = next_token_logits[:, :-1, :]
+                probs = torch.softmax(next_token_logits_wo_last, dim=-1)
+                eps = 1e-8
+                log_probs = torch.log(probs + eps)
+                token_entropy = -torch.sum(probs * log_probs, dim=-1)
+
+                # Apply masking and global reduction
+                seq_entropy = masked_mean(
+                    token_entropy,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+
         loss = actor_loss + kl
         with torch.no_grad():
             probs_ratio = masked_mean(
@@ -348,6 +382,7 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                "full_entropy": seq_entropy.item(),
             },
         )
 
