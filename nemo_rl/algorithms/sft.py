@@ -138,6 +138,7 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -152,6 +153,7 @@ def setup(
         shuffle=False,
         collate_fn=rl_collate_fn,
         drop_last=False,
+        num_workers=data_config["num_workers"],
     )
 
     # ==========================

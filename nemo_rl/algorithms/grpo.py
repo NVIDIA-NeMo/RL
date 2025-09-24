@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
@@ -40,6 +42,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -59,11 +62,20 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # ===============================================================================
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+class AsyncGRPOConfig(TypedDict):
+    enabled: bool
+    # Maximum trajectory age in training steps for samples drawn from the
+    # async replay buffer. Trajectories older than this are excluded during
+    # sampling; buffer sizing also scales with this value.
+    max_trajectory_age_steps: int
 
 
 class GRPOConfig(TypedDict):
@@ -79,6 +91,7 @@ class GRPOConfig(TypedDict):
     val_at_start: bool
     max_val_samples: int
     seed: int
+    async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
 
 
@@ -1121,4 +1134,640 @@ def validate(
     # Make sure to reset the timer after validation
     timer.reset()
 
+    # Explicit GPU memory cleanup after validation
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return val_metrics, timing_metrics
+
+
+def async_grpo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    grpo_save_state: GRPOSaveState,
+    master_config: MasterConfig,
+    max_trajectory_age_steps: int = 1,
+) -> None:
+    """Run asynchronous GRPO training with replay buffer.
+
+    Args:
+        policy: Training policy
+        policy_generation: Generation interface
+        dataloader: Training data loader
+        val_dataloader: Validation data loader
+        tokenizer: Tokenizer
+        loss_fn: Loss function
+        task_to_env: Training environments
+        val_task_to_env: Validation environments
+        logger: Logger
+        checkpointer: Checkpoint manager
+        grpo_save_state: Training state
+        master_config: Master configuration
+        max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+    """
+    # Ensure we are running with a compatible async generation backend
+    assert _should_use_async_rollouts(master_config), (
+        "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
+        "Set policy.generation.vllm_cfg.async_engine to true in your config."
+    )
+    assert master_config["loss_fn"]["use_importance_sampling_correction"] is True, (
+        "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
+    )
+    # Import async utilities only when needed
+    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+
+    timer = Timer()
+    NEED_REFIT = True
+
+    # Setup generation interface
+    if policy_generation is None:
+        policy_generation = policy
+        NEED_REFIT = False
+    POLICY_GENERATION_STALE = True
+    assert policy_generation is not None
+
+    # Training state
+    step = grpo_save_state["current_step"]
+    weight_version = step  # Tracks refitted weight versions
+    consumed_samples = grpo_save_state["consumed_samples"]
+    val_period = master_config["grpo"]["val_period"]
+    val_at_start = master_config["grpo"]["val_at_start"]
+    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+
+    assert not colocated_inference, (
+        "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
+    )
+
+    # Calculate minimum buffer size from training requirements
+    # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt
+    num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
+    samples_per_prompt_group = master_config["grpo"]["num_generations_per_prompt"]
+    train_gbs = master_config["policy"]["train_global_batch_size"]
+
+    # Ensure the buffer has at least one step worth of prompt-groups before training
+    min_trajectories_needed = num_prompts_per_step
+
+    print("📊 Buffer requirements calculation:")
+    print(f"   - num_prompts_per_step: {num_prompts_per_step}")
+    print(f"   - num_generations_per_prompt: {samples_per_prompt_group}")
+    print(f"   - samples_per_prompt_group: {samples_per_prompt_group}")
+    print(f"   - train_global_batch_size: {train_gbs}")
+    print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
+
+    _replay_py_exec = get_actor_python_env(
+        "nemo_rl.algorithms.async_utils.ReplayBuffer"
+    )
+    if _replay_py_exec.startswith("uv"):
+        # Lazily build a dedicated venv across all Ray nodes on-demand.
+        _replay_py_exec = create_local_venv_on_each_node(
+            _replay_py_exec,
+            "nemo_rl.algorithms.async_utils.ReplayBuffer",
+        )
+
+    _replay_runtime_env = {
+        "py_executable": _replay_py_exec,
+        "env_vars": {
+            **os.environ,
+            "VIRTUAL_ENV": _replay_py_exec,
+            "UV_PROJECT_ENVIRONMENT": _replay_py_exec,
+        },
+    }
+
+    # Calculate optimal buffer size based on generation limits to prevent length bias
+    # Each weight version generates exactly num_prompts_per_step trajectories
+    # With max_age_steps, we keep trajectories from multiple weight versions
+    num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
+    late_arrival_slack = 2
+    optimal_buffer_size = (
+        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    )
+
+    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+        max_size=optimal_buffer_size
+    )
+
+    _tc_py_exec = get_actor_python_env(
+        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
+    )
+    if _tc_py_exec.startswith("uv"):
+        _tc_py_exec = create_local_venv_on_each_node(
+            _tc_py_exec,
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+        )
+
+    _tc_runtime_env = {
+        "py_executable": _tc_py_exec,
+        "env_vars": {
+            **os.environ,
+            "VIRTUAL_ENV": _tc_py_exec,
+            "UV_PROJECT_ENVIRONMENT": _tc_py_exec,
+        },
+    }
+
+    # Initialize trajectory collector with synchronized collection
+    trajectory_collector = AsyncTrajectoryCollector.options(
+        runtime_env=_tc_runtime_env
+    ).remote(
+        policy_generation=policy_generation,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        master_config=master_config,
+        replay_buffer=replay_buffer,
+        start_step=step,
+    )
+
+    # Start trajectory collection in background
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
+
+    # Ensure collector knows initial weight version
+    trajectory_collector.set_weight_version.remote(weight_version)
+
+    print("📦 Started continuous background trajectory collection")
+
+    print(
+        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
+    )
+
+    print("⏳ Preparing policy generation for training...")
+    if NEED_REFIT and POLICY_GENERATION_STALE:
+        print("🔄 Refitting policy generation with actual model weights...")
+        try:
+            refit_policy_generation(policy, policy_generation, colocated_inference)
+            print("✅ Policy generation refit completed successfully")
+            POLICY_GENERATION_STALE = False
+        except Exception as e:
+            print(f"❌ Policy generation refit failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return
+    else:
+        print("🔄 Preparing policy generation for inference...")
+        try:
+            policy_generation.prepare_for_generation()
+            print("✅ Policy generation preparation completed successfully")
+        except Exception as e:
+            print(f"❌ Policy generation preparation failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return
+
+    print("✅ Policy generation setup complete, proceeding to validation...")
+
+    # Run validation at start if configured
+    if val_at_start and step == 0:
+        print("\n🔍 Running initial validation...")
+        # Pause trajectory collection during initial validation
+        trajectory_collector.pause.remote()
+
+        try:
+            val_metrics, validation_timings = validate(
+                policy_generation,
+                val_dataloader,
+                tokenizer,
+                val_task_to_env,
+                step=0,
+                master_config=master_config,
+            )
+            policy_generation.finish_generation()
+            logger.log_metrics(val_metrics, step, prefix="validation")
+            logger.log_metrics(validation_timings, step, prefix="timing/validation")
+            print("✅ Initial validation completed successfully")
+        except Exception as e:
+            print(f"❌ Initial validation failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            # Continue anyway since validation is optional
+        finally:
+            # Resume trajectory collection after initial validation
+            trajectory_collector.resume.remote()
+
+    print("✅ All setup complete, starting buffer wait...")
+
+    # Wait for initial buffer fill
+    print(
+        f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
+    )
+    wait_iterations = 0
+    while True:
+        buffer_size_current = ray.get(replay_buffer.size.remote())
+
+        print(
+            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+        )
+
+        if buffer_size_current >= min_trajectories_needed:
+            break
+
+        time.sleep(1.0)
+
+    print("✅ Buffer ready! Starting training loop...")
+
+    # Main training loop
+    try:
+        while step < master_config["grpo"]["max_num_steps"]:
+            print(
+                f"\n{'=' * 25} Step {step + 1}/{master_config['grpo']['max_num_steps']} {'=' * 25}"
+            )
+            maybe_gpu_profile_step(policy, step + 1)
+            if policy != policy_generation:
+                maybe_gpu_profile_step(policy_generation, step + 1)
+
+            with timer.time("total_step_time"):
+                # Sample trajectories from replay buffer
+                print("📦 Sampling from replay buffer...")
+                with timer.time("buffer_sampling"):
+                    buffer_size_current = ray.get(replay_buffer.size.remote())
+                    print(
+                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
+                    )
+
+                    # Sample the required number of per-prompt groups.
+                    num_prompt_groups_needed = master_config["grpo"][
+                        "num_prompts_per_step"
+                    ]
+                    sample_result = ray.get(
+                        replay_buffer.sample.remote(
+                            num_prompt_groups=num_prompt_groups_needed,
+                            current_weight_version=weight_version,
+                            max_age_steps=max_trajectory_age_steps,
+                        )
+                    )
+
+                    if (
+                        sample_result is None
+                        or len(sample_result["trajectories"])
+                        != num_prompt_groups_needed
+                    ):
+                        print(
+                            "⏳ Buffer empty or not enough groups to form a full step, waiting..."
+                        )
+
+                        # Get buffer debug info to help diagnose the issue
+                        buffer_debug = ray.get(replay_buffer.get_debug_info.remote())
+                        buffer_size = buffer_debug["total_trajectories"]
+
+                        if buffer_size > 0:
+                            print(
+                                f"🔍 Debug: Buffer has {buffer_size} trajectories but sampling requires exactly {num_prompt_groups_needed}."
+                            )
+                            print(f"   Current weight version: {weight_version}")
+                            print(f"   Max trajectory age: {max_trajectory_age_steps}")
+                            print(
+                                f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
+                            )
+
+                        time.sleep(0.5)
+                        continue
+
+                    # Extract trajectories and metadata from sample result
+                    trajectories = sample_result["trajectories"]
+                    avg_trajectory_age = sample_result["avg_trajectory_age"]
+
+                    print(
+                        f"✅ Sampled {len(trajectories)} trajectory groups from buffer (avg age: {avg_trajectory_age:.2f} steps)"
+                    )
+
+                    # Concatenate per-prompt groups into a single training batch
+                    per_prompt_batches = [t["batch"] for t in trajectories]
+                    repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+                    # Aggregate rollout metrics across groups (simple mean where applicable)
+                    rollout_metrics = {}
+                    for t in trajectories:
+                        for k, v in t["rollout_metrics"].items():
+                            rollout_metrics.setdefault(k, []).append(v)
+                    rollout_metrics = {
+                        k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
+                        for k, v in rollout_metrics.items()
+                    }
+
+                # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
+                expected_batch_size = (
+                    master_config["grpo"]["num_prompts_per_step"]
+                    * master_config["grpo"]["num_generations_per_prompt"]
+                )
+                if repeated_batch.size != expected_batch_size:
+                    print(
+                        f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
+                    )
+                    time.sleep(0.5)
+                    continue
+
+                # Optional sanity: ensure DP divisibility to avoid sharding issues
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                if expected_batch_size % dp_size != 0:
+                    raise AssertionError(
+                        f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
+                    )
+
+                print(f"Got trajectory batch (size: {repeated_batch.size})")
+
+                print("▶ Processing rewards...")
+                with timer.time("reward_calculation"):
+                    prompt_only_message_logs = []
+                    for message_log in repeated_batch["message_log"]:
+                        prompt_only_log = []
+                        for message in message_log:
+                            if message["role"] == "user" or message["role"] == "system":
+                                prompt_only_log.append(message)
+                        prompt_only_message_logs.append(prompt_only_log)
+
+                    prompt_batched_flat, prompt_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            prompt_only_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                    )
+                    prompt_only_ids = prompt_batched_flat["token_ids"]
+
+                    rewards = repeated_batch["total_reward"]
+
+                    print("▶ Computing advantages...")
+
+                    baseline, std = calculate_baseline_and_std_per_prompt(
+                        prompt_only_ids,
+                        rewards,
+                        torch.ones_like(rewards),
+                        leave_one_out_baseline=master_config["grpo"][
+                            "use_leave_one_out_baseline"
+                        ],
+                    )
+                    advantages = (rewards - baseline).unsqueeze(-1)
+
+                    print(
+                        f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
+                    )
+                    print(
+                        f"  📊 Baseline stats: min={baseline.min():.4f}, max={baseline.max():.4f}, mean={baseline.mean():.4f}"
+                    )
+                    print(
+                        f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
+
+                    if master_config["grpo"]["normalize_rewards"]:
+                        zero_std_mask = std > 0
+                        advantages[zero_std_mask] = (
+                            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                        )
+                        print(
+                            f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                        )
+
+                # Prepare training data (same as sync version)
+                with timer.time("data_processing"):
+                    # Add loss mask and advantages to each message
+                    for i, message_log in enumerate(repeated_batch["message_log"]):
+                        for j, message in enumerate(message_log):
+                            if message["role"] == "assistant":
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
+                            else:
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            if "generation_logprobs" not in message:
+                                message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
+                            message["advantages"] = advantages[i].expand(
+                                message["token_ids"].shape
+                            )
+
+                    # Convert to flat format for training
+                    flat_messages, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config["policy"][
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
+
+                    # Create training data
+                    train_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": flat_messages["token_ids"],
+                            "input_lengths": input_lengths,
+                            "advantages": flat_messages["advantages"],
+                            "generation_logprobs": flat_messages["generation_logprobs"],
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
+                        }
+                    )
+                    train_data.to("cpu")
+
+                # Training phase (same as sync version)
+                print("▶ Preparing for logprob inference...")
+                with timer.time("logprob_inference_prep"):
+                    policy.prepare_for_lp_inference()
+
+                print("▶ Computing logprobs...")
+                with timer.time("policy_and_reference_logprobs"):
+                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    reference_logprobs = policy.get_reference_policy_logprobs(
+                        train_data
+                    )["reference_logprobs"]
+                    train_data["prev_logprobs"] = fprop_logprobs
+                    train_data["reference_policy_logprobs"] = reference_logprobs
+
+                print("▶ Preparing for training...")
+                with timer.time("training_prep"):
+                    policy.prepare_for_training()
+                    POLICY_GENERATION_STALE = True
+
+                print("▶ Training policy...")
+                with timer.time("policy_training"):
+                    train_results = policy.train(train_data, loss_fn)
+
+                print("🔄 Synchronizing policy weights to trajectory collector…")
+                if NEED_REFIT:
+                    # Measure pending-generation wait as exposed_generation time
+                    print("🔄 Coordinating with trajectory collector before refit...")
+                    with timer.time("exposed_generation"):
+                        ray.get(trajectory_collector.prepare_for_refit.remote())
+
+                    # Only the actual refit/weight transfer should be counted as weight_sync
+                    print("🔄 Performing policy generation refit...")
+                    with timer.time("weight_sync"):
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference
+                        )
+                        POLICY_GENERATION_STALE = False
+
+                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                        weight_version += 1
+                        trajectory_collector.set_weight_version.remote(weight_version)
+                        trajectory_collector.resume_after_refit.remote()
+
+                # Validation
+                val_metrics, validation_timings = None, None
+                is_last_step = step + 1 == master_config["grpo"]["max_num_steps"]
+
+                if val_period > 0 and (step + 1) % val_period == 0:
+                    # Pause trajectory collection during validation to reduce memory pressure
+                    trajectory_collector.pause.remote()
+
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        policy_generation.prepare_for_generation()
+                    val_metrics, validation_timings = validate(
+                        policy_generation,
+                        val_dataloader,
+                        tokenizer,
+                        val_task_to_env,
+                        step=step + 1,
+                        master_config=master_config,
+                    )
+                    policy_generation.finish_generation()
+                    logger.log_metrics(
+                        validation_timings, step + 1, prefix="timing/validation"
+                    )
+                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+
+                    # Explicit GPU memory cleanup after validation in async mode
+                    import gc
+
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    # Resume trajectory collection after validation
+                    trajectory_collector.resume.remote()
+
+                # Checkpointing (same as sync version)
+                consumed_samples += master_config["grpo"]["num_prompts_per_step"]
+                if master_config["checkpointing"]["enabled"] and (
+                    is_last_step
+                    or (step + 1) % master_config["checkpointing"]["save_period"] == 0
+                ):
+                    policy.prepare_for_training()
+
+                    grpo_save_state["current_step"] = step + 1
+                    if val_metrics is not None:
+                        grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                    elif "val_reward" in grpo_save_state:
+                        del grpo_save_state["val_reward"]
+                    grpo_save_state["consumed_samples"] = consumed_samples
+
+                    if master_config["checkpointing"]["metric_name"] is not None:
+                        if (
+                            master_config["checkpointing"]["metric_name"]
+                            not in grpo_save_state
+                        ):
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                                "Saving most recent k checkpoints instead."
+                            )
+                            master_config["checkpointing"]["metric_name"] = None
+
+                    with timer.time("checkpointing"):
+                        print(f"Saving checkpoint for step {step + 1}...")
+                        checkpoint_path = checkpointer.init_tmp_checkpoint(
+                            step + 1, grpo_save_state, master_config
+                        )
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "policy", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                        )
+                        # Get dataloader state from trajectory collector
+                        actual_dataloader_state = ray.get(
+                            trajectory_collector.get_dataloader_state.remote()
+                        )
+                        torch.save(
+                            actual_dataloader_state,
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        checkpointer.finalize_checkpoint(checkpoint_path)
+                    policy.offload_after_refit()
+
+            log_data = {"content": flat_messages["content"]}
+            log_data["rewards"] = rewards.tolist()
+            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
+            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+
+            metrics = {
+                "loss": train_results["loss"].numpy(),
+                "reward": rewards.numpy(),
+                "grad_norm": train_results["grad_norm"].numpy(),
+            }
+            metrics.update(train_results["all_mb_metrics"])
+            for k, v in metrics.items():
+                if k in {
+                    "lr",
+                    "wd",
+                    "reward",
+                    "global_valid_seqs",
+                    "global_valid_toks",
+                }:
+                    metrics[k] = np.mean(v).item()
+                else:
+                    metrics[k] = np.sum(v).item()
+            metrics.update(rollout_metrics)
+
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                reduction_op="sum"
+            )
+
+            # Add buffer stats
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            metrics["buffer_size"] = buffer_size_current
+            metrics["avg_trajectory_age"] = avg_trajectory_age
+
+            print("\n📊 Training Results:")
+            print(f"  • Loss: {metrics['loss']:.4f}")
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(f"  • Buffer Size: {buffer_size_current}")
+            print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
+
+            print("\n⏱️  Timing:")
+            total_time = timing_metrics.get("total_step_time", 0)
+            print(f"  • Total step time: {total_time:.2f}s")
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k != "total_step_time":
+                    percent = (v / total_time * 100) if total_time > 0 else 0
+                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
+            logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+
+            timer.reset()
+            step += 1
+
+    finally:
+        # Clean up
+        print("🛑 Stopping trajectory collection...")
+        try:
+            ray.kill(trajectory_collector)
+        except Exception as e:
+            print(f"Error stopping trajectory collector: {e}")
+
+        try:
+            ray.kill(replay_buffer)
+        except Exception as e:
+            print(f"Error stopping replay buffer: {e}")
+
+        print("Async GRPO training complete!")
