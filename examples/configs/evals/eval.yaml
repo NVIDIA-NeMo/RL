@@ -21,7 +21,7 @@ generation:
     precision: "bfloat16"
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
-    enable_expert_parallel: false
+    expert_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: False
@@ -38,6 +38,7 @@ generation:
 tokenizer:
   name: ${generation.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   chat_template: "default"
+  chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
 
 data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation

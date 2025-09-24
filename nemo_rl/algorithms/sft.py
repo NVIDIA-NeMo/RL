@@ -26,7 +26,8 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
@@ -137,6 +138,7 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -151,6 +153,7 @@ def setup(
         shuffle=False,
         collate_fn=rl_collate_fn,
         drop_last=False,
+        num_workers=data_config["num_workers"],
     )
 
     # ==========================
@@ -523,6 +526,7 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             train_dataloader.state_dict(),
