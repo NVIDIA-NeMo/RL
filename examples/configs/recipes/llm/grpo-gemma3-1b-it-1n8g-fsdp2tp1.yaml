@@ -26,5 +26,4 @@ logger:
     project: nemo-rl
     name: grpo-gemma3-1b-it-1n8g-fsdp2tp1
 cluster:
-  num_nodes: 1
   gpus_per_node: 8
