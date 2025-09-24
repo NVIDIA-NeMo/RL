@@ -694,25 +694,61 @@ def grpo_train(
                 reference_logprobs, ref_inf_metrics = (
                     policy.get_reference_policy_logprobs(train_data)
                 )
-                policy_expert_idx = np.stack(inf_metrics.pop("expert_ids"))
-                ref_expert_idx = np.stack(ref_inf_metrics.pop("expert_ids"))
+
+                # Handle expert_ids for MoE models (only if they exist)
+                policy_expert_idx = None
+                ref_expert_idx = None
+                if "expert_ids" in inf_metrics:
+                    expert_ids_list = inf_metrics.pop("expert_ids")
+                    # Handle variable-shaped expert_ids arrays
+                    if expert_ids_list:
+                        # Convert all elements to numpy arrays if they aren't already
+                        expert_ids_arrays = [np.asarray(arr) for arr in expert_ids_list]
+
+                        # Check if all arrays have the same shape
+                        shapes = [arr.shape for arr in expert_ids_arrays]
+                        if len(set(shapes)) == 1:
+                            # All same shape, use stack
+                            policy_expert_idx = np.stack(expert_ids_arrays)
+                        else:
+                            # Variable shapes, keep as list
+                            policy_expert_idx = expert_ids_arrays
+
+                if "expert_ids" in ref_inf_metrics:
+                    ref_expert_ids_list = ref_inf_metrics.pop("expert_ids")
+                    # Handle variable-shaped expert_ids arrays
+                    if ref_expert_ids_list:
+                        # Convert all elements to numpy arrays if they aren't already
+                        ref_expert_ids_arrays = [
+                            np.asarray(arr) for arr in ref_expert_ids_list
+                        ]
+
+                        # Check if all arrays have the same shape
+                        shapes = [arr.shape for arr in ref_expert_ids_arrays]
+                        if len(set(shapes)) == 1:
+                            # All same shape, use stack
+                            ref_expert_idx = np.stack(ref_expert_ids_arrays)
+                        else:
+                            # Variable shapes, keep as list
+                            ref_expert_idx = ref_expert_ids_arrays
+
                 pattern = r"^(.+?)_(\d+)$"
 
                 accumulated_inf_metrics = defaultdict(list)
                 for k, v in inf_metrics.items():
                     match = re.match(pattern, k)
-                    name = match.group(1)
-                    layer_num = match.group(2)
-
-                    accumulated_inf_metrics[name].append(v)
+                    if match:
+                        name = match.group(1)
+                        layer_num = match.group(2)
+                        accumulated_inf_metrics[name].append(v)
 
                 accumulated_ref_inf_metrics = defaultdict(list)
                 for k, v in ref_inf_metrics.items():
                     match = re.match(pattern, k)
-                    name = match.group(1)
-                    layer_num = match.group(2)
-
-                    accumulated_ref_inf_metrics[name].append(v)
+                    if match:
+                        name = match.group(1)
+                        layer_num = match.group(2)
+                        accumulated_ref_inf_metrics[name].append(v)
 
                 inf_metrics = {
                     k: float(np.mean(v)) for k, v in accumulated_inf_metrics.items()
@@ -721,12 +757,48 @@ def grpo_train(
                     k: float(np.mean(v)) for k, v in accumulated_ref_inf_metrics.items()
                 }
 
-                inf_metrics["expert_id_diffs"] = (
-                    policy_expert_idx != ref_expert_idx
-                ).sum()
-                inf_metrics["percent_expert_id_diffs"] = (
-                    policy_expert_idx != ref_expert_idx
-                ).mean()
+                # Only compute expert ID differences if we have expert IDs (MoE models)
+                if policy_expert_idx is not None and ref_expert_idx is not None:
+                    # Handle both numpy arrays and lists
+                    if isinstance(policy_expert_idx, np.ndarray) and isinstance(
+                        ref_expert_idx, np.ndarray
+                    ):
+                        # Both are numpy arrays with same shape, can compare directly
+                        inf_metrics["expert_id_diffs"] = (
+                            policy_expert_idx != ref_expert_idx
+                        ).sum()
+                        inf_metrics["percent_expert_id_diffs"] = (
+                            policy_expert_idx != ref_expert_idx
+                        ).mean()
+                    elif isinstance(policy_expert_idx, list) and isinstance(
+                        ref_expert_idx, list
+                    ):
+                        # Both are lists (variable shapes), compare element-wise
+                        total_diffs = 0
+                        total_elements = 0
+                        for p_idx, r_idx in zip(policy_expert_idx, ref_expert_idx):
+                            # Convert to numpy arrays if needed
+                            p_arr = np.asarray(p_idx)
+                            r_arr = np.asarray(r_idx)
+                            # Only compare if shapes match, otherwise count all as different
+                            if p_arr.shape == r_arr.shape:
+                                diffs = (p_arr != r_arr).sum()
+                                total_diffs += diffs
+                                total_elements += p_arr.size
+                            else:
+                                # Different shapes, count all as different
+                                total_diffs += max(p_arr.size, r_arr.size)
+                                total_elements += max(p_arr.size, r_arr.size)
+
+                        inf_metrics["expert_id_diffs"] = total_diffs
+                        inf_metrics["percent_expert_id_diffs"] = (
+                            total_diffs / total_elements if total_elements > 0 else 0.0
+                        )
+                    else:
+                        # Mixed types or unexpected format, skip the comparison
+                        warnings.warn(
+                            "Expert IDs have unexpected format, skipping comparison"
+                        )
 
                 train_data["prev_logprobs"] = fprop_logprobs["logprobs"]
                 train_data["reference_policy_logprobs"] = reference_logprobs[
