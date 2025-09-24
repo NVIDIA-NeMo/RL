@@ -210,7 +210,6 @@ jobs:
 
           # Set outputs
           echo "needs_attention=$needs_attention" >> $GITHUB_OUTPUT
-          comment_body="This is a test comment"
           if [[ -n "$comment_body" ]]; then
             echo "comment_body<<EOF" >> $GITHUB_OUTPUT
             echo "$comment_body" >> $GITHUB_OUTPUT

@@ -63,7 +63,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "enable_expert_parallel": False,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -133,6 +133,7 @@ def get_basic_megatron_test_config(
     precision: str = "float32",
     activation_checkpointing: bool = False,
     sequence_parallel: bool = False,
+    empty_unused_memory_level: int = 0,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     # Use the exact same model as vLLM tests for perfect compatibility
@@ -158,7 +159,7 @@ def get_basic_megatron_test_config(
         },
         "megatron_cfg": {
             "enabled": True,
-            "empty_unused_memory_level": 0,
+            "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
             "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
@@ -1983,7 +1984,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     )
 
     # Megatron config with same model
-    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config = get_basic_megatron_test_config(
+        tp=1, pp=1, precision="float32", empty_unused_memory_level=1
+    )
     megatron_config["model_name"] = model_name
     megatron_config["tokenizer"]["name"] = model_name
 
