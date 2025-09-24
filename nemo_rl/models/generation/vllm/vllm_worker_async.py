@@ -181,18 +181,27 @@ def _replace_prefix_tokens(
     """
     if not model_prefix_token_ids:
         return template_token_ids
+
     eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None
+    assert eos_token_id is not None, "Your model must have an EOS token ID!"
+
     model_cut_end = len(model_prefix_token_ids)
     if model_prefix_token_ids:
+        # We are not always guaranteed that the model outputs an EOS token as the stop criteria of the previous model call e.g. when the model reaches max_tokens.
+        # And since chat templates will always add one for us, we just cut the model input to right before the EOS token ID (if applicable)
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
+
+    # We take everything starting with the EOS token ID.
     template_cut_start = -1
     for pos in reversed(range(len(template_prefix_token_ids))):
         if template_token_ids[pos] == eos_token_id:
             template_cut_start = pos
             break
-    assert template_cut_start >= 0
+
+    # This should never be the case, but 
+    assert template_cut_start >= 0, "No EOS token ID found in the chat-templated messages!"
+
     return model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
 
 
