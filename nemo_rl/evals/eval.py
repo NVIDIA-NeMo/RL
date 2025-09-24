@@ -191,13 +191,10 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
         return float(1.0 - torch.prod(1.0 - k / torch.arange(n - c + 1, n + 1)).item())
 
     # rewards is a 1d tensor of size (batch_size * num_tests_per_prompt)
-    print("rewards", rewards)
     group_rewards = rewards.split(num_tests_per_prompt)
     pass_k_score = 0.0
     for group_reward in group_rewards:
-        num_correct = group_reward.sum().item() 
-        print("num_correct", num_correct)
-        print("group_reward", group_reward)
+        num_correct = group_reward.sum().item()
         pass_k_score += eval_single_chunk(num_tests_per_prompt, num_correct, k)
 
     return pass_k_score
@@ -328,8 +325,6 @@ async def _run_env_eval_impl(
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
         if use_multiturn:
-            print('use_multiturn')
-            print("env", env)
             if tokenizer is None:
                 raise ValueError("tokenizer is required for multi-turn evaluation (bfcl_multiturn)")
             unique_task_names = set()
@@ -348,7 +343,6 @@ async def _run_env_eval_impl(
             
             # Get rollout parameters from config
             max_rollout_turns = master_config["env"]["bfcl_multiturn"].get("max_turns", 999999)
-            print('max_rollout_turns', max_rollout_turns)
             max_seq_len = None
             if "generation" in master_config and "vllm_cfg" in master_config["generation"]:
                 max_seq_len = master_config["generation"]["vllm_cfg"].get("max_model_len", 8192)
@@ -380,7 +374,6 @@ async def _run_env_eval_impl(
             
             # Get rewards from rollout result
             rewards = batch["total_reward"]
-            print("rollout_metrics", rollout_metrics)
             # For data collection, extract final prompts and outputs
             prompts = []
             outputs = []
@@ -393,12 +386,8 @@ async def _run_env_eval_impl(
                         initial_content.append(msg["content"])
                     elif msg["role"] == "assistant" and not final_response:
                         final_response = msg["content"]
-                    elif msg["role"] == "environment" and msg["content"] == "Environment: correct":
-                        print("correct")
                 prompts.append("\n".join(initial_content))
                 outputs.append(final_response)
-            print("rewards", rewards[0])
-            print("length of rewards", len(rewards))
         else:
             # Original single-turn evaluation logic
             # get input prompt from message_log
@@ -451,8 +440,8 @@ async def _run_env_eval_impl(
                 }
             )
 
-        accuracy = sum(rewards) / len(rewards)
-        print("accuracy", accuracy)
+        # accuracy = sum(rewards) / len(rewards)
+        # print("accuracy", accuracy)
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, k_value)

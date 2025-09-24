@@ -490,14 +490,20 @@ def run_multi_turn_rollout(
             if continuing_metadata[i] is not None:
                 current_batch["extra_env_info"][global_idx] = continuing_metadata[i]
     
+    #append next user question for BFCL environments (those with user_question_bank)
     for global_idx in continuing_indices_global.tolist():
-        _append_next_user_question(
-            current_batch,
-            global_idx,
-            tokenizer,
-            max_seq_len,
-            sample_token_counts,
-        )
+        print("global_idx", global_idx)
+        print("current batch", current_batch)
+        meta = current_batch["extra_env_info"][global_idx]
+        if isinstance(meta, dict) and "user_question_bank" in meta:
+            _append_next_user_question(
+                current_batch,
+                global_idx,
+                tokenizer,
+                max_seq_len,
+                sample_token_counts,
+            )
+        print("current batch after", current_batch)
     # Record samples that reached max turns
     sample_max_turns_reached[active_indices] = True
 
