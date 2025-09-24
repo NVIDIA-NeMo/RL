@@ -19,18 +19,18 @@ Both commands support printing to stdout or in-place editing of the config file.
 
 Example:
   # Expand a config with a root level "defaults" key to see the full config; print to stdout
-  uv run tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
 
   # Expand a config with a root level "defaults" key to see the full config; edit the config in place
-  uv run tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  tools/config_cli.py expand examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
 
   # Minimize a config and remove all keys that are present in the base config; print to stdout
-  # uv run tools/config_cli.py minimize <base_config> <config>
-  uv run tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
+  # tools/config_cli.py minimize <base_config> <config>
+  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml
 
   # Minimize a config and remove all keys that are present in the base config; edit the config in place
-  # uv run tools/config_cli.py minimize <base_config> <config>
-  uv run tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
+  # tools/config_cli.py minimize <base_config> <config>
+  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml --in-place
 
   # Minimize all llm the configs:
   for algo in grpo dpo sft; do
@@ -39,21 +39,21 @@ Example:
       base_config=examples/configs/grpo_math_1B.yaml
     fi
     for recipe in examples/configs/recipes/llm/${algo}-*.yaml; do
-      uv run tools/config_cli.py minimize $base_config $recipe --in-place
+      tools/config_cli.py minimize $base_config $recipe --in-place
     done
   done
 
   # Minimize vlm configs:
   for recipe in examples/configs/recipes/vlm/vlm_grpo-*.yaml; do
-    uv run tools/config_cli.py minimize examples/configs/vlm_grpo_3B.yaml $recipe --in-place
+    tools/config_cli.py minimize examples/configs/vlm_grpo_3B.yaml $recipe --in-place
   done
 
   # Compare two configs
-  uv run tools/config_cli.py compare examples/configs/grpo_math_1B.yaml examples/configs/grpo_math_8B.yaml
+  tools/config_cli.py compare examples/configs/grpo_math_1B.yaml examples/configs/grpo_math_8B.yaml
 
   # Minimize a config and compare it to not minimzing (should be the same)
-  uv run tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml >examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
-  uv run tools/config_cli.py compare \
+  tools/config_cli.py minimize examples/configs/dpo.yaml examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml >examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
+  tools/config_cli.py compare \
     examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml \
     examples/configs/recipes/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.yaml.minimized
 """
