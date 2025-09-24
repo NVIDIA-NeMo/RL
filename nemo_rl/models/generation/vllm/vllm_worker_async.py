@@ -164,6 +164,21 @@ def _replace_prefix_tokens(
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
 ) -> list[int]:
+    """This is a subroutine used inside the vLLM Chat Completion server.
+
+    This function is for fixing up the chat template-tokenized messages history
+    to match the model output tokenization up to the last assistant turn,
+    in order to preserve the monotonic tokens property for optimized multi-turn
+    training.
+
+    Previously, we were using _maybe_correct_merged_tokens (above), but there
+    are real cases where the model output string _does not match_ the chat
+    template tokenization of the parsed model output. A concrete example is
+    inconsistent whitespace tokens around tool call special tokens.
+
+    TODO(pjin): this is a replacement for _maybe_correct_merged_tokens (above),
+    and if breakage occurs, maybe temporarily revert to the old code.
+    """
     if not model_prefix_token_ids:
         return template_token_ids
     eos_token_id = tokenizer.eos_token_id
@@ -330,6 +345,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
+                # NB(pjin): below, using _replace_prefix_tokens instead of
+                # _maybe_correct_merged_tokens b/c the model output might be
+                # mismatched vs the chat template output (up to the final
+                # assistant turn in the messages history).
+                # TODO: if you see chat completions tokenization related
+                # breakage, revert this to _maybe_correct_merged_tokens!
                 final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
