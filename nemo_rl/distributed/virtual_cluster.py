@@ -55,7 +55,7 @@ class PY_EXECUTABLES:
     # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
     # but the submodules are not downloaded yet. This results in errors where it appears Megatron/Nemo
     # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
-    MCORE = "uv run --reinstall --extra mcore"
+    MCORE = "uv run --locked --extra mcore"
 
 
 @ray.remote  # pragma: no cover
