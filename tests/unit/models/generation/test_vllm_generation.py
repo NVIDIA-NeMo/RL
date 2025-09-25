@@ -34,6 +34,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _maybe_correct_merged_tokens,
+    _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -1224,24 +1225,27 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     # Test super simple example of correcting the merged tokens
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
+        model_prefix_token_ids=[26951, 3834],
         actual_token_ids=[94224],
+        actual_corresponding_token_ids=[94224],
     )
     expected_result = [26951, 3834]
     assert expected_result == actual_result
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[61830, 65],
+        model_prefix_token_ids=[61830, 65],
         actual_token_ids=[2435, 20828],
+        actual_corresponding_token_ids=[2435, 20828],
     )
     expected_result = [61830, 65]
     assert expected_result == actual_result
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[758, 12601],
+        model_prefix_token_ids=[758, 12601],
         actual_token_ids=[89038],
+        actual_corresponding_token_ids=[89038],
     )
     expected_result = [758, 12601]
     assert expected_result == actual_result
@@ -1249,8 +1253,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     # Test no-op
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
+        model_prefix_token_ids=[26951, 3834],
         actual_token_ids=[26951, 3834],
+        actual_corresponding_token_ids=[26951, 3834],
     )
     expected_result = [26951, 3834]
 
@@ -1260,8 +1265,9 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
     ):
         _maybe_correct_merged_tokens(
             tokenizer=tokenizer,
-            reference_token_ids=[26951, 26951, 26951, 26951],
+            model_prefix_token_ids=[26951, 26951, 26951, 26951],
             actual_token_ids=[26951, 26951, 3834, 3834, 3834],
+            actual_corresponding_token_ids=[26951, 26951, 3834, 3834, 3834],
         )
 
     test_data_fpath = Path(__file__).with_name(
@@ -1272,11 +1278,138 @@ def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
 
     actual_result = _maybe_correct_merged_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=test_data["seen_token_ids"],
+        model_prefix_token_ids=test_data["seen_token_ids"],
         actual_token_ids=test_data["output_prompt_token_ids"],
+        actual_corresponding_token_ids=test_data["output_prompt_token_ids"],
     )
     expected_result = test_data["expected_output"]
     assert expected_result == actual_result
+
+
+def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id == 151645
+
+    og_model_token_ids = [151644, 8948, 198, 2, 13852, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311, 7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32628, 2878, 366, 15918, 1472, 15918, 29, 11874, 9492, 510, 27, 15918, 397, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 88821, 497, 330, 4684, 788, 330, 47866, 264, 35972, 7493, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9413, 788, 5212, 4684, 788, 330, 32, 2697, 13027, 7493, 10465, 330, 2102, 788, 330, 16041, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9413, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 5955, 28534, 497, 330, 4684, 788, 330, 8890, 279, 10981, 4226, 323, 1779, 421, 432, 374, 4396, 13, 1096, 1917, 374, 15022, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9217, 788, 5212, 4684, 788, 330, 2008, 19586, 4226, 10465, 330, 2102, 788, 330, 16141, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9217, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 522, 15918, 1339, 2461, 1817, 729, 1618, 11, 470, 264, 2951, 1633, 448, 729, 829, 323, 5977, 2878, 220, 151657, 151658, 11874, 9492, 510, 151657, 198, 4913, 606, 788, 366, 1688, 11494, 8066, 330, 16370, 788, 366, 2116, 56080, 40432, 31296, 151658, 151645, 198, 151644, 872, 198, 38, 648, 2782, 23108, 458, 5461, 315, 220, 18, 16, 20, 8756, 369, 220, 18, 2849, 13, 73210, 23108, 264, 2790, 315, 220, 16, 11, 17, 20, 15, 8756, 916, 825, 2003, 13, 2585, 1657, 8756, 42626, 1521, 73210, 6541, 30, 151645, 198, 151644, 77091, 198, 5338, 11, 1077, 594, 1477, 700, 1246, 1657, 8756, 479, 648, 2782, 23108, 304, 2790, 916, 220, 18, 2849, 1447, 14085, 198, 59, 1318, 90, 7595, 8756, 16227, 553, 479, 648, 2782, 92, 284, 220, 18, 16, 20, 1124, 11, 1124, 1318, 90, 76, 3658, 44739, 92, 1124, 15136, 220, 18, 1124, 11, 1124, 1318, 90, 13778, 532, 14085, 271, 12209, 11, 582, 686, 9429, 419, 311, 279, 2790, 8756, 16227, 553, 73210, 11, 879, 23108, 220, 16, 11, 17, 20, 15, 8756, 304, 825, 2003, 382, 23949, 11, 582, 686, 11047, 1246, 1657, 8756, 42626, 73210, 23108, 553, 32256, 287, 479, 648, 2782, 594, 2790, 504, 73210, 594, 2790, 382, 10061, 752, 12564, 419, 3019, 553, 3019, 382, 151657, 198, 4913, 606, 788, 330, 88821, 497, 330, 16370, 788, 5212, 9413, 788, 330, 18, 16, 20, 353, 220, 18, 95642, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 24, 19, 20, 198, 151666, 151645, 198, 151644, 77091, 198]
+
+    model_token_ids = [151644, 8948, 198, 2, 13852, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311, 7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32628, 2878, 366, 15918, 1472, 15918, 29, 11874, 9492, 510, 27, 15918, 397, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 88821, 497, 330, 4684, 788, 330, 47866, 264, 35972, 7493, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9413, 788, 5212, 4684, 788, 330, 32, 2697, 13027, 7493, 10465, 330, 2102, 788, 330, 16041, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9413, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 5955, 28534, 497, 330, 4684, 788, 330, 8890, 279, 10981, 4226, 323, 1779, 421, 432, 374, 4396, 13, 1096, 1917, 374, 15022, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9217, 788, 5212, 4684, 788, 330, 2008, 19586, 4226, 10465, 330, 2102, 788, 330, 16141, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9217, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 522, 15918, 1339, 2461, 1817, 729, 1618, 11, 470, 264, 2951, 1633, 448, 729, 829, 323, 5977, 2878, 220, 151657, 151658, 11874, 9492, 510, 151657, 198, 4913, 606, 788, 366, 1688, 11494, 8066, 330, 16370, 788, 366, 2116, 56080, 40432, 31296, 151658, 151645, 198, 151644, 872, 198, 38, 648, 2782, 23108, 458, 5461, 315, 220, 18, 16, 20, 8756, 369, 220, 18, 2849, 13, 73210, 23108, 264, 2790, 315, 220, 16, 11, 17, 20, 15, 8756, 916, 825, 2003, 13, 2585, 1657, 8756, 42626, 1521, 73210, 6541, 30, 151645, 198, 151644, 77091, 198, 5338, 11, 1077, 594, 1477, 700, 1246, 1657, 8756, 479, 648, 2782, 23108, 304, 2790, 916, 220, 18, 2849, 1447, 14085, 198, 59, 1318, 90, 7595, 8756, 16227, 553, 479, 648, 2782, 92, 284, 220, 18, 16, 20, 1124, 11, 1124, 1318, 90, 76, 3658, 44739, 92, 1124, 15136, 220, 18, 1124, 11, 1124, 1318, 90, 13778, 532, 14085, 271, 12209, 11, 582, 686, 9429, 419, 311, 279, 2790, 8756, 16227, 553, 73210, 11, 879, 23108, 220, 16, 11, 17, 20, 15, 8756, 304, 825, 2003, 382, 23949, 11, 582, 686, 11047, 1246, 1657, 8756, 42626, 73210, 23108, 553, 32256, 287, 479, 648, 2782, 594, 2790, 504, 73210, 594, 2790, 382, 10061, 752, 12564, 419, 3019, 553, 3019, 624, 151657, 198, 4913, 606, 788, 330, 88821, 497, 330, 16370, 788, 5212, 9413, 788, 330, 18, 16, 20, 353, 220, 18, 95642, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 24, 19, 20, 198, 151666, 151645, 198, 151644, 77091, 198]
+
+    template_token_ids = [151644, 8948, 198, 2, 13852, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311, 7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32628, 2878, 366, 15918, 1472, 15918, 29, 11874, 9492, 510, 27, 15918, 397, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 88821, 497, 330, 4684, 788, 330, 47866, 264, 35972, 7493, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9413, 788, 5212, 4684, 788, 330, 32, 2697, 13027, 7493, 10465, 330, 2102, 788, 330, 16041, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9413, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 4913, 1313, 788, 330, 1688, 497, 330, 1688, 788, 5212, 606, 788, 330, 5955, 28534, 497, 330, 4684, 788, 330, 8890, 279, 10981, 4226, 323, 1779, 421, 432, 374, 4396, 13, 1096, 1917, 374, 15022, 10465, 330, 13786, 788, 5212, 1313, 788, 330, 1700, 497, 330, 13193, 788, 5212, 9217, 788, 5212, 4684, 788, 330, 2008, 19586, 4226, 10465, 330, 2102, 788, 330, 16141, 497, 330, 1313, 788, 330, 917, 9207, 2137, 330, 6279, 788, 4383, 9217, 7914, 330, 35499, 7903, 788, 895, 2137, 330, 6627, 788, 830, 11248, 522, 15918, 1339, 2461, 1817, 729, 1618, 11, 470, 264, 2951, 1633, 448, 729, 829, 323, 5977, 2878, 220, 151657, 151658, 11874, 9492, 510, 151657, 198, 4913, 606, 788, 366, 1688, 11494, 8066, 330, 16370, 788, 366, 2116, 56080, 40432, 31296, 151658, 151645, 198, 151644, 872, 198, 38, 648, 2782, 23108, 458, 5461, 315, 220, 18, 16, 20, 8756, 369, 220, 18, 2849, 13, 73210, 23108, 264, 2790, 315, 220, 16, 11, 17, 20, 15, 8756, 916, 825, 2003, 13, 2585, 1657, 8756, 42626, 1521, 73210, 6541, 30, 151645, 198, 151644, 77091, 198, 5338, 11, 1077, 594, 1477, 700, 1246, 1657, 8756, 479, 648, 2782, 23108, 304, 2790, 916, 220, 18, 2849, 1447, 14085, 198, 59, 1318, 90, 7595, 8756, 16227, 553, 479, 648, 2782, 92, 284, 220, 18, 16, 20, 1124, 11, 1124, 1318, 90, 76, 3658, 44739, 92, 1124, 15136, 220, 18, 1124, 11, 1124, 1318, 90, 13778, 532, 14085, 271, 12209, 11, 582, 686, 9429, 419, 311, 279, 2790, 8756, 16227, 553, 73210, 11, 879, 23108, 220, 16, 11, 17, 20, 15, 8756, 304, 825, 2003, 382, 23949, 11, 582, 686, 11047, 1246, 1657, 8756, 42626, 73210, 23108, 553, 32256, 287, 479, 648, 2782, 594, 2790, 504, 73210, 594, 2790, 382, 10061, 752, 12564, 419, 3019, 553, 3019, 382, 151657, 198, 4913, 606, 788, 330, 88821, 497, 330, 16370, 788, 5212, 9413, 788, 330, 18, 16, 20, 353, 220, 18, 95642, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 24, 19, 20, 198, 151666, 151645, 198, 151644, 77091, 198]
+
+    og_model_str = tokenizer.decode(og_model_token_ids)
+    model_str = tokenizer.decode(model_token_ids)
+    template_str = tokenizer.decode(template_token_ids)
+    assert og_model_str == template_str
+    assert model_str != template_str
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
 
 
 @pytest.mark.asyncio
@@ -1323,8 +1456,8 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     _wait_for_vllm_http_server_spinup(base_urls[0])
 
-    # Check that the re-tokenized ids are the same with the reference and different without the reference.
-    # WITHOUT reference token IDs
+    # Check that the re-tokenized ids are the same with the model and different without the model.
+    # WITHOUT model token IDs
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
     actual_result = response.json()
     expected_result = {
@@ -1345,7 +1478,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     }
     assert expected_result == actual_result
 
-    # WITH reference token IDs
+    # WITH model token IDs
     initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
     initial_tokenized_query_ids = [
         *initial_tokenized_query_ids_prefix,
@@ -1355,11 +1488,11 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         77091,
         198,
     ]
-    body_with_reference_token_ids = body | {
+    body_with_model_prefix_token_ids = body | {
         "required_prefix_token_ids": initial_tokenized_query_ids_prefix
     }
     response = requests.post(
-        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+        url=f"{base_urls[0]}/../tokenize", json=body_with_model_prefix_token_ids
     )
     actual_result = response.json()
     expected_result = {
@@ -1372,7 +1505,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     # Generate and check result
     response = requests.post(
-        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+        url=f"{base_urls[0]}/chat/completions", json=body_with_model_prefix_token_ids
     )
     vllm_http_server_result = response.json()
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][

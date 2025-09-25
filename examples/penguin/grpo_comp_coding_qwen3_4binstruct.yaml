@@ -1,0 +1,17 @@
+defaults: grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml
+
+grpo:
+  max_val_samples: 800  # Just take the first 50 examples from the train set times 16 for num_rollouts_per_prompt.
+
+data:
+  train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/comp_coding/train.jsonl
+  # Comp coding currently doesn't have a validation set as of Tue Sep 23, so we just use the first few examples of the train set instead.
+  validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/comp_coding/train.jsonl
+
+env:
+  penguin:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
+    - resources_servers/comp_coding/configs/comp_coding.yaml
+    profiling_enabled: true
+    profiling_results_dirpath: results/profiling/comp_coding

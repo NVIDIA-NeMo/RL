@@ -1045,6 +1045,7 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
+            additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             # We cascade penguin first since penguin also uses async rollouts.
@@ -1062,6 +1063,7 @@ def validate(
                 )
                 val_batch = penguin_rollout_result.final_batch
                 gen_metrics = penguin_rollout_result.rollout_metrics
+                additional_metrics_to_report = gen_metrics
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
@@ -1104,6 +1106,7 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            **additional_metrics_to_report,
         }
 
         # Print sample conversations only once at the end of validation
