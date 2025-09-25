@@ -181,6 +181,7 @@ def main(is_vlm: bool = False):
 
     # setup tokenizer (or processor)
     tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
+
     # setup data
     (
         dataset,
@@ -199,6 +200,7 @@ def main(is_vlm: bool = False):
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     sft_train(
         policy,
         train_dataloader,
