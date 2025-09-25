@@ -58,23 +58,27 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
     
-    if env_configs["bfcl_multiturn"]["enable"]:
+    bfcl_cfg = env_configs.get("bfcl_multiturn", {})
+    if bool(bfcl_cfg.get("enable", False)):
         env = MultiTurnToolEnvironment.options(
             runtime_env={
                 "py_executable": get_actor_python_env(
                     "nemo_rl.environments.multi_turn_tool_environment.MultiTurnToolEnvironment"
                 )
             }
-        ).remote(env_configs["bfcl_multiturn"])
+        ).remote(bfcl_cfg)
     else:
         # Default to MathEnvironment only if no other environment is enabled
+        math_cfg = env_configs.get("math")
+        if math_cfg is None:
+            raise KeyError("env.math config missing and bfcl_multiturn is disabled")
         env = MathEnvironment.options(
             runtime_env={
                 "py_executable": get_actor_python_env(
                     "nemo_rl.environments.math_environment.MathEnvironment"
                 )
             }
-        ).remote(env_configs["math"])
+        ).remote(math_cfg)
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
