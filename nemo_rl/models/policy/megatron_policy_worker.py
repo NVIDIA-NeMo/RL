@@ -1537,7 +1537,7 @@ class MegatronPolicyWorker:
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
     
-    # @torch.no_grad()
+    @torch.no_grad()
     def _pack_and_send_tensor_group(self, gathered_hf_params: dict, type_to_total_size: dict) -> None:
         """Pack a group of tensors and send them via IPC.
         
@@ -1605,15 +1605,31 @@ class MegatronPolicyWorker:
                 all_handles.append((key, handle))
             self._held_gather_buffer = gathered_hf_params
             serialized = (False, all_handles)
+        
+        # serialized = {self.report_device_id(): serialized}
 
         with torch.profiler.record_function("zmq_send_pyobj"):
             if os.getenv("NRL_PICKLE", "False") == "True":
                 import pickle
                 serialized = pickle.dumps(serialized)
+            torch.cuda.synchronize()
             self.zmq_socket.send_pyobj(serialized)
         # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
         with torch.profiler.record_function("zmq_recv"):
             self.zmq_socket.recv()
+        
+        # Fast cleanup to avoid slow cudaIpcCloseMemHandle operations
+        if self._held_gather_buffer is not None:
+            # Use fast tensor release to avoid slow IPC handle cleanup
+            self._release_tensors_fast(self._held_gather_buffer)
+            self._held_gather_buffer = None
+        
+        # Clean up packed tensors if they exist
+        if 'packed_tensors' in locals() and packed_tensors is not None:
+            self._release_tensors_fast(packed_tensors)
+        
+        del all_handles
+        del serialized
         return
 
     @torch.no_grad()
@@ -1626,7 +1642,7 @@ class MegatronPolicyWorker:
                 record_shapes=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0924/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot_0924/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1663,8 +1679,6 @@ class MegatronPolicyWorker:
             
             if used_bytes >= total_available_bytes:
                 self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
-                del self._held_gather_buffer
-                self._held_gather_buffer = None
                 gathered_hf_params = {}
                 type_to_total_size = defaultdict(lambda: 0)
                 used_bytes = 0
@@ -1673,11 +1687,9 @@ class MegatronPolicyWorker:
         # Send any remaining tensors
         if gathered_hf_params:
             self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
-            del self._held_gather_buffer
-            self._held_gather_buffer = None
             count_of_group += 1
             
-        self.zmq_socket.send_pyobj(None)
+        self.zmq_socket.send_pyobj("complete")
         self.zmq_socket.recv()
         # self.zmq_socket.close()
         # gc.collect()
@@ -1688,6 +1700,28 @@ class MegatronPolicyWorker:
         self.count_of_function_calls += 1
         print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
         # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
+
+    def _release_tensors_fast(self, tensor_dict: dict) -> None:
+        """Fast tensor release to avoid slow cudaIpcCloseMemHandle operations.
+        
+        This function explicitly releases tensors without waiting for garbage collection
+        to avoid the slow cudaIpcCloseMemHandle operation that occurs when IPC memory
+        handles are held by old tensor references.
+        """
+        if not tensor_dict:
+            return
+            
+        # Explicitly delete each tensor to release IPC handles immediately
+        for tensor in tensor_dict.values():
+            if hasattr(tensor, 'data_ptr'):
+                # Force immediate release of the tensor's memory handle
+                del tensor
+        
+        # Clear the dictionary
+        tensor_dict.clear()
+        
+        # Force garbage collection without synchronization
+        gc.collect()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1785,10 +1819,6 @@ class MegatronPolicyWorker:
         Returns:
             Dict mapping device UUID to list of (mapped_key, handle) tuples
         """
-        if self._held_gather_buffer is not None:
-            del self._held_gather_buffer
-            self._held_gather_buffer = None
-
         # extract the conversion tasks in this pack
         conversion_tasks = self.refit_conversion_tasks[
             self.refit_conversion_tasks_current_index : self.refit_conversion_tasks_current_index

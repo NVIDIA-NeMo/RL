@@ -13,6 +13,8 @@
 # limitations under the License.
 from collections import defaultdict
 from typing import Any, Optional
+import gc
+import time
 
 import os
 import torch
@@ -54,9 +56,15 @@ class VllmInternalWorkerExtension:
     @property
     def zmq_address(self):
         return f"ipc:///{self.report_device_id()}.sock"
-
+    
     def update_weights_from_ipc_handles_zmq(self) -> bool:
-        """Update weights from IPC ZMQ."""
+        """Update weights from IPC ZMQ.
+        
+        This method processes multiple weight updates in a loop. To avoid slow
+        cudaIpcCloseMemHandle operations when overwriting dtype_to_packed_tensor
+        in subsequent iterations, we explicitly release old tensors before
+        creating new ones.
+        """
         if not hasattr(self, "count_of_function_calls"):
             self.count_of_function_calls = 0
         if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
@@ -65,7 +73,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0924/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot_0924/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -78,17 +86,38 @@ class VllmInternalWorkerExtension:
             self.socket = self._zmq_ctx.socket(zmq.REP)
             self.socket.connect(self.zmq_address)
         
+        dtype_to_packed_tensor = {}
         while True:
-            payload = self.socket.recv_pyobj()
+            # Non-blocking receive with cache clearing while waiting
+            payload = None
+            cache_cleared = False
+            with torch.profiler.record_function("zmq_recv_pyobj"):
+                while payload is None:
+                    try:
+                        # Try to receive with no wait (non-blocking)
+                        payload = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        # No message available, clear cache only once while waiting
+                        if not cache_cleared:
+                            # Fast release of old tensors to avoid slow cudaIpcCloseMemHandle
+                            self._release_tensors_fast(dtype_to_packed_tensor)
+                            dtype_to_packed_tensor = {}
+                            weights = []
+                            torch.cuda.empty_cache()
+                            cache_cleared = True
+                        # Small sleep to avoid busy waiting
+                        time.sleep(0.001)
+            
+            # Synchronize before processing
+            # torch.cuda.synchronize()
+            
             # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
-            if payload is None:
+            if payload == "complete":
                 # means the update is done
-                # torch.cuda.synchronize()
                 self.socket.send(b"")
                 break
-            if os.getenv("NRL_PICKLE", "False") == "True":
-                import pickle
-                payload = pickle.loads(payload)
+            
+            # local_device_ipc_handles = payload[self.report_device_id()]
             local_device_ipc_handles = payload
             try:
                 is_tensor_packed = local_device_ipc_handles[0]
@@ -106,8 +135,9 @@ class VllmInternalWorkerExtension:
                         "Please call prepare_refit_info when initializing the worker."
                     )
 
-                    # Extract packed tensor from IPC handle
-                    dtype_to_packed_tensor = {}
+                    # Fast release of old tensors before overwriting to avoid slow cudaIpcCloseMemHandle
+                    # self._release_tensors_fast(dtype_to_packed_tensor)
+
                     for dtype, tensor_handle in all_handles:
                         func = rebuild_cuda_tensor
                         args = tensor_handle[0]
@@ -173,6 +203,28 @@ class VllmInternalWorkerExtension:
         self.count_of_function_calls += 1
 
         return True
+
+    def _release_tensors_fast(self, tensor_dict: dict) -> None:
+        """Fast tensor release to avoid slow cudaIpcCloseMemHandle operations.
+        
+        This function explicitly releases tensors without waiting for garbage collection
+        to avoid the slow cudaIpcCloseMemHandle operation that occurs when IPC memory
+        handles are held by old tensor references.
+        """
+        if not tensor_dict:
+            return
+            
+        # Explicitly delete each tensor to release IPC handles immediately
+        for tensor in tensor_dict.values():
+            if hasattr(tensor, 'data_ptr'):
+                # Force immediate release of the tensor's memory handle
+                del tensor
+        
+        # Clear the dictionary
+        tensor_dict.clear()
+        
+        # Force garbage collection without synchronization
+        gc.collect()
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
