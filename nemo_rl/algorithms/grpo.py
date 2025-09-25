@@ -557,6 +557,19 @@ def refit_policy_generation(
 # Training & Validation
 # ===============================================================================
 
+def scale_rewards(
+    repeated_batch: BatchedDataDict[DatumSpec], master_config: MasterConfig
+) -> BatchedDataDict[DatumSpec]:
+    """Scale the rewards according to the reward_scaling config."""
+    # For math environments, correct answers get a reward of 1.0 and incorrect answers get a reward of 0.0.
+    # We scale the rewards according to the reward_scaling config.
+    if master_config["grpo"]["reward_scaling"]["enabled"]:
+        rewards = repeated_batch["total_reward"]
+        rewards[rewards == 1.0] = master_config["grpo"]["reward_scaling"]["correct"]
+        rewards[rewards == 0.0] = master_config["grpo"]["reward_scaling"]["incorrect"]
+        repeated_batch["total_reward"] = rewards
+    return repeated_batch
+
 
 def grpo_train(
     policy: ColocatablePolicyInterface,
@@ -706,6 +719,8 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+
+                repeated_batch = scale_rewards(repeated_batch, master_config)
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
