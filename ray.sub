@@ -4,7 +4,6 @@
 #SBATCH --account=ACCOUNT
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
-#SBATCH --time=1:0:0
 #SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
@@ -126,6 +125,8 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node
 CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 
+TMP_DIR="/tmp/yifuw"
+
 num_retries=3
 
 # Track backgrounded srun client PIDs for head and workers
@@ -238,8 +239,8 @@ log-sync-sidecar() {
   mkdir -p $LOG_DIR/ray
   while true; do
     sleep $RAY_LOG_SYNC_FREQUENCY
-    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
-      for session_dir in /tmp/ray/session_[0-9]*/; do
+    if ls $TMP_DIR/tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in $TMP_DIR/tmp/ray/session_[0-9]*/; do
         if [[ -d "\$session_dir/logs" ]]; then
           session_name=\$(basename "\$session_dir")
           mkdir -p "$LOG_DIR/ray/\$session_name"
@@ -278,6 +279,7 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    --temp-dir=$TMP_DIR/tmp \
     \
     --block
 EOFINNER
@@ -340,8 +342,8 @@ log-sync-sidecar() {
   mkdir -p $LOG_DIR/ray/$node_i
   while true; do
     sleep $RAY_LOG_SYNC_FREQUENCY
-    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
-      for session_dir in /tmp/ray/session_[0-9]*/; do
+    if ls $TMP_DIR/tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in $TMP_DIR/tmp/ray/session_[0-9]*/; do
         if [[ -d "\$session_dir/logs" ]]; then
           session_name=\$(basename "\$session_dir")
           mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
@@ -377,6 +379,7 @@ ray start --address "$ip_head" \
           --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
           --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
+	  --temp-dir=$TMP_DIR/tmp \
           \
           --block
 EOFINNER
@@ -432,6 +435,8 @@ done
 
 echo "All workers connected!"
 
+MOUNTS_ARGS=" --container-mounts=$MOUNTS"
+
 # We can now launch a job on this cluster
 # We do so by launching a driver process on the physical node that the head node is on
 # This driver process is responsible for launching a job on the Ray cluster
@@ -446,7 +451,7 @@ else
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
   # and use nodes_array[1] through nodes_array[N-1]
@@ -455,7 +460,7 @@ else
     exit 1
   fi
   nodes_array=($nodes)
-  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh

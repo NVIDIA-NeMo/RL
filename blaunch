@@ -1,0 +1,36 @@
+#!/bin/bash
+
+JOB_NAME=${1:-grpo_ds_dapo_long}
+CMD=${2:-}
+NUM_ACTOR_NODES=${3:-1}  # Total nodes requested (head is colocated on ray-worker-0)
+PARTITION=${4:-main}  # Total nodes requested (head is colocated on ray-worker-0)
+REINFORCER_ROOT=${6:-/mnt/data/yifuw/code/RL}
+PORT=${7:-6379}
+
+NUM_GPUS_PER_NODE=8
+CONTAINER=/mnt/data/yifuw/images/nemo-rl:f17f331-34444450.squashfs
+
+# CHANGE THESE
+WANDB_API_KEY=""
+#NEMO_RL_CHECKPOINT_DIR=/lustre/fs1/portfolios/coreai/users/yifuw/nemo_rl_checkpoints
+NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+if [ -n "$CMD" ]; then
+    COMMAND="uv pip install -e .; NRL_VLLM_ASYNC_TIMEOUT_SECONDS=2400 NRL_FORCE_REBUILD_VENVS=true uv run ${REINFORCER_ROOT}/${CMD}"
+fi
+
+COMMAND="${COMMAND}" \
+NCCL_NVLS_ENABLE=0 \
+RAY_DEDUP_LOGS=0 \
+CONTAINER=${CONTAINER} \
+MOUNTS="/mnt/data/yifuw:/mnt/data/yifuw,/tmp:/tmp" \
+WANDB_API_KEY=${WANDB_API_KEY} \
+PORT=${PORT} \
+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR} \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --job-name=${JOB_NAME} \
+    --partition=${PARTITION} \
+    --gres=gpu:${NUM_GPUS_PER_NODE} \
+    --time=240:0:0 \
+    ray.sub
