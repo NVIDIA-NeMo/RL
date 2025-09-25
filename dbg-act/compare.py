@@ -5,6 +5,7 @@ from functools import lru_cache
 from functools import partial
 param_groups = defaultdict(list)
 files = [x for x in os.listdir(".") if x.endswith(".pt")]
+files = sorted(files, key=lambda x: os.path.getmtime(x))
 
 for f in files:
     param_name = f.split("%")[0]
@@ -120,7 +121,7 @@ for param_name, files in param_groups.items():
                     print("ALL GOOD")
                 except AssertionError as e:
                     if 'o_proj' in param_name:
-                        breakpoint()
+                        #breakpoint()
                         import matplotlib.pyplot as plt
                         import numpy as np
                         from matplotlib.colors import SymLogNorm
