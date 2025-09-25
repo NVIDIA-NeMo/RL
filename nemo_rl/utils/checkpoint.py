@@ -20,6 +20,7 @@ own checkpoint saving function (called by the algorithm loop).
 import glob
 import json
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -263,7 +264,11 @@ class CheckpointManager:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
-        step_dirs = glob.glob(str(self.checkpoint_dir / "step_*"))
+        step_dirs = [
+            x
+            for x in glob.glob(str(self.checkpoint_dir / "step_*"))
+            if re.fullmatch(r"step_\d+", Path(x).name)
+        ]
         step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
         if len(step_dirs) == 0:
             return None
@@ -303,7 +308,11 @@ def _load_checkpoint_history(
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
 
     # Find all step directories
-    step_dirs = glob.glob(str(checkpoint_dir / "step_*"))
+    step_dirs = [
+        x
+        for x in glob.glob(str(checkpoint_dir / "step_*"))
+        if re.fullmatch(r"step_\d+", Path(x).name)
+    ]
 
     for step_dir in step_dirs:
         info_file = Path(step_dir) / "training_info.json"
