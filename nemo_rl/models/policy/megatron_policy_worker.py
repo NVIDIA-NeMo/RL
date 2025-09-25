@@ -1222,7 +1222,8 @@ class MegatronPolicyWorker:
         model_metrics = get_and_clear_hacky_global_metrics()
         for k, v in model_metrics.items():
             if "expert_ids" in k:
-                metrics[k] = v
+                # Skip expert_ids collection to improve performance
+                continue
             else:
                 num_layers = len(v) // len(list_of_logprobs)
                 outputs = (
