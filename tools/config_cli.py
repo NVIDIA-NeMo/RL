@@ -79,7 +79,7 @@ from pathlib import Path
 # VENDORED SECTION: Minimal self-contained config loader (no nemo_rl dependency)
 #
 # Original source: `nemo_rl/utils/config.py`
-#   - Functions adapted: `_resolve_path`, `load_config_with_inheritance`, `load_config`
+#   - Functions adapted: `resolve_path`, `load_config_with_inheritance`, `load_config`
 #   - Purpose: avoid importing from nemo_rl so this script is standalone
 #   - If upstream changes, consider updating this vendored block accordingly
 # ============================================================================
@@ -88,58 +88,120 @@ from typing import Any, Iterable, Optional, Union, cast
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 
-def _resolve_path(base_path: Path, path: str) -> Path:
+def resolve_path(base_path: Path, path: str) -> Path:
+    """Resolve a path relative to the base path."""
     if path.startswith("/"):
         return Path(path)
-    return (base_path / path).resolve()
+    return base_path / path
 
 
 def load_config_with_inheritance(
-    config_path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None
+    config_path: Union[str, Path],
+    base_dir: Optional[Union[str, Path]] = None,
 ) -> DictConfig:
-    """Load a YAML config and resolve simple inheritance via a top-level `defaults` key.
+    """Load a config file with inheritance support.
 
-    Supports:
-    - `defaults: parent.yaml` (string)
-    - `defaults: [parent1.yaml, parent2.yaml]` (list)
-    - Nested inheritance via parent files with their own `defaults`.
+    Args:
+        config_path: Path to the config file
+        base_dir: Base directory for resolving relative paths. If None, uses config_path's directory
+
+    Returns:
+        Merged config dictionary
     """
-    config_path = Path(config_path).resolve()
+    config_path = Path(config_path)
     if base_dir is None:
         base_dir = config_path.parent
     base_dir = Path(base_dir)
 
-    cfg = OmegaConf.load(config_path)
-    if not isinstance(cfg, DictConfig):
-        raise TypeError(
-            f"Config at {config_path} must be a mapping (DictConfig), got {type(cfg)}"
-        )
+    config = OmegaConf.load(config_path)
+    assert isinstance(config, DictConfig), (
+        "Config must be a Dictionary Config (List Config not supported)"
+    )
 
-    if "defaults" in cfg:
-        defaults = cfg.pop("defaults")
+    # Handle inheritance
+    if "defaults" in config:
+        defaults = config.pop("defaults")
         if isinstance(defaults, (str, Path)):
-            defaults_list = [str(defaults)]
+            defaults = [defaults]
         elif isinstance(defaults, ListConfig):
-            defaults_list = [str(d) for d in defaults]
-        elif isinstance(defaults, list):
-            defaults_list = [str(d) for d in defaults]
-        else:
-            raise TypeError(
-                f"Unsupported type for defaults: {type(defaults)} in {config_path}"
-            )
+            defaults = [str(d) for d in defaults]
 
-        merged: DictConfig = OmegaConf.create({})  # type: ignore[assignment]
-        for default_entry in defaults_list:
-            parent_path = _resolve_path(base_dir, str(default_entry))
-            parent_cfg = load_config_with_inheritance(parent_path, base_dir)
-            merged = cast(DictConfig, OmegaConf.merge(merged, parent_cfg))
+        # Load and merge all parent configs
+        base_config = OmegaConf.create({})
+        for default in defaults:
+            parent_path = resolve_path(base_dir, str(default))
+            parent_config = load_config_with_inheritance(parent_path, base_dir)
+            base_config = cast(DictConfig, OmegaConf.merge(base_config, parent_config))
 
-        cfg = cast(DictConfig, OmegaConf.merge(merged, cfg))
+        # Merge with current config
+        config = cast(DictConfig, OmegaConf.merge(base_config, config))
 
-    return cfg
+    return config
 
 
 def load_config(config_path: Union[str, Path]) -> DictConfig:
+    """Load a config file with inheritance support and convert it to an OmegaConf object.
+
+    The config inheritance system supports:
+
+    1. Single inheritance:
+        ```yaml
+        # child.yaml
+        defaults: parent.yaml
+        common:
+          value: 43
+        ```
+
+    2. Multiple inheritance:
+        ```yaml
+        # child.yaml
+        defaults:
+          - parent1.yaml
+          - parent2.yaml
+        common:
+          value: 44
+        ```
+
+    3. Nested inheritance:
+        ```yaml
+        # parent.yaml
+        defaults: grandparent.yaml
+        common:
+          value: 43
+
+        # child.yaml
+        defaults: parent.yaml
+        common:
+          value: 44
+        ```
+
+    4. Variable interpolation:
+        ```yaml
+        # parent.yaml
+        base_value: 42
+        derived:
+          value: ${base_value}
+
+        # child.yaml
+        defaults: parent.yaml
+        base_value: 43  # This will update both base_value and derived.value
+        ```
+
+    The system handles:
+    - Relative and absolute paths
+    - Multiple inheritance
+    - Nested inheritance
+    - Variable interpolation
+
+    The inheritance is resolved depth-first, with later configs overriding earlier ones.
+    This means in multiple inheritance, the last config in the list takes precedence.
+
+    Args:
+        config_path: Path to the config file
+
+    Returns:
+        Merged config dictionary
+    """
     return load_config_with_inheritance(config_path)
 
 
