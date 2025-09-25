@@ -710,7 +710,7 @@ class DTensorPolicyWorkerV2:
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
-                                use_cache=False,
+                                # use_cache=False,
                                 flash_attn_kwargs=flash_attn_kwargs,
                                 **vlm_kwargs,
                             )
