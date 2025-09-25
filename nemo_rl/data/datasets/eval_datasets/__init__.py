@@ -83,9 +83,7 @@ def load_eval_dataset(data_config):
             system_prompt_file=data_config["system_prompt_file"],
         )
     elif dataset_name == "bfcl_multiturn":
-        base_dataset = BFCLDataset(
-            data_path=data_config["dataset_path"],
-        )
+        base_dataset = BFCLDataset()
     # fall back to local dataset
     else:
         print(f"Loading dataset from {dataset_name}...")

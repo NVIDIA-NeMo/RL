@@ -15,24 +15,41 @@
 import argparse
 import os
 import pprint
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any, Optional
 import logging
 import jsonlines
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
+from nemo_rl.data.interfaces import (
+    TaskDataProcessFnCallable,
+    TaskDataSpec,
+    DatumSpec,
+)
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    get_actor_python_env,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.data.processors import bfcl_multiturn_hf_data_processor
 from nemo_rl.environments.multi_turn_tool_environment import MultiTurnToolEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+
+# ===============================================================================
+#                            BFCL Data Processing
+# ===============================================================================
+TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args():
@@ -48,114 +65,81 @@ def parse_args():
     return args, overrides
 
 
-@dataclass
-class JsonlinesDataset:
-    jsonl_path: str
-    seed: int
-    tokenizer: AutoTokenizer
-    max_seq_length: int
-    filter_long_samples: bool = False
-
-    def __post_init__(self):
-        self.data = self._load_data()
-
-        idx_to_ignore = set()
-        if self.filter_long_samples:
-            for i, item in enumerate(self):
-                if item["length"] > self.max_seq_length:
-                    idx_to_ignore.add(i)
-            print(f"found {len(idx_to_ignore)} long samples to ignore on dataset init")
-
-        self.data = [item for i, item in enumerate(self.data) if i not in idx_to_ignore]
-    
-
-    def _load_data(self):
-        with jsonlines.open(self.jsonl_path, "r") as reader:
-            data = [line for line in reader]
-        return data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> DatumSpec:
-        data = self.data[idx]
-        # support single turn for now
-        assert len(data["messages"]) == 1
-
-        single_message = data["messages"][0]
-
-        message_log = []
-
-        # this will also contain system prompt
-        user_message = {"role": "user"}
-
-        for m in single_message:
-            if m["role"] == "user":
-                # need to be deepcopy to avoid overwriting the original metadata
-                extra_env_info = deepcopy(m["metadata"])
-
-        message = self.tokenizer.apply_chat_template(
-            single_message,
-            tokenize=False,
-            add_generation_prompt=True,
-            add_special_tokens=False,
-        )
-        user_message["token_ids"] = self.tokenizer.apply_chat_template(
-            single_message,
-            tokenize=True,
-            add_generation_prompt=True,
-            add_special_tokens=False,
-            return_tensors="pt",
-        )[0]
-        user_message["content"] = message
-        message_log.append(user_message)
-
-        length = sum(len(m["token_ids"]) for m in message_log)
-  
-        #print("message log ", message_log)
-        output = {
-            "message_log": message_log,
-            "length": length,
-            "extra_env_info": extra_env_info,
-            "loss_multiplier": 1.0,
-            "idx": idx,
-            "task_name": data["task_name"],
-            "dataset": data["dataset"],
-            # "system_prompt": system_prompt,
-            # "user_prompt": user_prompt,
-        }
-
-        return output
-
-
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, env_configs):
+def setup_data(
+    tokenizer: TokenizerType,
+    data_config: DataConfig,
+    env_configs: dict[str, Any],
+    seed: int,
+) -> tuple[
+    AllTaskProcessedDataset,
+    Optional[AllTaskProcessedDataset],
+    dict[str, EnvironmentInterface],
+    dict[str, EnvironmentInterface],
+]:
     print("\n▶ Setting up data...")
-
-    train_ds = JsonlinesDataset(
-        data_config["train"]["jsonl_path"],
-        data_config["train"]["seed"],
-        tokenizer,
-        max_seq_length=data_config["max_input_seq_length"],
-        filter_long_samples=data_config["train"]["filter_long_samples"]
-    )
-    val_ds = JsonlinesDataset(
-        data_config["val"]["jsonl_path"],
-        data_config["val"]["seed"],
-        tokenizer,
-        max_seq_length=data_config["max_input_seq_length"],
-        filter_long_samples=data_config["val"]["filter_long_samples"]
+    
+    # Define task specification for your HuggingFace dataset
+    task_spec = TaskDataSpec(
+        task_name="bfcl_multiturn",
+        prompt_file=data_config["prompt_file"],
+        system_prompt_file=data_config["system_prompt_file"],
     )
 
-    task_to_env = {}
-    if 'bfcl_multiturn' in env_configs and env_configs['bfcl_multiturn']['enable']:
+    # Load dataset from HuggingFace
+    data: Any = load_response_dataset(data_config, seed)
+
+    # Set up data processors 
+    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
+        defaultdict(lambda: (task_spec, bfcl_multiturn_hf_data_processor))
+    )
+    task_name = 'bfcl_multiturn'
+    task_data_processors[task_name] = (task_spec, bfcl_multiturn_hf_data_processor)
+
+    # Create training dataset
+    dataset = AllTaskProcessedDataset(
+        data.formatted_ds["train"],
+        tokenizer,
+        task_spec,
+        task_data_processors,
+        max_seq_length=data_config["max_input_seq_length"],
+    )
+
+    # Create validation dataset if available
+    val_dataset: Optional[AllTaskProcessedDataset] = None
+    if data.formatted_ds.get("validation"):
+        val_dataset = AllTaskProcessedDataset(
+            data.formatted_ds["validation"],
+            tokenizer,
+            task_spec,
+            task_data_processors,
+            max_seq_length=data_config["max_input_seq_length"],
+        )
+    else:
+        val_dataset = None
+
+    # Set up environment - customize based on your needs
+    task_to_env: dict[str, EnvironmentInterface] = {}
+    
+    # If you have specific environment configs, you can add them here
+    if 'bfcl_multiturn' in env_configs and env_configs['bfcl_multiturn'].get('enable', False):
         multi_turn_tool_env = MultiTurnToolEnvironment.options(
             runtime_env={
-                "py_executable": MultiTurnToolEnvironment.DEFAULT_PY_EXECUTABLE,
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.multi_turn_tool_environment.MultiTurnToolEnvironment"
+                ),
                 "env_vars": dict(os.environ),
             },
         ).remote(env_configs['bfcl_multiturn'])
+        task_to_env[task_name] = multi_turn_tool_env
         task_to_env['bfcl_multiturn'] = multi_turn_tool_env
-    return train_ds, val_ds, task_to_env, task_to_env
+    
+    # Create a default environment mapping
+    if not task_to_env:
+        # You can set up a default environment here if needed
+        task_to_env = defaultdict(lambda: None)
+        task_to_env[task_name] = None
+
+    return dataset, val_dataset, task_to_env, task_to_env
 
 
 def main():
@@ -202,7 +186,7 @@ def main():
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
 
     (
         policy,

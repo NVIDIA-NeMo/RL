@@ -2,14 +2,13 @@
 defaults: "eval.yaml"
 
 generation:
-  model_name: "./results/grpo/hf"
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
   vllm_cfg:
     max_model_len: 8192    
     tensor_parallel_size: 1
 
 data:
   dataset_name: "bfcl_multiturn"
-  dataset_path: "/path/to/dataset/BFCL_v3_multi_turn_val_final.jsonl"
 
 env:
   bfcl_multiturn:

@@ -462,9 +462,6 @@ class MultiTurnToolEnvironment(EnvironmentInterface):
             observation = self._get_next_observation(tool_results, sample_metadata)
             
             is_final_turn = not should_continue
-            if is_final_turn:
-                print(f"final turn {sample_metadata['current_turn']}")
-            
             # Use new per-turn partial reward function  
             state_score, call_score = self.reward_calculator.calculate_reward(sample_metadata, is_final_turn)
             reward = (0.5 * state_score + 0.5 * call_score) / sample_metadata["max_turns"]

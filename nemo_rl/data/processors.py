@@ -295,3 +295,70 @@ def bfcl_processor(
         output["dataset"] = datum_dict["dataset"]
         
     return output
+
+def bfcl_multiturn_hf_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from BFCL dataset) into a DatumSpec for function calling."""
+    
+    # support single turn for now
+    assert len(datum_dict["messages"]) == 1
+    
+    single_message = datum_dict["messages"][0]
+    
+    message_log = []
+    extra_env_info = {}
+    
+    # Extract metadata from user message
+    for m in single_message:
+        if m["role"] == "user":
+            # need to be deepcopy to avoid overwriting the original metadata
+            extra_env_info = deepcopy(m["metadata"])
+            break
+    
+    # Apply chat template to the entire conversation
+    message = tokenizer.apply_chat_template(
+        single_message,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    
+    # Create user message entry for message_log
+    user_message = {"role": "user"}
+    user_message["token_ids"] = tokenizer.apply_chat_template(
+        single_message,
+        tokenize=True,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )[0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        "dataset": datum_dict["dataset"],
+    }
+    return output
+    

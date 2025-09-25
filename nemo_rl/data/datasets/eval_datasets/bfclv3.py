@@ -1,19 +1,14 @@
-from typing import Any, Optional
-import random
-
+from typing import Any
 import jsonlines
+from huggingface_hub import hf_hub_download
 
 from nemo_rl.data import processors
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
 class BFCLDataset:
-    def __init__(
-        self,
-        data_path: str,
-    ):
-        self.data_path = data_path
-        
+    def __init__(self):
+        """Initialize BFCL dataset loading from HuggingFace."""
         # Load and process data immediately
         raw_data = self._load_data()
         # Apply the rekeying transformation to create the processed dataset
@@ -26,9 +21,19 @@ class BFCLDataset:
         self.processor = processors.bfcl_processor
 
     def _load_data(self):
-        """Load JSONL data into memory."""
-        with jsonlines.open(self.data_path, "r") as reader:
+        """Load JSONL data from HuggingFace dataset."""
+        print("Loading BFCL eval data from HuggingFace: slikhite/BFCLv3")
+        
+        file_path = hf_hub_download(
+            repo_id="slikhite/BFCLv3",
+            filename="BFCL_v3_multi_turn_val_final.jsonl",
+            repo_type="dataset"
+        )
+        print(f"Downloaded to: {file_path}")
+        
+        with jsonlines.open(file_path, "r") as reader:
             data = [line for line in reader]
+        print(f"✅ Loaded {len(data)} samples from HuggingFace")
         return data
 
     def __len__(self):
