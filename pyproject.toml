@@ -51,7 +51,8 @@ dependencies = [
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
     "nvidia-nvshmem-cu12", # for deep_ep build
-    "jsonlines",  # for BFCL data processing
+    "swanlab",
+    "jsonlines",
 ]
 
 [project.optional-dependencies]
