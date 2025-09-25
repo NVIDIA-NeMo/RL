@@ -289,7 +289,7 @@ jobs:
 
   CI_QA_Gate:
     name: CI quality check
-    if: always()
+    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     runs-on: ubuntu-latest
     needs:
       - pre-flight
