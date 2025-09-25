@@ -384,8 +384,8 @@ async def _run_env_eval_impl(
                 for msg in message_log:
                     if msg["role"] == "user":
                         initial_content.append(msg["content"])
-                    elif msg["role"] == "assistant" and not final_response:
-                        final_response = msg["content"]
+                    elif msg["role"] == "assistant":
+                        final_response = msg["content"]  # keep last assistant response
                 prompts.append("\n".join(initial_content))
                 outputs.append(final_response)
         else:

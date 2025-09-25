@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import importlib
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Set
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Set, NotRequired
 import torch
 import ray
 
@@ -42,10 +42,14 @@ class MultiTurnToolMetadata(TypedDict):
     model_calls_per_turn: List[List[str]]  # Model's calls per turn
 
 class MultiTurnEnvConfig(TypedDict):
-    """Configuration for MultiTurnToolEnvironment."""
+    """Configuration for MultiTurnToolEnvironment.
+
+    Keys:
+      num_workers (int, optional): Number of env workers. Recommended default: 1.
+      max_turns (int, optional): Upper bound for turns; environment typically derives per-episode from ground_truth.
+    """
     num_workers: int
     max_turns: int
-
 
 class ToolManager:
     """Manages tool initialization and execution."""
@@ -187,10 +191,11 @@ class ToolManager:
 class RewardCalculator:
     """Calculates rewards for turns."""
     def calculate_reward(self, metadata: MultiTurnToolMetadata, is_final_turn: bool) -> float:
-        """Calculate reward for current turn."""
-        
-        # if not is_final_turn:
-        #     return 0.0  # No reward for intermediate turns
+        """Calculate (state_score, call_score) for the current turn.
+
+        state_score is only computed on the each turn to conpare states
+        call_score is turn-local similarity of calls vs. ground truth.
+        """
         
         # Final turn - calculate reward
         # Compare states only for tools the model actually invoked this turn
@@ -207,7 +212,6 @@ class RewardCalculator:
                     used_tools.add(t_name)
 
         state_score = 0.0
-        # compute state score only on final turn
         state_score = self._compare_tool_states(
                 metadata["model_tool_instances"],
                 metadata["gt_tool_instances"],
@@ -219,7 +223,6 @@ class RewardCalculator:
             metadata["ground_truth"],
             cur_turn,
         )
-        # breakpoint()
         return state_score, call_score
     
     def _compare_tool_states(
@@ -299,7 +302,7 @@ class RewardCalculator:
         return correct_calls / total_unique
 
 
-@ray.remote
+@ray.remote # pragma: no cover
 class MultiTurnToolEnvironment(EnvironmentInterface):
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.SYSTEM
     """Multi-turn tool environment"""

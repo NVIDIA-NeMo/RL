@@ -256,12 +256,13 @@ def bfcl_processor(
             add_generation_prompt=False,
             add_special_tokens=False,
         )
-        sys_prompt["token_ids"] = tokenizer(sys, return_tensors="pt")["input_ids"][0]
+        sys_prompt["token_ids"] = tokenizer(
+            sys, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
         sys_prompt["content"] = sys
         message_log.append(sys_prompt)
     
-    # User prompt  
-    # Use custom prompt template if provided, otherwise use the content directly
+    # User prompt
     final_user_content = user_content
     
     user_message = {"role": "user", "content": final_user_content}
@@ -271,20 +272,29 @@ def bfcl_processor(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
+    user_message["token_ids"] = tokenizer(
+        message, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
     user_message["content"] = message
     message_log.append(user_message)
 
     length = sum(len(m["token_ids"]) for m in message_log)
-    
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        for indiv_message in message_log:
+            indiv_message["token_ids"] = indiv_message["token_ids"][
+                : min(4, max_seq_length // max(1, len(message_log)))
+            ]
+        loss_multiplier = 0.0
+        # recompute after truncation
+        length = sum(len(m["token_ids"]) for m in message_log)
     # Use deepcopy to avoid overwriting the original metadata
     extra_env_info = deepcopy(metadata) if metadata else {}
-    
     output: DatumSpec = {
         "message_log": message_log,
         "length": length,
         "extra_env_info": extra_env_info,
-        "loss_multiplier": 1.0,
+        "loss_multiplier": loss_multiplier,
         "idx": idx,
     }
     
@@ -305,8 +315,11 @@ def bfcl_multiturn_hf_data_processor(
 ) -> DatumSpec:
     """Process a datum dictionary (directly loaded from BFCL dataset) into a DatumSpec for function calling."""
     
-    # support single turn for now
-    assert len(datum_dict["messages"]) == 1
+    # Support single turn for now
+    if len(datum_dict.get("messages", [])) != 1:
+        raise ValueError(
+            "bfcl_multiturn_hf_data_processor currently expects a single conversation in messages[0]."
+        )
     
     single_message = datum_dict["messages"][0]
     

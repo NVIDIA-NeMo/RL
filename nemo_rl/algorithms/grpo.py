@@ -916,8 +916,18 @@ def grpo_train(
                 extra_env_info = repeated_batch["extra_env_info"]
             except KeyError:
                 extra_env_info = [None] * len(rewards)
-
-            log_data["metadata"] = [json.dumps(m, default=str) if m is not None else "" for m in extra_env_info]
+            # Normalize to a list with the same length as rewards
+            if not isinstance(extra_env_info, (list, tuple)):
+                extra_env_info = [extra_env_info] * len(rewards)
+            else:
+                extra_env_info = list(extra_env_info)
+            if len(extra_env_info) < len(rewards):
+                extra_env_info.extend([None] * (len(rewards) - len(extra_env_info)))
+            elif len(extra_env_info) > len(rewards):
+                extra_env_info = extra_env_info[: len(rewards)]
+            log_data["metadata"] = [
+                json.dumps(m, default=str) if m is not None else "" for m in extra_env_info
+            ]
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{total_steps}.jsonl"
             )

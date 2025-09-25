@@ -44,18 +44,26 @@ class BFCLDataset:
         return self.rekeyed_ds[idx]
 
     def _rekey(self, data: dict[str, Any]):
-        single_message = data["messages"][0]
+        messages = data.get("messages", [])
+        if not messages:
+            raise KeyError("messages missing from BFCL sample")
+        first = messages[0]
+        if isinstance(first, dict):
+            iterable = messages
+        elif isinstance(first, list):
+            iterable = first
+        else:
+            raise TypeError(f"Unexpected messages format: {type(first)}")
         system_content = ""
         user_content = ""
         metadata = {}
-
-        for m in single_message:
-            if m["role"] == "system":
-                system_content = m["content"]
-            if m["role"] == "user":
-                user_content = m["content"]
-                if "metadata" in m:
-                    metadata = m["metadata"]
+        for m in iterable:
+            role = m.get("role")
+            if role == "system":
+                system_content = m.get("content", "")
+            elif role == "user":
+                user_content = m.get("content", "")
+                metadata = m.get("metadata", metadata)
         return {
             "system_content": system_content,
             "user_content": user_content,

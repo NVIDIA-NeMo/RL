@@ -906,27 +906,22 @@ def run_async_multi_turn_rollout(
 def _append_next_user_question(
     batch: "BatchedDataDict",
     idx: int,
-    tokenizer: "AutoTokenizer",
+    tokenizer: TokenizerType,
     max_seq_len: int,
     sample_token_counts: torch.Tensor,
 ):
     """Append the next user question to the message log for sample `idx`, if any.
-
     The question is taken from `batch["extra_env_info"][idx]["user_question_bank"]`
     at index `current_turn - 1`.
     """
-
     meta = batch["extra_env_info"][idx]
     if not isinstance(meta, dict):
         return
-
     # Only proceed if previous turn was successful
     if not meta.get("turn_success", False):
         return
-
     current_turn = meta.get("current_turn")
     qbank = meta.get("user_question_bank")
-
     if (
         current_turn is None
         or qbank is None
@@ -935,28 +930,27 @@ def _append_next_user_question(
         or current_turn - 1 >= len(qbank)
     ):
         return
-
     entry = qbank[current_turn - 1]
-
-    # entry is single element list
-    entry = entry[0]
-
-    if not isinstance(entry, dict):
-        raise ValueError(f"Expected dict, got {type(entry)} {entry}")
-
-    next_q = entry.get("content")
+    # entry may be dict, list[dict], or str
+    if isinstance(entry, list) and entry:
+        entry = entry[0]
+    if isinstance(entry, dict):
+        next_q = entry.get("content")
+    elif isinstance(entry, str):
+        next_q = entry
+    else:
+        raise TypeError(f"user_question_bank entry must be dict|list|str, got {type(entry)}")
     if not next_q:
         return
-
-    tokenized_q = tokenizer(next_q, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
-
+    tokenized_q = tokenizer(
+        next_q, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
     # Truncate if needed
     available_len = max_seq_len - sample_token_counts[idx]
     if available_len <= 0:
         return
     if tokenized_q.size(0) > available_len:
         tokenized_q = tokenized_q[:available_len]
-
     batch["message_log"][idx].append(
         {"role": "user", "content": next_q, "token_ids": tokenized_q}
     )
