@@ -1,155 +1,48 @@
-# GRPO Algorithm Configuration
-defaults: "../../grpo_math_1B.yaml"
-
+defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
-  max_num_steps: 1000000
-  normalize_rewards: true
-  use_leave_one_out_baseline: true
-  val_period: 10
-  val_at_start: false
-  max_val_samples: 256
-  val_batch_size: 256
-loss_fn:
-  reference_policy_kl_penalty: 0.01
-  ratio_clip_min: 0.2
-  ratio_clip_max: 0.2
-  # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
-  use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
-  token_level_loss: true
-  ratio_clip_c: null
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-8n8g-megatron
-  metric_name: val_reward
-  higher_is_better: true
-  keep_top_k: 3
-  save_period: 10
-  checkpoint_must_save_by: null
 policy:
-  model_name: "Qwen/Qwen3-30B-A3B"
-  tokenizer:
-    name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
-  train_global_batch_size: 512
+  model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
-  generation_batch_size: 32 # Only used when generating using HF backend
-  logprob_batch_size: 4
   max_total_sequence_length: 4096
-  precision: "bfloat16"
-
   dtensor_cfg:
     enabled: false
-
-  optimizer: null # remove default FSDP optimizer
-
-  scheduler: null # remove default FSDP scheduler
-
-  dynamic_batching:
-    enabled: False
+  optimizer: null
+  scheduler: null
   sequence_packing:
-    enabled: False # coming soon
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_ffd"
-    sequence_length_round: 64
-  max_grad_norm: 1.0
+    enabled: false
+    algorithm: modified_ffd
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    activation_checkpointing: false
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 4
-    context_parallel_size: 1
-    expert_tensor_parallel_size: 1
     expert_model_parallel_size: 4
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
-    sequence_parallel: True
-    pipeline_dtype: ${policy.precision}
-    freeze_moe_router: true
-    moe_router_dtype: "fp64"
-    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
-    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-    moe_permute_fusion: false
-    #gives ~20% training perf speedup with sequence packing 
-    apply_rope_fusion: True
-
+    sequence_parallel: true
     optimizer:
-      optimizer: "adam"
-      lr: 3.0e-7
-      min_lr: 3.0e-8
-      weight_decay: 0.01
-      bf16: true
-      fp16: false
-      params_dtype: "float32"
-      clip_grad: ${policy.max_grad_norm}
-      #adam
-      adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1e-8
-      #sgd
-      sgd_momentum: 0.9
-      #distributed optimizer
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
-
+      lr: 3.0e-07
+      min_lr: 3.0e-08
     scheduler:
-      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      weight_decay_incr_style: "constant"
-      lr_decay_style: "constant"
-      lr_decay_iters: 1000
       lr_warmup_iters: 50
-      lr_warmup_init: 3.0e-8
-    
+      lr_warmup_init: 3.0e-08
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
-    
-    distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
-      overlap_param_gather: true
-      average_in_collective: true
-      use_custom_fsdp: false
-      data_parallel_sharding_strategy: "optim_grads_params"
-
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   generation:
-    backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
-    temperature: 1.0
-    top_p: 1.0
-    top_k: null
-    stop_token_ids: null
-    stop_strings: null
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.7
-      max_model_len: ${policy.max_total_sequence_length}
-data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
-  system_prompt_file: null
-  dataset_name: "OpenMathInstruct-2"
-env:
-  math:
-    num_workers: 8
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron
-  num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
-  mlflow_enabled: False
-  monitor_gpus: true
   wandb:
     project: nemo-rl
     name: grpo-qwen3-30ba3b-8n8g-megatron
-  tensorboard: {}
-  gpu_monitoring:
-    collection_interval: 10
-    flush_interval: 10
 cluster:
   gpus_per_node: 8
   num_nodes: 8
