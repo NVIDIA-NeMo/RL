@@ -42,7 +42,7 @@ env:
 
 ## Data
 
-We downloaded the data from [here](https://github.com/bespokelabsai/verifiers/blob/main/verifiers/berkeley-function-call-leaderboard/data/BFCL_v3_multi_turn_base.json). We preprocessed the data to convert it into a specific format. Formatting involves adding a system prompt, including tool descriptions and preprocessing it to add metadata/initial environment configs. Adding tool description in system prompt helps in getting quick gains in reward. You can access the preprocessed data at this link: (insert Google Drive link). 
+We downloaded the data from [here](https://github.com/bespokelabsai/verifiers/blob/main/verifiers/berkeley-function-call-leaderboard/data/BFCL_v3_multi_turn_base.json). We preprocessed the data to convert it into a specific format. Formatting involves adding a system prompt, including tool descriptions and preprocessing it to add metadata/initial environment configs. Adding tool description in system prompt helps in getting quick gains in reward. You can access the preprocessed data on huggingface: [slikhite/BFCLv3](https://huggingface.co/datasets/slikhite/BFCLv3)
 
 **Example data format:**
 ```json
@@ -61,7 +61,7 @@ We downloaded the data from [here](https://github.com/bespokelabsai/verifiers/bl
 The multi-turn training process using GRPO follows this detailed lifecycle:
 
 ### 1. **Data Loading & Initialization**
-- First turn extracted from JSONL dataset with `JsonlinesDataset` class
+- First turn extracted from `load_response_dataset` function from HF dataset.
 - Each sample contains:
   - Initial user message with system prompt applied via chat template
   - `extra_env_info` containing metadata like `initial_config`, `ground_truth`, `user_question_bank`, etc.

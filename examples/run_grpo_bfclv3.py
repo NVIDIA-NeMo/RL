@@ -16,11 +16,8 @@ import argparse
 import os
 import pprint
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
-import logging
-import jsonlines
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
