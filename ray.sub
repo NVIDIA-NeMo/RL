@@ -122,6 +122,7 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # TODO: delete these (just for debugging)
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+COMMON_SRUN_ARGS+=" --exclusive"
 # Number of CPUs per worker node
 CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
 

@@ -7,7 +7,7 @@ grpo:
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: false
-  val_period: 5
+  val_period: 10
   val_at_start: true
   max_val_samples: 2000
   val_batch_size: 512
@@ -17,16 +17,16 @@ grpo:
   ## TODO
   #use_dynamic_sampling: false
   #max_num_gen_batches: 10
-  #reward_scaling:
-  #  enabled: true #false
-  #  correct: 1.0
-  #  incorrect: -1.0
+  reward_scaling:
+    enabled: true #false
+    correct: 1.0
+    incorrect: -1.0
   ## TODO: make sure penalty is only applied on the generation
-  reward_shaping:
-    enabled: true
-    overlong_buffer_length: 4096
-    overlong_buffer_penalty: 1.0
-    max_response_length: 20480
+  #reward_shaping:
+  #  enabled: true
+  #  overlong_buffer_length: 4096
+  #  overlong_buffer_penalty: 1.0
+  #  max_response_length: 20480
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -44,7 +44,7 @@ checkpointing:
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 100
-  save_period: 5
+  save_period: 10
   checkpoint_must_save_by: null
 
 policy:
@@ -114,7 +114,7 @@ policy:
 
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1 #0
     activation_checkpointing: true
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 4
