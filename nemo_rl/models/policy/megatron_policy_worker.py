@@ -251,6 +251,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
@@ -264,6 +267,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router._maintain_float32_expert_bias()
@@ -1178,11 +1184,13 @@ class MegatronPolicyWorker:
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
 
+            multimodal_data = data_dict.get_multimodal_dict(as_tensors=True, device=input_ids.device)
             output_tensor = model(
-                input_ids_cp_sharded,
-                position_ids,
-                attention_mask,
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
+                **multimodal_data,
             )
 
             # Apply temperature scaling to logits for training
