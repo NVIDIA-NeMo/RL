@@ -19,6 +19,7 @@ import asyncio
 import copy
 from typing import Any, Optional
 
+from collections import defaultdict
 from dataclasses import dataclass
 import statistics
 
@@ -919,12 +920,12 @@ class AsyncPenguinRolloutResult:
 
 def _calculate_single_metric(values: list[float], batch_size: int, key_name: str) -> dict:
     return {
-        f"mean_{key_name}": sum(values) / batch_size,
-        f"max_{key_name}": max(values),
-        f"min_{key_name}": min(values),
-        f"median_{key_name}": statistics.median(values),
-        f"stddev_{key_name}": statistics.stdev(values),
-        f"histogram_{key_name}": Histogram(values),
+        f"{key_name}/mean": sum(values) / batch_size,
+        f"{key_name}/max": max(values),
+        f"{key_name}/min": min(values),
+        f"{key_name}/median": statistics.median(values),
+        f"{key_name}/stddev": statistics.stdev(values),
+        f"{key_name}/histogram": Histogram(values),
     }
 
 
@@ -1003,6 +1004,25 @@ def run_async_penguin_rollout(
         # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
         # / batch_size,
     }
+    
+    agent_to_results: dict[str, list[dict]] = defaultdict(list)
+    for penguin_row, result in zip(penguin_rows, results):
+        agent_name = penguin_row["agent_ref"]["name"] # multineedle_simple_agent
+        agent_to_results[agent_name].append(result["full_result"])
+
+    per_agent_metrics = {}
+    for agent_name, agent_results in agent_to_results.items():
+        keys = agent_results[0].keys()
+        for key in keys:
+            values = []
+            for r in agent_results:
+                if isinstance(r.get(key), (bool, int, float)):
+                    values.append(float(r[key]))
+
+            if values:
+                per_agent_metrics.update(_calculate_single_metric(values, len(agent_results), f"{agent_name}/{key}"))
+
+    rollout_metrics.update(per_agent_metrics)
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
