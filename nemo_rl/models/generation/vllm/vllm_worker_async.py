@@ -17,7 +17,6 @@ import gc
 import threading
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
-from logging import LogRecord, getLogger, Filter as LoggingFilter
 
 import ray
 import torch
@@ -483,6 +482,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        from logging import LogRecord, getLogger, Filter as LoggingFilter
         import threading
 
         import uvicorn
