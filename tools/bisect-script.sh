@@ -88,7 +88,7 @@ fi
 
 set -x
 git bisect start "$BAD" "$GOOD"
-git bisect run bash -c "${USER_CMD[@]}"
+git bisect run -- "${USER_CMD[@]}"
 set +x
 
 RESULT=0
