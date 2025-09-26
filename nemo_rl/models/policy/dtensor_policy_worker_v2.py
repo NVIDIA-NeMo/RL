@@ -631,7 +631,6 @@ class DTensorPolicyWorkerV2:
                                 ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
                             )
                             seq_len = input_ids.shape[1]
-                            attention_mask = None
                             flash_attn_kwargs = get_flash_attention_kwargs(
                                 input_lengths=mb["input_lengths"],
                             )
@@ -640,15 +639,12 @@ class DTensorPolicyWorkerV2:
                             input_ids = mb.get("input_ids").cuda()
                             batch_size, seq_len = input_ids.shape
 
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
                             position_ids = torch.arange(
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
                             flash_attn_kwargs = {}
+
+                        attention_mask = None
 
                         # add vlm kwargs to model call
                         vlm_kwargs = mb.get_multimodal_dict(
@@ -952,7 +948,6 @@ class DTensorPolicyWorkerV2:
                         return_attention_mask=False,
                     )
                     seq_len = input_ids.shape[1]
-                    attention_mask = None
                     flash_attn_kwargs = get_flash_attention_kwargs(
                         input_lengths=input_lengths,
                     )
@@ -972,15 +967,11 @@ class DTensorPolicyWorkerV2:
                     ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
-                    # DTensor requires the casual attention kernel to hit,
-                    # yet our attention mask above is not always all 1s
-                    # this is fine because we mask with the actual attention mask
-                    # later, but for input it has to be all 1s
-                    attention_mask = torch.ones(
-                        (batch_size, seq_len),
-                        dtype=torch.bool,
-                        device=input_ids.device,
-                    )
+                # DTensor requires the casual attention kernel to hit,
+                # yet our attention mask above is not always all 1s
+                # this is fine because we mask with the actual attention mask
+                # later, but for input it has to be all 1s
+                attention_mask = None
 
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:
