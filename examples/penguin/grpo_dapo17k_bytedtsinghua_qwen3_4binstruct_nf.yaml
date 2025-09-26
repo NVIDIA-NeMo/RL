@@ -9,8 +9,8 @@ grpo:
   val_period: 10
   val_at_start: true
   overlong_filtering: false
-  max_val_samples: 960  # BytedTsinghua uses 30 examples in AIME24 * 32 generations each.
-  val_batch_size: ${grpo.max_val_samples}
+  max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
+  val_batch_size: null
   seed: 42
 
 loss_fn:
