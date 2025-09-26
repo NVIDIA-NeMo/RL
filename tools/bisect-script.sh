@@ -20,7 +20,7 @@ Exit codes inside the command determine good/bad:
 Environment variables:
   GOOD    Commit-ish known to be good (required)
   BAD     Commit-ish suspected bad (required)
-  BISECT_NO_RESET      If set, do not auto-reset bisect state at the end
+  (The script will automatically restore the repo state with 'git bisect reset' on exit.)
 
 Notes:
   - The working tree will be reset by git bisect. Ensure you have no uncommitted changes.
@@ -66,17 +66,27 @@ if ! git diff --cached --quiet; then
   exit 2
 fi
 
-# On interruption or script error, remind how to restore repo state
+# On interruption or script error, print helpful message
 on_interrupt_or_error() {
   local status=$?
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if git bisect log >/dev/null 2>&1; then
       echo "[bisect] Script interrupted or failed (exit ${status})." >&2
-      echo "[bisect] You can run 'git bisect reset' to restore the original state." >&2
+      echo "[bisect] Restoring original state with 'git bisect reset' on exit." >&2
     fi
   fi
 }
 trap on_interrupt_or_error INT TERM ERR
+
+# Always reset bisect on exit to restore original state
+cleanup_reset() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if git bisect log >/dev/null 2>&1; then
+      git bisect reset >/dev/null 2>&1 || true
+    fi
+  fi
+}
+trap cleanup_reset EXIT
 
 # Reset any ongoing bisect unless user asked to keep it
 if git bisect log >/dev/null 2>&1; then
@@ -88,18 +98,10 @@ fi
 
 set -x
 git bisect start "$BAD" "$GOOD"
-git bisect run -- "${USER_CMD[@]}"
+git bisect run "${USER_CMD[@]}"
+RUN_STATUS=$?
 set +x
 
-RESULT=0
-if git bisect log >/dev/null 2>&1; then
-  if [[ -z "${BISECT_NO_RESET:-}" ]]; then
-    git bisect reset || RESULT=$?
-  else
-    echo "[bisect] Leaving repository in bisect state (BISECT_NO_RESET set)." >&2
-  fi
-fi
-
-exit $RESULT
+exit $RUN_STATUS
 
 
