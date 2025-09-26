@@ -61,6 +61,8 @@ def load_response_dataset(data_config, seed: int = 42):
             data_config["chat_key"],
             data_config["system_key"],
             data_config["system_prompt"],
+            data_config["tool_key"],
+            data_config["use_preserving_dataset"],
         )
     # for rl training
     elif dataset_name == "OpenMathInstruct-2":

@@ -314,7 +314,7 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 ## Supervised Fine-Tuning (SFT)
 
-We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+We provide example SFT experiments using various datasets including [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/), OpenAI format datasets (with tool calling support), and custom JSONL datasets. For detailed documentation on supported datasets and configurations, see the [SFT documentation](docs/guides/sft.md).
 
 ### SFT Single Node
 

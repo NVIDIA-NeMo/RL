@@ -249,6 +249,12 @@ def get_tokenizer(
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
+        elif tokenizer_config["chat_template"].endswith(".jinja"):
+            # Load template from file
+            template_path = tokenizer_config["chat_template"]
+            print(f"Loading chat template from file: {template_path}")
+            with open(template_path, "r") as f:
+                tokenizer.chat_template = f.read()
         else:
             print("Using custom chat template")
             tokenizer.chat_template = tokenizer_config["chat_template"]

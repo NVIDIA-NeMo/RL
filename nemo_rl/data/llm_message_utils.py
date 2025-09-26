@@ -424,6 +424,10 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
 
 def get_images_from_message(message: dict[str, Any]) -> list[Any]:
     """Get all images from a message log item."""
+    # Handle None or missing content (e.g., assistant messages with only tool_calls)
+    if message.get("content") is None:
+        return []
+    # Handle string content (no images)
     if isinstance(message["content"], str):
         return []
     # iterate over the content list
@@ -443,6 +447,7 @@ def get_formatted_message_log(
     add_bos_token: bool = True,
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
+    tools: Optional[list[dict[str, Any]]] = None,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -453,7 +458,7 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
-
+        tools: Optional list of tool/function definitions to pass to the chat template. Default: None
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
@@ -522,11 +527,19 @@ def get_formatted_message_log(
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
+
+        # Only pass tools parameter if tools exist
+        template_kwargs = {
+            "add_generation_prompt": add_generation_prompt
+            and message["role"] in ["user", "tool"],
+            "tokenize": False,
+            "add_special_tokens": False,
+        }
+        if tools is not None:
+            template_kwargs["tools"] = tools
+
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
-            message_log_strs[: i + 1],
-            add_generation_prompt=add_generation_prompt and message["role"] == "user",
-            tokenize=False,
-            add_special_tokens=False,
+            message_log_strs[: i + 1], **template_kwargs
         )
 
         ## get the length of the previous message, excluding the eos token (if present)
@@ -537,6 +550,31 @@ def get_formatted_message_log(
 
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
+
+        # Debug: Print each message turn separately (only once for the first sample)
+        if not hasattr(get_formatted_message_log, "_debug_printed"):
+            if i == 0:
+                # Print header only at the start of first message
+                print("\n" + "=" * 80)
+                print("DEBUG: Individual message turns from apply_chat_template")
+                print("=" * 80)
+
+            print(f"\n[Turn {i + 1}/{len(message_log_strs)}] Role: {message['role']}")
+            print("-" * 40)
+            print("Extracted message chunk:")
+            print(repr(message_chunk))  # Using repr to show special characters
+            print(f"Raw text (len={len(message_chunk)}):")
+            print(message_chunk)
+            print("-" * 40)
+
+            if i == len(message_log_strs) - 1:
+                # Mark as printed after processing all turns of the first sample
+                get_formatted_message_log._debug_printed = True
+                print("\n" + "=" * 80)
+                print("DEBUG: Complete formatted conversation:")
+                print("-" * 80)
+                print(formatted_message)
+                print("=" * 80 + "\n")
 
         if i == 0:
             if add_bos_token:
@@ -598,12 +636,16 @@ def get_formatted_message_log(
             new_message["token_ids"] = new_message["token_ids"].to(torch.int64)  # type: ignore
 
         # format content correctly
-        if isinstance(message["content"], str):
+        content = message.get("content")
+        if content is None or not content:
+            # Handle None or missing content (e.g., assistant messages with only tool_calls)
+            new_message["content"] = message_chunk
+        elif isinstance(content, str):
             new_message["content"] = message_chunk
         else:
             # format the content list of new message the same way as the original message but replace the text with the new message chunk
             new_message["content"] = []
-            for item in message["content"]:
+            for item in content:
                 if item["type"] == "text":
                     new_message["content"].append(
                         {"type": "text", "text": message_chunk}
