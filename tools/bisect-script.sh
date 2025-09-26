@@ -66,6 +66,18 @@ if ! git diff --cached --quiet; then
   exit 2
 fi
 
+# On interruption or script error, remind how to restore repo state
+on_interrupt_or_error() {
+  local status=$?
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if git bisect log >/dev/null 2>&1; then
+      echo "[bisect] Script interrupted or failed (exit ${status})." >&2
+      echo "[bisect] You can run 'git bisect reset' to restore the original state." >&2
+    fi
+  fi
+}
+trap on_interrupt_or_error INT TERM ERR
+
 # Reset any ongoing bisect unless user asked to keep it
 if git bisect log >/dev/null 2>&1; then
   # We are in a bisect session
@@ -76,7 +88,7 @@ fi
 
 set -x
 git bisect start "$BAD" "$GOOD"
-git bisect run -- "${USER_CMD[@]}"
+git bisect run bash -c "${USER_CMD[@]}"
 set +x
 
 RESULT=0
