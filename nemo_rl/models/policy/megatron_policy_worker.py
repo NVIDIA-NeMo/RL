@@ -1225,7 +1225,9 @@ class MegatronPolicyWorker:
                 # Skip expert_ids collection to improve performance
                 continue
             else:
-                num_layers = len(v) // len(list_of_logprobs)
+                # Use data_iterator_len which represents actual microbatches processed
+                # list_of_logprobs is only populated on last pipeline stage
+                num_layers = len(v) // data_iterator_len
                 outputs = (
                     torch.as_tensor(v, dtype=torch.float32)
                     .view(num_layers, -1)
