@@ -102,6 +102,14 @@ git bisect run "${USER_CMD[@]}"
 RUN_STATUS=$?
 set +x
 
+# Show bisect details before cleanup
+if git bisect log >/dev/null 2>&1; then
+  echo "[bisect] --- bisect log ---"
+  git bisect log | cat
+  echo "[bisect] --- bisect visualize (oneline) ---"
+  GIT_PAGER=cat git bisect visualize --oneline --decorate -n 20 | cat || true
+fi
+
 exit $RUN_STATUS
 
 
