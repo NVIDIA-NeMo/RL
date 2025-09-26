@@ -156,9 +156,11 @@ def main() -> None:
 
     if config["grpo"]["max_val_samples"] is not None:
         raise ValueError(
-            f"""A non-null `grpo.max_val_samples` parameter is not supported. 
+            """A non-null `grpo.max_val_samples` parameter is not supported. 
 
-The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and ng_prepare_data will prepare it accordingly."""
+Gym principle is that there is no hidden data pre or post processing from you. What you see is what you get.
+
+The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
         )
 
     print(f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataloader)}")
