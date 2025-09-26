@@ -24,7 +24,9 @@ Environment variables:
 
 Notes:
   - The working tree will be reset by git bisect. Ensure you have no uncommitted changes.
-  - The script will attempt to reset bisect state on exit unless BISECT_NO_RESET is set.
+  - If GOOD is an ancestor of BAD with 0 or 1 commits in between, git can
+    conclude immediately; the script will show the result and exit without
+    running your command.
 EOF
 }
 
@@ -98,6 +100,21 @@ fi
 
 set -x
 git bisect start "$BAD" "$GOOD"
+set +x
+
+# Detect immediate conclusion (no midpoints to test)
+if git bisect log >/dev/null 2>&1; then
+  if git bisect log | grep -q "first bad commit:"; then
+    echo "[bisect] Immediate conclusion from endpoints; no midpoints to test."
+    echo "[bisect] --- bisect log ---"
+    git bisect log | cat
+    echo "[bisect] --- bisect visualize (oneline) ---"
+    GIT_PAGER=cat git bisect visualize --oneline --decorate -n 20 | cat || true
+    exit 0
+  fi
+fi
+
+set -x
 git bisect run "${USER_CMD[@]}"
 RUN_STATUS=$?
 set +x
