@@ -1014,11 +1014,12 @@ def run_async_penguin_rollout(
     for agent_name, agent_results in agent_to_results.items():
         keys = agent_results[0].keys()
         for key in keys:
-            if not isinstance(agent_results[0][key], (bool, int, float)):
-                # ignore values that can't be converted to float
-                continue
-            values = [float(r[key]) for r in agent_results]
-            per_agent_metrics.update(_calculate_single_metric(values, len(agent_results), f"{agent_name}/{key}"))
+            values = []
+            for r in agent_results:
+                if isinstance(r[key], (bool, int, float)):
+                    values.append(float(r[key]))
+            if values:
+                per_agent_metrics.update(_calculate_single_metric(values, len(agent_results), f"{agent_name}/{key}"))
 
     rollout_metrics.update(per_agent_metrics)
 
