@@ -1,7 +1,7 @@
 import pytest
 
 
-@pytest.mark.parametrize("a", list(range(5)))
+@pytest.mark.parametrize("a", list(range(8)))
 def test_hello(a):
     a == a
 
