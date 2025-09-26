@@ -127,6 +127,8 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    fp8_cfg: null
+
     env_vars: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 

@@ -1,5 +1,5 @@
 # GRPO Algorithm Configuration
-defaults: "grpo_math_8B_megatron.yaml"
+defaults: "grpo_math_70B_megatron.yaml"
 
 loss_fn:
   use_importance_sampling_correction: true
@@ -9,8 +9,8 @@ policy:
     vllm_cfg:
       precision: "fp8"
       use_deep_gemm: true
-      gpu_memory_utilization: 0.5
   megatron_cfg:
+    pipeline_model_parallel_size: 8
     fp8_cfg:
       enabled: true
       fp8: "e4m3"
