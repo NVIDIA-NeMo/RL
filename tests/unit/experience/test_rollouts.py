@@ -776,30 +776,62 @@ def test_run_async_penguin_rollout(
             "total_reward": torch.tensor([0.0, 0.0]),
         },
         "rollout_metrics": {
-            "mean_turns_per_sample": 2.0,
-            "max_turns_per_sample": 2,
-            "min_turns_per_sample": 2,
-            "median_turns_per_sample": 2.0,
-            "stddev_turns_per_sample": 0.0,
-            "histogram_turns_per_sample": None,
-            "mean_total_tokens_per_sample": 3843.0,
-            "max_total_tokens_per_sample": 3848,
-            "min_total_tokens_per_sample": 3838,
-            "median_total_tokens_per_sample": 3843.0,
-            "stddev_total_tokens_per_sample": 7.0710678118654755,
-            "histogram_total_tokens_per_sample": None,
-            "mean_gen_tokens_per_sample": 732.5,
-            "max_gen_tokens_per_sample": 748,
-            "min_gen_tokens_per_sample": 717,
-            "median_gen_tokens_per_sample": 732.5,
-            "stddev_gen_tokens_per_sample": 21.920310216782973,
-            "histogram_gen_tokens_per_sample": None,
-            "mean_total_reward": 0.0,
-            "max_total_reward": 0.0,
-            "min_total_reward": 0.0,
-            "median_total_reward": 0.0,
-            "stddev_total_reward": 0.0,
-            "histogram_total_reward": None,
+            # core metrics
+            "turns_per_sample/mean": 2.0,
+            "turns_per_sample/max": 2,
+            "turns_per_sample/min": 2,
+            "turns_per_sample/median": 2.0,
+            "turns_per_sample/stddev": 0.0,
+            "turns_per_sample/histogram": None,
+            "total_tokens_per_sample/mean": 3843.0,
+            "total_tokens_per_sample/max": 3848,
+            "total_tokens_per_sample/min": 3838,
+            "total_tokens_per_sample/median": 3843.0,
+            "total_tokens_per_sample/stddev": 7.0710678118654755,
+            "total_tokens_per_sample/histogram": None,
+            "gen_tokens_per_sample/mean": 732.5,
+            "gen_tokens_per_sample/max": 748,
+            "gen_tokens_per_sample/min": 717,
+            "gen_tokens_per_sample/median": 732.5,
+            "gen_tokens_per_sample/stddev": 21.920310216782973,
+            "gen_tokens_per_sample/histogram": None,
+            "total_reward/mean": 0.0,
+            "total_reward/max": 0.0,
+            "total_reward/min": 0.0,
+            "total_reward/median": 0.0,
+            "total_reward/stddev": 0.0,
+            "total_reward/histogram": None,
+            # per agent metrics
+            "multineedle_simple_agent/accuracy/histogram": None,
+            "multineedle_simple_agent/accuracy/max": 0.0,
+            "multineedle_simple_agent/accuracy/mean": 0.0,
+            "multineedle_simple_agent/accuracy/median": 0.0,
+            "multineedle_simple_agent/accuracy/min": 0.0,
+            "multineedle_simple_agent/accuracy/stddev": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/histogram": None,
+            "multineedle_simple_agent/order_instruction_following_failure/max": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/mean": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/median": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/min": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/stddev": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/histogram": None,
+            "multineedle_simple_agent/original_term_minefield_hit/max": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/mean": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/median": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/min": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/stddev": 0.0,
+            "multineedle_simple_agent/reward/histogram": None,
+            "multineedle_simple_agent/reward/max": 0.0,
+            "multineedle_simple_agent/reward/mean": 0.0,
+            "multineedle_simple_agent/reward/median": 0.0,
+            "multineedle_simple_agent/reward/min": 0.0,
+            "multineedle_simple_agent/reward/stddev": 0.0,
+            "multineedle_simple_agent/set_overlap/histogram": None,
+            "multineedle_simple_agent/set_overlap/max": 0.0,
+            "multineedle_simple_agent/set_overlap/mean": 0.0,
+            "multineedle_simple_agent/set_overlap/median": 0.0,
+            "multineedle_simple_agent/set_overlap/min": 0.0,
+            "multineedle_simple_agent/set_overlap/stddev": 0.0,
         },
     }
 
@@ -812,11 +844,11 @@ def test_run_async_penguin_rollout(
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
-            if key.endswith("total_tokens_per_sample") or key.endswith("gen_tokens_per_sample") or key.endswith("turns_per_sample"):
+            if key.startswith("total_tokens_per_sample") or key.startswith("gen_tokens_per_sample") or key.startswith("turns_per_sample"):
                 d["rollout_metrics"][key] = None
             
             # Histograms are objects.
-            if key.startswith("histogram_"):
+            if key.endswith("histogram"):
                 d["rollout_metrics"][key] = None
 
         return {
