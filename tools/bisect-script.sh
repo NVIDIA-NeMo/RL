@@ -9,8 +9,42 @@ Usage: GOOD=<good_ref> BAD=<bad_ref> tools/bisect-script.sh [command ...]
 Runs a git bisect session between GOOD and BAD to find the first bad commit.
 
 Examples:
-  GOOD=464ed38 BAD=HEAD tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
   GOOD=56a6225 BAD=32faafa tools/bisect-script.sh uv run --group dev pre-commit run --all-files
+  GOOD=464ed38 BAD=HEAD tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
+
+  # Example ouptut:
+  #    1. Will run until hits the first bad commit
+  #    2. Will show the bisect log (what was run) and visualize the bisect
+  #
+  #    25e05a3d557dfe59a14df43048e16b6eea04436e is the first bad commit
+  #    commit 25e05a3d557dfe59a14df43048e16b6eea04436e
+  #    Author: Terry Kong <terryk@nvidia.com>
+  #    Date:   Fri Sep 26 17:24:45 2025 +0000
+  
+  #        3==4
+  #        
+  #        Signed-off-by: Terry Kong <terryk@nvidia.com>
+  
+  #     tests/unit/test_foobar.py | 2 +-
+  #     1 file changed, 1 insertion(+), 1 deletion(-)
+  #    bisect found first bad commit
+  #    + RUN_STATUS=0
+  #    + set +x
+  #    [bisect] --- bisect log ---
+  #    # bad: [f117e6fb52823d083663d5d6c5a5c852e5b23853] 3==4 (n=8)
+  #    # good: [464ed38e68dcd23f0c1951784561dc8c78410ffe] add passing foobar
+  #    git bisect start 'HEAD' '464ed38'
+  #    # good: [e5df1c2d35514f306df6dfaa3c53e6a82a3a7abe] ok try this
+  #    git bisect good e5df1c2d35514f306df6dfaa3c53e6a82a3a7abe
+  #    # good: [c82e0b69d52b8e1641226c022cb487afebe8ba99] 2==2
+  #    git bisect good c82e0b69d52b8e1641226c022cb487afebe8ba99
+  #    # bad: [2fcb4071404559f13295aeafc09092435867ab4c] 3==4 (n=5)
+  #    git bisect bad 2fcb4071404559f13295aeafc09092435867ab4c
+  #    # bad: [25e05a3d557dfe59a14df43048e16b6eea04436e] 3==4
+  #    git bisect bad 25e05a3d557dfe59a14df43048e16b6eea04436e
+  #    # first bad commit: [25e05a3d557dfe59a14df43048e16b6eea04436e] 3==4
+  #    [bisect] --- bisect visualize (oneline) ---
+  #    25e05a3d (HEAD) 3==4
 
 Exit codes inside the command determine good/bad:
   0 -> good commit
@@ -30,26 +64,37 @@ Notes:
 EOF
 }
 
+# Minimal color helpers: blue for info, red for errors (TTY-only; NO_COLOR disables)
+BLUE=""; RED=""; NC=""
+if [[ -z "${NO_COLOR:-}" ]] && { [[ -t 1 ]] || [[ -t 2 ]]; }; then
+  BLUE=$'\033[34m'
+  RED=$'\033[31m'
+  NC=$'\033[0m'
+fi
+
+iecho() { printf "%b%s%b\n" "$BLUE" "$*" "$NC"; }
+fecho() { printf "%b%s%b\n" "$RED" "$*" "$NC" >&2; }
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   print_usage
   exit 0
 fi
 
 if [[ -z "${GOOD:-}" || -z "${BAD:-}" ]]; then
-  echo "ERROR: GOOD and BAD environment variables are required." >&2
+  fecho "ERROR: GOOD and BAD environment variables are required."
   echo >&2
   print_usage >&2
   exit 2
 fi
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "ERROR: Not inside a git repository." >&2
+  fecho "ERROR: Not inside a git repository."
   exit 2
 fi
 
 # Ensure there is a command to run
 if [[ $# -lt 1 ]]; then
-  echo "ERROR: Missing command to evaluate during bisect." >&2
+  fecho "ERROR: Missing command to evaluate during bisect."
   echo >&2
   print_usage >&2
   exit 2
@@ -60,11 +105,11 @@ USER_CMD=("$@")
 # Require a clean working tree
 git update-index -q --refresh || true
 if ! git diff --quiet; then
-  echo "ERROR: Unstaged changes present. Commit or stash before bisect." >&2
+  fecho "ERROR: Unstaged changes present. Commit or stash before bisect."
   exit 2
 fi
 if ! git diff --cached --quiet; then
-  echo "ERROR: Staged changes present. Commit or stash before bisect." >&2
+  fecho "ERROR: Staged changes present. Commit or stash before bisect."
   exit 2
 fi
 
@@ -73,8 +118,8 @@ on_interrupt_or_error() {
   local status=$?
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if git bisect log >/dev/null 2>&1; then
-      echo "[bisect] Script interrupted or failed (exit ${status})." >&2
-      echo "[bisect] Restoring original state with 'git bisect reset' on exit." >&2
+      iecho "[bisect] Script interrupted or failed (exit ${status})."
+      iecho "[bisect] Restoring original state with 'git bisect reset' on exit."
     fi
   fi
 }
@@ -105,11 +150,9 @@ set +x
 # Detect immediate conclusion (no midpoints to test)
 if git bisect log >/dev/null 2>&1; then
   if git bisect log | grep -q "first bad commit:"; then
-    echo "[bisect] Immediate conclusion from endpoints; no midpoints to test."
-    echo "[bisect] --- bisect log ---"
+    iecho "[bisect] Immediate conclusion from endpoints; no midpoints to test."
+    iecho "[bisect] --- bisect log ---"
     git bisect log | cat
-    echo "[bisect] --- bisect visualize (oneline) ---"
-    GIT_PAGER=cat git bisect visualize --oneline --decorate -n 20 | cat || true
     exit 0
   fi
 fi
@@ -121,10 +164,8 @@ set +x
 
 # Show bisect details before cleanup
 if git bisect log >/dev/null 2>&1; then
-  echo "[bisect] --- bisect log ---"
+  iecho "[bisect] --- bisect log ---"
   git bisect log | cat
-  echo "[bisect] --- bisect visualize (oneline) ---"
-  GIT_PAGER=cat git bisect visualize --oneline --decorate -n 20 | cat || true
 fi
 
 exit $RUN_STATUS
