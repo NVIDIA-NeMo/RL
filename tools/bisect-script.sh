@@ -10,7 +10,7 @@ Runs a git bisect session between GOOD and BAD to find the first bad commit.
 
 Examples:
   GOOD=56a6225 BAD=32faafa tools/bisect-script.sh uv run --group dev pre-commit run --all-files
-  GOOD=464ed38 BAD=HEAD tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
+  GOOD=464ed38 BAD=c843f1b tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
 
   # Example ouptut:
   #    1. Will run until hits the first bad commit
