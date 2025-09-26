@@ -13,5 +13,9 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/comp_coding/configs/comp_coding.yaml
-    profiling_enabled: true
-    profiling_results_dirpath: results/profiling/comp_coding
+    comp_coding:
+      resources_servers:
+        comp_coding:
+          num_processes: 32
+          unit_test_timeout_secs: 10
+          debug: false
