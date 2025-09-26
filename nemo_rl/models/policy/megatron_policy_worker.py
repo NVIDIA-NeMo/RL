@@ -1537,6 +1537,12 @@ class MegatronPolicyWorker:
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
     
+    def get_aligned_param_size(self, p: torch.Tensor, align_size: int=256) -> int:
+        return self.get_size_in_bytes(p.nbytes, align_size)
+    
+    def get_size_in_bytes(self, n_bytes: int, align_size: int=256) -> int:
+        return int((n_bytes + align_size - 1) // align_size * align_size)
+    
     @torch.no_grad()
     def _pack_and_send_tensor_group(self, gathered_hf_params: dict, type_to_total_size: dict) -> None:
         """Pack a group of tensors and send them via IPC.
@@ -1671,22 +1677,55 @@ class MegatronPolicyWorker:
             torch.float16: 2,
             torch.float32: 4,
         }
-        
+
+        buffer = None
+
+        param_names = []
+
         for name, tensor in hf_params_generator:
-            used_bytes += tensor.numel() * prec_to_bytes[tensor.dtype]
-            gathered_hf_params[name] = tensor
-            type_to_total_size[tensor.dtype] += tensor.numel()
-            
-            if used_bytes >= total_available_bytes:
-                self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
-                gathered_hf_params = {}
-                type_to_total_size = defaultdict(lambda: 0)
+            aligned_size = self.get_aligned_param_size(tensor)
+            assert aligned_size <= total_available_bytes, "Aligned size is greater than total available bytes"
+            if used_bytes + aligned_size > total_available_bytes:
+                cuda_ipc_handle = get_handle_from_tensor(buffer)
+                serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
+                torch.cuda.synchronize()
+                self.zmq_socket.send_pyobj(serialized)
+                self.zmq_socket.recv()
+                buffer.zero_()
                 used_bytes = 0
+                param_names = []
                 count_of_group += 1
 
+                # buffer = torch.empty(
+                #     self.get_size_in_bytes(total_available_bytes),
+                #     device=tensor.device,
+                #     dtype=torch.uint8,
+                #     requires_grad=False,
+                # )
+
+            param_names.append(name)
+            if buffer is None:
+                buffer = torch.empty(
+                    self.get_size_in_bytes(total_available_bytes),
+                    device=tensor.device,
+                    dtype=torch.uint8,
+                    requires_grad=False,
+                )
+            buffer[used_bytes:used_bytes+tensor.nbytes].data.copy_(
+                tensor.data.view(-1).view(dtype=torch.uint8),
+            )
+            used_bytes += aligned_size
+            
         # Send any remaining tensors
-        if gathered_hf_params:
-            self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
+        if param_names:
+            cuda_ipc_handle = get_handle_from_tensor(buffer)
+            serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
+            torch.cuda.synchronize()
+            self.zmq_socket.send_pyobj(serialized)
+            self.zmq_socket.recv()
+            buffer.zero_()
+            used_bytes = 0
+            param_names = []
             count_of_group += 1
             
         self.zmq_socket.send_pyobj("complete")
@@ -1700,28 +1739,6 @@ class MegatronPolicyWorker:
         self.count_of_function_calls += 1
         print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
         # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
-
-    def _release_tensors_fast(self, tensor_dict: dict) -> None:
-        """Fast tensor release to avoid slow cudaIpcCloseMemHandle operations.
-        
-        This function explicitly releases tensors without waiting for garbage collection
-        to avoid the slow cudaIpcCloseMemHandle operation that occurs when IPC memory
-        handles are held by old tensor references.
-        """
-        if not tensor_dict:
-            return
-            
-        # Explicitly delete each tensor to release IPC handles immediately
-        for tensor in tensor_dict.values():
-            if hasattr(tensor, 'data_ptr'):
-                # Force immediate release of the tensor's memory handle
-                del tensor
-        
-        # Clear the dictionary
-        tensor_dict.clear()
-        
-        # Force garbage collection without synchronization
-        gc.collect()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.

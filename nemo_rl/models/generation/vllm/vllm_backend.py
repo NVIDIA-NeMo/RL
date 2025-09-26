@@ -73,7 +73,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot_0924/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0927/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -85,116 +85,100 @@ class VllmInternalWorkerExtension:
             self._zmq_ctx = zmq.Context()
             self.socket = self._zmq_ctx.socket(zmq.REP)
             self.socket.connect(self.zmq_address)
+    
+
+        def get_size(p: torch.Tensor, align_size: int=256) -> int:
+            return (p.nbytes + align_size - 1) // align_size * align_size
         
         dtype_to_packed_tensor = {}
-        while True:
-            # Non-blocking receive with cache clearing while waiting
-            payload = None
-            cache_cleared = False
-            with torch.profiler.record_function("zmq_recv_pyobj"):
-                while payload is None:
-                    try:
-                        # Try to receive with no wait (non-blocking)
-                        payload = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
-                    except zmq.Again:
-                        # No message available, clear cache only once while waiting
-                        if not cache_cleared:
-                            # Fast release of old tensors to avoid slow cudaIpcCloseMemHandle
-                            self._release_tensors_fast(dtype_to_packed_tensor)
-                            dtype_to_packed_tensor = {}
-                            weights = []
-                            torch.cuda.empty_cache()
-                            cache_cleared = True
-                        # Small sleep to avoid busy waiting
-                        time.sleep(0.001)
-            
-            # Synchronize before processing
-            # torch.cuda.synchronize()
-            
-            # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
-            if payload == "complete":
-                # means the update is done
-                self.socket.send(b"")
-                break
-            
-            # local_device_ipc_handles = payload[self.report_device_id()]
-            local_device_ipc_handles = payload
-            try:
-                is_tensor_packed = local_device_ipc_handles[0]
-                if is_tensor_packed:
-                    _, all_handles, list_keys = local_device_ipc_handles
-                else:
-                    _, name_and_handle_list = local_device_ipc_handles
+        buffer = None
+        with torch.cuda.stream(torch.cuda.current_stream()):
+        # if True:
+            while True:
+                with torch.profiler.record_function("zmq_recv_pyobj"):
+                    # Blocking receive (this is the main operation)
+                    payload = self.socket.recv_pyobj()
+                    # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
+                
+                # Synchronize before processing
+                # torch.cuda.synchronize()
+                
+                # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
+                if payload == "complete":
+                    # means the update is done
+                    # torch.cuda.synchronize()
+                    self.socket.send(b"")
+                    break
+                
+                # local_device_ipc_handles = payload[self.report_device_id()]
+                local_device_ipc_handles = payload
+                try:
+                    is_tensor_packed = local_device_ipc_handles[0]
+                    if is_tensor_packed:
+                        _, tensor_handle, list_keys, used_bytes = local_device_ipc_handles
+                    else:
+                        _, name_and_handle_list = local_device_ipc_handles
 
-                device_id = self.device.index
-                weights = []
+                    device_id = self.device.index
 
-                if is_tensor_packed:
-                    assert self.state_dict_info is not None, (
-                        "state_dict_info is not prepared. "
-                        "Please call prepare_refit_info when initializing the worker."
-                    )
-
-                    # Fast release of old tensors before overwriting to avoid slow cudaIpcCloseMemHandle
-                    # self._release_tensors_fast(dtype_to_packed_tensor)
-
-                    for dtype, tensor_handle in all_handles:
-                        func = rebuild_cuda_tensor
-                        args = tensor_handle[0]
-                        list_args = list(args)
-                        list_args[6] = device_id
-                        tensor = func(*list_args)
-                        dtype_to_packed_tensor[dtype] = tensor
-
-                    weights = []
-                    dtype_to_offset = defaultdict(lambda: 0)
-                    for key in list_keys:
-                        shape, dtype, size = self.state_dict_info[key]
-                        weights.append(
-                            (
-                                key,
-                                dtype_to_packed_tensor[dtype][
-                                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-                                ].view(*shape),
-                            )
+                    if is_tensor_packed:
+                        assert self.state_dict_info is not None, (
+                            "state_dict_info is not prepared. "
+                            "Please call prepare_refit_info when initializing the worker."
                         )
-                        dtype_to_offset[dtype] += size
 
-                    expected_sizes = {
-                        dtype: tensor.numel()
-                        for dtype, tensor in dtype_to_packed_tensor.items()
-                    }
-                    assert dtype_to_offset == expected_sizes, (
-                        f"Packed tensor size mismatch: expected sizes from keys list {expected_sizes} != actual packed tensor sizes {dtype_to_offset}. "
-                        f"This indicates the keys list order doesn't match the order used when packing tensors."
+                        if buffer is None or True:
+                            func = rebuild_cuda_tensor
+                            args = tensor_handle[0]
+                            list_args = list(args)
+                            list_args[6] = device_id
+                            buffer = func(*list_args)
+
+                        weights = []
+                        offset = 0
+                        for key in list_keys:
+                            shape, dtype, size = self.state_dict_info[key]
+                            size = dtype.itemsize * shape.numel()
+                            weights.append(
+                                (
+                                    key,
+                                    buffer[offset : offset + size].view(dtype=dtype).view(shape),
+                                )
+                            )
+                            aligned_size = (size + 255) // 256 * 256
+                            offset += aligned_size
+                        assert offset == used_bytes, "Offset is not equal to used bytes"
+                    else:
+                        assert False, "This should not happen"
+                        # Process each handle to get the tensor
+                        for name, handle in name_and_handle_list:
+                            func = rebuild_cuda_tensor
+                            args = handle[0]
+                            list_args = list(args)
+                            list_args[6] = device_id
+                            tensor = func(*list_args)
+                            weights.append((name, tensor))
+
+                    # Load weights into the model
+                    from nemo_rl.models.generation import fp8
+
+                    if fp8.is_fp8_model(self.model_runner.vllm_config):
+                        # the fp8 load_weights additionally casts bf16 weights into fp8
+                        fp8.load_weights(weights, self.model_runner)
+                    else:
+                        self.model_runner.model.load_weights(weights=weights)
+                    
+                    torch.cuda.synchronize()
+                    # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
+                    self.socket.send(b"")
+
+                except Exception as e:
+                    print(
+                        f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
                     )
-                else:
-                    # Process each handle to get the tensor
-                    for name, handle in name_and_handle_list:
-                        func = rebuild_cuda_tensor
-                        args = handle[0]
-                        list_args = list(args)
-                        list_args[6] = device_id
-                        tensor = func(*list_args)
-                        weights.append((name, tensor))
+                    return False
 
-                # Load weights into the model
-                from nemo_rl.models.generation import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
-
-            except Exception as e:
-                print(
-                    f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
-                )
-                return False
-
-            # torch.cuda.synchronize()
-            self.socket.send(b"")
+            #n torch.cuda.synchronize()
             # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
         
         if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
@@ -203,28 +187,6 @@ class VllmInternalWorkerExtension:
         self.count_of_function_calls += 1
 
         return True
-
-    def _release_tensors_fast(self, tensor_dict: dict) -> None:
-        """Fast tensor release to avoid slow cudaIpcCloseMemHandle operations.
-        
-        This function explicitly releases tensors without waiting for garbage collection
-        to avoid the slow cudaIpcCloseMemHandle operation that occurs when IPC memory
-        handles are held by old tensor references.
-        """
-        if not tensor_dict:
-            return
-            
-        # Explicitly delete each tensor to release IPC handles immediately
-        for tensor in tensor_dict.values():
-            if hasattr(tensor, 'data_ptr'):
-                # Force immediate release of the tensor's memory handle
-                del tensor
-        
-        # Clear the dictionary
-        tensor_dict.clear()
-        
-        # Force garbage collection without synchronization
-        gc.collect()
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
