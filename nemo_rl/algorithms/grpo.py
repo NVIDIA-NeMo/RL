@@ -740,11 +740,17 @@ def grpo_train(
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
-                        # don't sharpen the ones with no variation
-                        zero_std_mask = std > 0
-                        advantages[zero_std_mask] = (
-                            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
-                        )
+                        if master_config["grpo"].get("use_verl_normalization", False):
+                            # Use epsilon to avoid division by zero instead of masking
+                            epsilon = 1e-6
+                            advantages = advantages / (std.unsqueeze(-1) + epsilon)
+
+                        else:
+                            # don't sharpen the ones with no variation
+                            zero_std_mask = std > 0
+                            advantages[zero_std_mask] = (
+                                advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                            )
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
