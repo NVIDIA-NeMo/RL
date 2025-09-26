@@ -46,6 +46,7 @@ checkpointing:
   keep_top_k: 100
   save_period: 10
   checkpoint_must_save_by: null
+  model_save_format: "dummy" #"safetensors"
 
 policy:
   model_name: "Qwen/Qwen3-14B-Base"
