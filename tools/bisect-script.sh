@@ -143,6 +143,10 @@ trap on_interrupt_or_error INT TERM ERR
 
 # Always reset bisect on exit to restore original state
 cleanup_reset() {
+  if [[ -n "${BISECT_NO_RESET:-}" ]]; then
+    # Respect user's request to not reset the bisect
+    return
+  fi
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if git bisect log >/dev/null 2>&1; then
       git bisect reset >/dev/null 2>&1 || true
@@ -151,12 +155,10 @@ cleanup_reset() {
 }
 trap cleanup_reset EXIT
 
-# Reset any ongoing bisect unless user asked to keep it
+# Check if we are already in a bisect session
 if git bisect log >/dev/null 2>&1; then
-  # We are in a bisect session
-  if [[ -z "${BISECT_NO_RESET:-}" ]]; then
-    git bisect reset >/dev/null 2>&1 || true
-  fi
+  fecho "[bisect] We are already in a bisect session. Please reset the bisect manually if you want to start a new one."
+  exit 1
 fi
 
 set -x
