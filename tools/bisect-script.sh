@@ -9,7 +9,7 @@ Usage: GOOD=<good_ref> BAD=<bad_ref> tools/bisect-script.sh [command ...]
 Runs a git bisect session between GOOD and BAD to find the first bad commit.
 
 Examples:
-  GOOD=v1.2.3 BAD=HEAD tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
+  GOOD=464ed38 BAD=HEAD tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
   GOOD=56a6225 BAD=32faafa tools/bisect-script.sh uv run --group dev pre-commit run --all-files
 
 Exit codes inside the command determine good/bad:

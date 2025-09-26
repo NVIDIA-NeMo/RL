@@ -1,2 +1,2 @@
 def test_foobar():
-    assert 1 == 1
+    assert 2 == 2
