@@ -13,35 +13,34 @@ Examples:
   GOOD=464ed38 BAD=c843f1b tools/bisect-script.sh uv run --group test pytest tests/unit/test_foobar.py
 
   # Example ouptut:
-  #    1. Will run until hits the first bad commit
-  #    2. Will show the bisect log (what was run) and visualize the bisect
+  #    1. Will run until hits the first bad commit.
+  #    2. Will show the bisect log (what was run) and visualize the bisect.
+  #    3. Reset git bisect state to return you to the git state you were originally.
   #
   #    25e05a3d557dfe59a14df43048e16b6eea04436e is the first bad commit
   #    commit 25e05a3d557dfe59a14df43048e16b6eea04436e
   #    Author: Terry Kong <terryk@nvidia.com>
   #    Date:   Fri Sep 26 17:24:45 2025 +0000
-  
+  #
   #        3==4
-  #        
+  #
   #        Signed-off-by: Terry Kong <terryk@nvidia.com>
-  
+  #
   #     tests/unit/test_foobar.py | 2 +-
   #     1 file changed, 1 insertion(+), 1 deletion(-)
   #    bisect found first bad commit
   #    + RUN_STATUS=0
   #    + set +x
   #    [bisect] --- bisect log ---
-  #    # bad: [f117e6fb52823d083663d5d6c5a5c852e5b23853] 3==4 (n=8)
+  #    # bad: [c843f1b994cb7e331aa8bc41c3206a6e76e453ef] try echo
   #    # good: [464ed38e68dcd23f0c1951784561dc8c78410ffe] add passing foobar
-  #    git bisect start 'HEAD' '464ed38'
-  #    # good: [e5df1c2d35514f306df6dfaa3c53e6a82a3a7abe] ok try this
-  #    git bisect good e5df1c2d35514f306df6dfaa3c53e6a82a3a7abe
-  #    # good: [c82e0b69d52b8e1641226c022cb487afebe8ba99] 2==2
-  #    git bisect good c82e0b69d52b8e1641226c022cb487afebe8ba99
-  #    # bad: [2fcb4071404559f13295aeafc09092435867ab4c] 3==4 (n=5)
-  #    git bisect bad 2fcb4071404559f13295aeafc09092435867ab4c
+  #    git bisect start 'c843f1b' '464ed38'
+  #    # good: [8b8b3961e9cdbc1b4a9b6a912f7d36d117952f62] try visualize
+  #    git bisect good 8b8b3961e9cdbc1b4a9b6a912f7d36d117952f62
   #    # bad: [25e05a3d557dfe59a14df43048e16b6eea04436e] 3==4
   #    git bisect bad 25e05a3d557dfe59a14df43048e16b6eea04436e
+  #    # good: [c82e0b69d52b8e1641226c022cb487afebe8ba99] 2==2
+  #    git bisect good c82e0b69d52b8e1641226c022cb487afebe8ba99
   #    # first bad commit: [25e05a3d557dfe59a14df43048e16b6eea04436e] 3==4
   #    [bisect] --- bisect visualize (oneline) ---
   #    25e05a3d (HEAD) 3==4
