@@ -1016,8 +1016,9 @@ def run_async_penguin_rollout(
         for key in keys:
             values = []
             for r in agent_results:
-                if isinstance(r[key], (bool, int, float)):
+                if isinstance(r.get(key), (bool, int, float)):
                     values.append(float(r[key]))
+
             if values:
                 per_agent_metrics.update(_calculate_single_metric(values, len(agent_results), f"{agent_name}/{key}"))
 
