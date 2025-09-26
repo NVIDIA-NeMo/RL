@@ -15,11 +15,15 @@
 
 set -euo pipefail
 
+# When we bisect, we need to ensure that the venvs are refreshed b/c the commit could
+# habe changed the uv.lock or 3rdparty submoduels, so we need to force a rebuild to be safe
+export NRL_FORCE_REBUILD_VENVS=true
 print_usage() {
   cat <<EOF
 Usage: GOOD=<good_ref> BAD=<bad_ref> tools/bisect-script.sh [command ...]
 
 Runs a git bisect session between GOOD and BAD to find the first bad commit.
+Sets NRL_FORCE_REBUILD_VENVS=true to ensure test environments are rebuilt to match commit's uv.lock.
 
 Examples:
   GOOD=56a6225 BAD=32faafa tools/bisect-script.sh uv run --group dev pre-commit run --all-files
@@ -170,8 +174,10 @@ if git bisect log >/dev/null 2>&1; then
 fi
 
 set -x
+set +e  # Temporarily allow the command to fail to capture the exit status
 git bisect run "${USER_CMD[@]}"
 RUN_STATUS=$?
+set -e
 set +x
 
 # Show bisect details before cleanup
