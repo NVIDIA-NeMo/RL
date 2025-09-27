@@ -518,6 +518,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class No200Filter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
+                print("UVICORN LOGGING MESSAGE", repr(msg))
                 return not msg.strip().endswith("200") and "Added request" not in msg
 
         uvicorn_logger = getLogger("uvicorn.access")
