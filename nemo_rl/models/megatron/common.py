@@ -348,6 +348,7 @@ def forward_step_arbitrary_loss(
             position_ids,
             attention_mask,
             packed_seq_params=packed_seq_params,
+            fp32_output=False,
         )
 
         # Apply temperature scaling to logits for training
