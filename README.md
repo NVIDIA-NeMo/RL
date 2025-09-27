@@ -3,6 +3,8 @@
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
 
 ## 📣 News
+* [9/25/2025] On-policy Distillation (Qwen3-style)
+    * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
@@ -59,7 +61,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Megatron Bridge Integration** - Integrate Megatron Bridge to enable training features from Megatron Core.
 - 🔜 **NeMo Automodel Integration** - Integrate NeMo Automodel to power our DTensor path.
 - 🔜 **New Models** - gpt-oss.
-- 🔜 **Expand Algorithms** - DAPO, GSPO.
+- 🔜 **Expand Algorithms** - DAPO, GSPO, On-policy Distillation.
 - 🔜 **GB200** - Add container support for GB200.
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
@@ -83,6 +85,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |Algorithms|Single Node|Multi-node|
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
+    |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
     |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -310,6 +313,49 @@ We also support multi-turn generation and training (tool use, games, etc.).
 Reference example for training to play a Sliding Puzzle Game:
 ```sh
 uv run python examples/run_grpo_sliding_puzzle.py
+```
+
+## On-policy Distillation
+
+We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
+
+> [!NOTE]
+> Distillation currently supports the DTensor and vLLM generation backend. Megatron generation/training paths are not supported yet.
+
+### On-policy Distillation Single Node
+
+To run on-policy distillation on a single GPU using `Qwen/Qwen3-1.7B-Base` as the student and `Qwen/Qwen3-4B` as the teacher:
+
+```sh
+uv run python examples/run_distillation_math.py
+```
+
+Customize parameters with command-line overrides. For example:
+
+```sh
+uv run python examples/run_distillation_math.py \
+  policy.model_name="Qwen/Qwen3-1.7B-Base" \
+  teacher.model_name="Qwen/Qwen3-4B" \
+  cluster.gpus_per_node=8
+```
+
+### On-policy Distillation Multi-node
+
+```sh
+# Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_distillation_math.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
 ```
 
 ## Supervised Fine-Tuning (SFT)

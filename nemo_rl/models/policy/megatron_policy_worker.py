@@ -1373,6 +1373,19 @@ class MegatronPolicyWorker:
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
+    @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ):
+        raise NotImplementedError(
+            "get_topk_logits (teacher top-k logits for distillation) is not implemented for the Megatron backend yet."
+            " Track progress in the GitHub issue: https://github.com/NVIDIA-NeMo/RL/issues/1151"
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
         self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

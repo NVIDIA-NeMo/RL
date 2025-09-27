@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import ray
+import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -43,6 +44,7 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
+    TopkLogitsOutputSpec,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
@@ -370,6 +372,72 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
+
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data: list[SlicedDataDict]
+        unsorted_data_indices: list[int]
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            # we just shard into DP shards here as Sequence packing allows for CP.
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_topk_logits",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+
+        # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
+        all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
+
+        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
+        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
+        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            stacked.reorder_data(unsorted_data_indices)
+
+        return stacked
 
     def train(
         self,
