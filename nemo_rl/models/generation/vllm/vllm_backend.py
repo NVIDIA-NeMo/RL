@@ -73,7 +73,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0927/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0928_orig/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -171,6 +171,12 @@ class VllmInternalWorkerExtension:
                     torch.cuda.synchronize()
                     # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
                     self.socket.send(b"")
+                    # buffer = torch.empty(0, device=self.device)
+                    # del buffer
+                    # buffer = None
+                    # gc.collect()
+                    # torch.cuda.empty_cache()
+
 
                 except Exception as e:
                     print(
