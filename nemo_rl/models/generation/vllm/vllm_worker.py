@@ -699,11 +699,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any], kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            kv_scales (dict, optional): Dictionary of KV cache scales for FP8 quantization.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -721,10 +722,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             if self.tensor_parallel_size == 1:
                 # UniProcExecutor
                 assert len(self.vllm_device_ids) == 1
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_local_ipc_handles",
-                    args=(ipc_handles[self.vllm_device_ids[0]],),
-                )
+                if kv_scales:
+                    result_or_coro = self.llm.collective_rpc(
+                        "update_weights_from_local_ipc_handles",
+                        args=(ipc_handles[self.vllm_device_ids[0]], kv_scales),
+                    )
+                else:
+                    result_or_coro = self.llm.collective_rpc(
+                        "update_weights_from_local_ipc_handles",
+                        args=(ipc_handles[self.vllm_device_ids[0]],),
+                    )
             else:
                 """
                 DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
@@ -739,12 +746,21 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 for worker, device_id in zip(
                     self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
                 ):
-                    ray_worker_outputs.append(
-                        worker.execute_method.remote(
-                            "update_weights_from_local_ipc_handles",
-                            ipc_handles[device_id],
+                    if kv_scales:
+                        ray_worker_outputs.append(
+                            worker.execute_method.remote(
+                                "update_weights_from_local_ipc_handles",
+                                ipc_handles[device_id],
+                                kv_scales,
+                            )
                         )
-                    )
+                    else:
+                        ray_worker_outputs.append(
+                            worker.execute_method.remote(
+                                "update_weights_from_local_ipc_handles",
+                                ipc_handles[device_id],
+                            )
+                        )
 
                 # Gather the results
                 result_or_coro = ray.get(ray_worker_outputs)
@@ -765,7 +781,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -777,9 +793,14 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
+            if kv_scales:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective", args=(kv_scales,)
+                )
+            else:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
             worker_result = result_or_coro[0]
 
             if not worker_result:

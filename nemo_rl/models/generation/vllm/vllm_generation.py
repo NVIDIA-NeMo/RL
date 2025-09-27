@@ -742,13 +742,14 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any], kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
 
         For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
 
         Args:
             ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            kv_scales (dict, optional): Dictionary of KV cache scales for FP8 quantization.
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -773,12 +774,20 @@ class VllmGeneration(GenerationInterface):
             ipc_handles_list.append(worker_ipc_handles)
 
         try:
-            # Directly pass ipc_handles to the method
-            futures = self.worker_group.run_all_workers_multiple_data(
-                method_name,
-                ipc_handles=ipc_handles_list,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
+            # Pass both ipc_handles and kv_scales to the method
+            if kv_scales:
+                futures = self.worker_group.run_all_workers_multiple_data(
+                    method_name,
+                    ipc_handles=ipc_handles_list,
+                    kv_scales=[kv_scales] * len(ipc_handles_list),
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                )
+            else:
+                futures = self.worker_group.run_all_workers_multiple_data(
+                    method_name,
+                    ipc_handles=ipc_handles_list,
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                )
             # Wait for all futures to complete
             results = ray.get(futures)
             return all(result for result in results if result is not None)
@@ -786,7 +795,7 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during update weights: {e}")
             return False
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -799,10 +808,17 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
+        if kv_scales:
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                kv_scales=kv_scales,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+        else:
+            futures = self.worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures

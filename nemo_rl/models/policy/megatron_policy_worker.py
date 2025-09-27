@@ -17,6 +17,8 @@ import os
 import time
 import warnings
 from collections import defaultdict
+import json
+import re
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
@@ -1867,6 +1869,10 @@ class MegatronPolicyWorker:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        # Temporary fix to avoid OOM after saving checkpoint
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(f"GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -1927,6 +1933,30 @@ class MegatronPolicyWorker:
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
+            
+            # Temporary fix to avoid OOM after saving checkpoint: https://github.com/NVIDIA-NeMo/RL/issues/1057
+            torch.randn(1).cuda()  # wake up torch allocator
+            if hasattr(self, "optimizer") and self.optimizer is not None:
+                # Iterate through the state dictionaries for each parameter group
+                if isinstance(self.optimizer, ChainedOptimizer):
+                    optimizer_state = self.optimizer.state
+                else:
+                    optimizer_state = self.optimizer._get_state()
+                for _, state in optimizer_state.items():
+                    # Iterate through the state items (e.g., momentum, variance) for a parameter
+                    for k, v in state.items():
+                        # Check if the item is a tensor and on the GPU
+                        if torch.is_tensor(v) and v.is_cuda:
+                            # Move the tensor to CPU and update the state dictionary
+                            state[k] = v.to("cpu")
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+            print(f"GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
@@ -1957,3 +1987,208 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        save_path: Optional[str] = None,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
+
+        - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
+        - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
+        - By default only returns and saves K/V scales, optionally returns Q.
+
+        Args:
+            data: Representative sample batch for calibration, following get_logprobs input conventions.
+            micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
+            percentile: Percentile for amax (e.g. 99.9).
+            margin: Margin factor, e.g. 1.05.
+            save_path: If provided, rank0 will save results as JSON.
+            include_q: Whether to also return Q scale (usually only K/V needed).
+
+        Returns:
+            { "format": "fp8", "percentile": float, "margin": float,
+              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+        """
+
+        # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
+        # Defaults align with FP8 e4m3 max magnitude.
+        # Use different defaults for Q, K, V to adapt to distribution diffefences
+        def _get_env_float(name: str, default: float) -> float:
+            try:
+                val = os.getenv(name, None)
+                return float(val) if val is not None and val != "" else default
+            except Exception:
+                return default
+
+        FP8_MAX_Q = _get_env_float("FP8_MAX_Q", 448.0)
+        FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
+        FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
+
+        self.model.eval()
+
+        # Record local percentile amax for q/k/v of each layer
+        layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
+        hook_handles = []
+
+        def _extract_layer_key(module_name: str) -> str:
+            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
+            if m is not None:
+                return f"layer_{m.group(1)}"
+            return module_name
+
+        # Hook to capture q/k/v after q/k norm and RoPE
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
+                try:
+                    args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                    if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                        args = args[0]
+                    # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
+                    q = args[0]
+                    k = args[1]
+                    v = args[2]
+                    if include_q:
+                        layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
+                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
+                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
+                except Exception as e:
+                    print(f"[KV_SCALES] Error in core_attention pre-hook on {module_name}: {e}")
+                    pass
+
+            return _pre_hook
+
+        matched_modules = []
+        # Try to register forward_pre_hook on core_attention first
+        for name, module in self.model.named_modules():
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(f"[KV_SCALES] Error registering pre-hook on {name}: {e}")
+                    continue
+
+        if not hook_handles:
+            print("[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:")
+            try:
+                # Print the first 10 modules and parameters to help locate the actual names
+                cnt = 0
+                for n, _m in self.model.named_modules():
+                    if cnt >= 10:
+                        break
+                    print(f"    [module] {n}")
+                    cnt += 1
+                cnt = 0
+                for n, _p in self.model.named_parameters():
+                    if cnt >= 10:
+                        break
+                    print(f"    [param]  {n}")
+                    cnt += 1
+            except Exception:
+                pass
+        else:
+            # Lightly print the first few modules and parameters to confirm hits
+            print("[KV_SCALES] Registered hooks on modules (showing up to 8):")
+            for i, (mn, cls, kind) in enumerate(matched_modules[:8]):
+                print(f"    {i:02d}: {mn}  <{cls}>  [{kind}]")
+
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
+        try:
+            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception as e:
+                    print(f"[KV_SCALES] Error removing hook: {e}")
+                    pass    
+
+        # Compute local percentile amax
+        def _percentile(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
+            rank = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
+            return float(t[rank].item())
+
+        local_layer_to_pamax = {}
+        for layer_key in set(list(layer_to_samples_k.keys()) + list(layer_to_samples_v.keys()) + (list(layer_to_samples_q.keys()) if include_q else [])):
+            entry = {}
+            if include_q:
+                entry["q_amax_p"] = _percentile(layer_to_samples_q.get(layer_key, []), percentile)
+            entry["k_amax_p"] = _percentile(layer_to_samples_k.get(layer_key, []), percentile)
+            entry["v_amax_p"] = _percentile(layer_to_samples_v.get(layer_key, []), percentile)
+            local_layer_to_pamax[layer_key] = entry
+
+        # Merge across all ranks: take maximum of percentile amax (conservative approach)
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        gathered = [None for _ in range(world_size)] if world_size > 1 else None
+        if world_size > 1:
+            torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
+            merged = defaultdict(dict)
+            for d in gathered:  # type: ignore
+                if d is None:
+                    continue
+                for k, v in d.items():
+                    dst = merged[k]
+                    for kk, vv in v.items():
+                        dst[kk] = max(dst.get(kk, 0.0), float(vv))
+            layer_to_pamax = dict(merged)
+        else:
+            layer_to_pamax = local_layer_to_pamax
+
+        # Compute scale (symmetric quantization): scale = pamax / fp8_max
+        result_layers = {}
+        for layer_key, vals in layer_to_pamax.items():
+            out_entry = {}
+            if include_q:
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_Q
+                out_entry["q_scale"] = float(q_scale)
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_K
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_V
+            out_entry["k_scale"] = float(k_scale)
+            out_entry["v_scale"] = float(v_scale)
+            result_layers[layer_key] = out_entry
+
+        final_result = {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": result_layers,
+        }
+        print(f"[KV_SCALES] Calibrated KV cache scales: {final_result}")
+
+        # Sync results across all ranks (broadcast rank0's result)
+        if world_size > 1:
+            if torch.distributed.get_rank() == 0:
+                obj_list = [final_result]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]
+            else:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]  # type: ignore
+
+        # Optional save to JSON (only rank0)
+        if save_path is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            try:
+                with open(save_path, "w") as f:
+                    json.dump(final_result, f)
+            except Exception:
+                pass
+
+        return final_result

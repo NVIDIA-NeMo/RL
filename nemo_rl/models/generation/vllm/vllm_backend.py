@@ -13,7 +13,6 @@
 # limitations under the License.
 from collections import defaultdict
 from typing import Any, Optional
-
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
@@ -87,11 +86,12 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_local_ipc_handles"
     )
-    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
+    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles, kv_scales: Optional[dict[str, float]] = None):
         """Update weights from local IPC handles.
 
         Args:
             local_device_ipc_handles (dict): parameter IPC handles for local device.
+            kv_scales (dict): KV cache scales to be loaded.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -154,14 +154,54 @@ class VllmInternalWorkerExtension:
                     tensor = func(*list_args)
                     weights.append((name, tensor))
 
+            # Add KV scales to weights if provided
+            # TODO: Remove this after debugging.
+            print(f"[KV_SCALES] KV scales to be loaded: {kv_scales}")
+            if kv_scales:
+                print(f"[KV_SCALES] Loading {len(kv_scales)} KV cache scales")
+                for param_name, scale_value in kv_scales.items():
+                    # Convert scale to tensor
+                    scale_tensor = torch.tensor(scale_value, dtype=torch.float32)
+                    weights.append((param_name, scale_tensor))
+
+            # Debug print to check if the KV scales are in the weights
+            # TODO: Remove this after debugging.
+            kv_scale_params = [name for name, _ in weights if any(scale_name in name for scale_name in ['q_scale', 'k_scale', 'v_scale'])]
+            print(f"[KV_SCALES] KV scale parameters found in weights: {kv_scale_params}")
+            if kv_scale_params:
+                for name, tensor in weights:
+                    if any(scale_name in name for scale_name in ['q_scale', 'k_scale', 'v_scale']):
+                        print(f"[KV_SCALES] Parameter {name}: shape={tensor.shape}, dtype={tensor.dtype}, value={tensor.item() if tensor.numel() == 1 else 'multi-element'}")
+            else:
+                print("[KV_SCALES] No KV scale parameters found in weights")
+        
             # Load weights into the model
             from nemo_rl.models.generation import fp8
 
             if fp8.is_fp8_model(self.model_runner.vllm_config):
                 # the fp8 load_weights additionally casts bf16 weights into fp8
+                # TODO: Remove this after debugging.
+                print(f"[KV_SCALES] Loading weights into FP8 model")
                 fp8.load_weights(weights, self.model_runner)
             else:
                 self.model_runner.model.load_weights(weights=weights)
+            
+            # When kv_scales is provided, we need to invoke process_weights_after_loading() 
+            # to copy the q_scale, _k_scale and _v_scale scales to the _q_scale, _k_scale and _v_scale attributes used during inference
+            if kv_scales:
+                print(f"[KV_SCALES] Processing {len(kv_scales)} KV cache scales after weight loading")
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                
+                # Get target device for processing
+                target_device = next(self.model_runner.model.parameters()).device
+                
+                # Call process_weights_after_loading to handle KV scales
+                process_weights_after_loading(
+                    self.model_runner.model, 
+                    self.model_runner.model_config, 
+                    target_device
+                )
+                print("[KV_SCALES] KV cache scales processing completed")
 
             return True
         except Exception as e:
@@ -173,7 +213,7 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
@@ -181,17 +221,45 @@ class VllmInternalWorkerExtension:
         )
 
         try:
+            weights = []
             for name, (shape, dtype) in self.state_dict_info.items():
                 weight = torch.empty(shape, dtype=dtype, device="cuda")
                 self.model_update_group.broadcast(weight, src=0)
+                weights.append((name, weight))
+            
+            # Add KV scales if provided
+            if kv_scales:
+                print(f"[KV_SCALES] Loading {len(kv_scales)} KV cache scales via collective")
+                for param_name, scale_value in kv_scales.items():
+                    # Convert scale to tensor
+                    scale_tensor = torch.tensor(scale_value, dtype=torch.float32, device="cuda")
+                    weights.append((param_name, scale_tensor))
 
-                from nemo_rl.models.generation import fp8
+            from nemo_rl.models.generation import fp8
 
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights([(name, weight)], self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=[(name, weight)])
+            if fp8.is_fp8_model(self.model_runner.vllm_config):
+                # the fp8 load_weights additionally casts bf16 weights into fp8
+                fp8.load_weights(weights, self.model_runner)
+            else:
+                self.model_runner.model.load_weights(weights=weights)
+            
+            # When kv_scales is provided, we need to invoke process_weights_after_loading() 
+            # to copy the q_scale, _k_scale and _v_scale scales to the _q_scale, _k_scale and _v_scale attributes used during inference
+            if kv_scales:
+                print(f"[KV_SCALES] Processing {len(kv_scales)} KV cache scales after collective weight loading")
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                
+                # Get target device for processing
+                target_device = next(self.model_runner.model.parameters()).device
+                
+                # Call process_weights_after_loading to handle KV scales
+                process_weights_after_loading(
+                    self.model_runner.model, 
+                    self.model_runner.model_config, 
+                    target_device
+                )
+                print("[KV_SCALES] KV cache scales processing completed")
+                
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

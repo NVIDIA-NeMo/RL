@@ -588,6 +588,71 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        save_path: Optional[str] = None,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
+
+        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements 
+        distributed reduction, returning results merged across ranks. Therefore, we shard the 
+        input by DP and call in parallel, then take the result from the first worker.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "calibrate_qkv_fp8_scales",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "micro_batch_size": micro_batch_size,
+                "percentile": percentile,
+                "margin": margin,
+                "save_path": save_path,
+                "include_q": include_q,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        return results[0]
+
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
     ) -> list[list[str]]:
