@@ -490,8 +490,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NoAddedRequestFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
-                # TODO REMOVE THIS PRINT
-                print("VLLM LOGGER", repr(msg))
                 return "Added request" not in msg
 
         vllm_async_llm_logger.addFilter(NoAddedRequestFilter())
