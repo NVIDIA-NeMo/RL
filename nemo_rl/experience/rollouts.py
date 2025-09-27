@@ -1024,6 +1024,9 @@ def run_async_penguin_rollout(
 
     rollout_metrics.update(per_agent_metrics)
 
+    # Necessary for downstream nemo rl logging/printing.
+    rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics["gen_tokens_per_sample/mean"]
+
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {

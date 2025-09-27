@@ -122,10 +122,6 @@ def main() -> None:
     setup_penguin_config(config, tokenizer)
     setup_qwen3_penguin_config(config, tokenizer)
 
-    # Print config
-    print("Final config:")
-    pprint.pprint(config)
-
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_penguin(config)
 
@@ -138,6 +134,24 @@ def main() -> None:
         jsonl_fpath=config["data"]["validation_jsonl_fpath"],
         tokenizer=tokenizer,
     )
+
+    # Validation dataset config setup.
+    if config["grpo"]["max_val_samples"] is not None:
+        raise ValueError(
+            """A non-null `grpo.max_val_samples` parameter is not supported. 
+
+Gym principle is that there is no hidden data pre or post processing from you. What you see is what you get.
+
+The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
+        )
+
+    print(f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}")
+    config["grpo"]["max_val_samples"] = len(val_dataset)
+    config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
+
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
 
     init_ray()
 
@@ -153,19 +167,6 @@ def main() -> None:
         grpo_state,
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
-
-    if config["grpo"]["max_val_samples"] is not None:
-        raise ValueError(
-            """A non-null `grpo.max_val_samples` parameter is not supported. 
-
-Gym principle is that there is no hidden data pre or post processing from you. What you see is what you get.
-
-The validation set you pass in will directly be used for validation with no additional preprocessing. If you want to have some number of repetitions, please include that in your dataset, via ``num_repeats``, in your dataset config and `ng_prepare_data` will prepare it accordingly."""
-        )
-
-    print(f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataloader)}")
-    config["grpo"]["max_val_samples"] = len(val_dataloader)
-    config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
 
     penguin_config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],

@@ -482,6 +482,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
+        from logging import LogRecord, getLogger, Filter as LoggingFilter
         import threading
 
         import uvicorn
@@ -509,6 +510,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             port=free_port,
         )
         server = uvicorn.Server(config=config)
+
+
+        print(
+            "Adding a uvicorn logging filter so that the logs aren't spammed with 200 OK messages. This is to help errors pop up better and filter out noise."
+        )
+        class No200Filter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+                return not msg.strip().endswith("200") and "Added request" not in msg
+
+        uvicorn_logger = getLogger("uvicorn.access")
+        uvicorn_logger.addFilter(No200Filter())
 
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
