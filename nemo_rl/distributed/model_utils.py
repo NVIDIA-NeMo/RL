@@ -56,6 +56,60 @@ def _compute_distributed_log_softmax(
     return vocab_parallel_logits - sum_exp_logits.log_().to(vocab_parallel_logits.dtype)
 
 
+def _compute_distributed_entropy(
+    vocab_parallel_logits: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Compute entropy across distributed vocabulary shards.
+
+    This computes the true entropy H(π) = -∑_v π(v) * log(π(v)) across all vocabulary
+    shards in a numerically stable way.
+
+    Args:
+        vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_length, vocab_size//TP]
+            where TP is the tensor parallel size.
+        group (torch.distributed.ProcessGroup): Process group for the all-reduce operations.
+
+    Returns:
+        torch.Tensor: Entropy values with shape [batch_size, seq_length].
+    """
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        logits_max,
+        op=torch.distributed.ReduceOp.MAX,
+        group=group,
+    )
+
+    vocab_parallel_logits_stable = vocab_parallel_logits - logits_max
+
+    sum_exp_logits = vocab_parallel_logits_stable.exp().sum(-1, keepdim=True).float()
+    torch.distributed.all_reduce(
+        sum_exp_logits,
+        op=torch.distributed.ReduceOp.SUM,
+        group=group,
+    )
+
+    log_probs_local = vocab_parallel_logits_stable - sum_exp_logits.log_().to(
+        vocab_parallel_logits.dtype
+    )
+
+    probs_local = log_probs_local.exp()
+
+    # Compute local entropy contribution: -p * log(p)
+    eps = 1e-8
+    entropy_local = -probs_local * torch.log(probs_local + eps)
+
+    entropy_local_sum = entropy_local.sum(dim=-1)
+
+    torch.distributed.all_reduce(
+        entropy_local_sum,
+        op=torch.distributed.ReduceOp.SUM,
+        group=group,
+    )
+
+    return entropy_local_sum
+
+
 class DistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 
