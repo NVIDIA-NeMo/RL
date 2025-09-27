@@ -554,6 +554,12 @@ class VllmGeneration(GenerationInterface):
             try:
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
+                    # sample_result is a tuple: (original_idx, BatchedDataDict)
+                    # Tag the result with worker index for downstream attribution
+                    original_idx, result_batch = sample_result
+                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
+                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                    sample_result = (original_idx, result_batch)
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging
