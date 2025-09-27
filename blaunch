@@ -12,7 +12,6 @@ CONTAINER=/mnt/data/yifuw/images/nemo-rl:f17f331-34444450.squashfs
 
 # CHANGE THESE
 WANDB_API_KEY=""
-#NEMO_RL_CHECKPOINT_DIR=/lustre/fs1/portfolios/coreai/users/yifuw/nemo_rl_checkpoints
 NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 if [ -n "$CMD" ]; then

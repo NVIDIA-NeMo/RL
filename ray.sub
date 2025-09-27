@@ -102,6 +102,11 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
+# Unique identifier for container names (keep logs unchanged)
+UNIQUE_ID=${UNIQUE_ID:-$(date +%Y%m%d%H%M%S)}
+HEAD_CONTAINER_NAME="ray-head-$UNIQUE_ID"
+WORKER_CONTAINER_NAME_PREFIX="ray-worker-$UNIQUE_ID"
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
@@ -296,8 +301,8 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
-SRUN_PIDS["ray-head"]=$!
+srun $COMMON_SRUN_ARGS --container-name=$HEAD_CONTAINER_NAME --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+SRUN_PIDS["$HEAD_CONTAINER_NAME"]=$!
 
 NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
@@ -395,8 +400,8 @@ touch $LOG_DIR/ENDED
 exit 1
 EOF
 )
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
-  SRUN_PIDS["ray-worker-$i"]=$!
+  srun $COMMON_SRUN_ARGS --container-name=${WORKER_CONTAINER_NAME_PREFIX}-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  SRUN_PIDS["${WORKER_CONTAINER_NAME_PREFIX}-$i"]=$!
   sleep 3
 done
 
@@ -410,7 +415,7 @@ done
 # Before we launch a job on this cluster we need to make sure that the bringup is complete
 # We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
 extract_worker_units() {
-  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" ray status)
+  status_output=$(srun --overlap --container-name=$HEAD_CONTAINER_NAME --nodes=1 --ntasks=1 -w "$head_node" ray status)
   if echo "$status_output" | grep -q "worker_units"; then
     worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
     echo $worker_units
@@ -442,16 +447,18 @@ MOUNTS_ARGS=" --container-mounts=$MOUNTS"
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+  srun --no-container-mount-home --overlap --container-name=$HEAD_CONTAINER_NAME --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 WORKER_NUM=\${1:-}
+HEAD_CONTAINER_NAME="$HEAD_CONTAINER_NAME"
+WORKER_CONTAINER_NAME_PREFIX="$WORKER_CONTAINER_NAME_PREFIX"
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=$HEAD_CONTAINER_NAME --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
   # and use nodes_array[1] through nodes_array[N-1]
@@ -460,7 +467,7 @@ else
     exit 1
   fi
   nodes_array=($nodes)
-  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  srun $MOUNTS_ARGS --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=${WORKER_CONTAINER_NAME_PREFIX}-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
