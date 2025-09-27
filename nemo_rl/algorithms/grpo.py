@@ -959,6 +959,7 @@ def grpo_train(
 
             print(f"  • Loss: {metrics['loss']:.4f}")
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(f"  • Token mult prob error: {metrics['token_mult_prob_error']:.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
