@@ -108,9 +108,12 @@ def math_hf_data_processor(
     extra_env_info = {"ground_truth": user_message[1]["content"]}
 
     message_log: LLMMessageLogType = []
+    formatted_content = (
+        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+    )
     user_message = {
         "role": "user",
-        "content": task_data_spec.prompt.format(problem),
+        "content": formatted_content,
     }
     message: list[str] = tokenizer.apply_chat_template(  # type: ignore
         [user_message],
