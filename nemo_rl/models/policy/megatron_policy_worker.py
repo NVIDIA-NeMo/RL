@@ -1618,7 +1618,7 @@ class MegatronPolicyWorker:
             if os.getenv("NRL_PICKLE", "False") == "True":
                 import pickle
                 serialized = pickle.dumps(serialized)
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             self.zmq_socket.send_pyobj(serialized)
         # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
         with torch.profiler.record_function("zmq_recv"):
@@ -1648,7 +1648,7 @@ class MegatronPolicyWorker:
                 record_shapes=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moonshot_0924/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0928_stream/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1682,62 +1682,67 @@ class MegatronPolicyWorker:
 
         param_names = []
 
-        for name, tensor in hf_params_generator:
-            aligned_size = self.get_aligned_param_size(tensor)
-            assert aligned_size <= total_available_bytes, "Aligned size is greater than total available bytes"
-            if used_bytes + aligned_size > total_available_bytes:
+        with torch.cuda.stream(torch.cuda.current_stream()):
+            for name, tensor in hf_params_generator:
+                aligned_size = self.get_aligned_param_size(tensor)
+                assert aligned_size <= total_available_bytes, "Aligned size is greater than total available bytes"
+                if used_bytes + aligned_size > total_available_bytes:
+                    cuda_ipc_handle = get_handle_from_tensor(buffer)
+                    serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
+                    # torch.cuda.synchronize()
+                    # torch.cuda.current_stream().synchronize()
+                    self.zmq_socket.send_pyobj(serialized)
+                    self.zmq_socket.recv()
+                    # buffer.zero_()
+                    used_bytes = 0
+                    param_names = []
+                    count_of_group += 1
+
+                    buffer = torch.empty(
+                        self.get_size_in_bytes(total_available_bytes),
+                        device=tensor.device,
+                        dtype=torch.uint8,
+                        requires_grad=False,
+                    )
+
+                param_names.append(name)
+                if buffer is None:
+                    buffer = torch.empty(
+                        self.get_size_in_bytes(total_available_bytes),
+                        device=tensor.device,
+                        dtype=torch.uint8,
+                        requires_grad=False,
+                    )
+                # else:
+                #     buffer.zero_()
+                buffer[used_bytes:used_bytes+tensor.nbytes].data.copy_(
+                    tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+                )
+                used_bytes += aligned_size
+                
+            # Send any remaining tensors
+            if param_names:
                 cuda_ipc_handle = get_handle_from_tensor(buffer)
                 serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
+                # torch.cuda.current_stream().synchronize()
                 self.zmq_socket.send_pyobj(serialized)
                 self.zmq_socket.recv()
-                buffer.zero_()
+                # buffer.zero_()
                 used_bytes = 0
                 param_names = []
                 count_of_group += 1
-
-                # buffer = torch.empty(
-                #     self.get_size_in_bytes(total_available_bytes),
-                #     device=tensor.device,
-                #     dtype=torch.uint8,
-                #     requires_grad=False,
-                # )
-
-            param_names.append(name)
-            if buffer is None:
-                buffer = torch.empty(
-                    self.get_size_in_bytes(total_available_bytes),
-                    device=tensor.device,
-                    dtype=torch.uint8,
-                    requires_grad=False,
-                )
-            buffer[used_bytes:used_bytes+tensor.nbytes].data.copy_(
-                tensor.data.view(-1).view(dtype=torch.uint8),
-            )
-            used_bytes += aligned_size
-            
-        # Send any remaining tensors
-        if param_names:
-            cuda_ipc_handle = get_handle_from_tensor(buffer)
-            serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
-            torch.cuda.synchronize()
-            self.zmq_socket.send_pyobj(serialized)
+                
+            self.zmq_socket.send_pyobj("complete")
             self.zmq_socket.recv()
-            buffer.zero_()
-            used_bytes = 0
-            param_names = []
-            count_of_group += 1
-            
-        self.zmq_socket.send_pyobj("complete")
-        self.zmq_socket.recv()
-        # self.zmq_socket.close()
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
-            print(f"profiler stop", flush=True)
-            profiler.stop()
-        self.count_of_function_calls += 1
-        print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
+            # self.zmq_socket.close()
+            # gc.collect()
+            # torch.cuda.empty_cache()
+            if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
+                print(f"profiler stop", flush=True)
+                profiler.stop()
+            self.count_of_function_calls += 1
+            print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
         # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:

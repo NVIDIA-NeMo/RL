@@ -73,7 +73,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_0928_orig/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_moon_stream/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -93,7 +93,6 @@ class VllmInternalWorkerExtension:
         dtype_to_packed_tensor = {}
         buffer = None
         with torch.cuda.stream(torch.cuda.current_stream()):
-        # if True:
             while True:
                 with torch.profiler.record_function("zmq_recv_pyobj"):
                     # Blocking receive (this is the main operation)
@@ -107,6 +106,7 @@ class VllmInternalWorkerExtension:
                 if payload == "complete":
                     # means the update is done
                     # torch.cuda.synchronize()
+                    torch.cuda.current_stream().synchronize()
                     self.socket.send(b"")
                     break
                 
@@ -168,7 +168,8 @@ class VllmInternalWorkerExtension:
                     else:
                         self.model_runner.model.load_weights(weights=weights)
                     
-                    torch.cuda.synchronize()
+                    # torch.cuda.current_stream().synchronize()
+                    # torch.cuda.synchronize()
                     # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
                     self.socket.send(b"")
                     # buffer = torch.empty(0, device=self.device)
