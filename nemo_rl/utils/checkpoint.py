@@ -206,7 +206,7 @@ class CheckpointManager:
             if self.higher_is_better:
                 # For higher_is_better=True: higher metric values first, then higher step numbers
                 checkpoint_history.sort(
-                    key=lambda x: x[2].get(self.metric_name, -float("inf")),
+                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
                     reverse=True,
                 )
             else:
