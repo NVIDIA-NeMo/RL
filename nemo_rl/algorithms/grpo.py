@@ -581,6 +581,9 @@ def grpo_train(
     )
     timeout.start_iterations()
 
+    logger.log_config_dict(master_config, "train_config.json")
+    logger.log_config_dict(master_config, "train_config.yaml")
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
@@ -1185,6 +1188,10 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     timer = Timer()
+
+    logger.log_config_dict(master_config, "train_config.json")
+    logger.log_config_dict(master_config, "train_config.yaml")
+
     NEED_REFIT = True
 
     # Setup generation interface

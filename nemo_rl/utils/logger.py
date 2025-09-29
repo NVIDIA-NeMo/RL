@@ -31,6 +31,7 @@ import requests
 import swanlab
 import torch
 import wandb
+import yaml
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
@@ -1015,6 +1016,22 @@ class Logger(LoggerInterface):
             logger.log_plot(fig, step, name)
 
         plt.close(fig)
+
+    def log_config_dict(self, config: dict, filename: str):
+        # Create full path within log directory
+        filepath = os.path.join(self.base_log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        if filepath.endswith(".json"):
+            with open(filepath, "w") as f:
+                print(json.dumps(config, indent=2), end="", file=f)
+        elif filepath.endswith(".yaml"):
+            with open(filepath, "w") as f:
+                yaml.safe_dump(config, f)
+        else:
+            raise NotImplementedError
+
+        print(f"Logged config dict to {repr(filepath)}", flush=True)
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
