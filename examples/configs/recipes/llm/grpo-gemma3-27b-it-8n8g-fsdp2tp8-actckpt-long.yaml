@@ -5,6 +5,7 @@ grpo:
   max_num_steps: 20
 checkpointing:
   checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
+  model_save_format: null
 policy:
   model_name: google/gemma-3-27b-it
   tokenizer:

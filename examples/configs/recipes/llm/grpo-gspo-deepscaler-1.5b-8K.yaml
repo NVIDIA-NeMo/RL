@@ -10,6 +10,7 @@ loss_fn:
   token_level_loss: false
 checkpointing:
   keep_top_k: 10
+  model_save_format: null
 policy:
   model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
   train_global_batch_size: 64
