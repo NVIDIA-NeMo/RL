@@ -31,7 +31,9 @@ from nemo_rl.models.policy import TokenizerConfig
 
 
 def calculate_kl_penalty_joschu2020(
-    logprobs_policy: torch.Tensor, logprobs_reference: torch.Tensor
+    logprobs_policy: torch.Tensor,
+    logprobs_reference: torch.Tensor,
+    clamp_value: Optional[float] = 20.0,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two log_probs.
 
@@ -41,6 +43,8 @@ def calculate_kl_penalty_joschu2020(
     logprobs_reference: torch.Tensor (b, s)
     """
     r = logprobs_reference - logprobs_policy
+    if clamp_value is not None:
+        r = r.clamp(min=-clamp_value, max=clamp_value)
     return torch.exp(r) - r - 1
 
 
@@ -245,6 +249,12 @@ def get_tokenizer(
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
+        elif tokenizer_config["chat_template"].endswith(".jinja"):
+            # Load template from file
+            template_path = tokenizer_config["chat_template"]
+            print(f"Loading chat template from file: {template_path}")
+            with open(template_path, "r") as f:
+                tokenizer.chat_template = f.read()
         else:
             print("Using custom chat template")
             tokenizer.chat_template = tokenizer_config["chat_template"]

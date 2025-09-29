@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -203,13 +204,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
+            sequence_length_pad_multiple = (
+                cp_size * 2 * tp_size if cp_size > 1 else tp_size
+            )
+            if (
+                config["megatron_cfg"]["enabled"]
+                and config["megatron_cfg"].get("fp8_cfg", None) is not None
+                and config["megatron_cfg"]["fp8_cfg"].get("enabled", False)
+            ):
+                # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                # Ref: https://github.com/NVIDIA/TransformerEngine/blob/5b3092a0e40654436bec5ea0a0b0f7ad2887b20d/transformer_engine/pytorch/utils.py#L437-L441
+                sequence_length_pad_multiple = math.lcm(
+                    16, sequence_length_pad_multiple
+                )
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_pad_multiple": (cp_size * 2 * tp_size)
-                if cp_size > 1
-                else tp_size,
+                "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"

@@ -1,5 +1,7 @@
 # Nemo RL: A Scalable and Efficient Post-Training Library
 
+[![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
+
 ## 📣 News
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
@@ -312,7 +314,7 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 ## Supervised Fine-Tuning (SFT)
 
-We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+We provide example SFT experiments using various datasets including [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/), OpenAI format datasets (with tool calling support), and custom JSONL datasets. For detailed documentation on supported datasets and configurations, see the [SFT documentation](docs/guides/sft.md).
 
 ### SFT Single Node
 
@@ -520,7 +522,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 ## Tips and Tricks
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
-  
+
   ```sh
   ModuleNotFoundError: No module named 'megatron'
   ```
