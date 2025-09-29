@@ -1205,7 +1205,9 @@ class MegatronPolicyWorker:
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
 
-            multimodal_data = data_dict.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+            multimodal_data = data_dict.get_multimodal_dict(
+                as_tensors=True, device=input_ids.device
+            )
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,

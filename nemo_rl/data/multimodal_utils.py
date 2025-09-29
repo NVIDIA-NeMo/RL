@@ -49,7 +49,9 @@ class PackedTensor:
             )
         self.dim_to_pack = dim_to_pack
 
-    def as_tensor(self, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+    def as_tensor(
+        self, device: Optional[torch.device] = None
+    ) -> Optional[torch.Tensor]:
         if device is not None:
             # Move only non-None tensors to device, preserve Nones
             for i, item in enumerate(self.tensors):

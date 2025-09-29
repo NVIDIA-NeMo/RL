@@ -342,7 +342,9 @@ def forward_step_arbitrary_loss(
                 pad_mask_loss=False,
             )
 
-    multimodal_data = data_dict.get_multimodal_dict(as_tensors=True, device=input_ids_cp_sharded.device)
+    multimodal_data = data_dict.get_multimodal_dict(
+        as_tensors=True, device=input_ids_cp_sharded.device
+    )
     with straggler_timer:
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
