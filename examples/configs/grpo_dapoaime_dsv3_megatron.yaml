@@ -1,0 +1,49 @@
+defaults: grpo_math_1B.yaml
+grpo:
+  val_period: 20
+  max_val_samples: 2000
+loss_fn:
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo_dsv3_dapo17k
+  keep_top_k: 100
+policy:
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 4
+    apply_rope_fusion: false
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 32
+data:
+  prompt_file: null
+  dataset_name: DAPOMath17K
+env:
+  math:
+    use_dapo_math_verifier: true
+logger:
+  monitor_gpus: false
+  wandb:
+    name: grpo_dapoaime_dsv3_megatron
+  mlflow:
+    run_name: grpo_dapoaime_dsv3_megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
