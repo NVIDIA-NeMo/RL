@@ -73,7 +73,7 @@ class VllmInternalWorkerExtension:
             record_shapes=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_moon_stream/memory_trace_vllm",
+                "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0929_stream/memory_trace_vllm",
                 use_gzip=True,
             ),
         )
@@ -81,6 +81,13 @@ class VllmInternalWorkerExtension:
             profiler.start()
 
         print(f"[VllmInternalWorkerExtension] Updating weights from IPC ZMQ to {self.zmq_address}", flush=True)
+        
+        # Reset ZMQ socket state between function calls to prevent state issues
+        if hasattr(self, "socket") and self.socket is not None:
+            # Flush any pending messages
+            while self.socket.poll(timeout=0):
+                self.socket.recv()
+        
         if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
             self.socket = self._zmq_ctx.socket(zmq.REP)
@@ -92,6 +99,7 @@ class VllmInternalWorkerExtension:
         
         dtype_to_packed_tensor = {}
         buffer = None
+        # sync_event = torch.cuda.Event(enable_timing=False)
         with torch.cuda.stream(torch.cuda.current_stream()):
             while True:
                 with torch.profiler.record_function("zmq_recv_pyobj"):
@@ -99,14 +107,16 @@ class VllmInternalWorkerExtension:
                     payload = self.socket.recv_pyobj()
                     # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
                 
-                # Synchronize before processing
-                # torch.cuda.synchronize()
+                # Strong synchronization to ensure sender operations are complete
+                torch.cuda.synchronize()
                 
                 # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
                 if payload == "complete":
                     # means the update is done
                     # torch.cuda.synchronize()
-                    torch.cuda.current_stream().synchronize()
+                    # torch.cuda.current_stream().synchronize()
+                    # sync_event.record()
+                    # sync_event.wait()
                     self.socket.send(b"")
                     break
                 
@@ -168,8 +178,8 @@ class VllmInternalWorkerExtension:
                     else:
                         self.model_runner.model.load_weights(weights=weights)
                     
-                    # torch.cuda.current_stream().synchronize()
-                    # torch.cuda.synchronize()
+                    # Strong synchronization after loading weights to ensure completion
+                    torch.cuda.synchronize()
                     # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
                     self.socket.send(b"")
                     # buffer = torch.empty(0, device=self.device)

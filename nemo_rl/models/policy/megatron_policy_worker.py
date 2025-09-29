@@ -1648,7 +1648,7 @@ class MegatronPolicyWorker:
                 record_shapes=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0928_stream/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_moon_0929_stream/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1668,8 +1668,6 @@ class MegatronPolicyWorker:
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,
         )
-        gathered_hf_params = {}
-        type_to_total_size = defaultdict(lambda: 0)
         used_bytes = 0
         count_of_group = 0
         prec_to_bytes = {
@@ -1681,16 +1679,35 @@ class MegatronPolicyWorker:
         buffer = None
 
         param_names = []
-
+        
+        # Ensure all previous operations are complete before starting new call
+        torch.cuda.current_stream().synchronize()
+        
+        # Refresh ZMQ socket to prevent state issues between calls
+        if hasattr(self, 'zmq_socket') and self.zmq_socket is not None:
+            # Flush any pending messages
+            try:
+                while self.zmq_socket.poll(timeout=0):
+                    self.zmq_socket.recv()
+            except:
+                pass  # No pending messages
+            
+            # Optional: Recreate socket if needed (more aggressive)
+            # self.zmq_socket.close()
+            # self.init_zmq()
+        
+        # Create fresh event for this synchronization
+        sync_event = torch.cuda.Event(enable_timing=False)
+        
         with torch.cuda.stream(torch.cuda.current_stream()):
             for name, tensor in hf_params_generator:
                 aligned_size = self.get_aligned_param_size(tensor)
                 assert aligned_size <= total_available_bytes, "Aligned size is greater than total available bytes"
                 if used_bytes + aligned_size > total_available_bytes:
+                    # Strong synchronization required for IPC handle correctness
+                    torch.cuda.current_stream().synchronize()
                     cuda_ipc_handle = get_handle_from_tensor(buffer)
                     serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
-                    # torch.cuda.synchronize()
-                    # torch.cuda.current_stream().synchronize()
                     self.zmq_socket.send_pyobj(serialized)
                     self.zmq_socket.recv()
                     # buffer.zero_()
@@ -1698,12 +1715,12 @@ class MegatronPolicyWorker:
                     param_names = []
                     count_of_group += 1
 
-                    buffer = torch.empty(
-                        self.get_size_in_bytes(total_available_bytes),
-                        device=tensor.device,
-                        dtype=torch.uint8,
-                        requires_grad=False,
-                    )
+                    # buffer = torch.empty(
+                    #     self.get_size_in_bytes(total_available_bytes),
+                    #     device=tensor.device,
+                    #     dtype=torch.uint8,
+                    #     requires_grad=False,
+                    # )
 
                 param_names.append(name)
                 if buffer is None:
@@ -1713,19 +1730,17 @@ class MegatronPolicyWorker:
                         dtype=torch.uint8,
                         requires_grad=False,
                     )
-                # else:
-                #     buffer.zero_()
                 buffer[used_bytes:used_bytes+tensor.nbytes].data.copy_(
-                    tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+                    tensor.data.view(-1).view(dtype=torch.uint8),
                 )
                 used_bytes += aligned_size
                 
             # Send any remaining tensors
             if param_names:
+                # Strong synchronization required for IPC handle correctness
+                torch.cuda.current_stream().synchronize()
                 cuda_ipc_handle = get_handle_from_tensor(buffer)
                 serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
-                # torch.cuda.synchronize()
-                # torch.cuda.current_stream().synchronize()
                 self.zmq_socket.send_pyobj(serialized)
                 self.zmq_socket.recv()
                 # buffer.zero_()
@@ -1733,8 +1748,13 @@ class MegatronPolicyWorker:
                 param_names = []
                 count_of_group += 1
                 
+            sync_event.record()
+            # Wait for event (lighter than stream sync)
+            sync_event.wait()
             self.zmq_socket.send_pyobj("complete")
             self.zmq_socket.recv()
+            del buffer
+            buffer = None
             # self.zmq_socket.close()
             # gc.collect()
             # torch.cuda.empty_cache()
@@ -1744,6 +1764,7 @@ class MegatronPolicyWorker:
             self.count_of_function_calls += 1
             print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
         # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
+        torch.cuda.synchronize()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
