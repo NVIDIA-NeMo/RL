@@ -793,7 +793,8 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    logprobs_results = policy.get_logprobs(train_data)
+                    fprop_logprobs = logprobs_results["logprobs"]
                     reference_logprobs = policy.get_reference_policy_logprobs(
                         train_data
                     )["reference_logprobs"]
@@ -915,12 +916,15 @@ def grpo_train(
                 log_data, f"train_data_step{total_steps}.jsonl"
             )
 
+            print(f"train_results: {train_results['train_max_seq_len']}")
             metrics = {
                 "loss": train_results["loss"].numpy(),
+                "train_max_seq_len": train_results["train_max_seq_len"],
                 "reward": rewards.numpy(),
                 "grad_norm": train_results["grad_norm"].numpy(),
                 "mean_prompt_length": repeated_batch["length"].numpy(),
                 "total_num_tokens": input_lengths.numpy(),
+                "train_max_seq_len": train_results["train_max_seq_len"],
             }
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():

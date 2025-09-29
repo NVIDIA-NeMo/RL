@@ -1,15 +1,20 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 128
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
 policy:
-  model_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
+  model_name: /lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf
   tokenizer:
     name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
-  max_total_sequence_length: 1024
-  train_global_batch_size: 128
+  max_total_sequence_length: 24576
+  #max_total_sequence_length: 1024
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
   dtensor_cfg:
     activation_checkpointing: true
-    tensor_parallel_size: 8
+    context_parallel_size: 4
+    tensor_parallel_size: 2
     custom_parallel_plan: examples.configs.recipes.llm.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
   dynamic_batching:
     enabled: true
@@ -32,16 +37,19 @@ policy:
     - 13
   generation:
     vllm_cfg:
+      async_engine: false
       tensor_parallel_size: 4
+      #pipeline_parallel_size: 2
+  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size}, 2}, ${policy.max_total_sequence_length}}
 logger:
   wandb_enabled: true
   monitor_gpus: false
   wandb:
     project: grpo-nemotron-super-49b
-    name: grpo-${data.dataset_name}-nemotron-super-49b-tp${policy.dtensor_cfg.tensor_parallel_size}
+    name: grpo-${data.dataset_name}-nemotron-super-49b-tp${policy.dtensor_cfg.tensor_parallel_size}-cp${policy.dtensor_cfg.context_parallel_size}
   mlflow:
     experiment_name: sft-dev
     run_name: grpo-nemotron-super-49b
 cluster:
   gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 8

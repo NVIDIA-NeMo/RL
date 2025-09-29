@@ -52,6 +52,8 @@ dependencies = [
     "mlflow",
     "nvidia-nvshmem-cu12", # for deep_ep build
     "swanlab",
+    "humanize",
+    "tabulate",
 ]
 
 [project.optional-dependencies]
@@ -202,11 +204,12 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 [tool.black]
 line-length = 120
 include = '\.pyi?$'
-exclude = '''
+force-exclude = '''
 /(
     \.git
   | \.venv
   | build
+  | nemo_rl/models/dtensor/custom_models
 )/
 '''
 

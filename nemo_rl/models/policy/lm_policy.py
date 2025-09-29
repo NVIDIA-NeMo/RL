@@ -430,6 +430,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
+            "train_max_seq_len": max([r["train_max_seq_len"] for r in results]),
         }
 
         if self.flops_tracker is not None:

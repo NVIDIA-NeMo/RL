@@ -18,8 +18,10 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import wraps
 from typing import Any, Generator, Iterable, Optional, cast
 
+import humanize
 import ray
 import torch
 from accelerate import init_empty_weights
@@ -44,6 +46,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from tabulate import tabulate
 from torch import nn
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -90,6 +93,26 @@ from nemo_rl.utils.automodel_checkpoint import (
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def mem_stats(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        torch.cuda.reset_peak_memory_stats()
+        ret = func(*args, **kwargs)
+        allocated = humanize.naturalsize(torch.cuda.memory_allocated())
+        reserved = humanize.naturalsize(torch.cuda.memory_reserved())
+        peak_allocated = humanize.naturalsize(torch.cuda.max_memory_allocated())
+        peak_reserved = humanize.naturalsize(torch.cuda.max_memory_reserved())
+
+        headers = ["Allocated", "Peak Allocated", "Reserved", "Peak Reserved"]
+        row = [[allocated, peak_allocated, reserved, peak_reserved]]
+
+        print("Memory stats:")
+        print(tabulate(row, headers=headers, tablefmt="grid"))
+        return ret
+
+    return wrapper
 
 
 @ray.remote(
@@ -180,6 +203,8 @@ class DTensorPolicyWorkerV2:
             else None,
         )
 
+        # model_config.num_hidden_layers = 2
+
         self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
             model_config
         )
@@ -245,10 +270,7 @@ class DTensorPolicyWorkerV2:
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
-                use_liger_kernel=False,
+                attn_implementation="sdpa",
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
@@ -488,6 +510,7 @@ class DTensorPolicyWorkerV2:
         """Return information about the GPU being used by this worker."""
         return get_gpu_info(self.model)
 
+    @mem_stats
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -498,6 +521,8 @@ class DTensorPolicyWorkerV2:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        max_seq_len_in_step = 0
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -656,6 +681,8 @@ class DTensorPolicyWorkerV2:
                         )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
+
+                    max_seq_len_in_step = max(max_seq_len_in_step, seq_len)
 
                     context_parallel_ctx = None
                     if self.cp_size > 1:
@@ -859,6 +886,7 @@ class DTensorPolicyWorkerV2:
                 "gpu_name": torch.cuda.get_device_name(),
                 "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
+                "train_max_seq_len": max_seq_len_in_step,
             }
 
             return metrics
@@ -880,6 +908,7 @@ class DTensorPolicyWorkerV2:
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        max_seq_len_in_step = 0
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -985,6 +1014,8 @@ class DTensorPolicyWorkerV2:
                 # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
                 if len(vlm_kwargs) > 0:
                     position_ids = None
+
+                max_seq_len_in_step = max(max_seq_len_in_step, seq_len)
 
                 context_parallel_ctx = None
                 if self.cp_size > 1:
@@ -1167,6 +1198,9 @@ class DTensorPolicyWorkerV2:
                 )
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        print(f"get_logprobs: max_seq_len_in_step: {max_seq_len_in_step}")
+
+        # return_data["logprobs_max_seq_len"] = max_seq_len_in_step
 
         return return_data
 
