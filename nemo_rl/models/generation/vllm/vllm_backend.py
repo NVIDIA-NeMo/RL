@@ -82,12 +82,6 @@ class VllmInternalWorkerExtension:
 
         print(f"[VllmInternalWorkerExtension] Updating weights from IPC ZMQ to {self.zmq_address}", flush=True)
         
-        # Reset ZMQ socket state between function calls to prevent state issues
-        if hasattr(self, "socket") and self.socket is not None:
-            # Flush any pending messages
-            while self.socket.poll(timeout=0):
-                self.socket.recv()
-        
         if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
             self.socket = self._zmq_ctx.socket(zmq.REP)
@@ -108,7 +102,7 @@ class VllmInternalWorkerExtension:
                     # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
                 
                 # Strong synchronization to ensure sender operations are complete
-                torch.cuda.synchronize()
+                # torch.cuda.current_stream().synchronize()
                 
                 # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
                 if payload == "complete":
@@ -179,7 +173,7 @@ class VllmInternalWorkerExtension:
                         self.model_runner.model.load_weights(weights=weights)
                     
                     # Strong synchronization after loading weights to ensure completion
-                    torch.cuda.synchronize()
+                    torch.cuda.current_stream().synchronize()
                     # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
                     self.socket.send(b"")
                     # buffer = torch.empty(0, device=self.device)

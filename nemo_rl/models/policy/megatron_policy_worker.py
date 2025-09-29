@@ -1681,23 +1681,8 @@ class MegatronPolicyWorker:
         param_names = []
         
         # Ensure all previous operations are complete before starting new call
-        torch.cuda.current_stream().synchronize()
+        # torch.cuda.current_stream().synchronize()
         
-        # Refresh ZMQ socket to prevent state issues between calls
-        if hasattr(self, 'zmq_socket') and self.zmq_socket is not None:
-            # Flush any pending messages
-            try:
-                while self.zmq_socket.poll(timeout=0):
-                    self.zmq_socket.recv()
-            except:
-                pass  # No pending messages
-            
-            # Optional: Recreate socket if needed (more aggressive)
-            # self.zmq_socket.close()
-            # self.init_zmq()
-        
-        # Create fresh event for this synchronization
-        sync_event = torch.cuda.Event(enable_timing=False)
         
         with torch.cuda.stream(torch.cuda.current_stream()):
             for name, tensor in hf_params_generator:
@@ -1731,7 +1716,7 @@ class MegatronPolicyWorker:
                         requires_grad=False,
                     )
                 buffer[used_bytes:used_bytes+tensor.nbytes].data.copy_(
-                    tensor.data.view(-1).view(dtype=torch.uint8),
+                    tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
                 )
                 used_bytes += aligned_size
                 
@@ -1748,9 +1733,6 @@ class MegatronPolicyWorker:
                 param_names = []
                 count_of_group += 1
                 
-            sync_event.record()
-            # Wait for event (lighter than stream sync)
-            sync_event.wait()
             self.zmq_socket.send_pyobj("complete")
             self.zmq_socket.recv()
             del buffer
@@ -1764,7 +1746,6 @@ class MegatronPolicyWorker:
             self.count_of_function_calls += 1
             print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
         # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
-        torch.cuda.synchronize()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
