@@ -1018,6 +1018,14 @@ class Logger(LoggerInterface):
         plt.close(fig)
 
     def log_config_dict(self, config: dict, filename: str):
+        """Log a config dictionary to a json or yaml file.
+
+        Args:
+            config: Dict to log
+            filename: Filename to log to (within the log directory)
+        """
+        assert isinstance(config, dict)
+
         # Create full path within log directory
         filepath = os.path.join(self.base_log_dir, filename)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -1025,13 +1033,13 @@ class Logger(LoggerInterface):
         if filepath.endswith(".json"):
             with open(filepath, "w") as f:
                 print(json.dumps(config, indent=2), end="", file=f)
-        elif filepath.endswith(".yaml"):
+        elif filepath.endswith(".yaml") or filepath.endswith(".yml"):
             with open(filepath, "w") as f:
                 yaml.safe_dump(config, f)
         else:
             raise NotImplementedError
 
-        print(f"Logged config dict to {repr(filepath)}", flush=True)
+        print(f"Logged config dict to {filepath!r}", flush=True)
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
