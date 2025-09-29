@@ -1,0 +1,64 @@
+defaults: ../../distillation_math.yaml
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 500
+  val_batch_size: 32
+  val_period: 50
+  max_val_samples: 256
+loss_fn:
+  kl_type: reverse
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-8b-base-long
+  save_period: 50
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_global_batch_size: 32
+  generation_batch_size: 32
+  max_total_sequence_length: 32768
+  dtensor_cfg:
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+  make_sequence_length_divisible_by: 4
+  optimizer:
+    kwargs:
+      lr: 1.0e-05
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 150
+  - name: torch.optim.lr_scheduler.CosineAnnealingLR
+    kwargs:
+      T_max: 1350
+      eta_min: 1.0e-07
+  - milestones:
+    - 150
+teacher:
+  model_name: Qwen/Qwen3-32B
+  train_global_batch_size: 32
+  generation_batch_size: 32
+  max_total_sequence_length: 32768
+  make_sequence_length_divisible_by: 4
+  optimizer:
+    kwargs:
+      lr: 1.0e-05
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 150
+  - name: torch.optim.lr_scheduler.CosineAnnealingLR
+    kwargs:
+      T_max: 1350
+      eta_min: 1.0e-07
+  - milestones:
+    - 150
+logger:
+  log_dir: logs/distillation-qwen3-32b-to-8b-base-long
+  wandb:
+    project: nemo-rl
+    name: distillation-qwen3-32b-to-8b-base-long
+cluster:
+  num_nodes: 4

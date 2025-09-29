@@ -1,0 +1,57 @@
+defaults: ../../distillation_math.yaml
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 100
+  val_batch_size: 32
+  val_period: 10
+  max_val_samples: 256
+loss_fn:
+  kl_type: reverse
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-8b-base
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_global_batch_size: 32
+  generation_batch_size: 32
+  max_total_sequence_length: 16384
+  make_sequence_length_divisible_by: 2
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 20
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 20
+teacher:
+  model_name: Qwen/Qwen3-32B
+  train_global_batch_size: 32
+  generation_batch_size: 32
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+  make_sequence_length_divisible_by: 2
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 20
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 20
+logger:
+  log_dir: logs/distillation-qwen3-32b-to-8b-base
+  wandb:
+    project: nemo-rl
+    name: distillation-qwen3-32b-to-8b-base
+cluster:
+  num_nodes: 2

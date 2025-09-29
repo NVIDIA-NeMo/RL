@@ -1,0 +1,170 @@
+# Distillation Algorithm Configuration
+distillation:
+    num_prompts_per_step: 128
+    num_generations_per_prompt: 1
+    max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_num_steps: 1000
+    val_batch_size: 64
+    val_period: 20
+    val_at_start: false
+    max_val_samples: 512
+    topk_logits_k: 64
+    seed: 42
+
+loss_fn:
+    kl_type: "mixed" # forward, reverse, mixed
+    mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
+    zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+
+checkpointing:
+    enabled: true
+    checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
+    metric_name: "val_reward"
+    higher_is_better: true
+    keep_top_k: 3
+    save_period: 10
+    checkpoint_must_save_by: null
+    model_save_format: "safetensors"
+    save_consolidated: false
+
+policy: &POLICY_BASE
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    tokenizer:
+        name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    train_global_batch_size: 64
+    train_micro_batch_size: 1
+    generation_batch_size: 64
+    logprob_batch_size: 1
+    max_total_sequence_length: 8192
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    dtensor_cfg: &DTENSOR_BASE
+        enabled: true
+        _v2: true
+        cpu_offload: False
+        sequence_parallel: false
+        activation_checkpointing: true
+        tensor_parallel_size: 2
+        context_parallel_size: 2
+        custom_parallel_plan: null
+
+    dynamic_batching:
+        enabled: true
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        sequence_length_round: 64
+
+    sequence_packing:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        algorithm: "modified_first_fit_decreasing"
+        sequence_length_round: 64
+
+    max_grad_norm: 1.0
+    # makes the training sequence length divisible by the tensor parallel size
+    # this is useful for sequence parallel training
+    # must be divisible by 2*cp
+    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    optimizer:
+        name: "torch.optim.AdamW"
+        kwargs:
+            lr: 2.0e-5
+            weight_decay: 0.01
+            betas: [0.9, 0.999]
+            eps: 1e-8
+            # when using Dtensor, we need to set foreach
+            # and fused to False
+            foreach: False
+            fused: False
+
+    megatron_cfg: # [TODO]
+        enabled: false
+
+    scheduler:
+        - name: "torch.optim.lr_scheduler.LinearLR"
+          kwargs:
+              start_factor: 0.1
+              end_factor: 1.0
+              total_iters: 10
+        - name: "torch.optim.lr_scheduler.ConstantLR"
+          kwargs:
+              factor: 1.0
+              total_iters: 10000000000
+        - milestones: [10]
+
+    generation:
+        backend: "vllm"
+        max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
+        temperature: 1.0
+        top_p: 1.0
+        top_k: null
+        stop_token_ids: null
+        stop_strings: null
+        vllm_cfg:
+            async_engine: false
+            precision: ${...precision}
+            tensor_parallel_size: 1
+            pipeline_parallel_size: 1
+            expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+            gpu_memory_utilization: 0.6
+            max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
+            enforce_eager: False
+            use_deep_gemm: False
+            num_last_layers_in_bf16: 0
+            num_first_layers_in_bf16: 0
+            distributed_executor_backend: null
+
+        colocated:
+            # true: generation shares training GPUs
+            # false: uses dedicated generation resources
+            enabled: true
+            # only relevant when enabled is false
+            resources:
+                gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+                num_nodes: null # Decides number of nodes to be dedicated to generation
+
+
+teacher:
+    <<: *POLICY_BASE
+    model_name: "Qwen/Qwen3-4B"
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        context_parallel_size: 2 
+        tensor_parallel_size: 4
+
+data:
+    max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    dataset_name: "DeepScaler"
+    shuffle: true
+
+env:
+    math:
+        num_workers: 8
+
+logger:
+    log_dir: "logs/distillation"
+    num_val_samples_to_print: 5
+    wandb_enabled: true
+    tensorboard_enabled: true
+    mlflow_enabled: false
+    swanlab_enabled: false
+    monitor_gpus: true
+    wandb:
+        project: "nemo-distillation"
+        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    tensorboard:
+        log_dir: "tb_logs-distillation-${data.dataset_name}"
+    mlflow:
+        experiment_name: "distillation-dev"
+        run_name: "distillation-math-cl-logger"
+    gpu_monitoring:
+        collection_interval: 10
+        flush_interval: 10
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1

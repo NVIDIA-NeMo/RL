@@ -65,7 +65,11 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
+from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
+    get_logprobs_from_vocab_parallel_logits,
+)
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -1295,6 +1299,286 @@ class DTensorPolicyWorkerV2:
             }
         )
         return return_data
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits")
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-position top-k logits and corresponding global indices.
+
+        Notes:
+        - Return shapes are [B, S, k].
+        - Computes top-k over the full sequence (no trimming of the last position).
+        - If alignment with next-token targets is required, the caller should handle it.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
+        - Otherwise, computes local top-k on full-vocab tensor.
+        """
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        out_topk_vals = []
+        out_topk_idx = []
+        self.model.eval()
+
+        with torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                # dynamic batching support (no CP/packed)
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(topk_batch_size)
+                iterator_len = data.size // topk_batch_size
+
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+
+                batch_size, seq_len = input_ids.shape
+                # Store original shapes for unpacking later
+                original_batch_size = batch_size
+                original_seq_len = seq_len
+
+                if self.enable_seq_packing:
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Build attention mask (right-padded inputs)
+                    attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        attention_mask[i, :length] = 1
+
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+
+                    flash_attn_kwargs = {}
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with get_train_context(False, False, context_parallel_ctx)():
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                        )
+
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    del outputs
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+
+                    if self.cp_size > 1:
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        # deal with TP first
+                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
+
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(local_logits.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
+
+                        vals, idx = distributed_vocab_topk(
+                            local_logits,
+                            k=k,
+                            tp_group=tp_group,
+                            vocab_start_index=vocab_start_index,
+                            vocab_end_index=vocab_end_index,
+                        )
+                        # [B, S_cp, k]
+
+                        cp_group = self.cp_mesh.get_group()
+
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
+                        )
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
+                        )
+                        # [B, S, k]
+                    else:
+                        # Compute top-k over full sequence length (do not drop last position)
+                        if isinstance(logits, DTensor):
+                            local_logits = logits.to_local()  # [B, S, V_local]
+                            tp_group = self.tp_mesh.get_group()
+                            tp_rank = torch.distributed.get_rank(tp_group)
+                            V_local = int(local_logits.shape[-1])
+                            vocab_start_index = tp_rank * V_local
+                            vocab_end_index = (tp_rank + 1) * V_local
+
+                            vals, idx = distributed_vocab_topk(
+                                local_logits,
+                                k=k,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                        else:
+                            full_logits = logits.to(torch.float32)
+                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
+
+                # Handle sequence packing unpacking
+                if self.enable_seq_packing:
+                    # Unpack top-k results from packed format back to original batch format
+                    # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+
+                    # Create tensors to store unpacked results
+                    unpacked_vals = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=vals.dtype,
+                        device=vals.device,
+                    )
+                    unpacked_idx = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=idx.dtype,
+                        device=idx.device,
+                    )
+
+                    # Get cumulative sequence lengths for unpacking
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+
+                    for i in range(original_batch_size):
+                        start = cu_seqlens[i].item()
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+
+                        # Extract the corresponding portion from packed results
+                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+
+                    # Replace with unpacked results
+                    vals = unpacked_vals
+                    idx = unpacked_idx
+
+                    # Update batch_size and seq_len for consistency
+                    batch_size = original_batch_size
+                    seq_len = original_seq_len
+
+                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
+                # Shapes remain [B, S, k].
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
+        all_topk_vals_padded = []
+        all_topk_idx_padded = []
+        target_seq_len = seq_dim_size
+        for vals, idx in zip(out_topk_vals, out_topk_idx):
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
+            all_topk_vals_padded.append(vals)
+            all_topk_idx_padded.append(idx)
+
+        ret["topk_logits"] = (
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

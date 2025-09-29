@@ -18,6 +18,7 @@ import torch
 
 from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossFn,
+    DistillationLossFn,
     DPOLossFn,
     NLLLoss,
 )
@@ -1410,3 +1411,381 @@ def test_clipped_pg_loss_gspo_importance_sampling_correction():
         global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
     )
     torch.testing.assert_close(actual_loss, expected_actor_loss, atol=1e-4, rtol=1e-3)
+
+
+def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64):
+    """Setup test data for distillation loss function tests."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+
+    # Create input data
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    input_lengths = torch.tensor([seq_len] * batch_size, device=device)
+    token_mask = torch.ones((batch_size, seq_len), device=device)
+    sample_mask = torch.ones(batch_size, device=device)
+
+    # Create teacher top-k logits and indices
+    teacher_topk_logits = torch.randn((batch_size, seq_len, topk), device=device)
+    teacher_topk_indices = torch.randint(
+        0, vocab_size, (batch_size, seq_len, topk), device=device
+    )
+
+    data = {
+        "input_ids": input_ids,
+        "input_lengths": input_lengths,
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": teacher_topk_logits,
+        "teacher_topk_indices": teacher_topk_indices,
+    }
+
+    # Create student logits
+    student_logits = torch.randn((batch_size, seq_len, vocab_size), device=device)
+
+    return data, student_logits
+
+
+def test_distillation_loss_forward_kl():
+    """Test forward KL divergence loss calculation."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Verify loss is a scalar tensor
+    assert loss.dim() == 0
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Verify metrics dictionary
+    assert isinstance(metrics, dict)
+    assert "loss" in metrics
+
+
+def test_distillation_loss_reverse_kl():
+    """Test reverse KL divergence loss calculation."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Verify loss is a scalar tensor
+    assert loss.dim() == 0
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Verify metrics dictionary
+    assert isinstance(metrics, dict)
+    assert "loss" in metrics
+
+
+def test_distillation_loss_mixed_kl():
+    """Test mixed KL divergence loss calculation."""
+    data, student_logits = setup_distillation_test_data()
+
+    mixed_kl_weight = 0.3
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "mixed",
+            "mixed_kl_weight": mixed_kl_weight,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Verify loss is a scalar tensor
+    assert loss.dim() == 0
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Verify metrics dictionary
+    assert isinstance(metrics, dict)
+    assert "loss" in metrics
+
+
+def test_distillation_loss_topk_filtering():
+    """Test top-k filtering functionality with various k values."""
+    # Test with different k values (excluding k=0 which should be invalid)
+    k_values = [1, 32, 64, 1000000]  # Valid k values
+
+    for k in k_values:
+        data, student_logits = setup_distillation_test_data(topk=k)
+
+        loss_fn = DistillationLossFn(
+            {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            }
+        )
+
+        loss, metrics = loss_fn(
+            student_logits,
+            data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+
+        # Verify loss is calculated correctly with top-k filtering
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
+
+        # For k=1, we expect only the top-1 token to be considered
+        if k == 1:
+            assert isinstance(loss, torch.Tensor)
+
+        # For large k values, we expect normal behavior
+        if k >= 32:
+            assert isinstance(loss, torch.Tensor)
+            assert loss.item() != 0.0  # Should have some meaningful loss
+
+
+def test_distillation_loss_invalid_k_zero():
+    """Test that k=0 should raise a ValueError."""
+    # Test with k=0 which should be invalid
+    data, student_logits = setup_distillation_test_data(topk=0)
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    # This should raise a ValueError for k=0
+    with pytest.raises(ValueError, match="topk must be positive"):
+        loss_fn(
+            student_logits,
+            data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+
+
+def test_distillation_loss_zero_outside_topk():
+    """Test zeroing outside top-k functionality with various k values."""
+    # Test with different k values for zero_outside_topk (excluding k=0 which should be invalid)
+    k_values = [1, 32, 64, 1000000]  # Valid k values
+
+    for k in k_values:
+        data, student_logits = setup_distillation_test_data(topk=k)
+
+        loss_fn = DistillationLossFn(
+            {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": True,
+            }
+        )
+
+        loss, metrics = loss_fn(
+            student_logits,
+            data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+
+        # Verify loss is calculated correctly with zeroing
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
+
+        # For k=1, only top-1 token should remain non-zero
+        if k == 1:
+            assert isinstance(loss, torch.Tensor)
+
+        # For large k values, most tokens should remain non-zero
+        if k >= 32:
+            assert isinstance(loss, torch.Tensor)
+            assert loss.item() != 0.0  # Should have some meaningful loss
+
+
+def test_distillation_loss_gradient_flow():
+    """Test gradient flow in distillation loss function."""
+    data, student_logits = setup_distillation_test_data()
+
+    # Make student_logits require gradients
+    student_logits.requires_grad_(True)
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, _ = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Compute gradients
+    loss.backward()
+
+    # Verify gradients are computed and non-zero
+    assert student_logits.grad is not None
+    assert not torch.allclose(
+        student_logits.grad, torch.zeros_like(student_logits.grad)
+    )
+
+
+def test_distillation_loss_edge_cases():
+    """Test distillation loss with edge cases."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    # Test with all-zero logits
+    zero_logits = torch.zeros_like(student_logits)
+    loss, _ = loss_fn(
+        zero_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Test with very large logits
+    large_logits = torch.ones_like(student_logits) * 100.0
+    loss, _ = loss_fn(
+        large_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+    # Test with very small logits
+    small_logits = torch.ones_like(student_logits) * -100.0
+    loss, _ = loss_fn(
+        small_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    assert not torch.isnan(loss)
+    assert not torch.isinf(loss)
+
+
+def test_distillation_loss_fn_initialization():
+    """Test DistillationLossFn initialization."""
+    # Test with default values
+    default_config = {
+        "kl_type": "forward",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+    }
+    loss_fn = DistillationLossFn(default_config)
+    assert loss_fn.kl_type == "forward"
+    assert loss_fn.mixed_kl_weight == 0.5
+    assert not loss_fn.zero_outside_topk
+
+    # Test with custom values
+    custom_config = {
+        "kl_type": "reverse",
+        "mixed_kl_weight": 0.3,
+        "zero_outside_topk": True,
+    }
+    loss_fn = DistillationLossFn(custom_config)
+    assert loss_fn.kl_type == "reverse"
+    assert loss_fn.mixed_kl_weight == 0.3
+    assert loss_fn.zero_outside_topk
+
+
+def test_distillation_loss_fn_call():
+    """Test DistillationLossFn call interface."""
+    data, student_logits = setup_distillation_test_data()
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    # Verify return types
+    assert isinstance(loss, torch.Tensor)
+    assert isinstance(metrics, dict)
+
+    # Verify loss is scalar
+    assert loss.dim() == 0
+
+    # Verify metrics contains expected fields
+    expected_fields = ["loss"]
+    for field in expected_fields:
+        assert field in metrics
