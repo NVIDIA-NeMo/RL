@@ -173,7 +173,7 @@ class VllmInternalWorkerExtension:
                         self.model_runner.model.load_weights(weights=weights)
                     
                     # Strong synchronization after loading weights to ensure completion
-                    # torch.cuda.current_stream().synchronize()
+                    torch.cuda.current_stream().synchronize()
                     # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
                     self.socket.send(b"")
                     # buffer = torch.empty(0, device=self.device)

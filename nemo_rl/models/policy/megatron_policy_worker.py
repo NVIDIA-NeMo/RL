@@ -1696,7 +1696,7 @@ class MegatronPolicyWorker:
                     if pending_recv:
                         self.zmq_socket.recv()
                         pending_recv = False
-                    # torch.cuda.current_stream().synchronize()
+                    torch.cuda.current_stream().synchronize()
                     buffer_holder = buffer
                     cuda_ipc_handle = get_handle_from_tensor(buffer)
                     serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
@@ -1730,7 +1730,7 @@ class MegatronPolicyWorker:
                     pending_recv = False
                 
                 # Strong synchronization required for IPC handle correctness
-                # torch.cuda.current_stream().synchronize()
+                torch.cuda.current_stream().synchronize()
                 cuda_ipc_handle = get_handle_from_tensor(buffer)
                 serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
                 self.zmq_socket.send_pyobj(serialized)
