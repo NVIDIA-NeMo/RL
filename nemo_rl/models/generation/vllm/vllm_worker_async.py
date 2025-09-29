@@ -884,6 +884,31 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         await self.llm.wake_up(**wake_up_args)
 
+    async def abort_request_async(self, request_id: str) -> bool:
+        """Abort an ongoing generation request.
+
+        Args:
+            request_id: The request ID to abort
+
+        Returns:
+            True if request was successfully aborted, False otherwise
+        """
+        try:
+            assert self.llm is not None, (
+                "Attempting to abort request with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "abort_request_async can only be used with async_engine=True."
+                )
+
+            await self.llm.abort(request_id)
+            return True
+        except Exception as e:
+            print(f"Error aborting request {request_id}: {e}")
+            return False
+
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:

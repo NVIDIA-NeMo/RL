@@ -687,6 +687,30 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
+    def abort_requests(self, request_ids: list[str]) -> list[Any]:
+        """Abort ongoing generation requests.
+
+        Args:
+            request_ids: List of request IDs to abort
+
+        Returns:
+            List of futures for abort operations
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "abort_requests can only be used with async_engine=True."
+            )
+
+        futures = []
+        for request_id in request_ids:
+            worker_futures = self.worker_group.run_all_workers_single_data(
+                "abort_request_async",
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                request_id=request_id,
+            )
+            futures.extend(worker_futures)
+        return futures
+
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
         try:

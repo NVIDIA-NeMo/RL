@@ -17,7 +17,7 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -598,6 +598,8 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    abort_event: Optional[Any] = None,
+    state_callback: Optional[Any] = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -613,6 +615,8 @@ async def run_sample_multi_turn_rollout(
         max_seq_len: Maximum sequence length
         max_rollout_turns: Maximum number of turns
         greedy: Whether to use greedy decoding
+        abort_event: Optional threading.Event to check for abort signals (for partial rollouts)
+        state_callback: Optional callback(message_log, turn) to save partial state on abort
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -632,11 +636,23 @@ async def run_sample_multi_turn_rollout(
     terminated = False
     truncated = False
     max_turns_reached = False
+    aborted = False
 
     # Track per-turn metrics
     turn_gen_tokens = []
 
     for turn in range(max_rollout_turns):
+        # Check for abort signal at turn boundary (clean state)
+        if abort_event is not None and abort_event.is_set():
+            print(
+                f"🚫 Abort signal detected for sample {sample_idx} at turn {turn_count}"
+            )
+            aborted = True
+            # Save partial state via callback
+            if state_callback is not None:
+                state_callback(current_message_log, turn_count)
+            break
+
         if terminated or truncated:
             break
 
@@ -730,6 +746,7 @@ async def run_sample_multi_turn_rollout(
         "total_reward": torch.tensor(total_reward),
         "stop_strings": current_stop_strings,
         "idx": sample_idx,
+        "aborted": aborted,  # Flag to indicate if rollout was aborted early
     }
 
     # Sample metrics
@@ -741,6 +758,7 @@ async def run_sample_multi_turn_rollout(
         "terminated": terminated,
         "truncated": truncated,
         "max_turns_reached": max_turns_reached,
+        "aborted": aborted,
         "total_reward": total_reward,
         "turn_gen_tokens": turn_gen_tokens,
     }
@@ -756,6 +774,8 @@ def run_async_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    abort_event: Optional[Any] = None,
+    state_callback: Optional[Any] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with sample-level processing.
 
@@ -770,6 +790,8 @@ def run_async_multi_turn_rollout(
         max_seq_len: Maximum sequence length allowed
         max_rollout_turns: Maximum number of agent-environment interaction turns
         greedy: Whether to use greedy decoding
+        abort_event: Optional threading.Event to check for abort signals (for partial rollouts)
+        state_callback: Optional callback(sample_idx, message_log, turn) to save partial state on abort
 
     Returns:
         Tuple containing:
@@ -797,6 +819,17 @@ def run_async_multi_turn_rollout(
         async def run_single_sample_with_error_handling(i, sample_state):
             """Wrapper to handle errors for individual sample rollouts."""
             try:
+                # Create per-sample callback if batch-level callback provided
+                sample_state_callback = None
+                if state_callback is not None:
+
+                    def sample_callback(message_log, turn):
+                        # state_callback is guaranteed to be not None here due to outer check
+                        if state_callback is not None:  # Type checker satisfaction
+                            state_callback(i, message_log, turn)
+
+                    sample_state_callback = sample_callback
+
                 result = await run_sample_multi_turn_rollout(
                     sample_idx=i,
                     initial_sample_state=sample_state,
@@ -806,6 +839,8 @@ def run_async_multi_turn_rollout(
                     max_seq_len=max_seq_len,
                     max_rollout_turns=max_rollout_turns,
                     greedy=greedy,
+                    abort_event=abort_event,
+                    state_callback=sample_state_callback,
                 )
                 return result
             except Exception as e:

@@ -76,6 +76,10 @@ class AsyncGRPOConfig(TypedDict):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int
+    # Enable partial rollouts: abort ongoing generations during weight updates
+    # and resume them with new weights using the partial generation as prefix.
+    # This reduces pipeline stalls at the cost of some off-policy samples.
+    partial_rollouts_enabled: NotRequired[bool]
 
 
 class GRPOConfig(TypedDict):

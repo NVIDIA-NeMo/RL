@@ -287,6 +287,27 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
 
+        # Implementation:
+        # 1. prepare_for_refit() signals abort via abort_event
+        # 2. run_sample_multi_turn_rollout() checks abort at each turn start
+        # 3. On abort: saves completed turns via callback to thread state
+        # 4. resume_after_refit() merges partial message_logs as prefixes
+        # 5. Re-enqueued batches continue from last completed turn
+        #
+        # This reduces pipeline stalls at the cost of some off-policy samples.
+        # ====================================================================
+        self.partial_rollouts_enabled = (
+            self.master_config.get("grpo", {})
+            .get("async_grpo", {})
+            .get("partial_rollouts_enabled", False)
+        )
+
+        self._thread_generation_state: dict[_threading.Thread, dict[str, Any]] = {}
+        self._generation_state_lock: _threading.Lock = _threading.Lock()
+
+        self._partial_generation_buffer: list[dict[str, Any]] = []
+        self._partial_buffer_lock: _threading.Lock = _threading.Lock()
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -520,7 +541,14 @@ class AsyncTrajectoryCollector:
         print("Trajectory collection resumed")
 
     def prepare_for_refit(self) -> None:
-        """Pause new generation starts and wait for pending generations to complete before refit."""
+        """Pause new generation starts and handle pending generations before refit.
+
+        If partial_rollouts_enabled:
+            - Abort ongoing requests
+            - Store partial generations for resumption after refit
+        Else:
+            - Wait for all pending generations to complete (legacy behavior)
+        """
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
@@ -528,21 +556,184 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.clear()
         print("⏸️ New generation starts paused")
 
-        # Wait for all pending generations to complete
-        # Note that is suboptimal for async performance and will be fixed in a follow-up PR where two more options will be added:
-        # 1. Pause the generations at their current decoding step, update the weights and continue with decoding.
-        # 2. Stop the current generations, store in a buffer and resume them in next iteration with new weights.
-        self.wait_for_pending_generations()
+        if self.partial_rollouts_enabled:
+            print("🚫 Partial rollouts enabled: aborting ongoing requests...")
+            self._abort_and_store_partial_generations()
+            elapsed = time.time() - start_time
+            print(
+                f"✅ Aborted {len(self._partial_generation_buffer)} partial generations, ready for refit (took {elapsed:.2f}s)"
+            )
+        else:
+            # Wait for all pending generations to complete (legacy behavior)
+            self.wait_for_pending_generations()
+            elapsed = time.time() - start_time
+            print(
+                f"✅ All pending generations completed, ready for refit (took {elapsed:.2f}s)"
+            )
 
-        elapsed = time.time() - start_time
+    def _abort_and_store_partial_generations(self) -> None:
+        """Abort ongoing generations and move partial results to buffer for resumption.
+
+        Signal threads to abort between turns. Threads save state via callback to
+        _thread_generation_state, which we then move (not copy) to _partial_generation_buffer.
+        """
+        with self._threads_lock:
+            active_threads = list(self._inflight_threads)
+
         print(
-            f"✅ All pending generations completed, ready for refit (took {elapsed:.2f}s)"
+            f"🚫 Signaling {len(active_threads)} active generation threads to abort between turns..."
         )
 
+        # Signal all threads to abort by setting their abort events
+        with self._generation_state_lock:
+            for thread in active_threads:
+                if thread in self._thread_generation_state:
+                    state = self._thread_generation_state[thread]
+                    if "abort_event" in state:
+                        state["abort_event"].set()
+
+        time.sleep(0.1)
+
+        # Move partial generation states from thread_state to buffer
+        num_partials = 0
+        with self._generation_state_lock:
+            with self._partial_buffer_lock:
+                for thread in active_threads:
+                    if thread in self._thread_generation_state:
+                        state = self._thread_generation_state[thread]
+                        partial_message_log = state.get("partial_message_log")
+
+                        # Only store if we have actual partial generations
+                        if partial_message_log:
+                            partial_gen_info = {
+                                "batch": state["batch"],
+                                "generation_weight_version": state[
+                                    "generation_weight_version"
+                                ],
+                                "target_weight": state["target_weight"],
+                                "prompt_idx": state["prompt_idx"],
+                                "partial_message_log": partial_message_log,
+                                "current_turn": state.get("current_turn", 0),
+                            }
+
+                            self._partial_generation_buffer.append(partial_gen_info)
+                            num_partials += 1
+
+                            # Count tokens in partial generations
+                            partial_tokens = sum(
+                                len(msg.get("token_ids", []))
+                                for msg_log in partial_message_log
+                                for msg in msg_log
+                                if msg["role"] == "assistant"
+                            )
+
+                            print(
+                                f"📦 Moved partial generation for prompt_idx {state['prompt_idx']}: "
+                                f"{partial_tokens} tokens from {state.get('current_turn', 0)} completed turns"
+                            )
+
+        print(f"✅ Moved {num_partials} partial generations to buffer for resumption")
+
     def resume_after_refit(self) -> None:
-        """Resume new generation starts after refit is complete."""
+        """Resume new generation starts after refit is complete.
+
+        If partial_rollouts_enabled, this will also resume any aborted generations
+        with the new weights.
+        """
         print("🔄 Resuming generation starts after refit")
+
+        if self.partial_rollouts_enabled and self._partial_generation_buffer:
+            print(
+                f"🔄 Resuming {len(self._partial_generation_buffer)} partial generations with new weights..."
+            )
+            self._resume_partial_generations()
+
         self._refit_pause_cleared.set()
+
+    def _resume_partial_generations(self) -> None:
+        """Resume partial generations that were aborted during weight update.
+
+        Uses the stored partial message logs as prefixes to continue generation
+        with the new weights.
+        """
+        with self._partial_buffer_lock:
+            partial_gens = self._partial_generation_buffer.copy()
+            self._partial_generation_buffer.clear()
+
+        print(
+            f"🔄 Resuming {len(partial_gens)} aborted generations with new weights..."
+        )
+
+        for partial_gen in partial_gens:
+            batch = partial_gen.get("batch")
+            target_weight = partial_gen.get("target_weight")
+            prompt_idx = partial_gen.get("prompt_idx")
+            partial_message_log = partial_gen.get("partial_message_log")
+            current_turn = partial_gen.get("current_turn", 0)
+
+            if batch is None:
+                continue
+
+            # Update the batch with partial generations if available
+            if partial_message_log:
+                # Create a new batch that includes the partial generation as prefix
+                # We'll merge the partial message log into the original batch
+                for i in range(len(batch["message_log"])):
+                    # Extend the message log with partial generations
+                    original_log = batch["message_log"][i]
+
+                    # Find matching partial log (they should correspond to the same sample)
+                    if i < len(partial_message_log):
+                        partial_log = partial_message_log[i]
+                        merged_log = []
+                        for msg in original_log:
+                            merged_log.append(msg)
+
+                        # Add any partial assistant responses
+                        for msg in partial_log:
+                            if msg["role"] == "assistant" and "token_ids" in msg:
+                                merged_log.append(msg)
+
+                        batch["message_log"][i] = merged_log
+
+                        partial_tokens = sum(
+                            len(msg.get("token_ids", []))
+                            for msg in partial_log
+                            if msg["role"] == "assistant"
+                        )
+                        print(
+                            f"🔄 Resuming prompt_idx {prompt_idx} sample {i} with {partial_tokens} partial tokens"
+                        )
+
+            # Update the target weight version to the current one
+            # since we're resuming with new weights
+            updated_target_weight = self.current_weight_version + 1
+
+            print(
+                f"🔄 Re-enqueueing prompt_idx {prompt_idx}, old target: {target_weight}, "
+                f"new target: {updated_target_weight}, turn: {current_turn}"
+            )
+
+            # Re-enqueue the batch for generation with new weights
+            # The batch now includes partial generations as prefix
+            self._inflight_sema.acquire()
+            worker = _threading.Thread(
+                target=self._run_prompt_group_worker,
+                args=(
+                    batch,
+                    self.current_weight_version,
+                    updated_target_weight,
+                    prompt_idx,
+                ),
+                daemon=True,
+            )
+            with self._threads_lock:
+                self._inflight_threads.add(worker)
+            worker.start()
+
+        print(
+            f"✅ Re-enqueued {len(partial_gens)} partial generations with continuations"
+        )
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""
@@ -572,6 +763,73 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
+    def _run_abortable_rollout(
+        self,
+        repeated_batch: BatchedDataDict[DatumSpec],
+        abort_event: _threading.Event,
+        current_thread: _threading.Thread,
+    ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
+        """Run a rollout with abort support at turn boundaries.
+
+        The rollout will check abort_event at the start of each turn and
+        return early with partial results if abort is detected.
+
+        Returns:
+            Tuple of (final_batch, rollout_metrics)
+        """
+        import copy
+
+        # Create callback to save partial state when aborted
+        def save_partial_state(sample_idx: int, message_log: list, turn: int):
+            """Callback to save partial message_log when rollout is aborted."""
+            with self._generation_state_lock:
+                if current_thread in self._thread_generation_state:
+                    state = self._thread_generation_state[current_thread]
+                    # Initialize partial_message_log list if not exists
+                    if state.get("partial_message_log") is None:
+                        state["partial_message_log"] = [None] * len(
+                            repeated_batch["message_log"]
+                        )
+
+                    # Save this sample's partial message_log
+                    state["partial_message_log"][sample_idx] = copy.deepcopy(
+                        message_log
+                    )
+                    state["current_turn"] = max(state.get("current_turn", 0), turn)
+
+                    # Count tokens for logging
+                    partial_tokens = sum(
+                        len(msg.get("token_ids", []))
+                        for msg in message_log
+                        if msg["role"] == "assistant"
+                    )
+                    print(
+                        f"📦 Saved partial state for sample {sample_idx}: "
+                        f"{partial_tokens} tokens, {turn} turns completed"
+                    )
+
+        try:
+            result = run_async_multi_turn_rollout(
+                policy_generation=self.policy_generation,
+                input_batch=repeated_batch,
+                tokenizer=self.tokenizer,
+                task_to_env=self.task_to_env,
+                max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
+                max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
+                greedy=False,
+                abort_event=abort_event,
+                state_callback=save_partial_state,
+            )
+
+            return result
+
+        except Exception as e:
+            print(f"Error in rollout for thread {current_thread.name}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return repeated_batch, {}
+
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
@@ -586,17 +844,50 @@ class AsyncTrajectoryCollector:
         prompt_idx: int,
     ) -> None:
         try:
+            # Track this thread's generation state for partial rollouts
+            current_thread = _threading.current_thread()
+            abort_event = _threading.Event()
+
+            if self.partial_rollouts_enabled:
+                with self._generation_state_lock:
+                    self._thread_generation_state[current_thread] = {
+                        "batch": repeated_batch,
+                        "generation_weight_version": generation_weight_version,
+                        "target_weight": target_weight_version,
+                        "prompt_idx": prompt_idx,
+                        "abort_event": abort_event,
+                        "partial_message_log": None,
+                        "current_turn": 0,
+                    }
+
             # Run rollout for this prompt group
-            # Async engine supports concurrent generation; avoid locking
-            final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                policy_generation=self.policy_generation,
-                input_batch=repeated_batch,
-                tokenizer=self.tokenizer,
-                task_to_env=self.task_to_env,
-                max_seq_len=self.master_config["policy"]["max_total_sequence_length"],
-                max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
-                greedy=False,
-            )
+            # For partial rollouts, we use an abortable wrapper
+            if self.partial_rollouts_enabled:
+                final_batch, rollout_metrics = self._run_abortable_rollout(
+                    repeated_batch=repeated_batch,
+                    abort_event=abort_event,
+                    current_thread=current_thread,
+                )
+
+                # If aborted, don't push to buffer - the partial state is already stored
+                if abort_event.is_set():
+                    print(
+                        f"🚫 Rollout for prompt_idx {prompt_idx} was aborted, skipping buffer push"
+                    )
+                    return
+            else:
+                # Standard non-abortable rollout
+                final_batch, rollout_metrics = run_async_multi_turn_rollout(
+                    policy_generation=self.policy_generation,
+                    input_batch=repeated_batch,
+                    tokenizer=self.tokenizer,
+                    task_to_env=self.task_to_env,
+                    max_seq_len=self.master_config["policy"][
+                        "max_total_sequence_length"
+                    ],
+                    max_rollout_turns=self.master_config["grpo"]["max_rollout_turns"],
+                    greedy=False,
+                )
 
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
@@ -662,10 +953,17 @@ class AsyncTrajectoryCollector:
                     )
 
             # Detach thread record when finished
+            current = _threading.current_thread()
             with self._threads_lock:
-                current = _threading.current_thread()
                 if current in self._inflight_threads:
                     self._inflight_threads.remove(current)
+
+            # Clean up generation state for partial rollouts
+            if self.partial_rollouts_enabled:
+                with self._generation_state_lock:
+                    if current in self._thread_generation_state:
+                        del self._thread_generation_state[current]
+
             try:
                 self._inflight_sema.release()
             except Exception:
