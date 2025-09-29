@@ -1,0 +1,14 @@
+defaults:
+- ../../vlm_grpo_3B.yaml
+- ../../vlm_grpo_3B_megatron.yaml
+checkpointing:
+  checkpoint_dir: results/clevr_grpo
+policy:
+  max_total_sequence_length: 3072
+  megatron_cfg:
+    empty_unused_memory_level: 1
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_init: 5.0e-08

@@ -3,12 +3,3 @@ checkpointing:
   checkpoint_dir: results/clevr_grpo
 policy:
   max_total_sequence_length: 3072
-env:
-  refcoco:
-    reward_functions:
-    - name: format
-      weight: 0.1
-    - name: bbox_giou
-      weight: 0.9
-      kwargs:
-        giou_penalty_thres: 1.0
