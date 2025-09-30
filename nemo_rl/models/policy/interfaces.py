@@ -40,6 +40,13 @@ class ScoreOutputSpec(TypedDict):
     scores: torch.Tensor
 
 
+class TopkLogitsOutputSpec(TypedDict):
+    """Per-position top-k logits and corresponding global token indices."""
+
+    topk_logits: torch.Tensor
+    topk_indices: torch.Tensor
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -70,6 +77,20 @@ class PolicyInterface(ABC):
         Returns:
             BatchedDataDict containing:
                 - logprobs: Tensor of logprobs of actions
+        """
+        pass
+
+    @abstractmethod
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get per-position top-k logits and global indices for a batch of inputs.
+
+        Notes:
+            - Aligns to next-token positions → returns S-1 positions.
         """
         pass
 

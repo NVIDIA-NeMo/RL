@@ -35,3 +35,19 @@ tests/test_suites/llm/sft-llama3.1-70b-8n8g-tp4pp2-long-megatron.sh
 tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp4.sh
 tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatron.v2.sh
 tests/test_suites/llm/dpo-llama3.1-8b-tulu3-1n8g-fsdp2tp1.sh
+
+################
+# Distillation #
+################
+
+# 100 step 4b convergence
+tests/test_suites/llm/distillation-qwen3-32b-to-8b-base-2n8g-fsdp2tp2.v1.sh
+ 
+# Long 4b and 8b convergence
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-long.v1.sh
+tests/test_suites/llm/distillation-qwen3-32b-to-8b-base-4n8g-fsdp2tp8-long.v1.sh
+ 
+# 20 step functional tests on dynamic batching, non-colocated and seqence packing features
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-1n8g-fsdp2tp2-dynamicbatch.v1.sh
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp8-noncolocated.v1.sh
+tests/test_suites/llm/distillation-qwen3-32b-to-4b-instruct-2n8g-fsdp2tp2-seqpack.v1.sh
