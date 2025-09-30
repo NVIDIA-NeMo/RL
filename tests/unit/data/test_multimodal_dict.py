@@ -339,3 +339,13 @@ def test_packedtensor_to_with_none_entry():
     assert pt.tensors[0] is None
     assert isinstance(pt.tensors[1], torch.Tensor)
     assert pt.tensors[1].device.type == "cpu"
+
+
+def test_packedtensor_as_tensor_with_mixed_none_and_tensors():
+    t1 = torch.randn(2, 3)
+    t2 = None
+    t3 = torch.randn(4, 3)
+    pt = PackedTensor([t1, t2, t3], dim_to_pack=0)
+    out = pt.as_tensor()
+    expected = torch.cat([t1, t3], dim=0)
+    assert torch.equal(out, expected)
