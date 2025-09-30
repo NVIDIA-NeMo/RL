@@ -24,7 +24,7 @@ policy:
   #   name: Qwen/Qwen2.5-7B-Instruct
   model_name: "/lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf"
   tokenizer:
-    name: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5"
+    name: ${policy.model_name}
   max_total_sequence_length: 4096
   precision: "bfloat16"
   train_global_batch_size: 128
