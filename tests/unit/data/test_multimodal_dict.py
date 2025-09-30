@@ -316,3 +316,26 @@ def test_get_multimodal_dict():
     assert "token_type_ids" in mm_dict
     assert isinstance(mm_dict["image_features"], PackedTensor)
     assert torch.is_tensor(mm_dict["token_type_ids"])
+
+
+def test_packedtensor_all_none():
+    pt = PackedTensor([None, None], dim_to_pack=0)
+    assert pt.as_tensor() is None
+
+
+def test_packedtensor_with_none_entry():
+    original = PackedTensor([torch.randn(2, 3), None], dim_to_pack=0)
+    empty = PackedTensor.empty_like(original)
+    # same logical length
+    assert len(empty) == len(original)
+    # all entries are None, thus as_tensor returns None
+    assert empty.as_tensor() is None
+
+
+def test_packedtensor_to_with_none_entry():
+    t = torch.randn(1, 2)
+    pt = PackedTensor([None, t], dim_to_pack=0)
+    pt = pt.to("cpu")
+    assert pt.tensors[0] is None
+    assert isinstance(pt.tensors[1], torch.Tensor)
+    assert pt.tensors[1].device.type == "cpu"
