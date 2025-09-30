@@ -50,7 +50,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
