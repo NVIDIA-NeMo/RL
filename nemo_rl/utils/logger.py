@@ -1035,7 +1035,7 @@ class Logger(LoggerInterface):
                 print(json.dumps(config, indent=2), end="", file=f)
         elif filepath.endswith(".yaml") or filepath.endswith(".yml"):
             with open(filepath, "w") as f:
-                yaml.safe_dump(config, f)
+                yaml.safe_dump(config, f, sort_keys=False)
         else:
             raise NotImplementedError
 
