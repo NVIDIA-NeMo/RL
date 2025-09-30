@@ -145,7 +145,7 @@ def test_remove_old_checkpoints_topk_some_missing_val_metric(
     checkpoint_manager, checkpoint_dir
 ):
     # Create checkpoints where some have validation metrics and others don't
-    steps = [1, 2, 3, 4, 10, 12]
+    steps = [1, 2, 3, 4, 10, 11, 12]
     # Some checkpoints have loss metrics, others don't have any validation metrics
     training_infos = [
         {"loss": 0.5},  # step 1 - has loss
@@ -153,6 +153,7 @@ def test_remove_old_checkpoints_topk_some_missing_val_metric(
         {"other_metric": 0.8},  # step 3 - missing loss metric
         {"loss": 0.2},  # step 4 - has loss
         {},  # step 10 - missing loss metric
+        {"loss": 1.0}, # has loss but not in top-k
         {},  # step 12 - missing loss (latest)
     ]
 
