@@ -683,7 +683,8 @@ def _parallelize_model(
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
+        # output_dtype=torch.float32,
+        cast_forward_inputs=True,
     )
 
     offload_policy = (
