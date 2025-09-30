@@ -35,6 +35,7 @@ def load_two_tensors_from_files(files):
     files = sorted(files, key=comparator)
     left = load_tensor(files[0])
     right = [load_tensor(f) for f in files[1:]]
+    print(f"left: {left.shape}, right[0]: {right[0].shape}")
     dim_to_gather = comparator(files[-1])[2]  # just check the last
     right = torch.cat(right, dim=dim_to_gather)
     return left, right
