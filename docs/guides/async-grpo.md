@@ -156,7 +156,7 @@ sequenceDiagram
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
 
-## Why Importance Sampling Correction is required for Async
+## Why Importance Sampling Correction Is Required for Async
 
 ### The GRPO Objective
 
