@@ -316,6 +316,34 @@ class DTensorPolicyWorkerV2:
         # 3) Move to GPU + Composable FSDP
         #    (Initialize device mesh, shard submodules, then shard entire model)
         # ------------------------------------------------
+        from torch.distributed.tensor.parallel import (
+            ColwiseParallel,
+            ParallelStyle,
+            RowwiseParallel,
+            SequenceParallel,
+        )
+        from torch.distributed.tensor.placement_types import Replicate, Shard
+        base_model_tp_plan = { 
+            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+            "model.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+            ),  
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": ColwiseParallel(
+                input_layouts=Shard(-1),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": ColwiseParallel(
+                input_layouts=Shard(-1),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+        }
         self.model = fsdp2_strategy_parallelize(
             self.model,
             device_mesh=self.device_mesh,
@@ -331,7 +359,8 @@ class DTensorPolicyWorkerV2:
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
             ],
-            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            #tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            tp_shard_plan=base_model_tp_plan,
             dp_replicate_mesh_name="dp_replicate",
             dp_shard_cp_mesh_name="dp_shard_cp",
             tp_mesh_name="tp",
