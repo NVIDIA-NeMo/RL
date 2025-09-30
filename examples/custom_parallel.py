@@ -30,7 +30,7 @@ custom_parallel_plan = {
 """
 Note on numerical stability:
 
-- Default plans that keep attention output proj and mlp downproj RowwiseParallel are numerically 
+- Default plans that keep attention output proj and mlp downproj RowwiseParallel are numerically
   unstable and tend to increase with larger TP (e.g., TP >= 4).
 
 Enable this custom plan via:
