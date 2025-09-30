@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
 
@@ -403,8 +404,9 @@ class AdvTrainingWithReferenceEnvironment(EnvironmentInterface):
             return
             
         try:
-            # Create filename with step counter
-            filename = f"step_{self.step_counter:06d}.json"
+            # Create filename with UTC timestamp
+            timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"time_{timestamp_str}.json"
             log_file = self.env_log_dir / filename
             
             # Add metadata
