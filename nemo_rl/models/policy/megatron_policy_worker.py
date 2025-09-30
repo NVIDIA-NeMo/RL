@@ -1208,6 +1208,9 @@ class MegatronPolicyWorker:
             multimodal_data = data_dict.get_multimodal_dict(
                 as_tensors=True, device=input_ids.device
             )
+            if len(multimodal_data) > 0:
+                position_ids = None
+
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
