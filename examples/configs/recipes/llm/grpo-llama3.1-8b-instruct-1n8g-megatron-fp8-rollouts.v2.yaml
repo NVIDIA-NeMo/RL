@@ -42,11 +42,11 @@ policy:
 data:
   max_input_seq_length: 4096
 logger:
-  log_dir: logs/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts
+  log_dir: logs/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v2
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts
+    name: grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v2
 cluster:
   gpus_per_node: 8
