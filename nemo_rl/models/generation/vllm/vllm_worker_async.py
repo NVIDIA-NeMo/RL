@@ -237,6 +237,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from typing import List, Optional, Union
+        from logging import LogRecord, Filter as LoggingFilter
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -254,6 +255,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -479,6 +481,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
 
+        ########################################
+        # Logging
+        ########################################
+        print(
+            "Adding a vLLM logging filter so that the logs aren't spammed with `Added request ...` messages. This is to help errors pop up better and filter out noise."
+        )
+        class NoAddedRequestFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+                return "Added request" not in msg
+
+        vllm_async_llm_logger.addFilter(NoAddedRequestFilter())
+
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
@@ -518,7 +533,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class No200Filter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
-                return not msg.strip().endswith("200") and "Added request" not in msg
+                return not msg.strip().endswith("200")
 
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())

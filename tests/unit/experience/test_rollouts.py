@@ -777,6 +777,7 @@ def test_run_async_penguin_rollout(
         },
         "rollout_metrics": {
             # core metrics
+            "mean_gen_tokens_per_sample": None,
             "turns_per_sample/mean": 2.0,
             "turns_per_sample/max": 2,
             "turns_per_sample/min": 2,
@@ -844,12 +845,7 @@ def test_run_async_penguin_rollout(
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
-            if key.startswith("total_tokens_per_sample") or key.startswith("gen_tokens_per_sample") or key.startswith("turns_per_sample"):
-                d["rollout_metrics"][key] = None
-            
-            # Histograms are objects.
-            if key.endswith("histogram"):
-                d["rollout_metrics"][key] = None
+            d["rollout_metrics"][key] = None
 
         return {
             "final_batch": final_batch,
