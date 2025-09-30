@@ -22,6 +22,7 @@ import pytest
 from omegaconf import OmegaConf
 from typing_extensions import NotRequired
 
+from nemo_rl.algorithms.distillation import DistillationConfig
 from nemo_rl.algorithms.dpo import DPOConfig
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.sft import SFTConfig
@@ -179,7 +180,16 @@ def test_all_config_files_have_required_keys():
             ]
 
             # Add algorithm-specific validation
-            if "dpo" in config_dict:
+            if "distillation" in config_dict:
+                section_validations.extend(
+                    [("distillation", DistillationConfig), ("logger", LoggerConfig)]
+                )
+                # Distillation also has a loss_fn section
+                if "loss_fn" in config_dict:
+                    from nemo_rl.algorithms.loss_functions import DistillationLossConfig
+
+                    section_validations.append(("loss_fn", DistillationLossConfig))
+            elif "dpo" in config_dict:
                 section_validations.extend(
                     [("dpo", DPOConfig), ("logger", LoggerConfig)]
                 )

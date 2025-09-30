@@ -4,10 +4,10 @@ This document explains how to use an evaluation script for assessing model capab
 
 ## Prepare for Evaluation
 
-To prepare for evaluation, first ensure your model is in the correct format, which may involve an optional conversion of PyTorch DCP checkpoints to the Hugging Face format. Following this, you need to prepare the evaluation configuration, which includes defining prompt templates and any custom settings required to run the evaluation.
+To prepare for evaluation, first ensure your model is in the correct format, which may involve an optional conversion of PyTorch DCP checkpoints to the HuggingFace format. Following this, you need to prepare the evaluation configuration, which includes defining prompt templates and any custom settings required to run the evaluation.
 
 ### Convert DCP to HF (Optional)
-If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the Hugging Face format before running evaluation.
+If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the HuggingFace format before running evaluation.
 
 Use the `examples/converters/convert_dcp_to_hf.py` script. You'll need the path to the training configuration file (`config.yaml`), the DCP checkpoint directory, and specify an output path for the HF format model.
 
@@ -37,9 +37,9 @@ For open-source models, we recommend setting `tokenizer.chat_template=default`, 
 
 ## Run the Evaluation Script
 
-We will use the `run_eval.py` script to run an evaluation using a model directly from the Hugging Face Hub or from a local path that is already in Hugging Face format.
+We will use the `run_eval.py` script to run an evaluation using a model directly from the HuggingFace Hub or from a local path that is already in HuggingFace format.
 
-Note that the evaluation script only supports the Hugging Face format model. If you haven't converted your DCP format model, you should back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
+Note that the evaluation script only supports the HuggingFace format model. If you haven't converted your DCP format model, you should back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
 
 ```sh
 # Run evaluation script with default config (examples/configs/evals/eval.yaml)
@@ -47,6 +47,16 @@ uv run python examples/run_eval.py
 
 # Run evaluation script with converted model
 uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
+
+# Run evaluation script with Qwen3 model under thinking mode
+uv run python examples/run_eval.py \
+    generation.model_name=Qwen/Qwen3-8B \
+    generation.temperature=0.6 \
+    generation.top_p=0.95 \
+    generation.top_k=20 \
+    generation.vllm_cfg.max_model_len=38912 \
+    tokenizer.chat_template_kwargs.enable_thinking=true \
+    data.prompt_file=examples/prompts/cot.txt
 
 # Run evaluation script with custom config file
 uv run python examples/run_eval.py --config path/to/custom_config.yaml
@@ -89,12 +99,10 @@ score=0.1000 (3.0/30)
 
 ## List of currently supported benchmarks
 
-- [AIME-2024](../../nemo_rl/data/eval_datasets/aime2024.py): the corresponding `data.dataset_name` is `"aime2024"`.
-- [AIME-2025](../../nemo_rl/data/eval_datasets/aime2025.py): the corresponding `data.dataset_name` is `"aime2025"`.
-- [GPQA and GPQA-diamond](../../nemo_rl/data/eval_datasets/gpqa.py): the corresponding `data.dataset_name` are `"gpqa"` and `"gpqa-diamond"`.
-- [MATH and MATH-500](../../nemo_rl/data/eval_datasets/math.py): the corresponding `data.dataset_name` are `"math"` and `"math500"`.
-- [MMLU](../../nemo_rl/data/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages. When `data.dataset_name` is set to `mmlu`, the English version is used. If one wants to run evaluation on another language, `data.dataset_name` should be set to `mmlu_{language}` where `language` is one of following 14 values, `["AR-XY", "BN-BD", "DE-DE", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
-- [MMLU-Pro](../../nemo_rl/data/eval_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
+- [AIME-2024 and AIME-2025](../../nemo_rl/data/datasets/eval_datasets/aime.py): the corresponding `data.dataset_name` are `"aime2024"` and `"aime2025"`.
+- [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/eval_datasets/gpqa.py): the corresponding `data.dataset_name` are `"gpqa"` and `"gpqa_diamond"`.
+- [MATH and MATH-500](../../nemo_rl/data/datasets/eval_datasets/math.py): the corresponding `data.dataset_name` are `"math"` and `"math500"`.
+- [MMLU](../../nemo_rl/data/datasets/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages. When `data.dataset_name` is set to `mmlu`, the English version is used. If one wants to run evaluation on another language, `data.dataset_name` should be set to `mmlu_{language}` where `language` is one of following 14 values, `["AR-XY", "BN-BD", "DE-DE", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
+- [MMLU-Pro](../../nemo_rl/data/datasets/eval_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
 
-More details can be found in [load_eval_dataset](../../nemo_rl/data/eval_datasets/__init__.py).
-
+More details can be found in [load_eval_dataset](../../nemo_rl/data/datasets/eval_datasets/__init__.py).

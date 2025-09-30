@@ -13,6 +13,10 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  async_grpo:
+    enabled: false # Set to true to enable async training mode
+    # Max age (in training steps) for trajectories used in training
+    max_trajectory_age_steps: 1
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -21,6 +25,8 @@ loss_fn:
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
+  # Async GRPO requires importance sampling correction enabled
+  # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
   sequence_level_importance_ratios: false
   token_level_loss: true
@@ -33,6 +39,8 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -119,6 +127,8 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
+    fp8_cfg: null
+
     env_vars: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
@@ -178,7 +188,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
+      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
       # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
@@ -202,8 +212,19 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
-  dataset_name: "OpenMathInstruct-2"
   shuffle: true
+
+  dataset_name: "OpenMathInstruct-2"
+  # You can use custom response datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: ResponseDataset
+  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  #     val_data_path: <PathToValidationDataset>
+  #     input_key: <QuestionKey>, default is "input"
+  #     output_key: <AnswerKey>, default is "output"
+  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#datasets for more details.
 
 env:
   math:
@@ -215,6 +236,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
