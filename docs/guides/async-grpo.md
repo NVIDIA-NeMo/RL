@@ -155,3 +155,43 @@ sequenceDiagram
 2. **Age Limits**: Start with `max_trajectory_age_steps: 1` and increase if needed for higher throughput
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
+
+## Why Importance Sampling Correction Is Required for Async
+
+### The GRPO Objective
+
+The standard GRPO loss function (without KL penalty) is:
+
+$$
+L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big]
+$$
+
+where:
+- $\pi_\theta$ is the policy model we are currently optimizing
+- $\pi_{\theta_{\text{old}}}$ is the previous policy model (from the beginning of this step)
+- $A_t$ is the advantage estimate
+- $\varepsilon$ is a clipping hyperparameter
+
+In standard GRPO, we assume trajectories are sampled from $\pi_{\theta_{\text{old}}}$. However, in async GRPO, trajectories are actually sampled from $\pi_{\theta_{\text{generator}}}$, which is the policy weights from N training steps ago (where N ≥ 1 depending on `max_trajectory_age_steps`).
+
+Without importance sampling correction, the GRPO objective becomes fundamentally incorrect:
+
+1. **Incorrect probability ratios**: The ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ uses $\pi_{\theta_{\text{old}}}$ probabilities that were never actually used to generate the trajectories.
+
+2. **Biased gradient estimates**: Since we're computing gradients based on samples from the wrong distribution, the policy updates become biased and can lead to instability.
+
+When we enable importance sampling correction (`use_importance_sampling_correction: true`), we introduce the corrective term:
+
+$$
+\frac{\pi_{\text{training}}(x)}{\pi_{\text{generator}}(x)}
+$$
+
+This transforms our loss function to properly account for the distribution mismatch. The corrected objective becomes:
+
+$$
+L(\theta) = E_{x \sim \pi_{\theta_{\text{generator}}}} \Big[ \frac{\pi_{\text{training}}(x)}{\pi_{\text{generator}}(x)} \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big]
+$$
+
+The importance sampling ratio $\frac{\pi_{\text{training}}(x)}{\pi_{\text{generator}}(x)}$ is effectively $\frac{\pi_{\theta_{\text{old}}}(x)}{\pi_{\theta_{\text{generator}}}(x)}$, which corrects for the N-step gap between the generator policy and the policy we assume we're sampling from.
+
+This correction ensures that we have unbiased gradient estimates and stable convergence.
