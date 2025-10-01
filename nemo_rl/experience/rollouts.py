@@ -1004,10 +1004,11 @@ def run_async_penguin_rollout(
         # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
         # / batch_size,
     }
-    
+
+    # Per-agent misc metrics
     agent_to_results: dict[str, list[dict]] = defaultdict(list)
     for penguin_row, result in zip(penguin_rows, results):
-        agent_name = penguin_row["agent_ref"]["name"] # multineedle_simple_agent
+        agent_name = penguin_row["agent_ref"]["name"]
         agent_to_results[agent_name].append(result["full_result"])
 
     per_agent_metrics = {}
