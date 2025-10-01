@@ -236,6 +236,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return self.base_url
 
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
+        from copy import deepcopy
         from typing import List, Optional, Union
         from logging import LogRecord, Filter as LoggingFilter
 
