@@ -1,6 +1,6 @@
-# Auto-Generated API Reference
+# API Reference
 
-This page contains auto-generated API reference documentation for all NeMo RL components.
+This page contains API reference documentation for NeMo RL components generated from source code.
 
 ```{toctree}
 :titlesonly:
@@ -89,9 +89,9 @@ Dataset interfaces, environment abstractions, and data processing.
 
 ## Detailed API Reference
 
-For complete API documentation with all functions, classes, and parameters, see the [full auto-generated reference](nemo_rl/nemo_rl).
+For complete API documentation with all functions, classes, and parameters, see the full reference: [nemo_rl](nemo_rl/nemo_rl).
 
-This documentation is automatically generated from the source code using [sphinx-autodoc2](https://github.com/chrisjsewell/sphinx-autodoc2) and includes:
+This documentation is generated from the source code using [sphinx-autodoc2](https://github.com/chrisjsewell/sphinx-autodoc2) and includes:
 
 - **Function signatures** with parameter types and return values
 - **Class hierarchies** and inheritance relationships  

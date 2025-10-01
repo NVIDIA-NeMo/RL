@@ -36,5 +36,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] > 0.69314' \
         'data["train/loss"]["1"] < 0.69316' \
-        'data["train/loss"]["150"] < 0.55'
-fi 
+        'data["train/loss"]["150"] < 0.55' \
+        'mean(data["timing/train/total_step_time"], -11, -1) < 1.3'
+fi

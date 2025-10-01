@@ -16,6 +16,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B"
@@ -25,8 +26,6 @@ policy:
   train_micro_batch_size: 2
   max_total_sequence_length: 4096
   precision: "bfloat16"
-  fsdp_offload_enabled: false
-  activation_checkpointing_enabled: false
 
   dtensor_cfg:
     enabled: true
@@ -37,8 +36,17 @@ policy:
     context_parallel_size: 1
     custom_parallel_plan: null
 
+  megatron_cfg:
+    enabled: false
+
   dynamic_batching:
     enabled: false
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
@@ -66,17 +74,23 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  shuffle: true
 
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"
     name: "openmathinstruct-nemorl-1M_train"
   tensorboard:
     log_dir: "tb_logs-openmathinstruct-nemorl-1M_train"
+  mlflow:
+    experiment_name: "sft-dev"
+    run_name: "openmathinstruct-nemorl-1M_train"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

@@ -42,7 +42,7 @@ Complete setup instructions for all environments and platforms.
 {bdg-success}`Essential`
 :::
 
-:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Architecture Overview
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Core Architecture
 :link: architecture-overview
 :link-type: doc
 
@@ -128,7 +128,7 @@ For comprehensive guides with step-by-step implementation, architectural pattern
 
 NeMo RL's architecture is designed for distributed reinforcement learning with modular components, Ray-based coordination, and support for multiple training backends. The framework provides advanced scalability from single-GPU setups to multi-node clusters with thousands of GPUs.
 
-For comprehensive details on system design, components, scalability, and technical specifications, see the [Architecture Overview](architecture-overview) documentation.
+For comprehensive details on system design, components, scalability, and technical specifications, see the [Core Architecture](architecture-overview) documentation.
 
 ## API and Development
 

@@ -1,0 +1,32 @@
+defaults: ../../dpo.yaml
+dpo:
+  val_period: 50
+  val_batches: 16
+  val_global_batch_size: 32
+  val_at_start: false
+  sft_loss_weight: 0.01
+checkpointing:
+  enabled: false
+policy:
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: dpo-llama3.1-8b-instruct-4n8g-megatron-tp4.v2
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

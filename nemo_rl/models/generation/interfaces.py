@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 import ray
 import torch
@@ -99,11 +99,12 @@ def verify_right_padding(
     return True, None
 
 
-class ColocationConfig(TypedDict):
-    class ResourcesConfig(TypedDict):
-        gpus_per_node: int
-        num_nodes: int
+class ResourcesConfig(TypedDict):
+    gpus_per_node: int
+    num_nodes: int
 
+
+class ColocationConfig(TypedDict):
     enabled: bool
     resources: NotRequired[ResourcesConfig]
 
@@ -153,7 +154,7 @@ class GenerationDatumSpec(TypedDict):
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
-    stop_strings: Optional[list[str]] = None
+    stop_strings: NotRequired[list[str]]
     __extra__: Any
 
 
@@ -228,12 +229,14 @@ class GenerationInterface(ABC):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         pass
 
-    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        raise NotImplementedError
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 
-    def update_weights_from_collective(
-        self, info: dict[str, Any]
-    ) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError

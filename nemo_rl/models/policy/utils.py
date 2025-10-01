@@ -14,10 +14,76 @@
 
 import importlib
 import os
-from typing import Any
+from typing import Any, Dict
 
 import torch
-from transformers import AutoConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForTextToWaveform,
+)
+
+# Try to import nemo_automodel classes, fallback to None if not available
+try:
+    from nemo_automodel.components._transformers.auto_model import (
+        NeMoAutoModelForCausalLM,
+        NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForTextToWaveform,
+    )
+
+    NEMO_AUTOMODEL_AVAILABLE = True
+except ImportError:
+    # nemo_automodel is not installed, classes will be None
+    NeMoAutoModelForCausalLM = None  # type: ignore
+    NeMoAutoModelForImageTextToText = None  # type: ignore
+    NeMoAutoModelForTextToWaveform = None  # type: ignore
+    NEMO_AUTOMODEL_AVAILABLE = False
+
+from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+# an automodel factory for loading the huggingface models from correct class
+
+AUTOMODEL_FACTORY: Dict[str, Any] = {
+    "qwen2_5_vl": AutoModelForImageTextToText,
+    "qwen2_vl": AutoModelForImageTextToText,
+    "qwen2_5_omni": AutoModelForTextToWaveform,
+    "llava": AutoModelForImageTextToText,
+    "internvl": AutoModelForImageTextToText,
+    "gemma3": AutoModelForImageTextToText,
+    "smolvlm": AutoModelForImageTextToText,
+    "mistral3": AutoModelForImageTextToText,
+    "llama4": AutoModelForImageTextToText,
+}
+
+if NEMO_AUTOMODEL_AVAILABLE:
+    AUTOMODEL_FACTORY = {
+        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "llava": NeMoAutoModelForImageTextToText,
+        "internvl": NeMoAutoModelForImageTextToText,
+        "gemma3": NeMoAutoModelForImageTextToText,
+        "smolvlm": NeMoAutoModelForImageTextToText,
+        "mistral3": NeMoAutoModelForImageTextToText,
+        "llama4": NeMoAutoModelForImageTextToText,
+    }
+
+
+def resolve_model_class(model_name: str) -> Any:
+    """Resolve the appropriate model class for a given model name."""
+    if NEMO_AUTOMODEL_AVAILABLE:
+        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+
+
+def is_vllm_v1_engine_enabled() -> bool:
+    """Check if vLLM V1 engine is enabled.
+
+    Returns:
+        bool: True if V1 engine is enabled, False otherwise (defaults to True if not set)
+    """
+    return os.environ.get("NRL_VLLM_USE_V1", "1") == "1"
 
 
 def import_class_from_path(name: str) -> Any:
@@ -127,3 +193,60 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         )
 
     return overwrite_dict
+
+
+def configure_dynamo_cache() -> None:
+    """Disable dynamo autotune_local_cache.
+
+    Dynamo may fail at cached_autotune when there's already a cache with different order of node_bundles.
+    Disable autotune_local_cache as a workaround.
+    See https://github.com/pytorch/pytorch/issues/153791 for more details.
+    """
+    torch._inductor.config.autotune_local_cache = False
+
+
+def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
+    """Get runtime environment configuration for policy workers.
+
+    Note: expandable_segments configuration is handled directly in the worker init methods
+    to ensure proper GPU detection after CUDA initialization.
+    """
+    runtime_env = {
+        **get_nsight_config_if_pattern_matches(policy_worker_name),
+    }
+
+    return runtime_env
+
+
+def get_megatron_checkpoint_dir() -> str:
+    """Gets the default megatron checkpoint directory for initial HF -> Mcore conversion.
+
+    Megatron initial checkpoint should be saved to a path available on all nodes. The directory used will take this order of precendence:
+    1. $NRL_MEGATRON_CHECKPOINT_DIR (if set)
+    2. $HF_HOME/nemo_rl (if HF_HOME is set)
+    3. ~/.cache/huggingface/nemo_rl
+
+    HF_HOME is preferred since many users will also have that path mounted and it means one less directory
+    to mount into your runtime environment.
+    """
+    nrl_checkpoint_dir = os.environ.get("NRL_MEGATRON_CHECKPOINT_DIR")
+    if nrl_checkpoint_dir is not None and nrl_checkpoint_dir.strip():
+        checkpoint_dir = nrl_checkpoint_dir
+    else:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is not None and hf_home.strip():
+            checkpoint_dir = os.path.join(hf_home, "nemo_rl")
+        else:
+            checkpoint_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "huggingface", "nemo_rl"
+            )
+    print(f"Using default megatron checkpoint dir: {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
+    """Get IPC handle from a tensor."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    # skip serializing the function for better refit performance
+    return reduce_tensor(tensor.detach())[1:]

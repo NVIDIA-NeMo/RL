@@ -152,6 +152,8 @@ def save_checkpoint(
         optimizer: Optional optimizer to save
         scheduler: Optional scheduler to save
         optimizer_path: Path to save optimizer state (required if optimizer provided)
+        tokenizer: Optional tokenizer to save
+        tokenizer_path: Path to save tokenizer state (required if tokenizer provided)
     """
     model_state = {"model": ModelState(model)}
     dcp.save(model_state, checkpoint_id=weights_path)
@@ -169,6 +171,7 @@ def save_checkpoint(
             raise ValueError(
                 "tokenizer_path must be provided when saving tokenizer state"
             )
+        print(f"Saving tokenizer (or processor) to {tokenizer_path}")
         tokenizer.save_pretrained(tokenizer_path)
 
 
@@ -244,16 +247,18 @@ def convert_dcp_to_hf(
     )
     torch.save(state_dict["model"], weights_path)
 
-    config = AutoConfig.from_pretrained(model_name_or_path)
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     config.save_pretrained(hf_ckpt_path)
 
     # TODO: After the following PR gets merged:
-    # https://github.com/NVIDIA/NeMo-RL/pull/148/files
+    # https://github.com/NVIDIA-NeMo/RL/pull/148/files
     # tokenizer should be copied from policy/tokenizer/* instead of relying on the model name
     # We can expose a arg at the top level --tokenizer_path to plumb that through.
     # This is more stable than relying on the current NeMo-RL get_tokenizer() which can
     # change release to release.
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path, trust_remote_code=True
+    )
     tokenizer.save_pretrained(hf_ckpt_path)
 
     return hf_ckpt_path

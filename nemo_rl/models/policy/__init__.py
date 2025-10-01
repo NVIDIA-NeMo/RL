@@ -12,26 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
 class DTensorConfig(TypedDict):
     enabled: bool
-    cpu_offload: bool
-    sequence_parallel: bool
-    activation_checkpointing: bool
-    tensor_parallel_size: int
-    context_parallel_size: int
-    custom_parallel_plan: str
+    env_vars: NotRequired[dict[str, str]]
+    _v2: NotRequired[bool]
+    cpu_offload: NotRequired[bool]
+    sequence_parallel: NotRequired[bool]
+    activation_checkpointing: NotRequired[bool]
+    tensor_parallel_size: NotRequired[int]
+    context_parallel_size: NotRequired[int]
+    custom_parallel_plan: NotRequired[str]
+    clear_cache_every_n_steps: NotRequired[int]
 
 
 class SequencePackingConfig(TypedDict):
     enabled: bool
     train_mb_tokens: int
-    logprob_mb_tokens: int
+    # Not required because some algorithms like SFT don't calculate log probs
+    logprob_mb_tokens: NotRequired[int]
     algorithm: str
+
+
+class RewardModelConfig(TypedDict):
+    enabled: bool
+    reward_model_type: str
 
 
 class MegatronOptimizerConfig(TypedDict):
@@ -75,6 +84,7 @@ class MegatronDDPConfig(TypedDict):
 
 class MegatronConfig(TypedDict):
     enabled: bool
+    env_vars: NotRequired[dict[str, str]]
     empty_unused_memory_level: int
     activation_checkpointing: bool
     converter_type: str
@@ -85,6 +95,10 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     pipeline_dtype: str
     sequence_parallel: bool
+    freeze_moe_router: bool
+    expert_tensor_parallel_size: int
+    expert_model_parallel_size: int
+    defer_fp32_logits: NotRequired[bool]
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]
@@ -93,7 +107,9 @@ class MegatronConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: str
+    chat_template: NotRequired[str]
+    # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
+    chat_template_kwargs: NotRequired[dict[str, Any]]
 
 
 class PytorchOptimizerConfig(TypedDict):
@@ -104,6 +120,7 @@ class PytorchOptimizerConfig(TypedDict):
 class SinglePytorchSchedulerConfig(TypedDict):
     name: str
     kwargs: dict[str, Any]
+    milestones: NotRequired[list[int]]  # Used in SequentialLR configuration
 
 
 SchedulerMilestones = dict[str, list[int]]
@@ -116,9 +133,11 @@ class DynamicBatchingConfig(TypedDict):
     # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
     # training and logprob stages respectively.
     enabled: bool
-    train_mb_tokens: int
-    logprob_mb_tokens: int
-    sequence_length_round: int
+
+    ## required if enabled is true
+    train_mb_tokens: NotRequired[int]
+    logprob_mb_tokens: NotRequired[int]
+    sequence_length_round: NotRequired[int]
 
 
 class PolicyConfig(TypedDict):
@@ -126,23 +145,21 @@ class PolicyConfig(TypedDict):
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
-    learning_rate: float
-    logprob_batch_size: int
-    generation: Optional[GenerationConfig]
+    logprob_batch_size: NotRequired[int]
+    logprob_chunk_size: NotRequired[int]
+    generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation
     precision: str
+    reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig
-    megatron_cfg: MegatronConfig
+    megatron_cfg: NotRequired[MegatronConfig]
     dynamic_batching: DynamicBatchingConfig
-    sequence_packing: SequencePackingConfig
+    sequence_packing: NotRequired[SequencePackingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    max_grad_norm: Optional[Union[float, int]]
-    fsdp_offload_enabled: bool
-    activation_checkpointing_enabled: bool
-    optimizer: NotRequired[PytorchOptimizerConfig] = None
-    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones] = (
-        None
-    )
+    max_grad_norm: NotRequired[Union[float, int]]
+    refit_buffer_size_gb: NotRequired[float]
+    optimizer: NotRequired[PytorchOptimizerConfig]
+    scheduler: NotRequired[list[SinglePytorchSchedulerConfig] | SchedulerMilestones]

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
 
 import torch
-from transformers import PreTrainedTokenizerBase
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 # OpenAI-API-like message log, but every messsage may contain associated tensors (i.e. tokenized strings and logprobs) in addition to the original "content" string
 LLMMessageLogType = list[dict[str, Union[str, torch.Tensor]]]
@@ -35,8 +35,8 @@ class DatumSpec(TypedDict):
     extra_env_info: dict[str, Any]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
-    task_name: NotRequired[str] = "default"
-    stop_strings: NotRequired[list[str]] = None  # Optional stop strings for generation
+    task_name: NotRequired[str]
+    stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 
@@ -94,7 +94,7 @@ class TaskDataProcessFnCallable(Protocol):
         datum_dict: dict[str, Any],
         task_data_spec: TaskDataSpec,
         tokenizer: TokenizerType,
-        max_seq_length: int,
+        max_seq_length: int | None,
         idx: int,
     ) -> DatumSpec:
         raise NotImplementedError("Task data process not implemented")

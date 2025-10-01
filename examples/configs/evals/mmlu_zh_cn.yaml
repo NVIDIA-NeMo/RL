@@ -1,0 +1,5 @@
+# MMLU_ZH-CN evaluation Configuration
+defaults: "mmlu.yaml"
+
+data:
+  dataset_name: "mmlu_ZH-CN"

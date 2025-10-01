@@ -8,7 +8,7 @@ content_type: "concept"
 modality: "universal"
 ---
 
-# Architecture Overview
+# Core Architecture
 
 NeMo RL is built on a modular, scalable architecture designed to handle the complexities of distributed reinforcement learning while maintaining simplicity and flexibility. This overview provides a high-level understanding of NeMo RL's architectural components and design principles.
 

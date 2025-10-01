@@ -8,26 +8,22 @@ content_type: "reference"
 modality: "universal"
 ---
 
-# About NeMo RL API Documentation
+# About NeMo RL API
 
-Welcome to the NeMo RL API documentation! This section provides comprehensive reference documentation for all the APIs, interfaces, and components that make up the NeMo RL framework.
+Welcome to the NeMo RL API reference documentation. This section provides detailed technical documentation for all modules, classes, functions, and interfaces in the NeMo RL codebase.
 
 ## Overview
 
-NeMo RL provides a modular and extensible API for reinforcement learning with large language models. The framework is built around several core abstractions that enable scalable, distributed training and inference across multiple backends.
+This API reference is auto-generated from the NeMo RL source code and provides:
 
-## Core Architecture
+- **Class and function signatures** with parameter types and return values
+- **Docstring documentation** explaining usage and behavior
+- **Module organization** showing how components relate to each other
+- **Source code links** for diving deeper into implementation details
 
-NeMo RL is designed around four key capabilities that every RL system needs:
+For conceptual guides and tutorials, see the [Guides](../guides/index) section. For architectural overview, see [About NeMo RL](../about/index).
 
-1. **Resource Management**: Allocate and manage compute resources (GPUs/CPUs)
-2. **Isolation**: Provide isolated process environments for different components
-3. **Coordination**: Control and orchestrate distributed components
-4. **Communication**: Enable data flow between components
-
-These capabilities are implemented through a set of composable abstractions that scale from single GPU to thousands of GPUs.
-
-## Quick Navigation
+## API Modules
 
 ::::{grid} 1 2 2 2
 :gutter: 2 2 2 2
@@ -36,7 +32,7 @@ These capabilities are implemented through a set of composable abstractions that
 :link: nemo_rl/nemo_rl.distributed
 :link-type: doc
 
-Core distributed computing abstractions including VirtualCluster and WorkerGroup.
+Core distributed computing abstractions including `VirtualCluster`, `WorkerGroup`, and communication primitives.
 
 +++
 {bdg-primary}`Core`
@@ -46,7 +42,7 @@ Core distributed computing abstractions including VirtualCluster and WorkerGroup
 :link: nemo_rl/nemo_rl.models
 :link-type: doc
 
-Model interfaces, policy implementations, and generation backends.
+Model interfaces, policy implementations, and generation backends for Hugging Face, Megatron, and vLLM.
 
 +++
 {bdg-info}`Models`
@@ -56,7 +52,7 @@ Model interfaces, policy implementations, and generation backends.
 :link: nemo_rl/nemo_rl.algorithms
 :link-type: doc
 
-RL algorithms including DPO, GRPO, SFT, and custom loss functions.
+RL training algorithms including DPO, GRPO, SFT, loss functions, and training utilities.
 
 +++
 {bdg-warning}`Training`
@@ -66,162 +62,133 @@ RL algorithms including DPO, GRPO, SFT, and custom loss functions.
 :link: nemo_rl/nemo_rl.data
 :link-type: doc
 
-Data processing, dataset interfaces, and environment implementations.
+Dataset interfaces, data processing utilities, and RL environment abstractions.
 
 +++
 {bdg-secondary}`Data`
 :::
 
-:::{grid-item-card} {octicon}`package;1.5em;sd-mr-1` Converters
-:link: converters
+:::{grid-item-card} {octicon}`beaker;1.5em;sd-mr-1` Environments
+:link: nemo_rl/nemo_rl.environments
 :link-type: doc
 
-Model conversion and export utilities for deployment and production.
+Environment interfaces and implementations for math problems, games, and custom tasks.
 
 +++
-{bdg-info}`Deployment`
+{bdg-info}`Environments`
+:::
+
+:::{grid-item-card} {octicon}`package;1.5em;sd-mr-1` Converters
+:link: nemo_rl/nemo_rl.converters
+:link-type: doc
+
+Model conversion and export utilities for vLLM deployment and format transformations.
+
++++
+{bdg-success}`Deployment`
+:::
+
+:::{grid-item-card} {octicon}`meter;1.5em;sd-mr-1` Evaluation
+:link: nemo_rl/nemo_rl.evals
+:link-type: doc
+
+Evaluation frameworks, metrics computation, and model assessment utilities.
+
++++
+{bdg-warning}`Evaluation`
+:::
+
+:::{grid-item-card} {octicon}`tools;1.5em;sd-mr-1` Utilities
+:link: nemo_rl/nemo_rl.utils
+:link-type: doc
+
+Logging, configuration, checkpointing, profiling, and other helper utilities.
+
++++
+{bdg-secondary}`Utilities`
 :::
 
 ::::
 
-## Key Components
+## Key Interfaces
 
-### Distributed Computing
+### PolicyInterface
 
-The distributed computing layer provides abstractions for managing compute resources and coordinating distributed processes:
+The core interface for RL policies. Implement this to create custom policy implementations:
 
-- **VirtualCluster**: Manages resource allocation and placement groups
-- **WorkerGroup**: Coordinates groups of distributed worker processes
-- **BatchedDataDict**: Efficient data structures for distributed communication
+- `nemo_rl.models.policy.interfaces.PolicyInterface` - Abstract base class for policies
+- `nemo_rl.models.policy.lm_policy.Policy` - Main policy implementation
 
-### Models and Policies
+### GenerationInterface
 
-The model layer provides interfaces for different model backends and policy implementations:
+Unified interface for text generation across backends:
 
-- **PolicyInterface**: Abstract interface for RL policies
-- **GenerationInterface**: Unified interface for text generation backends
-- **Model Backends**: Support for Hugging Face, Megatron, and custom backends
+- `nemo_rl.models.generation.interfaces.GenerationInterface` - Base generation interface
+- `nemo_rl.models.generation.vllm.VllmGeneration` - vLLM-based generation
 
-### Algorithms
+### EnvironmentInterface
 
-The algorithms layer implements various RL algorithms and training methods:
+Interface for RL environments:
 
-- **DPO**: Direct Preference Optimization
-- **GRPO**: Group Relative Policy Optimization  
-- **SFT**: Supervised Fine-Tuning
-- **Custom Loss Functions**: Extensible loss function framework
+- `nemo_rl.environments.interfaces.EnvironmentInterface` - Base environment interface
+- `nemo_rl.environments.math_environment.MathEnvironment` - Math problem environment
 
-### Data and Environments
+## Common Patterns
 
-The data layer handles data processing, dataset management, and environment interactions:
-
-- **Dataset Interfaces**: Standardized dataset loading and processing
-- **Environment Interfaces**: RL environment abstractions
-- **Data Processing**: Tokenization, batching, and preprocessing utilities
-
-### Converters
-
-The converters layer provides model conversion and export utilities:
-
-- **HuggingFace/Megatron Converters**: vLLM export and Megatron → HuggingFace
-- **Deployment Utilities**: Model export and production deployment tools
-
-## Design Philosophy
-
-NeMo RL follows several key design principles:
-
-### Modular Abstractions
-
-Each component is designed as a modular abstraction that can be composed and extended:
-
-```python
-# Example: Composing a generation pipeline
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.vllm import VllmGeneration, VllmConfig
-
-cluster = RayVirtualCluster(bundle_ct_per_node_list=[4], use_gpus=True, num_gpus_per_node=4)
-vllm_cfg: VllmConfig = {
-    "backend": "vllm",
-    "model_name": "meta-llama/Llama-3.1-8B-Instruct",
-    "max_new_tokens": 128,
-    "temperature": 0.0,
-    "top_p": 1.0,
-    "top_k": None,
-    "pad_token_id": 0,
-    "stop_token_ids": [],
-    "vllm_cfg": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_model_len": 4096, "skip_tokenizer_init": True, "async_engine": False, "precision": "bfloat16", "load_format": "auto"},
-}
-generator = VllmGeneration(cluster, vllm_cfg)
-```
-
-### Backend Independence
-
-The framework is designed to be backend-agnostic, allowing easy switching between different implementations:
-
-```python
-# Same interface, different backends (via configuration in Policy)
-# See nemo_rl.models.policy.lm_policy.Policy and example configs in examples/configs/
-```
-
-### Scalability
-
-The abstractions scale seamlessly from single GPU to thousands of GPUs:
-
-```python
-# Single GPU
-cluster = RayVirtualCluster([1])  # 1 GPU
-
-# Multi-GPU
-cluster = RayVirtualCluster([8, 8])  # 2 nodes, 8 GPUs each
-
-# Same code works at any scale
-worker_group = RayWorkerGroup(cluster, policy_class)
-```
-
-## Getting Started
-
-### Basic Usage
+### Creating a Virtual Cluster
 
 ```python
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.algorithms.dpo import setup as dpo_setup, dpo_train
 
-# Set up distributed environment
-cluster = RayVirtualCluster(bundle_ct_per_node_list=[4], use_gpus=True, num_gpus_per_node=4)
-
-# See examples/run_dpo.py for a complete training pipeline using Policy and dpo_train
+# Single node, 4 GPUs
+cluster = RayVirtualCluster(
+    bundle_ct_per_node_list=[4],
+    use_gpus=True,
+    num_gpus_per_node=4
+)
 ```
 
-### Custom Components
-
-Extending NeMo RL with custom components is straightforward:
+### Setting Up a Worker Group
 
 ```python
-from nemo_rl.models.interfaces import PolicyInterface
+from nemo_rl.distributed.worker_groups import RayWorkerGroup
 
-class CustomPolicy(PolicyInterface):
-    def generate(self, batch):
-        # Custom generation logic
-        pass
-    
-    def train(self, batch, loss_fn):
-        # Custom training logic
+worker_group = RayWorkerGroup(
+    virtual_cluster=cluster,
+    actor_class=PolicyWorker,
+    num_workers=4
+)
+```
+
+### Implementing Custom Loss Functions
+
+```python
+from nemo_rl.algorithms.interfaces import LossFunctionInterface
+
+class CustomLoss(LossFunctionInterface):
+    def compute_loss(self, batch, model_output):
+        # Your loss computation
         pass
 ```
 
-## API Reference
+## Module Index
 
-The following sections provide detailed API documentation for each component:
+Browse the complete API by module:
 
-- [Distributed Computing](nemo_rl/nemo_rl.distributed): VirtualCluster, WorkerGroup, and distributed utilities
-- [Models and Policies](nemo_rl/nemo_rl.models): Policy interfaces, generation backends, and model implementations
-- [Algorithms](nemo_rl/nemo_rl.algorithms): RL algorithms, loss functions, and training utilities
-- [Data and Environments](nemo_rl/nemo_rl.data): Dataset interfaces, environment abstractions, and data processing
-- [Converters](nemo_rl/nemo_rl.converters): Model conversion and export utilities for deployment
-- [Utilities](nemo_rl/nemo_rl.utils): Logging, configuration, and utility functions
-- [Auto-Generated Reference](auto-generated): Complete API reference with all functions, classes, and parameters
-- [Complete API Reference](nemo_rl/nemo_rl): Full auto-generated documentation for all modules
+- [nemo_rl.algorithms](nemo_rl/nemo_rl.algorithms) - Training algorithms
+- [nemo_rl.converters](nemo_rl/nemo_rl.converters) - Model converters
+- [nemo_rl.data](nemo_rl/nemo_rl.data) - Data utilities
+- [nemo_rl.distributed](nemo_rl/nemo_rl.distributed) - Distributed computing
+- [nemo_rl.environments](nemo_rl/nemo_rl.environments) - RL environments
+- [nemo_rl.evals](nemo_rl/nemo_rl.evals) - Evaluation tools
+- [nemo_rl.experience](nemo_rl/nemo_rl.experience) - Experience management
+- [nemo_rl.metrics](nemo_rl/nemo_rl.metrics) - Metrics and logging
+- [nemo_rl.models](nemo_rl/nemo_rl.models) - Models and policies
+- [nemo_rl.utils](nemo_rl/nemo_rl.utils) - Utility functions
 
+## Additional Resources
 
-
+- [Core Architecture](../about/architecture-overview) - System design and components
+- [Core Design](../core-design/index) - Design principles and patterns
+- [Guides](../guides/index) - Task-focused how-to guides
+- [Examples](../learning-resources/examples/index) - Working code examples

@@ -1,0 +1,32 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 20
+checkpointing:
+  checkpoint_dir: results/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
+  save_period: 100
+policy:
+  model_name: Qwen/Qwen2.5-32B
+  tokenizer:
+    name: Qwen/Qwen2.5-32B
+  max_total_sequence_length: 16000
+  dtensor_cfg:
+    sequence_parallel: true
+    activation_checkpointing: true
+    tensor_parallel_size: 8
+  make_sequence_length_divisible_by: 8
+data:
+  dataset_name: openmathinstruct2
+  prompt_file: examples/prompts/math.txt
+  split: train_1M
+  add_generation_prompt: true
+  output_key: generated_solution
+logger:
+  log_dir: logs/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
+  wandb:
+    project: nemo-rl
+    name: sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt
+  tensorboard:
+    log_dir: tb_logs-sft-dev-openmathinstruct2
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

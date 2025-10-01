@@ -104,6 +104,43 @@ class MyTestActor:
         return resources, env_vars_update, init_kwargs_update
 
 
+@ray.remote(
+    runtime_env={
+        "env_vars": {
+            "TEST_VAR_1": "ray_remote_runtime_value",
+            "TEST_VAR_3": "ray_remote_runtime_value",
+            "RAY_REMOTE_VAR": "ray_remote_only",
+        }
+    }
+)
+class PrecedenceActor:
+    """Actor with configure_worker method that sets environment variables."""
+
+    _default_options = {}
+
+    def __init__(self, *args, **kwargs):
+        self.init_args = args
+        self.init_kwargs = kwargs
+        self.env_vars = dict(os.environ)
+
+    def get_env_var(self, var_name):
+        return self.env_vars.get(var_name)
+
+    def get_all_env_vars(self):
+        return dict(self.env_vars)
+
+    @classmethod
+    def configure_worker(cls, num_gpus, bundle_indices=None):
+        return (
+            {"num_gpus": num_gpus},  # resources
+            {
+                "TEST_VAR_1": "configure_worker_value",
+                "WORKER_VAR": "worker_only",
+            },  # env_vars
+            {},  # init_kwargs
+        )
+
+
 MY_TEST_ACTOR_FQN = f"{MyTestActor.__module__}.MyTestActor"
 
 
@@ -138,7 +175,6 @@ class NsightDummyActor:
 def register_test_actor(request):
     # Default to PY_EXECUTABLES.SYSTEM if no param is given
     py_exec_to_register = getattr(request, "param", PY_EXECUTABLES.SYSTEM)
-
     original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(MY_TEST_ACTOR_FQN)
     ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN] = py_exec_to_register
 
@@ -150,6 +186,27 @@ def register_test_actor(request):
             del ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN]
         else:
             ACTOR_ENVIRONMENT_REGISTRY[MY_TEST_ACTOR_FQN] = original_registry_value
+
+
+# Create fixtures for each actor class
+@pytest.fixture
+def register_precedence_actor(request):
+    """Fixture for ConfigureWorkerActor."""
+    # Default to PY_EXECUTABLES.SYSTEM if no param is given
+    py_exec_to_register = getattr(request, "param", PY_EXECUTABLES.SYSTEM)
+    actor_fqn = f"{PrecedenceActor.__module__}.PrecedenceActor"
+
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(actor_fqn)
+    ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] = py_exec_to_register
+
+    yield actor_fqn  # Provide the FQN to the test
+
+    # Clean up: revert ACTOR_ENVIRONMENT_REGISTRY to its original state for this FQN
+    if actor_fqn in ACTOR_ENVIRONMENT_REGISTRY:  # Check if key still exists
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[actor_fqn]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[actor_fqn] = original_registry_value
 
 
 @pytest.fixture
@@ -297,6 +354,92 @@ def test_environment_variables_setup(register_test_actor, virtual_cluster):
         m_addr, m_port = ray.get(worker_group.workers[i].get_master_addr_port.remote())
         assert m_addr == expected_master_addr
         assert m_port == expected_master_port
+
+    worker_group.shutdown(force=True)
+
+
+def test_custom_environment_variables(register_test_actor, virtual_cluster):
+    """Test that custom environment variables passed through env_vars are correctly set in workers."""
+    actor_fqn = register_test_actor
+    builder = RayWorkerBuilder(actor_fqn)
+
+    # Define custom environment variables to pass to workers
+    custom_env_vars = {
+        "CUSTOM_VAR_1": "test_value_1",
+        "CUSTOM_VAR_2": "test_value_2",
+        "NEMO_TEST_ENV": "nemo_test_value",
+        "DUMMY_TEST_VAR": "/custom/test/path",
+    }
+
+    # Create worker group with custom environment variables
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=2,
+        env_vars=custom_env_vars.copy(),
+    )
+
+    assert len(worker_group.workers) == 2
+
+    # Check that all workers have the custom environment variables set
+    for i, worker in enumerate(worker_group.workers):
+        # Check each custom environment variable
+        for var_name, expected_value in custom_env_vars.items():
+            actual_value = ray.get(worker.get_env_var.remote(var_name))
+            assert actual_value == expected_value, (
+                f"Worker {i}: Expected {var_name}={expected_value}, got {actual_value}"
+            )
+
+        # Also verify that the standard distributed environment variables are still set
+        rank, ws, node_rank, local_rank = ray.get(
+            worker.get_rank_world_size_node_rank_local_rank.remote()
+        )
+        assert rank == str(i)
+        assert ws == "2"
+        assert node_rank == "0"
+        assert local_rank == str(i)
+
+    worker_group.shutdown(force=True)
+
+
+def test_custom_environment_variables_override_existing(
+    register_test_actor, virtual_cluster
+):
+    """Test that custom environment variables can override existing environment variables."""
+    actor_fqn = register_test_actor
+    builder = RayWorkerBuilder(actor_fqn)
+
+    # Set an environment variable in the current process
+    os.environ["DUMMY_PYTHONPATH"] = "/original/python/path"
+
+    # Define custom environment variables that override existing ones
+    custom_env_vars = {
+        "DUMMY_PYTHONPATH": "/overridden/python/path",
+        "CUSTOM_OVERRIDE": "overridden_value",
+    }
+
+    # Create worker group with custom environment variables
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=1,
+        env_vars=custom_env_vars,
+    )
+
+    assert len(worker_group.workers) == 1
+    worker = worker_group.workers[0]
+
+    # Check that the custom environment variable overrides the original
+    pythonpath_value = ray.get(worker.get_env_var.remote("DUMMY_PYTHONPATH"))
+    assert pythonpath_value == "/overridden/python/path", (
+        f"Expected DUMMY_PYTHONPATH to be overridden, got {pythonpath_value}"
+    )
+
+    # Check that the new custom variable is set
+    custom_value = ray.get(worker.get_env_var.remote("CUSTOM_OVERRIDE"))
+    assert custom_value == "overridden_value", (
+        f"Expected CUSTOM_OVERRIDE=overridden_value, got {custom_value}"
+    )
 
     worker_group.shutdown(force=True)
 
@@ -977,3 +1120,75 @@ def test_get_nsight_config_output_format():
         assert "env_vars" in combined_runtime_env_no_match
         assert "py_executable" in combined_runtime_env_no_match
         assert "nsight" not in combined_runtime_env_no_match
+
+
+# Environment Variable Precedence Test
+def test_environment_variable_precedence_full(
+    register_precedence_actor, virtual_cluster
+):
+    """Test that the order of precedence is as follows (from highest to lowest):
+    - configure_worker
+    - RayWorkerGroup
+    - system
+    - @ray.remote runtime_env
+    """
+    # Set up system environment variables
+    original_env = dict(os.environ)
+    os.environ["TEST_VAR_1"] = "system_value"
+    os.environ["TEST_VAR_2"] = "system_value"
+    os.environ["TEST_VAR_3"] = "system_value"
+    os.environ["TEST_VAR_4"] = "system_value"
+
+    try:
+        # Create a worker builder with configure_worker method
+        builder = RayWorkerBuilder(register_precedence_actor)
+
+        # Create RayWorkerGroup environment variables
+        env_vars = {
+            "TEST_VAR_1": "yaml_worker_group_value",
+            "TEST_VAR_2": "yaml_worker_group_value",
+        }
+
+        # Create worker group
+        worker_group = RayWorkerGroup(
+            cluster=virtual_cluster,
+            remote_worker_builder=builder,
+            workers_per_node=1,
+            ## passing env_vars here mimics passing env vars from yaml config
+            ## because lm_policy automicatically passes env vars to RayWorkerGroup
+            env_vars=env_vars,
+        )
+
+        assert len(worker_group.workers) == 1
+        worker = worker_group.workers[0]
+
+        # Verify configure_worker has highest precedence
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_1")) == "configure_worker_value"
+        )  # configure_worker overrides all
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_2"))
+            == "yaml_worker_group_value"
+        )  # RayWorkerGroup value preserved
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_3")) == "system_value"
+        )  # system value takes precedence over worker env vars
+        assert (
+            ray.get(worker.get_env_var.remote("TEST_VAR_4")) == "system_value"
+        )  # system value preserved
+        assert (
+            ray.get(worker.get_env_var.remote("WORKER_VAR")) == "worker_only"
+        )  # configure_worker value set
+        assert (
+            ray.get(worker.get_env_var.remote("RAY_REMOTE_VAR")) == "ray_remote_only"
+        )  # ray.remote runtime_env value preserved
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        # Restore original environment
+        for key in ["TEST_VAR_1", "TEST_VAR_2", "TEST_VAR_3", "TEST_VAR_4"]:
+            if key in original_env:
+                os.environ[key] = original_env[key]
+            else:
+                os.environ.pop(key, None)

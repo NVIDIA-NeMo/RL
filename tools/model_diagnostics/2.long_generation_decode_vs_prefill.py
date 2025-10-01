@@ -25,7 +25,7 @@ def extract_logprobs(logprobs):
     return output
 
 
-def calculate_error(a, b):
+def calculate_error(a, b) -> float:
     return torch.exp(torch.abs(a - b)).mean().item()
 
 

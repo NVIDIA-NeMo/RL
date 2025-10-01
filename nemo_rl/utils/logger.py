@@ -19,13 +19,16 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
+import mlflow
 import ray
 import requests
+import swanlab
 import torch
 import wandb
 from matplotlib import pyplot as plt
@@ -45,12 +48,23 @@ _rich_logging_configured = False
 
 
 class WandbConfig(TypedDict):
-    project: str
-    name: str
+    project: NotRequired[str]
+    name: NotRequired[str]
+
+
+class SwanlabConfig(TypedDict):
+    project: NotRequired[str]
+    name: NotRequired[str]
 
 
 class TensorboardConfig(TypedDict):
-    log_dir: str
+    log_dir: NotRequired[str]
+
+
+class MLflowConfig(TypedDict):
+    experiment_name: str
+    run_name: str
+    tracking_uri: NotRequired[str]
 
 
 class GPUMonitoringConfig(TypedDict):
@@ -61,11 +75,16 @@ class GPUMonitoringConfig(TypedDict):
 class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
+    swanlab_enabled: bool
     tensorboard_enabled: bool
+    mlflow_enabled: bool
     wandb: WandbConfig
-    tensorboard: TensorboardConfig
+    tensorboard: NotRequired[TensorboardConfig]
+    swanlab: NotRequired[SwanlabConfig]
+    mlflow: NotRequired[MLflowConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
+    num_val_samples_to_print: NotRequired[int]
 
 
 class LoggerInterface(ABC):
@@ -313,6 +332,75 @@ class WandbLogger(LoggerInterface):
         self.run.log({name: figure}, step=step)
 
 
+class SwanlabLogger(LoggerInterface):
+    """SwanLab logger backend."""
+
+    def __init__(self, cfg: SwanlabConfig, log_dir: Optional[str] = None):
+        self.run = swanlab.init(**cfg, logdir=log_dir)
+        print(
+            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
+        )
+
+    def define_metric(
+        self,
+        name: str,
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Define a metric with custom step metric.
+
+        Args:
+            name: Name of the metric or pattern (e.g. 'ray/*')
+            step_metric: Optional name of the step metric to use
+        """
+        self.run.define_metric(name, step_metric=step_metric)
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Log metrics to swanlab.
+
+        Args:
+            metrics: Dict of metrics to log
+            step: Global step value
+            prefix: Optional prefix for metric names
+            step_metric: Optional name of a field in metrics to use as step instead
+                         of the provided step value
+        """
+        if prefix:
+            metrics = {
+                f"{prefix}/{k}" if k != step_metric else k: v
+                for k, v in metrics.items()
+            }
+
+        # If step_metric is provided, use the corresponding value from metrics as step
+        if step_metric and step_metric in metrics:
+            # commit=False so the step does not get incremented
+            self.run.log(metrics, commit=False)
+        else:
+            self.run.log(metrics, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to swanlab.
+
+        Args:
+            params: Dict of hyperparameters to log
+        """
+        self.run.config.update(params)
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to swanlab.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+        """
+        self.run.log({name: figure}, step=step)
+
+
 class GpuMetricSnapshot(TypedDict):
     step: int
     metrics: dict[str, Any]
@@ -349,6 +437,7 @@ class RayGpuMonitorLogger:
         self.is_running = False
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
+        self.start_time: float = float("-inf")
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""
@@ -535,7 +624,7 @@ class RayGpuMonitorLogger:
                 unique_metric_addresses[metrics_address] = True
 
             # Process each node's metrics
-            collected_metrics = {}
+            collected_metrics: dict[str, Any] = {}
             for node_idx, metric_address in enumerate(unique_metric_addresses):
                 metrics = self._fetch_and_parse_metrics(
                     node_idx, metric_address, parser_fn
@@ -610,6 +699,91 @@ class RayGpuMonitorLogger:
             self.metrics_buffer = []
 
 
+class MLflowLogger(LoggerInterface):
+    """MLflow logger backend."""
+
+    def __init__(self, cfg: MLflowConfig, log_dir: Optional[str] = None):
+        """Initialize MLflow logger.
+
+        Args:
+            cfg: MLflow configuration
+            log_dir: Optional log directory
+        """
+        if cfg["tracking_uri"]:
+            mlflow.set_tracking_uri(cfg["tracking_uri"])
+
+        experiment = mlflow.get_experiment_by_name(cfg["experiment_name"])
+        if experiment is None:
+            if log_dir:
+                mlflow.create_experiment(
+                    name=cfg["experiment_name"],
+                    artifact_location=log_dir,
+                )
+            else:
+                mlflow.create_experiment(cfg["experiment_name"])
+        else:
+            mlflow.set_experiment(cfg["experiment_name"])
+
+        # Start run
+        run_kwargs: dict[str, str] = {}
+        run_kwargs["run_name"] = cfg["run_name"]
+
+        self.run = mlflow.start_run(**run_kwargs)
+        print(
+            f"Initialized MLflowLogger for experiment {cfg['experiment_name']}, "
+            f"run {cfg['run_name']}"
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: Optional[str] = "",
+        step_metric: Optional[str] = None,
+    ) -> None:
+        """Log metrics to MLflow.
+
+        Args:
+            metrics: Dict of metrics to log
+            step: Global step value
+            prefix: Optional prefix for metric names
+            step_metric: Optional step metric name (ignored in MLflow)
+        """
+        for name, value in metrics.items():
+            if prefix:
+                name = f"{prefix}/{name}"
+            mlflow.log_metric(name, value, step=step)
+
+    def log_hyperparams(self, params: Mapping[str, Any]) -> None:
+        """Log hyperparameters to MLflow.
+
+        Args:
+            params: Dictionary of hyperparameters to log
+        """
+        # MLflow does not support nested dicts
+        mlflow.log_params(flatten_dict(params))
+
+    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+        """Log a plot to MLflow.
+
+        Args:
+            figure: Matplotlib figure to log
+            step: Global step value
+            name: Name of the plot
+        """
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp_file:
+            figure.savefig(tmp_file.name, format="png", bbox_inches="tight")
+            mlflow.log_artifact(tmp_file.name, f"plots/{name}")
+
+    def __del__(self) -> None:
+        """Clean up resources when the logger is destroyed."""
+        try:
+            mlflow.end_run()
+        except Exception:
+            # Ignore errors during cleanup
+            pass
+
+
 class Logger(LoggerInterface):
     """Main logger class that delegates to multiple backend loggers."""
 
@@ -620,14 +794,17 @@ class Logger(LoggerInterface):
             cfg: Config dict with the following keys:
                 - wandb_enabled
                 - tensorboard_enabled
+                - mlflow_enabled
                 - wandb
                 - tensorboard
+                - mlflow
                 - monitor_gpus
                 - gpu_collection_interval
                 - gpu_flush_interval
         """
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
+        self.swanlab_logger = None
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -638,6 +815,12 @@ class Logger(LoggerInterface):
             self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
 
+        if cfg["swanlab_enabled"]:
+            swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
+            os.makedirs(swanlab_log_dir, exist_ok=True)
+            self.swanlab_logger = SwanlabLogger(cfg["swanlab"], log_dir=swanlab_log_dir)
+            self.loggers.append(self.swanlab_logger)
+
         if cfg["tensorboard_enabled"]:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
             os.makedirs(tensorboard_log_dir, exist_ok=True)
@@ -646,6 +829,12 @@ class Logger(LoggerInterface):
             )
             self.loggers.append(tensorboard_logger)
 
+        if cfg["mlflow_enabled"]:
+            mlflow_log_dir = os.path.join(self.base_log_dir, "mlflow")
+            os.makedirs(mlflow_log_dir, exist_ok=True)
+            mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
+            self.loggers.append(mlflow_logger)
+
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
         if cfg["monitor_gpus"]:
@@ -653,6 +842,11 @@ class Logger(LoggerInterface):
             step_metric = f"{metric_prefix}/ray_step"
             if cfg["wandb_enabled"] and self.wandb_logger:
                 self.wandb_logger.define_metric(
+                    f"{metric_prefix}/*", step_metric=step_metric
+                )
+
+            if cfg["swanlab_enabled"] and self.swanlab_logger:
+                self.swanlab_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
@@ -757,14 +951,22 @@ class Logger(LoggerInterface):
             data["full_lengths"][sample_idx] - 1,
         )
 
+        if generation_start_idx >= generation_end_idx:
+            print(
+                f"Skipping token_mult_prob_error plot because generation_start_idx ({generation_start_idx}) >= generation_end_idx ({generation_end_idx})"
+            )
+            return
+
         generation_logprob = generation_logprobs[
-            sample_idx, generation_start_idx:generation_end_idx
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
         prev_logprob = (
-            prev_logprobs[sample_idx, generation_start_idx:generation_end_idx]
-            * mask[sample_idx, generation_start_idx:generation_end_idx]
+            prev_logprobs[
+                sample_idx, int(generation_start_idx) : int(generation_end_idx)
+            ]
+            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
         )
-        diff_i = diff[sample_idx, generation_start_idx:generation_end_idx]
+        diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
 
         # Find max absolute error token
         max_abs_error_idx = torch.argmax(diff_i).item()
@@ -778,7 +980,7 @@ class Logger(LoggerInterface):
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()
-        step_idx = torch.arange(generation_start_idx, generation_end_idx)
+        step_idx = torch.arange(int(generation_start_idx), int(generation_end_idx))
 
         plt.plot(step_idx, generation_logprob, label="logprob (inference engine)")
         plt.plot(step_idx, prev_logprob, label="logprob (reference policy)")

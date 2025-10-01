@@ -22,91 +22,35 @@
 
 import os
 import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any
 
-# Add custom extensions directory to Python path
-sys.path.insert(0, os.path.abspath('_extensions'))
+import git
+from docutils import nodes
+from docutils.transforms import Transform
+from sphinx import addnodes
+from sphinx.application import Sphinx
 
-project = "NeMo RL"
+project = "NeMo-RL"
 copyright = "2025, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "0.2.1"
+release = "latest"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
     "myst_parser",  # For our markdown docs
-    # "autodoc2" - Added conditionally below based on package availability
+    "autodoc2",  # Generates API docs
     "sphinx.ext.viewcode",  # For adding a link to view source code in docs
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
-    "sphinx_copybutton",  # For copy button in code blocks,
-    "sphinx_design",  # For grid layout
-    "sphinx.ext.ifconfig",  # For conditional content
-    "content_gating",  # Unified content gating extension
-    "myst_codeblock_substitutions",  # Our custom MyST substitutions in code blocks
-    "json_output",  # Generate JSON output for each page
-    "search_assets",  # Enhanced search assets extension
-    #"ai_assistant",  # AI Assistant extension for intelligent search responses
-    "sphinxcontrib.mermaid",  # For Mermaid diagrams
+    "sphinx_copybutton",  # For copy button in code blocks
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = [
-    "_build",
-    "Thumbs.db",
-    ".DS_Store",
-    "_extensions/*/README.md",      # Exclude README files in extension directories
-    "_extensions/README.md",        # Exclude main extensions README
-    "_extensions/*/__pycache__",    # Exclude Python cache directories
-    "_extensions/*/*/__pycache__", # Exclude nested Python cache directories
-    "api/**",  # Exclude any legacy generated API files under docs/api
-]
-
-# -- Options for Intersphinx -------------------------------------------------
-# Cross-references to external documentation
-intersphinx_mapping = {
-    # Core Python and scientific libraries
-    "python": ("https://docs.python.org/3", None),
-    "numpy": ("https://numpy.org/doc/stable", None),
-    "scipy": ("https://docs.scipy.org/doc/scipy", None),
-    
-    # Deep learning frameworks
-    "torch": ("https://pytorch.org/docs/stable", None),
-    "transformers": ("https://huggingface.co/docs/transformers", None),
-    "datasets": ("https://huggingface.co/docs/datasets", None),
-    
-    # Reinforcement learning libraries
-    "gymnasium": ("https://gymnasium.farama.org", None),
-    "stable-baselines3": ("https://stable-baselines3.readthedocs.io/en/master", None),
-    "ray": ("https://docs.ray.io/en/latest", None),
-    "ray-rllib": ("https://docs.ray.io/en/latest/rllib", None),
-    
-    # NVIDIA ecosystem
-    "nemo": ("https://docs.nvidia.com/nemo", None),
-    "megatron": ("https://nvidia.github.io/Megatron-LM", None),
-    
-    # Other relevant libraries
-    "wandb": ("https://docs.wandb.ai", None),
-    "tensorboard": ("https://www.tensorflow.org/tensorboard", None),
-}
-
-# Intersphinx timeout for slow connections
-intersphinx_timeout = 30
-
-# -- Options for JSON Output -------------------------------------------------
-# Configure the JSON output extension for comprehensive search indexes
-json_output_settings = {
-    'enabled': True,
-}
-
-# -- Options for AI Assistant -------------------------------------------------
-# Configure the AI Assistant extension for intelligent search responses
-ai_assistant_enabled = False
-ai_assistant_endpoint = "https://prod-1-data.ke.pinecone.io/assistant/chat/test-assistant"
-ai_assistant_api_key = ""  # Set this to your Pinecone API key
-ai_trigger_threshold = 2  # Trigger AI when fewer than N search results
-ai_auto_trigger = True  # Automatically trigger AI analysis
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # -- Options for MyST Parser (Markdown) --------------------------------------
 # MyST Parser settings
@@ -117,169 +61,179 @@ myst_enable_extensions = [
     "deflist",  # Supports definition lists with term: definition format
     "fieldlist",  # Enables field lists for metadata like :author: Name
     "tasklist",  # Adds support for GitHub-style task lists with [ ] and [x]
-    "attrs_inline", # Enables inline attributes for markdown
-    "substitution", # Enables substitution for markdown
 ]
-
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
-
-# MyST substitutions for reusable variables across documentation
-myst_substitutions = {
-    "product_name": "NVIDIA NeMo RL",
-    "product_name_short": "NeMo RL",
-    "company": "NVIDIA",
-    "version": release,
-    "current_year": "2025",
-    "github_repo": "[https://github.com/NVIDIA/NeMo-RL](https://github.com/NVIDIA/NeMo-RL)",
-    "docs_url": "[https://docs.nvidia.com/nemo-rl](https://docs.nvidia.com/nemo-rl)",
-    "support_email": "nemo-rl-support@nvidia.com",
-    "min_python_version": "3.9",
-    "recommended_cuda": "12.0+",
-}
-
-# Enable figure numbering
-numfig = True
-
-# Optional: customize numbering format
-numfig_format = {
-    'figure': 'Figure %s',
-    'table': 'Table %s',
-    'code-block': 'Listing %s'
-}
-
-# Optional: number within sections
-numfig_secnum_depth = 1  # Gives you "Figure 1.1, 1.2, 2.1, etc."
-
-# -- Options for custom roles -----------------------------------------------------
-# Octicon support is handled by sphinx_design and nvidia_sphinx_theme
-# No custom setup needed since octicons work out of the box
-
-# Suppress expected warnings for conditional content builds
-suppress_warnings = [
-    "toc.not_included",  # Expected when video docs are excluded from GA builds
-    "toc.no_title",      # Expected for helm docs that include external README files
-    "docutils",          # Expected for autodoc2-generated content with regex patterns and complex syntax
-
-]
 
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))
 
-# Conditional autodoc2 configuration - only enable if packages exist
-autodoc2_packages_list = [
-    # Core package
-    "../nemo_rl",
-    # Algorithms
-    "../nemo_rl/algorithms",
-    # Converters
-    "../nemo_rl/converters",
-    "../nemo_rl/converters/huggingface",
-    "../nemo_rl/converters/megatron",
-    # Data handling
-    "../nemo_rl/data",
-    "../nemo_rl/data/hf_datasets",
-    # Distributed computing
-    "../nemo_rl/distributed",
-    # Environments
-    "../nemo_rl/environments",
-    # Evaluation
-    "../nemo_rl/evals",
-    # Experience management
-    "../nemo_rl/experience",
-    # Metrics
-    "../nemo_rl/metrics",
-    # Models
-    "../nemo_rl/models",
-    # Utilities
-    "../nemo_rl/utils",
+autodoc2_packages = [
+    "../nemo_rl",  # Path to your package relative to conf.py
 ]
-
-# Check if any of the packages actually exist before enabling autodoc2
-autodoc2_packages = []
-for pkg_path in autodoc2_packages_list:
-    abs_pkg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), pkg_path))
-    if os.path.exists(abs_pkg_path):
-        autodoc2_packages.append(pkg_path)
-
-# Only include autodoc2 in extensions if we have valid packages
-if autodoc2_packages:
-    if "autodoc2" not in extensions:
-        extensions.append("autodoc2")
-
-    autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
-    autodoc2_output_dir = "api-docs"  # Output directory for autodoc2 (relative to docs/)
-    # Use custom index template so API landing page renders with grid cards
-    autodoc2_index_template = "_templates/autodoc2_index.rst"
-    
-    # Exclude problematic files and modules
-    autodoc2_exclude_files = [
-        "**/__pycache__/**",
-        "**/*.pyc",
-        "**/tests/**",
-        "**/test_*",
-        "**/*_test.py",
-    ]
-    
-    # Skip modules that don't have proper __init__.py files
-    autodoc2_skip_module_exprs = [
-        r"\.games$",  # Skip games directory without __init__.py
-    ]
-    
-    # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
-    # render google style docstrings.
-    # Related Issue: [https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33](https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33)
-    # autodoc2_docstring_parser_regexes = [
-    #     (r".*", "docs.autodoc2_docstrings_parser"),
-    # ]
-else:
-    # Remove autodoc2 from extensions if no valid packages
-    if "autodoc2" in extensions:
-        extensions.remove("autodoc2")
-    print("INFO: autodoc2 disabled - no valid packages found in autodoc2_packages_list")
-
-# -- Options for Napoleon (Google Style Docstrings) -------------------------
-napoleon_google_docstring = True
-napoleon_numpy_docstring = False  # Focus on Google style only
-napoleon_include_init_with_doc = False
-napoleon_include_private_with_doc = False
-napoleon_include_special_with_doc = True
-napoleon_use_admonition_for_examples = True
-napoleon_use_admonition_for_notes = True
-napoleon_use_param = True
-napoleon_use_rtype = True
+autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
+autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
+# This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
+# render google style docstrings.
+# Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
+autodoc2_docstring_parser_regexes = [
+    (r".*", "docs.autodoc2_docstrings_parser"),
+]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "nvidia_sphinx_theme"
-
 html_theme_options = {
-    # This line controls the main navigation sidebar expansion
-    "show_nav_level": 2,
-    # This line controls the in-page table of contents expansion
-    "show_toc_level": 2,
-
+    "icon_links": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/NVIDIA-NeMo/RL",
+            "icon": "fa-brands fa-github",
+        }
+    ],
     "switcher": {
-        "json_url": "./versions1.json",
+        "json_url": "../versions1.json",
         "version_match": release,
     },
-    # Configure PyData theme search
-    "search_bar_text": "Search NVIDIA docs...",
-    "navbar_persistent": ["search-button"],
-
+    "extra_head": {
+        """
+    <script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js" ></script>
+    """
+    },
+    "extra_footer": {
+        """
+    <script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
+    """
+    },
 }
-
-# html_static_path = ["_static"]  # Commented out since no static files are needed
-# html_css_files = [
-#     "https://cdnjs.cloudflare.com/ajax/libs/octicons/8.5.0/build.css",  # GitHub Octicons CDN
-#     "octicons.css",  # Custom octicon styling
-# ]
-
-# html_js_files = [
-#     "octicons.js",  # Octicon enhancement script
-# ]
-
 html_extra_path = ["project.json", "versions1.json"]
 
-# Note: JSON output configuration has been moved to the consolidated
-# json_output_settings dictionary above for better organization and new features!
+
+# Github links are now getting rate limited from the Github Actions
+linkcheck_ignore = [
+    ".*github\\.com.*",
+    ".*githubusercontent\\.com.*",
+]
+
+
+def _convert_gh_admonitions(
+    app: Sphinx, relative_path: Path, parent_docname: str, contents: list[str]
+) -> None:
+    """Supporting rendering GitHub alerts correctly.
+
+    # https://github.com/executablebooks/MyST-Parser/issues/845
+    """
+    _github_admonitions = {
+        "> [!NOTE]": "note",
+        "> [!TIP]": "tip",
+        "> [!IMPORTANT]": "important",
+        "> [!WARNING]": "warning",
+        "> [!CAUTION]": "caution",
+    }
+    # loop through content lines, replace github admonitions
+    for i, orig_content in enumerate(contents):
+        orig_line_splits = orig_content.split("\n")
+        replacing = False
+        for j, line in enumerate(orig_line_splits):
+            # look for admonition key
+            line_roi = line.lstrip()
+            for admonition_key in _github_admonitions:
+                if line_roi.startswith(admonition_key):
+                    line = line.replace(
+                        admonition_key,
+                        "```{" + _github_admonitions[admonition_key] + "}",
+                    )
+                    # start replacing quotes in subsequent lines
+                    replacing = True
+                    break
+            else:  # no break
+                if not replacing:
+                    continue
+                # remove GH directive to match MyST directive
+                # since we are replacing on the original line, this will preserve the right indent, if any
+                if line_roi.startswith("> "):
+                    line = line.replace("> ", "", 1)
+                elif line_roi.rstrip() == ">":
+                    line = line.replace(">", "", 1)
+                else:
+                    # missing "> ", so stop replacing and terminate directive
+                    line = f"```\n{line}"
+                    replacing = False
+            # swap line back in splits
+            orig_line_splits[j] = line
+        # swap line back in original
+        contents[i] = "\n".join(orig_line_splits)
+
+
+class _GitHubLinkTransform(Transform):
+    """Converting the relative path to a file in a Markdown to the URL of that file on GitHub."""
+
+    default_priority = 500  # type: ignore[bad-override]
+
+    @staticmethod
+    def _get_github_source_url(repo: git.Repo) -> str:
+        # Find out which remote GitHub repo should be the source.
+        if "origin" in repo.remotes:
+            url = repo.remotes.origin.url
+        elif len(repo.remotes) == 1:
+            url = repo.remotes[0].url
+        else:
+            raise ValueError(
+                "Cannot determine which remote repo on GitHub this local repo is from."
+            )
+        # Canonicalize the URL.
+        if url.startswith("git@github.com:"):
+            url = url.replace("git@github.com:", "https://github.com/", 1)
+        if url.endswith(".git"):
+            url = url[: -len(".git")]
+        return url
+
+    def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
+        try:
+            local_repo = git.Repo(search_parent_directories=True)
+            remote_repo_url = self._get_github_source_url(local_repo)
+        except Exception:
+            # Cannot figure out which source url it should be; leave links as-is.
+            return
+        if local_repo.working_tree_dir is None:
+            # If the local repo is a bare repo, the method below won't work.
+            return
+        wt_dir = local_repo.working_tree_dir
+
+        for node in self.document.traverse(addnodes.download_reference):
+            md_dir = Path(node["refdoc"]).parent
+            dst_path = md_dir / Path(node["reftarget"])
+            try:
+                dst_path = dst_path.resolve(strict=True)
+            except OSError:
+                # If the path doesn't exist or a symlink loop is encountered.
+                continue
+            if dst_path.is_file():
+                kind = "blob"
+            elif dst_path.is_dir():
+                kind = "tree"
+            else:
+                # Cannot figure out what type of thing this path is pointing to.
+                continue
+            refuri = "/".join(
+                (
+                    remote_repo_url.rstrip("/"),
+                    kind,
+                    local_repo.head.object.hexsha,
+                    urllib.parse.quote(dst_path.relative_to(wt_dir).as_posix()),
+                )
+            )
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
+            # Preserve styling and title if present.
+            if "classes" in node:
+                new_node["classes"] = list(node["classes"])
+            if "title" in node:
+                new_node["title"] = node["title"]
+            if node.children:
+                new_node += node.children
+            node.replace_self(new_node)
+
+
+def setup(app: Sphinx) -> None:
+    app.add_transform(_GitHubLinkTransform)
+    app.connect("include-read", _convert_gh_admonitions)

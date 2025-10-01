@@ -30,30 +30,84 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 
 dir_path = os.path.dirname(os.path.abspath(__file__))
 
+
+def pytest_addoption(parser):
+    """Add custom command line options for controlling test execution."""
+    parser.addoption(
+        "--hf-gated",
+        action="store_true",
+        default=False,
+        help="Include tests that require HuggingFace token access",
+    )
+    parser.addoption(
+        "--mcore-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY mcore tests (combine with --hf-gated to include mcore+hf_gated tests)",
+    )
+    parser.addoption(
+        "--automodel-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY automodel tests",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to skip tests based on markers unless explicitly requested."""
+    run_hf_gated = config.getoption("--hf-gated")
+    run_mcore_only = config.getoption("--mcore-only")
+    run_automodel_only = config.getoption("--automodel-only")
+    assert not (run_mcore_only and run_automodel_only), (
+        "--mcore-only and --automodel-only are mutually exclusive"
+    )
+    marker_expr = config.getoption("-m", default="")
+
+    # If user specified -m marker expressions, still prioritize run_first tests
+    if marker_expr:
+        items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
+        return
+
+    # Start with all items and apply filters sequentially
+    new_items = list(items)
+
+    # Filter by hf_gated marker
+    if not run_hf_gated:
+        # Exclude hf_gated tests unless explicitly requested
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("hf_gated")
+        ]
+
+    # Filter by mcore marker
+    if run_mcore_only:
+        # Include only mcore tests
+        new_items = [item for item in new_items if item.get_closest_marker("mcore")]
+    else:
+        # Exclude mcore tests by default
+        new_items = [item for item in new_items if not item.get_closest_marker("mcore")]
+
+    # Filter by automodel marker
+    if run_automodel_only:
+        # Include only automodel tests
+        new_items = [item for item in items if item.get_closest_marker("automodel")]
+    else:
+        # Exclude automodel tests by default
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("automodel")
+        ]
+
+    # Ensure run_first tests are prioritized
+    new_items.sort(key=lambda item: 0 if item.get_closest_marker("run_first") else 1)
+
+    # Update the items list in-place
+    items[:] = new_items
+
+
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
 UNIT_RESULTS_FILE = os.path.join(dir_path, "unit_results.json")
 UNIT_RESULTS_FILE_DATED = os.path.join(
     dir_path, f"unit_results/{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 )
-
-
-# Mapping between asset and absolute path (each are populated from a session level fixture)
-class TEST_ASSETS:
-    TINY_LLAMA_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_llama_with_llama3.2_tokenizer"
-    )
-    TINY_LLAMA_TIED_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_llama_tied_with_llama3.2_tokenizer"
-    )
-    TINY_QWEN2_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_qwen2_with_qwen2_tokenizer"
-    )
-    TINY_QWEN3_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_qwen3_with_qwen3_tokenizer"
-    )
-    TINY_GEMMA3_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_gemma3_with_gemma3_tokenizer"
-    )
 
 
 class UnitTestData(TypedDict):
@@ -198,7 +252,14 @@ def tracker(request, session_data, ray_gpu_monitor):
     session_data["metrics"][qualified_name]["_elapsed"] = end_time - start_time
 
 
+def pytest_sessionstart(session):
+    os.makedirs(TEST_ASSETS_DIR, exist_ok=True)
+
+
 def pytest_sessionfinish(session, exitstatus):
+    if not hasattr(session.config, "_unit_test_data"):
+        return
+
     data = session.config._unit_test_data
     data["exit_status"] = exitstatus
     print(f"\nSaving unit test data to {UNIT_RESULTS_FILE}")
@@ -391,14 +452,14 @@ def mock_2gpu_distributed_env():
 #######################
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_llama_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-    model_path = TEST_ASSETS.TINY_LLAMA_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_llama_with_llama3.2_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=128256 (so we can re-use llama3.2 1b tokenizer)
     config = LlamaConfig(
@@ -419,14 +480,16 @@ def tiny_llama_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_llama_tied_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-    model_path = TEST_ASSETS.TINY_LLAMA_TIED_MODEL_PATH
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_llama_tied_with_llama3.2_tokenizer"
+    )
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=128256 (so we can re-use llama3.2 1b tokenizer)
     config = LlamaConfig(
@@ -447,14 +510,14 @@ def tiny_llama_tied_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_qwen2_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
-    model_path = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_qwen2_with_qwen2_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=151936 (so we can re-use qwen2 1.5b tokenizer)
     config = Qwen2Config(
@@ -475,14 +538,14 @@ def tiny_qwen2_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_qwen3_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
 
-    model_path = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_qwen3_with_qwen3_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=151936 (so we can re-use qwen2 1.5b tokenizer)
     config = Qwen3Config(
@@ -503,14 +566,14 @@ def tiny_qwen3_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_gemma3_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig
 
-    model_path = TEST_ASSETS.TINY_GEMMA3_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_gemma3_with_gemma3_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=262144 so we can re-use gemma-3-1b tokenizer
     config = Gemma3TextConfig(
@@ -528,4 +591,50 @@ def tiny_gemma3_model_path():
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
     del model, tokenizer
+    yield model_path
+
+
+def _build_tiny_nemotron5_h_checkpoint(model_path: str) -> None:
+    import shutil
+
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    config = AutoConfig.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+    config.hybrid_override_pattern = "M*-"
+    config.num_hidden_layers = 3
+    config.intermediate_size = 32
+    config.hidden_size = 256
+    config.num_attention_heads = 8
+    config.mamba_num_heads = 8
+    config.num_key_value_heads = 8
+    config.n_groups = 1
+
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
+    )
+
+    shutil.rmtree(model_path, ignore_errors=True)
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(model_path)
+
+
+@pytest.fixture(scope="session")
+def tiny_nemotron5_h_model_path():
+    """Fixture that returns a path to a tiny nemotron model with a dummy tokenizer.
+
+    If the asset hasn't been prepared by the prepare script, skip the tests that require it.
+    """
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_nemotron5_h_with_nemotron_tokenizer"
+    )
+
+    config_file = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_file):
+        pytest.skip(
+            "Tiny Nemotron-H test asset not prepared. Run `uv run tests/unit/prepare_unit_test_assets.py` first."
+        )
+
     yield model_path

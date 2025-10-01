@@ -4,6 +4,7 @@ defaults: "grpo_math_1B.yaml"
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
+  max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
   use_leave_one_out_baseline: true
@@ -11,6 +12,9 @@ grpo:
   val_at_start: false
   max_val_samples: 256
   val_batch_size: 256
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -29,6 +33,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -40,24 +45,26 @@ policy:
   logprob_batch_size: 8
   max_total_sequence_length: 512
   precision: "bfloat16"
-  refit_buffer_size_gb: 4 # used for refitting inference engine, the unit is GB
 
   dtensor_cfg:
     enabled: false
 
-  # dynamic_batching improves performance by ensuring logprob and training microbatches
-  # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
-  # responses are sorted by sequence length and bucketed into microbatches with a total
-  # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
-  # training and logprob stages respectively.
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # for more details on dynamic batching and sequence packing.
+  #
+  # We disable dynamic batching for Megatron as it is incompatible with Pipeline parallelism.
+  # Instead, we use sequence packing.
   dynamic_batching:
     enabled: False
-
-  sequence_packing:
-    enabled: False # coming soon
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_ffd"
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
   max_grad_norm: 1.0
@@ -73,13 +80,22 @@ policy:
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: false
-
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false
+    #gives ~20% training perf speedup with sequence packing 
+    apply_rope_fusion: True
+    
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6
@@ -108,8 +124,8 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
-      lr_warmup_iters: 50
+      lr_decay_iters: 1000
+      lr_warmup_iters: 13
       lr_warmup_init: 5.0e-7
 
     distributed_data_parallel_config:
@@ -136,6 +152,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   dataset_name: "OpenMathInstruct-2"
+  shuffle: true
 
 env:
   math:
@@ -146,11 +163,16 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
   tensorboard_enabled: false
+  mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
     name: "sj_megatron_1B"
   tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "sj_megatron_1B"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

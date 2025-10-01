@@ -11,16 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pprint
+import time
 
 import pytest
 import ray
 import torch
-
-# Define a custom marker for model configuration tests
-pytestmark = pytest.mark.modelconfig
-
 from transformers import AutoModelForCausalLM
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -31,18 +27,18 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.conftest import TEST_ASSETS
 from tests.unit.test_utils import SimpleLoss
 
 
 def create_test_config(
-    model_name: str = TEST_ASSETS.TINY_LLAMA_MODEL_PATH,
+    model_name: str,
     tp: int = 1,
     cp: int = 1,
-    sequence_parallel: bool = False,
+    sp: bool = False,
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
-    custom_parallel_plan: str = None,
+    custom_parallel_plan: str | None = None,
+    dtensor_v2: bool = False,
 ) -> PolicyConfig:
     return {
         "model_name": model_name,
@@ -61,11 +57,19 @@ def create_test_config(
             "top_k": None,
             "stop_token_ids": None,
             "stop_strings": None,
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
         },
         "dtensor_cfg": {
+            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
             "cpu_offload": cpu_offload,
-            "sequence_parallel": sequence_parallel,
+            "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
@@ -76,6 +80,9 @@ def create_test_config(
             "train_mb_tokens": 128,
             "logprob_mb_tokens": 128,
             "sequence_length_round": 4,
+        },
+        "sequence_packing": {
+            "enabled": False,
         },
         "optimizer": {
             "name": "torch.optim.AdamW",
@@ -96,17 +103,6 @@ def create_test_config(
         },
         "max_grad_norm": 1.0,
     }
-
-
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
 
 
 @pytest.fixture(scope="module")
@@ -135,9 +131,10 @@ def gc_collect():
 
 
 @pytest.fixture
-def policy_setup(two_gpu_virtual_cluster):
+def policy_setup(request, two_gpu_virtual_cluster, tiny_llama_model_path):
     """Setup and teardown for policy tests - creates a virtual cluster and policy."""
-    config = create_test_config()
+    use_v2 = request.param if hasattr(request, "param") else False
+    config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
@@ -150,7 +147,9 @@ def policy_setup(two_gpu_virtual_cluster):
     policy.shutdown()
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("policy_setup", [True, False], indirect=True)
 def test_lm_policy_init(policy_setup):
     policy = policy_setup
 
@@ -230,20 +229,53 @@ def test_lm_policy_init(policy_setup):
 @pytest.fixture
 def training_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
-    model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing = (
-        request.param
-    )
+    # Get the use_v2 parameter from the test function
+    use_v2 = getattr(request.function, "pytestmark", [])
+    use_v2_value = False
+    for mark in use_v2:
+        if (
+            hasattr(mark, "args")
+            and len(mark.args) > 1
+            and "use_v2" in str(mark.args[0])
+        ):
+            for param_set in mark.args[1]:
+                if isinstance(param_set, bool):
+                    use_v2_value = param_set
+                    break
+
+    # If multiple parametrize decorators, we need to check the node id
+    if hasattr(request, "node") and hasattr(request.node, "callspec"):
+        if "use_v2" in request.node.callspec.params:
+            use_v2_value = request.node.callspec.params["use_v2"]
+
+    (
+        model_fixture_name,
+        tp,
+        cp,
+        sp,
+        cpu_offload,
+        activation_checkpointing,
+    ) = request.param
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
     policy = None
     data = None
     loss_fn = None
 
     try:
         config = create_test_config(
-            model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing
+            model_name,
+            tp,
+            cp,
+            sp,
+            cpu_offload,
+            activation_checkpointing,
+            dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating training Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
         )
         policy = Policy(
             cluster=two_gpu_virtual_cluster,
@@ -289,36 +321,51 @@ def training_setup(request, two_gpu_virtual_cluster):
         policy.shutdown()
 
 
-@pytest.mark.timeout(60)
+@pytest.mark.hf_gated
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
 @pytest.mark.parametrize(
     "training_setup",
     [
-        # model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing
-        # Split grid over tp/cp/cpu/sp/act across qwen and llama
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, True, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, True, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 1, False, False, True),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, True, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, False, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, False, True, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 1, True, True, True),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, True, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, False, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, False, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 1, True, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, True, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, False, True),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, False, True, True),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 1, 1, True, True, True),
+        # model_fixture_name        tp cp  sp     cpu    act
+        ("tiny_llama_model_path", 1, 1, False, False, False),
+        ("tiny_llama_model_path", 1, 1, True, False, False),
+        ("tiny_llama_model_path", 1, 1, False, True, False),
+        ("tiny_llama_model_path", 1, 1, False, False, True),
+        ("tiny_llama_model_path", 1, 2, False, False, False),
+        ("tiny_qwen2_model_path", 1, 1, True, True, False),
+        ("tiny_qwen2_model_path", 1, 1, True, False, True),
+        ("tiny_qwen2_model_path", 1, 1, False, True, True),
+        ("tiny_qwen2_model_path", 1, 1, True, True, True),
+        ("tiny_qwen2_model_path", 1, 2, False, False, False),
+        ("tiny_qwen3_model_path", 1, 1, True, True, False),
+        ("tiny_qwen3_model_path", 1, 1, True, False, True),
+        ("tiny_qwen3_model_path", 1, 1, False, True, True),
+        ("tiny_qwen3_model_path", 1, 1, True, True, True),
+        ("tiny_qwen3_model_path", 1, 2, False, False, False),
+        (
+            "tiny_gemma3_model_path",
+            1,
+            1,
+            True,
+            True,
+            False,
+        ),  # gemma3 doesn't support spda
+        ("tiny_gemma3_model_path", 1, 1, True, False, True),
+        ("tiny_gemma3_model_path", 1, 1, False, True, True),
+        ("tiny_gemma3_model_path", 1, 1, True, True, True),
         # CP doesn't support gemma3 due to spda input has attent_mask != None.
+        # Nemotron-H doesn't support SP https://github.com/NVIDIA-NeMo/RL/issues/881
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
+        # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+        ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+        # nemotron5_h doesn't support cp
     ],
     indirect=True,
 )
-def test_dtensor_worker_training(training_setup):
+def test_dtensor_worker_training(use_v2, training_setup):
     def verify_loss_tensor(loss_tensor):
         assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
         assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
@@ -352,23 +399,65 @@ def test_dtensor_worker_training(training_setup):
     # Verify loss changed between iterations (model parameters were updated)
     assert losses[0] > losses[-1], "Loss should decrease over training iterations"
 
+    # Verify the train function returns the performance metrics
+
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert isinstance(results["theoretical_tflops"], (int, float)), (
+                "training backend should report theoretical_tflops"
+            )
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
+
 
 @pytest.fixture
 def logprob_setup(request, two_gpu_virtual_cluster):
     """Setup and teardown specifically for training tests."""
-    model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing = (
-        request.param
-    )
+    # Get the use_v2 parameter from the test function
+    use_v2_value = False
+    if hasattr(request, "node") and hasattr(request.node, "callspec"):
+        if "use_v2" in request.node.callspec.params:
+            use_v2_value = request.node.callspec.params["use_v2"]
+
+    (
+        model_fixture_name,
+        tp,
+        cp,
+        sp,
+        cpu_offload,
+        activation_checkpointing,
+    ) = request.param
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
     policy = None
     data = None
 
     try:
         config = create_test_config(
-            model_name, tp, cp, cpu_offload, sequence_parallel, activation_checkpointing
+            model_name,
+            tp,
+            cp,
+            sp,
+            cpu_offload,
+            activation_checkpointing,
+            dtensor_v2=use_v2_value,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         print(
-            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sequence_parallel}, activation_checkpointing={activation_checkpointing}..."
+            f"Creating logprob Policy with tp={tp}, cpu_offload={cpu_offload}, sequence_parallel={sp}, activation_checkpointing={activation_checkpointing}..."
         )
         policy = Policy(
             cluster=two_gpu_virtual_cluster,
@@ -433,32 +522,34 @@ def logprob_setup(request, two_gpu_virtual_cluster):
         policy.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(360)
+@pytest.mark.parametrize("use_v2", [True, False])
 @pytest.mark.parametrize(
     "logprob_setup",
     [
         # TP=2, CP=1
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, 1, False, True, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 2, 1, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, True, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 2, 1, False, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, 1, False, True, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 2, 1, False, False, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, 1, False, True, False),
-        (TEST_ASSETS.TINY_GEMMA3_MODEL_PATH, 2, 1, False, False, False),
+        ("tiny_qwen2_model_path", 2, 1, False, True, False),
+        ("tiny_qwen2_model_path", 2, 1, False, False, False),
+        ("tiny_llama_model_path", 2, 1, False, False, False),
+        ("tiny_llama_model_path", 2, 1, False, True, False),
+        ("tiny_llama_model_path", 2, 1, False, True, True),
+        ("tiny_qwen3_model_path", 2, 1, False, True, False),
+        ("tiny_qwen3_model_path", 2, 1, False, False, False),
+        ("tiny_gemma3_model_path", 2, 1, False, True, False),
+        ("tiny_gemma3_model_path", 2, 1, False, False, False),
         # TP=1, CP=2
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, True, False),
-        (TEST_ASSETS.TINY_QWEN2_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, False, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, True, False),
-        (TEST_ASSETS.TINY_LLAMA_MODEL_PATH, 1, 2, False, True, True),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, True, False),
-        (TEST_ASSETS.TINY_QWEN3_MODEL_PATH, 1, 2, False, False, False),
+        ("tiny_qwen2_model_path", 1, 2, False, True, False),
+        ("tiny_qwen2_model_path", 1, 2, False, False, False),
+        ("tiny_llama_model_path", 1, 2, False, False, False),
+        ("tiny_llama_model_path", 1, 2, False, True, False),
+        ("tiny_llama_model_path", 1, 2, False, True, True),
+        ("tiny_qwen3_model_path", 1, 2, False, True, False),
+        ("tiny_qwen3_model_path", 1, 2, False, False, False),
     ],
     indirect=True,
 )
-def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
+def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_setup):
     policy, data, logprobs = logprob_setup
 
     # Verify resources were created properly assert policy is not None, "Policy was not created properly"
@@ -475,19 +566,28 @@ def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(logprob_setup):
     )
 
 
-def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_cluster):
+@pytest.mark.hf_gated
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
+    use_v2, two_gpu_virtual_cluster, tiny_llama_tied_model_path
+):
     """Test that DTensor with a tp > 1 and a tied model with a custom parallel plan works."""
     from torch.distributed.tensor.parallel import ColwiseParallel
     from torch.distributed.tensor.placement_types import Replicate
 
-    custom_parallel_plan = {"lm_head": ColwiseParallel(output_layouts=Replicate())}
+    custom_parallel_plan = {
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+        "model.embed_tokens": ColwiseParallel(output_layouts=Replicate()),
+    }
     config = create_test_config(
-        model_name=TEST_ASSETS.TINY_LLAMA_TIED_MODEL_PATH,
+        model_name=tiny_llama_tied_model_path,
         tp=2,
+        cp=1,
+        sp=False,
         cpu_offload=False,
-        sequence_parallel=False,
         activation_checkpointing=False,
         custom_parallel_plan=custom_parallel_plan,
+        dtensor_v2=use_v2,
     )
     tokenizer = get_tokenizer(config["tokenizer"])
 
@@ -503,19 +603,22 @@ def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(two_gpu_virtual_clu
     state_dict = ray.get(policy.worker_group.workers[0].return_state_dict.remote())
     total_shape = state_dict["lm_head.weight"].shape
     sharded_shape = state_dict["lm_head.weight"].to_local().shape
-    assert total_shape[0] == sharded_shape[0] * 2, (
-        "lm_head.weight should be sharded across 2 GPUs"
+    assert total_shape[0] == sharded_shape[0], (
+        "lm_head.weight should have the same number of rows"
     )
-    assert total_shape[1] == sharded_shape[1], (
-        "lm_head.weight should have the same number of columns"
+    assert total_shape[1] == sharded_shape[1] * 2, (
+        "lm_head.weight should be sharded across 2 GPUs"
     )
 
     # Clean up
     policy.shutdown()
 
 
+@pytest.mark.hf_gated
 @pytest.mark.timeout(180)
-def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cluster):
+def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
+    two_gpu_virtual_cluster, tiny_llama_model_path
+):
     """Tests that changing microbatch size while keeping global batch size constant does not affect loss values in DTensor."""
     # Create test batch with global batch size of 8
     global_batch_size = 8
@@ -549,7 +652,7 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cl
     )
 
     # Test with mbs=1, 2 microbatches per GPU
-    config = create_test_config()
+    config = create_test_config(tiny_llama_model_path)
     tokenizer = get_tokenizer(config["tokenizer"])
 
     print("Creating training Policy with mbs=1...")
@@ -585,7 +688,7 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cl
     policy_mbs1.worker_group.shutdown()
 
     # Test with mbs=2, 1 microbatch per GPU
-    config = create_test_config()
+    config = create_test_config(tiny_llama_model_path)
     config["train_micro_batch_size"] = 2
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
 
@@ -610,3 +713,113 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(two_gpu_virtual_cl
     torch.testing.assert_close(mbs1_pg_loss, mbs2_pg_loss, rtol=1e-5, atol=1e-5)
 
     policy_mbs2.worker_group.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("use_v2", [True, False])
+def test_dtensor_v1_policy_flops_range_check(
+    tiny_llama_model_path, two_gpu_virtual_cluster, use_v2
+):
+    """Test that the returned FLOPS is within a reasonable range using dtensor backend.
+
+    Performs 2 warmup iterations and measures FLOPS for the next 3 iterations.
+    """
+    batch_size = 8
+    seq_len = 128
+    vocab_size = 32000
+
+    # Create dtensor v1 config with default settings
+    config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
+
+    # Update config for FLOPS testing with larger batch and sequence length
+    config["train_global_batch_size"] = batch_size
+    config["train_micro_batch_size"] = (
+        batch_size  # Use full batch size for single microbatch
+    )
+
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    policy = Policy(
+        cluster=two_gpu_virtual_cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Create test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+
+    # Create loss function
+    loss_fn = SimpleLoss()
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Perform 2 warmup iterations
+        print("Performing warmup iterations...")
+        for warmup_step in range(2):
+            results = policy.train(data, loss_fn)
+
+        # Measure FLOPS on the third iteration
+        print("Measuring FLOPS on 3 iterations...")
+        time_begin = time.time()
+        for train_step in range(3):
+            results = policy.train(data, loss_fn)
+        runtime_sec = time.time() - time_begin
+
+        # Check if FLOPS tracking is available
+        if policy.flops_tracker is not None:
+            assert "total_flops" in results, (
+                "Training results should contain 'total_flops'"
+            )
+            total_flops = results["total_flops"]
+
+            assert isinstance(total_flops, (int, float)), (
+                "total_flops should be numeric"
+            )
+            assert total_flops > 0, "total_flops should be positive"
+
+            total_tflops = total_flops / 1e12 / 3
+            print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
+
+            flop_count_total = total_flops * runtime_sec
+            assert 1e9 < flop_count_total < 5e10, (
+                "Total FLOPS should be within 1e9 and 5e10"
+            )
+
+            if "theoretical_tflops" in results:
+                theoretical_tflops = results["theoretical_tflops"]
+                assert isinstance(theoretical_tflops, (int, float)), (
+                    "theoretical_tflops should be numeric"
+                )
+                assert theoretical_tflops > 0, "theoretical_tflops should be positive"
+
+                utilization = total_tflops / theoretical_tflops
+                print(f"Theoretical TFLOPS: {theoretical_tflops:.2f}")
+                print(f"Model utilization: {utilization * 100:.2f}%")
+
+                assert utilization <= 1.0, (
+                    f"Model utilization {utilization * 100:.2f}% should not exceed 100%"
+                )
+        else:
+            print("FLOPS tracker not available, skipping FLOPS range check")
+            pytest.skip("FLOPS tracker not supported for this model configuration")
+
+    finally:
+        policy.shutdown()

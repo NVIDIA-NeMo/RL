@@ -14,34 +14,58 @@
 
 from functools import lru_cache
 from types import FunctionType
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, cast
 
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+    fully_shard,
+)
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
-    PrepareModuleInput,
-    PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
+from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+from transformers.models.llava_next.modeling_llava_next import (
+    LlavaNextForConditionalGeneration,
+)
+from transformers.models.llava_next_video.modeling_llava_next_video import (
+    LlavaNextVideoForConditionalGeneration,
+)
+from transformers.models.llava_onevision.modeling_llava_onevision import (
+    LlavaOnevisionForConditionalGeneration,
+)
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3ForConditionalGeneration,
+)
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
+from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    Qwen2VLForConditionalGeneration,
+)
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
 from nemo_rl.models.policy.utils import import_class_from_path
 
 
@@ -86,19 +110,15 @@ class RotaryEmbedParallel(SequenceParallel):
 def _parallelize_gemma3(
     model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
     sequence_parallel: bool = False,
-):
-    """Parallelizes a Gemma3ForCausalLM model across data parallel dimensions.
-
-    Tensor parallelism is not supported for Gemma3 models because of tied word embeddings.
-    """
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a Gemma3ForCausalLM model across data and tensor parallel dimensions."""
     if isinstance(model, Gemma3ForConditionalGeneration):
-        model_prefix = "language_model"
+        model_prefix = "model.language_model"
     else:
         model_prefix = "model"
 
-    # For gemma3 models, we don't include the model.embed_tokens and lm_head in the
-    # parallelization plans because they have tied weights.
-    base_model_tp_plan = {
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        f"{model_prefix}.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
@@ -106,13 +126,12 @@ def _parallelize_gemma3(
         f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
         f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
     base_model_sp_plan = {
-        f"{model_prefix}.embed_tokens": PrepareModuleOutput(
-            output_layouts=Replicate(),
-            desired_output_layouts=Shard(1),
-            use_local_output=False,
+        f"{model_prefix}.embed_tokens": RowwiseParallel(
+            input_layouts=Replicate(), output_layouts=Shard(1)
         ),
         f"{model_prefix}.rotary_emb": RotaryEmbedParallel(use_local_output=True),
         f"{model_prefix}.rotary_emb_local": RotaryEmbedParallel(use_local_output=True),
@@ -127,30 +146,24 @@ def _parallelize_gemma3(
         ),
         f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
         f"{model_prefix}.norm": SequenceParallel(),
-        f"{model_prefix}.lm_head": PrepareModuleInput(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
-            use_local_output=True,
+        "lm_head": ColwiseParallel(
+            input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False
         ),
     }
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(base_model_sp_plan)
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 def _parallelize_llama(
     model: LlamaForCausalLM,
     sequence_parallel: bool = False,
-):
+) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
-
-    base_model_tp_plan = {
+    base_model_tp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": RowwiseParallel(input_layouts=Replicate()),
         "model.layers.*.self_attn.q_proj": ColwiseParallel(),
         "model.layers.*.self_attn.k_proj": ColwiseParallel(),
@@ -178,15 +191,15 @@ def _parallelize_llama(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(base_model_sp_plan)
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
     sequence_parallel: bool = False,
-):
+) -> dict[str, ParallelStyle]:
     """Parallelizes a Qwen2ForCausalLM model across data and tensor parallel dimensions."""
 
     class Qwen3QKNorm(SequenceParallel):
@@ -196,6 +209,7 @@ def _parallelize_qwen(
 
             if isinstance(input_tensor, DTensor):
                 assert input_tensor.placements == (Shard(dim=2),)
+                return input_tensor
             elif isinstance(input_tensor, torch.Tensor):
                 # assume the input passed in already sharded on the sequence dim and create the DTensor
                 return DTensor.from_local(
@@ -206,9 +220,6 @@ def _parallelize_qwen(
                     f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
                 )
 
-    assert not model.config.tie_word_embeddings, (
-        "Tie word embeddings not supported when TP is enabled"
-    )
     if sequence_parallel:
         base_model_tp_plan = {
             "lm_head": ColwiseParallel(
@@ -252,7 +263,7 @@ def _parallelize_qwen(
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
         }
 
-    return base_model_tp_plan
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 PARALLIZE_FUNCTIONS: dict[
@@ -292,7 +303,7 @@ def translate_parallel_style(style: str):
         raise ValueError(f"Unknown parallel style: {style}")
 
 
-def get_hf_tp_plan(model):
+def get_hf_tp_plan(model: PreTrainedModel):
     """Get the Hugging Face tensor parallel plan from the model.
 
     This function:
@@ -312,17 +323,53 @@ def get_hf_tp_plan(model):
         AssertionError: If no TP plan is found
     """
     model_cls = type(model)
-    if model_cls == Gemma3ForConditionalGeneration:
+
+    # Handle VL models structure
+    if model_cls in [
+        Qwen2VLForConditionalGeneration,
+        Qwen2_5_VLForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Gemma3ForConditionalGeneration:
         inner_model = model.language_model
         model_prefix = "language_model"
+        config = model.config.text_config
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        inner_model = model.language_model.model
+        model_prefix = "language_model.model"
+        config = model.language_model.model.config
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+        config = model.model.language_model.config
+
     else:
         inner_model = model.model
         model_prefix = "model"
+        config = model.config
 
     hf_tp_plan = {}
 
     # model_cls._tp_plan will override model_cls after xxxForCausalLM.post_init() (transformers==4.51.3)
     if hasattr(model_cls, "_tp_plan") and model_cls._tp_plan is not None:
+        assert isinstance(model_cls._tp_plan, dict), (
+            f"model_cls._tp_plan is not a dict: {model_cls._tp_plan}"
+        )
         hf_tp_plan.update(model_cls._tp_plan)
 
     if hasattr(model, "_tp_plan") and model._tp_plan is not None:
@@ -339,19 +386,12 @@ def get_hf_tp_plan(model):
     )
 
     # hf tp plan not contain embed_tokens, we add it and set to rowwise_rep
-    if (
-        f"{model_prefix}.embed_tokens" not in hf_tp_plan
-        and not model.config.tie_word_embeddings
-    ):
+    if f"{model_prefix}.embed_tokens" not in hf_tp_plan:
         hf_tp_plan[f"{model_prefix}.embed_tokens"] = "rowwise_rep"
 
     for k, v in hf_tp_plan.items():
         # speed up the tp plan for lm_head
-        if (
-            k == "lm_head"
-            and v == "colwise_rep"
-            and not model.config.tie_word_embeddings
-        ):
+        if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             hf_tp_plan[k] = ColwiseParallel(
                 output_layouts=Shard(-1), use_local_output=False
             )
@@ -361,9 +401,80 @@ def get_hf_tp_plan(model):
     return hf_tp_plan
 
 
+def _parallelize_nm5_h(
+    model,
+    dp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    sequence_parallel: bool = False,
+    activation_checkpointing: bool = False,
+    cpu_offload: bool = False,
+    custom_parallel_plan: Optional[Union[dict, str]] = None,
+) -> torch.distributed.fsdp.FSDPModule:
+    """Parallelize a NemotronHForCausalLM model across data and tensor parallel dimensions."""
+    assert not sequence_parallel, (
+        "Sequence parallelism is not supported for NemotronHForCausalLM"
+    )
+    assert custom_parallel_plan is None, (
+        "Custom parallel plan is not supported for NemotronHForCausalLM"
+    )
+
+    model_tp_plan: dict[str, ParallelStyle] = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    mlp_tp_plan: dict[str, ParallelStyle] = {
+        "mixer.up_proj": ColwiseParallel(),
+        "mixer.down_proj": RowwiseParallel(),
+    }
+
+    layers: torch.nn.ModuleList = model.backbone.layers
+    parallelize_module(model, tp_mesh, model_tp_plan)
+
+    for layer in model.backbone.layers:
+        if layer.block_type == "mlp":
+            parallelize_module(layer, tp_mesh, mlp_tp_plan)
+
+    if activation_checkpointing:
+        for i in range(len(layers)):
+            if layers[i].block_type == "mlp":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+            if layers[i].block_type == "mamba":
+                layers[i] = checkpoint_wrapper(layers[i])
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    offload_policy = (
+        CPUOffloadPolicy(pin_memory=False)
+        if cpu_offload
+        else torch.distributed.fsdp.OffloadPolicy
+    )
+
+    for layer in layers:
+        fully_shard(
+            layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+        )
+
+    # do not reshard after forward for root model
+    # because its parameters will be used in backward immediately
+    return fully_shard(
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
+
+
 def _parallelize_model(
     model: Union[
         Qwen2ForCausalLM,
+        Qwen3ForCausalLM,
         LlamaForCausalLM,
         Gemma3ForCausalLM,
         Gemma3ForConditionalGeneration,
@@ -398,11 +509,93 @@ def _parallelize_model(
         ValueError: If the model type is not supported for parallelization.
     """
     model_cls = type(model)
+
+    # Handle different model structures
     if model_cls == Gemma3ForConditionalGeneration:
+        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        layers: list = []
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # siglip encoder also has the same structure as clip encoder (being the same model after all)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
         layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
+
+    elif model_cls.__name__ == "NemotronHForCausalLM":
+        # need to do something special for nm5, since it's harder to shard the mamba layers
+        # nm5 is not importable, so we check the __name__ attribute
+        return _parallelize_nm5_h(
+            model,
+            dp_mesh,
+            tp_mesh,
+            param_dtype,
+            sequence_parallel,
+            activation_checkpointing,
+            cpu_offload,
+            custom_parallel_plan,
+        )
+
+    elif model_cls in [
+        Qwen2_5_VLForConditionalGeneration,
+        Qwen2VLForConditionalGeneration,
+    ]:
+        # VL models have the language model at model.language_model
+        layers: list = []
+        # append language model layers
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        # append visual model layers
+        for layer in model.visual.blocks:
+            layers.append(layer)
+
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == SmolVLMForConditionalGeneration:
+        layers: list = []
+        for layer in model.model.text_model.layers:
+            layers.append(layer)
+        for layer in model.model.vision_model.encoder.layers:
+            layers.append(layer)
+        num_attention_heads = model.model.text_model.config.num_attention_heads
+        num_key_value_heads = model.model.text_model.config.num_key_value_heads
+
+    elif model_cls in [
+        LlavaForConditionalGeneration,
+        LlavaNextForConditionalGeneration,
+        LlavaNextVideoForConditionalGeneration,
+        LlavaOnevisionForConditionalGeneration,
+    ]:
+        layers: list = []
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        for layer in model.vision_tower.vision_model.encoder.layers:
+            layers.append(layer)
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == Mistral3ForConditionalGeneration:
+        layers: list = []
+        for layer in model.model.language_model.layers:
+            layers.append(layer)
+        for layer in model.model.vision_tower.transformer.layers:
+            layers.append(layer)
+        num_attention_heads = model.model.language_model.config.num_attention_heads
+        num_key_value_heads = model.model.language_model.config.num_key_value_heads
+
+    elif model_cls == Llama4ForConditionalGeneration:
+        layers: list = []
+        for layer in model.language_model.model.layers:
+            layers.append(layer)
+        for layer in model.vision_model.model.layers:
+            layers.append(layer)
+        num_attention_heads = model.language_model.model.config.num_attention_heads
+        num_key_value_heads = model.language_model.model.config.num_key_value_heads
+
     else:
+        # this is the default case for all other models (assumed to be a causal LM)
         layers: torch.nn.ModuleList = model.model.layers  # type: ignore
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
@@ -468,6 +661,25 @@ def _parallelize_model(
         for i in range(len(layers)):
             layers[i].mlp = checkpoint_wrapper(layers[i].mlp)  # type: ignore
 
+            """
+            the extra memory overhead for layer norm seems to be only present
+            in mistral models, where some intermediate state is converted to float32
+
+            need to find a better solution for checkpointing
+            """
+            if hasattr(layers[i], "self_attn"):
+                layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+            if hasattr(layers[i], "input_layernorm"):
+                layers[i].input_layernorm = checkpoint_wrapper(
+                    layers[i].input_layernorm  # type: ignore
+                )
+
+            if hasattr(layers[i], "post_attention_layernorm"):
+                layers[i].post_attention_layernorm = checkpoint_wrapper(
+                    layers[i].post_attention_layernorm  # type: ignore
+                )
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,
@@ -475,9 +687,7 @@ def _parallelize_model(
     )
 
     offload_policy = (
-        CPUOffloadPolicy(pin_memory=False)
-        if cpu_offload
-        else torch.distributed.fsdp.OffloadPolicy
+        CPUOffloadPolicy(pin_memory=False) if cpu_offload else OffloadPolicy()
     )
 
     for layer in layers:
@@ -571,9 +781,7 @@ def get_grad_norm(
 
     # Grads.
     grads_for_norm = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
+        to_local_if_dtensor(p.grad.detach()) for p in parameters if p.grad is not None
     ]
 
     # Norm parameters.
@@ -583,9 +791,7 @@ def get_grad_norm(
     # Calculate norm.
     if norm_type == torch.inf:
         total_norm = max(grad.abs().max().item() for grad in grads_for_norm)
-        total_norm_cuda = torch.tensor(
-            [float(total_norm)], dtype=torch.float, device="cuda"
-        )
+        total_norm_cuda = torch.tensor([float(total_norm)], dtype=dtype, device="cuda")
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
@@ -594,54 +800,22 @@ def get_grad_norm(
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=tp_group
         )
-        total_norm = total_norm_cuda[0].item()
+        total_norm = float(total_norm_cuda[0].item())
 
     else:
+        total_norm_cuda = torch.tensor(0.0, dtype=dtype, device="cuda")
         for grad in grads_for_norm:
-            grad_norm = torch.norm(grad, norm_type)
-            total_norm += grad_norm**norm_type
+            grad_norm = torch.linalg.vector_norm(grad, ord=norm_type, dtype=dtype)
+            total_norm_cuda += torch.pow(grad_norm, norm_type)
 
-        total_norm = total_norm.cuda()  # type: ignore
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
         )
 
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
-        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+        total_norm = float(total_norm_cuda.item() ** (1.0 / norm_type))
 
     return total_norm
-
-
-def get_logprobs_from_vocab_parallel_logits(
-    vocab_parallel_logits: DTensor, input_ids: torch.Tensor
-):
-    """Computes log probabilities from vocabulary-parallel logits.
-
-    This function takes logits that are sharded across the vocabulary dimension (tensor parallel)
-    and computes the log probabilities for the given input IDs.
-
-    Args:
-        vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
-            with shape [batch_size, seq_len, vocab_size/tp_size].
-        input_ids (torch.Tensor): Input token IDs for which to compute log probabilities,
-            with shape [batch_size, seq_len].
-
-    Returns:
-        torch.Tensor: Log probabilities for the given input IDs.
-    """
-    tp_mesh = vocab_parallel_logits.device_mesh
-    tp_rank: int = tp_mesh.get_local_rank()
-
-    vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_mesh.size()
-
-    return from_parallel_logits_to_logprobs(
-        vocab_parallel_logits.to_local(),
-        input_ids,
-        vocab_interval_per_rank * tp_rank,
-        (tp_rank + 1) * vocab_interval_per_rank,
-        tp_mesh.get_group(),
-        inference_only=not torch.is_grad_enabled(),
-    )

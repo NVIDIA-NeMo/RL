@@ -18,7 +18,8 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 cd $PROJECT_ROOT
-uv run $PROJECT_ROOT/examples/run_grpo_sliding_puzzle.py \
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_grpo_sliding_puzzle.py \
     policy.model_name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     grpo.max_rollout_turns=5 \
@@ -40,5 +41,5 @@ uv run $PROJECT_ROOT/examples/run_grpo_sliding_puzzle.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.1' \
+    'max(data["train/token_mult_prob_error"]) < 1.1'
 

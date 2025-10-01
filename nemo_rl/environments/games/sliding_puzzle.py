@@ -14,7 +14,7 @@
 
 import copy
 import random
-from typing import Any, Optional, TypedDict
+from typing import Any, Mapping, Optional, TypedDict
 
 import ray
 import torch
@@ -40,7 +40,7 @@ class SlidingPuzzleMetadata(TypedDict):
 
 class SlidingPuzzleGameLogic:
     @staticmethod
-    def generate(config: dict[str, Any]) -> dict[str, Any]:
+    def generate(config: Mapping[str, Any]) -> dict[str, Any]:
         """Generate a new Sliding Puzzle."""
         size = config.get("size", 4)  # Default to 4x4 (15-puzzle)
         shuffle_moves = config.get(
@@ -272,6 +272,7 @@ class SlidingPuzzleRunner:
         bool,
         Optional[list[str]],
         Optional[SlidingPuzzleMetadata],
+        Optional[list[str]],
     ]:
         """Processes a single turn for the sliding puzzle task."""
         game_state = metadata["game_state"]
@@ -297,6 +298,7 @@ class SlidingPuzzleRunner:
                 is_terminated,
                 None,
                 next_metadata,
+                None,
             )
 
         # Get last assistant message and parse action
@@ -328,18 +330,20 @@ class SlidingPuzzleRunner:
 
             if is_terminated:
                 next_metadata = None  # Clear metadata on termination
-
+        # answers save the extracted answer, only assigned in the verify function
+        next_answers = None
         return (
             {"role": "environment", "content": next_observation_content + "\n"},
             turn_reward,
             is_terminated,
             next_stop_strings,
             next_metadata,
+            next_answers,
         )
 
 
-@ray.remote
-class SlidingPuzzleEnv(EnvironmentInterface):
+@ray.remote  # pragma: no cover
+class SlidingPuzzleEnv(EnvironmentInterface[SlidingPuzzleMetadata]):
     """Sliding Puzzle environment (Ray Actor)."""
 
     def __init__(self, cfg: Optional[SlidingPuzzleConfig] = None):
@@ -350,13 +354,13 @@ class SlidingPuzzleEnv(EnvironmentInterface):
     def step(
         self,
         message_log_batch: list[LLMMessageLogType],
-        metadata_batch: list[SlidingPuzzleMetadata],
-    ) -> EnvironmentReturn:
+        metadata: list[SlidingPuzzleMetadata],
+    ) -> EnvironmentReturn[SlidingPuzzleMetadata]:
         """Processes a batch of sliding puzzle interactions."""
         # Since logic is synchronous, process sequentially (can parallelize if logic becomes heavy)
         results = [
             self.runner.process_turn(log, meta)
-            for log, meta in zip(message_log_batch, metadata_batch)
+            for log, meta in zip(message_log_batch, metadata)
         ]
 
         # Unpack results and format according to EnvironmentReturn NamedTuple
@@ -365,13 +369,15 @@ class SlidingPuzzleEnv(EnvironmentInterface):
         terminateds = []
         all_stop_strings = []
         all_next_metadata = []
+        all_answers = []
 
-        for obs, rew, term, stops, meta in results:
+        for obs, rew, term, stops, meta, answ in results:
             observations.append(obs)
             rewards.append(rew)
             terminateds.append(term)
             all_stop_strings.append(stops)
             all_next_metadata.append(meta)
+            all_answers.append(answ)
 
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
         terminated_tensor = torch.tensor(terminateds, dtype=torch.bool)
@@ -382,6 +388,7 @@ class SlidingPuzzleEnv(EnvironmentInterface):
             next_stop_strings=all_stop_strings,
             rewards=rewards_tensor,
             terminateds=terminated_tensor,
+            answers=all_answers,
         )
 
     def shutdown(self):
