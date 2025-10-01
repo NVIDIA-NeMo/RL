@@ -18,6 +18,7 @@
 import asyncio
 import copy
 from typing import Any, Optional
+import json
 
 from collections import defaultdict
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from wandb import Histogram
+from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -918,7 +919,9 @@ class AsyncPenguinRolloutResult:
     rollout_metrics: dict[str, Any]
 
 
-def _calculate_single_metric(values: list[float], batch_size: int, key_name: str) -> dict:
+def _calculate_single_metric(
+    values: list[float], batch_size: int, key_name: str
+) -> dict:
     return {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
@@ -939,8 +942,7 @@ def run_async_penguin_rollout(
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
 ) -> AsyncPenguinRolloutResult:
-    """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters.
-    """
+    """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
 
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     penguin_rows = input_batch["extra_env_info"]
@@ -948,13 +950,21 @@ def run_async_penguin_rollout(
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # Penguin policy is "What you see is what you get".
     assert not greedy, f"`greedy` is not supported in Penguin path!"
-    assert max_rollout_turns is None, f"`max_rollout_turns` is not supported in Penguin path!"
+    assert max_rollout_turns is None, (
+        f"`max_rollout_turns` is not supported in Penguin path!"
+    )
     assert max_seq_len is None, f"`max_seq_len` is not supported in Penguin path!"
     # We don't use these stop criteria
-    assert not generation_config["stop_strings"], f"Stop strings is not supported in the generation config in Penguin path!"
-    assert not generation_config["stop_token_ids"], f"Stop strings is not supported in the generation config in Penguin path!"
+    assert not generation_config["stop_strings"], (
+        f"Stop strings is not supported in the generation config in Penguin path!"
+    )
+    assert not generation_config["stop_token_ids"], (
+        f"Stop strings is not supported in the generation config in Penguin path!"
+    )
     # Top k is not OpenAI compatible, so Penguin does not guarantee support over it.
-    assert not generation_config["top_k"], f"Top k is not supported in the generation config in Penguin path!"
+    assert not generation_config["top_k"], (
+        f"Top k is not supported in the generation config in Penguin path!"
+    )
 
     for row in penguin_rows:
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
@@ -974,14 +984,24 @@ def run_async_penguin_rollout(
     # Tensorize all token ids
     [_tensorize_by_key(r["input_message_log"], "token_ids") for r in results]
     [_tensorize_by_key(r["message_log"], "token_ids") for r in results]
-    [_tensorize_by_key([m for m in r["message_log"] if m["role"] == "assistant"], "generation_logprobs") for r in results]
+    [
+        _tensorize_by_key(
+            [m for m in r["message_log"] if m["role"] == "assistant"],
+            "generation_logprobs",
+        )
+        for r in results
+    ]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
     all_sample_metrics = [
         {
             "total_reward": r["full_result"]["reward"],
-            "assistant_tokens": sum(len(m["token_ids"]) for m in r["message_log"] if m["role"] == "assistant"),
+            "assistant_tokens": sum(
+                len(m["token_ids"])
+                for m in r["message_log"]
+                if m["role"] == "assistant"
+            ),
             "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
             "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
         }
@@ -990,10 +1010,24 @@ def run_async_penguin_rollout(
 
     # Aggregate metrics across all samples
     rollout_metrics = {
-        **_calculate_single_metric([m["turn_count"] for m in all_sample_metrics], batch_size, "turns_per_sample"),
-        **_calculate_single_metric([m["total_tokens"] for m in all_sample_metrics], batch_size, "total_tokens_per_sample"),
-        **_calculate_single_metric([m["assistant_tokens"] for m in all_sample_metrics], batch_size, "gen_tokens_per_sample"),
-        **_calculate_single_metric([m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"),
+        **_calculate_single_metric(
+            [m["turn_count"] for m in all_sample_metrics],
+            batch_size,
+            "turns_per_sample",
+        ),
+        **_calculate_single_metric(
+            [m["total_tokens"] for m in all_sample_metrics],
+            batch_size,
+            "total_tokens_per_sample",
+        ),
+        **_calculate_single_metric(
+            [m["assistant_tokens"] for m in all_sample_metrics],
+            batch_size,
+            "gen_tokens_per_sample",
+        ),
+        **_calculate_single_metric(
+            [m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"
+        ),
         # TODO there may be some other metrics here that are good to log.
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
@@ -1021,12 +1055,24 @@ def run_async_penguin_rollout(
                     values.append(float(r[key]))
 
             if values:
-                per_agent_metrics.update(_calculate_single_metric(values, len(agent_results), f"{agent_name}/{key}"))
+                per_agent_metrics.update(
+                    _calculate_single_metric(
+                        values, len(agent_results), f"{agent_name}/{key}"
+                    )
+                )
+
+        # Log the full result
+        per_agent_metrics[f"{agent_name}/full_result"] = Table(
+            data=[[json.dumps(r, separators=((",", ":"))) for r in agent_results]],
+            columns=["Full result"]
+        )
 
     rollout_metrics.update(per_agent_metrics)
 
     # Necessary for downstream nemo rl logging/printing.
-    rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics["gen_tokens_per_sample/mean"]
+    rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+        "gen_tokens_per_sample/mean"
+    ]
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
@@ -1044,7 +1090,9 @@ def run_async_penguin_rollout(
         {
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
-            "length": torch.tensor([len(r["input_message_log"][0]["token_ids"]) for r in results]),
+            "length": torch.tensor(
+                [len(r["input_message_log"][0]["token_ids"]) for r in results]
+            ),
             "loss_multiplier": input_batch["loss_multiplier"],
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
