@@ -153,7 +153,7 @@ def test_remove_old_checkpoints_topk_some_missing_val_metric(
         {"other_metric": 0.8},  # step 3 - missing loss metric
         {"loss": 0.2},  # step 4 - has loss
         {},  # step 10 - missing loss metric
-        {"loss": 1.0}, # has loss but not in top-k
+        {"loss": 1.0},  # has loss but not in top-k
         {},  # step 12 - missing loss (latest)
     ]
 
