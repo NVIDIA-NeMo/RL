@@ -36,6 +36,8 @@ Note on numerical stability:
 Enable this custom plan via:
 
 - policy.dtensor_cfg.custom_parallel_plan=examples.custom_parallel.qwen_model_tp_plan_stable
+
+Based on https://github.com/NVIDIA-NeMo/Automodel/blob/d79ccb94b0eca94a4c479313db2f9eee80db0139/nemo_automodel/components/distributed/optimized_tp_plans.py#L205-L217
 """
 qwen_model_tp_plan_stable = {
     "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
