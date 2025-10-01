@@ -603,6 +603,9 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
+            "bias_activation_fusion"
+        ]
         fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
         self.fp8_cfg = fp8_cfg
         if fp8_cfg is not None and fp8_cfg.get("enabled", False):
