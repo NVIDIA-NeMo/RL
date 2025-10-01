@@ -85,7 +85,7 @@ ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 # Ensure DeepEP is built for H100 and B200
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
-ENV NVSHMEM_DIR=${UV_PROJECT_ENVIRONMENT}/python3.12/site-packages/nvidia/nvshmem
+ENV NVSHMEM_DIR=${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages/nvidia/nvshmem
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
