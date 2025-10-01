@@ -882,9 +882,8 @@ def grpo_train(
                         ):
                             warnings.warn(
                                 f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
+                                "This checkpoint will not be saved as top-k."
                             )
-                            master_config["checkpointing"]["metric_name"] = None
 
                     with timer.time("checkpointing"):
                         print(

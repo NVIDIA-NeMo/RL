@@ -202,25 +202,18 @@ class CheckpointManager:
         if self.metric_name is None:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
-            try:
-                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-                if self.higher_is_better:
-                    # For higher_is_better=True: higher metric values first, then higher step numbers
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
-                    )
-                else:
-                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], -x[0])
-                    )
-            except KeyError:
-                warnings.warn(
-                    f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
+            # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+            if self.higher_is_better:
+                # For higher_is_better=True: higher metric values first, then higher step numbers
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                    reverse=True,
                 )
-                checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-
-                self.metric_name = None
+            else:
+                # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
+                )
 
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
