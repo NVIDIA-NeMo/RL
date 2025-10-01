@@ -91,7 +91,7 @@ policy:
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     # gives training perf speedup
-    bias_activation_fusion: True 
+    bias_activation_fusion: True
 
     optimizer:
       optimizer: "adam"
