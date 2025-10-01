@@ -85,7 +85,6 @@ ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 # Ensure DeepEP is built for H100 and B200
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
-ENV NVSHMEM_DIR=${UV_PROJECT_ENVIRONMENT}/lib/python3.12/site-packages/nvidia/nvshmem
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -98,6 +97,8 @@ RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EO
 # The venv is symlinked to avoid bloating the layer size
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+# Ensure nvshmem is installed before building DeepEP
+uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
