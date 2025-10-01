@@ -301,6 +301,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 truncate_prompt_tokens=None,
                 add_special_tokens=False,
             ):
+                # Deepcopy messages here since _preprocess_chat may be destructive.
+                messages_for_replace_prefix_tokens = deepcopy(messages)
+
                 # res is conversation, [request_prompt], [engine_prompt]
                 res = await super()._preprocess_chat(
                     request,
@@ -323,8 +326,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 # Find the last assistant message
                 last_assistant_message_idx = None
-                for i in reversed(range(len(messages))):
-                    if messages[i]["role"] == "assistant":
+                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
                         last_assistant_message_idx = i
                         break
 
@@ -333,7 +336,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     return res
 
                 # Include the last assistant message itself.
-                messages_to_last_assistant_message = messages[:last_assistant_message_idx + 1]
+                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[:last_assistant_message_idx + 1]
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
                     request,
