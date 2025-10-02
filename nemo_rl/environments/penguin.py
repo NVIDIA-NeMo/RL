@@ -20,7 +20,7 @@ import torch
 
 from tqdm.auto import tqdm
 
-from nemo_rl.data.datasets import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.environments.interfaces import EnvironmentInterface
 
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
