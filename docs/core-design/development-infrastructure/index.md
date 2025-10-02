@@ -12,6 +12,7 @@ This section covers the development tools and infrastructure that support NeMo R
 
 - **Checkpointing**: Understand the checkpointing mechanisms and strategies for model state persistence
 - **UV Package Management**: Learn about UV integration and package management strategies
+- **Environment Variables**: Learn about environment variable precedence and configuration in Ray workers
 
 ## Development Infrastructure
 
@@ -38,6 +39,16 @@ Understand UV package management and dependency handling.
 {bdg-secondary}`Tools`
 :::
 
+:::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Environment Variables
+:link: env-vars
+:link-type: doc
+
+Learn about environment variable precedence and configuration in Ray workers.
+
++++
+{bdg-info}`Configuration`
+:::
+
 ::::
 
 ---
@@ -48,6 +59,7 @@ Understand UV package management and dependency handling.
 :maxdepth: 2
 checkpointing
 uv
+env-vars
 :::: 
 
  

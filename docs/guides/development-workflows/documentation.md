@@ -1,3 +1,13 @@
+---
+description: "Build and contribute to NeMo RL documentation using Sphinx, including live building, link checking, and docstring testing"
+categories: ["guides"]
+tags: ["documentation", "sphinx", "contributing", "docstrings", "development"]
+personas: ["contributor-focused", "devops-focused"]
+difficulty: "intermediate"
+content_type: "tutorial"
+modality: "universal"
+---
+
 # Documentation Development
 
 - [Documentation Development](#documentation-development)

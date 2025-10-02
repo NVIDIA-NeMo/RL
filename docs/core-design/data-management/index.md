@@ -12,6 +12,7 @@ This section covers data handling, processing, and persistence mechanisms in NeM
 
 - **Chat Datasets**: Explore the design of chat dataset processing and conversation handling
 - **Padding**: Learn about padding strategies and their impact on training efficiency
+- **Sequence Packing and Dynamic Batching**: Optimize training efficiency for variable-length sequences
 
 ## Data Management
 
@@ -38,7 +39,15 @@ Learn about padding strategies and their impact on training efficiency.
 {bdg-secondary}`Optimization`
 :::
 
+:::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` Sequence Packing
+:link: sequence-packing-and-dynamic-batching
+:link-type: doc
 
+Optimize training efficiency for variable-length sequences with packing and dynamic batching.
+
++++
+{bdg-success}`Performance`
+:::
 
 ::::
 
@@ -51,6 +60,7 @@ Learn about padding strategies and their impact on training efficiency.
 chat-datasets
 padding
 checkpointing
+sequence-packing-and-dynamic-batching
 :::: 
 
  

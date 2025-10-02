@@ -11,16 +11,6 @@ NeMo RL training requires careful attention to environment configuration, data p
 ::::{grid} 1 2 2 2
 :gutter: 2 2 2 2
 
-:::{grid-item-card} {octicon}`bug;1.5em;sd-mr-1` Debugging
-:link: debugging
-:link-type: doc
-
-Debugging techniques and tools for RL training pipelines.
-
-+++
-{bdg-success}`Quality`
-:::
-
 :::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` NSYS Profiling
 :link: nsys-profiling
 :link-type: doc
@@ -287,7 +277,6 @@ For additional learning resources, visit the main [Guides](../index) page.
 :hidden:
 :caption: Environment and Data
 :maxdepth: 2
-debugging
 environment-development
 nsys-profiling
 :::: 

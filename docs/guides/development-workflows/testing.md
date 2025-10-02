@@ -1,3 +1,13 @@
+---
+description: "Comprehensive testing guide for NeMo RL including unit tests, functional tests, Docker-based testing, and metric tracking"
+categories: ["deployment-operations"]
+tags: ["testing", "unit-tests", "functional-tests", "docker", "pytest", "development", "ci-cd"]
+personas: ["contributor-focused", "devops-focused", "mle-focused"]
+difficulty: "intermediate"
+content_type: "tutorial"
+modality: "universal"
+---
+
 # Test NeMo RL
 
 This guide outlines how to test NeMo RL using unit and functional tests, detailing steps for local or Docker-based execution, dependency setup, and metric tracking to ensure effective and reliable testing.
@@ -52,7 +62,7 @@ What to expect:
 
 Limitations and tips:
 - Selection is based on Python imports and file mtimes; non-Python assets (YAML/JSON/shell) are not tracked. When editing those, re-run target tests explicitly.
-- The remote-aware selection uses a conservative static import map (no dynamic import resolution). If a test loads code dynamically that isn’t visible via imports, you may need to run it explicitly once to seed the map.
+- The remote-aware selection uses a conservative static import map (no dynamic import resolution). If a test loads code dynamically that isn't visible via imports, you may need to run it explicitly once to seed the map.
 - The helper is test-only and does not alter library behavior. It activates automatically when you pass `--testmon`.
 
 Refreshing remote-selection artifacts
@@ -76,7 +86,7 @@ in Docker with this script:
 CONTAINER=... bash tests/run_unit_in_docker.sh
 ```
 
-The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
+The required `CONTAINER` can be built by following the instructions in the [Docker documentation](../../get-started/docker.md).
 
 ### Track Metrics in Unit Tests
 
@@ -196,3 +206,4 @@ uv run --group test mypy examples/run_sft.py
 ```
 
 mypy.ini controls the configuration of mypy.
+

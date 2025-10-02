@@ -13,6 +13,7 @@ This section contains the fundamental architectural decisions and design princip
 - **Design Philosophy**: Understand the core design principles and philosophical approach behind NeMo RL's architecture
 - **FSDP2 Parallel Plan**: Learn about the FSDP2 parallelization strategy and implementation details  
 - **Generation**: Explore the text generation pipeline and inference mechanisms
+- **Loss Functions**: Understand loss function design for gradient accumulation equivalence
 
 ## Design Principles
 
@@ -49,6 +50,16 @@ Explore the text generation pipeline and inference mechanisms.
 {bdg-info}`Computation`
 :::
 
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Loss Functions
+:link: loss-functions
+:link-type: doc
+
+Understand loss function design for gradient accumulation equivalence.
+
++++
+{bdg-warning}`Advanced`
+:::
+
 ::::
 
 ---
@@ -60,4 +71,5 @@ Explore the text generation pipeline and inference mechanisms.
 design-and-philosophy
 fsdp2-parallel-plan
 generation
+loss-functions
 :::: 

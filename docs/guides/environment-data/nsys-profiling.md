@@ -85,15 +85,23 @@ When profiling is enabled, it generates the following logs and files:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   worker_process_<PID>.nsys-rep
    ```
+If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, the `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` will be empty, and the `worker_process_<PID>.nsys-rep` are nsight profiles from vllm's ray distributed executors (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
-3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node.
+3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
-**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent `$SLURM_JOB_ID-logs/ray` directory.
+**Note for SLURM users with `ray.sub`**: When using `ray.sub` on SLURM, set `RAY_LOG_SYNC_FREQUENCY=$NUM_SEC` (e.g., `RAY_LOG_SYNC_FREQUENCY=30`) to ensure that the nsight profile files get copied from the container's ephemeral filesystem (`/tmp/ray`) to the persistent directory. The header node's files will be synced to ``$SLURM_JOB_ID-logs/ray`, and other nodes' files will be synced to `$SLURM_JOB_ID-logs/ray/$node_ip/` where `$node_ip` is the IP address of the node.
 
 ## Analyze Profile Files
 
 To analyze the generated profile files, load the `.nsys-rep` files into the NVIDIA Nsight Systems desktop application, which you can download from the [NVIDIA Nsight Systems Get Started page](https://developer.nvidia.com/nsight-systems/get-started).
+
+### How to Analyze the End-to-End RL Loop All at Once
+
+Nsight Systems supports [multi-report view](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#viewing-multiple-reports-in-the-same-timeline) functionality. If you open the profiles from different workers (e.g., `*policy_worker*.nsys-rep` and `*generation_worker*.nsys-rep`) in a single multi-report view, you can analyze the behavior of the end-to-end RL loop on the same timeline.
+
+<img src="../../assets/nsys-multi-report-view.png" alt="Pretraining loss curves" width="1000"/>
 
 ## How We Patched Nsight Support in Ray
 

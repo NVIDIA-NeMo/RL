@@ -14,7 +14,7 @@ Welcome to the NeMo RL Guides! This comprehensive collection provides everything
 
 ## What You'll Find Here
 
-Our guides are organized into four core areas that cover the essential needs of NeMo RL practitioners:
+Our guides are organized into five core areas that cover the essential needs of NeMo RL practitioners:
 
 ### **Training Algorithms**
 Master the fundamental training techniques for reinforcement learning with language models. Learn supervised fine-tuning, preference optimization, and advanced RL algorithms like DPO and GRPO. This section provides the foundation for training high-quality language models with human feedback.
@@ -22,11 +22,14 @@ Master the fundamental training techniques for reinforcement learning with langu
 ### **Model Development**
 Integrate custom models and architectures into NeMo RL training pipelines. Handle model-specific behaviors, special cases, and learn how to extend the framework for new model types. This section is essential for researchers and developers working with custom architectures.
 
+### **Development Workflows**
+Essential workflows for contributing to NeMo RL. Learn debugging techniques, testing strategies, and how to build documentation. This section helps contributors and maintainers develop and improve the framework.
+
 ### **Environment and Data**
-Set up robust development environments and optimize your training infrastructure. Learn debugging techniques, performance profiling, and data management strategies. This section helps you build reliable, efficient training workflows.
+Set up robust development environments and optimize your training infrastructure. Learn performance profiling and data management strategies. This section helps you build reliable, efficient training workflows.
 
 ### **Production and Support**
-Deploy and maintain NeMo RL models in production environments. Learn testing strategies, debugging techniques, packaging, and deployment best practices. This section ensures your models are ready for real-world applications.
+Deploy and maintain NeMo RL models in production environments. Learn testing strategies, packaging, and deployment best practices. This section ensures your models are ready for real-world applications.
 
 
 
@@ -106,20 +109,47 @@ Handle model-specific behaviors and special cases in NeMo RL.
 
 ::::
 
-## Environment and Data
+## Development Workflows
 
 ::::{grid} 1 1 1 2
 :gutter: 2 2 2 2
 
 :::{grid-item-card} {octicon}`bug;1.5em;sd-mr-1` Debugging
-:link: environment-data/debugging
+:link: development-workflows/debugging
 :link-type: doc
 
-Ray distributed debugging with VS Code/Cursor integration and SLURM debugging techniques.
+Debug NeMo RL applications using Ray distributed debugger for worker/actor processes.
 
 +++
 {bdg-success}`Quality`
 :::
+
+:::{grid-item-card} {octicon}`beaker;1.5em;sd-mr-1` Testing
+:link: development-workflows/testing
+:link-type: doc
+
+Run unit tests, functional tests, and track metrics for quality assurance.
+
++++
+{bdg-primary}`Quality Assurance`
+:::
+
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Documentation
+:link: development-workflows/documentation
+:link-type: doc
+
+Build and contribute to NeMo RL documentation with Sphinx.
+
++++
+{bdg-info}`Documentation`
+:::
+
+::::
+
+## Environment and Data
+
+::::{grid} 1 1 1 2
+:gutter: 2 2 2 2
 
 :::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` NSYS Profiling
 :link: environment-data/nsys-profiling
