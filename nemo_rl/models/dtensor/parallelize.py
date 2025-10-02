@@ -719,7 +719,6 @@ def clip_grad_by_total_norm_(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     max_grad_norm: Union[int, float],
     total_norm: float,
-    dtype: torch.dtype = torch.float32,
 ):
     """Clips gradient of an iterable of parameters by total norm.
 
@@ -737,17 +736,17 @@ def clip_grad_by_total_norm_(
     if isinstance(parameters, (torch.Tensor, DTensor)):
         parameters = [parameters]
 
-    # Grads.
-    grads = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
-    ]
-
     # Scale.
     clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
 
     if clip_coeff < 1.0:
+        # Grads.
+        grads = [
+            to_local_if_dtensor(p.grad.detach())
+            for p in parameters
+            if p.grad is not None
+        ]
+
         for g in grads:
             g.mul_(clip_coeff)
 
