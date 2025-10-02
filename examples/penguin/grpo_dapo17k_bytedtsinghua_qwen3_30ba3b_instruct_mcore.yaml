@@ -26,13 +26,13 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 2
+    context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
