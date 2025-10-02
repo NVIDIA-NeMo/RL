@@ -1063,7 +1063,7 @@ def run_async_penguin_rollout(
 
         # Log the full result
         per_agent_metrics[f"{agent_name}/full_result"] = Table(
-            data=[[json.dumps(r, separators=((",", ":"))) for r in agent_results]],
+            data=[[json.dumps(r, separators=((",", ":")))] for r in agent_results],
             columns=["Full result"]
         )
 
