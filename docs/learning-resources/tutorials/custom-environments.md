@@ -10,12 +10,12 @@ modality: "universal"
 
 # Build Custom Training Environments
 
-This tutorial teaches you how to build custom training environments for NeMo RL, implementing the EnvironmentInterface and creating specialized reward functions for your specific use cases.
+This tutorial teaches you how to build custom training environments for NeMo RL, using the EnvironmentInterface and creating specialized reward functions for your specific use cases.
 
 ## What You'll Learn
 
 - **Environment Architecture**: Understand NeMo RL's environment framework
-- **Custom Reward Functions**: Design and implement specialized reward functions
+- **Custom Reward Functions**: Design and create specialized reward functions
 - **Environment State Management**: Handle complex environment state and metadata
 - **Ray Remote Environments**: Scale environments with distributed processing
 - **Advanced Environment Patterns**: Learn sophisticated environment design patterns
@@ -30,18 +30,23 @@ This tutorial teaches you how to build custom training environments for NeMo RL,
 ## Tutorial Overview
 
 ### **Step 1: Understanding the Environment Interface**
+
 Learn NeMo RL's environment architecture and interface requirements.
 
 ### **Step 2: Implementing Basic Environments**
+
 Create simple environments with custom reward functions.
 
 ### **Step 3: Advanced Environment Features**
+
 Build environments with complex state management and metadata.
 
 ### **Step 4: Distributed Environment Scaling**
+
 Scale environments using Ray remote actors.
 
 ### **Step 5: Advanced Environment Patterns**
+
 Learn advanced patterns for complex environment design.
 
 ## Step 1: Understanding the Environment Interface
@@ -114,7 +119,7 @@ class EnvironmentReturn(NamedTuple):
 1. **Message Processing**: Handle conversation message logs
 2. **Reward Computation**: Calculate rewards based on responses
 3. **State Management**: Track environment state and metadata
-4. **Batch Processing**: Efficiently process multiple conversations
+4. **Batch Processing**: Efficiently process many conversations
 5. **Termination Logic**: Determine episode termination conditions
 
 ## Step 2: Implementing Basic Environments
@@ -981,9 +986,9 @@ After completing this tutorial:
 
 ## Related Resources
 
-- **[Environment Interfaces API](../../api-docs/nemo_rl/nemo_rl.environments.interfaces)**: Detailed API documentation
+- **[Environment Interfaces API](../../apidocs/nemo_rl/nemo_rl.environments)**: Detailed API documentation
 - **[Environment Development Guide](../../guides/environment-data/environment-development)**: Environment development fundamentals
-- **[Ray Distributed Computing](../../api-docs/distributed/distributed)**: Distributed computing with Ray
+- **[Ray Distributed Computing](../../apidocs/nemo_rl/nemo_rl.distributed)**: Distributed computing with Ray
 - **[Advanced Algorithm Development](../../../advanced/algorithm-development/index)**: Advanced algorithm development techniques
 
 ## Summary
@@ -991,9 +996,9 @@ After completing this tutorial:
 In this tutorial, you learned:
 
 - ✅ **Environment Architecture**: Understanding NeMo RL's environment framework
-- ✅ **Custom Reward Functions**: Designing and implementing specialized reward functions
+- ✅ **Custom Reward Functions**: Designing and creating specialized reward functions
 - ✅ **Environment State Management**: Handling complex environment state and metadata
 - ✅ **Ray Remote Environments**: Scaling environments with distributed processing
 - ✅ **Advanced Environment Patterns**: Learning sophisticated environment design patterns
 
-You now have the skills to build custom training environments that extend NeMo RL's capabilities for your specific use cases. 
+You now have the skills to build custom training environments that extend NeMo RL's capabilities for your specific use cases.

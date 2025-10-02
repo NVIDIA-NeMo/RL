@@ -14,7 +14,7 @@ Advanced research methodologies and validation frameworks for NeMo RL. Learn exp
 
 ## Overview
 
-This section provides comprehensive frameworks for conducting rigorous research in reinforcement learning using NeMo RL. Each guide combines theoretical research methodology with practical NeMo RL integration examples to ensure both scientific rigor and practical applicability.
+This section provides comprehensive frameworks for conducting rigorous research in reinforcement learning using NeMo RL. Each guide combines theoretical research methods with practical NeMo RL integration examples to ensure both scientific rigor and practical applicability.
 
 ## Research Methodologies
 
@@ -25,7 +25,7 @@ This section provides comprehensive frameworks for conducting rigorous research 
 :link: experimental-design-validation
 :link-type: doc
 
-Design controlled experiments and research studies with proper experimental methodology for NeMo RL research.
+Design controlled experiments and research studies with proper experimental methods for NeMo RL research.
 
 +++
 {bdg-info}`Research Methodology`
@@ -35,13 +35,13 @@ Design controlled experiments and research studies with proper experimental meth
 :link: model-evaluation-validation
 :link-type: doc
 
-Build comprehensive evaluation frameworks and implement robust model assessment and comparison strategies.
+Build comprehensive evaluation frameworks and create robust model assessment and comparison strategies.
 
 +++
 {bdg-info}`Evaluation Framework`
 :::
 
-:::{grid-item-card} {octicon}`chart` Performance Analysis
+:::{grid-item-card} {octicon}`graph` Performance Analysis
 :link: performance-analysis
 :link-type: doc
 
@@ -75,7 +75,7 @@ Conduct systematic ablation studies to understand model components and their con
 :link: reproducible-research-validation
 :link-type: doc
 
-Implement deterministic training and environment management for reproducible experiments.
+Create deterministic training and environment management for reproducible experiments.
 
 +++
 {bdg-info}`Reproducibility`
@@ -94,7 +94,7 @@ All research guides include practical examples using actual NeMo RL code:
 - **Real Evaluation Functions**: Using `eval_pass_k`, `run_env_eval`, `dpo_validate`, `grpo_validate`
 - **Real Logging and Monitoring**: Using NeMo RL's `Logger`, `Timer`, and configuration systems
 
-### Research Methodology
+### Research Methods
 
 Each guide provides both theoretical frameworks and practical implementation:
 
@@ -116,39 +116,48 @@ Robust validation approaches for research rigor:
 ## Research Workflow
 
 ### 1. Experimental Design
-Start with proper experimental design using the [Experimental Design](experimental-design-validation) guide to formulate research questions and design systematic experiments.
+
+Start with proper experimental design using the [Experimental Design](experimental-design-validation) guide to create research questions and design systematic experiments
 
 ### 2. Model Evaluation
-Use the [Model Evaluation](model-evaluation-validation) guide to build comprehensive evaluation frameworks for assessing model performance across multiple dimensions.
+
+Use the [Model Evaluation](model-evaluation-validation) guide to build comprehensive evaluation frameworks for assessing model performance across many dimensions
 
 ### 3. Performance Analysis
-Apply the [Performance Analysis](performance-analysis) guide to analyze results with statistical rigor and interpret performance patterns.
+
+Apply the [Performance Analysis](performance-analysis) guide to analyze results with statistical rigor and interpret performance patterns
 
 ### 4. Custom Algorithm Development
-Extend NeMo RL using the [Custom Algorithms](custom-algorithms) guide to develop new training approaches and algorithms.
+
+Extend NeMo RL using the [Custom Algorithms](custom-algorithms) guide to develop new training approaches and algorithms
 
 ### 5. Ablation Studies
-Conduct systematic ablation studies using the [Ablation Studies](ablation-studies) guide to understand component contributions.
+
+Conduct systematic ablation studies using the [Ablation Studies](ablation-studies) guide to understand component contributions
 
 ### 6. Reproducible Research
-Ensure reproducibility using the [Reproducible Research](reproducible-research-validation) guide for deterministic experiments.
+
+Ensure reproducibility using the [Reproducible Research](reproducible-research-validation) guide for deterministic experiments
 
 ## Best Practices
 
 ### Research Rigor
-- **Hypothesis-Driven**: Formulate clear, testable research questions
+
+- **Hypothesis-Driven**: Create clear, testable research questions
 - **Statistical Rigor**: Use proper statistical tests and significance levels
-- **Reproducibility**: Ensure experiments can be reproduced consistently
+- **Reproducibility**: Ensure experiments reproduce consistently
 - **Documentation**: Document all experimental procedures and results
 
 ### NeMo RL Integration
+
 - **Real Code Examples**: Use actual NeMo RL functions and patterns
 - **Configuration Management**: Use proper YAML configuration structures
 - **Logging and Monitoring**: Leverage NeMo RL's logging and timing systems
 - **Validation**: Use built-in validation functions for reliable results
 
 ### Performance Analysis
-- **Multi-Dimensional**: Evaluate across multiple performance dimensions
+
+- **Multi-Dimensional**: Assess across many performance dimensions
 - **Statistical Analysis**: Apply proper statistical methods for result interpretation
 - **Visualization**: Create comprehensive performance dashboards
 - **Benchmarking**: Compare against appropriate baselines
@@ -156,6 +165,7 @@ Ensure reproducibility using the [Reproducible Research](reproducible-research-v
 ## Configuration Examples
 
 ### Research Configuration
+
 ```yaml
 # configs/research_config.yaml
 research:

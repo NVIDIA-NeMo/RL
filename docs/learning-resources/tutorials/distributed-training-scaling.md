@@ -16,9 +16,9 @@ This tutorial teaches you how to scale NeMo RL training with distributed systems
 
 - **Distributed Architecture**: Understand NeMo RL's distributed training framework
 - **Multi-Node Cluster Setup**: Configure and manage multi-node training clusters
-- **Distributed Data Loading**: Optimize data loading across multiple nodes
-- **Gradient Synchronization**: Implement efficient gradient synchronization strategies
-- **Performance Monitoring**: Monitor and debug distributed training performance
+- **Distributed Data Loading**: Optimize data loading across many nodes
+- **Gradient Synchronization**: Use efficient gradient synchronization strategies
+- **Performance Monitoring**: Track and debug distributed training performance
 
 ## Prerequisites
 
@@ -30,19 +30,24 @@ This tutorial teaches you how to scale NeMo RL training with distributed systems
 ## Tutorial Overview
 
 ### **Step 1: Understanding Distributed Architecture**
+
 Learn NeMo RL's distributed training framework and components.
 
 ### **Step 2: Multi-Node Cluster Setup**
+
 Configure and manage multi-node training clusters.
 
 ### **Step 3: Distributed Data Loading**
-Optimize data loading across multiple nodes.
+
+Optimize data loading across many nodes.
 
 ### **Step 4: Gradient Synchronization**
-Implement efficient gradient synchronization strategies.
+
+Use efficient gradient synchronization strategies.
 
 ### **Step 5: Performance Monitoring**
-Monitor and debug distributed training performance.
+
+Track and debug distributed training performance.
 
 ## Step 1: Understanding Distributed Architecture
 
@@ -1065,7 +1070,7 @@ After completing this tutorial:
 ## Related Resources
 
 - **[Distributed Training Guide](../../../advanced/performance/distributed-training)**: Distributed training fundamentals
-- **[Ray Distributed Computing](../../api-docs/distributed/distributed)**: Ray distributed computing documentation
+- **[Ray Distributed Computing](../../apidocs/nemo_rl/nemo_rl.distributed)**: Ray distributed computing documentation
 - **[Cluster Setup Guide](../../get-started/cluster)**: Cluster setup and management
 - **[Performance Optimization](../../../advanced/performance/index)**: Performance optimization techniques
 
@@ -1075,8 +1080,8 @@ In this tutorial, you learned:
 
 - ✅ **Distributed Architecture**: Understanding NeMo RL's distributed training framework
 - ✅ **Multi-Node Cluster Setup**: Configuring and managing multi-node training clusters
-- ✅ **Distributed Data Loading**: Optimizing data loading across multiple nodes
-- ✅ **Gradient Synchronization**: Implementing efficient gradient synchronization strategies
-- ✅ **Performance Monitoring**: Monitoring and debugging distributed training performance
+- ✅ **Distributed Data Loading**: Optimizing data loading across many nodes
+- ✅ **Gradient Synchronization**: Using efficient gradient synchronization strategies
+- ✅ **Performance Monitoring**: Tracking and debugging distributed training performance
 
-You now have the skills to scale NeMo RL training with distributed systems for production-scale training. 
+You now have the skills to scale NeMo RL training with distributed systems for production-scale training.

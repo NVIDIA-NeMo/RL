@@ -214,7 +214,7 @@ python examples/converters/convert_megatron_to_hf.py --input megatron_model --ou
 
 - [Configuration Reference](configuration-reference) - Complete configuration options
 - [Troubleshoot NeMo RL](../guides/troubleshooting) - Common issues and solutions
-- [API Documentation](../api-docs/index) - Complete API documentation
+- [API Documentation](../apidocs/index) - Complete API documentation
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub issues and discussions
 
 ## Advanced Usage
@@ -285,4 +285,4 @@ python examples/run_dpo.py --config config_with_mlflow.yaml
 
 - [Configuration Reference](configuration-reference)
 - [Troubleshoot NeMo RL](../guides/troubleshooting)
-- [API Documentation](../api-docs/index) 
+- [API Documentation](../apidocs/index) 

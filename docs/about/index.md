@@ -134,7 +134,7 @@ For comprehensive details on system design, components, scalability, and technic
 
 NeMo RL provides a comprehensive Python API for implementing custom reinforcement learning algorithms, environments, and training workflows. The framework offers clean interfaces for algorithm development, environment creation, and distributed training orchestration.
 
-For complete API documentation, code examples, and development guides, see the [API Documentation](../api-docs/index) section.
+For complete API documentation, code examples, and development guides, see the [API Documentation](../apidocs/index) section.
 
 ## Get Started
 

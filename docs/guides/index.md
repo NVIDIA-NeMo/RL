@@ -179,7 +179,7 @@ Comprehensive performance optimization and profiling techniques.
 :gutter: 2 2 2 2
 
 :::{grid-item-card} {octicon}`bug;1.5em;sd-mr-1` Troubleshooting
-:link: troubleshooting
+:link: troubleshooting/index
 :link-type: doc
 
 Resolve common problems and errors in production environments.
@@ -191,3 +191,15 @@ Resolve common problems and errors in production environments.
 ::::
 
 For additional learning resources, visit the main [Guides](../index) page.
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+training-algorithms/index
+model-development/index
+development-workflows/index
+environment-data/index
+training-optimization/index
+troubleshooting/index
+```

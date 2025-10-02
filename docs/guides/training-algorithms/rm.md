@@ -1,38 +1,27 @@
-# Direct Preference Optimization in NeMo RL
+# Reward Model Training in NeMo RL
 
-[Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290) is an RL-free alignment algorithm that operates on preference data. Given a prompt and a pair of chosen and rejected responses, DPO aims
-to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the
-[DPO paper](https://arxiv.org/pdf/2305.18290).
+This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the DTensor backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
 
-## Launch a DPO Run
+## Launch a Training Job
 
-The script [examples/run_dpo.py](../../examples/run_dpo.py) can be used to launch a DPO experiment. This script can either be launched locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../cluster.md).
+The script, [examples/run_rm.py](../../examples/run_rm.py), is used to train a Bradley-Terry reward model. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../get-started/cluster.md).
 
-Be sure to launch the job using `uv`. The command to launch a DPO job is as follows:
-```bash
-uv run examples/run_dpo.py --config <PATH TO YAML CONFIG> <OVERRIDES>
-```
-If not specified, `config` will default to [examples/configs/dpo.yaml](../../examples/configs/dpo.yaml).
-
-## Configuration
-
-NeMo RL allows users to configure DPO experiments using `yaml` config files. An example DPO configuration file can be found [here](../../examples/configs/dpo.yaml).
-
-To override a value in the config, either update the value in the `yaml` file directly, or pass the override via the command line. For example:
+Be sure to launch the job using `uv`. The command to launch a training job is as follows:
 
 ```bash
-uv run examples/run_dpo.py \
-    cluster.gpus_per_node=8 \
-    dpo.sft_loss_weight=0.1 \
-    dpo.preference_average_log_probs=True \
-    logger.wandb.name="dpo-dev-8-gpu"
+uv run examples/run_rm.py
+
+# Can also add overrides on CLI, like changing the config or changing the model
+uv run examples/run_rm.py --config examples/configs/rm.yaml policy.model_name=Qwen/Qwen2.5-1.5B
 ```
 
-**Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+The default YAML config shares the same base template as the SFT config but includes a new `reward_model_cfg` section with `enabled: true` to load the model as a Reward Model. You can find an example RM config file at [examples/configs/rm.yaml](../../examples/configs/rm.yaml).
+
+**Reminder**: Set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). Make sure to log in using `huggingface-cli` if you're working with Llama models.
 
 ## Datasets
 
-Each DPO dataset class is expected to have the following attributes:
+Each RM dataset class is expected to have the following attributes:
 1. `formatted_ds`: The dictionary of formatted datasets, where each dataset should be formatted like
 ```json
 {
@@ -51,7 +40,7 @@ Each DPO dataset class is expected to have the following attributes:
 ```
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
-DPO training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
+Currently, RM training supports only two completions (where the lowest rank is preferred and the highest one is rejected), with each completion being a single response. For example:
 ```json
 {
     "context": [
@@ -93,7 +82,7 @@ DPO training supports only two completions (where the lowest rank is preferred a
 
 By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace. You can modify your config as follows to use such a custom preference dataset:
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace.. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
   dataset_name: PreferenceDataset
@@ -123,18 +112,60 @@ Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
 
-## DPO-Specific Parameters
+## Using Reward Models as Environments
 
-The DPO implementation in NeMo RL supports several key parameters that can be adjusted:
+Trained reward models can be used as environments in GRPO training for reinforcement learning from human feedback (RLHF). This allows you to use your trained reward model to provide rewards during policy optimization.
 
-- `dpo.reference_policy_kl_penalty`: Controls the strength of the KL penalty term
-- `dpo.preference_loss_weight`: Weight for the preference loss
-- `dpo.sft_loss_weight`: Weight for the auxiliary SFT loss
-- `dpo.preference_average_log_probs`: Whether to average log probabilities over tokens in the preference loss term
-- `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
+### Reward Model Environment
 
-These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
+The Reward Model Environment provides a standardized interface for using trained reward models in RL training:
 
-## Evaluate the Trained Model
+```python
+from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+env_config = {
+    "enabled": True,
+    "model_name": "path/to/your/trained/reward/model",
+    "tokenizer": {"name": "path/to/your/trained/reward/model"},
+    "precision": "bfloat16",
+    "batch_size": 32,
+    "resources": {"gpus_per_node": 1, "num_nodes": 1},
+    "reward_model_cfg": {
+        "enabled": True,
+        "reward_model_type": "bradley_terry",
+    },
+}
+
+reward_env = RewardModelEnvironment.remote(env_config)
+```
+
+### Integration with GRPO
+
+To use your trained reward model with GRPO, you can use the [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) script:
+
+```bash
+# Run GRPO training with your trained reward model
+uv run examples/run_grpo_rm.py --config examples/configs/grpo_rm_1B.yaml
+```
+
+### Configuration
+
+In your GRPO configuration, specify the reward model environment:
+
+```yaml
+env:
+  reward_model:
+    enabled: true
+    model_name: "path/to/your/trained/reward/model"
+    tokenizer:
+      name: "path/to/your/trained/reward/model"
+    precision: "bfloat16"
+    batch_size: 32
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+```
+

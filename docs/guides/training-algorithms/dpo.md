@@ -11,22 +11,24 @@ modality: "universal"
 # Align Models with Direct Preference Optimization (DPO)
 
 [Direct Preference Optimization (DPO)](https://arxiv.org/pdf/2305.18290) is an RL-free alignment algorithm that operates on preference data. Given a prompt and a pair of chosen and rejected responses, DPO aims
-to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The actor is initialized using the reference model. For more details, refer to the
+to increase the probability of the chosen response and decrease the probability of the rejected response relative to a frozen reference model. The algorithm initializes the actor using the reference model. For more details, refer to the
 [DPO paper](https://arxiv.org/pdf/2305.18290).
 
 ## Launch a DPO Run
 
-The script, [examples/run_dpo.py](../../../examples/run_dpo.py), can be used to launch an experiment. This script can either be launched locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../../get-started/cluster.md).
+Use the [examples/run_dpo.py](../../../examples/run_dpo.py) script to launch an experiment. Launch this script either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../../get-started/cluster.md).
 
 Be sure to launch the job using `uv`. The command to launch a DPO job is as follows:
+
 ```bash
 uv run examples/run_dpo.py --config <PATH TO YAML CONFIG> <OVERRIDES>
 ```
-If not specified, `config` will default to [examples/configs/dpo.yaml](../../../examples/configs/dpo.yaml).
+
+If not specified, `config` will default to `examples/configs/dpo.yaml`.
 
 ## Configuration
 
-NeMo RL allows users to configure DPO experiments using `yaml` config files. An example DPO configuration file can be found [here](../../../examples/configs/dpo.yaml).
+NeMo RL allows users to configure DPO experiments using `yaml` config files. An example DPO configuration file can be found at `examples/configs/dpo.yaml`.
 
 To override a value in the config, either update the value in the `yaml` file directly, or pass the override via the command line. For example:
 
@@ -51,7 +53,7 @@ DPO datasets are expected to follow a specific format with three key fields:
 - `chosen_response`: The preferred/winning response
 - `rejected_response`: The non-preferred/losing response
 
-[data/hf_datasets/helpsteer3.py](../../../nemo_rl/data/hf_datasets/helpsteer3.py) provides an example of how to format data for DPO:
+See `nemo_rl/data/hf_datasets/helpsteer3.py` for an example of how to format data for DPO:
 
 ```python
 def format_helpsteer3(data):
@@ -76,7 +78,7 @@ def format_helpsteer3(data):
     }
 ```
 
-We also provide a [DPODataset](../../../nemo_rl/data/hf_datasets/dpo.py) class that is compatible with jsonl-formatted preference datasets. This class assumes train and validation datasets have been split and processed into the expected format offline. The jsonl files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
+We also provide a `DPODataset` class (see `nemo_rl/data/hf_datasets/dpo.py`) that is compatible with jsonl-formatted preference datasets. This class assumes train and validation datasets have been split and processed into the expected format offline. The jsonl files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 
 ## Adding Custom DPO Datasets
 

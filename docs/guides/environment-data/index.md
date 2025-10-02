@@ -264,7 +264,7 @@ nemo-rl train --config config.yaml --debug
 
 ## Next Steps
 
-- [Debugging Guide](debugging) - Learn debugging techniques
+- [Debugging Guide](../development-workflows/debugging) - Learn debugging techniques
 - [NSYS Profiling](nsys-profiling) - Profile training performance
 - [Advanced Performance](../../advanced/performance/index) - Deep dive into optimization
 - [Distributed Training](../../advanced/performance/distributed-training) - Scale across nodes

@@ -87,7 +87,7 @@ This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0** 
 
 ## Accuracy
 
-![Llama-3.1-8B-Instruct GRPO Curve BF16 vs FP8](assets/fp8_e2e_curve.png)
+![Llama-3.1-8B-Instruct GRPO Curve BF16 vs FP8](../../assets/fp8_e2e_curve.png)
 
 The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run them with the following example configs:
 * For BF16: `examples/configs/grpo_math_8B_megatron.yaml`

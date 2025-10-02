@@ -8,7 +8,7 @@ content_type: "tutorial"
 modality: "universal"
 ---
 
-# Evaluate Model Performance
+# Assess Model Performance
 
 This document explains how to use an evaluation script for assessing model capabilities.
 
@@ -17,6 +17,7 @@ This document explains how to use an evaluation script for assessing model capab
 To prepare for evaluation, first ensure your model is in the correct format, which may involve an optional conversion of PyTorch DCP checkpoints to the Hugging Face format. Following this, you need to prepare the evaluation configuration, which includes defining prompt templates and any custom settings required to run the evaluation.
 
 ### Convert DCP to HF (Optional)
+
 If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the Hugging Face format before running evaluation.
 
 Use the `examples/converters/convert_dcp_to_hf.py` script. You'll need the path to the training configuration file (`config.yaml`), the DCP checkpoint directory, and specify an output path for the HF format model.
@@ -28,14 +29,16 @@ uv run python examples/converters/convert_dcp_to_hf.py \
     --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
     --hf-ckpt-path results/grpo/hf
 ```
+
 > **Note:** Adjust the paths according to your training output directory structure.
 
 Once the conversion is complete, you can override the `generation.model_name` to point to the directory containing the converted HF model in [this section](#run-the-evaluation-script).
 
 ### Prepare the Evaluation Configuration
+
 **Override with Custom Settings**
 
-To run the evaluation, you can use the [default configuration file](../../../examples/configs/eval.yaml). Alternatively, you can specify a custom one or override some settings via the command line.
+To run the evaluation, you can use the default configuration file at `examples/configs/eval.yaml`. Alternatively, you can specify a custom one or override some settings via the command line.
 
 The default configuration employs greedy sampling to evaluate Qwen2.5-Math-1.5B-Instruct on AIME-2024.
 

@@ -31,7 +31,7 @@ We create composable and hackable abstractions for each layer of the tasks above
 
 By creating a common interface for these four tasks, the RL algorithm code can scale seamlessly from 1 to 1000 GPUs and remain independent of the specific RL Actor (such as Megatron, Hugging Face, or abstract components like a grad student with pen and paper).
 
-![actor-wg-worker-vc](../assets/actor-wg-worker-vc.png)
+![actor-wg-worker-vc](../../assets/actor-wg-worker-vc.png)
 
 ### {py:class}`RayVirtualCluster <nemo_rl.distributed.virtual_cluster.RayVirtualCluster>`
 VirtualCluster provides a basic abstraction on top of Ray Placement Groups that allow you to section off a part of your compute resources for WorkerGroups to run on as though they had their own cluster. They support running just one WorkerGroup on each VirtualCluster, or *colocation*, where multiple WorkerGroups share resources (i.e running policy training(hf) and generation(vllm) on the same GPUs in-turn).
@@ -111,7 +111,7 @@ def grpo_train(
         training_data = calculate_grpo_training_data(generations, logprobs, reference_logprobs, rewards)
         policy.train(generations, logprobs, reference_logprobs, GRPOLossFn)
 ```
-For a complete implementation of GRPO, including validation, checkpointing, memory movement, and the data processing steps not detailed here, see [grpo_train](../../nemo_rl/algorithms/grpo.py).
+For a complete implementation of GRPO, including validation, checkpointing, memory movement, and the data processing steps not detailed here, see `grpo_train` in `nemo_rl/algorithms/grpo.py`.
 
 
 ### TypedDict and Configuration Defaults

@@ -4,11 +4,11 @@ This guide covers how to develop custom environments for reinforcement learning 
 
 ## Overview
 
-NeMo RL environments are designed for language model training and evaluation. They process conversations between users and AI assistants, evaluate responses, and provide rewards based on task-specific criteria. Custom environments allow you to define specific problem domains, evaluation metrics, and reward structures for your RL training tasks.
+NeMo RL environments support language model training and evaluation. They process conversations between users and AI assistants, assess responses, and provide rewards based on task-specific criteria. Custom environments allow you to define specific problem domains, evaluation metrics, and reward structures for your RL training tasks.
 
 ## Environment Interface
 
-All environments must implement the `EnvironmentInterface`:
+All environments must use the `EnvironmentInterface`:
 
 ```python
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
@@ -113,11 +113,11 @@ class EnvironmentMetadata(TypedDict):
 
 ### Reward Evaluation
 
-Design reward functions that evaluate language model responses:
+Design reward functions that assess language model responses:
 
 ```python
 def _evaluate_response(self, responses: list[str], metadata: dict) -> float:
-    """Evaluate assistant responses and return reward.
+    """Assess assistant responses and return reward.
     
     Args:
         responses: List of assistant response strings
@@ -154,8 +154,8 @@ def _evaluate_response(self, responses: list[str], metadata: dict) -> float:
 
 - **Robust Parsing**: Handle various message formats and edge cases
 - **Context Preservation**: Maintain conversation context across turns
-- **Error Handling**: Gracefully handle malformed messages
-- **Batch Efficiency**: Process multiple conversations efficiently
+- **Error Handling**: Handle malformed messages appropriately
+- **Batch Efficiency**: Process many conversations efficiently
 
 ### 3. Reward Design
 
@@ -436,8 +436,8 @@ class CodeGenerationEnvironment(EnvironmentInterface):
 
 ## Next Steps
 
-- Review the [Environment Interfaces API](../../api-docs/nemo_rl/nemo_rl.environments.interfaces) for detailed API documentation
-- Explore [Math Environment](../../api-docs/nemo_rl/nemo_rl.environments.math_environment) for a complete implementation example
-- Check [Debugging](debugging) for troubleshooting guidance
+- Review the [Environment Interfaces API](../../apidocs/nemo_rl/nemo_rl.environments) for detailed API documentation
+- Explore [Math Environment](../../apidocs/nemo_rl/nemo_rl.environments) for a complete implementation example
+- Check [Debugging](../development-workflows/debugging) for troubleshooting guidance
 - See [Advanced Training](../../advanced/algorithm-development/index) for optimization techniques
-- Review [Configuration Reference](../../references/configuration-reference) for environment setup 
+- Review [Configuration Reference](../../references/configuration-reference) for environment setup

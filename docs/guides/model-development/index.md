@@ -332,7 +332,7 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 - [Model Quirks and Special Cases](model-quirks) - Handle edge cases and special behaviors
 - [Training Algorithms](../training-algorithms/index) - Apply your models to RL training
 - [Performance Optimization](../training-optimization/index) - Optimize model performance
-- [API Documentation](../../../api-docs/index) - Complete model API reference
+- [API Documentation](../../apidocs/index) - Complete model API reference
 
 ## Get Help
 

@@ -51,7 +51,13 @@ extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "BUILD_INSTRUCTIONS.md",
+    "_extensions/*/README.md",
+]
 
 # -- Options for MyST Parser (Markdown) --------------------------------------
 # MyST Parser settings
@@ -73,6 +79,7 @@ autodoc2_packages = [
 ]
 autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
 autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
+autodoc2_index_template = None  # Don't auto-generate index file, we maintain it manually
 # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
 # render google style docstrings.
 # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33

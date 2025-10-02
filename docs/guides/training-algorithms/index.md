@@ -232,7 +232,7 @@ uv run examples/run_eval.py --config examples/configs/eval.yaml
 ## Get Help
 
 - [Troubleshooting](../troubleshooting) - Common training issues and solutions
-- [API Documentation](../../../api-docs/index) - Complete algorithm documentation
+- [API Documentation](../../apidocs/index) - Complete algorithm documentation
 - [Configuration Reference](../../../references/configuration-reference) - Training parameters
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub discussions
 

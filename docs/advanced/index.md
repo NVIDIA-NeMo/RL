@@ -14,19 +14,23 @@ Essential advanced topics for AI developers and scientists: algorithm developmen
 
 ## What You'll Find Here
 
-Our advanced topics are organized into four core areas that cover the essential needs of AI developers and scientists:
+The advanced topics organize into four core areas that cover the essential needs of AI developers and scientists:
 
 ### **Algorithm Development**
-Extend and customize NeMo RL algorithms for your specific use cases. Implement custom DPO and GRPO variants, design novel loss functions, and understand mathematical foundations.
+
+Extend and customize NeMo RL algorithms for your specific use cases. Create custom DPO and GRPO variants, design novel loss functions, and understand mathematical foundations.
 
 ### **Performance and Scaling**
-Scale NeMo RL from single GPU to production clusters. Optimize memory usage, implement distributed training, and achieve maximum performance for large-scale models.
+
+Scale NeMo RL from single GPU to production clusters. Optimize memory usage, use distributed training, and achieve peak performance for large-scale models.
 
 ### **Research and Validation**
-Design rigorous experiments, evaluate model performance, and ensure reproducible research. Build robust evaluation frameworks and maintain scientific rigor.
+
+Design rigorous experiments, assess model performance, and ensure reproducible research. Build robust evaluation frameworks and maintain scientific rigor.
 
 ### **Production Deployment**
-Deploy NeMo RL models in production environments. Build serving systems, implement monitoring, and ensure reliable model deployment.
+
+Deploy NeMo RL models in production environments. Build serving systems, use monitoring, and ensure reliable model deployment.
 
 ## Key Capabilities
 
@@ -158,7 +162,7 @@ Profile and analyze training performance with advanced tools.
 :link: performance/monitoring
 :link-type: doc
 
-Monitor training performance in real-time with comprehensive metrics.
+Track training performance in real-time with comprehensive metrics.
 
 ++++
 {bdg-info}`Intermediate`
@@ -173,8 +177,6 @@ Benchmark training speed, memory usage, and scalability.
 ++++
 {bdg-warning}`Advanced`
 :::
-
-
 
 :::::
 
@@ -203,7 +205,7 @@ Build comprehensive evaluation frameworks.
 {bdg-info}`Validation`
 :::
 
-:::{grid-item-card} {octicon}`chart;1.5em;sd-mr-1` Performance Analysis
+:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Performance Analysis
 :link: research/performance-analysis
 :link-type: doc
 
@@ -244,4 +246,3 @@ Ensure reproducible results and scientific rigor.
 :::
 
 ::::
-

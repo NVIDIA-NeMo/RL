@@ -1,1 +1,0 @@
-_templates/autodoc2_index.rst

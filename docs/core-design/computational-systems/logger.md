@@ -149,7 +149,7 @@ When `num_val_samples_to_print` is set to a value greater than 0, the logger wil
 
 When enabled, the pretty logging will generate formatted text similar to:
 
-![Validation Pretty Logging Example](../assets/val-log.png)
+![Validation Pretty Logging Example](../../assets/val-log.png)
 
 ## GPU Metric Logging
 

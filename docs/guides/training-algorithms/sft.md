@@ -14,7 +14,7 @@ This document explains how to perform SFT within NeMo RL. It outlines key operat
 
 ## Launch an SFT Run
 
-The script, [examples/run_sft.py](../../../examples/run_sft.py), can be used to launch an experiment. This script can be launched either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../../get-started/cluster.md).
+Use the [examples/run_sft.py](../../../examples/run_sft.py) script to launch an experiment. Launch this script either locally or via Slurm. For details on how to set up Ray and launch a job using Slurm, refer to the [cluster documentation](../../get-started/cluster.md).
 
 Be sure to launch the job using `uv`. The command to launch an SFT job is as follows:
 
@@ -22,11 +22,11 @@ Be sure to launch the job using `uv`. The command to launch an SFT job is as fol
 uv run examples/run_sft.py --config <PATH TO YAML CONFIG> <OVERRIDES>
 ```
 
-If not specified, `config` will default to [examples/configs/sft.yaml](../../../examples/configs/sft.yaml).
+If not specified, `config` will default to `examples/configs/sft.yaml`.
 
 ## Example Configuration File
 
-NeMo RL allows users to configure experiments using `yaml` config files. An example SFT configuration file can be found [here](../../../examples/configs/sft.yaml).
+NeMo RL allows users to configure experiments using `yaml` config files. An example SFT configuration file can be found at `examples/configs/sft.yaml`.
 
 To override a value in the config, either update the value in the `yaml` file directly, or pass the override via the command line. For example:
 
@@ -41,10 +41,11 @@ uv run examples/run_sft.py \
 ## Datasets
 
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
+
   1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
   2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
-SFT datasets are expected to follow the Hugging Face chat format. Refer to the [chat dataset document](../../core-design/data-management/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [data/hf_datasets/squad.py](../../../nemo_rl/data/hf_datasets/squad.py) has an example:
+SFT datasets are expected to follow the Hugging Face chat format. Refer to the [chat dataset document](../../core-design/data-management/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. See `nemo_rl/data/hf_datasets/squad.py` for an example:
 
 ```python
 def format_squad(data):
@@ -66,7 +67,7 @@ def format_squad(data):
     }
 ```
 
-NeMo RL SFT uses Hugging Face chat templates to format the individual examples. Three types of chat templates are supported, which can be configured via `tokenizer.chat_template` in your yaml config (see [sft.yaml](../../../examples/configs/sft.yaml) for an example):
+NeMo RL SFT uses Hugging Face chat templates to format the individual examples. Three types of chat templates are supported, which can be configured via `tokenizer.chat_template` in your yaml config (see `examples/configs/sft.yaml` for an example):
 
 1. Apply the tokenizer's default chat template. To use the tokenizer's default, either omit `tokenizer.chat_template` from the config altogether, or set `tokenizer.chat_template="default"`.
 2. Use a "passthrough" template which simply concatenates all messages. This is desirable if the chat template has been applied to your dataset as an offline preprocessing step. In this case, you should set `tokenizer.chat_template` to None as follows:
@@ -80,7 +81,6 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     tokenizer:
     custom_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer: '}}{%- elif message['role'] == 'assistant'  %}{{message['content'].strip()}}{%- endif %}{% endfor %}"
     ```
-
 
 By default, NeMo RL has support for `Squad` and `OpenAssistant` datasets. Both of these datasets are downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 

@@ -24,7 +24,7 @@ uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
 
 The script, [examples/run_grpo_math.py](../../../examples/run_grpo_math.py), can be used to launch an experiment.
 
-If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../../examples/configs/grpo_math_1B.yaml).
+If not specified, `config` will default to `examples/configs/grpo_math_1B.yaml`.
 
 **Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 
@@ -40,7 +40,7 @@ In this guide, we'll walk through how we handle:
 
 We support training with multiple RL "Environments" at the same time.
 
-An [Environment](../../../nemo_rl/environments/interfaces.py) is an object that accepts a state/action history and returns an update state and rewards for the step. They run as Ray Remote Actors. Example [MathEnvironment](../../../nemo_rl/environments/math_environment.py).
+An Environment (see `nemo_rl/environments/interfaces.py`) is an object that accepts a state/action history and returns an update state and rewards for the step. They run as Ray Remote Actors. Example: `MathEnvironment` in `nemo_rl/environments/math_environment.py`.
 
 To support this, we need to know:
 
@@ -86,7 +86,7 @@ def validate_training_data(dataset, tokenizer, max_length):
 
 #### Common Data Format
 
-We define a [DatumSpec](../../../nemo_rl/data/interfaces.py) that holds all relevant information for each training example:
+We define a `DatumSpec` (see `nemo_rl/data/interfaces.py`) that holds all relevant information for each training example:
 
 ```python
 class DatumSpec(TypedDict):
@@ -103,7 +103,7 @@ class DatumSpec(TypedDict):
 
 We refer to each distinct environment your model aims to optimize against as a "task." For example, you might define tasks like "math" or "code."
 
-For each task, you should provide a data processor that reads from your dataset and returns a [DatumSpec](../../../nemo_rl/data/interfaces.py)
+For each task, you should provide a data processor that reads from your dataset and returns a `DatumSpec` (see `nemo_rl/data/interfaces.py`)
 
 ```python
 def my_data_processor(
@@ -151,16 +151,16 @@ Ensure you provide a mapping of tasks to their processors so the dataset knows w
 
 We define a {py:class}`PolicyInterface]() <nemo_rl.models.interfaces>` that contains everything you need to train a Policy model.
 
-This Policy object holds a [RayWorkerGroup](../../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
+This Policy object holds a `RayWorkerGroup` (see `nemo_rl/distributed/worker_groups.py`) of SPMD (1 proc/gpu) processes that run HF/MCore, all coordinated by this object so it appears to you like 1 GPU!
 
 ## Fast Generation
 
-We support vLLM through the [VllmGeneration](../../../nemo_rl/models/generation/vllm.py) class right now.
+We support vLLM through the `VllmGeneration` class (see `nemo_rl/models/generation/vllm.py`).
 
-The function [grpo_train](../../../nemo_rl/algorithms/grpo.py) contains the core GRPO training loop.
+The function `grpo_train` (see `nemo_rl/algorithms/grpo.py`) contains the core GRPO training loop.
 
 ## Loss
-We use the [ClippedPGLossFn](../../../nemo_rl/algorithms/loss_functions.py) to calculate the loss for GRPO. Formally,
+We use the `ClippedPGLossFn` (see `nemo_rl/algorithms/loss_functions.py`) to calculate the loss for GRPO. Formally,
 
 $$
 L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})

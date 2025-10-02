@@ -78,7 +78,7 @@ Advanced performance optimization, research techniques, and cutting-edge algorit
 :::
 
 ::: {grid-item-card} {octicon}`code;1.5em;sd-mr-1` API Documentation
-:link: api-docs/index
+:link: apidocs/index
 :link-type: doc
 
 Complete API reference for algorithms, models, data, environments, and distributed training components.
@@ -180,7 +180,6 @@ Debugging, common problems, and advanced problem resolution for RL training work
 
 ## Need Help
 
-- **FAQs**: [Common questions](references/faqs)
 - **Troubleshooting**: [Fix common issues](guides/troubleshooting)
 - **Community**: [GitHub Issues](https://github.com/NVIDIA/NeMo-RL/issues)
 
@@ -262,17 +261,7 @@ learning-resources/use-cases/index
 :hidden:
 :caption: API Documentation
 :maxdepth: 2
-api-docs/index
-api-docs/nemo_rl/nemo_rl.algorithms
-api-docs/nemo_rl/nemo_rl.converters
-api-docs/nemo_rl/nemo_rl.data
-api-docs/nemo_rl/nemo_rl.distributed
-api-docs/nemo_rl/nemo_rl.environments
-api-docs/nemo_rl/nemo_rl.evals
-api-docs/nemo_rl/nemo_rl.experience
-api-docs/nemo_rl/nemo_rl.models
-api-docs/nemo_rl/nemo_rl.utils
-api-docs/nemo_rl/nemo_rl.metrics
+apidocs/index
 ```
 
 ```{toctree}

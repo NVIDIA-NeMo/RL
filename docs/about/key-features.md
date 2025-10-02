@@ -14,6 +14,7 @@ modality: "universal"
 NeMo RL provides a robust, modular toolkit for scalable reinforcement learning and supervised fine-tuning of large language models. This summary highlights the core features most relevant to AI developers.
 
 ## 1. Scalable and Efficient Training
+
 - **Single-GPU to Multi-Node**: Seamless scaling from 1 GPU to 64+ GPUs and multi-node clusters.
 - **Model Size Flexibility**: Supports models from small (0.6B) to 70B+ parameters.
 - **Advanced Parallelism**: FSDP2, Tensor Parallelism, Pipeline Parallelism, Context Parallelism.
@@ -46,23 +47,27 @@ Backends are configurable and interchangeable without altering core algorithm lo
 - **Conversion Tools**: Utilities for converting between Hugging Face and Torch-native formats.
 
 ## 4. Integration Ecosystem
+
 - **Hugging Face**: For model loading, datasets, tokenizer management
 - **Ray**: Distributed rollout generation, process isolation, fault tolerance
 - **uv**: Python environment management for reproducibility
 - **Weights and Biases**: Logging and training visualization support
 
 ## 5. Data and Environment Integration
+
 - **Dataset Support**: Direct integration with Hugging Face datasets and custom data loaders.
 - **Environment Abstractions**: Standardized RL environment interfaces for custom or built-in tasks.
 - **Multi-Environment**: Support for complex, multi-environment RL scenarios.
 
 ## 6. Configuration and Extensibility
+
 - **YAML Configs**: Human-readable configuration files for all training and rollout parameters.
 - **CLI Overrides**: Command-line parameter overrides for rapid experimentation.
 - **Unified APIs**: Standardized interfaces for training, rollout, and generation backends.
 - **Modular Components**: Plug-and-play actors, environments, reward models, and policies.
 
 ## 7. Developer Experience
+
 - **Comprehensive Documentation**: Detailed guides, API docs, and examples.
 - **Type Hints and Testing**: Full type annotation and extensive test coverage.
 - **Debugging and Profiling**: Integrated tools for debugging distributed training and profiling performance.
@@ -82,5 +87,5 @@ Backends are configurable and interchangeable without altering core algorithm lo
 
 ---
 
-For more details, see the [API Documentation](../api-docs/index), [Guides](../guides/index), and [Core Design and Architecture](../core-design/index).
+For more details, see the [API Documentation](../apidocs/index), [Guides](../guides/index), and [Core Design and Architecture](../core-design/index).
 
