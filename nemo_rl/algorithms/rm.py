@@ -444,7 +444,9 @@ def rm_train(
         current_epoch = rm_save_state["epoch"]
         current_step = rm_save_state["step"]
         total_steps = rm_save_state["total_steps"]
-        total_valid_tokens = rm_save_state["total_valid_tokens"]
+        total_valid_tokens = rm_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     rm_config = master_config["rm"]
     # Validation configuration

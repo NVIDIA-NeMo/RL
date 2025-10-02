@@ -510,7 +510,9 @@ def dpo_train(
         current_epoch = dpo_save_state["epoch"]
         current_step = dpo_save_state["step"]
         total_steps = dpo_save_state["total_steps"]
-        total_valid_tokens = dpo_save_state["total_valid_tokens"]
+        total_valid_tokens = dpo_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     dpo_config = master_config["dpo"]
     # Validation configuration

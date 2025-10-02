@@ -493,7 +493,9 @@ def distillation_train(
     # common config/state itmes
     step = distillation_save_state["step"]
     consumed_samples = distillation_save_state["consumed_samples"]
-    total_valid_tokens = distillation_save_state["total_valid_tokens"]
+    total_valid_tokens = distillation_save_state.get(
+        "total_valid_tokens", 0
+    )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]

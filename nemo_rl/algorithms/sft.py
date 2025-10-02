@@ -374,7 +374,9 @@ def sft_train(
         current_epoch = sft_save_state["epoch"]
         current_step = sft_save_state["step"]
         total_steps = sft_save_state["total_steps"]
-        total_valid_tokens = sft_save_state["total_valid_tokens"]
+        total_valid_tokens = sft_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     sft_config = master_config["sft"]
     # Validation configuration

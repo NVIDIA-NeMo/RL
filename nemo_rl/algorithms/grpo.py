@@ -608,9 +608,9 @@ def grpo_train(
     consumed_samples = grpo_save_state[
         "consumed_samples"
     ]  # total samples consumed across all epochs
-    total_valid_tokens = grpo_save_state[
-        "total_valid_tokens"
-    ]  # total valid tokens processed across all epochs
+    total_valid_tokens = grpo_save_state.get(
+        "total_valid_tokens", 0
+    )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -1199,7 +1199,9 @@ def async_grpo_train(
     step = grpo_save_state["current_step"]
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
-    total_valid_tokens = grpo_save_state["total_valid_tokens"]
+    total_valid_tokens = grpo_save_state.get(
+        "total_valid_tokens", 0
+    )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
