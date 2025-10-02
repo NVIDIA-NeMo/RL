@@ -70,7 +70,7 @@ def gpt3(config: FLOPSConfig):
 
 
 def llama(config: FLOPSConfig):
-    """Model FLOPs for llama3 family."""
+    """Model FLOPs for llama2/3 family."""
     return (
         config.gbs
         * config.enc_seq_len
@@ -81,6 +81,24 @@ def llama(config: FLOPSConfig):
             12
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.ffn_hs / config.hs)
+            + (6 * config.enc_seq_len / config.hs)
+            + (6 * config.vocab_size / (config.layers * config.hs))
+        )
+    )
+
+
+def llama4(config: FLOPSConfig):
+    """Model FLOPs for llama4 family."""
+    return (
+        config.gbs
+        * config.enc_seq_len
+        * config.layers
+        * config.hs
+        * config.hs
+        * (
+            12
+            + (12 * config.query_groups / config.attention_heads)
+            + (18 * config.moe_router_topk * config.ffn_hs / config.hs)
             + (6 * config.enc_seq_len / config.hs)
             + (6 * config.vocab_size / (config.layers * config.hs))
         )
@@ -117,7 +135,7 @@ def mixtral(config: FLOPSConfig):
             12
             + (12 * config.query_groups / config.attention_heads)
             + (18 * config.moe_router_topk * config.ffn_hs / config.hs)
-            + (12 * config.enc_seq_len / config.hs)
+            + (6 * config.enc_seq_len / config.hs)
             + (6 * config.vocab_size / (config.layers * config.hs))
         )
     )
