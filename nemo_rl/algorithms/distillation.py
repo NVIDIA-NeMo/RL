@@ -824,8 +824,8 @@ def distillation_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            timing_metrics["valid_tokens_per_sec"] = (
-                metrics["global_valid_toks"] / total_time
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
