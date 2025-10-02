@@ -51,7 +51,7 @@ Core mathematical foundations and theoretical concepts for all NeMo RL algorithm
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Loss Functions
-:link: algorithm-development/loss-functions
+:link: ../core-design/design-principles/loss-functions
 :link-type: doc
 
 Comprehensive guide to loss function design, implementation, and optimization.
@@ -98,7 +98,7 @@ Systematic approaches to finding optimal training configurations using advanced 
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Advanced Training Strategies
-:link: algorithm-development/loss-functions
+:link: ../core-design/design-principles/loss-functions
 :link-type: doc
 
 Advanced training strategies and optimization techniques for complex scenarios.

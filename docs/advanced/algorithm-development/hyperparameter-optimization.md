@@ -614,7 +614,7 @@ def log_optimization_metrics(logger, config, metrics):
 
 ## Next Steps
 
-- Learn about [Loss Functions](loss-functions) for advanced loss customization
+- Learn about [Loss Functions](../../core-design/design-principles/loss-functions) for advanced loss customization
 - Review [Mathematical Foundations](mathematical-foundations) for theoretical understanding
 - Explore [Performance & Scaling](../performance/index) for training optimization
 - Study [Troubleshooting](../../guides/troubleshooting) for common issues 

@@ -44,7 +44,7 @@ Core mathematical foundations and theoretical concepts for all NeMo RL algorithm
 :::
 
 :::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Loss Functions
-:link: loss-functions
+:link: ../../core-design/design-principles/loss-functions
 :link-type: doc
 
 Comprehensive guide to loss function design, implementation, and optimization.
@@ -125,7 +125,6 @@ For additional learning resources, visit the main [Advanced](../index) page.
 :caption: Algorithm Development
 :maxdepth: 2
 mathematical-foundations
-loss-functions
 custom-dpo
 hyperparameter-optimization
 :::::
