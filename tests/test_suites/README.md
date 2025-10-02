@@ -2,20 +2,43 @@
 
 ## Naming
 
-Each test is named:
+Base pattern (LLM):
+
 ```
-<algo>-<model>-#n#g-<parallelism>-<opt:long><opt:v$N>.sh
+<algo>-<model>-<nodes>n<gpus>g-<strategy-and-params>[-modifiers][-long][.vN].sh
 ```
 
+VLM pattern:
+
+```
+vlm_<algo>-<model>-<nodes>n<gpus>g-<strategy>[-modifiers][.vN].sh
+```
+
+- **algo**: task or algorithm, e.g., `sft`, `dpo`, `grpo`.
+- **model**: model identifier, e.g., `llama3.1-8b-instruct`, `qwen2.5-7b-instruct`.
+- **nodes/gpus**: cluster allocation, e.g., `1n8g`, `4n8g`, `8n8g`.
+- **strategy-and-params**: parallelism or framework detail, e.g., `fsdp2tp1`, `tp4pp2`, `megatron`, `dtensor2tp1`.
+- **modifiers** (optional): short flags like `sp` (sequence packing), `actckpt` (activation checkpointing), `fp8`, `noncolocated`, `quick`.
+- **-long** (optional): indicates long-running recipe.
+- **.vN** (optional): version suffix (e.g., `.v2`, `.v3`) reserved for convergence-impacting changes. Use when the recipe's convergence behavior changes (dataset, loss, convergence bug fix). Pure performance changes do not require a version bump.
+
 Examples:
-* sft-llama3.2-1b-1n8g-fsdp2tp1.sh
-* grpo-qwen2-1.5B-instruct-4n8g-fsdp2tp2.sh
-* grpo-qwen2-1.5B-instruct-4n8g-fsdp2tp2-long.sh
-* grpo-qwen2-1.5B-instruct-4n8g-fsdp2tp2-long.v2.sh
-    * The final verison suffix (starts with `.v2`, `.v3`, ...), is reserved for cases contributors believe the recipe's 
-      convergence has changed due to their commit. Versioning signals that this recipe should not be compared to its
-      predecessor due to a change in convergence behavior. Examples of this change include: changing dataset, changing loss,
-      convergence bug fix. Changes affecting performance do not need a version change. 
+
+```
+sft-llama3.1-8b-1n8g-fsdp2tp1-long.sh
+dpo-llama3.1-8b-instruct-4n8g-fsdp2tp4.sh
+grpo-llama3.1-8b-instruct-1n8g-megatron-fp8.sh
+grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.sh
+```
+
+Known exceptions currently present:
+- Deepscaler recipes encode context length in place of the cluster tuple, e.g., `grpo-deepscaler-1.5b-8K.sh`. These are allowed but should document the intended hardware in the script body.
+- Some recipes include additional short flags in the strategy token (e.g., `fsdp2tp8sp`). Treat these as modifiers appended to the strategy.
+
+Directory placement and naming parity:
+- Place driver scripts under `tests/test_suites/llm/` or `tests/test_suites/vlm/`.
+- The script filename should mirror the YAML recipe filename under `examples/configs/recipes/**` but with a `.sh` suffix.
+- Add the relative script path to `tests/test_suites/nightly.txt` for nightly execution.
 
 ## Running manually
 

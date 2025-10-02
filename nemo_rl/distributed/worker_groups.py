@@ -27,7 +27,10 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import (
+    create_local_venv_on_each_node,
+    patch_transformers_module_dir,
+)
 
 
 @dataclass
@@ -457,6 +460,17 @@ class RayWorkerGroup:
         # Get all placement groups
         placement_groups = self.cluster.get_placement_groups()
 
+        # Get available address and port for each worker
+        available_addresses = []
+        available_ports = []
+        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
+            for local_rank, bundle_idx in enumerate(local_bundle_indices):
+                addr, port = self.cluster.get_available_address_and_port(
+                    pg_idx, bundle_idx
+                )
+                available_addresses.append(addr)
+                available_ports.append(port)
+
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
 
@@ -478,9 +492,17 @@ class RayWorkerGroup:
                         "MASTER_ADDR": self.master_address,
                         "MASTER_PORT": str(self.master_port),
                         "NODE_RANK": str(pg_idx),
+                        "AVAILABLE_ADDR_LIST": str(available_addresses),
+                        "AVAILABLE_PORT_LIST": str(available_ports),
                     }
                 )
+                # Remove Ray-specific environment variables, let the worker itself set them.
                 worker_env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+                worker_env_vars.pop("RAY_CLIENT_MODE", None)
+                worker_env_vars.pop("RAY_JOB_ID", None)
+                worker_env_vars.pop("RAY_LD_PRELOAD", None)
+                worker_env_vars.pop("RAY_RAYLET_PID", None)
+                worker_env_vars.pop("RAY_USAGE_STATS_ENABLED", None)
 
                 # Only the first worker in each group gets bundle_indices
                 # This ensures only one worker per group is the model owner
@@ -510,6 +532,7 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                patch_transformers_module_dir(runtime_env["env_vars"])
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 

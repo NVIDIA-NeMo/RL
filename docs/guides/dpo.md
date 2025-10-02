@@ -91,30 +91,37 @@ DPO training supports only two completions (where the lowest rank is preferred a
 }
 ```
 
-NeMo RL provides a DPO-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
   dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  # multiple validation sets is supported
   val_data_paths:
-    <NameOfValidationDataset>: <LocalPathToValidationDataset>
+    <NameOfValidationDataset>: <PathToValidationDataset1>
+    <NameOfValidationDataset2>: <PathToValidationDataset2>
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
-with support for multiple validation sets achieved with:
+
+We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_paths:
-    <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
-    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+  dataset_name: BinaryPreferenceDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  val_data_path: <PathToValidationDataset>
+  prompt_key: <PromptKey>, default is "prompt"
+  chosen_key: <ChosenKey>, default is "chosen"
+  rejected_key: <RejectedKey>, default is "rejected"
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
+
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
-
-The older [DPODataset](../../nemo_rl/data/hf_datasets/dpo.py) class is deprecated. This class is also compatible with JSONL-formatted preference datsets. It assumes train and validation datasets have been split and processed into the expected format offline. The JSONL files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 
 ## DPO-Specific Parameters
 

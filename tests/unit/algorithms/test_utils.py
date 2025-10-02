@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from datetime import datetime
 
 import pytest
 import torch
 
-from nemo_rl.algorithms.utils import get_tokenizer, maybe_pad_last_batch
-from nemo_rl.data.hf_datasets.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.algorithms.utils import (
+    get_tokenizer,
+    maybe_pad_last_batch,
+    print_performance_metrics,
+)
+from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -212,3 +217,179 @@ def test_maybe_pad_last_batch():
     assert result["sample_mask"].shape[0] == expected_size
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
+
+
+# Performance Metrics Tests
+
+
+def _base_master_config(colocated: bool):
+    return {
+        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+        "policy": {
+            "generation": {
+                "colocated": {
+                    "enabled": colocated,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                }
+            }
+        },
+        "grpo": {"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+    }
+
+
+def test_sync_colocated_throughput_flops_and_imbalance(capsys):
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "generation": 5.0,
+        "weight_sync": 1.0,
+    }
+
+    # total_num_gpus = 2 * 8 = 16
+    # samples_per_step = 8 * 10 = 80
+    metrics = {
+        "total_num_tokens": 8000.0,
+        "per_worker_token_counts": {0: 1000, 1: 2000, 2: 3000, 3: 4000},
+    }
+
+    # total_tflops = total_flops / policy_training / 1e12 = 1e15 / 4 / 1e12 = 250
+    # per-rank TFLOPS message shows 31.25 TFLOPS per rank for 8 ranks
+    train_results = {
+        "total_flops": 1.0e15,
+        "num_ranks": 8,
+        "theoretical_tflops": 500.0,
+    }
+
+    perf = print_performance_metrics(
+        train_results, metrics, timing_metrics, master_config
+    )
+
+    # Validate key throughput metrics
+    assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
+    assert math.isclose(perf["tokens_per_sec_per_gpu"], 50.0, rel_tol=1e-6)
+    assert math.isclose(
+        perf["policy_training_tokens_per_sec_per_gpu"], 125.0, rel_tol=1e-6
+    )
+    assert math.isclose(
+        perf["policy_and_reference_logprobs_tokens_per_sec_per_gpu"],
+        250.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        perf["training_worker_group_tokens_per_sec_per_gpu"],
+        8000.0 / 6.0 / 16.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        perf["generation_tokens_per_sec_per_gpu"], 8000.0 / 5.0 / 16.0, rel_tol=1e-6
+    )
+
+    # Group totals
+    assert math.isclose(perf["samples_per_sec"], 8.0, rel_tol=1e-6)
+    assert math.isclose(perf["tokens_per_sec"], 800.0, rel_tol=1e-6)
+    assert math.isclose(
+        perf["training_worker_group_tokens_per_sec"], 8000.0 / 6.0, rel_tol=1e-6
+    )
+
+    # Imbalance metric from ratios [0.25, 0.5, 0.75, 1.0]
+    assert math.isclose(perf["average_token_imbalance"], 0.375, rel_tol=1e-6)
+
+    # Verify selected console output snippets
+    out = capsys.readouterr().out
+    assert "Performance Metrics" in out
+    assert "Throughputs (per GPU)" in out
+    assert "Average Token Imbalance" in out
+    assert "Training FLOPS" in out
+    assert "Floating Point Utilization" in out
+
+
+def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
+    master_config = _base_master_config(colocated=False)
+    master_config["async_grpo"] = {"enabled": True}
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 2.0,
+        "prepare_for_generation/total": 1.0,
+    }
+
+    # total_num_gpus = 16, training_num_gpus = 8, generation_num_gpus = 8
+    metrics = {
+        "total_num_tokens": 6050.0,
+        "per_worker_token_counts": [{0: 3000}, {1: 3050}],
+    }
+
+    train_results = {}
+
+    perf = print_performance_metrics(
+        train_results, metrics, timing_metrics, master_config
+    )
+
+    # Throughput checks
+    assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
+    assert math.isclose(
+        perf["tokens_per_sec_per_gpu"], 6050.0 / 10.0 / 16.0, rel_tol=1e-6
+    )
+    assert math.isclose(
+        perf["policy_training_tokens_per_sec_per_gpu"],
+        6050.0 / 4.0 / 8.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        perf["policy_and_reference_logprobs_tokens_per_sec_per_gpu"],
+        6050.0 / 2.0 / 8.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        perf["training_worker_group_tokens_per_sec_per_gpu"],
+        6050.0 / (4.0 + 2.0) / 8.0,
+        rel_tol=1e-6,
+    )
+    # generation_time = 2 + 2 + 4 = 8.0, per-gpu = 6050 / 8.0 / 8.0
+    assert math.isclose(
+        perf["generation_tokens_per_sec_per_gpu"], 6050.0 / 8.0 / 8.0, rel_tol=1e-6
+    )
+
+    # Aggregated worker counts: {0: 3000, 1: 3050} -> imbalance = 0.05
+    imbalance = ((3050 - 3000) / 3050) / 2
+    assert math.isclose(perf["average_token_imbalance"], imbalance, rel_tol=1e-6)
+
+
+def test_minimal_inputs_no_counts_no_flops(capsys):
+    master_config = _base_master_config(colocated=False)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "exposed_generation": 0.2,
+        "prepare_for_generation/total": 0.5,
+    }
+
+    metrics = {
+        "total_num_tokens": 1600.0,
+        # no per_worker_token_counts present
+    }
+
+    train_results = {}
+
+    perf = print_performance_metrics(
+        train_results, metrics, timing_metrics, master_config
+    )
+
+    # Core metrics exist
+    for k in [
+        "samples_per_sec",
+        "tokens_per_sec",
+        "samples_per_sec_per_gpu",
+        "tokens_per_sec_per_gpu",
+    ]:
+        assert k in perf
+
+    out = capsys.readouterr().out
+    assert "Throughputs (per GPU)" in out

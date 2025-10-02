@@ -18,26 +18,51 @@ import tempfile
 from collections import defaultdict
 
 import pytest
+import torch
 from datasets import Dataset
 
 abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
 
-from examples.run_grpo_math import hf_data_processor
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.eval_datasets import (
-    AIME2024Dataset,
-    AIME2025Dataset,
+from nemo_rl.data.datasets.eval_datasets import (
+    AIMEDataset,
     GPQADataset,
     MathDataset,
     MMLUDataset,
 )
-from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
-from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
+from nemo_rl.data.datasets.response_datasets import (
+    DeepScalerDataset,
+    OpenMathInstruct2Dataset,
+)
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
-from nemo_rl.data.processors import math_data_processor
+from nemo_rl.data.processors import math_data_processor, math_hf_data_processor
 from nemo_rl.models.policy import TokenizerConfig
+
+
+class DummyTokenizer:
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    ):
+        content = "".join(
+            f"{m.get('role', 'user')}: {m['content']}\n" for m in messages
+        )
+        if add_generation_prompt:
+            content += "assistant:"
+        return content
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=False):
+        if isinstance(text, list):
+            text = "".join(text)
+        encoded = list(range(len(text)))
+        if return_tensors == "pt":
+            return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
+        return {"input_ids": encoded}
 
 
 def test_math_data_processor():
@@ -112,9 +137,9 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     )
 
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (math_task_spec, hf_data_processor))
+        defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, hf_data_processor)
+    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         dataset=data.formatted_ds["train"],
@@ -129,6 +154,37 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     assert first_item is not None
     assert "message_log" in first_item
     assert len(first_item["message_log"]) > 0
+
+
+def test_math_hf_data_processor_without_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 1+1."},
+            {"role": "assistant", "content": "2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    math_task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=None,
+        system_prompt_file=None,
+    )
+
+    result = math_hf_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=math_task_spec,
+        tokenizer=tokenizer,
+        max_seq_length=128,
+        idx=0,
+    )
+
+    assert result["extra_env_info"]["ground_truth"] == "2"
+    assert result["loss_multiplier"] == 1.0
+    assert len(result["message_log"]) == 1
+    assert result["message_log"][0]["role"] == "user"
+    assert "Solve 1+1." in result["message_log"][0]["content"]
 
 
 @pytest.fixture
@@ -154,11 +210,10 @@ def system_prompt_file(request):
 @pytest.mark.parametrize(
     "dataset_cls",
     [
-        MMLUDataset,
+        AIMEDataset,
         GPQADataset,
         MathDataset,
-        AIME2024Dataset,
-        AIME2025Dataset,
+        MMLUDataset,
     ],
 )
 @pytest.mark.parametrize(

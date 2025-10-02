@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-LM"]
 	path = 3rdparty/Megatron-LM-workspace/Megatron-LM
 	url = https://github.com/terrykong/Megatron-LM.git
-	branch = yuya/nemo-rl-use-2
+	branch = guyueh/yuya/nemo-rl-use-2
 	shallow = true
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge

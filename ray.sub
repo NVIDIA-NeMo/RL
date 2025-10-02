@@ -62,7 +62,6 @@ METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 PORT=${PORT:-54514}
 RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
-DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
 
@@ -269,7 +268,6 @@ ray start --head \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
-    --dashboard-grpc-port=${DASHBOARD_GRPC_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
@@ -443,10 +441,15 @@ else
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
+# Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   # Empty means we are on the head node
-  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+  fi
 else
   # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
   # and use nodes_array[1] through nodes_array[N-1]
@@ -455,10 +458,15 @@ else
     exit 1
   fi
   nodes_array=($nodes)
-  srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+  fi
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
+  echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."

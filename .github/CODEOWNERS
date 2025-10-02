@@ -1,0 +1,61 @@
+# Order is important: later matches have higher precedence
+
+# List of reviewer teams
+# @nvidia-nemo/rl_reviewers_algo
+# @nvidia-nemo/rl_reviewers_supervised
+# @nvidia-nemo/rl_reviewers_async
+# @nvidia-nemo/rl_reviewers_automodel
+# @nvidia-nemo/rl_reviewers_ci
+# @nvidia-nemo/rl_reviewers_doc
+# @nvidia-nemo/rl_reviewers_environments
+# @nvidia-nemo/rl_reviewers_eval
+# @nvidia-nemo/rl_reviewers_generation
+# @nvidia-nemo/rl_reviewers_infra
+# @nvidia-nemo/rl_reviewers_mcore
+# @nvidia-nemo/rl_reviewers_multimodal
+# @nvidia-nemo/rl_reviewers_models
+# @nvidia-nemo/rl_reviewers_perf
+
+# Catch-all if not defined
+* @nvidia-nemo/rl_maintainers
+
+# CI/Test
+/.github/ @nvidia-nemo/rl_reviewers_ci
+/tests/ @nvidia-nemo/rl_reviewers_ci
+
+# Examples and configs (TODO: Add all algo subteams eventually)
+/examples/ @nvidia-nemo/rl_reviewers_algo
+/examples/**/*vlm* @nvidia-nemo/rl_reviewers_multimodal
+/examples/**/*sft* @nvidia-nemo/rl_reviewers_supervised
+/examples/**/*dpo* @nvidia-nemo/rl_reviewers_supervised
+/examples/**/*rm* @nvidia-nemo/rl_reviewers_supervised
+
+# Core (TODO: Add all algo subteams eventually)
+/nemo_rl/algorithms/ @nvidia-nemo/rl_reviewers_algo
+/nemo_rl/algorithms/sft.py @nvidia-nemo/rl_reviewers_supervised
+/nemo_rl/algorithms/dpo.py @nvidia-nemo/rl_reviewers_supervised
+/nemo_rl/algorithms/rm.py @nvidia-nemo/rl_reviewers_supervised
+/nemo_rl/environments/ @nvidia-nemo/rl_reviewers_environments @nvidia-nemo/rl_reviewers_algo
+/nemo_rl/data/ @nvidia-nemo/rl_reviewers_algo
+/nemo_rl/experience/ @nvidia-nemo/rl_reviewers_environments @nvidia-nemo/rl_reviewers_algo
+/nemo_rl/evals/ @nvidia-nemo/rl_reviewers_eval
+/nemo_rl/distributed/ @nvidia-nemo/rl_reviewers_infra
+/nemo_rl/models/ @nvidia-nemo/rl_reviewers_automodel @nvidia-nemo/rl_reviewers_mcore
+/nemo_rl/models/dtensor/ @nvidia-nemo/rl_reviewers_automodel
+/nemo_rl/models/generation/ @nvidia-nemo/rl_reviewers_generation
+/nemo_rl/models/generation/fp8.py @nvidia-nemo/rl_reviewers_perf
+/nemo_rl/models/megatron/ @nvidia-nemo/rl_reviewers_mcore
+/nemo_rl/models/policy/dtensor* @nvidia-nemo/rl_reviewers_automodel
+/nemo_rl/models/policy/megatron* @nvidia-nemo/rl_reviewers_mcore
+/nemo_rl/utils/flop* @nvidia-nemo/rl_reviewers_perf
+
+# Infra, tooling, and docs
+/docker/ @nvidia-nemo/rl_reviewers_infra
+/docs/ @nvidia-nemo/rl_reviewers_doc
+/3rdparty/Automodel-workspace/ @nvidia-nemo/rl_reviewers_automodel
+/3rdparty/Megatron-LM-workspace/ @nvidia-nemo/rl_reviewers_mcore
+/3rdparty/Megatron-Bridge-workspace/ @nvidia-nemo/rl_reviewers_mcore
+/ray.sub @nvidia-nemo/rl_reviewers_infra
+
+# Codeowners
+/.github/CODEOWNERS @nvidia-nemo/rl_maintainers

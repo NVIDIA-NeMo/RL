@@ -1,0 +1,25 @@
+defaults: ../../vlm_grpo_3B.yaml
+checkpointing:
+  checkpoint_dir: results/clevr_grpo
+policy:
+  max_total_sequence_length: 3072
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_iters: 50
+      lr_warmup_init: 5.0e-08
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+logger:
+  wandb:
+    name: vlm-grpo-3b-megatron
