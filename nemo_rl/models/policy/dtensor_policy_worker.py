@@ -177,9 +177,6 @@ class DTensorPolicyWorker:
         # with different order of node_bundles
         configure_dynamo_cache()
 
-        # vars used for refit
-        ## will be initialized in prepare_refit_info
-        self.refit_param_info = None
         ## used for streaming update inference engine weights
         self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
             None
@@ -1711,56 +1708,46 @@ class DTensorPolicyWorker:
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        state_dict = self.model.state_dict()
+        state_dict_info = {}
+        for name, tensor in self.model.state_dict().items():
+            state_dict_info[name] = (tensor.shape, self.dtype)
 
-        if self.is_generation_colocated:
-            # Collect info for streaming multiple tensors
-            self.refit_param_info = []
-            for name, tensor in state_dict.items():
-                # dtensor's numel will return complete tensor instead of only local tensor
-                size_in_bytes = tensor.element_size() * tensor.numel()
-                self.refit_param_info.append((name, size_in_bytes))
-
-        else:
-            # Collect info for collective communication
-            state_dict_info = {}
-            for name, tensor in state_dict.items():
-                state_dict_info[name] = (tensor.shape, self.dtype)
-
-            return state_dict_info
+        return state_dict_info
     
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
         from nemo_rl.utils.nvml import get_free_memory_bytes
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
-
+    
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/get_weights_ipc_handles")
-    def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
-        assert self._held_sharded_state_dict_reference is not None, (
-            "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
+    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+        from nemo_rl.models.dtensor.utils import to_local_if_dtensor
+        
+        def dtensor_params_generator():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            for name, tensor in self.model.state_dict().items():
+                if isinstance(tensor, DTensor):
+                    # Convert DTensor to full tensor for streaming
+                    full_tensor = tensor.full_tensor()
+                    # Convert to target dtype
+                    yield name, full_tensor.to(self.dtype, non_blocking=True)
+                else:
+                    # Convert to target dtype
+                    yield name, tensor.to(self.dtype, non_blocking=True)
+        
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=dtensor_params_generator(),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self)
         )
-
-        # Clean up the held tensors to reduce peak memory
-        if self._held_streamed_param_reference is not None:
-            del self._held_streamed_param_reference
-            self._held_streamed_param_reference = None
-
-        converted_params = {}
-        for key in keys:
-            # Get full_tensor for dtensor (GPU > 1)
-            tensor = self._held_sharded_state_dict_reference[key]
-            if isinstance(tensor, DTensor):
-                full_tensor = tensor.full_tensor()
-            else:
-                full_tensor = tensor
-            # Convert parameters to the configured dtype
-            converted_params[key] = full_tensor.to(self.dtype, non_blocking=True)
-
-        # Temporary record the full tensor for cleanup
-        # It is needed for cleanup the last full_tensor in the refit process
-        self._held_streamed_param_reference = converted_params
 
         # Get device UUID for IPC
         device_uuid = self.report_device_id()
@@ -1855,17 +1842,6 @@ class DTensorPolicyWorker:
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
-
-        # Clean up the held tensors
-        if self._held_sharded_state_dict_reference is not None:
-            del self._held_sharded_state_dict_reference
-            self._held_sharded_state_dict_reference = None
-        if self._held_streamed_param_reference is not None:
-            del self._held_streamed_param_reference
-            self._held_streamed_param_reference = None
-
-        gc.collect()
-        torch.cuda.empty_cache()
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB

@@ -250,3 +250,102 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
 
     # skip serializing the function for better refit performance
     return reduce_tensor(tensor.detach())[1:]
+
+
+def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
+    """Calculate aligned size for memory alignment.
+    
+    Args:
+        size_bytes: Size in bytes to align
+        alignment: Alignment boundary in bytes (default 512)
+        
+    Returns:
+        Aligned size in bytes
+    """
+    return ((size_bytes + alignment - 1) // alignment) * alignment
+
+
+def stream_weights_via_ipc_zmq_impl(
+    params_generator, 
+    buffer_size_bytes: int, 
+    zmq_socket, 
+    rank: int,
+    worker_name: str
+) -> None:
+    """Shared implementation for streaming weights via IPC ZMQ.
+    
+    Args:
+        params_generator: Generator yielding (name, tensor) pairs
+        buffer_size_bytes: Size of buffer in bytes for batching parameters
+        zmq_socket: ZMQ socket for communication
+        rank: Worker rank for logging
+        worker_name: Name of the worker for logging
+    """
+    def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> None:
+        """Send a group of parameters and return new pending_recv state."""
+        # overlap with the next group
+        if await_recv:
+            zmq_socket.recv()
+            await_recv = False
+        
+        torch.cuda.synchronize()
+        cuda_ipc_handle = get_handle_from_tensor(buffer)
+        serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
+        zmq_socket.send_pyobj(serialized)
+        return True  # pending_recv = True
+    
+    def allocate_buffer(device):
+        """Allocate a new aligned buffer."""
+        return torch.empty(
+            calculate_aligned_size(buffer_size_bytes),
+            device=device,
+            dtype=torch.uint8,
+            requires_grad=False,
+        )
+    
+    def pack_tensor(buffer, tensor, used_bytes) -> int:
+        """Pack tensor into buffer and return new used_bytes."""
+        buffer[used_bytes:used_bytes + tensor.nbytes].data.copy_(
+            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+        )
+        return used_bytes + calculate_aligned_size(tensor.nbytes)
+
+    used_bytes = 0
+    param_names = []
+    buffer = None
+    await_recv = False
+    count_of_groups = 0
+
+    for name, tensor in params_generator:
+        aligned_size = calculate_aligned_size(tensor.nbytes)
+        assert aligned_size <= buffer_size_bytes, "Parameter too large for buffer"
+        
+        # Check if we need to send current buffer (preserves overlap logic)
+        if used_bytes + aligned_size > buffer_size_bytes:
+            await_recv = send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv)
+            used_bytes = 0
+            param_names = []
+            buffer = None
+            count_of_groups += 1
+        
+        # Allocate buffer if needed
+        if buffer is None:
+            buffer = allocate_buffer(tensor.device)
+        
+        # Pack tensor
+        param_names.append(name)
+        used_bytes = pack_tensor(buffer, tensor, used_bytes)
+        
+    # Send remaining tensors
+    if param_names:
+        await_recv = send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv)
+        count_of_groups += 1
+
+    # Complete transmission
+    if await_recv:
+        zmq_socket.recv()
+    zmq_socket.send_pyobj("complete")
+    zmq_socket.recv()
+    
+    if rank == 0:
+        print(f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True)

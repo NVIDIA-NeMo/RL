@@ -52,6 +52,17 @@ class VllmInternalWorkerExtension:
         from nemo_rl.utils.nvml import get_device_uuid
 
         return get_device_uuid(self.device.index)
+    
+    def get_zmq_address(self):
+        """Get the ZMQ address for the current device."""
+        return f"ipc:///{self.report_device_id()}.sock"
+    
+    def maybe_init_zmq(self):
+        """Initialize the ZMQ socket if it doesn't exist."""
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REP)
+            self.zmq_socket.connect(self.get_zmq_address())
 
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]] = None
@@ -63,113 +74,81 @@ class VllmInternalWorkerExtension:
             non-colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
 
         MegatronPolicyWorker:
-            colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype, numel)}
+            colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
             non-colocated inference: state_dict_info is a dict of {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_global_ipc_handles"
+        "vllm_internal_worker_extension/update_weights_via_ipc_zmq"
     )
-    def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
-        """Update weights from global IPC handles.
+    def update_weights_via_ipc_zmq(self) -> bool:
+        """Update weights from local IPC handles via ZMQ socket.
 
         Args:
-            global_device_ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated.
-        """
-        device_uuid = self.report_device_id()
-        local_device_ipc_handles = global_device_ipc_handles[device_uuid]
-        return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
-
-    @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_local_ipc_handles"
-    )
-    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
-        """Update weights from local IPC handles.
-
-        Args:
-            local_device_ipc_handles (dict): parameter IPC handles for local device.
+            None
 
         Returns:
             bool: True if weights were successfully updated.
         """
         try:
-            is_tensor_packed = local_device_ipc_handles[0]
-            if is_tensor_packed:
-                _, all_handles, list_keys = local_device_ipc_handles
-            else:
-                _, name_and_handle_list = local_device_ipc_handles
-
-            device_id = self.device.index
-            weights = []
-
-            if is_tensor_packed:
-                assert self.state_dict_info is not None, (
-                    "state_dict_info is not prepared. "
-                    "Please call prepare_refit_info when initializing the worker."
-                )
-
-                # Extract packed tensor from IPC handle
-                dtype_to_packed_tensor = {}
-                for dtype, tensor_handle in all_handles:
-                    func = rebuild_cuda_tensor
-                    args = tensor_handle[0]
-                    list_args = list(args)
-                    list_args[6] = device_id
-                    tensor = func(*list_args)
-                    dtype_to_packed_tensor[dtype] = tensor
+            self.maybe_init_zmq()
+            from nemo_rl.models.policy.utils import calculate_aligned_size
+            
+            while True:
+                # Blocking receive (this is the main operation)
+                payload = self.socket.recv_pyobj()
+                torch.cuda.current_stream().synchronize()
+                    
+                if payload == "complete":
+                    # means the update is done
+                    torch.cuda.current_stream().synchronize()
+                    self.socket.send(b"")
+                    break
+                    
+                packed_tensor_handle, list_keys, used_bytes = payload
+                device_id = self.device.index
+                func = rebuild_cuda_tensor
+                args = packed_tensor_handle[0]
+                list_args = list(args)
+                list_args[6] = device_id
+                buffer = func(*list_args)
 
                 weights = []
-                dtype_to_offset = defaultdict(lambda: 0)
+                offset = 0
                 for key in list_keys:
-                    shape, dtype, size = self.state_dict_info[key]
+                    shape, dtype = self.state_dict_info[key]
+                    assert isinstance(shape, torch.Size), "Shape is not a torch.Size"
+                    assert isinstance(dtype, torch.dtype), "Dtype is not a torch.dtype"
+                    size_in_bytes = dtype.itemsize * shape.numel()
                     weights.append(
                         (
                             key,
-                            dtype_to_packed_tensor[dtype][
-                                dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-                            ].view(*shape),
+                            buffer[offset : offset + size_in_bytes].view(dtype=dtype).view(shape),
                         )
                     )
-                    dtype_to_offset[dtype] += size
+                    aligned_size = calculate_aligned_size(size_in_bytes)
+                    offset += aligned_size
+                assert offset == used_bytes, "Offset is not equal to used bytes, usually indicate key info inaccurate like dtype"
+                # Load weights into the model
+                from nemo_rl.models.generation import fp8
 
-                expected_sizes = {
-                    dtype: tensor.numel()
-                    for dtype, tensor in dtype_to_packed_tensor.items()
-                }
-                assert dtype_to_offset == expected_sizes, (
-                    f"Packed tensor size mismatch: expected sizes from keys list {expected_sizes} != actual packed tensor sizes {dtype_to_offset}. "
-                    f"This indicates the keys list order doesn't match the order used when packing tensors."
-                )
-            else:
-                # Process each handle to get the tensor
-                for name, handle in name_and_handle_list:
-                    func = rebuild_cuda_tensor
-                    args = handle[0]
-                    list_args = list(args)
-                    list_args[6] = device_id
-                    tensor = func(*list_args)
-                    weights.append((name, tensor))
-
-            # Load weights into the model
-            from nemo_rl.models.generation import fp8
-
-            if fp8.is_fp8_model(self.model_runner.vllm_config):
-                # the fp8 load_weights additionally casts bf16 weights into fp8
-                fp8.load_weights(weights, self.model_runner)
-            else:
-                self.model_runner.model.load_weights(weights=weights)
-
+                if fp8.is_fp8_model(self.model_runner.vllm_config):
+                    # the fp8 load_weights additionally casts bf16 weights into fp8
+                    fp8.load_weights(weights, self.model_runner)
+                else:
+                    self.model_runner.model.load_weights(weights=weights)
+                
+                self.socket.send(b"")
+            
             return True
+
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
             )
             return False
-
+        
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )

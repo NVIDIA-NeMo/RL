@@ -1566,10 +1566,7 @@ class MegatronPolicyWorker:
             show_progress=False,
         )
         for name, tensor in hf_params_generator:
-            if self.is_generation_colocated:
-                metadata = (tensor.shape, tensor.dtype, tensor.numel())
-            else:
-                metadata = (tensor.shape, tensor.dtype)
+            metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
 
@@ -1629,118 +1626,29 @@ class MegatronPolicyWorker:
         from nemo_rl.utils.nvml import get_free_memory_bytes
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
-    
-    def stream_packed_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream the weights via packed Cuda IPC handle over ZMQ socket."""
-        def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> None:
-            """Send a group of parameters and return new pending_recv state."""
-            # overlap with the next group
-            if await_recv:
-                self.zmq_socket.recv()
-                await_recv = False
-            
-            torch.cuda.synchronize()
-            cuda_ipc_handle = get_handle_from_tensor(buffer)
-            serialized = (True, cuda_ipc_handle, tuple(param_names), used_bytes)
-            self.zmq_socket.send_pyobj(serialized)
-            return True  # pending_recv = True
-        
-        def allocate_buffer(device):
-            """Allocate a new aligned buffer."""
-            return torch.empty(
-                self.calculate_aligned_size(buffer_size_bytes),
-                device=device,
-                dtype=torch.uint8,
-                requires_grad=False,
-            )
-        
-        def pack_tensor(buffer, tensor, used_bytes) -> int:
-            """Pack tensor into buffer and return new used_bytes."""
-            buffer[used_bytes:used_bytes + tensor.nbytes].data.copy_(
-                tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
-            )
-            return used_bytes + self.calculate_aligned_size(tensor.nbytes)
-    
-        used_bytes = 0
-        param_names = []
-        buffer = None
-        await_recv = False
-        count_of_groups = 0
-    
-        for name, tensor in hf_params_generator:
-            aligned_size = self.calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, "Parameter too large for buffer"
-            
-            # Check if we need to send current buffer (preserves overlap logic)
-            if used_bytes + aligned_size > buffer_size_bytes:
-                await_recv = send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv)
-                used_bytes = 0
-                param_names = []
-                buffer = None
-                count_of_groups += 1
-            
-            # Allocate buffer if needed
-            if buffer is None:
-                buffer = allocate_buffer(tensor.device)
-            
-            # Pack tensor
-            param_names.append(name)
-            used_bytes = pack_tensor(buffer, tensor, used_bytes)
-            
-        if param_names:
-            send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv)
-        
-        # Send remaining tensors
-        if param_names:
-            await_recv = send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv)
-            count_of_groups += 1
-
-        # Complete transmission
-        if await_recv:
-            self.zmq_socket.recv()
-        self.zmq_socket.send_pyobj("complete")
-        self.zmq_socket.recv()
-        
-        if self.rank == 0:
-            print(f"[MegatronPolicyWorker] Packed {count_of_groups} groups of tensors", flush=True)
-
-    def stream_unpacked_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream the weights via Cuda IPC handle over ZMQ socket."""
-        
-        # Main logic with overlap preserved
-        self.maybe_init_zmq()
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model], show_progress=False, conversion_tasks=self.refit_conversion_tasks
-        )
-
-        if buffer_size_bytes > 0:
-            self.stream_packed_weights_via_ipc_zmq(buffer_size_bytes)
-        else:
-            await_recv = False
-            for name, tensor in hf_params_generator:
-                # Check if we need to send current buffer (preserves overlap logic)
-                if await_recv:
-                    self.zmq_socket.recv()
-                    await_recv = False
-                
-                torch.cuda.synchronize()
-                cuda_ipc_handle = get_handle_from_tensor(tensor)
-                serialized = (False, cuda_ipc_handle)
-                self.zmq_socket.send_pyobj(serialized)
-                await_recv = True
-        
-        if await_recv:
-            self.zmq_socket.recv()
-        self.zmq_socket.send_pyobj("complete")
-        self.zmq_socket.recv()
                 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        if buffer_size_bytes > 0:
-            self.stream_packed_weights_via_ipc_zmq(buffer_size_bytes)
-        else:
-            self.stream_unpacked_weights_via_ipc_zmq(buffer_size_bytes)
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+        
+        # Generate HF parameters for streaming
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+        )
+        
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=hf_params_generator,
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self)
+        )
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
@@ -1748,6 +1656,7 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
         )
         # broadcast from train rank0 worker to inference workers
         for _, tensor in hf_params_generator:
