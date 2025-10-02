@@ -22,7 +22,7 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     activation_checkpointing: true
-    converter_type: "LlamaForCausalLM"
+    converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
