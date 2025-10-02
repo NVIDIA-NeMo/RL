@@ -65,7 +65,8 @@ class NemotronGeneration(GenerationAlgorithm):
                 max_new_tokens=validated_args['gen_length'],
                 steps=validated_args['steps'],
                 block_length=validated_args['block_length'],
-                threshold=validated_args['threshold']
+                threshold=validated_args['threshold'],
+                shift_logits=validated_args['shift_logits']
             )
             
             return output_ids, nfe
@@ -94,7 +95,7 @@ class NemotronGeneration(GenerationAlgorithm):
             params = list(sig.parameters.keys())
             
             # Nemotron's generate method should have these parameters
-            expected_params = ['max_new_tokens', 'steps', 'block_length', 'threshold']
+            expected_params = ['max_new_tokens', 'steps', 'block_length', 'threshold', 'shift_logits']
             return all(param in params for param in expected_params)
             
         except Exception as e:
@@ -110,7 +111,8 @@ class NemotronGeneration(GenerationAlgorithm):
             'temperature': 1.0,  # Not used by Nemotron but kept for compatibility
             'remasking': True,   # Not used by Nemotron but kept for compatibility
             'threshold': 0.9,    # Nemotron default
-            'factor': 1.0        # Not used by Nemotron but kept for compatibility
+            'factor': 1.0,       # Not used by Nemotron but kept for compatibility
+            'shift_logits': False # Nemotron default
         }
 
 
