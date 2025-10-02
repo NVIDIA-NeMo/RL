@@ -37,6 +37,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.code_environment.CodeEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.reward_model_environment.RewardModelEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vanilla_genrm_environment.VanillaGenRMEnvironment": PY_EXECUTABLES.SYSTEM,
+    "nemo_rl.environments.genrm_rlhf_environment.GenRMRLHFEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
     # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
     "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,

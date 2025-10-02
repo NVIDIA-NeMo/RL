@@ -640,6 +640,23 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
+                # Calculate percentage of prompts with zero advantages (no training signal)
+                # This happens when all responses for a prompt have the same reward
+                num_generations_per_prompt = master_config["grpo"][
+                    "num_generations_per_prompt"
+                ]
+                # Reshape advantages to [num_prompts, num_generations_per_prompt]
+                advantages_per_prompt = advantages.squeeze(-1).view(
+                    -1, num_generations_per_prompt
+                )
+                # Check which prompts have all zero advantages (no variance in rewards)
+                prompts_with_zero_advantages = (advantages_per_prompt.abs() < 1e-8).all(
+                    dim=1
+                )
+                pct_prompts_zero_advantages = (
+                    prompts_with_zero_advantages.float().mean().item() * 100
+                )
+
             with timer.time("data_processing"):
                 # Add loss mask and advantages to each message in LLMMessageLogType
                 for i, message_log in enumerate(repeated_batch["message_log"]):
@@ -852,6 +869,7 @@ def grpo_train(
         metrics.update(rollout_metrics)
         metrics.update(inf_metrics)
         metrics.update({f"{k}_ref": v for k, v in ref_inf_metrics.items()})
+        metrics["pct_prompts_zero_advantages"] = pct_prompts_zero_advantages
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
         # track example with high token mult prob error above 1.05
@@ -876,6 +894,7 @@ def grpo_train(
         print(
             f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
         )
+        print(f"  • % Prompts with Zero Advantages: {pct_prompts_zero_advantages:.2f}%")
         if "total_flops" in train_results:
             total_tflops = (
                 train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
@@ -968,6 +987,12 @@ def validate(
                     greedy=False,
                 )
             else:
+                num_val_generations = master_config["grpo"].get(
+                    "num_val_generations_per_prompt", 1
+                )
+                if num_val_generations > 1:
+                    val_batch = val_batch.repeat_interleave(num_val_generations)
+
                 val_batch, gen_metrics = run_multi_turn_rollout(
                     policy_generation,
                     val_batch,
@@ -1436,6 +1461,23 @@ def async_grpo_train(
                             f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                         )
 
+                    # Calculate percentage of prompts with zero advantages (no training signal)
+                    # This happens when all responses for a prompt have the same reward
+                    num_generations_per_prompt = master_config["grpo"][
+                        "num_generations_per_prompt"
+                    ]
+                    # Reshape advantages to [num_prompts, num_generations_per_prompt]
+                    advantages_per_prompt = advantages.squeeze(-1).view(
+                        -1, num_generations_per_prompt
+                    )
+                    # Check which prompts have all zero advantages (no variance in rewards)
+                    prompts_with_zero_advantages = (
+                        advantages_per_prompt.abs() < 1e-8
+                    ).all(dim=1)
+                    pct_prompts_zero_advantages = (
+                        prompts_with_zero_advantages.float().mean().item() * 100
+                    )
+
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Add loss mask and advantages to each message
@@ -1639,6 +1681,7 @@ def async_grpo_train(
                 else:
                     metrics[k] = np.sum(v).item()
             metrics.update(rollout_metrics)
+            metrics["pct_prompts_zero_advantages"] = pct_prompts_zero_advantages
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -1654,6 +1697,9 @@ def async_grpo_train(
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
+            print(
+                f"  • % Prompts with Zero Advantages: {pct_prompts_zero_advantages:.2f}%"
+            )
 
             print("\n⏱️  Timing:")
             total_time = timing_metrics.get("total_step_time", 0)
