@@ -1,0 +1,88 @@
+defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
+
+grpo:
+  val_period: 1
+  num_prompts_per_step: 1024
+  num_generations_per_prompt: 64
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+  # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
+  dtensor_cfg:
+    enabled: False
+  optimizer: null
+  scheduler: null
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2  # May need to set this to 4
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing
+    moe_permute_fusion: false
+    apply_rope_fusion: True
+    defer_fp32_logits: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: ${policy.megatron_cfg.optimizer.lr}
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+checkpointing:
+  checkpoint_must_save_by: "00:03:45:00"
+  save_period: 10
