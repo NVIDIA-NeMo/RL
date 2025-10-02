@@ -41,8 +41,6 @@ Follow this structured learning path to master NeMo RL:
 2. **Distributed Training and Scaling** → [Scale Training Across Multiple GPUs](tutorials/distributed-training-scaling)
 3. **Advanced Examples** → [GRPO on DeepScaleR](examples/grpo-deepscaler)
 4. **Use Cases** → [Code Generation](use-cases/code-generation) and [Mathematical Reasoning](use-cases/mathematical-reasoning)
-5. **Advanced Performance** → [Performance and Optimization](../advanced/performance/index)
-6. **Performance Optimization** → [Performance and Optimization](../advanced/performance/index)
 
 ## Tutorials
 
@@ -149,10 +147,9 @@ Build models that can solve complex mathematical problems with step-by-step reas
 
 After completing the learning resources:
 
-- **Explore Advanced Features**: Dive into [distributed computing](../advanced/performance/distributed-training) and [performance optimization](../advanced/performance/memory-optimization)
-- **Build Your Workflows**: Create custom experiment pipelines with [algorithm development](../advanced/algorithm-development/index)
-- **Optimize Performance**: Learn best practices for [performance optimization](../advanced/performance/index)
-- **Research and Validation**: Design rigorous experiments with [research methodologies](../advanced/research/index)
+- **Explore Features**: Dive into distributed computing and performance optimization
+- **Build Your Workflows**: Create custom experiment pipelines
+- **Optimize Performance**: Learn best practices for performance optimization
 - **Contribute**: Share your experiences and contribute to the community
 
 For additional learning resources and community support, visit the NeMo RL GitHub repository and documentation.

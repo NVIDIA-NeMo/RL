@@ -288,7 +288,7 @@ max_moves: 30
 
 The figure below displays training rewards vs. steps, along with validation accuracy.
 
-![Training Curve](../assets/train-reward-sliding-puzzle.png)
+![Training Curve](../../assets/train-reward-sliding-puzzle.png)
 
 
-![Validation Accuracy](../assets/valid_acc-sliding-puzzle.png)
+![Validation Accuracy](../../assets/valid_acc-sliding-puzzle.png)

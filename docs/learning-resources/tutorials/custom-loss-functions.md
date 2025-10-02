@@ -29,10 +29,10 @@ This tutorial teaches you how to implement custom loss functions for NeMo RL, ex
 
 ## Tutorial Overview
 
-### **Step 1: Understanding the Loss Function Interface**
+### **Step 1: Understand the Loss Function Interface**
 Learn NeMo RL's loss function architecture and extension points.
 
-### **Step 2: Implementing Custom DPO Losses**
+### **Step 2: Implement Custom DPO Losses**
 Create advanced DPO variants with specialized behavior.
 
 ### **Step 3: Advanced Custom Loss Patterns**
@@ -41,10 +41,10 @@ Build sophisticated loss functions with monitoring and adaptation.
 ### **Step 4: Configuration and Usage**
 Configure and use your custom loss functions in training.
 
-### **Step 5: Testing and Validation**
+### **Step 5: Test and Validate**
 Ensure your custom loss functions work correctly.
 
-## Step 1: Understanding the Loss Function Interface
+## Step 1: Understand the Loss Function Interface
 
 ### **NeMo RL Loss Function Architecture**
 
@@ -92,7 +92,7 @@ class LossFunction(Protocol):
 ### **Key Components**
 
 1. **Token-Level Processing**: Handle sequences at the token level
-2. **Distributed Support**: Work with distributed training across multiple processes
+2. **Distributed Support**: Work with distributed training across many processes
 3. **Loss Computation**: Implement the core loss logic
 4. **Metrics Return**: Provide detailed metrics for monitoring
 
@@ -116,7 +116,7 @@ loss_config = DPOLossConfig(
 loss_fn = DPOLossFn(loss_config)
 ```
 
-## Step 2: Implementing Custom DPO Losses
+## Step 2: Implement Custom DPO Losses
 
 ### **Advanced DPO Loss with Temperature Scheduling**
 
@@ -527,4 +527,5 @@ Remember to:
 - Handle errors gracefully
 - Document your custom loss functions thoroughly
 
-This tutorial provides a foundation for extending NeMo RL with custom loss functions while maintaining compatibility with the existing framework architecture. 
+This tutorial provides a foundation for extending NeMo RL with custom loss functions while maintaining compatibility with the existing framework architecture.
+ 

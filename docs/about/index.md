@@ -15,9 +15,9 @@ NeMo RL is an open-source, comprehensive framework for reinforcement learning an
 
 ## What is NeMo RL
 
-NeMo RL is a training-focused framework that combines the power of reinforcement learning with large language models. It provides a unified platform for training and fine-tuning language models using state-of-the-art RL algorithms.
+NeMo RL is an open-source framework that combines the power of reinforcement learning with large language models. It provides a unified platform for training and fine-tuning language models using state-of-the-art RL algorithms.
 
-The framework is designed to handle the complexities of distributed training across multiple GPUs and nodes, making it suitable for both research and production training environments. NeMo RL supports multiple training backends, including Hugging Face Transformers and Megatron-LM, providing flexibility for different model architectures and training requirements. NeMo RL is focused on training and evaluation - it does not include production deployment or serving infrastructure.
+The framework is designed for distributed training across multiple GPUs and nodes, supporting both research and production training environments. NeMo RL supports multiple backends including Hugging Face Transformers and Megatron-LM, and is focused exclusively on training and evaluation—it does not include production deployment or serving infrastructure.
 
 ::::{grid} 1 1 1 2
 :gutter: 2 2 2 2
@@ -42,7 +42,7 @@ Complete setup instructions for all environments and platforms.
 {bdg-success}`Essential`
 :::
 
-:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Core Architecture
+:::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Architecture Overview
 :link: architecture-overview
 :link-type: doc
 
@@ -64,16 +64,6 @@ Explore NeMo RL's key capabilities and technical highlights.
 
 ::::
 
-## Key Technical Capabilities
-
-NeMo RL provides comprehensive support for modern RL workflows with large language models:
-
-- **Model Scale**: Support for models ranging from 0.6B to 70B+ parameters
-- **Advanced Parallelism**: FSDP2, Tensor Parallelism, Pipeline Parallelism, and Context Parallelism
-- **State-of-the-Art Algorithms**: GRPO, DPO, and SFT with mathematical foundations and optimized implementations
-- **Framework Integration**: Seamless integration with Hugging Face Transformers, Megatron-LM, and vLLM
-- **Memory Optimization**: Gradient checkpointing, mixed precision, and efficient batching strategies
-
 ## Target Users
 
 - **Researchers**: Explore state-of-the-art RL algorithms (GRPO, DPO, SFT) with large language models
@@ -81,42 +71,27 @@ NeMo RL provides comprehensive support for modern RL workflows with large langua
 - **DevOps Engineers**: Manage multi-node training clusters and distributed training infrastructure
 - **Data Scientists**: Fine-tune language models for specific domains and applications
 
-## Why Use NeMo RL?
+## Why Choose NeMo RL?
 
-NeMo RL offers several key advantages for reinforcement learning with language models:
+NeMo RL is purpose-built for reinforcement learning with large language models, offering:
 
-- **Scalability**: Built on Ray for distributed computing, enabling training across multiple nodes and GPUs
-- **Flexibility**: Support for multiple model backends and RL algorithms
-- **Training Focused**: Comprehensive tooling for distributed training and evaluation
-- **Research Friendly**: Easy experimentation with different algorithms and environments
-- **Performance**: Optimized for high-throughput training with advanced parallelization strategies
-- **Reproducibility**: Comprehensive logging and experiment tracking for reliable research
-- **Extensibility**: Easy implementation of custom algorithms and environments
-- **Benchmarking**: Built-in evaluation frameworks and standardized metrics
-- **Collaboration**: Standardized workflows for multi-institution research projects
-- **Performance Highlights**: GRPO provides stable training across diverse model sizes and architectures with advanced optimization techniques.
+### Scale and Performance
+- **Model Support**: 0.6B to 70B+ parameter models
+- **Advanced Parallelism**: FSDP2, Tensor Parallelism, Pipeline Parallelism, Context Parallelism
+- **Distributed Computing**: Ray-based orchestration across multiple nodes and GPUs
+- **Memory Optimization**: Gradient checkpointing, mixed precision, efficient batching
 
-## NeMo RL Framework
+### Algorithms and Flexibility
+- **State-of-the-Art Algorithms**: GRPO, DPO, SFT with optimized implementations
+- **Multiple Backends**: Hugging Face Transformers, Megatron-LM, vLLM integration
+- **Extensible Design**: Easy implementation of custom algorithms and environments
+- **Algorithm Development**: Clean interfaces for research and experimentation
 
-NeMo RL is a standalone framework designed specifically for reinforcement learning and post-training alignment of large language models. It provides comprehensive capabilities for distributed training, algorithm implementation, and model evaluation.
-
-### Framework Design
-
-NeMo RL is built as a complete, self-contained framework that provides all necessary components for RL training:
-
-- **Distributed Training**: Ray-based orchestration for scalable training
-- **Algorithm Implementation**: State-of-the-art RL algorithms (DPO, GRPO, SFT)
-- **Model Support**: Integration with Hugging Face Transformers and Megatron-LM
-- **Evaluation Tools**: Comprehensive evaluation and benchmarking capabilities
-
-### Key Capabilities
-
-NeMo RL provides a complete toolkit for RL training:
-
-- **Model Training**: Distributed training across multiple GPUs and nodes
-- **Algorithm Development**: Easy implementation of custom RL algorithms
-- **Evaluation**: Comprehensive evaluation frameworks and standardized metrics
-- **Reproducibility**: Robust logging and experiment tracking
+### Research and Collaboration
+- **Reproducibility**: Comprehensive logging and experiment tracking
+- **Standardized Workflows**: Consistent patterns for multi-institution projects
+- **Built-in Evaluation**: Evaluation frameworks and standardized metrics
+- **Training Focused**: Complete tooling for distributed training and evaluation
 
 ## NeMo RL and Real-World Applications
 
@@ -128,7 +103,7 @@ For comprehensive guides with step-by-step implementation, architectural pattern
 
 NeMo RL's architecture is designed for distributed reinforcement learning with modular components, Ray-based coordination, and support for multiple training backends. The framework provides advanced scalability from single-GPU setups to multi-node clusters with thousands of GPUs.
 
-For comprehensive details on system design, components, scalability, and technical specifications, see the [Core Architecture](architecture-overview) documentation.
+For comprehensive details on system design, components, scalability, and technical specifications, see the [Architecture Overview](architecture-overview) documentation.
 
 ## API and Development
 
@@ -139,6 +114,3 @@ For complete API documentation, code examples, and development guides, see the [
 ## Get Started
 
 Ready to begin your NeMo RL journey? Start with the [Quick Start Guide](../get-started/quickstart) for your first training job, or explore the [Installation Guide](../get-started/installation) for complete setup instructions.
-
-
-

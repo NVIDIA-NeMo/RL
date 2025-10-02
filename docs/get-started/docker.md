@@ -20,7 +20,7 @@ This guide provides three methods for building Docker images:
 
 ### Release Image (Recommended)
 
-Use the **release** image if you want to pre-fetch the NeMo RL [worker virtual environments](local-workstation) and copy in the project source code. This is the most complete image and is recommended for most use cases.
+Use the **release** image to pre-fetch the NeMo RL [worker virtual environments](local-workstation) and copy in the project source code. This is the most complete image and suits most use cases.
 
 ### Hermetic Image
 
@@ -28,17 +28,17 @@ Use the **hermetic** image if you want to pre-fetch NeMo RL Python packages into
 
 ### Base Image
 
-Use the **base** image if you want maximum flexibility and plan to specify Python dependencies at runtime. This is the most minimal image.
+Use the **base** image if you want peak flexibility and plan to specify Python dependencies at runtime. This is the most minimal image.
 
-## Building Docker Images
+## Build Docker Images
 
 ### Prerequisites
 
 Before building Docker images, ensure you have:
 
-- **Docker**: Installed and running
-- **NVIDIA Container Toolkit**: For GPU support
-- **Git**: To clone the repository
+* **Docker**: Installed and running
+* **NVIDIA Container Toolkit**: For GPU support
+* **Git**: To clone the repository
 
 ### Build Commands
 
@@ -67,7 +67,7 @@ docker build -f docker/Dockerfile.hermetic -t nemo-rl:hermetic .
 docker build -f docker/Dockerfile.base -t nemo-rl:base .
 ```
 
-## Running Docker Containers
+## Run Docker Containers
 
 ### Basic Usage
 
@@ -92,7 +92,7 @@ docker run --gpus all -it nemo-rl:release /bin/bash
 docker run --gpus all -v $(pwd):/workspace -it nemo-rl:release /bin/bash
 ```
 
-### Running Training Jobs
+### Run Training Jobs
 
 ```bash
 # Run a training job inside the container
@@ -126,7 +126,7 @@ docker run --gpus all \
 
 ## Multi-Node Docker Setup
 
-For distributed training across multiple nodes:
+For distributed training across many nodes:
 
 ### Head Node
 
@@ -151,16 +151,16 @@ docker run --gpus all \
 
 ## Troubleshooting
 
-- **Container Issues**: Check Docker logs and container status
-- **GPU Access**: Verify NVIDIA Container Toolkit installation
-- **Memory Issues**: Monitor container memory usage
-- **Network Issues**: Check port forwarding and firewall settings
+* **Container Issues**: Check Docker logs and container status
+* **GPU Access**: Verify NVIDIA Container Toolkit installation
+* **Memory Issues**: Track container memory usage
+* **Network Issues**: Check port forwarding and firewall settings
 
-## Getting Help
+## Get Help
 
-- [Troubleshooting Guide](../guides/troubleshooting) - Comprehensive troubleshooting
-- [Installation Guide](installation.md) - Setup and configuration
-- [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub issues
+* [Troubleshooting Guide](../guides/troubleshooting) - Comprehensive troubleshooting
+* [Installation Guide](installation.md) - Setup and configuration
+* [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub issues
 
 ## Next Steps
 
@@ -168,5 +168,5 @@ After setting up Docker:
 
 1. **Run Your First Job**: Try the [quickstart guide](quickstart) inside the container
 2. **Configure Clusters**: Set up [distributed training](cluster.md) with Docker
-3. **Customize Images**: Modify Dockerfiles for your specific needs
+3. **Customize Images**: Edit Dockerfiles for your specific needs
 4. **Production Deployment**: Use Docker for [production deployments](../guides/troubleshooting)

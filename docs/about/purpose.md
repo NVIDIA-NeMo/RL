@@ -243,6 +243,6 @@ Ready to use NeMo RL? Here's how:
 ## Learn More
 
 - [Key Features](key-features) - Detailed feature breakdown
-- [Core Architecture](architecture-overview) - System design and components
+- [Architecture Overview](architecture-overview) - System design and components
 - [Training Algorithms](../guides/training-algorithms/index) - Algorithm guides and usage
 

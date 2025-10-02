@@ -3,7 +3,7 @@
 # Default target shows help
 .DEFAULT_GOAL := help
 
-.PHONY: help docs-html docs-clean docs-live docs-env docs-publish \
+.PHONY: help docs-html docs-clean docs-live docs-live-fast docs-env docs-publish \
         docs-html-internal docs-html-ga docs-html-ea docs-html-draft \
         docs-live-internal docs-live-ga docs-live-ea docs-live-draft \
         docs-publish-internal docs-publish-ga docs-publish-ea docs-publish-draft \
@@ -19,6 +19,7 @@ help: ## Show this help message
 	@echo "  docs-env                      Set up documentation environment"
 	@echo "  docs-html [DOCS_ENV=<env>]    Build HTML documentation"
 	@echo "  docs-live [DOCS_ENV=<env>]    Start live-reload server"
+	@echo "  docs-live-fast [DOCS_ENV=<env>] Start fast live-reload (no API docs)"
 	@echo "  docs-publish [DOCS_ENV=<env>] Build for publication (fail on warnings)"
 	@echo "  docs-clean                    Clean built documentation"
 	@echo ""
@@ -47,6 +48,7 @@ help: ## Show this help message
 	@echo "  make docs-html                # Build basic HTML docs"
 	@echo "  make docs-html DOCS_ENV=ga    # Build with GA tag"
 	@echo "  make docs-live DOCS_ENV=draft # Live server with draft tag"
+	@echo "  make docs-live-fast           # Fast live server (no API regeneration)"
 	@echo ""
 
 # Usage:
@@ -87,7 +89,7 @@ endif
 
 # Makefile targets for Sphinx documentation (all targets prefixed with 'docs-')
 
-.PHONY: docs-html docs-clean docs-live docs-env
+.PHONY: docs-html docs-clean docs-live docs-live-fast docs-env
 
 
 docs-html:
@@ -105,6 +107,10 @@ docs-clean:
 docs-live:
 	@echo "Starting live-reload server (sphinx-autobuild)..."
 	cd docs && $(DOCS_PYTHON_IN_DOCS) -m sphinx_autobuild $(if $(DOCS_ENV),-t $(DOCS_ENV)) --port 8001 . _build/html
+
+docs-live-fast:
+	@echo "Starting fast live-reload server (skipping API docs generation)..."
+	cd docs && set SKIP_AUTODOC=1 && $(DOCS_PYTHON_IN_DOCS) -m sphinx_autobuild $(if $(DOCS_ENV),-t $(DOCS_ENV)) --ignore "apidocs/*" -j auto --port 8001 . _build/html
 
 docs-env:
 	@echo "Setting up docs virtual environment with uv..."

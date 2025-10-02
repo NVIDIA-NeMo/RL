@@ -206,7 +206,7 @@ class CustomEnvironment(EnvironmentInterface):
         pass
 ```
 
-### Testing
+### Test Your Environment
 
 Test your environment thoroughly:
 
@@ -438,6 +438,5 @@ class CodeGenerationEnvironment(EnvironmentInterface):
 
 - Review the [Environment Interfaces API](../../apidocs/nemo_rl/nemo_rl.environments) for detailed API documentation
 - Explore [Math Environment](../../apidocs/nemo_rl/nemo_rl.environments) for a complete implementation example
-- Check [Debugging](../development-workflows/debugging) for troubleshooting guidance
-- See [Advanced Training](../../advanced/algorithm-development/index) for optimization techniques
-- Review [Configuration Reference](../../references/configuration-reference) for environment setup
+- Check [Debugging](../../development/debugging) for troubleshooting guidance
+- Review configuration documentation for environment setup

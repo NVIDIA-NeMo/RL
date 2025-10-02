@@ -29,11 +29,11 @@ This tutorial teaches you how to build custom training environments for NeMo RL,
 
 ## Tutorial Overview
 
-### **Step 1: Understanding the Environment Interface**
+### **Step 1: Understand the Environment Interface**
 
 Learn NeMo RL's environment architecture and interface requirements.
 
-### **Step 2: Implementing Basic Environments**
+### **Step 2: Implement Basic Environments**
 
 Create simple environments with custom reward functions.
 
@@ -49,7 +49,7 @@ Scale environments using Ray remote actors.
 
 Learn advanced patterns for complex environment design.
 
-## Step 1: Understanding the Environment Interface
+## Step 1: Understand the Environment Interface
 
 ### **NeMo RL Environment Architecture**
 
@@ -122,7 +122,7 @@ class EnvironmentReturn(NamedTuple):
 4. **Batch Processing**: Efficiently process many conversations
 5. **Termination Logic**: Determine episode termination conditions
 
-## Step 2: Implementing Basic Environments
+## Step 2: Implement Basic Environments
 
 ### **Simple Reward Environment**
 
@@ -881,7 +881,7 @@ class AdaptiveEnvironment(EnvironmentInterface):
 
 ## Configuration and Usage
 
-### **Registering Custom Environments**
+### **Register Custom Environments**
 
 ```python
 # In your training script
@@ -914,7 +914,7 @@ config = {
 }
 ```
 
-### **Testing Custom Environments**
+### **Test Custom Environments**
 
 ```python
 def test_custom_environment():
@@ -989,7 +989,6 @@ After completing this tutorial:
 - **[Environment Interfaces API](../../apidocs/nemo_rl/nemo_rl.environments)**: Detailed API documentation
 - **[Environment Development Guide](../../guides/environment-data/environment-development)**: Environment development fundamentals
 - **[Ray Distributed Computing](../../apidocs/nemo_rl/nemo_rl.distributed)**: Distributed computing with Ray
-- **[Advanced Algorithm Development](../../../advanced/algorithm-development/index)**: Advanced algorithm development techniques
 
 ## Summary
 

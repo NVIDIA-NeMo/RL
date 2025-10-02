@@ -118,7 +118,7 @@ Multi-GPU training shows:
 - **Throughput**: Higher samples/second
 - **Memory usage**: Distributed across GPUs
 
-### Step 3: Check Scaling
+### Step 3: Verify Scaling Performance
 
 Compare single vs multi-GPU performance:
 - Training time should scale approximately linearly
@@ -223,7 +223,7 @@ uv run python examples/run_sft.py \
    - Check Ray status: `ray status`
    - Restart Ray: `ray stop && ray start --head`
 
-### Getting Help
+### Get Help
 
 - [Installation Guide](installation.md) - Setup and configuration
 - [Model Selection](model-selection.md) - Choose appropriate models
@@ -239,11 +239,7 @@ After completing the quickstart:
 - [DPO Guide](../guides/training-algorithms/dpo) - Direct preference optimization
 - [SFT Guide](../guides/training-algorithms/sft) - Supervised fine-tuning
 
-2. **Learn Configuration**:
-   - [Configuration Reference](../references/index) - Complete configuration options
-- [CLI Reference](../references/index) - Command-line interface
-
-3. **Scale Up**:
+2. **Scale Up**:
    - [Cluster Setup](cluster.md) - Multi-node training
 - [Troubleshooting](../guides/troubleshooting) - Production deployment and support
 

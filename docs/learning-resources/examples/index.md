@@ -139,7 +139,7 @@ Each example can be customized for your specific needs:
 
 ### Advanced Workflow
 
-For advanced distributed training, see the [Distributed Training Guide](../../advanced/performance/distributed-training.md).
+For distributed training, see the cluster setup documentation.
 
 ## Best Practices
 
@@ -163,7 +163,7 @@ For advanced distributed training, see the [Distributed Training Guide](../../ad
 
 ### **Performance Optimization**
 
-For comprehensive performance optimization strategies, see the [Performance and Optimization Guide](../../advanced/performance/index).
+For comprehensive performance optimization strategies, see the training optimization guides.
 
 ## Troubleshooting
 
@@ -199,7 +199,7 @@ For additional learning resources, visit the main [Learning Resources](../index)
 :maxdepth: 2
 sft-openmathinstruct2
 grpo-deepscaler
+grpo-sliding-puzzle
 
 :::: 
-
  

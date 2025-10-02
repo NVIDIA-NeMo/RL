@@ -347,22 +347,22 @@ class TrainingRecovery:
 
 ### 1. Start Conservative
 - Use smaller learning rates initially
-- Implement gradient clipping from the start
-- Monitor loss and gradients closely
+- Use gradient clipping from the start
+- Track loss and gradients closely
 
-### 2. Implement Proper Monitoring
+### 2. Use Proper Monitoring
 - Track loss stability over time
-- Monitor gradient norms
+- Track gradient norms
 - Set up automatic checkpointing
 
 ### 3. Use Mixed Precision Carefully
 - Start with full precision
 - Gradually introduce mixed precision
-- Monitor for numerical instability
+- Track numerical instability
 
 ### 4. Have Recovery Strategies
 - Save checkpoints regularly
-- Implement automatic recovery
+- Use automatic recovery
 - Have fallback configurations
 
 ## Common Patterns
@@ -480,8 +480,7 @@ def debug_training_stability(model, dataloader, num_steps=100):
             break
 ```
 
-## Getting Help
+## Get Help
 
-- [Advanced Training Techniques](../../advanced/algorithm-development/index.md) - Advanced training methods
-- [Performance Monitoring](../../advanced/performance/monitoring.md) - Monitor training performance
-- [Troubleshooting](../troubleshooting.md) - Common issues and solutions 
+- [Troubleshooting](../troubleshooting.md) - Common issues and solutions
+ 

@@ -48,12 +48,12 @@ Each class representing a NeMo RL DPO dataset is expected to have the following 
 1. `formatted_ds`: The dictionary of formatted datasets. This dictionary should contain `train` and `validation` splits, and each split should conform to the format described below.
 2. `task_spec`: The `TaskDataSpec` for this dataset. This should specify the name you choose for this dataset.
 
-DPO datasets are expected to follow a specific format with three key fields:
+DPO datasets follow a specific format with three key fields:
 - `prompt`: The input prompt/context
 - `chosen_response`: The preferred/winning response
 - `rejected_response`: The non-preferred/losing response
 
-See `nemo_rl/data/hf_datasets/helpsteer3.py` for an example of how to format data for DPO:
+See `nemo_rl/data/hf_datasets/helpsteer3.py` for an example of how you can format data for DPO:
 
 ```python
 def format_helpsteer3(data):
@@ -80,7 +80,7 @@ def format_helpsteer3(data):
 
 We also provide a `DPODataset` class (see `nemo_rl/data/hf_datasets/dpo.py`) that is compatible with jsonl-formatted preference datasets. This class assumes train and validation datasets have been split and processed into the expected format offline. The jsonl files should consist of examples with `prompt`, `chosen_response`, and `rejected_response` keys.
 
-## Adding Custom DPO Datasets
+## Add Custom DPO Datasets
 
 Adding a new DPO dataset is straightforward. Your custom dataset class should:
 1. Implement the required format conversion in the constructor
@@ -198,7 +198,7 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 - `dpo.preference_average_log_probs`: Whether to average log probabilities over tokens in the preference loss term
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
 
-These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
+You can adjust these parameters in the config file or via command-line overrides to optimize training for your specific use case.
 
 ## Evaluate the Trained Model
 

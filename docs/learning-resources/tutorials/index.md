@@ -74,7 +74,6 @@ Scale your training across multiple GPUs and nodes with advanced distributed tra
 ### **Advanced Path** (4+ weeks)
 
 2. **Distributed Training and Scaling** → Scale training across multiple GPUs and nodes
-3. **Advanced Performance** → [Performance and Optimization](../../advanced/performance/index)
 
 ## Tutorial Descriptions
 

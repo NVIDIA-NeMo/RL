@@ -9,7 +9,7 @@ modality: "universal"
 ---
 
 (design-overview)=
-# About NeMo RL Core Design and Architecture
+# About NeMo RL Core Design
 
 This section contains detailed design documents, architectural decisions, and technical specifications for NeMo RL. These documents provide insights into the framework's internals and design philosophy for advanced users who want to understand, extend, or contribute to the framework.
 

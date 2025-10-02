@@ -112,11 +112,11 @@ Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
 
-## Using Reward Models as Environments
+## Use Reward Models as Environments
 
 Trained reward models can be used as environments in GRPO training for reinforcement learning from human feedback (RLHF). This allows you to use your trained reward model to provide rewards during policy optimization.
 
-### Reward Model Environment
+### Set the Reward Model Environment
 
 The Reward Model Environment provides a standardized interface for using trained reward models in RL training:
 
@@ -139,7 +139,7 @@ env_config = {
 reward_env = RewardModelEnvironment.remote(env_config)
 ```
 
-### Integration with GRPO
+### Integrate with GRPO
 
 To use your trained reward model with GRPO, you can use the [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) script:
 
@@ -148,7 +148,7 @@ To use your trained reward model with GRPO, you can use the [examples/run_grpo_r
 uv run examples/run_grpo_rm.py --config examples/configs/grpo_rm_1B.yaml
 ```
 
-### Configuration
+### Configure GRPO
 
 In your GRPO configuration, specify the reward model environment:
 

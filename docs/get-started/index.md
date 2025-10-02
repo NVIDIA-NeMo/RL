@@ -9,7 +9,7 @@ modality: "universal"
 ---
 
 (gs-overview)=
-# Get Started with NeMo RL
+# About Getting Started with NeMo RL
 
 Welcome to NeMo RL! This guide will help you set up your environment and run your first reinforcement learning training job with large language models.
 
@@ -120,7 +120,7 @@ Explore Direct Preference Optimization for preference learning and alignment. Pr
 
 ## Distributed Training
 
-For details on scaling NeMo RL across multiple GPUs and nodes, see the [Distributed Training Guide](../advanced/performance/distributed-training.md).
+For details on scaling NeMo RL across multiple GPUs and nodes, see the distributed training documentation.
 
 ## Next Steps
 
@@ -128,7 +128,7 @@ After completing your first training run:
 
 1. **Explore Algorithms**: Try [GRPO](../guides/training-algorithms/grpo) and [DPO](../guides/training-algorithms/dpo) training
 2. **Scale Up**: Set up [distributed training](cluster.md) for larger models
-3. **Optimize Performance**: Use [profiling tools](../guides/environment-data/nsys-profiling) for training optimization
+3. **Optimize Performance**: Use [profiling tools](../development/nsys-profiling) for training optimization
 4. **Customize**: Learn to [add new models](../guides/model-development/adding-new-models) and environments
 5. **Deploy**: Follow the [troubleshooting guide](../guides/troubleshooting) for production deployment
 
@@ -136,6 +136,5 @@ After completing your first training run:
 
 - [Troubleshooting](../guides/troubleshooting) - Common issues and solutions
 - [API Documentation](../apidocs/index) - Complete API documentation
-- [Configuration Guide](../references/configuration-reference) - Understand training parameters
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub issues and discussions
 

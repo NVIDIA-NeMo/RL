@@ -42,13 +42,17 @@ release = "latest"
 
 extensions = [
     "myst_parser",  # For our markdown docs
-    "autodoc2",  # Generates API docs
     "sphinx.ext.viewcode",  # For adding a link to view source code in docs
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
     "sphinx_copybutton",  # For copy button in code blocks
     "sphinx_design",  # For grid cards and design elements
+    "sphinxcontrib.mermaid",  # Mermaid diagrams support
 ]
+
+# Only include autodoc2 if not in fast mode (for faster builds when editing narrative docs)
+if not os.getenv("SKIP_AUTODOC"):
+    extensions.insert(1, "autodoc2")  # Generates API docs
 
 templates_path = ["_templates"]
 exclude_patterns = [
@@ -70,6 +74,10 @@ myst_enable_extensions = [
     "tasklist",  # Adds support for GitHub-style task lists with [ ] and [x]
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
+# Allow relative links to files outside docs (e.g., examples/, nemo_rl/)
+myst_url_schemes = ("http", "https", "mailto", "ftp")
+# Suppress warnings for links to files outside the docs tree
+suppress_warnings = ["myst.xref_missing", "ref.doc"]
 
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))

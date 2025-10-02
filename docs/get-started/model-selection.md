@@ -255,8 +255,8 @@ After selecting your model:
 
 1. **Check Hardware Compatibility**: Ensure your GPU meets the memory requirements
 2. **Start with Quickstart**: Use the [Quickstart Guide](quickstart.md) with your chosen model
-3. **Monitor Performance**: Use [Performance Monitoring](../advanced/performance/monitoring.md) to track training
-4. **Scale Up**: Consider [Distributed Training](../advanced/performance/distributed-training.md) for larger models
+3. **Monitor Performance**: Track training metrics during your runs
+4. **Scale Up**: Consider distributed training for larger models
 
 ## Common Pitfalls
 
@@ -272,9 +272,7 @@ After selecting your model:
 - **Problem**: Model doesn't perform well enough
 - **Solution**: Try larger model or different architecture
 
-## Getting Help
+## Get Help
 
 - [Hardware Requirements](installation.md#hardware-requirements) - Detailed system requirements
-- [Performance Optimization](../advanced/performance/index.md) - Advanced optimization techniques
-- [Distributed Training](../advanced/performance/distributed-training.md) - Scaling to multiple GPUs
 - [Troubleshooting](../guides/troubleshooting) - Common issues and solutions 

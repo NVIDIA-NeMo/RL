@@ -192,7 +192,7 @@ CONTAINER=... bash run_functional_in_docker.sh functional/sft.sh
 ```
 
 
-## Static Type Checking with [MyPy](https://mypy-lang.org/)
+## Check Static Type with [MyPy](https://mypy-lang.org/)
 Static type checking can be run with no GPU resources:
 
 ```sh

@@ -17,7 +17,7 @@ cd DeepSeek-V3/inference
 sed -i '88{s/new_safetensor_file/new_safetensor_file, metadata={"format": "pt"}/}' fp8_cast_bf16.py
 
 # convert weights
-python fp8_cast_bf16.py --input-fp8-hf-path ../../DeepSeek-V3-FP8 --output-bf16-hf-path ../../DeepSeek-V3-BF16
+uv run python fp8_cast_bf16.py --input-fp8-hf-path ../../DeepSeek-V3-FP8 --output-bf16-hf-path ../../DeepSeek-V3-BF16
 
 # copy other files
 cd ../..

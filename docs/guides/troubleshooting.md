@@ -188,7 +188,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Validate configuration using actual codebase patterns
-python -c "
+uv run python -c "
 from nemo_rl.utils.config import load_config
 try:
     config = load_config('$CONFIG_FILE')
@@ -199,7 +199,7 @@ except Exception as e:
 "
 
 # Deploy with environment-specific settings
-python examples/run_grpo_math.py --config "$CONFIG_FILE"
+uv run python examples/run_grpo_math.py --config "$CONFIG_FILE"
 ```
 
 ## Configuration Issues
@@ -568,7 +568,7 @@ TokenizationError: Input too long
 ### Enable Debug Logging
 
 ```bash
-python examples/run_grpo_math.py --config training.yaml --log-level DEBUG
+uv run python examples/run_grpo_math.py --config training.yaml --log-level DEBUG
 ```
 
 ### Validate Configuration
@@ -602,10 +602,10 @@ ray memory --stats-only
 ### Dry Run Mode
 
 ```bash
-python examples/run_grpo_math.py --config training.yaml --dry-run
+uv run python examples/run_grpo_math.py --config training.yaml --dry-run
 ```
 
-## Getting Help
+## Get Help
 
 ### Before Asking for Help
 
@@ -623,7 +623,7 @@ When reporting issues, include:
 2. **Configuration file (sanitized)**
 3. **System information:**
    ```bash
-   python --version
+   uv run python --version
    nvidia-smi
    ray status
    ```
@@ -634,10 +634,10 @@ When reporting issues, include:
 
 ```bash
 # Check NeMo RL version
-python -c "import nemo_rl; print(nemo_rl.__version__)"
+uv run python -c "import nemo_rl; print(nemo_rl.__version__)"
 
 # Validate configuration using actual codebase
-python -c "
+uv run python -c "
 from nemo_rl.utils.config import load_config
 try:
     config = load_config('training.yaml')
@@ -647,7 +647,7 @@ except Exception as e:
 "
 
 # Test model loading
-python -c "
+uv run python -c "
 from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained('llama2-7b', trust_remote_code=True)
 print('Model loading successful')
@@ -696,4 +696,5 @@ distributed:
   backend: "ray"
   num_workers: 2
   num_gpus_per_worker: 1
-``` 
+```
+ 

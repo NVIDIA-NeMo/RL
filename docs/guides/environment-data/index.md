@@ -8,37 +8,29 @@ NeMo RL training requires careful attention to environment configuration, data p
 
 ## Quick Navigation
 
+For GPU profiling and performance optimization, see the [Development](../../development/index) section.
+
 ::::{grid} 1 2 2 2
 :gutter: 2 2 2 2
 
-:::{grid-item-card} {octicon}`graph;1.5em;sd-mr-1` NSYS Profiling
-:link: nsys-profiling
+:::{grid-item-card} {octicon}`gear;1.5em;sd-mr-1` Environment Development
+:link: environment-development
 :link-type: doc
 
-NSYS-specific profiling for RL training performance.
+Set up and configure your development environment for NeMo RL.
 
 +++
-{bdg-secondary}`Performance`
+{bdg-primary}`Setup`
 :::
 
-:::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` Advanced Performance
-:link: ../../advanced/performance/index
+:::{grid-item-card} {octicon}`container;1.5em;sd-mr-1` Environments
+:link: environments
 :link-type: doc
 
-Comprehensive performance optimization and profiling techniques.
+Create and manage custom RL environments.
 
 +++
-{bdg-warning}`Advanced`
-:::
-
-:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Distributed Training
-:link: ../../advanced/performance/distributed-training
-:link-type: doc
-
-Scale RL training across multiple GPUs and nodes.
-
-+++
-{bdg-warning}`Advanced`
+{bdg-info}`Intermediate`
 :::
 
 ::::
@@ -264,10 +256,8 @@ nemo-rl train --config config.yaml --debug
 
 ## Next Steps
 
-- [Debugging Guide](../development-workflows/debugging) - Learn debugging techniques
-- [NSYS Profiling](nsys-profiling) - Profile training performance
-- [Advanced Performance](../../advanced/performance/index) - Deep dive into optimization
-- [Distributed Training](../../advanced/performance/distributed-training) - Scale across nodes
+- [Debugging Guide](../../development/debugging) - Learn debugging techniques
+- [GPU Profiling](../../development/nsys-profiling) - Profile training performance with NSYS
 
 For additional learning resources, visit the main [Guides](../index) page.
 
@@ -278,7 +268,6 @@ For additional learning resources, visit the main [Guides](../index) page.
 :caption: Environment and Data
 :maxdepth: 2
 environment-development
-nsys-profiling
+environments
 :::: 
-
  

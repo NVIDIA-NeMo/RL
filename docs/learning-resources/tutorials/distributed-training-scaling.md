@@ -29,7 +29,7 @@ This tutorial teaches you how to scale NeMo RL training with distributed systems
 
 ## Tutorial Overview
 
-### **Step 1: Understanding Distributed Architecture**
+### **Step 1: Understand Distributed Architecture**
 
 Learn NeMo RL's distributed training framework and components.
 
@@ -49,7 +49,7 @@ Use efficient gradient synchronization strategies.
 
 Track and debug distributed training performance.
 
-## Step 1: Understanding Distributed Architecture
+## Step 1: Understand Distributed Architecture
 
 ### **NeMo RL Distributed Framework**
 
@@ -208,7 +208,7 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=1
 
 # Launch distributed training
-srun python -m torch.distributed.launch \\
+srun uv run python -m torch.distributed.launch \\
     --nproc_per_node={self.gpus_per_node} \\
     --nnodes={self.num_nodes} \\
     --node_rank=$SLURM_PROCID \\
@@ -856,7 +856,7 @@ class DistributedTrainingMonitor:
         return recommendations
 ```
 
-### **Debugging Distributed Training**
+### **Debug Distributed Training**
 
 Implement debugging utilities for distributed training:
 
@@ -992,7 +992,7 @@ config = {
 distributed_components = setup_complete_distributed_training(config)
 ```
 
-### **Testing Distributed Training**
+### **Test Distributed Training**
 
 ```python
 def test_distributed_training():
@@ -1069,10 +1069,8 @@ After completing this tutorial:
 
 ## Related Resources
 
-- **[Distributed Training Guide](../../../advanced/performance/distributed-training)**: Distributed training fundamentals
 - **[Ray Distributed Computing](../../apidocs/nemo_rl/nemo_rl.distributed)**: Ray distributed computing documentation
 - **[Cluster Setup Guide](../../get-started/cluster)**: Cluster setup and management
-- **[Performance Optimization](../../../advanced/performance/index)**: Performance optimization techniques
 
 ## Summary
 

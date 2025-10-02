@@ -233,7 +233,7 @@ uv run examples/run_eval.py --config examples/configs/eval.yaml
 
 - [Troubleshooting](../troubleshooting) - Common training issues and solutions
 - [API Documentation](../../apidocs/index) - Complete algorithm documentation
-- [Configuration Reference](../../../references/configuration-reference) - Training parameters
+- Training configuration parameters
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub discussions
 
 ---
@@ -245,7 +245,8 @@ uv run examples/run_eval.py --config examples/configs/eval.yaml
 sft
 dpo
 grpo
+async-grpo
+rm
 eval
 :::::
-
  

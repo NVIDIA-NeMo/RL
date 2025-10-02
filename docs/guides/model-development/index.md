@@ -114,7 +114,7 @@ from nemo_rl.algorithms.dpo import setup as dpo_setup, dpo_train
 
 ### Memory Optimization Techniques
 - **Gradient Checkpointing**: Trade compute for memory
-- **Model Parallelism**: Distribute across multiple GPUs
+- **Model Parallelism**: Distribute across many GPUs
 - **Activation Checkpointing**: Reduce memory footprint
 - **Mixed Precision**: Use FP16/BF16 for efficiency
 
@@ -122,11 +122,11 @@ from nemo_rl.algorithms.dpo import setup as dpo_setup, dpo_train
 - **Kernel Fusion**: Optimize CUDA kernels
 - **Attention Optimization**: Flash attention, grouped query attention
 - **Quantization**: INT8/INT4 for inference
-- **Distributed Training**: Scale across multiple nodes
+- **Distributed Training**: Scale across many nodes
 
 ## Custom Model Development
 
-### Creating Custom Models
+### Create Custom Models
 Extend the base model interface:
 
 ```python
@@ -210,7 +210,7 @@ model:
 ```
 
 ### Multi-Model Training
-Training with multiple models:
+Training with many models:
 
 ```yaml
 # Multi-model configuration
@@ -277,7 +277,7 @@ def benchmark_model(model, test_data):
 
 #### Generation Issues
 - **Problem**: Incorrect or unexpected outputs
-- **Solution**: Check generation parameters, validate model outputs
+- **Solution**: Check generation parameters, check model outputs
 - **Prevention**: Test generation with known inputs
 
 ### Debugging Tools
@@ -337,7 +337,7 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 ## Get Help
 
 - [Troubleshooting](../troubleshooting) - Common model integration issues
-- [Configuration Reference](../../../references/configuration-reference) - Model configuration parameters
+- Model configuration parameters
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub discussions
 - [Model Examples](https://github.com/NVIDIA/NeMo-RL/tree/main/examples) - Working model integration examples
 
@@ -349,6 +349,6 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 :maxdepth: 2
 adding-new-models
 model-quirks
-::::: 
-
+deepseek
+::::::
  

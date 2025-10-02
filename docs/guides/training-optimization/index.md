@@ -63,16 +63,6 @@ Systematic approaches to finding optimal hyperparameters for your models.
 {bdg-info}`Intermediate`
 :::
 
-:::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` FP8 Quantization
-:link: fp8
-:link-type: doc
-
-Enable FP8 quantization for improved performance and memory efficiency.
-
-+++
-{bdg-warning}`Advanced`
-:::
-
 ::::
 
 ## When to Use Training Optimization
@@ -103,9 +93,8 @@ These techniques are essential when:
 
 ## Next Steps
 
-- [Advanced Training Techniques](../../advanced/algorithm-development/index.md) - Advanced training methods
-- [Performance Optimization](../../advanced/performance/index.md) - Performance tuning
-- [Research Methodologies](../../advanced/research/index.md) - Research best practices 
+- Advanced training techniques and optimization methods
+- For FP8 quantization, see [Development](../../development/fp8)
 
 ---
 
@@ -116,5 +105,4 @@ These techniques are essential when:
 learning-rate-scheduling
 training-stability
 hyperparameter-optimization
-fp8
-:::::
+::::

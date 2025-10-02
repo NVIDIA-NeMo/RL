@@ -134,6 +134,17 @@ pip install -r requirements-docs.txt
 uv sync --group test
 ```
 
+## Optional Backend Dependencies
+
+The [`3rdparty/`](https://github.com/NVIDIA/NeMo-RL/tree/main/3rdparty) directory contains optional third-party dependencies maintained as separate git submodules:
+
+- **Megatron-LM** - For large-scale transformer training with NVIDIA Megatron backend
+- **Megatron-Bridge** - Adapter layer for Megatron framework integration
+
+:::{note}
+Most users can use the default HuggingFace/DTensor backend. Only initialize submodules with `git submodule update --init --recursive` if you need Megatron backend support.
+:::
+
 ## Platform-Specific Instructions
 
 ### Ubuntu/Debian
@@ -241,7 +252,7 @@ uv sync --group test
 Run a simple test to verify the installation:
 
 ```bash
-python -c "import nemo_rl; print('NeMo RL installed successfully!')"
+uv run python -c "import nemo_rl; print('NeMo RL installed successfully!')"
 ```
 
 ### GPU Test
@@ -249,7 +260,7 @@ python -c "import nemo_rl; print('NeMo RL installed successfully!')"
 Verify GPU support:
 
 ```bash
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}')"
+uv run python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}')"
 ```
 
 ### Example Run
@@ -279,7 +290,7 @@ uv run python run_sft.py --config configs/sft.yaml cluster.gpus_per_node=1
    - Use `sudo` for system-wide installation
    - Check file permissions in installation directory
 
-### Getting Help
+### Get Help
 
 - **Documentation**: Check the [troubleshooting guide](../guides/troubleshooting)
 - **Community**: Join the [NeMo Discord](https://discord.gg/nvidia-nemo)
@@ -289,5 +300,4 @@ uv run python run_sft.py --config configs/sft.yaml cluster.gpus_per_node=1
 
 After installation, proceed to:
 - [Quickstart Guide](quickstart) - Get started with your first training run
-- [Cluster Setup](cluster.md) - Set up distributed training
-- [Configuration Reference](../references/configuration-reference) - Complete configuration options 
+- [Cluster Setup](cluster.md) - Set up distributed training 

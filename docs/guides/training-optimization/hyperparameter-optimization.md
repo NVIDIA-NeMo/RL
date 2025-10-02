@@ -519,8 +519,6 @@ def debug_optimization(optimizer, objective_function):
     print(f"Short optimization results: {results}")
 ```
 
-## Getting Help
+## Get Help
 
-- [Advanced Training Techniques](../../advanced/algorithm-development/index.md) - Advanced training methods
-- [Performance Monitoring](../../advanced/performance/monitoring.md) - Monitor training performance
 - [Troubleshooting](../troubleshooting.md) - Common issues and solutions 

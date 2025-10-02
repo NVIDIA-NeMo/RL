@@ -57,6 +57,16 @@ Deep-dive guides for training algorithms, model development, environment setup, 
 {bdg-primary}`Guides` {bdg-secondary}`How-to`
 :::
 
+::: {grid-item-card} {octicon}`tools;1.5em;sd-mr-1` Development
+:link: development/index
+:link-type: doc
+
+Essential tools for testing, debugging, profiling, and contributing to NeMo RL.
+
++++
+{bdg-info}`Development` {bdg-secondary}`Tools`
+:::
+
 ::: {grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Core Design
 :link: core-design/index
 :link-type: doc
@@ -67,16 +77,6 @@ Understand NeMo RL's architecture, design principles, computational systems, and
 {bdg-info}`Architecture` {bdg-secondary}`Design`
 :::
 
-::: {grid-item-card} {octicon}`zap;1.5em;sd-mr-1` Advanced Topics
-:link: advanced/index
-:link-type: doc
-
-Advanced performance optimization, research techniques, and cutting-edge algorithm development.
-
-+++
-{bdg-warning}`Advanced` {bdg-secondary}`Expert`
-:::
-
 ::: {grid-item-card} {octicon}`code;1.5em;sd-mr-1` API Documentation
 :link: apidocs/index
 :link-type: doc
@@ -85,16 +85,6 @@ Complete API reference for algorithms, models, data, environments, and distribut
 
 +++
 {bdg-info}`API` {bdg-secondary}`Reference`
-:::
-
-::: {grid-item-card} {octicon}`book;1.5em;sd-mr-1` References
-:link: references/index
-:link-type: doc
-
-Access configuration reference, FAQs, glossary, and comprehensive technical documentation.
-
-+++
-{bdg-secondary}`Reference` {bdg-secondary}`Documentation`
 :::
 
 ::::
@@ -115,7 +105,7 @@ Master SFT, DPO, and GRPO algorithms for training language models with reinforce
 :::
 
 ::: {grid-item-card} {octicon}`server;1.5em;sd-mr-1` Distributed Training
-:link: advanced/performance/distributed-training
+:link: learning-resources/tutorials/distributed-training-scaling
 :link-type: doc
 
 Scale across multiple GPUs and nodes with Ray, FSDP2, and advanced parallelization strategies.
@@ -145,7 +135,7 @@ Dataset preparation, processing pipelines, and efficient data handling for RL tr
 :::
 
 ::: {grid-item-card} {octicon}`graph;1.5em;sd-mr-1` Performance Optimization
-:link: advanced/performance/index
+:link: guides/training-optimization/index
 :link-type: doc
 
 Profiling, optimization techniques, and performance tuning for high-throughput training.
@@ -175,8 +165,8 @@ Debugging, common problems, and advanced problem resolution for RL training work
 ## Choose Your Path
 
 - **Researchers**: Start with [About NeMo RL](about/index) and then explore [Training Algorithms](guides/training-algorithms/index)
-- **ML Engineers**: Go to [Get Started](get-started/index), [Distributed Training](advanced/performance/distributed-training), and [Model Development](guides/model-development/index)
-- **DevOps**: See [Core Design](core-design/index), [Performance Optimization](advanced/performance/index), and [Troubleshooting](guides/troubleshooting)
+- **ML Engineers**: Go to [Get Started](get-started/index), [Distributed Training](learning-resources/tutorials/distributed-training-scaling), and [Model Development](guides/model-development/index)
+- **DevOps**: See [Core Design](core-design/index), [Performance Optimization](guides/training-optimization/index), and [Troubleshooting](guides/troubleshooting)
 
 ## Need Help
 
@@ -228,6 +218,18 @@ guides/troubleshooting
 
 ```{toctree}
 :hidden:
+:caption: Development
+:maxdepth: 2
+development/index
+development/debugging
+development/testing
+development/nsys-profiling
+development/fp8
+development/use-custom-vllm
+```
+
+```{toctree}
+:hidden:
 :caption: Core Design
 :maxdepth: 2
 core-design/index
@@ -235,16 +237,6 @@ core-design/design-principles/index
 core-design/computational-systems/index
 core-design/data-management/index
 core-design/development-infrastructure/index
-```
-
-```{toctree}
-:hidden:
-:caption: Advanced Topics
-:maxdepth: 2
-advanced/index
-advanced/performance/index
-advanced/algorithm-development/index
-advanced/research/index
 ```
 
 ```{toctree}
@@ -262,13 +254,4 @@ learning-resources/use-cases/index
 :caption: API Documentation
 :maxdepth: 2
 apidocs/index
-```
-
-```{toctree}
-:hidden:
-:caption: References
-:maxdepth: 2
-references/index
-references/configuration-reference
-references/cli-reference
 ```
