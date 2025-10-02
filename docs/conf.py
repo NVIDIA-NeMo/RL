@@ -128,17 +128,24 @@ def _convert_gh_admonitions_inplace(contents: list[str]) -> None:
         "> [!WARNING]": "warning",
         "> [!CAUTION]": "caution",
     }
+    # Use 8 backticks for admonition fences to allow code blocks with 3 or 6 backticks inside
+    FENCE = "````````"
     for i, orig_content in enumerate(contents):
         orig_line_splits = orig_content.split("\n")
         replacing = False
         for j, line in enumerate(orig_line_splits):
             line_roi = line.lstrip()
-            for admonition_key in _github_admonitions:
+            for admonition_key, admonition_name in _github_admonitions.items():
                 if line_roi.startswith(admonition_key):
-                    line = line.replace(
-                        admonition_key,
-                        "```{" + _github_admonitions[admonition_key] + "}",
-                    )
+                    replacement = f"{FENCE}{{{admonition_name}}}"
+                    if replacing:
+                        # Close previous fence before starting new admonition
+                        # Add blank line between admonitions for proper MyST parsing
+                        line = (
+                            f"{FENCE}\n\n{line.replace(admonition_key, replacement, 1)}"
+                        )
+                    else:
+                        line = line.replace(admonition_key, replacement, 1)
                     replacing = True
                     break
             else:
@@ -149,11 +156,11 @@ def _convert_gh_admonitions_inplace(contents: list[str]) -> None:
                 elif line_roi.rstrip() == ">":
                     line = line.replace(">", "", 1)
                 else:
-                    line = f"```\n{line}"
+                    line = f"{FENCE}\n{line}"
                     replacing = False
             orig_line_splits[j] = line
         if replacing:
-            orig_line_splits.append("```")
+            orig_line_splits.append(FENCE)
             replacing = False
         contents[i] = "\n".join(orig_line_splits)
 
