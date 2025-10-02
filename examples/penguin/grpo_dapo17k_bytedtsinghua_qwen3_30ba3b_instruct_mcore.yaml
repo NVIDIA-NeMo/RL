@@ -6,6 +6,8 @@ grpo:
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
 
+  max_total_sequence_length: 131072
+
   # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
   dtensor_cfg:
     enabled: False
