@@ -860,6 +860,8 @@ class DTensorPolicyWorker:
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+            # release gradient memory before rollouts
+            self.optimizer.zero_grad()
             # increment scheduler after all batches in rollout are processed
             if not eval_mode:
                 self.scheduler.step()
