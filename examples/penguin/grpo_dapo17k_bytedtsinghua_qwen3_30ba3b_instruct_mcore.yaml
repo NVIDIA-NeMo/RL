@@ -31,7 +31,7 @@ policy:
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
+    sequence_parallel: true
     freeze_moe_router: true
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
