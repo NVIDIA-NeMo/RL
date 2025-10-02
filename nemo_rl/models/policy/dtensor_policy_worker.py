@@ -1698,6 +1698,17 @@ class DTensorPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    def get_zmq_address(self):
+        """Get the ZMQ address for the current device."""
+        return f"ipc:///{self.report_device_id()}.sock"
+    
+    def maybe_init_zmq(self):
+        """Initialize the ZMQ socket if it doesn't exist."""
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.bind(self.get_zmq_address())
+
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         state_dict = self.model.state_dict()
@@ -1717,40 +1728,12 @@ class DTensorPolicyWorker:
                 state_dict_info[name] = (tensor.shape, self.dtype)
 
             return state_dict_info
-
-    @torch.no_grad()
-    def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
-        """Prepare the weights for IPC.
-
-        This function:
-        - Prepares the state_dict of the model.
-        - Collects the info for streaming multiple tensors.
-
-        Returns:
-            list: The list of parameters sizes.
-            float: The total available memory in bytes.
-        """
+    
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
         from nemo_rl.utils.nvml import get_free_memory_bytes
-
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
-            self.model = self.move_to_cuda(self.model)
-
-        # Get state_dict
-        self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
-            self.model.state_dict()
-        )
-
-        # Collect current available memory for refit
-        ## Get current device index from torch
         device_idx = torch.cuda.current_device()
-        ## Get device free memory using NVML
-        total_available_bytes = get_free_memory_bytes(device_idx)
-        ## Use 80% of the free memory for safety
-        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.8")
-        total_available_bytes *= float(memory_ratio)
-
-        return self.refit_param_info, total_available_bytes
+        return get_free_memory_bytes(device_idx)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/get_weights_ipc_handles")
