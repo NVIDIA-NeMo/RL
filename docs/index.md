@@ -28,10 +28,13 @@ guides/sft.md
 guides/dpo.md
 guides/grpo.md
 guides/grpo-deepscaler.md
+guides/grpo-sliding-puzzle.md
 guides/rm.md
+guides/environments.md
 guides/eval.md
 guides/deepseek.md
 model-quirks.md
+guides/async-grpo.md
 ```
 
 ```{toctree}
