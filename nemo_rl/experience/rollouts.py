@@ -1062,10 +1062,19 @@ def run_async_penguin_rollout(
                 )
 
         # Log the full result
-        per_agent_metrics[f"{agent_name}/full_result"] = Table(
-            data=[[json.dumps(r, separators=((",", ":")))] for r in agent_results],
-            columns=["Full result"]
-        )
+        to_log = []
+        for r in agent_results:
+            r = copy.deepcopy(r)
+            # Remove tokens from logging
+            for output_item in r["response"]["output"]:
+                output_item.pop("prompt_token_ids", None)
+                output_item.pop("generation_token_ids", None)
+                output_item.pop("generation_log_probs", None)
+
+            r = json.dumps(r, separators=((",", ":")))
+            to_log.append([r])
+
+        per_agent_metrics[f"{agent_name}/full_result"] = Table(data=to_log, columns=["Full result"])
 
     rollout_metrics.update(per_agent_metrics)
 
