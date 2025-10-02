@@ -68,6 +68,7 @@ def calculate_baseline_and_std_per_prompt(
 
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
+    std = torch.zeros_like(rewards)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
@@ -101,6 +102,7 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
+
             prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
@@ -111,8 +113,15 @@ def calculate_baseline_and_std_per_prompt(
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = prompt_baseline_square
+            std[prompt_idx] = (
+                (
+                    (prompt_baseline_square - prompt_baseline.square())
+                    * (num_valid / (num_valid - 1))
+                )
+                .sqrt()
+                .nan_to_num(0)
+            )
 
-    std = (sq_baseline - baseline.square()).sqrt().nan_to_num(0)
     return baseline, std
 
 
