@@ -698,7 +698,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Update weights from IPC handles via ZMQ socket.
 
@@ -715,7 +715,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                    "update_weights_via_ipc_zmq cannot be used with async_engine=True. Use update_weights_via_ipc_zmq_async instead."
                 )
 
             result_or_coro = self.llm.collective_rpc(

@@ -749,16 +749,7 @@ class VllmGeneration(GenerationInterface):
         ray.get(futures)
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
-        """Update weights of the policy using IPC handles, considering tensor parallelism.
-
-        For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+        """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
