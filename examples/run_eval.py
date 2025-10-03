@@ -27,6 +27,7 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.multi_turn_tool_environment import MultiTurnToolEnvironment
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
@@ -56,14 +57,28 @@ def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
     # load dataset
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
-
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            )
-        }
-    ).remote(env_configs["math"])
+    
+    bfcl_cfg = env_configs.get("bfcl_multiturn", {})
+    if bool(bfcl_cfg.get("enable", False)):
+        env = MultiTurnToolEnvironment.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.multi_turn_tool_environment.MultiTurnToolEnvironment"
+                )
+            }
+        ).remote(bfcl_cfg)
+    else:
+        # Default to MathEnvironment only if no other environment is enabled
+        math_cfg = env_configs.get("math")
+        if math_cfg is None:
+            raise KeyError("env.math config missing and bfcl_multiturn is disabled")
+        env = MathEnvironment.options(
+            runtime_env={
+                "py_executable": get_actor_python_env(
+                    "nemo_rl.environments.math_environment.MathEnvironment"
+                )
+            }
+        ).remote(math_cfg)
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
@@ -130,6 +145,7 @@ def main():
         dataloader,
         env,
         master_config,
+        tokenizer,
     )
 
 

@@ -430,9 +430,7 @@ def run_multi_turn_rollout(
 
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
-
         total_rewards[active_indices] += env_output.rewards
-
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
@@ -501,7 +499,18 @@ def run_multi_turn_rollout(
             # Update metadata (extra_env_info) using info from environment
             if continuing_metadata[i] is not None:
                 current_batch["extra_env_info"][global_idx] = continuing_metadata[i]
-
+    
+    #append next user question for BFCL environments (those with user_question_bank)
+    for global_idx in continuing_indices_global.tolist():
+        meta = current_batch["extra_env_info"][global_idx]
+        if isinstance(meta, dict) and "user_question_bank" in meta:
+            _append_next_user_question(
+                current_batch,
+                global_idx,
+                tokenizer,
+                max_seq_len,
+                sample_token_counts,
+            )
     # Record samples that reached max turns
     sample_max_turns_reached[active_indices] = True
 
@@ -927,3 +936,56 @@ def run_async_multi_turn_rollout(
         return final_batch, rollout_metrics
 
     return asyncio.run(_async_rollout_implementation())
+
+def _append_next_user_question(
+    batch: "BatchedDataDict",
+    idx: int,
+    tokenizer: TokenizerType,
+    max_seq_len: int,
+    sample_token_counts: torch.Tensor,
+):
+    """Append the next user question to the message log for sample `idx`, if any.
+    The question is taken from `batch["extra_env_info"][idx]["user_question_bank"]`
+    at index `current_turn - 1`.
+    """
+    meta = batch["extra_env_info"][idx]
+    if not isinstance(meta, dict):
+        return
+    # Only proceed if previous turn was successful
+    if not meta.get("turn_success", False):
+        return
+    current_turn = meta.get("current_turn")
+    qbank = meta.get("user_question_bank")
+    if (
+        current_turn is None
+        or qbank is None
+        or not isinstance(qbank, list)
+        or current_turn - 1 < 0
+        or current_turn - 1 >= len(qbank)
+    ):
+        return
+    entry = qbank[current_turn - 1]
+    # entry may be dict, list[dict], or str
+    if isinstance(entry, list) and entry:
+        entry = entry[0]
+    if isinstance(entry, dict):
+        next_q = entry.get("content")
+    elif isinstance(entry, str):
+        next_q = entry
+    else:
+        raise TypeError(f"user_question_bank entry must be dict|list|str, got {type(entry)}")
+    if not next_q:
+        return
+    tokenized_q = tokenizer(
+        next_q, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    # Truncate if needed
+    available_len = max_seq_len - sample_token_counts[idx]
+    if available_len <= 0:
+        return
+    if tokenized_q.size(0) > available_len:
+        tokenized_q = tokenized_q[:available_len]
+    batch["message_log"][idx].append(
+        {"role": "user", "content": next_q, "token_ids": tokenized_q}
+    )
+    sample_token_counts[idx] += tokenized_q.size(0)
