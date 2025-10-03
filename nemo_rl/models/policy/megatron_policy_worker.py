@@ -97,6 +97,7 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
 
+import zmq
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -123,7 +124,6 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_gpu_info,
-    get_handle_from_tensor,
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
@@ -1542,6 +1542,17 @@ class MegatronPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    def get_zmq_address(self):
+        """Get the ZMQ address for the current device."""
+        return f"ipc:///{self.report_device_id()}.sock"
+
+    def maybe_init_zmq(self):
+        """Initialize the ZMQ socket if it doesn't exist."""
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.bind(self.get_zmq_address())
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
@@ -1553,12 +1564,10 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
         for name, tensor in hf_params_generator:
-            if self.is_generation_colocated:
-                metadata = (tensor.shape, tensor.dtype, tensor.numel())
-            else:
-                metadata = (tensor.shape, tensor.dtype)
+            metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
 
@@ -1613,120 +1622,35 @@ class MegatronPolicyWorker:
             )
         return param_info
 
-    @wrap_with_nvtx_name("megatron_policy_worker/prepare_weights_for_ipc")
-    def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
-        """Prepare Megatron model weights for IPC transfer to vLLM.
-
-        Collects information about weight tensors (names and sizes).
-        Returns a list of (parameter_name, size_in_bytes) tuples.
-        """
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
-        # Collect current available memory for refit
-        ## Get current device index from torch
         device_idx = torch.cuda.current_device()
-        ## Get device free memory using NVML
-        total_available_bytes = get_free_memory_bytes(device_idx)
-        ## default to 20% to get some more speedup than 10%, OOM if set to 30%
-        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
-        total_available_bytes *= float(memory_ratio)
-        self.refit_conversion_tasks_current_index = 0
-        return self.refit_param_info_mcore, total_available_bytes
+        return get_free_memory_bytes(device_idx)
 
-    # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/get_weights_ipc_handles")
-    def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
-        """Get IPC handles for the requested Megatron model weights.
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        self.maybe_init_zmq()
 
-        Args:
-            keys: List of parameter names to get handles for
-        Returns:
-            Dict mapping device UUID to list of (mapped_key, handle) tuples
-        """
-        if self._held_gather_buffer is not None:
-            del self._held_gather_buffer
-            self._held_gather_buffer = None
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        # extract the conversion tasks in this pack
-        conversion_tasks = self.refit_conversion_tasks[
-            self.refit_conversion_tasks_current_index : self.refit_conversion_tasks_current_index
-            + len(keys)
-        ]
-        self.refit_conversion_tasks_current_index += len(keys)
-
+        # Generate HF parameters for streaming
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=conversion_tasks,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
-        gathered_hf_params = {name: tensor for name, tensor in hf_params_generator}
 
-        # Get device UUID for IPC handles
-        device_uuid = self.report_device_id()
-
-        # Create IPC handles for each parameter
-        tensor_number_threshold = os.getenv(
-            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
-        )  # an arbitrary threshold
-        if len(gathered_hf_params) >= int(tensor_number_threshold):
-            pack_tensor_for_ipc = True
-        else:
-            pack_tensor_for_ipc = False
-
-        if pack_tensor_for_ipc:
-            # Pack tensors in gathered_hf_params into consolidated tensors by dtype
-            # First calculate total size needed for each dtype
-            type_to_total_size = defaultdict(lambda: 0)
-
-            # Record offset of the tensor
-            for key, tensor in gathered_hf_params.items():
-                type_to_total_size[tensor.dtype] += tensor.numel()
-
-            # Allocate consolidated tensors for each dtype
-            packed_tensors = {
-                dtype: torch.empty(
-                    total_size,
-                    device=next(iter(gathered_hf_params.values())).device,
-                    dtype=dtype,
-                    requires_grad=False,
-                )
-                for dtype, total_size in type_to_total_size.items()
-            }
-
-            dtype_to_offset = defaultdict(lambda: 0)
-            # Copy tensors into consolidated buffers
-            for key, tensor in gathered_hf_params.items():
-                dtype = tensor.dtype
-                size = tensor.numel()
-                packed_tensors[dtype][
-                    dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-                ].copy_(tensor.detach().view(-1))
-                dtype_to_offset[dtype] += size
-
-            # Create IPC handles for consolidated tensors
-            all_handles = [
-                (dtype, get_handle_from_tensor(tensor))
-                for dtype, tensor in packed_tensors.items()
-            ]
-
-            # Store reference to prevent garbage collection
-            self._held_gather_buffer = packed_tensors
-
-            serialized = (
-                pack_tensor_for_ipc,
-                all_handles,
-                tuple(gathered_hf_params.keys()),
-            )
-        else:
-            all_handles = []
-            for key, tensor in gathered_hf_params.items():
-                handle = get_handle_from_tensor(tensor)
-                all_handles.append((key, handle))
-            self._held_gather_buffer = gathered_hf_params
-            serialized = (False, all_handles)
-
-        return {device_uuid: serialized}
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=hf_params_generator,
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+        )
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
@@ -1734,6 +1658,7 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
         # broadcast from train rank0 worker to inference workers
         for _, tensor in hf_params_generator:
@@ -1794,9 +1719,8 @@ class MegatronPolicyWorker:
                         # Move the tensor to CPU and update the state dictionary
                         state[k] = v.to("cpu")
 
-        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-            gc.collect()
-            torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -1815,14 +1739,6 @@ class MegatronPolicyWorker:
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
-
-        if self._held_gather_buffer is not None:
-            del self._held_gather_buffer
-            self._held_gather_buffer = None
-
-        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
-            gc.collect()
-            torch.cuda.empty_cache()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
