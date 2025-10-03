@@ -40,7 +40,7 @@ policy:
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 2
+    context_parallel_size: 4
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
