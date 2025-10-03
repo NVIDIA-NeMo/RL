@@ -362,6 +362,9 @@ def sft_train(
     )
     timeout.start_iterations()
 
+    logger.log_config_dict(master_config, "train_config.json")
+    logger.log_config_dict(master_config, "train_config.yaml")
+
     if sft_save_state is None:
         sft_save_state = _default_sft_save_state()
         current_epoch = 0
