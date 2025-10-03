@@ -43,6 +43,9 @@ checkpoints/
 results/
 code_snapshots*/
 
+# Archive
+archive/
+
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
