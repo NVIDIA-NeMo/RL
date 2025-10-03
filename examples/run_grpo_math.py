@@ -19,7 +19,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 from omegaconf import OmegaConf
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoConfig, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -159,7 +159,17 @@ def main() -> None:
 
     init_ray()
 
-    # setup tokenizer
+    # setup tokenizer and preloading model to force HF to download the model and modules
+    # to avoid race condition inside generation/policy workers.
+    try:
+        _ = AutoConfig.from_pretrained(
+            config["policy"]["model_name"], trust_remote_code=True
+        )
+        print(f"Config preloaded successfully: {config['policy']['model_name']}")
+    except Exception as e:
+        print("WARNIN: error in preloading model, in general it's not a problem: ")
+        print(e)
+
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     assert config["policy"]["generation"] is not None, (
         "A generation config is required for GRPO"
