@@ -699,11 +699,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
-        """Update weights from IPC handles by delegating to the vLLM Worker implementation.
+    def update_weights_via_ipc_zmq(self) -> bool:
+        """Update weights from IPC handles via ZMQ socket.
 
         Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
+            None
 
         Returns:
             bool: True if weights were successfully updated, False otherwise.
@@ -718,37 +718,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
                 )
 
-            if self.tensor_parallel_size == 1:
-                # UniProcExecutor
-                assert len(self.vllm_device_ids) == 1
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_local_ipc_handles",
-                    args=(ipc_handles[self.vllm_device_ids[0]],),
-                )
-            else:
-                """
-                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
-                leading to unnecessary network serialization overhead and potential performance degradation.
-
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_global_ipc_handles", args=(ipc_handles,)
-                )
-                """
-                ray_worker_outputs = []
-                # MultiProcExecutor
-                for worker, device_id in zip(
-                    self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
-                ):
-                    ray_worker_outputs.append(
-                        worker.execute_method.remote(
-                            "update_weights_from_local_ipc_handles",
-                            ipc_handles[device_id],
-                        )
-                    )
-
-                # Gather the results
-                result_or_coro = ray.get(ray_worker_outputs)
-
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_via_ipc_zmq",
+                args=tuple(),
+            )
             worker_result = result_or_coro[0]
 
             if not worker_result:
