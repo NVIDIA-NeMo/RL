@@ -129,12 +129,12 @@ After completing your first training run:
 1. **Explore Algorithms**: Try [GRPO](../guides/training-algorithms/grpo) and [DPO](../guides/training-algorithms/dpo) training
 2. **Scale Up**: Set up [distributed training](cluster.md) for larger models
 3. **Optimize Performance**: Use [profiling tools](../development/nsys-profiling) for training optimization
-4. **Customize**: Learn to [add new models](../guides/model-development/adding-new-models) and environments
+4. **Customize**: Learn to [add new models](../guides/model-development/add-new-models) and environments
 5. **Deploy**: Follow the [troubleshooting guide](../guides/troubleshooting) for production deployment
 
 ## Get Help
 
 - [Troubleshooting](../guides/troubleshooting) - Common issues and solutions
-- [API Documentation](../apidocs/index) - Complete API documentation
+- [API Reference](../apidocs/index) - Complete API documentation
 - [Community Support](https://github.com/NVIDIA/NeMo-RL/issues) - GitHub issues and discussions
 

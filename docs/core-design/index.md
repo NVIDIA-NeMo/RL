@@ -99,6 +99,16 @@ Learn about padding strategies and their impact on training efficiency.
 {bdg-secondary}`Optimization`
 :::
 
+:::{grid-item-card} {octicon}`package;1.5em;sd-mr-1` Sequence Packing and Dynamic Batching
+:link: data-management/sequence-packing-and-dynamic-batching
+:link-type: doc
+
+Optimize training efficiency with sequence packing and dynamic batching techniques.
+
++++
+{bdg-warning}`Performance`
+:::
+
 ::::
 
 ## Computational Systems
@@ -141,6 +151,26 @@ Understand the checkpointing mechanisms and strategies for model state persisten
 
 +++
 {bdg-success}`Reliability`
+:::
+
+:::{grid-item-card} {octicon}`terminal;1.5em;sd-mr-1` Environment Variables
+:link: development-infrastructure/env-vars
+:link-type: doc
+
+Configure NeMo RL behavior with environment variables for debugging, performance, and customization.
+
++++
+{bdg-info}`Configuration`
+:::
+
+:::{grid-item-card} {octicon}`package;1.5em;sd-mr-1` UV Package Management
+:link: development-infrastructure/uv
+:link-type: doc
+
+Learn about UV-based dependency and environment management for NeMo RL development.
+
++++
+{bdg-secondary}`Tools`
 :::
 
 ::::

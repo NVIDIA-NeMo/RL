@@ -17,7 +17,7 @@ NeMo RL is an open-source, comprehensive framework for reinforcement learning an
 
 NeMo RL is an open-source framework that combines the power of reinforcement learning with large language models. It provides a unified platform for training and fine-tuning language models using state-of-the-art RL algorithms.
 
-The framework is designed for distributed training across multiple GPUs and nodes, supporting both research and production training environments. NeMo RL supports multiple backends including Hugging Face Transformers and Megatron-LM, and is focused exclusively on training and evaluation—it does not include production deployment or serving infrastructure.
+The framework supports distributed training across multiple GPUs and nodes in both research and production training environments. NeMo RL supports multiple backends including Hugging Face Transformers and Megatron-LM, and focuses exclusively on training and evaluation—it does not include production deployment or serving infrastructure.
 
 ::::{grid} 1 1 1 2
 :gutter: 2 2 2 2
@@ -71,27 +71,11 @@ Explore NeMo RL's key capabilities and technical highlights.
 - **DevOps Engineers**: Manage multi-node training clusters and distributed training infrastructure
 - **Data Scientists**: Fine-tune language models for specific domains and applications
 
-## Why Choose NeMo RL?
+## Key Capabilities
 
-NeMo RL is purpose-built for reinforcement learning with large language models, offering:
+NeMo RL is purpose-built for reinforcement learning with large language models. It provides scalable training from single GPUs to multi-node clusters, supports models from 0.6B to 70B+ parameters, and includes state-of-the-art algorithms (GRPO, DPO, SFT) with multiple backend options.
 
-### Scale and Performance
-- **Model Support**: 0.6B to 70B+ parameter models
-- **Advanced Parallelism**: FSDP2, Tensor Parallelism, Pipeline Parallelism, Context Parallelism
-- **Distributed Computing**: Ray-based orchestration across multiple nodes and GPUs
-- **Memory Optimization**: Gradient checkpointing, mixed precision, efficient batching
-
-### Algorithms and Flexibility
-- **State-of-the-Art Algorithms**: GRPO, DPO, SFT with optimized implementations
-- **Multiple Backends**: Hugging Face Transformers, Megatron-LM, vLLM integration
-- **Extensible Design**: Easy implementation of custom algorithms and environments
-- **Algorithm Development**: Clean interfaces for research and experimentation
-
-### Research and Collaboration
-- **Reproducibility**: Comprehensive logging and experiment tracking
-- **Standardized Workflows**: Consistent patterns for multi-institution projects
-- **Built-in Evaluation**: Evaluation frameworks and standardized metrics
-- **Training Focused**: Complete tooling for distributed training and evaluation
+For a comprehensive breakdown of features, capabilities, and technical specifications, see [Key Features](key-features).
 
 ## NeMo RL and Real-World Applications
 
@@ -101,7 +85,7 @@ For comprehensive guides with step-by-step implementation, architectural pattern
 
 ## Architecture
 
-NeMo RL's architecture is designed for distributed reinforcement learning with modular components, Ray-based coordination, and support for multiple training backends. The framework provides advanced scalability from single-GPU setups to multi-node clusters with thousands of GPUs.
+NeMo RL's architecture supports distributed reinforcement learning with modular components, Ray-based coordination, and multiple training backends. The framework provides advanced scalability from single-GPU setups to multi-node clusters with thousands of GPUs.
 
 For comprehensive details on system design, components, scalability, and technical specifications, see the [Architecture Overview](architecture-overview) documentation.
 
@@ -109,7 +93,7 @@ For comprehensive details on system design, components, scalability, and technic
 
 NeMo RL provides a comprehensive Python API for implementing custom reinforcement learning algorithms, environments, and training workflows. The framework offers clean interfaces for algorithm development, environment creation, and distributed training orchestration.
 
-For complete API documentation, code examples, and development guides, see the [API Documentation](../apidocs/index) section.
+For complete API documentation, code examples, and development guides, see the [API Reference](../apidocs/index) section.
 
 ## Get Started
 

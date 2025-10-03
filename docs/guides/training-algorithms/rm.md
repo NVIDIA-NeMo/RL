@@ -1,4 +1,4 @@
-# Reward Model Training in NeMo RL
+# Train Reward Models
 
 This document explains how to train reward models (RM) within NeMo RL. Currently, only Bradley-Terry reward models are supported on the DTensor backend. Megatron backend support is tracked [here](https://github.com/NVIDIA-NeMo/RL/issues/720).
 

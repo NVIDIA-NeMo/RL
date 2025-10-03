@@ -14,7 +14,7 @@ Welcome to the NeMo RL Guides! This comprehensive collection provides everything
 
 ## What You'll Find Here
 
-Our guides are organized into four core areas that cover the essential needs of NeMo RL practitioners:
+These guides cover four core areas that address the essential needs of NeMo RL practitioners:
 
 ### **Training Algorithms**
 Master the fundamental training techniques for reinforcement learning with language models. Learn supervised fine-tuning, preference optimization, and advanced RL algorithms like DPO and GRPO. This section provides the foundation for training high-quality language models with human feedback.
@@ -88,7 +88,7 @@ Model evaluation and benchmarking strategies for RL-trained models.
 :gutter: 2 2 2 2
 
 :::{grid-item-card} {octicon}`plus;1.5em;sd-mr-1` Add New Models
-:link: model-development/adding-new-models
+:link: model-development/add-new-models
 :link-type: doc
 
 Learn how to integrate custom models and architectures into NeMo RL training pipelines.
@@ -105,6 +105,16 @@ Handle model-specific behaviors and special cases in NeMo RL.
 
 +++
 {bdg-warning}`Advanced`
+:::
+
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Use DeepSeek Models
+:link: model-development/deepseek
+:link-type: doc
+
+Convert and configure DeepSeek models for training in NeMo RL.
+
++++
+{bdg-primary}`Practical`
 :::
 
 ::::

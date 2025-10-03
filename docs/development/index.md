@@ -51,7 +51,7 @@ Debug NeMo RL applications using Ray distributed debugger for worker/actor proce
 :::
 
 :::{grid-item-card} {octicon}`book;1.5em;sd-mr-1` Build Documentation
-:link: documentation
+:link: BUILD_INSTRUCTIONS
 :link-type: doc
 
 Build and contribute to NeMo RL documentation with Sphinx.

@@ -30,7 +30,7 @@ What you can expect:
 - **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
-Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/main/docs/design-docs) for more details on the architecture and design philosophy.
+Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/main/docs/core-design) for more details on the architecture and design philosophy.
 
 ### Training Backends
 NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
@@ -38,7 +38,7 @@ NeMo RL supports multiple training backends to accommodate different model sizes
 - **DTensor** - PyTorch's next-generation distributed training with improved memory efficiency (PyTorch-native TP, SP, PP, CP, and FSDP2).
 - [**Megatron**](https://github.com/NVIDIA-NeMo/Megatron-Bridge) - NVIDIA's high-performance training framework for scaling to large models with 6D parallelisms.
 
-The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
+The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/core-design/computational-systems/training-backends.md).
 
 ### Generation Backends
 NeMo RL supports multiple generation/rollout backends to accommodate different model sizes and hardware configurations:
@@ -46,7 +46,7 @@ NeMo RL supports multiple generation/rollout backends to accommodate different m
 - [**vLLM**](https://github.com/vllm-project/vllm) - A high-throughput and memory-efficient popular inference and serving engine.
 - [**Megatron**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference) - A high-performance Megatron-native inference backend which eliminates weight conversion between training and inference.
 
-For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](docs/design-docs/generation.md).
+For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](docs/core-design/design-principles/generation.md).
 
 ## Features
 
@@ -259,7 +259,7 @@ uv run python examples/run_grpo_math.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
-For additional details on supported backends and how to configure the training backend to suit your setup, refer to the [Training Backends documentation](docs/design-docs/training-backends.md).
+For additional details on supported backends and how to configure the training backend to suit your setup, refer to the [Training Backends documentation](docs/core-design/computational-systems/training-backends.md).
 
 ### GRPO Multi-node
 
@@ -533,7 +533,7 @@ uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
 
 > **Note:** Adjust the paths according to your training output directory structure.
 
-For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/design-docs/checkpointing.md).
+For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/core-design/development-infrastructure/checkpointing.md).
 
 ### Run Evaluation
 
