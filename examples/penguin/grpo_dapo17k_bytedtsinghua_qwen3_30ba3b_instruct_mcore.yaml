@@ -14,6 +14,7 @@ policy:
   optimizer: null
   scheduler: null
 
+  # As of Thu Oct 02, 2025, we need sequence packing enabled to use context parallelism (CP) in mcore.
   sequence_packing:
     enabled: true
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
@@ -24,6 +25,8 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
+      # This is a very low GPU mem utilization. We GPU OOM in two places:
+      # Refit after train, refit before validation.
       gpu_memory_utilization: 0.5
 
   # Needs to be set to whatever backend TP size.
@@ -36,13 +39,18 @@ policy:
     converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
+    # We set this to 8, the number of GPUs in one node
     expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
+    # The context parallel size times the tensor model parallel size should equal 8.
     context_parallel_size: 4
     pipeline_dtype: ${policy.precision}
+    # Sequence parallel is required for expert parallel
     sequence_parallel: true
+    # Apparently freezing the MoE router and using fp64 here stabilizes training
+    # This is possibly related to some refit issues.
     freeze_moe_router: true
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
