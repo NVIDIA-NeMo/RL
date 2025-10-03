@@ -14,6 +14,13 @@ policy:
   optimizer: null
   scheduler: null
 
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
   generation:
     vllm_cfg:
       tensor_parallel_size: 2  # May need to set this to 4
@@ -27,13 +34,13 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 1
+    context_parallel_size: 2
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
