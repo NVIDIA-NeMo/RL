@@ -37,7 +37,7 @@ def mock_components():
     student_policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
-        "all_mb_metrics": {},
+        "all_mb_metrics": {"global_valid_toks": [10]},
     }
     # Add generate method since student_generation will be set to student_policy
     student_policy.generate.return_value = {

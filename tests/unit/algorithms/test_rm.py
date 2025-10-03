@@ -35,6 +35,7 @@ def mock_components():
             "rewards_chosen_mean": [4.5],
             "rewards_rejected_mean": [3.5],
             "num_valid_samples": [1.0],
+            "global_valid_toks": [10],
         },
     }
 
@@ -103,6 +104,10 @@ def mock_components():
             "enabled": False,
             "checkpoint_must_save_by": None,
             "save_period": 10,
+        },
+        "cluster": {
+            "num_nodes": 1,
+            "gpus_per_node": 2,
         },
     }
 
