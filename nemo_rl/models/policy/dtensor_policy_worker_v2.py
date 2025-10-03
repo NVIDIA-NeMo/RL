@@ -22,6 +22,7 @@ from typing import Any, Generator, Optional, cast
 
 import ray
 import torch
+import zmq
 from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
@@ -62,7 +63,6 @@ from transformers import (
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
-import zmq
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1670,9 +1670,7 @@ class DTensorPolicyWorkerV2:
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
-            assert tensor.dtype == self.dtype, (
-                f"Tensor {name} has dtype {tensor.dtype} but expected {self.dtype}"
-            )
+            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
         return state_dict_info
@@ -1698,10 +1696,10 @@ class DTensorPolicyWorkerV2:
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
                     # Convert to target dtype
-                    yield name, full_tensor.to(self.dtype, non_blocking=True)
+                    yield name, full_tensor.to(self.dtype, non_blocking=True).contiguous()
                 else:
                     # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True)
+                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(

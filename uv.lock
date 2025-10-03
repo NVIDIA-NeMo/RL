@@ -2914,6 +2914,7 @@ dependencies = [
     { name = "omegaconf" },
     { name = "pillow" },
     { name = "plotly" },
+    { name = "pyzmq" },
     { name = "ray", extra = ["default"] },
     { name = "rich" },
     { name = "setuptools" },
@@ -2931,7 +2932,6 @@ dependencies = [
     { name = "triton", version = "3.3.1", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
     { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "wandb" },
-    { name = "zmq" },
 ]
 
 [package.optional-dependencies]
@@ -3029,6 +3029,7 @@ requires-dist = [
     { name = "omegaconf" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "plotly" },
+    { name = "pyzmq" },
     { name = "ray", extras = ["default"], specifier = "==2.46.0" },
     { name = "rich" },
     { name = "setuptools" },
@@ -3049,7 +3050,6 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.10.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.10.0" },
     { name = "wandb" },
-    { name = "zmq" },
 ]
 provides-extras = ["automodel", "vllm", "mcore"]
 
@@ -6703,12 +6703,3 @@ sdist = { url = "https://files.pythonhosted.org/packages/e3/02/0f2892c661036d50e
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/54/647ade08bf0db230bfea292f893923872fd20be6ac6f53b2b936ba839d75/zipp-3.23.0-py3-none-any.whl", hash = "sha256:071652d6115ed432f5ce1d34c336c0adfd6a884660d1e9712a256d3d3bd4b14e", size = 10276, upload-time = "2025-06-08T17:06:38.034Z" },
 ]
-
-[[package]]
-name = "zmq"
-version = "0.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pyzmq" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/6e/78/833b2808793c1619835edb1a4e17a023d5d625f4f97ff25ffff986d1f472/zmq-0.0.0.tar.gz", hash = "sha256:6b1a1de53338646e8c8405803cffb659e8eb7bb02fff4c9be62a7acfac8370c9", size = 966, upload-time = "2015-05-21T17:34:26.603Z" }

@@ -15,9 +15,9 @@ import gc
 from typing import Any
 
 import torch
+import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-import zmq
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 try:
