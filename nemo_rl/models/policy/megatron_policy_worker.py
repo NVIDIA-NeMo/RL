@@ -1530,10 +1530,11 @@ class MegatronPolicyWorker:
         pass
 
     def report_device_id(self) -> str:
-        """Report the UUID of the current CUDA device using NVML.
-
+        """
+        Return the NVML UUID of the currently selected CUDA device.
+        
         Returns:
-            str: UUID of the device in the format "GPU-xxxxx"
+            str: NVML device UUID string (e.g., "GPU-xxxxx").
         """
         from nemo_rl.utils.nvml import get_device_uuid
 
@@ -1543,11 +1544,22 @@ class MegatronPolicyWorker:
         return get_device_uuid(device_idx)
 
     def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
+        """
+        Get the ZMQ IPC address for this worker's current CUDA device.
+        
+        Returns:
+            str: IPC address string for the device-specific ZMQ socket (e.g., "ipc:///tmp/<device_uuid>.sock").
+        """
         return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
+        """
+        Lazily create and bind a ZMQ REQ socket for this worker's device-specific IPC address.
+        
+        If a socket is already present on the instance, the function is a no-op. Otherwise it
+        creates a new zmq.Context, a REQ socket, and binds that socket to the address returned
+        by get_zmq_address().
+        """
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
@@ -1557,6 +1569,14 @@ class MegatronPolicyWorker:
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         # Get parameter info for refit / mcore side info
+        """
+        Gather information required for weight refitting on both the MCORE and HF sides.
+        
+        Populates self.refit_param_info_mcore with per-parameter size information used by MCORE, and returns a mapping of HF parameter metadata collected from the model export.
+        
+        Returns:
+            dict: Mapping from HF parameter name (str) to a tuple (shape, dtype).
+        """
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info
@@ -1572,18 +1592,18 @@ class MegatronPolicyWorker:
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
-        """Calculate parameter information for refit.
-
-        Each task contains:
-        - param_name: Local parameter name without module prefixes
-        - mapping: MegatronParamMapping instance for weight transformation
-        - pp_rank: Pipeline-parallel rank owning the parameter
-        - vp_stage: Virtual-pipeline stage index
-        - megatron_module: Reference to Megatron model/submodule
-        - param_weight: Target parameter tensor for converted weight
-
+        """
+        Compute the byte size required for each parameter involved in refitting and populate conversion tasks.
+        
+        This method populates self.refit_conversion_tasks from the megatron bridge, then computes a size in bytes for each conversion task's target parameter by accounting for:
+        - tensor element size and number of elements,
+        - tensor-parallel (tp) and expert-parallel (ep) replication factors,
+        - the ratio between the worker's configured dtype and the parameter's storage dtype.
+        
+        If a local parameter tensor is not present on this pipeline-parallel rank, the size value will be `None` and is broadcasted across PP ranks.
+        
         Returns:
-            List of (parameter_name, size_in_bytes) tuples.
+            list[tuple[str, int | None]]: A list of (parameter_name, size_in_bytes) tuples where `size_in_bytes` is the total bytes required for the parameter across TP/EP shards, or `None` when the local parameter is missing.
         """
         self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
             [self.model]
@@ -1623,7 +1643,11 @@ class MegatronPolicyWorker:
         return param_info
 
     def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
+        """
+        Get available free GPU memory for the current CUDA device.
+        
+        @returns int: Number of free bytes of GPU memory available on the current CUDA device.
+        """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
         device_idx = torch.cuda.current_device()
@@ -1632,6 +1656,12 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """
+        Stream the model's Hugging Face-exported weights to peers over a ZMQ IPC socket.
+        
+        Parameters:
+            buffer_size_bytes (int): Size in bytes of the IPC buffer to use for streaming; use 0 to let the streaming implementation pick a default.
+        """
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -1654,7 +1684,11 @@ class MegatronPolicyWorker:
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights for collective communication."""
+        """
+        Export the model's HF-format tensors and broadcast each tensor from the training rank 0 to all ranks in the model_update_group.
+        
+        This ensures all collective participants receive identical weights for inference or synchronized updates.
+        """
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
@@ -1693,7 +1727,11 @@ class MegatronPolicyWorker:
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
+        """
+        Move model gradient buffers and optimizer state tensors to CPU and free GPU memory.
+        
+        This method moves the active model's parameter gradients to CPU, transfers any CUDA tensors held in the optimizer state to CPU (if an optimizer is present), triggers the CUDA allocator, runs garbage collection, and empties the CUDA cache to reduce GPU memory usage.
+        """
         no_grad = torch.no_grad()
         no_grad.__enter__()
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -1732,6 +1770,11 @@ class MegatronPolicyWorker:
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
+        """
+        Offload model and optimizer state to CPU and perform post-refit memory cleanup.
+        
+        Moves the active model to the CPU, sets it to evaluation mode, warms the CUDA allocator, calls offload_before_refit to free additional GPU-resident buffers and optimizer state, and prints the current GPU memory allocation and reservation.
+        """
         no_grad = torch.no_grad()
         no_grad.__enter__()
         # Offload as much as possible on the CPU

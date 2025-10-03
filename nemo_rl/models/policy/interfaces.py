@@ -155,12 +155,26 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """
+        Prepare information required to refit or reinitialize the policy.
+        
+        Returns:
+            refit_info (Optional[dict[str, Any]]): A dictionary containing metadata and any auxiliary data needed to perform a refit or reinitialization (for example, state identifiers, weight references, or placement hints). Returns `None` if no refit is required.
+        """
         pass
 
     @abstractmethod
     def stream_weights_via_ipc_zmq(
         self, *args: Any, **kwargs: Any
     ) -> list[ray.ObjectRef]:
+        """
+        Streams model weights over an IPC channel using ZeroMQ and returns Ray object references for the streamed payload.
+        
+        Accepts backend-specific positional and keyword arguments to control streaming behavior (for example: destination endpoints, chunking/batching parameters, compression options, or transfer metadata).
+        
+        Returns:
+            list[ray.ObjectRef]: Ray ObjectRefs referencing streamed weight shards or transfer handles.
+        """
         pass
 
     @abstractmethod

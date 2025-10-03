@@ -158,6 +158,24 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        """
+        Initialize the DTensorPolicyWorker by configuring distributed runtime, loading and sharding the model, and preparing optimizer/scheduler state.
+        
+        Parameters:
+            config (PolicyConfig): Worker configuration containing model name, dtensor settings (dp/tp/cp sizes, cpu_offload, sequence_parallel),
+                precision, optimizer/scheduler settings, generation and sequence_packing flags, and optional reward model configuration.
+            tokenizer (AutoTokenizer): Tokenizer to associate with the model; used to ensure pad token consistency.
+            processor (Optional[AutoProcessor]): Optional multimodal processor; presence indicates a VLM model.
+            weights_path (Optional[str]): Path to checkpoint to load model/optimizer/scheduler weights from; if None, initialization starts from scratch.
+            optimizer_path (Optional[str]): Optional separate path for optimizer state when restoring from checkpoint.
+            init_optimizer (bool): If True, construct the optimizer from configuration; otherwise leave optimizer as None.
+            init_reference_model (bool): If True, save a CPU copy of the initialized model state dict to serve as a reference model.
+            **kwargs: Additional keyword arguments (reserved for future extensions).
+        
+        Raises:
+            ValueError: If an unknown precision is specified in the config.
+            NotImplementedError: If a reward model is enabled while sequence packing is active.
+        """
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -1691,11 +1709,20 @@ class DTensorPolicyWorker:
         return get_device_uuid(device_idx)
 
     def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
+        """
+        Constructs the IPC ZMQ socket address derived from this worker's device identifier.
+        
+        Returns:
+            address (str): IPC-style ZMQ address for the worker's device (e.g., "ipc:///tmp/<device_uuid>.sock").
+        """
         return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
+        """
+        Ensure a ZeroMQ REQ socket is created and bound to this worker's IPC address if one does not already exist.
+        
+        Creates a zmq.Context and a zmq REQ socket, sets send/receive timeouts to 30 seconds and linger to 0, binds the socket to the address returned by `get_zmq_address()`, and stores the context and socket on `self` as `zmq_context` and `zmq_socket`. No action is taken if `self.zmq_socket` already exists.
+        """
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
@@ -1706,6 +1733,12 @@ class DTensorPolicyWorker:
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """
+        Create a mapping describing the model's state dictionary shapes and the target dtype for refitting.
+        
+        Returns:
+            state_dict_info (Optional[dict[str, Any]]): A dict mapping each state_dict key (parameter or buffer name) to a tuple (shape, dtype) where `shape` is the tensor shape and `dtype` is the worker's target dtype to which tensors will be cast.
+        """
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
@@ -1714,7 +1747,12 @@ class DTensorPolicyWorker:
         return state_dict_info
 
     def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
+        """
+        Return the amount of free GPU memory on the current CUDA device in bytes.
+        
+        Returns:
+            free_memory_bytes (int): Available free memory on the current CUDA device, in bytes.
+        """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
         device_idx = torch.cuda.current_device()
@@ -1723,12 +1761,27 @@ class DTensorPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """
+        Stream the current model's weights over an IPC ZMQ socket to a collector.
+        
+        This method ensures a local ZMQ REQ socket is initialized and then streams every entry from the model's state dict over IPC. DTensor parameters are converted to full local tensors and all tensors are cast to the worker's configured dtype before being sent. Uses a shared implementation helper to perform chunking and transfer and identifies the sender by this worker's rank and name.
+        
+        Parameters:
+            buffer_size_bytes (int): Optional maximum IPC buffer size in bytes to use for streaming; a value of 0 lets the helper choose a default.
+        """
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            """
+            Yield (name, tensor) pairs for the model's state dictionary, converting any DTensor values to full local tensors and casting each tensor to the worker's target dtype.
+            
+            Each yielded tensor is converted to self.dtype with non-blocking transfer and returned as a contiguous tensor.
+            
+            Returns:
+                Iterator[Tuple[str, torch.Tensor]]: Pairs of parameter/buffer name and the corresponding tensor prepared for streaming.
+            """
             for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
@@ -1753,7 +1806,11 @@ class DTensorPolicyWorker:
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights for collective communication."""
+        """
+        Ensure model weights are broadcast to all ranks for collective communication.
+        
+        If cpu_offload is enabled, the model is temporarily moved to CUDA before broadcasting and moved back to CPU afterwards. DTensor entries are converted to full tensors before broadcasting. On rank 0, tensors are cast to the worker dtype and broadcast via the configured collective group.
+        """
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
@@ -1827,6 +1884,11 @@ class DTensorPolicyWorker:
     @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         # Offload as much as possible on the CPU
+        """
+        Move the model to CPU, run optimizer/state offload, and report post-offload GPU memory usage.
+        
+        This method moves the active model to CPU and switches it to evaluation mode, performs any additional offload steps (optimizer and related state) via offload_before_refit, and prints current CUDA memory allocation and reservation after offloading.
+        """
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator

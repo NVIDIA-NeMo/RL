@@ -730,7 +730,12 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+        """
+        Distribute refit-related state-dictionary metadata to all workers and wait for them to process it.
+        
+        Parameters:
+            state_dict_info (dict[str, Any]): Mapping containing metadata required for refitting (for example, state-dict identifiers, shapes, and any worker-visible handles or locations). This data is sent to every worker and must contain the keys/values the worker-side `prepare_refit_info` implementation expects.
+        """
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"
@@ -749,7 +754,15 @@ class VllmGeneration(GenerationInterface):
         ray.get(futures)
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
-        """Update weights of the policy using IPC handles via ZMQ socket."""
+        """
+        Trigger workers to update their model weights via IPC over ZMQ and return futures for the operations.
+        
+        Raises:
+            RuntimeError: If the worker group is not initialized.
+        
+        Returns:
+            list[ray.ObjectRef]: A list of Ray object references (futures) for the per-worker update tasks; callers should await these futures to observe completion or errors.
+        """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
@@ -770,7 +783,17 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Update weights of the policy using collective communication."""
+        """
+        Trigger a collective weight update across all workers.
+        
+        Selects the synchronous or asynchronous worker method according to the vllm async_engine configuration and invokes it on all workers.
+        
+        Returns:
+            list[ray.ObjectRef]: Ray object references for the invoked worker tasks; callers should wait on these futures to ensure completion.
+        
+        Raises:
+            RuntimeError: If the worker group is not initialized or contains no workers.
+        """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 

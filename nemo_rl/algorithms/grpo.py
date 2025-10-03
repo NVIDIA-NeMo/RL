@@ -493,14 +493,20 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
 ) -> None:
-    """Refit the policy generation interface with the latest policy weights.
-
-    Args:
-        policy: The policy to provide weights to the inference engine.
-        policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
+    """
+    Refit the generation engine with the policy's current weights.
+    
+    When called, this updates the inference engine's weights from the provided policy and prepares the generation engine for generation before and after the transfer as needed. If colocated_inference is True the function streams weights via an IPC/ZMQ path using a buffer size determined by _refit_buffer_size_gb or by a memory-ratio environment variable; otherwise it uses an NCCL collective broadcast. The function waits for the transfer and update futures to complete and raises a RuntimeError if any update reports failure.
+    
+    Parameters:
+        policy: Policy providing the source weights and offload hooks used around refit.
+        policy_generation: Inference engine to receive updated weights and to be prepared for generation.
+        colocated_inference: If True, use IPC/ZMQ streaming and offload/restore hooks appropriate for colocated inference; if False, use NCCL collectives.
+        _refit_buffer_size_gb: Optional buffer size in gigabytes for IPC streaming. If None, the buffer size is computed from the policy's available free memory multiplied by the NRl_REFIT_BUFFER_MEMORY_RATIO environment variable (default "0.15"). Primarily provided for testing overrides.
+        timer: Optional Timer used to time the prepare/transfer/update phase; if provided the timing is recorded under the "prepare_for_generation/transfer_and_update_weights" key.
+    
+    Raises:
+        RuntimeError: If the weight update process reports any failures.
     """
     if colocated_inference:
         policy.offload_before_refit()

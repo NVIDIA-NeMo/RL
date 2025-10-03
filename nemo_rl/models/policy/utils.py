@@ -246,7 +246,11 @@ def get_megatron_checkpoint_dir() -> str:
 
 
 def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
-    """Get IPC handle from a tensor."""
+    """
+    Extract an inter-process communication (IPC) handle and accompanying metadata for a tensor.
+    
+    The returned tuple contains the IPC handle followed by auxiliary data required to reconstruct the tensor in another process.
+    """
     from torch.multiprocessing.reductions import reduce_tensor
 
     # skip serializing the function for better refit performance
@@ -254,14 +258,15 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
 
 
 def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
-    """Calculate aligned size for memory alignment.
-
-    Args:
-        size_bytes: Size in bytes to align
-        alignment: Alignment boundary in bytes (default 512)
-
+    """
+    Compute the smallest byte size greater than or equal to `size_bytes` that is a multiple of `alignment`.
+    
+    Parameters:
+        size_bytes (int): Original size in bytes to be rounded up.
+        alignment (int): Byte boundary to align to (default 512).
+    
     Returns:
-        Aligned size in bytes
+        int: The aligned size in bytes, which is the smallest multiple of `alignment` >= `size_bytes`.
     """
     return int(((size_bytes + alignment - 1) // alignment) * alignment)
 
@@ -269,21 +274,32 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 def stream_weights_via_ipc_zmq_impl(
     params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
 ) -> None:
-    """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
-
-    Uses double buffering to enable overlapping communication while reusing buffers
-    to reduce memory allocation overhead and improve stability.
-
-    Args:
-        params_generator: Generator yielding (name, tensor) pairs
-        buffer_size_bytes: Size of buffer in bytes for batching parameters
-        zmq_socket: ZMQ socket for communication
-        rank: Worker rank for logging
-        worker_name: Name of the worker for logging
+    """
+    Stream model parameter tensors via ZeroMQ using CUDA IPC with double buffering.
+    
+    Streams (name, tensor) pairs from params_generator in memory-aligned batches into fixed-size GPU-backed buffers, serializes an IPC handle plus the packed parameter names and used byte count to zmq_socket for remote reconstruction, and signals completion when all parameters are sent. Uses two reusable buffers to overlap packing and transmission, enforces per-parameter alignment and buffer-size limits, and performs final CUDA synchronization before sending a terminal "complete" message.
+    
+    Parameters:
+        params_generator: An iterator yielding (name: str, tensor: torch.Tensor) pairs to transmit.
+        buffer_size_bytes: Size in bytes of each GPU buffer used to accumulate packed parameters; each parameter must fit within this size after alignment.
+        zmq_socket: A connected ZeroMQ socket used to send Python-serializable payloads (IPC handle, tuple of parameter names, used byte count) and to perform synchronization handshakes with the receiver.
+        rank: Integer worker rank used only for optional logging.
+        worker_name: Human-readable identifier used only for optional logging.
     """
 
     def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
-        """Send a group of parameters and return new pending_recv state."""
+        """
+        Send a packed buffer of parameters via the configured ZMQ socket and indicate that a receive is now pending.
+        
+        Parameters:
+            buffer (torch.Tensor): The contiguous device buffer containing packed parameter bytes.
+            param_names (list[str] | tuple[str]): Names of parameters included in this buffer.
+            used_bytes (int): Number of valid bytes in `buffer` to send.
+            await_recv (bool): If True, block until a preceding receive has been consumed before sending.
+        
+        Returns:
+            bool: `True` to indicate a receive is now pending after this send.
+        """
         # Synchronize before getting IPC handle to ensure data is ready
         torch.cuda.current_stream().synchronize()
         cuda_ipc_handle = get_handle_from_tensor(buffer)
@@ -296,7 +312,15 @@ def stream_weights_via_ipc_zmq_impl(
         return True  # pending_recv = True
 
     def allocate_buffer(device):
-        """Allocate a new aligned buffer with proper memory alignment."""
+        """
+        Allocate a new byte buffer whose size is rounded up to the configured alignment and placed on the given device.
+        
+        Parameters:
+            device (torch.device | str): Device on which to allocate the buffer.
+        
+        Returns:
+            torch.Tensor: A 1-D `torch.uint8` tensor allocated on `device` with length equal to the aligned buffer size.
+        """
         aligned_size = calculate_aligned_size(buffer_size_bytes)
         return torch.empty(
             aligned_size,
@@ -306,7 +330,17 @@ def stream_weights_via_ipc_zmq_impl(
         )
 
     def pack_tensor(buffer, tensor, used_bytes) -> int:
-        """Pack tensor into buffer and return new used_bytes."""
+        """
+        Pack a tensor's raw bytes into a contiguous byte buffer at the specified offset.
+        
+        Parameters:
+            buffer (torch.Tensor): 1D `uint8` tensor serving as the destination buffer.
+            tensor (torch.Tensor): Source tensor whose raw bytes will be copied into `buffer`.
+            used_bytes (int): Byte offset within `buffer` where the tensor bytes will be written.
+        
+        Returns:
+            int: New byte offset after the tensor was written, rounded up to the alignment boundary.
+        """
         tensor_bytes = tensor.nbytes
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
             tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
