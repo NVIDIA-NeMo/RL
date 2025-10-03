@@ -39,6 +39,7 @@ policy:
 ```yaml
 grpo:
   async_grpo:
+    enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
 ```
 
@@ -62,6 +63,7 @@ grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 4
   async_grpo:
+    enabled: true
     max_trajectory_age_steps: 1
 
 cluster:
