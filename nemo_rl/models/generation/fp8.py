@@ -40,6 +40,7 @@ class FP8Config:
     num_first_layers_in_bf16: int = 0
     num_last_layers_in_bf16: int = 0
     model_parallel_size: int = None
+    kv_cache_dtype: str = "auto"
 
 
 @dataclass()
@@ -104,6 +105,106 @@ def monkey_patch_vllm_ray_executor(fp8_config):
         fp8_patches_applied = True
 
 
+def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    """
+    Modified version of BaseKVCacheMethod.process_weights_after_loading that doesn't delete
+    k_scale, v_scale, q_scale, and prob_scale parameters to allow for dynamic updates.
+    """
+    import torch
+    from vllm.logger import init_logger
+    from vllm.platforms import current_platform
+    
+    logger = init_logger(__name__)
+    
+    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    # No need to process kv scales after loading if we are going to
+    # calculate them on the fly.
+    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            # We prefer to use separate k_scale and v_scale if present
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            # If no scales were loaded (both scales are invalid negative
+            # values), use the default value of 1.0
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            # If we find a single kv_scale in the checkpoint, we remap
+            # kv_scale to k_scale during weight loading, and duplicate
+            # k_scale to v_scale here
+            assert layer.k_scale > 0.0
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+
+        if not isinstance(k_scale, float) or not isinstance(
+                v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor "
+                             "for fp8 KV cache")
+
+        if layer.q_scale < 0.0:
+            logger.warning_once(
+                "Checkpoint does not provide a q scaling factor. "
+                "Setting it to k_scale. This only matters for "
+                "the flash-attn backend.")
+            layer._q_scale.copy_(k_scale)
+        # These are used in the final Attention.forward()
+        layer._k_scale.copy_(k_scale)
+        layer._v_scale.copy_(v_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+        if (k_scale == 1.0 and v_scale == 1.0
+                and "e5m2" not in layer.kv_cache_dtype):
+            logger.warning_once(
+                "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
+                "may cause accuracy issues. Please make sure k/v_scale "
+                "scaling factors are available in the fp8 checkpoint.")
+
+    if layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    is_singleton_float = lambda x: isinstance(x, float) or isinstance(
+        x, torch.Tensor) and x.numel() == 1 and x.is_floating_point()
+    if not is_singleton_float(q_scale) or not is_singleton_float(
+            prob_scale):
+        raise ValueError("Only support per-tensor scaling factor"
+                         "for fp8-quantized Q/prob")
+
+    # These are used in the final Attention.forward()
+    layer._q_scale.copy_(q_scale)
+    layer._prob_scale.copy_(prob_scale)
+    if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0
+                                          or prob_scale == 1.0):
+        logger.warning_once(
+            f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
+            f"{prob_scale} with fp8 attention. This may cause accuracy "
+            "issues. Please make sure q/prob scaling factors are "
+            "available in the fp8 checkpoint.")
+
+    # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
+    # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
+    print(f"[KV_SCALES] Patched process_weights_after_loading: keeping k_scale, v_scale parameters for dynamic updates")
+
+
 def apply_fp8_patches(self, fp8_config):
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
@@ -129,6 +230,11 @@ def apply_fp8_patches(self, fp8_config):
         patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
         fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
+    # Patch the vllm kv_cache.py process_weights_after_loading() to remove the deletion of k_scale and v_scale
+    func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+    patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
+    fp8_state.vllm_patches.append(patcher5)
+
     for p in fp8_state.vllm_patches:
         p.start()
 
@@ -151,6 +257,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
+        kv_cache_dtype=vllm_cfg.get("kv_cache_dtype", "auto"),
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
@@ -168,6 +275,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
@@ -192,8 +300,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
 
+    # TODO: Remove this after debugging.
+    print(f"[KV_SCALES] Global FP8 config: {global_fp8_config}")
     vllm_kwargs = {
         "quantization": "fp8",
+        # Conditionally set kv_cache_dtype to fp8 if global config kv_cache_dtype is fp8
+        "kv_cache_dtype": "fp8" if global_fp8_config.kv_cache_dtype == "fp8" else "auto",
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
     return vllm_kwargs
