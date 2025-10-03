@@ -177,12 +177,6 @@ class DTensorPolicyWorker:
         # with different order of node_bundles
         configure_dynamo_cache()
 
-        ## used for streaming update inference engine weights
-        self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
-            None
-        )
-        self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
-
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
@@ -1698,19 +1692,25 @@ class DTensorPolicyWorker:
 
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
-        return f"ipc:///{self.report_device_id()}.sock"
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
+            assert tensor.dtype == self.dtype, (
+                f"Tensor {name} has dtype {tensor.dtype} but expected {self.dtype}"
+            )
             state_dict_info[name] = (tensor.shape, self.dtype)
 
         return state_dict_info
@@ -1736,10 +1736,13 @@ class DTensorPolicyWorker:
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
                     # Convert to target dtype
-                    yield name, full_tensor.to(self.dtype, non_blocking=True)
+                    yield (
+                        name,
+                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                    )
                 else:
                     # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True)
+                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(

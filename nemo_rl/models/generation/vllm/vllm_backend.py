@@ -56,7 +56,7 @@ class VllmInternalWorkerExtension:
 
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
-        return f"ipc:///{self.report_device_id()}.sock"
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
@@ -64,7 +64,7 @@ class VllmInternalWorkerExtension:
             self.zmq_context = zmq.Context()  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
-            )  
+            )
             # Set receive timeout to 30 seconds to avoid hanging indefinitely
             self.zmq_socket.setsockopt(
                 zmq.RCVTIMEO, 30000
@@ -132,7 +132,7 @@ class VllmInternalWorkerExtension:
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
                 assert offset == used_bytes, (
-                    "Offset is not equal to used bytes, usually indicate key info inaccurate like dtype"
+                    "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
                 # Load weights into the model
                 from nemo_rl.models.generation import fp8
