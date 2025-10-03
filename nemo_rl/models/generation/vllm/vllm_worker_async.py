@@ -393,7 +393,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return thread, base_url, server
 
     async def init_collective_async(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         await self.llm.collective_rpc(
             "init_collective",
@@ -402,6 +407,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 ip,
                 port,
                 world_size,
+                train_world_size,
             ),
         )
 
