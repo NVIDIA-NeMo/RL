@@ -10,7 +10,7 @@ modality: "universal"
 
 # NeMo RL Documentation
 
-Welcome to the NeMo RL documentation. This page provides a quick overview of the docs: About, Get Started, Guides, Core Design, Advanced Topics, Learning Resources, API Documentation, and References.
+Welcome to the NeMo RL documentation. This page provides a quick overview of the docs: About, Get Started, Learning Resources, Guides, Development, Core Design, and API Reference.
 
 ## Quick Navigation
 
@@ -77,11 +77,11 @@ Understand NeMo RL's architecture, design principles, computational systems, and
 {bdg-info}`Architecture` {bdg-secondary}`Design`
 :::
 
-::: {grid-item-card} {octicon}`code;1.5em;sd-mr-1` API Documentation
+::: {grid-item-card} {octicon}`code;1.5em;sd-mr-1` API Reference
 :link: apidocs/index
 :link-type: doc
 
-Complete API reference for algorithms, models, data, environments, and distributed training components.
+Technical reference for algorithms, models, data, environments, and distributed training components.
 
 +++
 {bdg-info}`API` {bdg-secondary}`Reference`
@@ -183,7 +183,7 @@ Home <self>
 
 ```{toctree}
 :hidden:
-:caption: About NeMo RL
+:caption: About
 :maxdepth: 2
 about/index
 about/purpose
@@ -251,7 +251,7 @@ learning-resources/use-cases/index
 
 ```{toctree}
 :hidden:
-:caption: API Documentation
+:caption: Reference
 :maxdepth: 2
 apidocs/index
 ```

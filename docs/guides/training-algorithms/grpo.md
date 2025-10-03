@@ -22,7 +22,7 @@ We recommend launching the job using `uv`:
 uv run examples/run_grpo_math.py --config <PATH TO YAML CONFIG> {overrides}
 ```
 
-The script, [examples/run_grpo_math.py](../../../examples/run_grpo_math.py), can be used to launch an experiment.
+Use the script [examples/run_grpo_math.py](../../../examples/run_grpo_math.py) to launch an experiment.
 
 If not specified, `config` will default to `examples/configs/grpo_math_1B.yaml`.
 
@@ -178,7 +178,7 @@ where:
 Also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
 imposes an additional upper bound on the probability ratio when advantages are negative.
 This prevents excessive policy updates. $rA \ll 0$ -> $cA$(clipped).
-The loss function is modified to the following when A_t < 0:
+When A_t < 0, the loss function becomes:
 
 $$
 L(\theta) = E_t \Big[ \max \Big( \min \big(r_t(\theta) A_t, \text{clip}(r_t(\theta), 1-\varepsilon, 1+\varepsilon) A_t \big), c A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})
@@ -193,7 +193,7 @@ where:
 
 #### On-Policy KL Approximation (use_on_policy_kl_approximation)
 
-In practice, we calculate the KL divergence using the estimator from Schulman 2020 (http://joschu.net/blog/kl-approx.html), which is unbiased and guaranteed to be positive.
+In practice, we calculate the KL divergence using the estimator from Schulman 2020 (http://joschu.net/blog/kl-approx.html), which remains unbiased and guarantees positive values.
 
 $$
 D_{\text{KL}} (\pi_\theta || \pi_\text{ref}) \approx E_{x \sim \pi_{\theta}} \Big[ \frac{\pi_\text{ref}(x)}{\pi_\theta(x)} - \log \frac{\pi_\text{ref}(x)}{\pi_\theta(x)} - 1 \Big]
@@ -214,7 +214,7 @@ To enable the on-policy KL approximation, set the config `use_on_policy_kl_appro
 
 
 #### Importance Sampling Correction (use_importance_sampling_correction)
-The policy we use to draw samples, $\pi_{\theta_{\text{old}}}$, is used in both the inference framework and the training framework. To account for this distinction, we refer to the inference framework policy as $\pi_{\text{inference}}$ and the training framework policy as $\pi_{\text{training}}$. As noted in [Add New Models](../model-development/adding-new-models) guide, it is possible for the token probabilities from $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to have discrepancies (from numerics, precision differences, bugs, etc.), leading to off-policy samples. We can correct for this by introducing importance weights between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to the first term of the loss function. 
+Both the inference framework and training framework use the policy $\pi_{\theta_{\text{old}}}$ to draw samples. To account for this distinction, we refer to the inference framework policy as $\pi_{\text{inference}}$ and the training framework policy as $\pi_{\text{training}}$. As noted in [Add New Models](../model-development/add-new-models) guide, it is possible for the token probabilities from $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to have discrepancies (from numerics, precision differences, bugs, etc.), leading to off-policy samples. We can correct for this by introducing importance weights between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$ to the first term of the loss function. 
 
 Let $f_\theta(x) = \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big)$ represent the first term of loss function. Then,
 
@@ -235,22 +235,22 @@ To enable the importance sampling correction, set the config `use_importance_sam
 We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
 ### Multiplicative Token Probability Error (token_mult_prob_error)
-This is equal to the 'Logprob consistency metric' defined in [Add New Models](../model-development/adding-new-models) guide:
+This is equal to the 'Logprob consistency metric' defined in [Add New Models](../model-development/add-new-models) guide:
 
 $$
 \text{token-mult-prob-error} = \frac{1}{n}\sum_{i=1}^{n\text{(tokens)}}\exp\left(\left\|\text{log-train-fwk}_i - \text{logprobs-inference-fwk}_i\right\|\right)
 $$
 
-Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepencies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If very spiky, it can indicate a bug in the inference framework or buggy weight refitting.
+Intuitively, this measures the average multiplicative probability error for sampled tokens, where the inference framework draws samples as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepencies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how the system updates your weights. If very spiky, it can indicate a bug in the inference framework or buggy weight refitting.
 
 ### Sampling Importance Ratio (sampling_importance_ratio)
-Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
+Don't confuse this with the clipped importance ratio in PPO/GRPO. This is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
 
 This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi_{\text{training}}(t)) - \text{log}(\pi_{\text{inference}}(t)))$
 
-Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error-token_mult_prob_error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error instead of loosely the variance as it does not take the absolute value of the error. With some noise, this should hover around 1.
+Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error-token_mult_prob_error), this is a measure of how far off your inference backend is from your training framework. However, this metric finds the bias in that error instead of loosely the variance as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction-use_importance_sampling_correction) is enabled.
+This metric is always calculated and the per-token version (without the mean) is used in the loss function when you enable [Importance Sampling Correction](#importance-sampling-correction-use_importance_sampling_correction).
 
 ### Entropy (approx_entropy)
 We roughly approximate the entropy of the LLM's distribution throughout training by calculating:

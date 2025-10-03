@@ -10,7 +10,7 @@ modality: "universal"
 
 # Add New Models
 
-This guide outlines how to integrate and validate a new model within NeMo RL. Each new model must pass a standard set of compatibility tests before being considered ready to be used in RL pipelines. The guide also details diagnostic scripts to help identify and resolve common issues during model integration.
+This guide outlines how to integrate and validate a new model within NeMo RL. Each new model must pass a standard set of compatibility tests before you can use them in RL pipelines. The guide also details diagnostic scripts to help identify and resolve common issues during model integration.
 
 ## Importance of Log Probability Consistency in Training and Inference
 
@@ -135,8 +135,7 @@ By following these validation steps and ensuring your model's outputs remain con
 
 # Model Diagnostics
 
-We also maintain a set of standalone scripts that can be used to diagnose issues related to correctness that
-we have encountered before.
+We also maintain a set of standalone scripts to diagnose correctness issues that we have encountered before.
 
 ## [1.max_model_len_respected.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/1.max_model_len_respected.py)
 

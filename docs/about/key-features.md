@@ -87,5 +87,5 @@ Backends are configurable and interchangeable without altering core algorithm lo
 
 ---
 
-For more details, see the [API Documentation](../apidocs/index), [Guides](../guides/index), and [Core Design](../core-design/index).
+For more details, see the [API Reference](../apidocs/index), [Guides](../guides/index), and [Core Design](../core-design/index).
 

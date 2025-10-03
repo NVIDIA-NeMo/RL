@@ -59,7 +59,6 @@ Optimize training efficiency for variable-length sequences with packing and dyna
 :maxdepth: 2
 chat-datasets
 padding
-checkpointing
 sequence-packing-and-dynamic-batching
 :::: 
 

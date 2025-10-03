@@ -12,6 +12,59 @@ modality: "universal"
 
 This guide covers common issues, error messages, and solutions for NeMo RL. If you encounter a problem not covered here, please check the [GitHub Issues](https://github.com/NVIDIA/NeMo-RL/issues) or create a new one.
 
+## Installation Issues
+
+### Missing Submodules (ModuleNotFoundError)
+
+**Error Message:**
+```
+ModuleNotFoundError: No module named 'megatron'
+```
+
+**Why This Happens:**
+The NeMo RL repository uses git submodules for optional third-party dependencies like Megatron-LM and Megatron-Bridge. If you cloned the repository without the `--recursive` flag, these submodules won't be initialized, causing import errors when trying to use Megatron backend features.
+
+**Solutions:**
+
+1. **Initialize submodules** (if you forgot during initial clone):
+   ```bash
+   git submodule update --init --recursive
+   ```
+
+2. **Force rebuild virtual environments** (required after adding submodules):
+   
+   After initializing submodules, your existing virtual environments won't have access to the new dependencies. Force a rebuild:
+   
+   ```bash
+   NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo_math.py
+   ```
+   
+   This environment variable tells NeMo RL to rebuild all isolated virtual environments with the newly available submodules.
+
+3. **Verify submodules are properly initialized:**
+   ```bash
+   # Check if Megatron-LM is present
+   ls 3rdparty/Megatron-LM-workspace/Megatron-LM
+   
+   # Check if Megatron-Bridge is present
+   ls 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+   ```
+
+**Prevention:**
+Always clone with the `--recursive` flag to automatically initialize all submodules:
+```bash
+git clone --recursive git@github.com:NVIDIA-NeMo/RL.git nemo-rl
+```
+
+**When Switching Branches:**
+Different branches may have different submodule versions. After switching branches or pulling updates:
+```bash
+git submodule update --init --recursive
+NRL_FORCE_REBUILD_VENVS=true uv run <your_command>
+```
+
+**Note:** Most users can use the default HuggingFace/DTensor backend without initializing submodules. Only initialize submodules if you specifically need Megatron backend support.
+
 ## Common Errors
 
 ### CUDA Out of Memory
@@ -62,6 +115,40 @@ RuntimeError: CUDA out of memory. Tried to allocate X MiB
    model = model.cpu()
    torch.cuda.empty_cache()
    ```
+
+6. **Fix memory fragmentation** (for models without FlashAttention2 support):
+   
+   **Why This Happens:**
+   Large amounts of memory fragmentation can occur when running models without FlashAttention2 support. If OOM occurs after a few iterations of training, the PyTorch CUDA memory allocator may benefit from different settings.
+   
+   **Solutions:**
+   
+   **Option A: Set environment variable globally** (applies to all Ray actors):
+   ```bash
+   PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64 uv run python examples/run_dpo.py ...
+   ```
+   
+   **Option B: Configure in YAML** (more permanent, policy-specific):
+   ```yaml
+   policy:
+     dtensor_cfg:
+       env_vars:
+         PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
+   ```
+   
+   Or for Megatron backend:
+   ```yaml
+   policy:
+     megatron_cfg:
+       env_vars:
+         PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:64"
+   ```
+   
+   **What this does:**
+   The `max_split_size_mb` parameter controls how PyTorch's caching allocator splits large memory blocks. Setting it to 64MB can reduce fragmentation at the cost of slightly more allocation overhead.
+   
+   **Related PyTorch documentation:**
+   See [PyTorch CUDA memory management](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf) for more allocator configuration options.
 
 ### Model Loading Errors
 

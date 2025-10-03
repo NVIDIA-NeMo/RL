@@ -14,15 +14,15 @@ Welcome to the NeMo RL Model Development guide! This section covers everything y
 
 ## Overview
 
-NeMo RL is designed to be model-agnostic, supporting a wide range of language model architectures and backends. Whether you're working with Hugging Face models, custom architectures, or specialized implementations, this guide will help you integrate your models seamlessly into the RL training pipeline.
+NeMo RL provides model-agnostic support for a wide range of language model architectures and backends. Whether you're working with Hugging Face models, custom architectures, or specialized implementations, this guide will help you integrate your models seamlessly into the RL training pipeline.
 
 ## Core Concepts
 
 ::::{grid} 1 2 2 2
 :gutter: 2 2 2 2
 
-:::{grid-item-card} {octicon}`plus;1.5em;sd-mr-1` Adding New Models
-:link: adding-new-models
+:::{grid-item-card} {octicon}`plus;1.5em;sd-mr-1` Add New Models
+:link: add-new-models
 :link-type: doc
 
 Learn how to integrate custom models and architectures into NeMo RL training pipelines.
@@ -39,6 +39,16 @@ Handle model-specific behaviors, special cases, and edge cases in NeMo RL.
 
 +++
 {bdg-warning}`Advanced`
+:::
+
+:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Use DeepSeek Models
+:link: deepseek
+:link-type: doc
+
+Convert and configure DeepSeek models for training in NeMo RL.
+
++++
+{bdg-primary}`Practical`
 :::
 
 ::::
@@ -328,11 +338,11 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 
 ## Next Steps
 
-- [Adding New Models](adding-new-models) - Step-by-step integration guide
+- [Add New Models](add-new-models) - Step-by-step integration guide
 - [Model Quirks and Special Cases](model-quirks) - Handle edge cases and special behaviors
 - [Training Algorithms](../training-algorithms/index) - Apply your models to RL training
 - [Performance Optimization](../training-optimization/index) - Optimize model performance
-- [API Documentation](../../apidocs/index) - Complete model API reference
+- [API Reference](../../apidocs/index) - Complete model API reference
 
 ## Get Help
 
@@ -347,7 +357,7 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 :hidden:
 :caption: Model Development
 :maxdepth: 2
-adding-new-models
+add-new-models
 model-quirks
 deepseek
 ::::::

@@ -14,7 +14,7 @@ Welcome to the NeMo RL Learning Resources! This comprehensive collection provide
 
 ## What You'll Find Here
 
-Our learning resources are organized into three main categories to help you progress from basic concepts to real-world applications:
+These learning resources cover three main categories to help you progress from basic concepts to real-world applications:
 
 ### **Tutorials** 
 Step-by-step learning guides that teach you NeMo RL concepts and techniques. Start with intermediate tutorials to build your foundation, then progress to advanced topics like distributed training and performance optimization.
@@ -154,8 +154,8 @@ After completing the learning resources:
 
 For additional learning resources and community support, visit the NeMo RL GitHub repository and documentation.
 
-```{note}
+:::{note}
 The tutorial files referenced in this guide are available in the NeMo RL examples repository. Clone the repository to access the complete tutorial notebooks and scripts.
-```
+:::
 
 Start with the learning path that matches your experience level, and gradually work your way through the learning resource series. The advanced tutorials will help you master complex scenarios and performance optimization.
