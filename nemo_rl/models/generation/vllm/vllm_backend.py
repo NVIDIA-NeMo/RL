@@ -50,16 +50,31 @@ class VllmInternalWorkerExtension:
         )
 
     def report_device_id(self) -> str:
+        """
+        Retrieve the UUID of the current CUDA device.
+        
+        Returns:
+            device_uuid (str): UUID string identifying the device associated with self.device.index.
+        """
         from nemo_rl.utils.nvml import get_device_uuid
 
         return get_device_uuid(self.device.index)
 
     def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
+        """
+        Return the ZMQ IPC address for the current device.
+        
+        Returns:
+            str: IPC address formatted as "ipc:///tmp/{device_uuid}.sock".
+        """
         return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
+        """
+        Ensure a ZMQ REP socket and context exist and are connected to the device-specific IPC address.
+        
+        If the instance has no `zmq_socket` attribute, this creates `zmq_context` and `zmq_socket` (REP), sets a 30-second receive timeout, and connects the socket to the address returned by `get_zmq_address()`.
+        """
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
@@ -72,23 +87,25 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.connect(self.get_zmq_address())
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit.
-
-        Args:
-            state_dict_info (dict): A dictionary containing the info for refit.
-                e.g. {tensor_name: (shape, dtype)}
+        """
+        Store mapping of model parameter names to their shape and dtype for later weight refitting.
+        
+        Parameters:
+            state_dict_info (dict[str, Any]): Mapping from tensor name to a tuple of (shape, dtype).
+                - shape: a sequence or torch.Size describing the tensor dimensions.
+                - dtype: a torch.dtype representing the tensor data type.
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
-        """Update weights from local IPC handles via ZMQ socket.
-
-        Args:
-            None
-
+        """
+        Receive packed CUDA tensors over the extension's ZMQ REP socket and load them into the model until a "complete" signal is received.
+        
+        This method blocks on the socket, reconstructs CUDA buffers from received IPC handles, slices those buffers into named tensors according to previously prepared refit info, loads each batch into the model (with FP8 handling when applicable), synchronizes the CUDA stream, acknowledges each batch via the socket, and performs GPU memory cleanup after completion.
+        
         Returns:
-            bool: True if weights were successfully updated.
+            True if all received weight batches were applied successfully, `False` otherwise.
         """
         buffer = None
         weights = None

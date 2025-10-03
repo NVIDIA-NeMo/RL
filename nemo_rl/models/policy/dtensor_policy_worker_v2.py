@@ -121,6 +121,22 @@ class DTensorPolicyWorkerV2:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        """
+        Initialize the DTensorPolicyWorkerV2, set up distributed device mesh, construct and shard the model, and optionally initialize optimizer, scheduler, and reference model state.
+        
+        Parameters:
+            config (PolicyConfig): Worker configuration dict controlling model name, DTensor settings, precision, sequence packing, optimizer/scheduler, and other runtime flags.
+            tokenizer (AutoTokenizer): Tokenizer for the model; used to set pad token and for tokenization-related utilities.
+            processor (Optional[AutoProcessor]): Optional multimodal processor; presence indicates a vision-language model.
+            weights_path (Optional[str]): Path to checkpoint weights to load after initialization; if None, worker starts from scratch.
+            optimizer_path (Optional[str]): Optional path to optimizer checkpoint to load alongside weights.
+            init_optimizer (bool): If True, create the optimizer instance from config; otherwise leave optimizer as None.
+            init_reference_model (bool): If True, store a CPU copy of the initialized model state dict as a reference model.
+        
+        Raises:
+            ValueError: If config["precision"] is unrecognized or if DTensor dimensionality/configuration (e.g., cp/tp/dp sizing, sequence packing with incompatible modes) is invalid.
+            NotImplementedError: If sequence packing is enabled for a reward model (unsupported).
+        """
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -446,6 +462,14 @@ class DTensorPolicyWorkerV2:
             )
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the configured generation temperature to the provided logits tensor.
+        
+        If a generation temperature is present in the instance configuration, this scales the logits by dividing them by that temperature. If no generation configuration exists, the logits are returned unchanged.
+        
+        Returns:
+        	logits (torch.Tensor): The (possibly in-place) scaled logits tensor.
+        """
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
@@ -1653,11 +1677,19 @@ class DTensorPolicyWorkerV2:
         return get_device_uuid(device_idx)
 
     def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
+        """
+        Construct the IPC ZMQ address for the current device.
+        
+        @returns IPC address string for the device's ZMQ socket (e.g. "ipc:///tmp/<device-uuid>.sock").
+        """
         return f"ipc:///tmp/{self.report_device_id()}.sock"
 
     def maybe_init_zmq(self):
-        """Initialize the ZMQ socket if it doesn't exist."""
+        """
+        Ensure a ZMQ REQ socket is created and bound to this device's IPC address.
+        
+        When not already initialized, creates a ZMQ context and a REQ socket, configures send/receive timeouts and zero linger, and binds the socket to the address returned by `get_zmq_address()`. This method is idempotent: calling it when the socket exists has no effect.
+        """
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
@@ -1668,6 +1700,12 @@ class DTensorPolicyWorkerV2:
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """
+        Builds a description of the model state_dict for refit and IPC weight streaming.
+        
+        Returns:
+            state_dict_info (dict[str, tuple]): Mapping from each state_dict key (parameter or buffer name) to a tuple `(shape, dtype)` describing the tensor shape and the worker's target dtype. All tensors are intended to be cast to the worker dtype when streamed or broadcast.
+        """
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
@@ -1676,7 +1714,12 @@ class DTensorPolicyWorkerV2:
         return state_dict_info
 
     def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
+        """
+        Return the available free GPU memory in bytes for the current CUDA device.
+        
+        Returns:
+            free_memory_bytes (int): Number of free bytes available on the current CUDA device.
+        """
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
         device_idx = torch.cuda.current_device()
@@ -1685,12 +1728,30 @@ class DTensorPolicyWorkerV2:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """
+        Stream the model's state_dict over an IPC ZMQ socket for inter-process weight transfer.
+        
+        This converts any DTensor entries to full local tensors and casts all tensors to the worker's target dtype before streaming, then delegates the actual chunked transmission to the shared ZMQ streaming implementation. The method ensures the ZMQ socket is initialized and uses the current worker identity and rank when streaming.
+        
+        Parameters:
+            buffer_size_bytes (int): Optional maximum buffer size for each IPC transfer chunk; a value of 0 uses the implementation's default.
+        
+        """
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            """
+            Yield model state_dict entries as (name, tensor) pairs, converting any DTensor values to full local tensors and casting tensors to the worker's target dtype.
+            
+            This generator iterates over the model's state_dict, and for each entry:
+            - If the value is a DTensor, it is converted to a full local tensor before casting.
+            - All tensors are cast to self.dtype using non-blocking device transfer when possible.
+            
+            Returns:
+                tuple[str, torch.Tensor]: Consecutive (parameter_name, tensor) pairs ready for streaming or serialization.
+            """
             for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
@@ -1712,7 +1773,11 @@ class DTensorPolicyWorkerV2:
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights for collective communication."""
+        """
+        Ensure model weights are broadcast from rank 0 to all ranks for collective communication.
+        
+        If `cpu_offload` is enabled, the model is temporarily moved to CUDA before broadcasting and moved back to CPU afterwards. DTensor parameters are converted to local full tensors; on rank 0 they are cast to the worker dtype and each tensor is broadcast from source rank 0 via `model_update_group`.
+        """
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
@@ -1786,6 +1851,11 @@ class DTensorPolicyWorkerV2:
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
         # Offload as much as possible on the CPU
+        """
+        Offload the active model and optimizer state to CPU and report GPU memory usage after offload.
+        
+        Moves the in-memory model to CPU, sets it to evaluation mode, wakes the CUDA allocator, invokes offload_before_refit to perform optimizer/offload actions, and prints the GPU's allocated and reserved memory in gigabytes.
+        """
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator

@@ -646,10 +646,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pass
 
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        """Prepare the info for refit.
-
+        """
+        Gather information required for model refit from all workers.
+        
+        Queries all workers for per-worker refit metadata and returns the first worker's result (assumes all workers provide identical information).
+        
         Returns:
-            dict: A dictionary containing the info for refit.
+            refit_info (dict[str, Any] or None): A dictionary with refit information from a worker, or `None` if no info is available.
         """
         futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
@@ -657,21 +660,39 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return results[0]
 
     def get_free_memory_bytes(self) -> int:
-        """Get the available free memory."""
+        """
+        Query free memory across all policy workers and return a conservative minimum.
+        
+        Returns:
+            int: Free memory in bytes equal to the minimum free-memory value reported by any worker.
+        """
         futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
         # minimum free memory from all workers for safety
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int) -> list[ray.ObjectRef]:
-        """Send the weights for IPC handles via ZMQ socket."""
+        """
+        Stream the model weights from each worker to IPC handles using a ZMQ socket.
+        
+        Parameters:
+            buffer_size_bytes (int): Size of the ZMQ send buffer in bytes to use for each worker's stream.
+        
+        Returns:
+            futures (list[ray.ObjectRef]): A list of Ray futures, one per worker, for the asynchronous streaming operations.
+        """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes
         )
         return futures
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
-        """Broadcast the weights for collective communication."""
+        """
+        Broadcast model weights to all workers to prepare for collective communication.
+        
+        Returns:
+            futures (list[ray.ObjectRef]): A list of Ray ObjectRef futures, one per worker, representing the asynchronous broadcast tasks.
+        """
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective"
         )

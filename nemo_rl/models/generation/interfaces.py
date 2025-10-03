@@ -230,11 +230,21 @@ class GenerationInterface(ABC):
         pass
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+        """
+        Prepare and store information derived from a model state dictionary needed for refitting.
+        
+        Parameters:
+            state_dict_info (dict[str, Any]): Mapping containing metadata about a saved model state dict (for example: parameter names, shapes, dtypes, or source locations) that implementations should extract and retain to support subsequent refit operations.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
-        """Update the model weights from the given IPC handles."""
+        """
+        Retrieve updated model weight object references via IPC using ZeroMQ.
+        
+        Returns:
+            list[ray.ObjectRef]: A list of Ray object references pointing to the updated model weight payloads.
+        """
         raise NotImplementedError
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:

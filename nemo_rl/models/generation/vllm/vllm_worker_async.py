@@ -747,19 +747,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return cast(list[str], list_of_worker_results)
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
-        """Async version of prepare_refit_info."""
+        """
+        Send state-dict metadata to the model collective to prepare for refitting.
+        
+        Parameters:
+            state_dict_info (dict[str, Any]): Mapping containing metadata about the model state dictionary (e.g., parameter names, shapes, shards, or refit instructions) that the collective will use to prepare for a refit.
+        """
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
-        """Async version of update_weights_from_ipc_handles.
-
-        Args:
-            None
-
+        """
+        Trigger a distributed weight update across workers using IPC/ZeroMQ.
+        
+        This invokes the collective RPC named "update_weights_via_ipc_zmq" and interprets the first worker's result as the overall success indicator. Any exception raised during the RPC or a falsy first-worker result causes the function to return False.
+        
         Returns:
-            bool: True if weights were successfully updated, False otherwise.
+            bool: `True` if weights were successfully updated, `False` otherwise.
         """
         try:
             assert self.llm is not None, (

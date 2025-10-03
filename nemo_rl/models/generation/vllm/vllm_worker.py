@@ -695,18 +695,27 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         return cast(list[str], list_of_worker_results)
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+        """
+        Instruct the model to prepare refit data using provided state-dict metadata.
+        
+        Parameters:
+            state_dict_info (dict[str, Any]): Mapping containing metadata and information about model state dicts required for refitting (e.g., tensor shapes, device placement, IPC handle identifiers).
+        """
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
-        """Update weights from IPC handles via ZMQ socket.
-
-        Args:
-            None
-
+        """
+        Request a collective vLLM RPC to update model weights via the ZMQ IPC path.
+        
+        Invokes self.llm.collective_rpc("update_weights_via_ipc_zmq") and interprets the first element of the RPC result as the worker's success flag.
+        
+        Raises:
+            AssertionError: if the vLLM engine is not initialized or this is not the model owner.
+            RuntimeError: if the vLLM engine is configured with async_engine=True.
+        
         Returns:
-            bool: True if weights were successfully updated, False otherwise.
+            `True` if the worker reported a successful update (first element truthy), `False` otherwise.
         """
         try:
             assert self.llm is not None, (
