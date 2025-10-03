@@ -23,8 +23,8 @@ policy:
 
   generation:
     vllm_cfg:
-      tensor_parallel_size: 2  # May need to set this to 4
-      gpu_memory_utilization: 0.6
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.5
 
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
