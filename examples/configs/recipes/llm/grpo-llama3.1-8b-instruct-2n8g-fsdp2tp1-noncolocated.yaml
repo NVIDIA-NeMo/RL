@@ -42,6 +42,7 @@ policy:
     colocated:
       enabled: false
       resources:
+        gpus_per_node: 8
         num_nodes: 1
 data:
   max_input_seq_length: 4096
