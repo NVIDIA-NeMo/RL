@@ -3,9 +3,6 @@ defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
 grpo:
   num_generations_per_prompt: 16
 
-loss_fn:
-  use_importance_sampling_correction: true
-
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
 
