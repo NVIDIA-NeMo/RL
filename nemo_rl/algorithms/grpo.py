@@ -305,8 +305,8 @@ def setup(
         # validate and configure resources
         if policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
-            assert inference_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+            assert inference_gpus_per_node is not None and inference_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
                 "when policy_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_gpus_per_node}."
             )
@@ -338,15 +338,11 @@ def setup(
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
                 f"but got {inference_nodes}."
             )
-            assert (
-                inference_gpus_per_node is None
-                or inference_gpus_per_node == cluster_config["gpus_per_node"]
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+            assert inference_gpus_per_node is not None and inference_gpus_per_node == cluster_config["gpus_per_node"], (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
             )
-            inference_gpus_per_node = cluster_config["gpus_per_node"]
             train_nodes -= inference_nodes
 
         # initialize train cluster

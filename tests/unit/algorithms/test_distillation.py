@@ -349,3 +349,111 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
 
     with pytest.raises(AssertionError):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes=1."""
+    from nemo_rl.algorithms.distillation import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "model_name": "test-student-model",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": None,
+                    },
+                },
+            },
+        },
+        "teacher": {
+            "model_name": "test-teacher-model",
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "num_prompts_per_step": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "topk_logits_k": 64,
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "cluster": {
+            "num_nodes": 1,  # Single node
+            "gpus_per_node": 8,
+        },
+        "checkpointing": {},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+    
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+    ):
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes>1."""
+    from nemo_rl.algorithms.distillation import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "model_name": "test-student-model",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": 1,  # Use 1 node for inference
+                    },
+                },
+            },
+        },
+        "teacher": {
+            "model_name": "test-teacher-model",
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "num_prompts_per_step": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "topk_logits_k": 64,
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "cluster": {
+            "num_nodes": 2,  # Multi-node
+            "gpus_per_node": 8,
+        },
+        "checkpointing": {},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+    
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+    ):
+        setup(master_config, tokenizer, dataset, None)

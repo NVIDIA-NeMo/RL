@@ -210,3 +210,89 @@ def test_calculate_rewards_missing_environment():
         ValueError, match="No environment found for task type: unknown_task"
     ):
         calculate_rewards(batch, task_to_env)
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes=1."""
+    from unittest.mock import MagicMock
+    from nemo_rl.algorithms.grpo import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "model_name": "test-model",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": None,
+                    },
+                },
+            },
+        },
+        "loss_fn": {},
+        "env": {},
+        "grpo": {"seed": 42, "num_prompts_per_step": 1, "val_period": 0, "val_at_start": False},
+        "data": {"shuffle": False},
+        "logger": {},
+        "cluster": {
+            "num_nodes": 1,  # Single node, so policy_nodes=1
+            "gpus_per_node": 8,
+        },
+        "checkpointing": {},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+    
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+    ):
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
+    """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes>1."""
+    from unittest.mock import MagicMock
+    from nemo_rl.algorithms.grpo import setup
+
+    # Create minimal config with non-colocated inference but gpus_per_node=None
+    master_config = {
+        "policy": {
+            "model_name": "test-model",
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,  # Non-colocated
+                    "resources": {
+                        "gpus_per_node": None,  # This should trigger error
+                        "num_nodes": 1,  # Use 1 node for inference
+                    },
+                },
+            },
+        },
+        "loss_fn": {},
+        "env": {},
+        "grpo": {"seed": 42, "num_prompts_per_step": 1, "val_period": 0, "val_at_start": False},
+        "data": {"shuffle": False},
+        "logger": {},
+        "cluster": {
+            "num_nodes": 2,  # Multi-node, so policy_nodes=1 after subtracting inference
+            "gpus_per_node": 8,
+        },
+        "checkpointing": {},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+    
+    with pytest.raises(
+        AssertionError,
+        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+    ):
+        setup(master_config, tokenizer, dataset, None)
