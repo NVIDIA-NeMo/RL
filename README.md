@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/RL.svg?style=social&label=Star&cacheSeconds=14400)](https://github.com/NVIDIA-NeMo/RL/stargazers/)
 
-[Documentation](https://docs.nvidia.com/nemo/RL/latest/) | [Discussions](https://github.com/NVIDIA-NeMo/RL/discussions/categories/announcements) | [Contributing](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
+[Documentation](https://docs.nvidia.com/nemo/rl/latest/index.html/) | [Discussions](https://github.com/NVIDIA-NeMo/RL/discussions/categories/announcements) | [Contributing](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
 
 </div>
 
