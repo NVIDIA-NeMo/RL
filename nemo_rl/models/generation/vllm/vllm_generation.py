@@ -55,11 +55,36 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
-        if self.cfg["vllm_cfg"]["pipeline_parallel_size"] > 1:
+        self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
+        self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
+        self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
+        self.model_parallel_size = self.tp_size * self.pp_size
+
+        assert cluster.world_size() % self.model_parallel_size == 0, (
+            "World size must be a multiple of model parallel size. "
+            f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
+        )
+        self.dp_size = cluster.world_size() // self.model_parallel_size
+        self.vllm_dp_size = self.ep_size // self.tp_size
+
+        if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
                 "When pipeline_parallel_size > 1, async_engine must be set to True in the vLLM configuration. "
                 "You can enable it by adding `policy.generation.vllm_cfg.async_engine=true` to your command."
             )
+
+        if self.ep_size > 1:
+            assert self.ep_size % self.tp_size == 0, (
+                "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
+                "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
+            )
+            if self.ep_size != self.tp_size:
+                # vLLM's EP = DP * TP, so here we need to use DP inside vLLM.
+                assert not self.cfg["vllm_cfg"]["async_engine"], (
+                    "vLLM async_engine has some issues when using DP inside vLLM. "
+                    "Please update your configuration to set `policy.generation.vllm_cfg.async_engine=false`. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1101 for more details."
+                )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
@@ -101,15 +126,10 @@ class VllmGeneration(GenerationInterface):
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
-                -1,  # DP
-                config["vllm_cfg"]["pipeline_parallel_size"],  # PP
-                config["vllm_cfg"]["tensor_parallel_size"],  # TP
+                self.dp_size, self.pp_size, self.tp_size
             ),
             names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
         )
-        self.model_parallel_size = self.sharding_annotations.get_axis_size(
-            "tensor_parallel"
-        ) * self.sharding_annotations.get_axis_size("pipeline_parallel")
 
         # non-colocated needs to use PACK strategy to avoid uneven node_bundles
         # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
@@ -137,11 +157,15 @@ class VllmGeneration(GenerationInterface):
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
+        env_vars = {}
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-        env_vars = {}
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
+        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
+        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
+        if self.ep_size > self.tp_size:
+            env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -171,8 +195,13 @@ class VllmGeneration(GenerationInterface):
         # This is necessary for async engine to work
         self._post_init()
 
+        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+
         # Number of data parallel groups is the number of tied worker groups
-        self.dp_size = self.worker_group.dp_size
+        assert self.dp_size == self.worker_group.dp_size, (
+            f"Data parallel size mismatch. Expected {self.dp_size}, got {self.worker_group.dp_size}"
+        )
 
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
@@ -306,6 +335,20 @@ class VllmGeneration(GenerationInterface):
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results
+
+    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return [None]  # Not applicable since this is sync
+
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         # Wait for all futures to complete
         results = ray.get(futures)
@@ -511,6 +554,12 @@ class VllmGeneration(GenerationInterface):
             try:
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
+                    # sample_result is a tuple: (original_idx, BatchedDataDict)
+                    # Tag the result with worker index for downstream attribution
+                    original_idx, result_batch = sample_result
+                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
+                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                    sample_result = (original_idx, result_batch)
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging

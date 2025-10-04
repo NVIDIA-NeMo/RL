@@ -25,6 +25,7 @@ policy:
   model_name: "meta-llama/Llama-3.2-1B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    # chat_template can be a Jinja template string or path to a .jinja file
     chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
   train_global_batch_size: 32
   train_micro_batch_size: 1
@@ -132,11 +133,23 @@ policy:
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "squad"
   add_bos: true
   add_eos: true
   add_generation_prompt: false
   shuffle: true
+  num_workers: 1
+
+  dataset_name: "squad"
+  # You can use custom response datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: ResponseDataset
+  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  #     val_data_path: <PathToValidationDataset>
+  #     input_key: <QuestionKey>, default is "input"
+  #     output_key: <AnswerKey>, default is "output"
+  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
 
   ## unused with squad dataset
   prompt_file: null
@@ -144,11 +157,22 @@ data:
   output_key: null
   seed: null
 
+
+  ## OpenAI format specific configs
+  # train_data_path: "/path/to/train.jsonl"  # Path to training data
+  # val_data_path: "/path/to/val.jsonl"      # Path to validation data
+  # chat_key: "messages"                     # Key for messages in the data
+  # system_key: null                         # Key for system message (optional)
+  # system_prompt: null                      # Default system prompt (optional)
+  # tool_key: "tools"                        # Key for tools in the data
+  # use_preserving_dataset: false            # If true, uses PreservingDataset to preserve heterogeneous schemas (e.g., tool calls with varying argument structures)
+
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-dev"

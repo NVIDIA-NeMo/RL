@@ -25,9 +25,7 @@ dependencies = [
     "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
-    # transformers==4.54.0/4.54.1 both fail on rm models
-    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
-    "transformers>=4.51.0,<4.54.0",
+    "transformers>=4.55.4",
     "wandb",
     "numpy",
     "datasets>=4.0.0",
@@ -51,6 +49,7 @@ dependencies = [
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
     "nvidia-nvshmem-cu12", # for deep_ep build
+    "swanlab",
 ]
 
 [project.optional-dependencies]
@@ -68,6 +67,9 @@ automodel = [
 vllm = [
     "cuda-python",
     "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+    # deep_ep also needs libibverbs-dev
+    # sudo apt-get update
+    # sudo apt-get install libibverbs-dev
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
     "vllm==0.10.0",
     "num2words>=0.5.14",
@@ -123,6 +125,7 @@ docs = [
     "sphinx-copybutton",  # Adds a copy button for code blocks
     "myst_parser",  # For our markdown docs
     "nvidia-sphinx-theme",  # Our NVIDIA theme
+    "gitpython>=3.1.45",  # To git-related information
 ]
 dev = [
     "pre-commit>=4.2.0",
@@ -213,6 +216,7 @@ markers = [
     "run_first: marks tests that should run before others",
     "mcore: marks tests that require the mcore extra",
     "hf_gated: marks tests that require HuggingFace token access for gated models",
+    "automodel: marks tests that require the automodel extra",
 ]
 
 [tool.pyrefly]

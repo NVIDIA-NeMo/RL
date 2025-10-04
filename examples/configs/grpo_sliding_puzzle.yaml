@@ -19,7 +19,7 @@ checkpointing:
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 3072
+  max_total_sequence_length: 1024
 
   dtensor_cfg:
     enabled: true
@@ -41,7 +41,7 @@ policy:
       async_engine: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
-      enable_expert_parallel: false
+      expert_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
@@ -54,8 +54,8 @@ env:
     cfg:
       game_config:
         size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 15 # Number of random moves to shuffle the solved state
-      max_moves: 50 # Maximum moves allowed per episode
+        shuffle_moves: 10 # Number of random moves to shuffle the solved state
+      max_moves: 30 # Maximum moves allowed per episode
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -63,6 +63,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"

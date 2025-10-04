@@ -21,7 +21,10 @@ tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron.sh
 
 # Functional VLM run
 tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n2g-dtensor2tp1.v1.sh
-tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v1.sh
+tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp2.v1.sh
+
+# Removing this until this issue is resolved: https://github.com/huggingface/transformers/issues/41190
+# tests/test_suites/vlm/vlm_grpo-smolvlm2-2.2b-instruct-clevr-1n2g-dtensor2tp1.v2.sh
 
 # Deepscaler (short tests)
 tests/test_suites/llm/grpo-deepscaler-1.5b-16K.sh
@@ -35,10 +38,14 @@ tests/test_suites/llm/grpo-gspo-deepscaler-1.5b-8K.sh
 tests/test_suites/llm/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
 
 # FP8
-tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8.sh
+tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v2.sh
+tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e.sh
 
 # Non-colocated
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
+
+# Nemotron Super 49B
+tests/test_suites/llm/grpo-math-llama-nemotron-super-49b-v.5-4n8g-fsdp2tp8.sh
 
 #######
 # SFT #
@@ -75,3 +82,10 @@ tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.sh
 
 # Long dtensor
 tests/test_suites/llm/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long.sh
+
+################
+# Distillation #
+################
+
+# Distillation tests
+tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-fsdp2tp1.v1.sh
