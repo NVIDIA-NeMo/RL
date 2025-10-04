@@ -41,6 +41,9 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
 )
+from transformers.models.internvl.modeling_internvl import (
+    InternVLForConditionalGeneration,
+)
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
 from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
@@ -333,6 +336,11 @@ def get_hf_tp_plan(model: PreTrainedModel):
         model_prefix = "model.language_model"
         config = model.model.language_model.config
 
+    elif model_cls == InternVLForConditionalGeneration:
+        inner_model = model.language_model
+        model_prefix = "language_model"
+        config = model.language_model.config
+
     elif model_cls == Gemma3ForConditionalGeneration:
         inner_model = model.language_model
         model_prefix = "language_model"
@@ -548,6 +556,16 @@ def _parallelize_model(
             layers.append(layer)
         # append visual model layers
         for layer in model.visual.blocks:
+            layers.append(layer)
+
+        num_attention_heads = model.language_model.config.num_attention_heads
+        num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls == InternVLForConditionalGeneration:
+        layers: list = []
+        for layer in model.language_model.layers:
+            layers.append(layer)
+        for layer in model.vision_tower.encoder.layer:
             layers.append(layer)
 
         num_attention_heads = model.language_model.config.num_attention_heads
