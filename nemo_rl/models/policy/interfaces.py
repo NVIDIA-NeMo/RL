@@ -158,11 +158,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
-        pass
-
-    @abstractmethod
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    def stream_weights_via_ipc_zmq(
+        self, *args: Any, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
         pass
 
     @abstractmethod
