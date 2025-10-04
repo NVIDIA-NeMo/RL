@@ -109,6 +109,8 @@ done
 
 total_gpu_hours=0
 
+declare -a JOB_IDS=()
+
 for SCRIPT in $SCRIPTS; do
     # Extract and evaluate the config
     if ! config=$(extract_config $SCRIPT); then
@@ -136,11 +138,17 @@ for SCRIPT in $SCRIPTS; do
         echo "Submitting $i/$NUM_RUNS job with ${NUM_NODES} nodes for $(basename $SCRIPT)"
         JOB_NAME=$(basename $SCRIPT .sh)
 
-        RELEASE_ARGS=()
+        EXTRA_SCRIPT_ARGS=(
+            logger.wandb.name=$(basename $SCRIPT .sh)
+            ++git_meta=$(git log -1 --format='%h-%f' HEAD)
+            # Record the container just for provenance
+            ++container=$CONTAINER
+            # Add any other args, helpful if you are bisecting and need to pass an argument to make something pass
+            ${EXTRA_SCRIPT_ARGS:-}
+        )
         if [[ -n "${IS_RELEASE}" ]]; then
-            RELEASE_ARGS=(
+            EXTRA_SCRIPT_ARGS+=(
                 logger.wandb.project=nemo-rl-release
-                logger.wandb.name=$(basename $SCRIPT .sh)-$(git rev-parse --short HEAD)
             )
         fi
     
@@ -153,7 +161,7 @@ cd \$SCRIPT_DIR
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="apt install -y jq && uv run $rel_script ${RELEASE_ARGS[@]}" \\
+COMMAND="uv run $rel_script ${EXTRA_SCRIPT_ARGS[@]}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\
@@ -169,8 +177,111 @@ EOF
         if [[ "${DRYRUN}" -eq 2 ]]; then
             echo "[DRY_RUN]: Skipping submission of $SCRIPT. Find the snapshot at $SNAPSHOT_DIR and manually launch with 'bash continue.sh'"
         else
-            bash $SNAPSHOT_DIR/continue.sh
+            submission_output=$(bash $SNAPSHOT_DIR/continue.sh)
+            echo "$submission_output"
+            if [[ "$submission_output" =~ Submitted\ batch\ job\ ([0-9]+) ]]; then
+                JOB_IDS+=("${BASH_REMATCH[1]}")
+            else
+                echo "[ERROR]: Unable to parse job id after running 'bash $SNAPSHOT_DIR/continue.sh'"
+                exit 1
+            fi
         fi
     done
 done
 echo [INFO]: Total GPU hours: $total_gpu_hours
+
+if [[ -n "${WATCH:-}" && "${#JOB_IDS[@]}" -gt 0 ]]; then
+    WATCH_INTERVAL=${WATCH_INTERVAL:-300}
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Tracking ${#JOB_IDS[@]} jobs: ${JOB_IDS[*]}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Polling every ${WATCH_INTERVAL}s. Press Enter to refresh immediately."
+    active_ids=("${JOB_IDS[@]}")
+    while [[ ${#active_ids[@]} -gt 0 ]]; do
+        # This checks if we're in an interactive terminal then allow this interactive polling
+        if [[ -t 0 ]]; then
+            remaining=$WATCH_INTERVAL
+            while (( remaining > 0 )); do
+                if read -t 5 -n 1 _watch_input; then
+                    break
+                fi
+                remaining=$(( remaining - 5 ))
+            done
+        else
+            sleep "$WATCH_INTERVAL"
+        fi
+        mapfile -t current_ids < <(squeue --me -h -o "%A")
+        finished_ids=()
+        new_active_ids=()
+        for id in "${active_ids[@]}"; do
+            found=0
+            for cur in "${current_ids[@]}"; do
+                if [[ "$id" == "$cur" ]]; then
+                    found=1
+                    break
+                fi
+            done
+            if [[ $found -eq 1 ]]; then
+                new_active_ids+=("$id")
+            else
+                finished_ids+=("$id")
+            fi
+        done
+        if [[ ${#finished_ids[@]} -gt 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Finished jobs: ${finished_ids[*]}"
+        fi
+        active_ids=("${new_active_ids[@]}")
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: Remaining: ${#active_ids[@]}"
+    done
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCH]: All tracked jobs have finished."
+
+    # All tests follow the pattern where the ray-driver.log contains the test metric check results.
+    # There may be multiple runs per test case and the latest one is not necessarily the run containing
+    # the metrics. For example, a test may launch 5 times, but it finishes early so the results are in the
+    # 4th run.
+    any_fail=0
+    BASE_SNAPSHOT_DIR=$(dirname "$SNAPSHOT_DIR")  # take the last one
+    # Build list of ray-driver logs by iterating JOB_IDS directly (one log per id)
+    all_logs=""
+    shopt -s nullglob
+    for _id in "${JOB_IDS[@]}"; do
+        matches=("$BASE_SNAPSHOT_DIR"/*/"$_id"-logs/ray-driver.log)
+        if [[ ${#matches[@]} -gt 0 ]]; then
+            all_logs+="${matches[0]} "
+        fi
+    done
+    shopt -u nullglob
+    # Create an associative array where $(basename $(dirname $(dirname $log))) is the experiment name and key
+    declare -A experiment_name_to_logs
+    for log in $all_logs; do
+        experiment_name=$(basename $(dirname $(dirname $log)))
+        experiment_name_to_logs[$experiment_name]+=" $log"
+    done
+    for experiment_name in "${!experiment_name_to_logs[@]}"; do
+        logs=${experiment_name_to_logs[$experiment_name]}
+        echo "[WATCH]: Checking $experiment_name"
+        # Check for 'Metric Checks' in the logs:
+        #   - If not found in any log, mark as general fail.
+        #   - If found but any 'FAIL' is present, mark as metric fail.
+        #   - If found and no 'FAIL', mark as metric pass.
+        if ! fgrep -A10000 'Metric Checks' $logs &>/dev/null; then
+            echo "[GENERAL FAIL]   $experiment_name"
+            # Print the logs to inspect
+            ls -lah $logs
+            any_fail=1
+        elif fgrep -A10000 'Metric Checks' $logs | fgrep FAIL &>/dev/null; then
+            echo "[METRIC FAIL]    $experiment_name"
+            # Print the metrics to inspect
+            fgrep -A10000 -H 'Metric Checks' $logs
+            any_fail=1
+        else
+            echo "[METRIC PASS]    $experiment_name"
+            # Print the metrics to inspect
+            fgrep -A10000 -H 'Metric Checks' $logs
+        fi
+    done
+    if [[ $any_fail -eq 1 ]]; then
+        echo "[INFO]: One or more tests failed. Exiting with status 1."
+    else
+        echo "[INFO]: All tests passed. Exiting with status 0."
+    fi
+    exit $any_fail
+fi
