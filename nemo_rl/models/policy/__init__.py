@@ -61,6 +61,11 @@ class MegatronOptimizerConfig(TypedDict):
     use_distributed_optimizer: bool
     use_precision_aware_optimizer: bool
     clip_grad: float
+    # knob to enable optimizer cpu offload
+    optimizer_cpu_offload: bool
+    # knob to set the fraction of parameters to keep on CPU
+    # currently if optimizer_cpu_offload is true, this knob must be 1.0
+    optimizer_offload_fraction: float
 
 
 class MegatronSchedulerConfig(TypedDict):
