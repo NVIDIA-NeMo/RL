@@ -1,6 +1,14 @@
-# Nemo RL: A Scalable and Efficient Post-Training Library
+<div align="center">
+
+   # NeMo RL: A Scalable and Efficient Post-Training Library
 
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![GitHub Stars](https://img.shields.io/github/stars/NVIDIA-NeMo/RL.svg?style=social&label=Star&cacheSeconds=14400)](https://github.com/NVIDIA-NeMo/RL/stargazers/)
+
+[Documentation](https://docs.nvidia.com/nemo/RL/latest/) | [Discussions](https://github.com/NVIDIA-NeMo/RL/discussions/categories/announcements) | [Contributing](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md)
+
+</div>
 
 ## 📣 News
 * [9/25/2025] On-policy Distillation (Qwen3-style)
@@ -20,7 +28,7 @@
 
 ## Overview
 
-**Nemo RL** is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+**NeMo RL** is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
@@ -86,7 +94,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[Supervised Fine-Tuning (SFT)](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
+    |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
 
