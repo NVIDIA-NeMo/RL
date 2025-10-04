@@ -353,12 +353,13 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes=1."""
+    from unittest.mock import MagicMock, patch
+
     from nemo_rl.algorithms.distillation import setup
 
     # Create minimal config with non-colocated inference but gpus_per_node=None
     master_config = {
         "policy": {
-            "model_name": "test-student-model",
             "generation": {
                 "backend": "vllm",
                 "colocated": {
@@ -369,50 +370,60 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     },
                 },
             },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
         },
         "teacher": {
-            "model_name": "test-teacher-model",
+            "dtensor_cfg": {
+                "enabled": False,
+            },
         },
-        "loss_fn": {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        },
+        "loss_fn": {},
         "distillation": {
             "seed": 42,
-            "num_prompts_per_step": 1,
-            "val_period": 0,
-            "val_at_start": False,
             "topk_logits_k": 64,
+            "num_prompts_per_step": 1,  # Config extraction requires this key
+            "val_period": 0,  # Config extraction requires this key
+            "val_at_start": False,  # Config extraction requires this key
         },
         "data": {"shuffle": False},
-        "logger": {},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
         "cluster": {
             "num_nodes": 1,  # Single node
             "gpus_per_node": 8,
         },
-        "checkpointing": {},
     }
 
     tokenizer = MagicMock()
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=10)
-    
-    with pytest.raises(
-        AssertionError,
-        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
     ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes>1."""
+    from unittest.mock import MagicMock, patch
+
     from nemo_rl.algorithms.distillation import setup
 
     # Create minimal config with non-colocated inference but gpus_per_node=None
     master_config = {
         "policy": {
-            "model_name": "test-student-model",
             "generation": {
                 "backend": "vllm",
                 "colocated": {
@@ -423,37 +434,46 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     },
                 },
             },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
         },
         "teacher": {
-            "model_name": "test-teacher-model",
+            "dtensor_cfg": {
+                "enabled": False,
+            },
         },
-        "loss_fn": {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        },
+        "loss_fn": {},
         "distillation": {
             "seed": 42,
-            "num_prompts_per_step": 1,
-            "val_period": 0,
-            "val_at_start": False,
             "topk_logits_k": 64,
+            "num_prompts_per_step": 1,  # Config extraction requires this key
+            "val_period": 0,  # Config extraction requires this key
+            "val_at_start": False,  # Config extraction requires this key
         },
         "data": {"shuffle": False},
-        "logger": {},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
         "cluster": {
             "num_nodes": 2,  # Multi-node
             "gpus_per_node": 8,
         },
-        "checkpointing": {},
     }
 
     tokenizer = MagicMock()
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=10)
-    
-    with pytest.raises(
-        AssertionError,
-        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.distillation.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.distillation.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
     ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)

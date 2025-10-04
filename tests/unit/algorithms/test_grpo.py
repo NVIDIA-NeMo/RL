@@ -214,13 +214,13 @@ def test_calculate_rewards_missing_environment():
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes=1."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
+
     from nemo_rl.algorithms.grpo import setup
 
-    # Create minimal config with non-colocated inference but gpus_per_node=None
+    # Create minimal config - only what's needed before the validation we're testing
     master_config = {
         "policy": {
-            "model_name": "test-model",
             "generation": {
                 "backend": "vllm",
                 "colocated": {
@@ -232,38 +232,51 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                 },
             },
         },
-        "loss_fn": {},
-        "env": {},
-        "grpo": {"seed": 42, "num_prompts_per_step": 1, "val_period": 0, "val_at_start": False},
+        "loss_fn": {},  # Config extraction requires this key
+        "env": {},  # Config extraction requires this key
+        "grpo": {
+            "seed": 42,
+            "num_prompts_per_step": 1,
+            "val_period": 0,
+            "val_at_start": False,
+        },
         "data": {"shuffle": False},
-        "logger": {},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
         "cluster": {
             "num_nodes": 1,  # Single node, so policy_nodes=1
             "gpus_per_node": 8,
         },
-        "checkpointing": {},
     }
 
     tokenizer = MagicMock()
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=10)
-    
-    with pytest.raises(
-        AssertionError,
-        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
     ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes>1."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
+
     from nemo_rl.algorithms.grpo import setup
 
-    # Create minimal config with non-colocated inference but gpus_per_node=None
+    # Create minimal config - only what's needed before the validation we're testing
     master_config = {
         "policy": {
-            "model_name": "test-model",
             "generation": {
                 "backend": "vllm",
                 "colocated": {
@@ -275,24 +288,37 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                 },
             },
         },
-        "loss_fn": {},
-        "env": {},
-        "grpo": {"seed": 42, "num_prompts_per_step": 1, "val_period": 0, "val_at_start": False},
+        "loss_fn": {},  # Config extraction requires this key
+        "env": {},  # Config extraction requires this key
+        "grpo": {
+            "seed": 42,
+            "num_prompts_per_step": 1,
+            "val_period": 0,
+            "val_at_start": False,
+        },
         "data": {"shuffle": False},
-        "logger": {},
+        "logger": {},  # Config extraction requires this key
+        "checkpointing": {},  # Config extraction requires this key
         "cluster": {
             "num_nodes": 2,  # Multi-node, so policy_nodes=1 after subtracting inference
             "gpus_per_node": 8,
         },
-        "checkpointing": {},
     }
 
     tokenizer = MagicMock()
     dataset = MagicMock()
     dataset.__len__ = MagicMock(return_value=10)
-    
-    with pytest.raises(
-        AssertionError,
-        match="policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+
+    # Mock everything we don't need to test
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
     ):
+        # Configure mocks to skip checkpoint loading
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
