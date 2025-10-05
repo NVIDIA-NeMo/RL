@@ -1,0 +1,6 @@
+defaults:
+  - ../../grpo_math_1B.yaml
+
+cluster:
+  gpus_per_node: 8
+
