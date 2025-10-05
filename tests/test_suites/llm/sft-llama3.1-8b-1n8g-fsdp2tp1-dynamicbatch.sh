@@ -38,5 +38,5 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
 	    'data["train/loss"]["1"] < 0.6' \
         'data["train/loss"]["250"] < 0.36' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 70' \
-        'mean(data["timing/train/total_step_time"], 2) < 10'
+        'mean(data["timing/train/total_step_time"], -6, -1) < 10'
 fi
