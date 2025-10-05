@@ -173,6 +173,12 @@ members = [
     "3rdparty/Automodel-workspace/Automodel",
     "3rdparty/Megatron-Bridge-workspace",
     "3rdparty/Penguin-workspace",
+    # Research projects are also added here in order for them to share the global root level uv.lock.
+    # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly 
+    # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
+    # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
+    # globally we must choose 1.X otherwise we run into pickle issues from ray.
+    "research/template_project",
 ]
 
 [[tool.uv.index]]
