@@ -1041,6 +1041,17 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
+    val_sampling_params = {}
+    val_temperature = master_config["grpo"].get("val_temperature", None)
+    if val_temperature is not None:
+        val_sampling_params["temperature"] = val_temperature
+    val_top_p = master_config["grpo"].get("val_top_p", None)
+    if val_top_p is not None:
+        val_sampling_params["top_p"] = val_top_p
+    val_top_k = master_config["grpo"].get("val_top_k", None)
+    if val_top_k is not None:
+        val_sampling_params["top_k"] = val_top_k
+
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
@@ -1068,6 +1079,7 @@ def validate(
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                    sampling_params=val_sampling_params,
                 )
             else:
                 val_batch, gen_metrics = run_multi_turn_rollout(
@@ -1078,6 +1090,7 @@ def validate(
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
+                    sampling_params=val_sampling_params,
                 )
             rewards = val_batch["total_reward"]
 
