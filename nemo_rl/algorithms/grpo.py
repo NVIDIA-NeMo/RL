@@ -97,6 +97,9 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    val_temperature: NotRequired[float]
+    val_top_p: NotRequired[float]
+    val_top_k: NotRequired[int]
 
 
 class GRPOSaveState(TypedDict):
