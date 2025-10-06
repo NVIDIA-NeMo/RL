@@ -10,7 +10,7 @@ grpo:
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
-  max_val_samples: 256
+  max_val_samples: 10000
   val_batch_size: 256
 
 loss_fn:
@@ -18,29 +18,29 @@ loss_fn:
   ratio_clip_min: 0.2
   ratio_clip_max: 0.2
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
-  use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
   token_level_loss: true
   ratio_clip_c: null
 
 checkpointing:
-  enabled: false
-  checkpoint_dir: "results/grpo_megatron"
+  enabled: true
+  checkpoint_dir: "results/grpo_dapomath17k_dsv3_megatron"
   metric_name: "val_reward"
   higher_is_better: true
-  keep_top_k: 3
+  keep_top_k: 100
   save_period: 10
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "Qwen/Qwen2.5-1.5B"
+  model_name: "/path/to/dsv3"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512
-  train_micro_batch_size: 4
+  train_micro_batch_size: 1
   generation_batch_size: 64 # Only used when generating using megatron backend
-  logprob_batch_size: 8
-  max_total_sequence_length: 512
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
   precision: "bfloat16"
 
   dtensor_cfg:
@@ -74,29 +74,29 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    activation_checkpointing: false
+    activation_checkpointing: true
     converter_type: "Qwen2ForCausalLM"
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 16
+    num_layers_in_first_pipeline_stage: 3
+    num_layers_in_last_pipeline_stage: 2
+    context_parallel_size: 4
     pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
+    sequence_parallel: true
     freeze_moe_router: true
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
-    apply_rope_fusion: True
+    apply_rope_fusion: False
     
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
+      lr: 5.0e-7
+      min_lr: 5.0e-8
       weight_decay: 0.01
       bf16: true
       fp16: false
@@ -123,7 +123,7 @@ policy:
       lr_decay_style: "constant"
       lr_decay_iters: 1000
       lr_warmup_iters: 13
-      lr_warmup_init: 5.0e-7
+      lr_warmup_init: 5.0e-8
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
@@ -140,7 +140,8 @@ policy:
     top_p: 1.0
     top_k: null
     vllm_cfg:
-      tensor_parallel_size: 1
+      async_engine: true
+      tensor_parallel_size: 32
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
@@ -175,5 +176,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 1
-  num_nodes: 1
+  gpus_per_node: 8
+  num_nodes: 64
