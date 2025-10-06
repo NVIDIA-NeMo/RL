@@ -402,7 +402,10 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM."""
         assert isinstance(data, BatchedDataDict), (
@@ -423,7 +426,10 @@ class VllmGeneration(GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
+            common_kwargs={
+                "greedy": greedy,
+                "sampling_params": sampling_params,
+            },
         )
 
         # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
@@ -450,7 +456,10 @@ class VllmGeneration(GenerationInterface):
         return combined
 
     def generate_text(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate text responses using vLLM."""
         assert isinstance(data, BatchedDataDict), (
@@ -474,7 +483,10 @@ class VllmGeneration(GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,  # just run on tp rank 0
             output_is_replicated=None,
-            common_kwargs={"greedy": greedy},
+            common_kwargs={
+                "greedy": greedy,
+                "sampling_params": sampling_params,
+            },
         )
 
         # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
@@ -501,6 +513,7 @@ class VllmGeneration(GenerationInterface):
         method_name: str,
         data_validation_fn,
         greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Base async generation method that handles common worker management logic.
 
@@ -509,6 +522,9 @@ class VllmGeneration(GenerationInterface):
             method_name: Name of the worker method to call ('generate_async' or 'generate_text_async')
             data_validation_fn: Function to validate input data
             greedy: Whether to use greedy decoding
+            sampling_params: (Optional) Generation sampling parameters.
+                Note that setting `greedy` will override these parameters.
+                Currently supports: temperature, top_p, top_k.
 
         Yields:
             Tuple of (original_index, BatchedDataDict containing generation result)
@@ -537,6 +553,7 @@ class VllmGeneration(GenerationInterface):
             worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
+            sampling_params=sampling_params,
         )
 
         # Increment the round-robin worker group index
@@ -624,7 +641,10 @@ class VllmGeneration(GenerationInterface):
         )
 
     async def generate_text_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate text responses asynchronously, yielding results as they are ready.
 
@@ -642,12 +662,19 @@ class VllmGeneration(GenerationInterface):
             return True
 
         async for result in self._async_generate_base(
-            data, "generate_text_async", validate_text_data, greedy
+            data,
+            "generate_text_async",
+            validate_text_data,
+            greedy,
+            sampling_params,
         ):
             yield result
 
     async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate responses asynchronously, yielding individual samples as they complete.
 
@@ -665,7 +692,11 @@ class VllmGeneration(GenerationInterface):
             return True
 
         async for result in self._async_generate_base(
-            data, "generate_async", validate_generate_data, greedy
+            data,
+            "generate_async",
+            validate_generate_data,
+            greedy,
+            sampling_params,
         ):
             yield result
 

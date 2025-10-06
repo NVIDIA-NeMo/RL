@@ -430,11 +430,29 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        **extra_kwargs
     ):
-        top_k_cfg = self.cfg["top_k"]
-        top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
+        if extra_kwargs:
+            raise ValueError(
+                f"VllmGeneration does not support the extra sampling params: {extra_kwargs.keys()}"
+            )
 
-        temperature = 0.0 if greedy else self.cfg["temperature"]
+        if greedy:
+            temperature = 0.0
+            top_k = 1
+            top_p = self.cfg["top_p"]
+        else:
+            if temperature is None:
+                temperature = self.cfg["temperature"]
+            if top_p is None:
+                top_p = self.cfg["top_p"]
+            if top_k is None:
+                top_k = self.cfg["top_k"]
+            if top_k is None:
+                top_k = -1
 
         max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
@@ -442,8 +460,8 @@ class BaseVllmGenerationWorker:
 
         return self.SamplingParams(
             temperature=temperature,
-            top_p=self.cfg["top_p"],
-            top_k=top_k_val,
+            top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             logprobs=0,
             stop_token_ids=self.cfg["stop_token_ids"],
@@ -491,13 +509,19 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM generation.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths tensors
             greedy: Whether to use greedy decoding instead of sampling
+            sampling_params: (Optional) Generation sampling parameters.
+                Note that setting `greedy` will override these parameters.
+                Currently supports: temperature, top_p, top_k.
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
@@ -522,9 +546,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
+        if sampling_params is None:
+            sampling_params = {}
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            **sampling_params
         )
 
         # verify inputs have correct padding
@@ -618,13 +645,19 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate text responses using vLLM generation.
 
         Args:
             data: BatchedDataDict containing prompts with text strings
             greedy: Whether to use greedy decoding instead of sampling
+            sampling_params: (Optional) Generation sampling parameters.
+                Note that setting `greedy` will override these parameters.
+                Currently supports: temperature, top_p, top_k.
 
         Returns:
             BatchedDataDict containing:
@@ -653,16 +686,14 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         stop_strings = list(stop_strings) if len(stop_strings) > 0 else None
 
-        # Read generation parameters from config
-        top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
-        sampling_params = self.SamplingParams(
-            temperature=self.cfg["temperature"] if not greedy else 0,
-            top_p=self.cfg["top_p"],
-            top_k=top_k if not greedy else 1,
-            max_tokens=self.cfg["max_new_tokens"],
-            stop_token_ids=self.cfg["stop_token_ids"],
-            stop=stop_strings,
-            include_stop_str_in_output=True,  # returning stop strings like hf
+        if sampling_params is None:
+            sampling_params = {}
+
+        # Create sampling parameters
+        sampling_params = self._build_sampling_params(
+            greedy=greedy,
+            stop_strings=stop_strings,
+            **sampling_params
         )
 
         # Generate outputs
