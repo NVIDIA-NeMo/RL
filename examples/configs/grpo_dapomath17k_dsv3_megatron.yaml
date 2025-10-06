@@ -155,7 +155,7 @@ data:
 env:
   math:
     num_workers: 8
-    use_dapo_math_verifier: true
+    math_verify_impl: "dapo_math_verify"
 
 logger:
   log_dir: "logs"  # Base directory for all logs
