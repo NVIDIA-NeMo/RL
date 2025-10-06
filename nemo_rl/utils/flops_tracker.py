@@ -16,6 +16,7 @@ from dataclasses import asdict
 from typing import Callable, Optional
 
 import torch
+from packaging.version import Version as PkgVersion
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
@@ -80,9 +81,27 @@ def convert_config_to_flops_config(
         raise ValueError(f"Unsupported config type: {type(config)}")
 
 
+def is_using_tf32() -> bool:
+    """Check if the current device is using TF32."""
+    if PkgVersion(torch.__version__) < PkgVersion("2.9.0a0"):
+        return torch.backends.cuda.matmul.allow_tf32
+    else:
+        return torch.backends.cuda.matmul.fp32_precision == "tf32"
+
+
 THEORETICAL_TFLOPS = {
+    ("NVIDIA A100 80GB PCIe", torch.bfloat16): 624 / 2,
+    ("NVIDIA A100 80GB PCIe", torch.float32): 312 / 2 if is_using_tf32() else 19.5,
     ("NVIDIA H100 80GB HBM3", torch.bfloat16): 1979 / 2,
-    ("NVIDIA H100 80GB HBM3", torch.float32): 67.0,
+    ("NVIDIA H100 80GB HBM3", torch.float32): 989 / 2 if is_using_tf32() else 67.0,
+    ("NVIDIA B200", torch.bfloat16): 4500 / 2,
+    ("NVIDIA B200", torch.float32): 2200 / 2 if is_using_tf32() else 80.0,
+    ("NVIDIA B300", torch.bfloat16): 4500 / 2,
+    ("NVIDIA B300", torch.float32): 2200 / 2 if is_using_tf32() else 80.0,
+    ("NVIDIA GB200", torch.bfloat16): 4900 / 2,
+    ("NVIDIA GB200", torch.float32): 2500 / 2 if is_using_tf32() else 80.0,
+    ("NVIDIA GB300", torch.bfloat16): 4900 / 2,
+    ("NVIDIA GB300", torch.float32): 2500 / 2 if is_using_tf32() else 80.0,
 }
 
 
