@@ -535,7 +535,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return aggregated_results
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
         # Verify input data is right-padded
@@ -554,7 +557,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"greedy": greedy},
+            common_kwargs={
+                "greedy": greedy,
+                "sampling_params": sampling_params,
+            },
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
         result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
