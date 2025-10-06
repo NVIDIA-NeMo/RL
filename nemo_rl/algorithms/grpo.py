@@ -904,15 +904,29 @@ def grpo_train(
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in grpo_save_state
-                        ):
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "This checkpoint will not be saved as top-k."
-                            )
+                    metric_name = master_config["checkpointing"]["metric_name"]
+                    if metric_name is not None:
+                        assert metric_name.count(":") == 1, "metric_name must contain exactly one colon"
+                        parts = metric_name.split(":")
+                        train_or_val = parts[0]
+                        metric_name = parts[1]
+
+                        if train_or_val == "train":
+                            if metric_name not in metrics:
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the training metrics. "
+                                    "This checkpoint will not be saved as top-k."
+                                )
+                            else:
+                                grpo_save_state[metric_name] = metrics[metric_name]
+                        else:
+                            if val_metrics is None or metric_name not in val_metrics:
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the validation metrics. "
+                                    "This checkpoint will not be saved as top-k."
+                                )
+                            else:
+                                grpo_save_state[metric_name] = val_metrics[metric_name]
 
                     with timer.time("checkpointing"):
                         print(
@@ -1690,16 +1704,33 @@ def async_grpo_train(
                         del grpo_save_state["val_reward"]
                     grpo_save_state["consumed_samples"] = consumed_samples
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in grpo_save_state
-                        ):
-                            warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
-                            )
-                            master_config["checkpointing"]["metric_name"] = None
+                    original_metric_name = master_config["checkpointing"]["metric_name"]
+                    if original_metric_name is not None:
+                        assert original_metric_name.count(":") == 1, "metric_name must contain exactly one colon"
+                        parts = original_metric_name.split(":")
+                        train_or_val = "val" if "val" in parts[0] else "train"
+                        metric_name = parts[1]
+
+                        if train_or_val == "train":
+                            if metric_name not in metrics:
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the training metrics. "
+                                    "This checkpoint will not be saved as top-k."
+                                )
+                                if original_metric_name in grpo_save_state:
+                                    del grpo_save_state[original_metric_name]
+                            else:
+                                grpo_save_state[original_metric_name] = metrics[metric_name]
+                        else:
+                            if val_metrics is None or metric_name not in val_metrics:
+                                warnings.warn(
+                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the validation metrics. "
+                                    "This checkpoint will not be saved as top-k."
+                                )
+                                if original_metric_name in grpo_save_state:
+                                    del grpo_save_state[original_metric_name]
+                            else:
+                                grpo_save_state[original_metric_name] = val_metrics[metric_name]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")
