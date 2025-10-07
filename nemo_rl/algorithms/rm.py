@@ -572,33 +572,23 @@ def rm_train(
                     if val_metrics is not None:
                         rm_save_state.update(val_metrics)
 
-                    original_metric_name = master_config["checkpointing"]["metric_name"]
-                    if original_metric_name is not None:
-                        assert original_metric_name.count(":") == 1, "metric_name must contain exactly one colon"
-                        parts = original_metric_name.split(":")
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.count(":") == 1, "metric_name must contain exactly one colon"
+                        parts = full_metric_name.split(":")
                         train_or_val = "val" if "val" in parts[0] else "train"
                         metric_name = parts[1]
 
-                        if train_or_val == "train":
-                            if metric_name not in metrics:
-                                warnings.warn(
-                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the training metrics. "
-                                    "This checkpoint will not be saved as top-k."
-                                )
-                                if original_metric_name in rm_save_state:
-                                    del rm_save_state[original_metric_name]
-                            else:
-                                rm_save_state[original_metric_name] = metrics[metric_name]
+                        metrics_source = metrics if train_or_val == "train" else val_metrics
+                        if metric_name not in metrics_source:
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {metric_name} but the metric is not found in the {train_or_val} metrics. "
+                                "This checkpoint will not be saved as top-k."
+                            )
+                            if full_metric_name in rm_save_state:
+                                del rm_save_state[full_metric_name]
                         else:
-                            if val_metrics is None or metric_name not in val_metrics:
-                                warnings.warn(
-                                    f"You asked to save checkpoints based on {metric_name} but the metric is not found in the validation metrics. "
-                                    "This checkpoint will not be saved as top-k."
-                                )
-                                if original_metric_name in rm_save_state:
-                                    del rm_save_state[original_metric_name]
-                            else:
-                                rm_save_state[original_metric_name] = val_metrics[metric_name]
+                            rm_save_state[full_metric_name] = metrics_source[metric_name]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
