@@ -135,6 +135,7 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
@@ -171,12 +172,16 @@ class ClippedPGLossFn(LossFunction):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                chunk_size=logprob_chunk_size,
             )
             # slice off to the correct length to remove potential CP padding
             curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             curr_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                chunk_size=logprob_chunk_size,
             )
         else:
             next_token_logits_wo_last = next_token_logits[
@@ -373,6 +378,7 @@ class NLLLoss(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
         dpo_loss: bool = False,
         dpo_average_log_probs: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -398,12 +404,16 @@ class NLLLoss(LossFunction):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                chunk_size=logprob_chunk_size,
             )
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                chunk_size=logprob_chunk_size,
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -633,6 +643,7 @@ class DPOLossFn(PreferenceLoss):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ## TODO(@ashors): there's some duplicate code here with the NLLLoss function. We should refactor
         token_mask = data["token_mask"][:, 1:]
@@ -652,12 +663,16 @@ class DPOLossFn(PreferenceLoss):
                 tp_group=vocab_parallel_group,
                 inference_only=False,
                 cp_group=context_parallel_group,
+                chunk_size=logprob_chunk_size,
             )
             # slice off to the correct length to remove potential CP padding
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"], seq_index=seq_index
+                next_token_logits,
+                data["input_ids"],
+                seq_index=seq_index,
+                chunk_size=logprob_chunk_size,
             )
         else:
             next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
@@ -691,6 +706,7 @@ class DPOLossFn(PreferenceLoss):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         sft_loss_chosen = torch.tensor(0.0)
         if self.sft_loss_weight > 0:
@@ -705,6 +721,7 @@ class DPOLossFn(PreferenceLoss):
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                logprob_chunk_size=logprob_chunk_size,
                 dpo_loss=True,
                 dpo_average_log_probs=self.sft_average_log_probs,
             )
@@ -727,6 +744,7 @@ class DPOLossFn(PreferenceLoss):
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
+            logprob_chunk_size=logprob_chunk_size,
         )
 
         dpo_loss = (
@@ -768,6 +786,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
@@ -818,6 +837,7 @@ class SequencePackingLossWrapper:
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
+                logprob_chunk_size=logprob_chunk_size,
             )
             loss_accum += loss
             for k, v in metrics.items():
@@ -867,6 +887,7 @@ class DistillationLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
         # Basic shapes
@@ -942,6 +963,7 @@ class DistillationLossFn(LossFunction):
                 )
 
             S_local = int(logits_tensor.shape[1])
+            # TODO: hardcoded 1024 below ignores logprob_chunk_size.
             chunk_size = max(1, min(S_local, 1024))
             student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
                 logits_tensor,
