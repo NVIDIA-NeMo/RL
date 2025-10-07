@@ -155,8 +155,42 @@ def get_batch_files(folder_path: str) -> List[str]:
     return logits_files
 
 
+def _topk_overlap_from_indices(a_topk: torch.Tensor, b_topk: torch.Tensor) -> torch.Tensor:
+    """Compute mean top-k overlap ratio given two index tensors of shape [B, T, K]."""
+    k = a_topk.shape[-1]
+    a_expanded = a_topk.unsqueeze(-1)  # [B, T, K, 1]
+    b_expanded = b_topk.unsqueeze(-2)  # [B, T, 1, K]
+    # Any match across K for each of the K elements
+    overlap_counts = (a_expanded == b_expanded).any(dim=-1).float().sum(dim=-1)  # [B, T]
+    return (overlap_counts / float(k)).mean()
+
+
+def _compute_topk_overlaps(a_logits: torch.Tensor, b_logits: torch.Tensor, k_values: List[int]) -> Dict[int, float]:
+    """Compute mean overlap ratios for multiple k values using logits.
+
+    Computes top-k indices once using max(k_values) to avoid repeated work.
+    """
+    if not k_values:
+        return {}
+    vocab_size = a_logits.shape[-1]
+    max_k_requested = max(k_values)
+    max_k = min(max_k_requested, vocab_size)
+    if max_k_requested > vocab_size:
+        print(f"    Note: Requested max k={max_k_requested} exceeds vocab={vocab_size}; clamping to {max_k}")
+    # Compute top-k indices for the largest k once
+    _, a_idx = torch.topk(a_logits, k=max_k, dim=-1)
+    _, b_idx = torch.topk(b_logits, k=max_k, dim=-1)
+    results: Dict[int, float] = {}
+    for k in k_values:
+        eff_k = min(k, max_k)
+        ratio = _topk_overlap_from_indices(a_idx[:, :, :eff_k], b_idx[:, :, :eff_k])
+        results[k] = float(ratio.item())
+    return results
+
+
 def compare_logits(base_folder: str, compare_folders: List[str], output_file: str = None, 
-                   chunk_size: int = 4, check_shapes_only: bool = False, max_batches: int = None):
+                   chunk_size: int = 4, check_shapes_only: bool = False, max_batches: int = None,
+                   topk_values: List[int] = None):
     """
     Compare logit numerical differences between base folder and comparison folders.
     
@@ -194,9 +228,11 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
     # Initialize results storage
     shape_results = {}
     logit_diff_results = {}
+    topk_overlap_results: Dict[str, List[Dict[int, float]]] = {}
     for compare_folder in compare_folders:
         shape_results[compare_folder] = []
         logit_diff_results[compare_folder] = []
+        topk_overlap_results[compare_folder] = []
     
     # Process each batch
     for i, logits_file in enumerate(base_logits_files):
@@ -278,6 +314,7 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
             if check_shapes_only:
                 print(f"  {compare_folder}: Shapes match ✓")
                 logit_diff_results[compare_folder].append(None)
+                topk_overlap_results[compare_folder].append(None)
                 continue
             
             # Calculate logit differences
@@ -287,6 +324,15 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
             print(f"  {compare_folder}: Mean abs diff = {logit_diff_stats['mean_abs_diff']:.6e}")
             print(f"  {compare_folder}: Max abs diff = {logit_diff_stats['max_abs_diff']:.6e}")
             print(f"  {compare_folder}: Median abs diff = {logit_diff_stats['median_abs_diff']:.6e}")
+            
+            # Calculate top-k overlap(s) if requested
+            if topk_values is not None and len(topk_values) > 0:
+                overlaps = _compute_topk_overlaps(base_logits, compare_logits, topk_values)
+                topk_overlap_results[compare_folder].append(overlaps)
+                for k in sorted(overlaps.keys()):
+                    print(f"  {compare_folder}: Top-{k} overlap = {overlaps[k]:.4f}")
+            else:
+                topk_overlap_results[compare_folder].append(None)
     
     # Calculate and display summary statistics
     print("\n" + "=" * 80)
@@ -294,6 +340,7 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
     print("=" * 80)
     
     logit_diff_summary = {}
+    topk_overlap_summary: Dict[str, Dict[int, Dict[str, float]]] = {}
     
     for compare_folder in compare_folders:
         # Check for shape mismatches and sequence length slicing
@@ -326,6 +373,25 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
                 'seq_len_sliced': seq_len_sliced
             }
         
+        # Process top-k overlap results
+        valid_topk_overlaps = [r for r in topk_overlap_results[compare_folder] if isinstance(r, dict)]
+        if valid_topk_overlaps:
+            k_to_values: Dict[int, List[float]] = {}
+            for entry in valid_topk_overlaps:
+                for k, val in entry.items():
+                    k_to_values.setdefault(k, []).append(val)
+            # Aggregate per k
+            folder_summary: Dict[int, Dict[str, float]] = {}
+            for k, values in k_to_values.items():
+                folder_summary[k] = {
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'count': len(values),
+                }
+            topk_overlap_summary[compare_folder] = folder_summary
+        
         # Display results
         print(f"\n{compare_folder}:")
         
@@ -344,16 +410,26 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
             print(f"    Mean rel diff: {logit_diff_summary[compare_folder]['mean_rel_diff_avg']:.6e} ({logit_diff_summary[compare_folder]['mean_rel_diff_avg']*100:.4f}%)")
         else:
             print(f"  LOGIT DIFFERENCE STATISTICS: No valid comparisons")
+
+        if compare_folder in topk_overlap_summary:
+            print(f"  TOP-K OVERLAP STATISTICS:")
+            for k in sorted(topk_overlap_summary[compare_folder].keys()):
+                s = topk_overlap_summary[compare_folder][k]
+                print(f"    Top-{k}: {s['mean']:.4f} ± {s['std']:.4f} (min {s['min']:.4f}, max {s['max']:.4f}, n={s['count']})")
+        else:
+            if topk_values:
+                print(f"  TOP-K OVERLAP STATISTICS: No valid comparisons")
     
     # Save results to file if requested
     if output_file:
-        save_results(shape_results, logit_diff_results, logit_diff_summary, output_file)
+        save_results(shape_results, logit_diff_results, logit_diff_summary, topk_overlap_results, topk_overlap_summary, output_file)
         print(f"\nResults saved to: {output_file}")
     
     return logit_diff_summary
 
 
-def save_results(shape_results: Dict, logit_diff_results: Dict, logit_diff_summary: Dict, output_file: str):
+def save_results(shape_results: Dict, logit_diff_results: Dict, logit_diff_summary: Dict, 
+                 topk_overlap_results: Dict, topk_overlap_summary: Dict, output_file: str):
     """Save results to a text file."""
     with open(output_file, 'w') as f:
         f.write("Logit Numerical Difference Comparison Results\n")
@@ -389,6 +465,15 @@ def save_results(shape_results: Dict, logit_diff_results: Dict, logit_diff_summa
                 f.write(f"    Mean rel diff: {stats['mean_rel_diff_avg']:.6e} ({stats['mean_rel_diff_avg']*100:.4f}%)\n")
             else:
                 f.write(f"  LOGIT DIFFERENCE STATISTICS: No valid comparisons\n")
+            
+            # Top-k overlap statistics
+            if folder in topk_overlap_summary and topk_overlap_summary[folder]:
+                f.write(f"  TOP-K OVERLAP STATISTICS:\n")
+                for k in sorted(topk_overlap_summary[folder].keys()):
+                    s = topk_overlap_summary[folder][k]
+                    f.write(f"    Top-{k}: {s['mean']:.4f} ± {s['std']:.4f} (min {s['min']:.4f}, max {s['max']:.4f}, n={s['count']})\n")
+            else:
+                f.write(f"  TOP-K OVERLAP STATISTICS: No valid comparisons\n")
         
         # Write detailed results
         f.write("\n\nDETAILED RESULTS (per batch)\n")
@@ -398,8 +483,9 @@ def save_results(shape_results: Dict, logit_diff_results: Dict, logit_diff_summa
             f.write(f"\n{folder}:\n")
             shape_infos = shape_results[folder]
             logit_diffs = logit_diff_results[folder]
+            topk_overlaps = topk_overlap_results[folder]
             
-            for i, (shape_info, logit_diff) in enumerate(zip(shape_infos, logit_diffs)):
+            for i, (shape_info, logit_diff, topk_overlap_entry) in enumerate(zip(shape_infos, logit_diffs, topk_overlaps)):
                 f.write(f"  batch_{i}:\n")
                 
                 if shape_info is not None:
@@ -418,6 +504,13 @@ def save_results(shape_results: Dict, logit_diff_results: Dict, logit_diff_summa
                     f.write(f"    Mean rel diff: {logit_diff['mean_rel_diff']:.6e}\n")
                 else:
                     f.write(f"    Logit differences: N/A\n")
+                
+                if isinstance(topk_overlap_entry, dict) and topk_overlap_entry:
+                    f.write(f"    Top-k overlaps:\n")
+                    for k in sorted(topk_overlap_entry.keys()):
+                        f.write(f"      Top-{k}: {topk_overlap_entry[k]:.4f}\n")
+                else:
+                    f.write(f"    Top-k overlaps: N/A\n")
 
 
 def main():
@@ -456,6 +549,8 @@ Examples:
                        help='Only check tensor shapes without computing differences (fast)')
     parser.add_argument('--max-batches', type=int, default=1,
                        help='Maximum number of batches to compare (default: 1, set to 0 or negative for all batches)')
+    parser.add_argument('--topk-values', nargs='+', type=int, default=[1, 10, 100, 1000],
+                       help='Top-k values for overlap comparison on logits (default: 1 10 100 1000)')
     
     args = parser.parse_args()
     
@@ -485,7 +580,7 @@ Examples:
         max_batches = None if args.max_batches <= 0 else args.max_batches
         compare_logits(args.base, existing_compare_folders, output_file, 
                       chunk_size=args.chunk_size, check_shapes_only=args.check_shapes_only,
-                      max_batches=max_batches)
+                      max_batches=max_batches, topk_values=args.topk_values)
         return
     
     # Otherwise, use framework-based comparison
@@ -526,8 +621,25 @@ Examples:
         max_batches = None if args.max_batches <= 0 else args.max_batches
         summary = compare_logits(base_folder, compare_folders, output_file,
                                 chunk_size=args.chunk_size, check_shapes_only=args.check_shapes_only,
-                                max_batches=max_batches)
+                                max_batches=max_batches, topk_values=args.topk_values)
         all_summaries[framework] = summary
+    
+    # Cross-framework comparison: dtensor/tp1 vs megatron/tp1 (if both exist and selected)
+    if 'dtensor' in frameworks_to_compare and 'megatron' in frameworks_to_compare:
+        dtensor_tp1 = os.path.join('dtensor', 'tp1')
+        megatron_tp1 = os.path.join('megatron', 'tp1')
+        if os.path.exists(dtensor_tp1) and os.path.exists(megatron_tp1):
+            print("\n" + "=" * 80)
+            print("CROSS-FRAMEWORK: DTENSOR(tp1) vs MEGATRON(tp1)")
+            print("=" * 80)
+            output_file = os.path.join(args.output_dir, 'dtensor_vs_megatron_tp1_results.txt')
+            max_batches = None if args.max_batches <= 0 else args.max_batches
+            summary = compare_logits(dtensor_tp1, [megatron_tp1], output_file,
+                                     chunk_size=args.chunk_size,
+                                     check_shapes_only=args.check_shapes_only,
+                                     max_batches=max_batches,
+                                     topk_values=args.topk_values)
+            all_summaries['cross_tp1'] = summary
     
     # Print overall summary
     if all_summaries and not args.check_shapes_only:
