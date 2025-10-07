@@ -42,6 +42,7 @@ def import_model_from_hf_name(
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
     orig_pipeline_model_parallel_size = model_provider.pipeline_model_parallel_size
+    orig_context_parallel_size = model_provider.context_parallel_size
     orig_expert_model_parallel_size = model_provider.expert_model_parallel_size
     orig_expert_tensor_parallel_size = model_provider.expert_tensor_parallel_size
     orig_num_layers_in_first_pipeline_stage = (
@@ -58,6 +59,9 @@ def import_model_from_hf_name(
         ]
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
+        ]
+        model_provider.context_parallel_size = megatron_config[
+            "context_parallel_size"
         ]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"
@@ -82,6 +86,7 @@ def import_model_from_hf_name(
     config = megatron_model[0].config
     config.tensor_model_parallel_size = orig_tensor_model_parallel_size
     config.pipeline_model_parallel_size = orig_pipeline_model_parallel_size
+    config.context_parallel_size = orig_context_parallel_size
     config.expert_model_parallel_size = orig_expert_model_parallel_size
     config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
