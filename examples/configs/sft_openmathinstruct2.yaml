@@ -29,6 +29,7 @@ policy:
 
   dtensor_cfg:
     enabled: true
+    _v2: true
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -75,6 +76,7 @@ data:
   add_generation_prompt: true
   output_key: 'generated_solution'
   shuffle: true
+  num_workers: 20
 
 logger:
   log_dir: "logs"  # Base directory for all logs
