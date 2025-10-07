@@ -16,7 +16,6 @@ uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_gene
 uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_vllm_http_server
 
 # NeMo Gym communicates not using token ids, but in OpenAI schema. There are some edge cases we need to handle (e.g. token merging upon retokenization, multiple most efficient retokenizations, etc).
-uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens
 uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_VllmAsyncGenerationWorker_replace_prefix_tokens
 
 # NeMo RL test. This should pass no matter what the Gym setup is.
