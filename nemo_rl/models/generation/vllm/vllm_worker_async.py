@@ -200,6 +200,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 truncate_prompt_tokens=None,
                 add_special_tokens=False,
             ):
+                # Materialize the message tool calls so we can deepcopy below.
+                for message in messages:
+                    if message.get("tool_calls"):
+                        message["tool_calls"] = list(message["tool_calls"])
+
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
