@@ -159,6 +159,7 @@ class DTensorPolicyWorker:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        """Initialize the DTensorPolicyWorker."""
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -1711,6 +1712,7 @@ class DTensorPolicyWorker:
 
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
@@ -1728,6 +1730,7 @@ class DTensorPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -1839,7 +1842,7 @@ class DTensorPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
-        # Offload as much as possible on the CPU
+        """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator

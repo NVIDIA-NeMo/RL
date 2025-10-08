@@ -708,14 +708,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
-        """Update weights from IPC handles via ZMQ socket.
-
-        Args:
-            None
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+        """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"

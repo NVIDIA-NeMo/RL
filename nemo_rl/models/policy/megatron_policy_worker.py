@@ -1861,12 +1861,15 @@ class MegatronPolicyWorker:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
-        # Get parameter info for refit / mcore side info
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info
@@ -1942,6 +1945,7 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -2054,9 +2058,9 @@ class MegatronPolicyWorker:
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
+        """Offload as much as possible on the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        # Offload as much as possible on the CPU
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator

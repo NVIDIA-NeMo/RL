@@ -57,6 +57,7 @@ class VllmInternalWorkerExtension:
         )
 
     def report_device_id(self) -> str:
+        """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid
 
         return get_device_uuid(self.device.index)
@@ -72,14 +73,13 @@ class VllmInternalWorkerExtension:
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
             )
-            # Set receive timeout to 30 seconds to avoid hanging indefinitely
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 30000
-            )  # 30 seconds in milliseconds
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit.
+        """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
@@ -89,10 +89,7 @@ class VllmInternalWorkerExtension:
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
-        """Update weights from local IPC handles via ZMQ socket.
-
-        Args:
-            None
+        """Receive and update model weights via ZMQ IPC socket.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -168,7 +165,7 @@ class VllmInternalWorkerExtension:
 
         except Exception as e:
             print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
+                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}"
             )
             return False
 

@@ -853,14 +853,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
-        """Async version of update_weights_from_ipc_handles.
-
-        Args:
-            None
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+        """Async version of update_weights_via_ipc_zmq."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"

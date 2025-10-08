@@ -732,6 +732,7 @@ def refit_policy_generation(
         _refit_buffer_size_gb: The size of the buffer to use for refitting.
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
+        timer: Optional Timer used to time the prepare/transfer/update phase
     """
     if colocated_inference:
         policy.offload_before_refit()
