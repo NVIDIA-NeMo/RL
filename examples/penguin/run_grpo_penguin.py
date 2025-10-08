@@ -33,7 +33,6 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.penguin import (
     Penguin,
     PenguinConfig,
-    setup_qwen3_penguin_config,
     setup_penguin_config,
     penguin_example_to_nemo_rl_datum_spec,
 )
@@ -121,7 +120,6 @@ def main() -> None:
 
     # Penguin specific config setup.
     setup_penguin_config(config, tokenizer)
-    setup_qwen3_penguin_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_penguin(config)

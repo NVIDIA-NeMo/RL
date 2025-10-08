@@ -46,6 +46,7 @@ class RMSaveState(TypedDict):
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
     consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
 def _default_rm_save_state() -> RMSaveState:
@@ -54,6 +55,7 @@ def _default_rm_save_state() -> RMSaveState:
         "step": 0,
         "total_steps": 0,
         "consumed_samples": 0,
+        "total_valid_tokens": 0,
     }
 
 
@@ -437,10 +439,14 @@ def rm_train(
         current_epoch = 0
         current_step = 0
         total_steps = 0
+        total_valid_tokens = 0
     else:
         current_epoch = rm_save_state["epoch"]
         current_step = rm_save_state["step"]
         total_steps = rm_save_state["total_steps"]
+        total_valid_tokens = rm_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     rm_config = master_config["rm"]
     # Validation configuration
@@ -515,6 +521,17 @@ def rm_train(
                         val_mbs=rm_config["val_micro_batch_size"],
                         logger=logger,
                     )
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
                 timeout.mark_iteration()
@@ -537,6 +554,7 @@ def rm_train(
                     rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     rm_save_state["total_steps"] = total_steps + 1
                     rm_save_state["epoch"] = current_epoch
+                    rm_save_state["total_valid_tokens"] = total_valid_tokens
                     # Remove outdated validation metrics
                     for key in list(rm_save_state):
                         if (
@@ -589,17 +607,6 @@ def rm_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
-            losses = train_results["loss"]
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
@@ -622,6 +629,13 @@ def rm_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
