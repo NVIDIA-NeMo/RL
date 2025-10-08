@@ -74,6 +74,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
 
 class IPCProtocol(Enum):
     """IPC protocol constants for ZMQ weight streaming."""
+
     COMPLETE = "complete"
     ACK = "ack"
 
