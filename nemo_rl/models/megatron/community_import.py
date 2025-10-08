@@ -122,6 +122,10 @@ def export_model_from_megatron(
 
     # Export performs on CPU with proper distributed context
     with temporary_distributed_context(backend="gloo"):
+        # Need to set model parallel cuda manual seed for mamba mixer
+        from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+        model_parallel_cuda_manual_seed(0)
+
         # Load the Megatron model
         megatron_model = bridge.load_megatron_model(
             input_path, skip_temp_dist_context=True
