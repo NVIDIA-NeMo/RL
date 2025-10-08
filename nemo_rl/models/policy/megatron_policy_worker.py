@@ -507,6 +507,10 @@ class MegatronPolicyWorker:
                 hf_model_name, pretrained_path, self.cfg["megatron_cfg"]
             )
 
+            if parallel_state.model_parallel_is_initialized():
+                print("Reinitializing model parallel after loading model state.")
+                parallel_state.destroy_model_parallel()
+
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
         )
