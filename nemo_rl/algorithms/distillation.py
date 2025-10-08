@@ -90,6 +90,7 @@ class DistillationSaveState(TypedDict):
         float
     ]  # Can be any metric. Setted to 'accuracy' by default in validation.
     consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
 def _default_distillation_save_state() -> DistillationSaveState:
@@ -97,6 +98,7 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "step": 0,
         "val_reward": -99999999.0,  # Aligned with GRPO
         "consumed_samples": 0,
+        "total_valid_tokens": 0,
     }
 
 
@@ -302,8 +304,10 @@ def setup(
 
         # validate and configure resources
         if cluster_config["num_nodes"] == 1:
-            assert inference_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
                 "when cluster.num_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_gpus_per_node}."
             )
@@ -321,14 +325,13 @@ def setup(
                 f"but got {inference_nodes}."
             )
             assert (
-                inference_gpus_per_node is None
-                or inference_gpus_per_node == cluster_config["gpus_per_node"]
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
             ), (
-                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
             )
-            inference_gpus_per_node = cluster_config["gpus_per_node"]
             train_nodes -= inference_nodes
 
         # create clusters
@@ -491,6 +494,9 @@ def distillation_train(
     # common config/state itmes
     step = distillation_save_state["step"]
     consumed_samples = distillation_save_state["consumed_samples"]
+    total_valid_tokens = distillation_save_state.get(
+        "total_valid_tokens", 0
+    )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -677,6 +683,27 @@ def distillation_train(
                     )
                     logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                metrics.update(rollout_metrics)
+                total_valid_tokens += metrics["global_valid_toks"]
+
                 ## Checkpointing
                 consumed_samples += master_config["distillation"][
                     "num_prompts_per_step"
@@ -697,6 +724,7 @@ def distillation_train(
                     student_policy.prepare_for_training()
 
                     distillation_save_state["step"] = step + 1
+                    distillation_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         distillation_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in distillation_save_state:
@@ -743,26 +771,6 @@ def distillation_train(
             log_data = {"content": flat_messages["content"]}
             log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
-
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-                "mean_prompt_length": repeated_batch["length"].numpy(),
-                "total_num_tokens": input_lengths.numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {
-                    "lr",
-                    "wd",
-                    "global_valid_seqs",
-                    "global_valid_toks",
-                    "mean_prompt_length",
-                }:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
-            metrics.update(rollout_metrics)
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -817,6 +825,9 @@ def distillation_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
 

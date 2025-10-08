@@ -104,6 +104,7 @@ class GRPOSaveState(TypedDict):
     current_step: int
     current_epoch: int
     total_steps: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
@@ -115,6 +116,7 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "current_step": 0,
         "current_epoch": 0,
         "total_steps": 0,
+        "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
 
@@ -303,8 +305,10 @@ def setup(
         # validate and configure resources
         if policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
-            assert inference_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
                 "when policy_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_gpus_per_node}."
             )
@@ -337,14 +341,13 @@ def setup(
                 f"but got {inference_nodes}."
             )
             assert (
-                inference_gpus_per_node is None
-                or inference_gpus_per_node == cluster_config["gpus_per_node"]
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
             ), (
-                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
             )
-            inference_gpus_per_node = cluster_config["gpus_per_node"]
             train_nodes -= inference_nodes
 
         # initialize train cluster
@@ -606,6 +609,9 @@ def grpo_train(
     consumed_samples = grpo_save_state[
         "consumed_samples"
     ]  # total samples consumed across all epochs
+    total_valid_tokens = grpo_save_state.get(
+        "total_valid_tokens", 0
+    )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -846,6 +852,28 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "reward": rewards.numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "reward",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                metrics.update(rollout_metrics)
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -869,6 +897,7 @@ def grpo_train(
                     grpo_save_state["current_step"] = current_step + 1
                     grpo_save_state["total_steps"] = total_steps + 1
                     grpo_save_state["current_epoch"] = current_epoch
+                    grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -922,28 +951,6 @@ def grpo_train(
                 log_data, f"train_data_step{total_steps}.jsonl"
             )
 
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "reward": rewards.numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-                "mean_prompt_length": repeated_batch["length"].numpy(),
-                "total_num_tokens": input_lengths.numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {
-                    "lr",
-                    "wd",
-                    "reward",
-                    "global_valid_seqs",
-                    "global_valid_toks",
-                    "mean_prompt_length",
-                }:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
-            metrics.update(rollout_metrics)
-
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
@@ -993,6 +1000,9 @@ def grpo_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
@@ -1190,6 +1200,9 @@ def async_grpo_train(
     step = grpo_save_state["current_step"]
     weight_version = step  # Tracks refitted weight versions
     consumed_samples = grpo_save_state["consumed_samples"]
+    total_valid_tokens = grpo_save_state.get(
+        "total_valid_tokens", 0
+    )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -1639,6 +1652,27 @@ def async_grpo_train(
 
                     # Resume trajectory collection after validation
                     trajectory_collector.resume.remote()
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "reward": rewards.numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                    "mean_prompt_length": repeated_batch["length"].numpy(),
+                    "total_num_tokens": input_lengths.numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {
+                        "lr",
+                        "wd",
+                        "reward",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                metrics.update(rollout_metrics)
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -1649,6 +1683,7 @@ def async_grpo_train(
                     policy.prepare_for_training()
 
                     grpo_save_state["current_step"] = step + 1
+                    grpo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -1700,27 +1735,6 @@ def async_grpo_train(
             log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "reward": rewards.numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-                "mean_prompt_length": repeated_batch["length"].numpy(),
-                "total_num_tokens": input_lengths.numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {
-                    "lr",
-                    "wd",
-                    "reward",
-                    "global_valid_seqs",
-                    "global_valid_toks",
-                }:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
-            metrics.update(rollout_metrics)
-
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )
@@ -1746,6 +1760,13 @@ def async_grpo_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
