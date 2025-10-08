@@ -415,6 +415,115 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_distillation_setup_non_colocated_smoke(monkeypatch):
+    """Smoke test: calling setup with a non-colocated config should succeed."""
+    from unittest.mock import MagicMock, patch
+
+    import nemo_rl.algorithms.distillation as distil_mod
+
+    # Single node cluster; inference uses a subset of GPUs on same node
+    master_config = {
+        "policy": {
+            "generation": {
+                "backend": "vllm",
+                "colocated": {
+                    "enabled": False,
+                    "resources": {
+                        "gpus_per_node": 8,  # inference on 8 GPU
+                        "num_nodes": 1,
+                    },
+                },
+            },
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+            "model_name": "test-policy",
+        },
+        "teacher": {
+            "model_name": "test-teacher",
+            "dtensor_cfg": {
+                "enabled": False,
+            },
+        },
+        "loss_fn": {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        },
+        "distillation": {
+            "seed": 42,
+            "topk_logits_k": 64,
+            "num_prompts_per_step": 1,
+            "val_period": 0,
+            "val_at_start": False,
+        },
+        "data": {"shuffle": False},
+        "logger": {},
+        "checkpointing": {},
+        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+    }
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+
+    # Skip tokenizer/vocab equality check inside setup
+    monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "1")
+
+    ip_port = ("127.0.0.1", 12345)
+
+    class DummyCluster:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def world_size(self):
+            return 1
+
+        def get_master_address_and_port(self):
+            return ip_port
+
+    class DummyPolicy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare_refit_info(self):
+            return {}
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    class DummyVllmGeneration:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def finish_generation(self):
+            return None
+
+        def prepare_refit_info(self, *args, **kwargs):
+            return None
+
+        def init_collective(self, *args, **kwargs):
+            return [MagicMock()]
+
+    with (
+        patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
+        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
+        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(distil_mod, "Policy", DummyPolicy),
+        patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(distil_mod, "ray") as mock_ray,
+    ):
+        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ray.get = MagicMock(return_value=None)
+
+        # Should not raise
+        result = distil_mod.setup(master_config, tokenizer, dataset, None)
+
+        # Basic shape check of returned tuple
+        assert isinstance(result, tuple)
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     """Test that non-colocated inference requires explicit gpus_per_node when cluster.num_nodes>1."""
     from unittest.mock import MagicMock, patch

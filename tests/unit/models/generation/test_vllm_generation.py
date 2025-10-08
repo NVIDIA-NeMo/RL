@@ -944,8 +944,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Refit
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1747,9 +1754,15 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    world_size = tensor_parallel_size + 1
-    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info

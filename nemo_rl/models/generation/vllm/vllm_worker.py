@@ -477,7 +477,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         self.llm.collective_rpc(
             "init_collective",
@@ -486,6 +491,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 ip,
                 port,
                 world_size,
+                train_world_size,
             ),
         )
 
