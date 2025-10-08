@@ -22,7 +22,7 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
-from nemo_rl.data.datasets import rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -802,6 +802,7 @@ def test_run_async_penguin_rollout(
             "total_reward/median": 0.0,
             "total_reward/stddev": 0.0,
             "total_reward/histogram": None,
+            "multineedle_simple_agent/full_result": None,
             # per agent metrics
             "multineedle_simple_agent/accuracy/histogram": None,
             "multineedle_simple_agent/accuracy/max": 0.0,

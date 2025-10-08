@@ -180,6 +180,10 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      http_server_serving_chat_kwargs:
+        # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
+        enable_auto_tools: true
+        tool_parser: hermes
     vllm_kwargs:
       compilation_config:
         # when enforce_eager is False, set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
