@@ -15,6 +15,7 @@
 import gc
 import importlib
 import os
+from enum import Enum
 from typing import Any, Dict
 
 import torch
@@ -69,6 +70,12 @@ if NEMO_AUTOMODEL_AVAILABLE:
         "mistral3": NeMoAutoModelForImageTextToText,
         "llama4": NeMoAutoModelForImageTextToText,
     }
+
+
+class IPCProtocol(Enum):
+    """IPC protocol constants for ZMQ weight streaming."""
+    COMPLETE = "complete"
+    ACK = "ack"
 
 
 def resolve_model_class(model_name: str) -> Any:
@@ -271,7 +278,7 @@ def stream_weights_via_ipc_zmq_impl(
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
-    Uses double buffering to enable overlapping communication while reusing buffers
+    Uses ping-pong double buffering to enable overlapping communication while reusing buffers
     to reduce memory allocation overhead and improve stability.
 
     Args:
@@ -291,8 +298,9 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        serialized = (cuda_ipc_handle, tuple(param_names), used_bytes)
-        zmq_socket.send_pyobj(serialized)
+        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
+        payload = (cuda_ipc_handle, param_names, used_bytes)
+        zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
     def allocate_buffer(device):
@@ -313,7 +321,7 @@ def stream_weights_via_ipc_zmq_impl(
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 
-    # Initialize double buffering system
+    # Initialize ping-pong double buffering
     buffer_a: torch.Tensor | None = None
     buffer_b: torch.Tensor | None = None
     current_buffer: torch.Tensor | None = None
@@ -343,7 +351,7 @@ def stream_weights_via_ipc_zmq_impl(
                 )
                 count_of_groups += 1
 
-                # Switch buffers for double buffering
+                # Switch buffers for ping-pong double buffering
                 current_buffer = buffer_b if current_buffer is buffer_a else buffer_a
                 used_bytes, param_names = 0, []
 
@@ -364,7 +372,7 @@ def stream_weights_via_ipc_zmq_impl(
 
         # Final synchronization and completion signal
         torch.cuda.current_stream().synchronize()
-        zmq_socket.send_pyobj("complete")
+        zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
         zmq_socket.recv()
 
         if rank == 0:

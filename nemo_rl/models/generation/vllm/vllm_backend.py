@@ -15,9 +15,10 @@ import gc
 from typing import Any
 
 import torch
-import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
+import zmq
+from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
@@ -30,6 +31,25 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
+
+def rebuild_cuda_tensor_from_ipc(
+    cuda_ipc_handle: tuple, device_id: int
+) -> torch.Tensor:
+    """Rebuild a CUDA tensor from an IPC handle.
+
+    Args:
+        cuda_ipc_handle: Tuple containing the CUDA IPC handle data
+        device_id: Target CUDA device ID
+
+    Returns:
+        Reconstructed CUDA tensor on the target device
+    """
+    func = rebuild_cuda_tensor
+    args = cuda_ipc_handle[0]
+    list_args = list(args)
+    list_args[6] = device_id
+    return func(*list_args)
 
 
 class VllmInternalWorkerExtension:
@@ -74,7 +94,7 @@ class VllmInternalWorkerExtension:
                 zmq.REP
             )
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
@@ -99,24 +119,17 @@ class VllmInternalWorkerExtension:
 
         try:
             self.maybe_init_zmq()
-            from nemo_rl.models.policy.utils import calculate_aligned_size
-
             while True:
                 # Blocking receive with timeout (this is the main operation)
                 payload = self.zmq_socket.recv_pyobj()
 
-                if payload == "complete":
+                if payload == IPCProtocol.COMPLETE:
                     # means the update is done
-                    self.zmq_socket.send(b"")
+                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
-                packed_tensor_handle, list_keys, used_bytes = payload
-                device_id = self.device.index
-                func = rebuild_cuda_tensor
-                args = packed_tensor_handle[0]
-                list_args = list(args)
-                list_args[6] = device_id
-                buffer = func(*list_args)
+                ipc_handle, list_keys, used_bytes = payload
+                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
                 weights = []
                 offset = 0
@@ -157,7 +170,7 @@ class VllmInternalWorkerExtension:
                 del weights, buffer
                 weights = None
                 buffer = None
-                self.zmq_socket.send(b"")
+                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
             gc.collect()
             torch.cuda.empty_cache()
