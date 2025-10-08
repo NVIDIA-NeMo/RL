@@ -257,11 +257,11 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     """Calculate aligned size for memory alignment.
 
     Args:
-        size_bytes: Size in bytes to align
-        alignment: Alignment boundary in bytes (default 512)
+        size_bytes(int): Size in bytes to align
+        alignment(int): Alignment boundary in bytes (default 512)
 
     Returns:
-        Aligned size in bytes
+        Aligned size in bytes(int).
     """
     return int(((size_bytes + alignment - 1) // alignment) * alignment)
 
