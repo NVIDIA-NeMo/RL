@@ -528,6 +528,7 @@ class PreferenceLoss(LossFunction):
         data: BatchedDataDict[PreferenceLossDataDict],
         global_valid_seqs: Tensor,
         global_valid_toks: Tensor | None,
+        logprob_chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         sample_mask = data["sample_mask"]
 
