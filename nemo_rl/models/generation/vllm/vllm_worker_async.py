@@ -297,8 +297,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
-        # TODO remove
-        print(serving_chat_kwargs)
         openai_serving_chat = NeMoRLOpenAIServingChat(
             engine_client,
             model_config,

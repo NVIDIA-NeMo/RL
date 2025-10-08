@@ -45,6 +45,11 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):
     setup_penguin_config(master_config, penguin_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
+    # This is the tool parser for Qwen/Qwen3-0.6B. This needs to be changed for other models.
+    generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"] = {
+        "enable_auto_tools": True,
+        "tool_parser": "hermes",
+    }
 
     vllm_generation = VllmGeneration(cluster, generation_config)
 
