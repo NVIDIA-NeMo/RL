@@ -32,14 +32,20 @@ except ImportError:
 
 class VllmInternalWorkerExtension:
     def init_collective(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank()
-        rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
+        # Place vLLM ranks after all training ranks so all training workers can join
+        rank = train_world_size + rank_prefix + local_rank
 
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size

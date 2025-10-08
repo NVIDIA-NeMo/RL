@@ -234,11 +234,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.cfg = config
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
-            "init_collective", ip=ip, port=port, world_size=world_size
+            "init_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            train_world_size=train_world_size,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
