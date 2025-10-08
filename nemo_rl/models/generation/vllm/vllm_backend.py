@@ -175,7 +175,6 @@ class VllmInternalWorkerExtension:
             gc.collect()
             torch.cuda.empty_cache()
             return True
-
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}"
