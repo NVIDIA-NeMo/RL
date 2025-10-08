@@ -15,9 +15,9 @@ import gc
 from typing import Any
 
 import torch
+import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-import zmq
 from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
