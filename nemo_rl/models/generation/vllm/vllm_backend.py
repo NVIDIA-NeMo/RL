@@ -151,12 +151,17 @@ class VllmInternalWorkerExtension:
                     self.model_runner.model.load_weights(weights=weights)
 
                 torch.cuda.current_stream().synchronize()
+
+                # CRITICAL: Delete views before ACK to prevent corruption.
+                # 'weights' contains views into IPC shared memory. Even though load_weights()
+                # copied the data, Python may not garbage collect these view objects immediately.
+                # If sender reuses the buffer before GC runs, old views would read corrupted data.
+                # Explicit del ensures immediate cleanup before sending ACK.
+                del weights, buffer
+                weights = None
+                buffer = None
                 self.zmq_socket.send(b"")
 
-            if buffer is not None:
-                del buffer
-            if weights is not None:
-                del weights
             gc.collect()
             torch.cuda.empty_cache()
             return True

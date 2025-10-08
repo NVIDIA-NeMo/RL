@@ -1700,7 +1700,10 @@ class DTensorPolicyWorkerV2:
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
                     # Convert to target dtype
-                    yield name, full_tensor.to(self.dtype, non_blocking=True).contiguous()
+                    yield (
+                        name,
+                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                    )
                 else:
                     # Convert to target dtype
                     yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
