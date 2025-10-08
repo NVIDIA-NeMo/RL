@@ -6,7 +6,7 @@
 * [9/25/2025] On-policy Distillation (Qwen3-style)
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
-    * 📝 [v0.3.0 Blog Post](https://nvidia-nemo.github.io/blog/2025/07/21/nemo-rl-v0.3/)
+    * 📝 [v0.3.0 Announcement](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
 
 <details>

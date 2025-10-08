@@ -29,7 +29,7 @@ def mock_components():
     policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
-        "all_mb_metrics": {},
+        "all_mb_metrics": {"global_valid_toks": [10]},
     }
 
     # Create a proper message log structure with token_ids
@@ -82,6 +82,10 @@ def mock_components():
             "enabled": False,
             "checkpoint_must_save_by": None,
             "save_period": 10,
+        },
+        "cluster": {
+            "num_nodes": 1,
+            "gpus_per_node": 2,
         },
     }
 
