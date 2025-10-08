@@ -28,7 +28,7 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_config, setup_qwen3_penguin_config
+from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_config
 
 # cluster and tokenizer are fixture imports
 from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer as penguin_tokenizer, basic_vllm_test_config
@@ -43,7 +43,6 @@ def penguin_vllm_generation(cluster, penguin_tokenizer):
         },
     }
     setup_penguin_config(master_config, penguin_tokenizer)
-    setup_qwen3_penguin_config(master_config, penguin_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
 
