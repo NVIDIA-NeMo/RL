@@ -11,19 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, List, TypedDict
-
 from pathlib import Path
+from typing import Any, Dict, List, TypedDict
 
 import ray
 import torch
 
-from tqdm.auto import tqdm
-
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.environments.interfaces import EnvironmentInterface
-
-from nemo_rl.distributed.virtual_cluster import _get_node_ip_local, _get_free_port_local
 
 
 class PenguinConfig(TypedDict):
@@ -34,10 +30,8 @@ class PenguinConfig(TypedDict):
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class Penguin(EnvironmentInterface):
-    """
-    This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray.
-    So there is still one source of truth for resource management in NeMo RL.
-    """
+    """This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
+
     def __init__(self, cfg: PenguinConfig):
         self.cfg = cfg
 
@@ -45,9 +39,9 @@ class Penguin(EnvironmentInterface):
         self.head_server_port = _get_free_port_local()
 
         from omegaconf import DictConfig
-        from penguin.cli import RunHelper, GlobalConfigDictParserConfig
-        from penguin.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from penguin.cli import GlobalConfigDictParserConfig, RunHelper
         from penguin.rollout_collection import RolloutCollectionHelper
+        from penguin.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
 
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
@@ -55,15 +49,23 @@ class Penguin(EnvironmentInterface):
         initial_global_config_dict = self.cfg["initial_global_config_dict"]
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
-        initial_global_config_dict["policy_api_key"] = "dummy_key"  # No key necessary for training.
+        initial_global_config_dict["policy_api_key"] = (
+            "dummy_key"  # No key necessary for training.
+        )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = initial_global_config_dict.get("global_aiohttp_connector_limit_per_host") or 1024
-        initial_global_config_dict["global_aiohttp_connector_limit"] = initial_global_config_dict["global_aiohttp_connector_limit_per_host"] * len(self.cfg['base_urls'])
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = (
+            initial_global_config_dict.get("global_aiohttp_connector_limit_per_host")
+            or 1024
+        )
+        initial_global_config_dict["global_aiohttp_connector_limit"] = (
+            initial_global_config_dict["global_aiohttp_connector_limit_per_host"]
+            * len(self.cfg["base_urls"])
+        )
 
         print(
-            f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict['global_aiohttp_connector_limit_per_host']}.
-Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg['base_urls'])} * {initial_global_config_dict['global_aiohttp_connector_limit_per_host']} = {initial_global_config_dict['global_aiohttp_connector_limit']}."""
+            f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]}.
+Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg["base_urls"])} * {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} = {initial_global_config_dict["global_aiohttp_connector_limit"]}."""
         )
 
         # Head server
@@ -75,7 +77,8 @@ Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute() / "penguin_env.yaml",
+                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+                / "penguin_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
             )
@@ -96,7 +99,9 @@ Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances
             examples=penguin_examples, head_server_config=self.head_server_config
         )
 
-        nemo_rl_results = list(map(self._postprocess_penguin_to_nemo_rl_result, penguin_results))
+        nemo_rl_results = list(
+            map(self._postprocess_penguin_to_nemo_rl_result, penguin_results)
+        )
         return nemo_rl_results
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
@@ -111,18 +116,25 @@ Since there are {len(self.cfg['base_urls'])} data-parallel vLLM worker instances
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert seen_token_ids == output_item_dict["prompt_token_ids"][:len(seen_token_ids)], f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            assert (
+                seen_token_ids
+                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
+            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
-            nemo_rl_message_log.append({
+            nemo_rl_message_log.append(
+                {
                     "role": "user",
                     "content": "",
-                    "token_ids": output_item_dict["prompt_token_ids"][len(seen_token_ids):],
+                    "token_ids": output_item_dict["prompt_token_ids"][
+                        len(seen_token_ids) :
+                    ],
                 }
             )
-            nemo_rl_message_log.append({
+            nemo_rl_message_log.append(
+                {
                     "role": "assistant",
                     "content": "",
                     "token_ids": output_item_dict["generation_token_ids"],
@@ -172,10 +184,13 @@ def setup_penguin_config(config, tokenizer) -> None:
 # Data utils
 ########################################
 
+
 # We do some light preprocessing here to make our data format compatible with nemo rl format
 def penguin_example_to_nemo_rl_datum_spec(penguin_example: dict, idx: int) -> DatumSpec:
     return DatumSpec(
-        message_log=[{"role": "user", "content": "", "token_ids": torch.tensor([])}],  # Fake message
+        message_log=[
+            {"role": "user", "content": "", "token_ids": torch.tensor([])}
+        ],  # Fake message
         length=0,
         extra_env_info=penguin_example,
         loss_multiplier=1.0,  # Fix to 1.0 to backprop on all examples

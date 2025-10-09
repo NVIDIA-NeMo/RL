@@ -11,31 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
-
 import json
-
+import time
 from copy import deepcopy
-
 from pathlib import Path
-
-from yaml import safe_load
 
 import pytest
 import ray
+from yaml import safe_load
 
-from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_config
+from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
-from tests.unit.models.generation.test_vllm_generation import cluster, tokenizer as penguin_tokenizer, basic_vllm_test_config
+from tests.unit.models.generation.test_vllm_generation import (
+    basic_vllm_test_config,
+    cluster,  # noqa: F401
+)
+from tests.unit.models.generation.test_vllm_generation import (
+    tokenizer as penguin_tokenizer,  # noqa: F401
+)
 
 
 @pytest.fixture(scope="function")
-def penguin_vllm_generation(cluster, penguin_tokenizer):
+def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = {
         "policy": {
@@ -125,10 +127,14 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
     generation_config = penguin_vllm_generation.cfg
     examples = penguin_sanity_test_data["input"]
     for example in examples:
-        example["responses_create_params"]["temperature"] = generation_config["temperature"]
+        example["responses_create_params"]["temperature"] = generation_config[
+            "temperature"
+        ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
-    actual_result = ray.get(penguin.run_rollouts.remote(penguin_sanity_test_data["input"]))
+    actual_result = ray.get(
+        penguin.run_rollouts.remote(penguin_sanity_test_data["input"])
+    )
     expected_result = penguin_sanity_test_data["expected_output"]
 
     def _standardize_single_result(d: dict):

@@ -17,17 +17,15 @@
 
 import asyncio
 import copy
-from typing import Any, Optional
 import json
-
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass
-import statistics
+from typing import Any, Optional
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-
 from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
@@ -45,12 +43,11 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    GenerationConfig,
 )
-
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -977,27 +974,26 @@ def run_async_penguin_rollout(
     greedy: bool = False,
 ) -> AsyncPenguinRolloutResult:
     """Run multi-turn rollouts with Penguin. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
-
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     penguin_rows = input_batch["extra_env_info"]
 
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # Penguin policy is "What you see is what you get".
-    assert not greedy, f"`greedy` is not supported in Penguin path!"
+    assert not greedy, "`greedy` is not supported in Penguin path!"
     assert max_rollout_turns is None, (
-        f"`max_rollout_turns` is not supported in Penguin path!"
+        "`max_rollout_turns` is not supported in Penguin path!"
     )
-    assert max_seq_len is None, f"`max_seq_len` is not supported in Penguin path!"
+    assert max_seq_len is None, "`max_seq_len` is not supported in Penguin path!"
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], (
-        f"Stop strings is not supported in the generation config in Penguin path!"
+        "Stop strings is not supported in the generation config in Penguin path!"
     )
     assert not generation_config["stop_token_ids"], (
-        f"Stop strings is not supported in the generation config in Penguin path!"
+        "Stop strings is not supported in the generation config in Penguin path!"
     )
     # Top k is not OpenAI compatible, so Penguin does not guarantee support over it.
     assert not generation_config["top_k"], (
-        f"Top k is not supported in the generation config in Penguin path!"
+        "Top k is not supported in the generation config in Penguin path!"
     )
 
     for row in penguin_rows:
@@ -1108,7 +1104,9 @@ def run_async_penguin_rollout(
             r = json.dumps(r, separators=((",", ":")))
             to_log.append([r])
 
-        per_agent_metrics[f"{agent_name}/full_result"] = Table(data=to_log, columns=["Full result"])
+        per_agent_metrics[f"{agent_name}/full_result"] = Table(
+            data=to_log, columns=["Full result"]
+        )
 
     rollout_metrics.update(per_agent_metrics)
 

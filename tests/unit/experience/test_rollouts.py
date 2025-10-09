@@ -14,7 +14,6 @@
 
 import gc
 from copy import deepcopy
-
 from dataclasses import asdict
 
 import pytest
@@ -23,8 +22,8 @@ import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.games.sliding_puzzle import (
@@ -36,11 +35,20 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.penguin import penguin_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_multi_turn_rollout,
     run_async_penguin_rollout,
+    run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+
+# These are all fixtures
+from tests.unit.environments.test_penguin import (
+    cluster,  # noqa: F401
+    penguin,  # noqa: F401
+    penguin_sanity_test_data,  # noqa: F401
+    penguin_tokenizer,  # noqa: F401
+    penguin_vllm_generation,  # noqa: F401
+)
 
 # Import the test environment definitions
 from tests.unit.test_envs import (
@@ -48,14 +56,6 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
-from tests.unit.environments.test_penguin import (
-    penguin,
-    cluster,
-    penguin_vllm_generation,
-    penguin_sanity_test_data,
-    penguin_tokenizer,
-)
-
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -747,10 +747,10 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
 
 def test_run_async_penguin_rollout(
-    penguin,
-    penguin_vllm_generation,
-    penguin_sanity_test_data,
-    penguin_tokenizer,
+    penguin,  # noqa: F811
+    penguin_vllm_generation,  # noqa: F811
+    penguin_sanity_test_data,  # noqa: F811
+    penguin_tokenizer,  # noqa: F811
 ):
     nemo_rl_compatible_examples: list[DatumSpec] = [
         penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
