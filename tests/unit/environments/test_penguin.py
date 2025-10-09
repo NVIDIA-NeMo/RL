@@ -36,7 +36,7 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 try:
-    import penguin
+    from penguin import config_types  # noqa: F401
 
     PENGUIN_INSTALLED = True
 except ImportError:
@@ -49,7 +49,7 @@ except ImportError:
     reason="Skipping Penguin test since Penguin is not installed!",
 )
 def test_penguin_stub_module():
-    print(f"Penguin test successfully run! Penguin module: {penguin}")
+    print(f"Penguin test successfully run! Penguin config_types module: {config_types}")
 
 
 @pytest.fixture(scope="function")
