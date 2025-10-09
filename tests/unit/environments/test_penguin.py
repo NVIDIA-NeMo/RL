@@ -68,6 +68,7 @@ def penguin(penguin_vllm_generation):
   resources_servers:
     multineedle:
       entrypoint: app.py
+      domain: instruction_following
 multineedle_simple_agent:
   responses_api_agents:
     simple_agent:
