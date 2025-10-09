@@ -284,11 +284,13 @@ def stream_weights_via_ipc_zmq_impl(
 
     Args:
         params_generator: Generator yielding (name, tensor) pairs
-        buffer_size_bytes: Size of buffer in bytes for batching parameters
+        buffer_size_bytes: total size of buffer in bytes for batching parameters
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
     """
+    # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
+    buffer_size_bytes = buffer_size_bytes // 2
 
     def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
         """Send a group of parameters and return new pending_recv state."""
