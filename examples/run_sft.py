@@ -200,6 +200,7 @@ def main(is_vlm: bool = False):
         checkpointer,
         sft_save_state,
         master_config,
+        logits_output_dir,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     sft_train(
@@ -213,6 +214,7 @@ def main(is_vlm: bool = False):
         sft_task_spec,
         checkpointer,
         sft_save_state,
+        logits_output_dir,
     )
 
 

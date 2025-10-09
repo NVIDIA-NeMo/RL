@@ -121,6 +121,7 @@ def test_exit_on_max_steps(mock_components):
         mock_components["sft_task_spec"],
         mock_components["checkpointer"],
         sft_save_state,
+        logits_output_dir=None,
     )
 
     # Verify we only trained for 12 steps.
@@ -147,6 +148,7 @@ def test_exit_on_max_epochs(mock_components):
         mock_components["sft_task_spec"],
         mock_components["checkpointer"],
         sft_save_state,
+        logits_output_dir=None,
     )
 
     # Verify we trained for exactly two epochs (20 batches).

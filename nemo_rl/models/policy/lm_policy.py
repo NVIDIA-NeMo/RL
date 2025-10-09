@@ -460,7 +460,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
                 dynamic_batching_args=self.dynamic_batching_args,
@@ -469,7 +469,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["train_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
                 sequence_packing_args=self.sequence_packing_args,
@@ -535,6 +535,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             for k, v in r["all_mb_metrics"].items():
                 all_mb_metrics[k].extend(v)
         aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        # Aggregate logits
+        all_logits = torch.cat([r["all_logits"] for r in results], dim=0)
+
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            all_logits.reorder_data(unsorted_data_indices)
+
+        aggregated_results["all_logits"] = all_logits
 
         return aggregated_results
 
