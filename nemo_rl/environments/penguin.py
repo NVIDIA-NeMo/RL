@@ -30,9 +30,7 @@ class PenguinConfig(TypedDict):
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class Penguin(EnvironmentInterface):
-    """This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray.
-    So there is still one source of truth for resource management in NeMo RL.
-    """
+    """This environment class isn't really used for training. It's really meant as an integration wrapper around Penguin that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: PenguinConfig):
         self.cfg = cfg
