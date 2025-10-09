@@ -14,6 +14,7 @@
 
 """Checkpoint management utilities for HF models."""
 
+import io
 import os
 from typing import Any, Optional
 
@@ -210,6 +211,7 @@ def convert_dcp_to_hf(
     hf_ckpt_path: str,
     model_name_or_path: str,
     tokenizer_name_or_path: str,
+    safe_serialization: bool = False,
     overwrite: bool = False,
 ) -> str:
     """Convert a Torch DCP checkpoint to a Hugging Face checkpoint.
@@ -223,6 +225,7 @@ def convert_dcp_to_hf(
         model_name_or_path (str): Model name or path for config
         tokenizer_name_or_path (str, optional): Tokenizer name or path.
                                                Defaults to model_name_or_path if None.
+        safe_serialization (bool, optional): Whether to save the checkpoint as .safetensors. Defaults to False.
         overwrite (bool, optional): Whether to overwrite existing checkpoint. Defaults to False.
 
     Returns:
@@ -237,15 +240,51 @@ def convert_dcp_to_hf(
         )
 
     os.makedirs(hf_ckpt_path, exist_ok=True)
-    weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
-    dcp_to_torch_save(dcp_ckpt_path, weights_path)
 
-    # Need to reload and save b/c the state dict is scoped inside the model key {"model": actual_state_dict}
-    state_dict = torch.load(weights_path)
-    assert set(state_dict.keys()) == {"model"}, (
-        f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
-    )
-    torch.save(state_dict["model"], weights_path)
+    if safe_serialization:
+        from safetensors.torch import save_file as save_safetensors
+        
+        buffer = io.BytesIO()
+        
+        original_torch_save = torch.save
+
+        def save_to_buffer(obj, f, **kwargs):
+            original_torch_save(obj, buffer, **kwargs)
+
+        try:
+            torch.save = save_to_buffer
+            
+            # This will save to buffer instead of disk
+            dcp_to_torch_save(dcp_ckpt_path, "memory_buffer")
+
+            torch.save = original_torch_save
+            buffer.seek(0)
+            state_dict = torch.load(buffer, map_location="cpu")
+
+        finally:
+            # Ensure we restore torch.save even if an error occurs
+            torch.save = original_torch_save
+            buffer.close()
+
+        weights_path = os.path.join(hf_ckpt_path, "model.safetensors")
+
+        assert set(state_dict.keys()) == {"model"}, (
+            f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
+        )
+        save_safetensors(state_dict["model"], weights_path)
+
+    else:
+        weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
+        dcp_to_torch_save(dcp_ckpt_path, weights_path)
+
+        # Need to reload and save b/c the state dict is scoped inside the model key {"model": actual_state_dict}
+        state_dict = torch.load(weights_path)
+    
+        assert set(state_dict.keys()) == {"model"}, (
+            f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
+        )
+        torch.save(state_dict["model"], weights_path)
+
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
     config.save_pretrained(hf_ckpt_path)

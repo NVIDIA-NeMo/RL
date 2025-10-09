@@ -7,8 +7,13 @@ NeMo RL provides two checkpoint formats for Hugging Face models: Torch distribut
 A checkpoint converter is provided to convert a Torch distributed checkpoint to Hugging Face format after training:
 
 ```sh
-uv run examples/converters/convert_dcp_to_hf.py --config=<YAML CONFIG USED DURING TRAINING> <ANY CONFIG OVERRIDES USED DURING TRAINING> --dcp-ckpt-path=<PATH TO DIST CHECKPOINT TO CONVERT> --hf-ckpt-path=<WHERE TO SAVE HF CHECKPOINT>
+uv run examples/converters/convert_dcp_to_hf.py --config=<YAML CONFIG USED DURING TRAINING> <ANY CONFIG OVERRIDES USED DURING TRAINING> --dcp-ckpt-path=<PATH TO DIST CHECKPOINT TO CONVERT> --hf-ckpt-path=<WHERE TO SAVE HF CHECKPOINT> --safe-serialization=false
 ```
+
+The --safe-serialization flag controls the output format:
+
+--safe-serialization=false (default): Saves weights as PyTorch .bin files
+--safe-serialization=true: Saves weights as .safetensors files for enhanced security and faster loading
 
 Usually Hugging Face checkpoints keep the weights and tokenizer together (which we also recommend for provenance). You can copy it afterwards. Here's an end-to-end example:
 
@@ -16,7 +21,7 @@ Usually Hugging Face checkpoints keep the weights and tokenizer together (which 
 # Change to your appropriate checkpoint directory
 CKPT_DIR=results/sft/step_10
 
-uv run examples/converters/convert_dcp_to_hf.py --config=$CKPT_DIR/config.yaml --dcp-ckpt-path=$CKPT_DIR/policy/weights --hf-ckpt-path=${CKPT_DIR}-hf
+uv run examples/converters/convert_dcp_to_hf.py --config=$CKPT_DIR/config.yaml --dcp-ckpt-path=$CKPT_DIR/policy/weights --hf-ckpt-path=${CKPT_DIR}-hf --safe-serialization=false
 rsync -ahP $CKPT_DIR/policy/tokenizer ${CKPT_DIR}-hf/
 ```
 
