@@ -31,7 +31,7 @@ setuptools.setup(
     version="0.0.0",
     description="Standalone packaging for the Penguin sub-module.",
     author="NVIDIA",
-    author_email="",
+    author_email="nemo-toolkit@nvidia.com",
     packages=final_packages,
     package_dir=final_package_dir,
     py_modules=["is_penguin_installed"],

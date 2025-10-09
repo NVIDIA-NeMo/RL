@@ -8,6 +8,6 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "penguin"
 dynamic = ["dependencies", "version"]
-authors = [{ name = "NVIDIA", email = "" }]
+authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 description = "Standalone packaging for the Penguin sub-module."
 requires-python = ">=3.10"
