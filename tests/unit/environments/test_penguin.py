@@ -27,11 +27,15 @@ from nemo_rl.environments.penguin import Penguin, PenguinConfig, setup_penguin_c
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
-from tests.unit.models.generation.test_vllm_generation import basic_vllm_test_config
+from tests.unit.models.generation.test_vllm_generation import (
+    basic_vllm_test_config,
+    cluster,  # noqa: F401
+    tokenizer as penguin_tokenizer,  # noqa: F401
+)
 
 
 @pytest.fixture(scope="function")
-def penguin_vllm_generation(cluster, penguin_tokenizer):
+def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = {
         "policy": {
