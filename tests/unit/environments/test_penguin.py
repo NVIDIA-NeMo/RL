@@ -15,12 +15,16 @@ import pytest
 
 try:
     import penguin
+
     PENGUIN_INSTALLED = True
 except ImportError:
     penguin = None
     PENGUIN_INSTALLED = False
 
 
-@pytest.mark.skipif(not PENGUIN_INSTALLED, reason="Skipping Penguin test since Penguin is not installed!")
+@pytest.mark.skipif(
+    not PENGUIN_INSTALLED,
+    reason="Skipping Penguin test since Penguin is not installed!",
+)
 def test_penguin_stub_module():
     print(f"Penguin test successfully run! Penguin module: {penguin}")
