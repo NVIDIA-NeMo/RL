@@ -41,19 +41,20 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
+# These are all fixtures
+from tests.unit.environments.test_penguin import (
+    cluster,  # noqa: F401
+    penguin,  # noqa: F401
+    penguin_sanity_test_data,  # noqa: F401
+    penguin_tokenizer,  # noqa: F401
+    penguin_vllm_generation,  # noqa: F401
+)
+
 # Import the test environment definitions
 from tests.unit.test_envs import (
     MultiStepCalcMetadata,
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
-)
-# These are all fixtures
-from tests.unit.environments.test_penguin import (
-    penguin,  # noqa: F401
-    cluster,  # noqa: F401
-    penguin_vllm_generation,  # noqa: F401
-    penguin_sanity_test_data,  # noqa: F401
-    penguin_tokenizer,  # noqa: F401
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -746,10 +747,10 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
 
 def test_run_async_penguin_rollout(
-    penguin,
-    penguin_vllm_generation,
-    penguin_sanity_test_data,
-    penguin_tokenizer,
+    penguin,  # noqa: F811
+    penguin_vllm_generation,  # noqa: F811
+    penguin_sanity_test_data,  # noqa: F811
+    penguin_tokenizer,  # noqa: F811
 ):
     nemo_rl_compatible_examples: list[DatumSpec] = [
         penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
