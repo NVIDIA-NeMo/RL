@@ -22,7 +22,6 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
@@ -97,10 +96,14 @@ def _replace_prefix_tokens(
             template_cut_start = pos
             break
 
-    # This should never be the case, but 
-    assert template_cut_start >= 0, "No EOS token ID found in the chat-templated messages!"
+    # This should never be the case, but
+    assert template_cut_start >= 0, (
+        "No EOS token ID found in the chat-templated messages!"
+    )
 
-    return model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    return (
+        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    )
 
 
 @ray.remote(
@@ -135,8 +138,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord
         from typing import List, Optional, Union
-        from logging import LogRecord, Filter as LoggingFilter
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -240,7 +244,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     return res
 
                 # Include the last assistant message itself.
-                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[:last_assistant_message_idx + 1]
+                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
+                    : last_assistant_message_idx + 1
+                ]
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
                     request,
@@ -257,7 +263,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     truncate_prompt_tokens,
                     add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0]["prompt_token_ids"]
+                actual_corresponding_token_ids = corresponding_res[2][0][
+                    "prompt_token_ids"
+                ]
 
                 engine_prompt = res[2][
                     0
@@ -388,6 +396,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         print(
             "Adding a vLLM logging filter so that the logs aren't spammed with `Added request ...` messages. This is to help errors pop up better and filter out noise."
         )
+
         class NoAddedRequestFilter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()
@@ -398,8 +407,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
-        from logging import LogRecord, getLogger, Filter as LoggingFilter
         import threading
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord, getLogger
 
         import uvicorn
         from fastapi import FastAPI
@@ -427,10 +437,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
         server = uvicorn.Server(config=config)
 
-
         print(
             "Adding a uvicorn logging filter so that the logs aren't spammed with 200 OK messages. This is to help errors pop up better and filter out noise."
         )
+
         class No200Filter(LoggingFilter):
             def filter(self, record: LogRecord) -> bool:
                 msg = record.getMessage()

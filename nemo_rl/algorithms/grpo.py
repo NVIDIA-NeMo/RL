@@ -51,8 +51,8 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_multi_turn_rollout,
     run_async_penguin_rollout,
+    run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -491,8 +491,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
 
 def _should_use_penguin(master_config: MasterConfig) -> bool:
-    """Determine if Penguin should be used for rollouts and validation based on the configuration.
-    """
+    """Determine if Penguin should be used for rollouts and validation based on the configuration."""
     env_config = master_config["env"]
     should_use_penguin = bool(env_config.get("should_use_penguin"))
     if not should_use_penguin:
@@ -507,11 +506,17 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, f"In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
+    assert should_expose_http_server, (
+        "In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
+    )
 
-    # Penguin is strictly incompatible with reasoning parser. There is one source 
-    serving_chat_kwargs = generation_config["vllm_cfg"].get("http_server_serving_chat_kwargs", dict())
-    assert serving_chat_kwargs.get("reasoning_parser") is None, "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
+    # Penguin is strictly incompatible with reasoning parser. There is one source
+    serving_chat_kwargs = generation_config["vllm_cfg"].get(
+        "http_server_serving_chat_kwargs", dict()
+    )
+    assert serving_chat_kwargs.get("reasoning_parser") is None, (
+        "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
+    )
 
     return should_use_penguin
 
