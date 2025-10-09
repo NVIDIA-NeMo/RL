@@ -618,6 +618,19 @@ class MegatronPolicyWorker:
                     "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
                 )
 
+        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_cpu_offload"
+        ]
+        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_offload_fraction"
+        ]
+        if optimizer_cpu_offload:
+            # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
+            # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
+            assert optimizer_offload_fraction == 1.0, (
+                "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+            )
+
         checkpoint_config = CheckpointConfig(
             save_interval=100,
             save=weights_path,
@@ -1759,7 +1772,11 @@ class MegatronPolicyWorker:
         self.model.train()
 
         # Move optimizer state to CUDA if it exists
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state
             else:
@@ -1786,7 +1803,11 @@ class MegatronPolicyWorker:
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             # Iterate through the state dictionaries for each parameter group
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state
