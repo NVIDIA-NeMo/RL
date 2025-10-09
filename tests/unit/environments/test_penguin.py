@@ -27,4 +27,4 @@ except ImportError:
     reason="Skipping Penguin test since Penguin is not installed!",
 )
 def test_penguin_stub_module():
-    print(f"Penguin test successfully run! Penguin module: {penguin}")
+    print(f"Penguin test successfully run! Penguin config_types module: {config_types}")
