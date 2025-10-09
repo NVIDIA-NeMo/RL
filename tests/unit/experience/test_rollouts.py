@@ -47,6 +47,14 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
+# These are all fixtures
+from tests.unit.environments.test_penguin import (
+    penguin,  # noqa: F401
+    cluster,  # noqa: F401
+    penguin_vllm_generation,  # noqa: F401
+    penguin_sanity_test_data,  # noqa: F401
+    penguin_tokenizer,  # noqa: F401
+)
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
