@@ -30,8 +30,9 @@ if src_dir.exists():
 
     packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
 
-    final_packages.append(package_name)
-    final_package_dir[package_name] = src_dir
+    for package in packages:
+        final_packages.append(package)
+        final_package_dir[package] = src_dir / package
 
 setuptools.setup(
     name="penguin",
