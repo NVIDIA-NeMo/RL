@@ -19,7 +19,7 @@ final_packages = []
 final_package_dir = {}
 
 # If the submodule is present, expose `penguin` package from the checkout
-src_dir = "Penguin/penguin/__init__.py"
+src_dir = "Penguin/penguin"
 package_name = "penguin"
 
 if os.path.exists(src_dir):
