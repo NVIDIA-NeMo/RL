@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+from pathlib import Path
+
+import tomllib
 
 import setuptools
 
@@ -19,10 +21,16 @@ final_packages = []
 final_package_dir = {}
 
 # If the submodule is present, expose `penguin` package from the checkout
-src_dir = "Penguin/penguin"
+src_dir = Path("Penguin")
 package_name = "penguin"
 
-if os.path.exists(src_dir):
+if src_dir.exists():
+    pyproject_toml_path = src_dir / "pyproject.toml"
+    with pyproject_toml_path.open("rb") as f:
+        pyproject_toml = tomllib.load(f)
+
+    packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
+
     final_packages.append(package_name)
     final_package_dir[package_name] = src_dir
 
