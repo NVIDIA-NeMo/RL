@@ -52,10 +52,6 @@ def test_penguin_stub_module():
     print(f"Penguin test successfully run! Penguin module: {penguin}")
 
 
-@pytest.mark.skipif(
-    not PENGUIN_INSTALLED,
-    reason="Skipping Penguin test since Penguin is not installed!",
-)
 @pytest.fixture(scope="function")
 def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
