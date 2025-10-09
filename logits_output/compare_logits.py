@@ -295,10 +295,7 @@ def compare_logits(base_folder: str, compare_folders: List[str], output_file: st
                     print(f"  {compare_folder}: Slicing compare tensor to match base: [:, :{base_seq_len}, :]")
                     compare_logits = compare_logits[:, :base_seq_len, :]
                 else:
-                    print(f"  {compare_folder}: WARNING - Compare tensor has shorter sequence length!")
-                    print(f"  {compare_folder}: Base seq_len={base_seq_len}, Compare seq_len={comp_seq_len}")
-                    print(f"  {compare_folder}: Slicing base tensor to match compare: [:, :{comp_seq_len}, :]")
-                    base_logits = base_logits[:, :comp_seq_len, :]
+                    assert False, f"Compare tensor has shorter sequence length {comp_seq_len} < {base_seq_len}"
             
             # Record shape information after slicing
             shape_info = {

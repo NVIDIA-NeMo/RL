@@ -450,7 +450,7 @@ class MegatronPolicyWorker:
             print(forward_backward_func[0].shape, type(forward_backward_func[0]), forward_backward_func[0].dtype)
             tp_rank = get_tensor_model_parallel_rank()
             tp_grp = get_tensor_model_parallel_group()
-            out_list = [torch.zeros_like(forward_backward_func[0])] * torch.distributed.get_world_size(tp_grp)
+            out_list = [torch.zeros_like(forward_backward_func[0]) for _ in range(torch.distributed.get_world_size(tp_grp))]
             full_logits = torch.distributed.all_gather(out_list, forward_backward_func[0], tp_grp)
             if tp_rank == 0:
                 full_logits = torch.cat(out_list, dim=-1)

@@ -342,6 +342,8 @@ def validate(
                 }
             )
 
+            print(val_data["input_ids"].shape, val_data["input_lengths"].shape, val_data["token_mask"].shape, val_data["sample_mask"].shape)
+
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
             # When running validation with drop_last=False, we might end up with a partial batch.
