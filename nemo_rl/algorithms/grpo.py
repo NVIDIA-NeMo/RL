@@ -753,9 +753,8 @@ def refit_policy_generation(
                 buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
             else:
                 memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                # divides by 2 since we have 2 buffers for overlap
                 buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio) / 2
+                    policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(

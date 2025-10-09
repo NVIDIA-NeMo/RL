@@ -1861,8 +1861,8 @@ class MegatronPolicyWorker:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # 30s
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
