@@ -21,7 +21,6 @@ final_package_dir = {}
 
 # If the submodule is present, expose `penguin` package from the checkout
 src_dir = Path("Penguin")
-package_name = "penguin"
 
 if src_dir.exists():
     pyproject_toml_path = src_dir / "pyproject.toml"
