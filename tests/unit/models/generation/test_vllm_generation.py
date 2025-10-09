@@ -1223,7 +1223,9 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     eos_token_id = tokenizer.eos_token_id
     assert eos_token_id == 151645
 
-    data_fpath = Path(__file__).with_name("test_VllmAsyncGenerationWorker_replace_prefix_tokens_data.json")
+    data_fpath = Path(__file__).with_name(
+        "test_VllmAsyncGenerationWorker_replace_prefix_tokens_data.json"
+    )
     with data_fpath.open() as f:
         data = json.load(f)
 

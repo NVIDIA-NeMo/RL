@@ -30,6 +30,8 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from tests.unit.models.generation.test_vllm_generation import (
     basic_vllm_test_config,
     cluster,  # noqa: F401
+)
+from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as penguin_tokenizer,  # noqa: F401
 )
 
