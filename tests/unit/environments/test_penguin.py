@@ -14,7 +14,7 @@
 import pytest
 
 try:
-    import penguin
+    from penguin import config_types  # noqa: F401
 
     PENGUIN_INSTALLED = True
 except ImportError:
