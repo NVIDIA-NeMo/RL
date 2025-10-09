@@ -407,3 +407,16 @@ Now, let's consider \(f = x - n = (2 + \sqrt{3})^{1000} - \lfloor (2 + \sqrt{3})
         "Terminated flags should be a tensor of shape (1,)"
     )
     assert result.terminateds[0] == 1.0, "Terminated flag should be 1.0"
+
+
+try:
+    import penguin
+    PENGUIN_INSTALLED = True
+except ImportError:
+    penguin = None
+    PENGUIN_INSTALLED = False
+
+
+@pytest.mark.skipif(not PENGUIN_INSTALLED, reason="Skipping Penguin test since Penguin is not installed!")
+def test_penguin_stub_module():
+    print(f"Penguin test successfully run! Penguin module: {penguin}")
