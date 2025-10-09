@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional, Any
 from unittest.mock import patch
 
 import ray
@@ -25,6 +26,8 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from kitchen.base import LinearBaseModule
+
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
     "fmt": "e4m3",
@@ -35,6 +38,8 @@ FP8_BLOCK_QUANT_KWARGS = {
 
 @dataclass(frozen=True)
 class FP8Config:
+    use_kitchen: bool = False
+    kitchen_recipe_num: Any = None
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
@@ -49,6 +54,7 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    kitchen_qlinear_params: Any = None
 
 
 # Global FP8 config that can be accessed by patched vLLM functions
@@ -118,6 +124,9 @@ def apply_fp8_patches(self, fp8_config):
     func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     patcher1 = patch(func1_path, process_weights_after_loading)
     fp8_state.vllm_patches.append(patcher1)
+    func2_path = "vllm.model_executor.layers.linear.UnquantizedLinearMethod.apply"
+    patcher2 = patch(func2_path, unquantized_linear_method_apply_use_kitchen)
+    fp8_state.vllm_patches.append(patcher2)
     # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
     # SNR compared to plain fp32 scaling factors. This feature is still under active research.
     if global_fp8_config.use_activation_pow2_scale:
@@ -142,6 +151,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "FP8 generation for MoE models is currently not supported"
         )
 
+    if vllm_cfg.get("use_kitchen", False):
+        print(f"Using kitchen to emulate quantized linear in vllm, other fp8 related vllm kwargs are ignored!")
+        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+
     global global_fp8_config
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
@@ -151,6 +164,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
+        use_kitchen=vllm_cfg.get("use_kitchen", False),
+        kitchen_recipe_num=recipe_num,
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
@@ -164,6 +179,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     else:
         # if not async, just directly monkey patch the ray executor
         monkey_patch_vllm_ray_executor(global_fp8_config)
+    
+    if global_fp8_config.use_kitchen:
+        return {}
 
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
@@ -436,6 +454,61 @@ def process_weights_after_loading(self, layer) -> None:
             weight_loader=layer.weight_scale_inv.weight_loader,
         )
     )
+
+def kitchen_matmul(
+    x: torch.Tensor, 
+    layer: torch.nn.Linear) -> torch.Tensor:
+    """
+    Apply kitchen matmul to the tensor.
+    """
+
+    x_original_shape = x.shape
+    x = LinearBaseModule._pad_tensor_for_fp8(x, divisor=128)
+
+    global fp8_state
+    if fp8_state.kitchen_qlinear_params is None:
+        assert global_fp8_config.kitchen_recipe_num is not None, "kitchen_recipe_num is not set"
+        from nvidia_kitchen.config import get_qlinear_params_from_qat_params
+        qlinear_params = get_qlinear_params_from_qat_params(
+            global_fp8_config.kitchen_recipe_num
+        )
+        fp8_state.kitchen_qlinear_params = qlinear_params
+    else:
+        qlinear_params = fp8_state.kitchen_qlinear_params
+    
+    ret = qlinear_params.quantize_op.quantize(x, qlinear_params.x_params)
+    qx, sx = ret.data, ret.scale
+    
+    ret = qlinear_params.quantize_op.quantize(layer.weight, qlinear_params.w_params)
+    qw, sw = ret.data, ret.scale
+    
+    ret = qlinear_params.quantize_op.qgemm(
+        qx=qx, 
+        qw=qw, 
+        m_params=qlinear_params.mm_fprop, 
+        out_dtype=torch.bfloat16, 
+        sx=sx, 
+        sw=sw,
+        bias=layer.bias,
+        qparams_x=qlinear_params.x_params,
+        qparams_w=qlinear_params.w_params,
+    )
+    ret = LinearBaseModule._rm_pad_for_fp8(ret, x_original_shape)
+    return ret
+
+
+def unquantized_linear_method_apply_use_kitchen(
+    self,
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+
+    if global_fp8_config.use_kitchen:
+        return kitchen_matmul(x, layer)
+    else:
+        return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
 @triton.jit

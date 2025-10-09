@@ -6,10 +6,16 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = yifu/nemo-rl-use-chunkpatch-ds
+	branch = guyueh/nemo-rl-use-kitchen
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
 	branch = nemo-rl-submodule
 	shallow = true
+[submodule "3rdparty/kitchen-workspace/kitchen"]
+	path = 3rdparty/kitchen-workspace/kitchen
+	url = ssh://git@gitlab-master.nvidia.com:12051/compute/chef/kitchen.git
+[submodule "3rdparty/psx-formats-workspace/psx-formats"]
+	path = 3rdparty/psx-formats-workspace/psx-formats
+	url = ssh://git@gitlab-master.nvidia.com:12051/compute/psx/psx-formats/psx-formats.git

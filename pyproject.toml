@@ -79,6 +79,8 @@ vllm = [
     "mamba-ssm",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "causal-conv1d",
+    "kitchen",
+    "psx-formats",
 ]
 mcore = [
     # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -99,6 +101,8 @@ mcore = [
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.7.4.post1",
+    "kitchen",
+    "psx-formats",
 ]
 
 [dependency-groups]
@@ -146,6 +150,8 @@ test = [
 megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
+kitchen = { workspace = true }
+psx-formats = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -168,6 +174,8 @@ members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/Automodel-workspace/Automodel",
     "3rdparty/Megatron-Bridge-workspace",
+    "3rdparty/kitchen-workspace",
+    "3rdparty/psx-formats-workspace",
 ]
 
 [[tool.uv.index]]
