@@ -475,6 +475,9 @@ class AsyncTrajectoryCollector:
                     print(
                         f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
                     )
+                    print(
+                        "   Note: With vLLM V1 async engine, active threads can complete during weight update"
+                    )
                     self._refit_pause_cleared.wait()
 
                     # After refit finishes if weight version has updated, reflect that in the new trajectories
@@ -520,7 +523,14 @@ class AsyncTrajectoryCollector:
         print("Trajectory collection resumed")
 
     def prepare_for_refit(self) -> None:
-        """Pause new generation starts and wait for pending generations to complete before refit."""
+        """Pause new generation starts and optionally wait for pending generations.
+
+        For vLLM V1 async engine, leverages in-flight weight updates via collective_rpc,
+        allowing ongoing generations to continue with their current KV caches while
+        weights are updated. This significantly improves async performance.
+
+        For non-async engines, waits for all pending generations to complete before refit.
+        """
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
@@ -528,16 +538,33 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.clear()
         print("⏸️ New generation starts paused")
 
-        # Wait for all pending generations to complete
-        # Note that is suboptimal for async performance and will be fixed in a follow-up PR where two more options will be added:
-        # 1. Pause the generations at their current decoding step, update the weights and continue with decoding.
-        # 2. Stop the current generations, store in a buffer and resume them in next iteration with new weights.
-        self.wait_for_pending_generations()
+        # Check if we're using vLLM async engine
+        vllm_cfg = (
+            self.master_config.get("policy", {})
+            .get("generation", {})
+            .get("vllm_cfg", {})
+        )
+        is_async_engine = vllm_cfg.get("async_engine", False)
+
+        if is_async_engine:
+            # vLLM V1 async engine supports in-flight weight updates
+            # Ongoing generations will continue with their current KV caches
+            # New generations (after weight update) will use the updated weights
+            print(
+                "🚀 Using vLLM V1 in-flight weight update - skipping wait for pending generations"
+            )
+            print(
+                f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
+            )
+        else:
+            # For non-async engines, wait for all pending generations to complete
+            print(
+                "⏸️ Non-async engine: waiting for all pending generations to complete..."
+            )
+            self.wait_for_pending_generations()
 
         elapsed = time.time() - start_time
-        print(
-            f"✅ All pending generations completed, ready for refit (took {elapsed:.2f}s)"
-        )
+        print(f"✅ Ready for refit (took {elapsed:.2f}s)")
 
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
