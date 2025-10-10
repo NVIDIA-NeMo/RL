@@ -51,6 +51,10 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
+)
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -188,9 +192,10 @@ class DTensorPolicyWorkerV2:
         )
 
         self.model = None
+        self.use_custom_model = False # Whether config is using custom model inside automodel.
 
         self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
-            model_config
+            self.model_config
         )
 
         self._is_reward_model = (
@@ -225,6 +230,7 @@ class DTensorPolicyWorkerV2:
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
             if self.cfg["dtensor_cfg"]["model"]["_target_"] is not None:
+                self.use_custom_model = True
                 model_class = _resolve_target(
                     self.cfg["dtensor_cfg"]["model"]["_target_"]
                 )
@@ -270,27 +276,30 @@ class DTensorPolicyWorkerV2:
                 model_class = resolve_model_class(self.model_config.model_type)
                 print(f"model_class: {model_class}")
 
-        # full_state_dict = None
-        # if self.rank == 0:
-        #     load_model_class = resolve_model_class(self.model_config.model_type)
-        #     print(f"[Rank {self.rank}] Loading model {model_name}, load_model_class: {load_model_class} on CPU...")
+        if not self.use_custom_model:
+            full_state_dict = None
+            model_state_dict_keys = None
+            if self.rank == 0:
+                print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
+                model = model_class.from_pretrained(
+                    model_name,
+                    device_map="cpu",  # load weights onto CPU initially
+                    trust_remote_code=True,
+                    config=self.model_config,
+                    use_liger_kernel=False,
+                    torch_dtype=str(self.model_config.torch_dtype),
+                )
 
-        #     model = load_model_class.from_pretrained(
-        #         model_name,
-        #         device_map="cpu",  # load weights onto CPU initially
-        #         trust_remote_code=True,
-        #         config=self.model_config,
-        #         torch_dtype=str(self.model_config.torch_dtype),
-        #     )
-
-        #     full_state_dict = model.state_dict()
-        #     del model
+                full_state_dict = model.state_dict()
+                # Store the original model state dict keys before any parallelization
+                model_state_dict_keys = list(full_state_dict.keys())
+                del model
 
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
 
-        if self.model is None:
+        if not self.use_custom_model:
             with init_empty_weights():
                 # NeMoAutoModelForCausalLM uses flash_attention_2 by default
                 # so we need to set it to None if sequence packing is disabled
@@ -300,6 +309,7 @@ class DTensorPolicyWorkerV2:
                     attn_implementation="flash_attention_2"
                     if self.enable_seq_packing
                     else None,
+                    use_liger_kernel=False,
                     trust_remote_code=True,
                     torch_dtype=str(self.model_config.torch_dtype),
                 )

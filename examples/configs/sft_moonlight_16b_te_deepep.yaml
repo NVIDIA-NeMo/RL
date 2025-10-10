@@ -156,6 +156,7 @@ data:
   add_eos: true
   add_generation_prompt: false
   shuffle: true
+  num_workers: 20
 
   ## unused with squad dataset
   prompt_file: null
@@ -168,6 +169,7 @@ logger:
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: false
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "sft-moonlight-joyang"
@@ -177,6 +179,7 @@ logger:
   mlflow:
     experiment_name: "sft-dev"
     run_name: "sft-dev-${data.dataset_name}"
+    
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
