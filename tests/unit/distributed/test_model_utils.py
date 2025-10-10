@@ -18,6 +18,7 @@ import ray
 import torch
 
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     DistributedLogprob,
     _compute_distributed_log_softmax,
@@ -420,6 +421,172 @@ def test_allgather_cp_sharded_tensor(register_allgather_cp_test_actor, cp_size):
         # Check that all workers succeeded
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+
+        worker_group.shutdown(force=True)
+
+    finally:
+        cluster.shutdown()
+
+
+@ray.remote(num_gpus=1)
+class ChunkedGatherLogprobTestActor:
+    def __init__(self, tp_size, chunk_size, inference_only, sharding):
+        self.tp_size = tp_size
+        self.chunk_size = chunk_size
+        self.inference_only = inference_only
+        self.sharding = sharding
+        self.env_vars = dict(os.environ)
+
+    def test_chunked_gather_logprob(self):
+        torch.distributed.init_process_group(backend="nccl")
+
+        rank = int(os.environ["RANK"])
+        # TP-only: world_size == tp_size when cp_size == 1
+        tp_rank = rank
+        tp_group = torch.distributed.new_group(ranks=list(range(self.tp_size)))
+
+        batch_size = 2
+        seq_len = 16
+        vocab_size = 256
+        gather_k = 3
+
+        torch.manual_seed(1337)
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        global_indices = torch.randint(
+            low=0, high=vocab_size, size=(batch_size, seq_len, gather_k), device="cuda"
+        )
+
+        vocab_part_size = vocab_size // self.tp_size
+        vocab_start_index = tp_rank * vocab_part_size
+        vocab_end_index = (tp_rank + 1) * vocab_part_size
+
+        baseline_logits = (
+            full_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+        baseline_log_probs = torch.nn.functional.log_softmax(baseline_logits, dim=-1)
+        baseline_selected = torch.gather(
+            baseline_log_probs, dim=-1, index=global_indices
+        )
+
+        if not self.inference_only:
+            torch.gather(
+                baseline_log_probs, dim=-1, index=global_indices
+            ).sum().backward()
+            baseline_grad = baseline_logits.grad[
+                :, :, vocab_start_index:vocab_end_index
+            ]
+
+        local_logits = full_logits[:, :, vocab_start_index:vocab_end_index]
+        local_logits = (
+            local_logits.clone().detach().requires_grad_(not self.inference_only)
+        )
+
+        gathered = ChunkedDistributedGatherLogprob.apply(
+            local_logits,
+            global_indices,
+            vocab_start_index,
+            vocab_end_index,
+            self.chunk_size,
+            tp_group,
+            self.inference_only,
+        )
+
+        torch.testing.assert_close(gathered, baseline_selected, rtol=1e-4, atol=1e-4)
+
+        forward_diff = torch.max(torch.abs(gathered - baseline_selected)).item()
+
+        if not self.inference_only:
+            gathered.sum().backward()
+            grad_local = local_logits.grad
+            torch.testing.assert_close(grad_local, baseline_grad, rtol=1e-4, atol=1e-4)
+            grad_diff = torch.max(torch.abs(grad_local - baseline_grad)).item()
+        else:
+            grad_diff = None
+
+        return {
+            "forward_max_diff": forward_diff,
+            "grad_max_diff": grad_diff,
+        }
+
+
+CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN = (
+    f"{ChunkedGatherLogprobTestActor.__module__}.ChunkedGatherLogprobTestActor"
+)
+
+
+@pytest.fixture
+def register_chunked_gather_logprob_test_actor():
+    original_registry_value = ACTOR_ENVIRONMENT_REGISTRY.get(
+        CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN
+    )
+    ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN] = (
+        PY_EXECUTABLES.SYSTEM
+    )
+
+    yield CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN
+
+    if CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN in ACTOR_ENVIRONMENT_REGISTRY:
+        if original_registry_value is None:
+            del ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN]
+        else:
+            ACTOR_ENVIRONMENT_REGISTRY[CHUNKED_GATHER_LOGPROB_TEST_ACTOR_FQN] = (
+                original_registry_value
+            )
+
+
+@pytest.mark.parametrize(
+    "tp_size, chunk_size, inference_only",
+    [
+        (1, 5, False),
+        (2, 4, False),
+        (1, 3, True),
+    ],
+)
+def test_chunked_distributed_gather_logprob(
+    register_chunked_gather_logprob_test_actor, tp_size, chunk_size, inference_only
+):
+    world_size = tp_size
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+
+    try:
+        actor_fqn = register_chunked_gather_logprob_test_actor
+
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size), names=["tp"]
+        )
+        builder = RayWorkerBuilder(
+            actor_fqn, tp_size, chunk_size, inference_only, sharding
+        )
+
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+
+        futures = worker_group.run_all_workers_single_data(
+            "test_chunked_gather_logprob"
+        )
+        results = ray.get(futures)
+
+        for i, result in enumerate(results):
+            assert result["forward_max_diff"] < 1e-4, (
+                f"Worker {i} forward diff too large: {result['forward_max_diff']}"
+            )
+            if not inference_only:
+                assert (
+                    result["grad_max_diff"] is not None
+                    and result["grad_max_diff"] < 1e-4
+                ), f"Worker {i} grad diff too large: {result['grad_max_diff']}"
+            else:
+                assert result["grad_max_diff"] is None
 
         worker_group.shutdown(force=True)
 

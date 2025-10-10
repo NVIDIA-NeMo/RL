@@ -33,7 +33,7 @@ uv_cache/
 hf_home/
 hf_datasets_cache/
 *logs/
-datasets/
+/datasets/
 docker/*
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch

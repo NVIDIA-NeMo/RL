@@ -33,7 +33,7 @@ CACHED_DEPENDENCIES = [
     "packaging",
     "tensorboard>=2.19.0",
     "torch",
-    "transformers>=4.51.3",
+    "transformers>=4.55.0",
     "typing-extensions",
     "rich",
     "wandb>=0.19.10",
