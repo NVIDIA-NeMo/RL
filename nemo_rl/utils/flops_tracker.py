@@ -171,7 +171,8 @@ class FLOPTracker:
         }
 
         # Compute and accumulate flops
-        flops = self.flops_formula(FLOPSConfig(**config_dict))
+        # flops = self.flops_formula(FLOPSConfig(**config_dict))
+        flops = 0
         self.total_flops += flops
 
     def track_batch(self, sequence_lengths: list[int]):

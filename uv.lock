@@ -1550,6 +1550,17 @@ wheels = [
 ]
 
 [[package]]
+name = "grouped-gemm"
+version = "1.1.4"
+source = { git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4#172fada89fa7364fe5d026b3a0dfab58b591ffdd" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "numpy" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+]
+
+[[package]]
 name = "grpcio"
 version = "1.74.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2936,9 +2947,13 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d" },
+    { name = "deep-ep" },
+    { name = "deep-gemm" },
     { name = "flash-attn" },
+    { name = "grouped-gemm" },
     { name = "mamba-ssm" },
     { name = "nemo-automodel" },
+    { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
 mcore = [
@@ -3004,11 +3019,14 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vllm'" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
+    { name = "deep-ep", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
+    { name = "deep-gemm", marker = "extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
+    { name = "grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?rev=v1.1.4" },
     { name = "hydra-core" },
     { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
     { name = "mamba-ssm", marker = "extra == 'vllm'", git = "https://github.com/state-spaces/mamba.git?rev=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" },
@@ -3040,6 +3058,7 @@ requires-dist = [
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.22.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'automodel'", specifier = "==2.5.0" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.5.0" },
     { name = "transformers", specifier = ">=4.55.4" },
     { name = "triton", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu128" },
