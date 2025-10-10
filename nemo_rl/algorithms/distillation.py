@@ -427,11 +427,16 @@ def setup(
     if not colocated_inference:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+        train_world_size = train_cluster.world_size()
         # inference cluster + head node of the train cluster
-        world_size = inference_nodes * inference_gpus_per_node + 1
+        world_size = train_world_size + inference_nodes * inference_gpus_per_node
         # init collective
-        futures_train = student_policy.init_collective(ip, port, world_size)
-        futures_inference = student_generation.init_collective(ip, port, world_size)  # type: ignore
+        futures_train = student_policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = student_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
