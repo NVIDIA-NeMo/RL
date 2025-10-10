@@ -89,6 +89,8 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
