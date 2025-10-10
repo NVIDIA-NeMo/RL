@@ -644,15 +644,29 @@ def dpo_train(
                     if val_metrics is not None:
                         dpo_save_state.update(val_metrics)
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in dpo_save_state
-                        ):
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.count(":") == 1, (
+                            "metric_name must contain exactly one colon"
+                        )
+                        parts = full_metric_name.split(":")
+                        train_or_val = "val" if "val" in parts[0] else "train"
+                        metric_name = parts[1]
+
+                        metrics_source = (
+                            metrics if train_or_val == "train" else val_metrics
+                        )
+                        if metric_name not in metrics_source:
                             warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                                f"You asked to save checkpoints based on {metric_name} but the metric is not found in the {train_or_val} metrics. "
                                 "This checkpoint will not be saved as top-k."
                             )
+                            if full_metric_name in dpo_save_state:
+                                del dpo_save_state[full_metric_name]
+                        else:
+                            dpo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
