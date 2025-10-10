@@ -453,6 +453,11 @@ class MegatronPolicyWorker:
         **kwargs: Any,
     ):
         self.is_generation_colocated = None
+        """Initialize the MegatronPolicyWorker."""
+        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
+        apply_transformer_engine_patch()
+        self.is_generation_colocated = None
+        self.is_prepared = False
         if "generation" in config and config["generation"] is not None:
             self.is_generation_colocated = config["generation"]["colocated"]["enabled"]
 
@@ -882,6 +887,11 @@ class MegatronPolicyWorker:
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
         """Train the policy on a batch of data with a given loss function."""
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
@@ -1146,6 +1156,11 @@ class MegatronPolicyWorker:
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -1436,6 +1451,15 @@ class MegatronPolicyWorker:
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+<<<<<<< HEAD:nemo_rl/models/policy/megatron_policy_worker.py
+=======
+        # 512 bATCH SIZE (200 tokens)
+        if not self.is_prepared:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
+            )
+>>>>>>> d72b6222 (Add helpful error message if prepare_for_* not called):nemo_rl/models/policy/workers/megatron_policy_worker.py
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model.config.flash_decode = True
@@ -1763,12 +1787,14 @@ class MegatronPolicyWorker:
             self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
+        self.is_prepared = True
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
         self.offload_before_refit()
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
+        self.is_prepared = True
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
