@@ -820,17 +820,20 @@ class MegatronPolicyWorker:
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        if self.rank == 0:
-            pg = StatelessProcessGroup.create(
-                host=ip, port=port, rank=0, world_size=world_size
-            )
-            device = torch.cuda.current_device()
-            self.model_update_group = PyNcclCommunicator(pg, device=device)
+        # world_size = train_world_size + inference_world_size
+        # variable train_world_size is used in inference cluster
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self):
         return True
@@ -1735,10 +1738,9 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
-        # broadcast from train rank0 worker to inference workers
+        # broadcast from train rank 0 to all other ranks (training and inference)
         for _, tensor in hf_params_generator:
-            if self.rank == 0:
-                self.model_update_group.broadcast(tensor, src=0)
+            self.model_update_group.broadcast(tensor, src=0)
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
