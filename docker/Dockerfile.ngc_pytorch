@@ -70,7 +70,7 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
-
+COPY --from=nemo-rl docker/deepep.patch /opt/deepep.patch
 
 RUN <<"EOF" bash -exu
 
@@ -80,6 +80,17 @@ uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
+
+cd /opt
+git clone https://github.com/deepseek-ai/DeepEP.git
+cd DeepEP
+git pull
+git fetch origin 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+git checkout FETCH_HEAD
+patch -p1 < /opt/deepep.patch
+rm -rf /opt/deepep.patch
+cd /opt/nemo-rl
+
 uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
