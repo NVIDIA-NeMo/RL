@@ -1,0 +1,114 @@
+defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
+
+grpo:
+  num_generations_per_prompt: 16
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+  max_total_sequence_length: 131072
+
+  # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
+  dtensor_cfg:
+    enabled: False
+  optimizer: null
+  scheduler: null
+
+  # As of Thu Oct 02, 2025, we need sequence packing enabled to use context parallelism (CP) in mcore.
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+      # This is a very low GPU mem utilization. We GPU OOM in two places:
+      # Refit after train, refit before validation.
+      gpu_memory_utilization: 0.5
+
+  # Needs to be set to whatever backend TP size.
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    # We set this to 8, the number of GPUs in one node
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    # The context parallel size times the tensor model parallel size should equal 8.
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.precision}
+    # Sequence parallel is required for expert parallel
+    sequence_parallel: true
+    # Apparently freezing the MoE router and using fp64 here stabilizes training
+    # This is possibly related to some refit issues.
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    #gives ~20% training perf speedup with sequence packing
+    moe_permute_fusion: false
+    apply_rope_fusion: True
+    defer_fp32_logits: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: ${policy.megatron_cfg.optimizer.lr}
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      #sgd
+      sgd_momentum: 0.9
+
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: ${policy.megatron_cfg.optimizer.lr}
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      average_in_collective: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+checkpointing:
+  # This assumes a slurm job timeout of 4 hours.
+  # 1. It will usually take a 10-15 minutes to spin up the training job and for the timeout iterations to start.
+  # 2. The next step may also be a validation step which takes extra long.
+  #     1. For this config Qwen 3 30BA3B on math with 131k context length, the validation could take up to 20 mins pessimistically.
+  # 3. The step time for this config could take around 10 mins
+  # 4. The checkpoint time for this model is around 10 mins, pessimistically around 15 mins.
+  # So in total, in order to properly save out by the 4 hour time limit, we should save a checkpoint by 45 mins before the 4 hour limit.
+  checkpoint_must_save_by: "00:03:15:00"
+  save_period: 10
