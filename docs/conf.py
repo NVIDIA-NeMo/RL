@@ -191,7 +191,9 @@ class _GitHubLinkTransform(Transform):
     def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
         try:
             local_repo = git.Repo(search_parent_directories=True)
-            remote_repo_url = self._get_github_source_url(local_repo)
+            # Hardcode github url for now due to errors when building in a different environment
+            # remote_repo_url = self._get_github_source_url(local_repo)
+            remote_repo_url = "https://github.com/NVIDIA-NeMo/RL"
         except Exception:
             # Cannot figure out which source url it should be; leave links as-is.
             return
