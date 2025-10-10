@@ -38,6 +38,7 @@ docker/*
 !docker/Dockerfile
 !docker/Dockerfile.ngc_pytorch
 !docker/README.md
+!docker/deepep.patch
 wandb/
 checkpoints/
 results/
