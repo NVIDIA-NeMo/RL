@@ -41,7 +41,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv and python
-ARG UV_VERSION=0.7.2
+ARG UV_VERSION=0.9.1
 ARG PYTHON_VERSION=3.12
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
