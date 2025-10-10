@@ -43,19 +43,19 @@ class PY_EXECUTABLES:
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
-    BASE = "uv run --locked"
+    BASE = f"uv run --locked --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = "uv run --locked --extra vllm"
+    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
-    AUTOMODEL = "uv run --locked --extra automodel"
+    AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
     # Megatron-core (and nemo dependencies)
     # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
     # but the submodules are not downloaded yet. This results in errors where it appears Megatron/Nemo
     # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
-    MCORE = "uv run --reinstall --extra mcore"
+    MCORE = f"uv run --reinstall --extra mcore --directory {git_root}"
 
 
 @ray.remote  # pragma: no cover

@@ -35,3 +35,11 @@ if [[ $exit_code -eq 5 ]]; then
 else
     uv run --extra automodel bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
 fi
+
+# Research unit tests
+for i in research/*/tests/unit; do
+    project_dir=$(dirname $(dirname $i))
+    pushd $project_dir
+    uv run --no-sync pytest tests/unit
+    popd
+done
