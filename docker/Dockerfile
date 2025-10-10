@@ -67,15 +67,6 @@ ARG BUILD_CUSTOM_VLLM
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
-# This layer has to be manually updated
-RUN <<"EOF" bash -exu
-uv venv ${UV_PROJECT_ENVIRONMENT}
-
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.8.0 psutil ninja --torch-backend=cu128
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
-EOF
-
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
