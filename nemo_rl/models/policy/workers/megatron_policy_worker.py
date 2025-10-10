@@ -318,12 +318,12 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
+        """Train the policy on a batch of data with a given loss function."""
         if not self.is_prepared:
             raise RuntimeError(
                 "Model is not prepared for GPU execution. "
                 "Did you forget to call prepare_for_training() or prepare_for_lp_inference()?"
             )
-        """Train the policy on a batch of data with a given loss function."""
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
