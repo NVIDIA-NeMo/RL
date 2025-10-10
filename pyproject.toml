@@ -66,7 +66,7 @@ automodel = [
 ]
 vllm = [
     "cuda-python",
-    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.0",
     # deep_ep also needs libibverbs-dev
     # sudo apt-get update
     # sudo apt-get install libibverbs-dev

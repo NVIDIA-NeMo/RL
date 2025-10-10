@@ -960,8 +960,8 @@ source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc626
 
 [[package]]
 name = "deep-gemm"
-version = "2.0.0+7b6b556"
-source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c#7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" }
+version = "2.1.0+594953a"
+source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=v2.1.0#594953acce41793ae00a1233eb516044d604bcb6" }
 
 [[package]]
 name = "defusedxml"
@@ -3005,7 +3005,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "debugpy" },
     { name = "deep-ep", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
-    { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
+    { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=v2.1.0" },
     { name = "flash-attn", marker = "extra == 'automodel'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'mcore'", specifier = "==2.7.4.post1" },
     { name = "flash-attn", marker = "extra == 'vllm'", specifier = "==2.7.4.post1" },
