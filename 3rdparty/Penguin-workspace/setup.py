@@ -64,8 +64,8 @@ if src_dir.exists():
     # Compare cached dependencies with the submodule's pyproject
     ########################################
 
-    missing_in_cached = final_dependencies - set(CACHED_DEPENDENCIES)
-    extra_in_cached = set(CACHED_DEPENDENCIES) - final_dependencies
+    missing_in_cached = set(final_dependencies) - set(CACHED_DEPENDENCIES)
+    extra_in_cached = set(CACHED_DEPENDENCIES) - set(final_dependencies)
 
     if missing_in_cached or extra_in_cached:
         print(
