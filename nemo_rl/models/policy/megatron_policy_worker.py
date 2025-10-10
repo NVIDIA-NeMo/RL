@@ -1438,6 +1438,7 @@ class MegatronPolicyWorker:
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
+            nonlocal pp_seq_dim_size
             data_dict = next(data_iterator).to("cuda")
 
             pack = self.cfg["sequence_packing"]["enabled"]
@@ -1525,12 +1526,45 @@ class MegatronPolicyWorker:
 
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
-                topk_vals_full = allgather_cp_sharded_tensor(
-                    topk_vals_local, cp_grp, seq_dim=1
-                )
-                topk_idx_full = allgather_cp_sharded_tensor(
-                    topk_idx_local, cp_grp, seq_dim=1
-                )
+                if pack:
+                    # Per-sequence CP allgather following packed-sequence logic
+                    batch_size = data_dict["input_ids"].shape[0]
+                    total_packed_len = int(cu_seqlens_padded[-1].item())
+
+                    topk_vals_full = torch.zeros(
+                        (1, total_packed_len, k),
+                        dtype=topk_vals_local.dtype,
+                        device=topk_vals_local.device,
+                    )
+                    topk_idx_full = torch.zeros(
+                        (1, total_packed_len, k),
+                        dtype=topk_idx_local.dtype,
+                        device=topk_idx_local.device,
+                    )
+
+                    for i in range(batch_size):
+                        start_idx = int(cu_seqlens_padded[i].item())
+                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        if end_idx > start_idx:
+                            local_vals_slice = topk_vals_local[
+                                :, start_idx // cp_size : end_idx // cp_size, :
+                            ]
+                            local_idx_slice = topk_idx_local[
+                                :, start_idx // cp_size : end_idx // cp_size, :
+                            ]
+                            gathered_vals = allgather_cp_sharded_tensor(
+                                local_vals_slice, cp_grp, seq_dim=1
+                            )
+                            gathered_idx = allgather_cp_sharded_tensor(
+                                local_idx_slice, cp_grp, seq_dim=1
+                            )
+                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
+                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                else:
+                    # This path should be unreachable due to the earlier assertion
+                    raise RuntimeError(
+                        "Context Parallelism (CP>1) requires sequence packing to be enabled."
+                    )
             else:
                 topk_vals_full = topk_vals_local
                 topk_idx_full = topk_idx_local
