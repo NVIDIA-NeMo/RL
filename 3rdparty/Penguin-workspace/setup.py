@@ -19,7 +19,6 @@ import setuptools
 
 final_packages = []
 final_package_dir = {}
-final_dependencies = []
 
 # If the submodule is present, expose `penguin` package from the checkout
 src_dir = Path("Penguin")
@@ -58,14 +57,14 @@ if src_dir.exists():
         final_packages.append(package)
         final_package_dir[package] = src_dir / package
 
-    final_dependencies = pyproject_toml["project"]["dependencies"]
+    actual_dependencies = pyproject_toml["project"]["dependencies"]
 
     ########################################
     # Compare cached dependencies with the submodule's pyproject
     ########################################
 
-    missing_in_cached = set(final_dependencies) - set(CACHED_DEPENDENCIES)
-    extra_in_cached = set(CACHED_DEPENDENCIES) - set(final_dependencies)
+    missing_in_cached = set(actual_dependencies) - set(CACHED_DEPENDENCIES)
+    extra_in_cached = set(CACHED_DEPENDENCIES) - set(actual_dependencies)
 
     if missing_in_cached or extra_in_cached:
         print(
@@ -107,5 +106,5 @@ setuptools.setup(
     packages=final_packages,
     package_dir=final_package_dir,
     py_modules=["is_penguin_installed"],
-    install_requires=final_dependencies,
+    install_requires=CACHED_DEPENDENCIES,
 )
