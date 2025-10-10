@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
 import tomllib
 from pathlib import Path
 
@@ -23,10 +24,33 @@ final_dependencies = []
 # If the submodule is present, expose `penguin` package from the checkout
 src_dir = Path("Penguin")
 
+
+CACHED_DEPENDENCIES = [
+    "openai<=1.97.1",
+    "tqdm",
+    "pydantic",
+    "pydantic_core",
+    "devtools",
+    "fastapi",
+    "uvicorn",
+    "uvloop",
+    "hydra-core",
+    "omegaconf",
+    "gradio",
+    "mlflow",
+    "tdigest>=0.5.2.2",
+    "aiohttp",
+    "yappi",
+]
+
 if src_dir.exists():
     pyproject_toml_path = src_dir / "pyproject.toml"
     with pyproject_toml_path.open("rb") as f:
         pyproject_toml = tomllib.load(f)
+    if not pyproject_toml_path.exists():
+        raise FileNotFoundError(
+            f"[Penguin][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
+        )
 
     packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
 
@@ -35,6 +59,44 @@ if src_dir.exists():
         final_package_dir[package] = src_dir / package
 
     final_dependencies = pyproject_toml["project"]["dependencies"]
+
+    ########################################
+    # Compare cached dependencies with the submodule's pyproject
+    ########################################
+
+    missing_in_cached = final_dependencies - set(CACHED_DEPENDENCIES)
+    extra_in_cached = set(CACHED_DEPENDENCIES) - final_dependencies
+
+    if missing_in_cached or extra_in_cached:
+        print(
+            "[Penguin][setup] Dependency mismatch between Penguin-workspace/Penguin/pyproject.toml vs Penguin-workspace/setup.py::CACHED_DEPENDENCIES.",
+            file=sys.stderr,
+        )
+        if missing_in_cached:
+            print(
+                "  - Present in Penguin-workspace/Penguin/pyproject.toml but missing from CACHED_DEPENDENCIES:",
+                file=sys.stderr,
+            )
+            for dep in sorted(missing_in_cached):
+                print(f"    * {dep}", file=sys.stderr)
+        if extra_in_cached:
+            print(
+                "  - Present in CACHED_DEPENDENCIES but not in Penguin-workspace/Penguin/pyproject.toml:",
+                file=sys.stderr,
+            )
+            for dep in sorted(extra_in_cached):
+                print(f"    * {dep}", file=sys.stderr)
+        print(
+            "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        print(
+            "[Penguin][setup] Dependency sets are consistent with the submodule pyproject.",
+            file=sys.stderr,
+        )
+
 
 setuptools.setup(
     name="penguin",
