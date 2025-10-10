@@ -8,7 +8,7 @@
 # Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
 #
 # If installing new dependencies in the container, then use "uv pip install new-dependency"
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:25.09-py3
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -46,25 +46,6 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr
 ENV RAY_USAGE_STATS_ENABLED=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
-# Build vLLM from source to use with the NVIDIA PyTorch base image
-FROM base AS build_vllm
-
-ARG MAX_JOBS=32
-WORKDIR /opt
-COPY --from=nemo-rl uv.lock /tmp/uv.lock
-
-RUN <<"EOF" bash -exu
-echo "Building vLLM from source for PyTorch base image"
-VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
-echo "Building vLLM version: $VLLM_VERSION"
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout v$VLLM_VERSION
-python use_existing_torch.py
-pip install -r requirements/build.txt
-pip wheel --no-deps --no-build-isolation -v .
-EOF
-
 FROM base AS hermetic
 
 WORKDIR /opt/nemo-rl
@@ -91,12 +72,12 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 
-RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
+RUN <<"EOF" bash -exu
 
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 # The venv is symlinked to avoid bloating the layer size
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
-uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --extra mcore --extra automodel --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
