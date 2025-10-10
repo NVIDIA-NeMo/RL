@@ -171,13 +171,12 @@ logger:
     flush_interval: 10
 ```
 
-:::{note}
-While it is feasible to monitor using remote workers, the implementation requires careful attention to details to ensure:
-* Logs sent back to the driver do not introduce significant overhead.
-* Metrics remain clear and interpretable, avoiding issues like double counting caused by colocated workers.
-* Workers can gracefully flush their logs in case of failure.
-* Logging behaves consistently across TensorBoard, WandB, MLflow and Swanlab.
-* Workers that spawn other workers accurately report the total resource usage of any grandchild workers.
-
-Due to these complexities, we opted for a simpler approach: collecting metrics exposed by the Ray metrics server from the driver.
-:::
+> [!NOTE]
+> While it is feasible to monitor using remote workers, the implementation requires careful attention to details to ensure:
+> * Logs sent back to the driver do not introduce significant overhead.
+> * Metrics remain clear and interpretable, avoiding issues like double counting caused by colocated workers.
+> * Workers can gracefully flush their logs in case of failure.
+> * Logging behaves consistently across TensorBoard, WandB, MLflow and Swanlab.
+> * Workers that spawn other workers accurately report the total resource usage of any grandchild workers.
+>
+> Due to these complexities, we opted for a simpler approach: collecting metrics exposed by the Ray metrics server from the driver.
