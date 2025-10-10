@@ -82,7 +82,7 @@ COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN <<"EOF" bash -exu
-if [[ -n "${BUILD_CUSTOM_VLLM}" ]]; then
+if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh
     source 3rdparty/vllm/nemo-rl.env
 fi
