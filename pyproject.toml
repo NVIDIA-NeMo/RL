@@ -48,7 +48,7 @@ dependencies = [
     "torchvision>=0.22.0",
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
-    "nvidia-nvshmem-cu12", # for deep_ep build
+    "nvidia-nvshmem-cu13", # for deep_ep build
     "swanlab",
 ]
 
@@ -70,7 +70,7 @@ vllm = [
     # deep_ep also needs libibverbs-dev
     # sudo apt-get update
     # sudo apt-get install libibverbs-dev
-    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
+    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee",
     "vllm==0.10.0",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
