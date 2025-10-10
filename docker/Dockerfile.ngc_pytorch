@@ -38,7 +38,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
-ARG UV_VERSION=0.7.2
+ARG UV_VERSION=0.9.1
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
