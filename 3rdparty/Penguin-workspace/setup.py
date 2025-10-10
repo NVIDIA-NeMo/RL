@@ -18,6 +18,7 @@ import setuptools
 
 final_packages = []
 final_package_dir = {}
+final_dependencies = []
 
 # If the submodule is present, expose `penguin` package from the checkout
 src_dir = Path("Penguin")
@@ -33,6 +34,8 @@ if src_dir.exists():
         final_packages.append(package)
         final_package_dir[package] = src_dir / package
 
+    final_dependencies = pyproject_toml["project"]["dependencies"]
+
 setuptools.setup(
     name="penguin",
     version="0.0.0",
@@ -42,5 +45,5 @@ setuptools.setup(
     packages=final_packages,
     package_dir=final_package_dir,
     py_modules=["is_penguin_installed"],
-    install_requires=[],
+    install_requires=final_dependencies,
 )
