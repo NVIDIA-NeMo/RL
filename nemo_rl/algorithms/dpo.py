@@ -176,6 +176,7 @@ def setup(
             add_loss_mask=True,
         ),
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -198,6 +199,7 @@ def setup(
                 add_loss_mask=True,
             ),
             drop_last=False,
+            num_workers=data_config["num_workers"],
         )
         for k, v in val_dataset.items()
     }

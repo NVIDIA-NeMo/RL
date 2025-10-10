@@ -240,7 +240,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "val_period": 0,
             "val_at_start": False,
         },
-        "data": {"shuffle": False},
+        "data": {"shuffle": False, "num_workers": 1},
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {
@@ -296,7 +296,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "val_period": 0,
             "val_at_start": False,
         },
-        "data": {"shuffle": False},
+        "data": {"shuffle": False, "num_workers": 1},
         "logger": {},  # Config extraction requires this key
         "checkpointing": {},  # Config extraction requires this key
         "cluster": {

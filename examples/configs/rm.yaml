@@ -129,6 +129,7 @@ policy:
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
+  num_workers: 1
 
   dataset_name: HelpSteer3
   # You can use custom preference datasets for training and validation. For example:

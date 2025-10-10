@@ -207,6 +207,7 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
@@ -228,6 +229,7 @@ def setup(
             batch_size=grpo_config["val_batch_size"],
             shuffle=False,
             collate_fn=rl_collate_fn,
+            num_workers=data_config["num_workers"],
         )
         print(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
