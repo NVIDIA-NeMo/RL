@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -50,6 +51,12 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    disable_ppo_ratio: NotRequired[bool]
+    # If True, force the ratio to 1.0 for truly on-policy behavior,
+    # eliminating any importance sampling effects.
+    # NOTE: This should only be used when doing exactly one update per rollout
+    # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
+    force_on_policy_ratio: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -74,6 +81,7 @@ class ClippedPGLossFn(LossFunction):
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -114,6 +122,9 @@ class ClippedPGLossFn(LossFunction):
         self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
         self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
         self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
+        self.force_on_policy_ratio = cfg.get(
+            "force_on_policy_ratio", False
+        )  # Force ratio to 1.0
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
@@ -296,7 +307,13 @@ class ClippedPGLossFn(LossFunction):
             kl = torch.tensor(0.0)
 
         # Calculate clipped loss function if ppo ratio is enabled.
-        if not self.disable_ppo_ratio:
+        if self.force_on_policy_ratio:
+            # Force ratio to 1.0 for truly on-policy behavior
+            # Use curr_logprobs twice so ratio=1 but gradients still flow
+            log_ratios = curr_logprobs - curr_logprobs.detach()
+            ratios = log_ratios.exp()  # = exp(0) = 1.0, but depends on curr_logprobs
+            ratios_clamped = ratios
+        elif not self.disable_ppo_ratio:
             log_ratios = curr_logprobs - prev_logprobs
             if self.sequence_level_importance_ratios:
                 seq_log_ratio_mean = masked_mean(
@@ -419,6 +436,22 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             ).item()
 
+            # Calculate min/max values for ratios (only for valid tokens)
+            masked_ratios = ratios.detach()[mask.bool()]
+            masked_ratios_clamped = ratios_clamped.detach()[mask.bool()]
+
+            # Handle edge case where there might be no valid tokens
+            if masked_ratios.numel() > 0:
+                probs_ratio_min = masked_ratios.min().item()
+                probs_ratio_max = masked_ratios.max().item()
+                probs_ratio_clamped_min = masked_ratios_clamped.min().item()
+                probs_ratio_clamped_max = masked_ratios_clamped.max().item()
+            else:
+                probs_ratio_min = float("inf")
+                probs_ratio_max = float("-inf")
+                probs_ratio_clamped_min = float("inf")
+                probs_ratio_clamped_max = float("-inf")
+
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
@@ -428,6 +461,10 @@ class ClippedPGLossFn(LossFunction):
                 "loss": loss.item(),
                 "probs_ratio": probs_ratio,
                 "probs_ratio_clamped": probs_ratio_clamped,
+                "probs_ratio_min": probs_ratio_min,
+                "probs_ratio_max": probs_ratio_max,
+                "probs_ratio_clamped_min": probs_ratio_clamped_min,
+                "probs_ratio_clamped_max": probs_ratio_clamped_max,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
                 "token_mult_prob_error": mult_prob_error,
                 "gen_kl_error": gen_kl_error,
@@ -903,8 +940,24 @@ class SequencePackingLossWrapper:
             loss_accum += loss
             for k, v in metrics.items():
                 if k not in metrics_accum:
-                    metrics_accum[k] = 0
-                metrics_accum[k] += v
+                    if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                        metrics_accum[k] = float("inf")
+                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                        metrics_accum[k] = float("-inf")
+                    else:
+                        metrics_accum[k] = 0
+
+                val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
+
+                # Skip inf/-inf sentinel values (from sequences with no valid tokens)
+                if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                    if not math.isinf(val):
+                        metrics_accum[k] = min(metrics_accum[k], val)
+                elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
+                    if not math.isinf(val):
+                        metrics_accum[k] = max(metrics_accum[k], val)
+                else:
+                    metrics_accum[k] += val
 
         return loss_accum, metrics_accum
 
