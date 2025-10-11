@@ -190,12 +190,6 @@ def setup(
         "Distillation does not support Megatron generation backend; please use vLLM."
     )
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        if "megatron_cfg" in cfg and cfg["megatron_cfg"]["enabled"]:
-            raise AssertionError(
-                f"Distillation does not support Megatron training path ({who} policy). "
-                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1151 for more details."
-            )
-
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
@@ -366,6 +360,12 @@ def setup(
         weights_path = None
         optimizer_path = None
 
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        ## NOTE: this is equal to the total number of scheduler steps
+        policy_config["megatron_cfg"]["train_iters"] = distillation_config[
+            "max_num_steps"
+        ]
+
     student_policy = Policy(
         name_prefix="student",
         cluster=train_cluster,
@@ -389,6 +389,12 @@ def setup(
         check_vocab_equality(
             tokenizer, policy_config["model_name"], teacher_config["model_name"]
         )
+
+    if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
+        ## NOTE: this is equal to the total number of scheduler steps
+        teacher_config["megatron_cfg"]["train_iters"] = distillation_config[
+            "max_num_steps"
+        ]
 
     teacher_policy = Policy(
         name_prefix="teacher",

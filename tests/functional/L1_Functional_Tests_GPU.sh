@@ -30,6 +30,7 @@ time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correct
 time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 time uv run --no-sync bash ./tests/functional/distillation.sh
+time uv run --no-sync bash ./tests/functional/distillation_megatron.sh
 
 cd /opt/nemo-rl/tests
 coverage combine .coverage*

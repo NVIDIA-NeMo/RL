@@ -1321,6 +1321,363 @@ def test_megatron_dpo_training(tiny_llama_model_path):
         cluster.shutdown()
 
 
+@pytest.fixture
+def topk_setup(request):
+    """Setup and teardown specifically for top-k logits tests."""
+    # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
+    if hasattr(request, "param") and request.param is not None:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = request.param
+    else:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    cluster = None
+    data = None
+
+    try:
+        cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
+        print(
+            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        # Determine converter type based on model
+        converter_type = "LlamaForCausalLM"
+        if "qwen" in model_name.lower():
+            converter_type = "Qwen2ForCausalLM"
+        elif "gemma" in model_name.lower():
+            converter_type = "GemmaForCausalLM"
+
+        config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            converter_type=converter_type,
+            logprob_chunk_size=logprob_chunk_size,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron topk Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create test data
+        print("Creating test batch...")
+        torch.manual_seed(77)
+
+        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
+        attention_mask = torch.ones(4, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        yield policy, cluster, data
+
+    except Exception as e:
+        print(f"Error during topk setup: {e}")
+        pytest.skip(f"Topk setup failed: {e}")
+    finally:
+        print("Cleaning up topk resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "topk_setup",
+    [
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        (2, 1, 1, None, None, "tiny_llama_model_path"),
+        (2, 2, 1, None, None, "tiny_llama_model_path"),
+        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 1, 1, None, True, "tiny_llama_model_path"),
+        (2, 2, 1, None, True, "tiny_llama_model_path"),
+        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, True, "tiny_llama_model_path"),
+        (2, 2, 1, 16, True, "tiny_llama_model_path"),
+        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+    ],
+    indirect=True,
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
+)
+def test_megatron_policy_topk_logits(topk_setup):
+    """Test Megatron policy top-k logits computation."""
+    policy, cluster, data = topk_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Generate top-k logits
+    print("\nGenerating top-k logits...")
+    policy.prepare_for_lp_inference()
+    k = 5
+    outputs = policy.get_topk_logits(data, k=k)
+
+    # Basic validation
+    assert "topk_logits" in outputs and "topk_indices" in outputs, (
+        "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+    )
+    topk_logits = outputs["topk_logits"]
+    topk_indices = outputs["topk_indices"]
+
+    assert isinstance(topk_logits, torch.Tensor)
+    assert isinstance(topk_indices, torch.Tensor)
+    assert topk_logits.dtype == torch.float32
+    assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
+
+    # Shape checks
+    B, S = data.get("input_ids").shape
+    assert topk_logits.shape == (B, S, k)
+    assert topk_indices.shape == (B, S, k)
+
+    # Mask invalid positions and check for NaN/Inf
+    valid_mask = (
+        data.get("attention_mask")
+        .unsqueeze(-1)
+        .bool()
+        .expand(-1, -1, topk_logits.shape[-1])
+    )
+    valid_logits = topk_logits[valid_mask]
+    assert not torch.isnan(valid_logits).any(), "Top-k logits should not contain NaN"
+    assert not torch.isinf(valid_logits).any(), "Top-k logits should not contain Inf"
+
+    # Check descending order within top-k for valid positions
+    if S > 1:
+        diffs = topk_logits[..., :-1] - topk_logits[..., 1:]
+        valid_mask_diffs = (
+            data.get("attention_mask")
+            .unsqueeze(-1)
+            .bool()
+            .expand(-1, -1, topk_logits.shape[-1] - 1)
+        )
+        diffs = diffs[valid_mask_diffs]
+        assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
+    """Test that CP and non-CP models produce identical top-k logits with sequence packing enabled."""
+    num_gpus = 2
+    batch_size = 4
+    seq_len = 64
+
+    # Create test data with varying sequence lengths to test sequence packing
+    torch.manual_seed(123)
+    input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
+        batch_size, seq_len
+    )
+    input_lengths = torch.tensor([31, 21, 29, 56], dtype=torch.int32)
+    attention_mask = torch.zeros(batch_size, seq_len)
+    for i, length in enumerate(input_lengths):
+        attention_mask[i, :length] = 1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+        }
+    )
+
+    k = 5
+
+    # Test 1: Non-CP model (context_parallel_size=1) with sequence packing
+    print(
+        "=== Testing Non-CP model (context_parallel_size=1) with sequence packing for top-k ==="
+    )
+    cluster_no_cp = RayVirtualCluster(
+        name="test-no-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_no_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Ensure context parallel is disabled
+    config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+
+    # Enable sequence packing
+    config_no_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    tokenizer = get_tokenizer(config_no_cp["tokenizer"])
+    config_no_cp["generation"] = configure_generation_config(
+        config_no_cp["generation"], tokenizer
+    )
+
+    policy_no_cp = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Get top-k from non-CP model with sequence packing
+    policy_no_cp.prepare_for_lp_inference()
+    out_no_cp = policy_no_cp.get_topk_logits(data, k=k)
+    logits_no_cp = out_no_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp = out_no_cp["topk_indices"]
+    print(f"Non-CP topk logits shape: {logits_no_cp.shape}")
+
+    # Cleanup non-CP resources and run without packing
+    policy_no_cp.shutdown()
+    config_no_cp_no_packing = config_no_cp.copy()
+    config_no_cp_no_packing["sequence_packing"] = {"enabled": False}
+    policy_no_cp_no_packing = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp_no_packing,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy_no_cp_no_packing.prepare_for_lp_inference()
+    out_no_cp_np = policy_no_cp_no_packing.get_topk_logits(data, k=k)
+    logits_no_cp_np = out_no_cp_np["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp_np = out_no_cp_np["topk_indices"]
+    print(f"Non-CP (no packing) topk logits shape: {logits_no_cp_np.shape}")
+    cluster_no_cp.shutdown()
+
+    # Compare non-CP packing vs non-packing
+    print("=== Comparing non-CP packing vs non-packing top-k ===")
+    assert logits_no_cp.shape == logits_no_cp_np.shape
+    assert indices_no_cp.shape == indices_no_cp_np.shape
+    torch.testing.assert_close(logits_no_cp, logits_no_cp_np, rtol=1e-3, atol=1e-2)
+    valid_mask = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_no_cp.shape[-1])
+    )
+    assert torch.equal(indices_no_cp[valid_mask], indices_no_cp_np[valid_mask]), (
+        "Top-k indices should match between packing and non-packing"
+    )
+
+    # Test 2: CP model (context_parallel_size=2) with sequence packing
+    print(
+        "=== Testing CP model (context_parallel_size=2) with sequence packing for top-k ==="
+    )
+    cluster_cp = RayVirtualCluster(
+        name="test-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Enable context parallel
+    config_cp["megatron_cfg"]["context_parallel_size"] = 2
+
+    # Enable sequence packing
+    config_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config_cp["generation"] = configure_generation_config(
+        config_cp["generation"], tokenizer
+    )
+
+    policy_cp = Policy(
+        cluster=cluster_cp,
+        config=config_cp,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy_cp.prepare_for_lp_inference()
+    out_cp = policy_cp.get_topk_logits(data, k=k)
+    logits_cp = out_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_cp = out_cp["topk_indices"]
+
+    # Cleanup CP resources
+    policy_cp.shutdown()
+    cluster_cp.shutdown()
+
+    # Compare CP vs non-CP (no packing)
+    print("=== Comparing CP vs non-CP (no packing) top-k ===")
+    assert logits_no_cp_np.shape == logits_cp.shape
+    assert indices_no_cp_np.shape == indices_cp.shape
+    assert not torch.isnan(logits_cp).any()
+    assert not torch.isinf(logits_cp).any()
+    torch.testing.assert_close(logits_no_cp_np, logits_cp, rtol=1e-3, atol=1e-2)
+    # since there are close logits, we only check the index match ratio
+    valid_mask_idx = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_cp.shape[-1])
+    )
+    cp_idx_flat = indices_cp[valid_mask_idx]
+    nocp_idx_flat = indices_no_cp_np[valid_mask_idx]
+    match_ratio = (cp_idx_flat == nocp_idx_flat).float().mean().item()
+    print(f"Top-k index match ratio (CP vs non-CP): {match_ratio:.4f}")
+    assert match_ratio >= 0.95, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.95)"
+    )
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_sft_training(tiny_llama_model_path):
