@@ -21,6 +21,7 @@ import ray
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
+    placement_group_table,
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -169,6 +170,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"
     )
 
+@ray.remote(num_gpus=1)
+class GetGPUIDActor:
+    """ Util actor class to return GPU id of the current worker."""
+    def get_gpu_id(self):
+        return ray.get_gpu_ids()[0]
 
 class ResourceInsufficientError(Exception):
     """Exception raised when the cluster does not have enough resources to satisfy the requested configuration."""
@@ -251,6 +257,7 @@ class RayVirtualCluster:
                 self._node_placement_groups = self._create_placement_groups_internal(
                     strategy, use_unified_pg
                 )
+                self._sorted_bundle_indices = self._get_sorted_bundle_indices()
                 return self._node_placement_groups
             except ResourceInsufficientError as e:
                 print(e)
@@ -402,7 +409,49 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
+        if self._sorted_bundle_indices is not None:
+            return self.get_available_address_and_port(pg_idx=0, bundle_idx=self._sorted_bundle_indices[0])
         return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+    
+    def _get_sorted_bundle_indices(self) -> list[int]:
+        """Gets the sorted bundle indices for the placement groups."""
+        if self._node_placement_groups is None:
+            raise ValueError("Placement groups must be initialized before calling _get_sorted_bundle_indices")
+        
+        if len(self._node_placement_groups) != 1:
+            return None
+        
+        pg = self._node_placement_groups[0]
+        pg_data = placement_group_table(pg)
+        num_bundles = len(pg_data["bundles"])
+        bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+        # use info actor to get the GPU id
+        info_actors = []
+        for i in range(num_bundles):
+            info_actors.append(
+                GetGPUIDActor.options(
+                    num_cpus=0.01,  # set both num_cpus and num_gpus to be small values to enable assignment in colocated case
+                    num_gpus=0.01,
+                    resources=None,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
+                    ),
+                ).remote()
+            )
+
+        gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+        for actor in info_actors:
+            ray.kill(actor)
+
+        # original index, node_id, gpu_id
+        bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
+        pg_reordered_bundle_indices = [
+            bundle_info[0] for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+        ]  # sort by node_id, then gpu_id
+        return pg_reordered_bundle_indices
+
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.

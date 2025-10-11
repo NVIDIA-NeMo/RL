@@ -167,14 +167,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        self.worker_group = RayWorkerGroup(
-            cluster,
-            worker_builder,
-            name_prefix=name_prefix,
-            workers_per_node=workers_per_node,
-            sharding_annotations=self.sharding_annotations,
-            env_vars=env_vars or {},
-        )
+        pg = cluster.get_placement_groups()
+
+        if len(pg) == 1:
+            tied_groups = [(i // 8, [x]) for i,x in enumerate(cluster._sorted_bundle_indices)]
+
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                bundle_indices_list=tied_groups,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
+
+        else:
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                workers_per_node=workers_per_node,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
