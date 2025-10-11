@@ -32,6 +32,10 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
+from nemo_rl.algorithms.reward_functions import (
+    RewardShapingConfig,
+    apply_reward_shaping,
+)
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     print_performance_metrics,
@@ -74,6 +78,22 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+class RewardScalingConfig(TypedDict):
+    """Linearly rescales rewards from [r_min, r_max] to [min, max].
+
+    Example:
+        Original: [2.0, 5.0, 10.0], min=0.0, max=1.0
+        → Scaled: [0.0, 0.33, 1.0]
+
+    Formula:
+        scaled = min + (reward - r_min) / (r_max - r_min) * (max - min)
+    """
+
+    enabled: bool
+    min: NotRequired[float]
+    max: NotRequired[float]
+
+
 class AsyncGRPOConfig(TypedDict):
     enabled: bool
     # Maximum trajectory age in training steps for samples drawn from the
@@ -97,6 +117,17 @@ class GRPOConfig(TypedDict):
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
+    # whether to enable dynamic sampling, i.e.
+    # whether to discard prompts whose rewards have zero standard deviation
+    use_dynamic_sampling: bool
+    # When using dynamic sampling, the maximum number of batches to generate
+    # before throwing an error
+    max_num_gen_batches: NotRequired[int]
+    # When using dynamic sampling, generation prompt batch size will equal
+    # num_prompts_per_step * dapo_batch_multiplier
+    dapo_batch_multiplier: NotRequired[float]
+    reward_shaping: RewardShapingConfig
+    reward_scaling: RewardScalingConfig
 
 
 class GRPOSaveState(TypedDict):
@@ -201,9 +232,19 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    # Validate dapo_batch_multiplier
+    dapo_batch_multiplier = grpo_config["dapo_batch_multiplier"]
+    dataloader_batch_size = grpo_config["num_prompts_per_step"]
+    if not grpo_config["use_dynamic_sampling"]:
+        assert dapo_batch_multiplier == 1, (
+            "dapo_batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+        )
+    else:
+        dataloader_batch_size = int(dataloader_batch_size * dapo_batch_multiplier)
+
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config["num_prompts_per_step"],
+        batch_size=dataloader_batch_size,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -397,6 +438,10 @@ def setup(
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
+        ## make vllm hf overrides match the training policy
+        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            "hf_config_overrides", {}
+        )
 
         policy_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
@@ -476,6 +521,168 @@ def setup(
 # ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
+
+
+def dynamic_sampling(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    std: torch.Tensor,
+    baseline: torch.Tensor,
+    num_gen_batches: int,
+    master_config: MasterConfig,
+    timer: Timer,
+    batch_cache: BatchedDataDict[DatumSpec] = None,
+) -> BatchedDataDict[DatumSpec]:
+    """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
+
+    This function filters the current batch to retain only those prompts that have a non-zero standard deviation.
+    If the current batch has fewer number of prompts with non-zero standard deviation than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
+    we store it in the batch_cache to be used in later iterations.
+    If the current batch has more number of prompts with non-zero standard deviation than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
+    the batch is sliced to ensure batch size is num_prompts_per_step * num_generations_per_prompt.
+    is_batch_complete is set to False to indicate that the current batch is not enough to meet the required batch size. This is used as a signal in the GRPO training loop
+    to continue sampling or proceed to training.
+    This approach is based on the dynamic sampling algorithm from the DAPO paper:
+    https://arxiv.org/pdf/2503.14476.
+
+    Args:
+        repeated_batch (BatchedDataDict[DatumSpec]): The current batch of data containing prompts, responses, rewards, baselines, and std.
+        std (torch.Tensor): Tensor representing the standard deviation for each prompt group.
+        baseline (torch.Tensor): Baseline values for each prompt group.
+        num_gen_batches (int): Number of generation batches processed at the current step.
+        master_config (MasterConfig): Configuration containing GRPO and policy settings.
+        batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
+
+    Returns:
+        tuple: A tuple containing:
+            - repeated_batch (BatchedDataDict[DatumSpec]): Updated batch with selected prompts.
+            - is_batch_complete (bool): Indicates if the batch has enough samples with non-zero std for training.
+            - batch_cache (BatchedDataDict[DatumSpec]): Updated cache for future iterations.
+    """
+    # is_batch_complete is used to indicate if the current batch was able to generate enough prompts with non-zero std.
+    is_batch_complete = True
+
+    # Required batch size for training
+    train_prompts_size = (
+        master_config["grpo"]["num_prompts_per_step"]
+        * master_config["grpo"]["num_generations_per_prompt"]
+    )
+    # Store the baseline, std and total_reward for the current unfiltered batch.
+    repeated_batch["baseline"] = baseline
+    repeated_batch["std"] = std
+    total_rewards = repeated_batch["total_reward"]
+    # Dynamic sampling algorithm (used in DAPO algorithm)
+    # This block implements dynamic sampling by selecting prompt groups with non-zero std.
+    # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until max_num_gen_batches is reached.
+    if master_config["grpo"]["use_dynamic_sampling"]:
+        with timer.time("dynamic_sampling"):
+            # Get the prompt indices with non-zero std
+            non_zero_std_mask = std != 0.0
+
+            keep_prompt_indices = torch.arange(
+                len(non_zero_std_mask), device=std.device
+            )[non_zero_std_mask].tolist()
+
+            # Only select the inputs that have non-zero std
+            # total_reward is already a part of repeated_batch so we don't need to add it again
+            filtered_repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
+            filtered_repeated_batch["std"] = std[keep_prompt_indices]
+            filtered_repeated_batch["baseline"] = baseline[keep_prompt_indices]
+
+            # Store filtered and total rewards to track them separately
+            filtered_rewards = filtered_repeated_batch["total_reward"]
+            filtered_repeated_batch["total_reward"] = total_rewards
+            filtered_repeated_batch["filtered_reward"] = filtered_rewards
+
+            # Store the total_reward for the current filtered batch.
+            # If none of the prompts in current batch have non-zero std, filtered_repeated_batch.size will be 0.
+            # In this case, the current batch will be ignored and the next batch will be processed and we generate responses for it.
+            if filtered_repeated_batch.size > 0:
+                # Concatenate the previous partially filled batch with the current batch. This serves as a cache to store and collect the prompts with non-zero std.
+                # This is used in the next iteration when the current batch is not enough to fill the buffer.
+                batch_cache = (
+                    filtered_repeated_batch
+                    if batch_cache is None
+                    else BatchedDataDict.from_batches(
+                        [batch_cache, filtered_repeated_batch]
+                    )
+                )
+                filtered_repeated_batch = batch_cache
+
+            filtered_prompts_size = filtered_repeated_batch.size
+            # Calculate the fraction of prompts with non-zero std.
+            # Denominator is train_prompts_size that we use for training. This ratio can be > 1.0 if dapo_batch_multiplier > 1.0 and there are many prompt groups with non-zero std.
+            non_zero_std_fraction = (
+                filtered_prompts_size / train_prompts_size
+                if train_prompts_size > 0
+                else 0.0
+            )
+            print(
+                f"Detected {filtered_prompts_size} prompts with non-zero std; "
+                f"{train_prompts_size} are required and used for training."
+            )
+
+            # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
+            if filtered_prompts_size < train_prompts_size:
+                max_num_gen_batches = master_config["grpo"]["max_num_gen_batches"]
+                assert max_num_gen_batches > 0, (
+                    "When using grpo.use_dynamic_sampling, grpo.max_num_gen_batches must be > 0"
+                )
+                if num_gen_batches <= max_num_gen_batches:
+                    print(
+                        f"Generation sample buffer size: {filtered_prompts_size} is smaller than train_prompts_size: {train_prompts_size}. Processed {num_gen_batches} batches so far out of {max_num_gen_batches}."
+                    )
+                    is_batch_complete = False
+                else:
+                    raise ValueError(
+                        f"Dynamic sampling has reached the maximum allowed number of batches ({max_num_gen_batches}). Consider evaluating the complexity of your data or adjusting the num_prompts_per_step or num_generations_per_prompt parameters to enhance the diversity of the samples."
+                    )
+            else:
+                # Ideally, the fraction should be 1.0,
+                if non_zero_std_fraction > 1.5:
+                    print(
+                        "WARNING: Over 50% of prompts with non-zero std are being discarded. "
+                        "Adjust 'dapo_batch_multiplier' to reduce the number of discarded prompts. "
+                        "Please refer to the DAPO guide for details."
+                    )
+
+                #  Slice the batch, rewards, baselines and std to ensure batch size is train_prompts_size
+                filtered_repeated_batch = filtered_repeated_batch.slice(
+                    0, train_prompts_size
+                )
+
+        filtered_repeated_batch["non_zero_std_fraction"] = non_zero_std_fraction
+
+    batch_to_return = (
+        filtered_repeated_batch
+        if master_config["grpo"]["use_dynamic_sampling"]
+        else repeated_batch
+    )
+    return batch_to_return, is_batch_complete, batch_cache
+
+
+def scale_rewards(
+    repeated_batch: BatchedDataDict[DatumSpec], master_config: MasterConfig
+) -> BatchedDataDict[DatumSpec]:
+    """Linearly rescale rewards from [r_min, r_max] to [config_min, config_max].
+
+    If `reward_scaling.enabled` is True, this maps the original reward range
+    [r_min, r_max] to [config_min, config_max]. Defaults: config_min=0.0,
+    config_max=1.0.
+    """
+    rs_cfg = master_config["grpo"]["reward_scaling"]
+    if rs_cfg["enabled"]:
+        rewards = repeated_batch["total_reward"]
+        r_min, r_max = rewards.min(), rewards.max()
+
+        config_min = float(rs_cfg.get("min", 0.0))
+        config_max = float(rs_cfg.get("max", 1.0))
+
+        scaled = config_min + (rewards - r_min) / (r_max - r_min) * (
+            config_max - config_min
+        )
+        repeated_batch["total_reward"] = scaled
+
+    return repeated_batch
 
 
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
@@ -644,9 +851,12 @@ def grpo_train(
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
-        # Run grpo training (single-turn)
-        batch: BatchedDataDict[DatumSpec]
+        # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
+        batch_cache: BatchedDataDict[DatumSpec] = None
+        # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by max_num_gen_batches. Used in the case of dynamic sampling.
+        num_gen_batches = 0
 
+        # Run grpo/dapo training loop (single-turn)
         for batch in dataloader:
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
@@ -690,6 +900,7 @@ def grpo_train(
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
 
+                num_gen_batches += 1
                 with timer.time("generation"):
                     # Use async rollouts if vLLM async engine is enabled
                     if _should_use_async_rollouts(master_config):
@@ -725,6 +936,13 @@ def grpo_train(
                         )
                     policy_generation.finish_generation()
 
+                repeated_batch = scale_rewards(repeated_batch, master_config)
+                # Process rewards with custom reward function
+                if master_config["grpo"]["reward_shaping"]["enabled"]:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config["grpo"]["reward_shaping"]
+                    )
+
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
                 with timer.time("reward_calculation"):
@@ -740,6 +958,28 @@ def grpo_train(
                             "use_leave_one_out_baseline"
                         ],
                     )
+                    # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
+                    repeated_batch, is_batch_complete, batch_cache = dynamic_sampling(
+                        repeated_batch,
+                        std,
+                        baseline,
+                        num_gen_batches,
+                        master_config,
+                        timer,
+                        batch_cache,
+                    )
+                    # Get the updated rewards and baselines. For DAPO, these rewards and baselines only correspond to the prompts with non-zero std.
+                    rewards = (
+                        repeated_batch["total_reward"]
+                        if not master_config["grpo"]["use_dynamic_sampling"]
+                        else repeated_batch["filtered_reward"]
+                    )
+                    baseline = repeated_batch["baseline"]
+                    std = repeated_batch["std"]
+
+                    # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
+                    if not is_batch_complete:
+                        continue
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
@@ -858,19 +1098,25 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+
                 metrics = {
                     "loss": train_results["loss"].numpy(),
-                    "reward": rewards.numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
+                    "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                 }
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    metrics["filtered_reward"] = rewards.numpy()
+                    metrics["reward"] = repeated_batch["total_reward"].numpy()
+
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
                     if k in {
                         "lr",
                         "wd",
                         "reward",
+                        "filtered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -878,6 +1124,12 @@ def grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    metrics["non_zero_std_prompts_fraction"] = repeated_batch[
+                        "non_zero_std_fraction"
+                    ]
+
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
@@ -950,6 +1202,10 @@ def grpo_train(
             # Log training data
             log_data = {"content": flat_messages["content"]}
             log_data["rewards"] = rewards.tolist()
+            if master_config["grpo"]["use_dynamic_sampling"]:
+                log_data["filtered_rewards"] = rewards.tolist()
+                log_data["rewards"] = repeated_batch["total_reward"].tolist()
+
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
             log_data["input_lengths"] = input_lengths.tolist()
@@ -977,7 +1233,13 @@ def grpo_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
-            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            if master_config["grpo"]["use_dynamic_sampling"]:
+                print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
+                print(
+                    f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
+                )
+            else:
+                print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
@@ -1018,6 +1280,10 @@ def grpo_train(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+
+            # Reset the batch and set num_gen_batches to 0
+            batch_cache = None
+            num_gen_batches = 0
 
             timer.reset()
             current_step += 1
@@ -1085,9 +1351,8 @@ def validate(
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
-            rewards = val_batch["total_reward"]
 
-            total_rewards.extend(rewards.tolist())
+            total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -1101,8 +1366,18 @@ def validate(
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards)
-        avg_length = sum(total_lengths) / len(total_lengths)
+        num_samples = len(total_rewards)
+        if num_samples > 0:
+            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+            # Unscaled binary reward values range = {0.0, 1.0}
+            correct_response_reward = torch.tensor(1.0, dtype=torch.float32)
+            accuracy = (rewards_t == correct_response_reward).float().mean().item()
+        else:
+            accuracy = 0.0
+
+        avg_length = (
+            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
+        )
 
         val_metrics = {
             "accuracy": accuracy,
