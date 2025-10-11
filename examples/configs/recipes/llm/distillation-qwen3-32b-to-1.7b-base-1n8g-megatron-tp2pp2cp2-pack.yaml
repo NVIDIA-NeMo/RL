@@ -98,6 +98,8 @@ teacher:
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: false
     apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: null
     optimizer:
       optimizer: adam
       lr: 2.00001e-05
@@ -112,6 +114,8 @@ teacher:
       sgd_momentum: 0.9
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
       clip_grad: ${policy.max_grad_norm}
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
