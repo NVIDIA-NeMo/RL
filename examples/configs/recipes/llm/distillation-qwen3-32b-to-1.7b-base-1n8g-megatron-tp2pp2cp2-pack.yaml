@@ -22,54 +22,6 @@ policy:
     ${.megatron_cfg.context_parallel_size}}, 2}
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
-    activation_checkpointing: false
-    converter_type: Qwen3ForCausalLM
-    tensor_model_parallel_size: 2
-    expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 2
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 2
-    pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
-    freeze_moe_router: true
-    moe_router_dtype: fp64
-    moe_router_load_balancing_type: none
-    moe_router_bias_update_rate: 0.0
-    moe_permute_fusion: false
-    apply_rope_fusion: true
-    optimizer:
-      optimizer: adam
-      lr: 2.00001e-05
-      min_lr: 2.0e-05
-      weight_decay: 0.01
-      bf16: true
-      fp16: false
-      params_dtype: float32
-      adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1.0e-08
-      sgd_momentum: 0.9
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
-      clip_grad: ${policy.max_grad_norm}
-    scheduler:
-      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      weight_decay_incr_style: constant
-      lr_decay_style: constant
-      lr_decay_iters: 1000
-      lr_warmup_iters: 10
-      lr_warmup_init: 2.0e-06
-    distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
-      overlap_param_gather: true
-      average_in_collective: true
-      use_custom_fsdp: false
-      data_parallel_sharding_strategy: optim_grads_params
 teacher:
   model_name: Qwen/Qwen3-32B
   dtensor_cfg:
@@ -80,58 +32,8 @@ teacher:
     enabled: true
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
-    activation_checkpointing: false
-    converter_type: Qwen3ForCausalLM
     tensor_model_parallel_size: 4
-    expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 2
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
-    pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
-    freeze_moe_router: true
-    moe_router_dtype: fp64
-    moe_router_load_balancing_type: none
-    moe_router_bias_update_rate: 0.0
-    moe_permute_fusion: false
-    apply_rope_fusion: true
-    bias_activation_fusion: true
-    defer_fp32_logits: null
-    optimizer:
-      optimizer: adam
-      lr: 2.00001e-05
-      min_lr: 2.0e-05
-      weight_decay: 0.01
-      bf16: true
-      fp16: false
-      params_dtype: float32
-      adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1.0e-08
-      sgd_momentum: 0.9
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
-      clip_grad: ${policy.max_grad_norm}
-    scheduler:
-      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
-      weight_decay_incr_style: constant
-      lr_decay_style: constant
-      lr_decay_iters: 1000
-      lr_warmup_iters: 10
-      lr_warmup_init: 2.0e-06
-    distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
-      overlap_param_gather: true
-      average_in_collective: true
-      use_custom_fsdp: false
-      data_parallel_sharding_strategy: optim_grads_params
 logger:
   log_dir: logs/distillation-qwen3-32b-to-1.7b-base-megatron-tp2pp2cp2-pack
   wandb:
