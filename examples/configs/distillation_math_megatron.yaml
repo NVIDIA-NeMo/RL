@@ -1,7 +1,7 @@
 defaults: distillation_math.yaml
 
 checkpointing:
-    checkpoint_dir: "checkpoints/distillation-megatron-${policy.model_name}-reverse"
+    checkpoint_dir: "checkpoints/distillation-megatron-${policy.model_name}"
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
@@ -32,22 +32,21 @@ policy: &POLICY_BASE
         sequence_length_round: 64
 
     max_grad_norm: 1.0
-    # makes the training sequence length divisible by the tensor parallel size
-    # this is useful for sequence parallel training
-    make_sequence_length_divisible_by: ${.megatron_cfg.tensor_model_parallel_size}
+
+    make_sequence_length_divisible_by: ${mul:${mul:${.megatron_cfg.tensor_model_parallel_size}, ${.megatron_cfg.context_parallel_size}}, 2}
 
     megatron_cfg: &MEGATRON_BASE
         enabled: true
         empty_unused_memory_level: 0
         activation_checkpointing: false
         converter_type: "Qwen3ForCausalLM"
-        tensor_model_parallel_size: 4
+        tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
-        pipeline_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
         num_layers_in_first_pipeline_stage: null
         num_layers_in_last_pipeline_stage: null
-        context_parallel_size: 1
+        context_parallel_size: 2
         pipeline_dtype: ${policy.precision}
         sequence_parallel: false
         freeze_moe_router: true
@@ -134,18 +133,19 @@ teacher:
     model_name: "Qwen/Qwen3-4B"
     megatron_cfg:
         <<: *MEGATRON_BASE
-        context_parallel_size: 1 
-        tensor_parallel_size: 4
+        context_parallel_size: 2
+        tensor_model_parallel_size: 2
+        pipeline_model_parallel_size: 2
 
 logger:
-    num_val_samples_to_print: 5
     wandb_enabled: true
-    monitor_gpus: true
     wandb:
         project: "nemo-distillation"
         name: "distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
     tensorboard:
-        log_dir: "tb_logs-distillation-megatron-${data.dataset_name}"
+        log_dir: "tb_logs-distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    mlflow:
+        run_name: "distillation-math-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
 
 cluster:
     gpus_per_node: 8
