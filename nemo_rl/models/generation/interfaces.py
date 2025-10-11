@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -217,7 +217,10 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def generate(
-        self, data: BatchedDataDict["GenerationDatumSpec"], greedy: bool
+        self,
+        data: BatchedDataDict["GenerationDatumSpec"],
+        greedy: bool,
+        sampling_params: Optional[dict],
     ) -> BatchedDataDict["GenerationOutputSpec"]:
         pass
 
