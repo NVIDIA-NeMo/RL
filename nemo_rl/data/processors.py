@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import torch
 from transformers import PreTrainedTokenizerBase
-
+from copy import deepcopy
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, TaskDataSpec
 
 TokenizerType = PreTrainedTokenizerBase
@@ -231,3 +231,150 @@ def multichoice_qa_processor(
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
     return output
+
+def bfcl_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from BFCL dataset) into a DatumSpec for function calling."""
+    
+    system_content = datum_dict["system_content"]
+    user_content = datum_dict["user_content"]
+    metadata = datum_dict["metadata"]
+    
+    message_log = []
+    
+    # System prompt
+    if system_content and len(system_content.strip()) > 0: 
+        sys_prompt: dict[str, str | torch.Tensor] = {
+            "role": "system",
+            "content": system_content,
+        }
+        sys = tokenizer.apply_chat_template(
+            [cast(dict[str, str], sys_prompt)],
+            tokenize=False,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+        )
+        sys_prompt["token_ids"] = tokenizer(
+            sys, return_tensors="pt", add_special_tokens=False
+        )["input_ids"][0]
+        sys_prompt["content"] = sys
+        message_log.append(sys_prompt)
+    
+    # User prompt
+    final_user_content = user_content
+    
+    user_message = {"role": "user", "content": final_user_content}
+    message = tokenizer.apply_chat_template(
+        [user_message],
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    user_message["token_ids"] = tokenizer(
+        message, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        for indiv_message in message_log:
+            indiv_message["token_ids"] = indiv_message["token_ids"][
+                : min(4, max_seq_length // max(1, len(message_log)))
+            ]
+        loss_multiplier = 0.0
+        # recompute after truncation
+        length = sum(len(m["token_ids"]) for m in message_log)
+    # Use deepcopy to avoid overwriting the original metadata
+    extra_env_info = deepcopy(metadata) if metadata else {}
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    
+    # Add task_name and dataset if present
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    if "dataset" in datum_dict:
+        output["dataset"] = datum_dict["dataset"]
+        
+    return output
+
+def bfcl_multiturn_hf_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from BFCL dataset) into a DatumSpec for function calling."""
+    
+    # Support single turn for now
+    if len(datum_dict.get("messages", [])) != 1:
+        raise ValueError(
+            "bfcl_multiturn_hf_data_processor currently expects a single conversation in messages[0]."
+        )
+    
+    single_message = datum_dict["messages"][0]
+    
+    message_log = []
+    extra_env_info = {}
+    
+    # Extract metadata from user message
+    for m in single_message:
+        if m["role"] == "user":
+            # need to be deepcopy to avoid overwriting the original metadata
+            extra_env_info = deepcopy(m["metadata"])
+            break
+    
+    # Apply chat template to the entire conversation
+    message = tokenizer.apply_chat_template(
+        single_message,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    
+    # Create user message entry for message_log
+    user_message = {"role": "user"}
+    user_message["token_ids"] = tokenizer.apply_chat_template(
+        single_message,
+        tokenize=True,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )[0]
+    user_message["content"] = message
+    message_log.append(user_message)
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length > max_seq_length:
+        # make smaller and mask out
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict["task_name"],
+        "dataset": datum_dict["dataset"],
+    }
+    return output
+    

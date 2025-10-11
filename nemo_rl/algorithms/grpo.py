@@ -18,7 +18,7 @@ import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
-
+import json
 import numpy as np
 import ray
 import torch
@@ -953,6 +953,23 @@ def grpo_train(
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
             log_data["input_lengths"] = input_lengths.tolist()
+            # Add environment metadata for each sample. Serialise to JSON strings for safe logging.
+            try:
+                extra_env_info = repeated_batch["extra_env_info"]
+            except KeyError:
+                extra_env_info = [None] * len(rewards)
+            # Normalize to a list with the same length as rewards
+            if not isinstance(extra_env_info, (list, tuple)):
+                extra_env_info = [extra_env_info] * len(rewards)
+            else:
+                extra_env_info = list(extra_env_info)
+            if len(extra_env_info) < len(rewards):
+                extra_env_info.extend([None] * (len(rewards) - len(extra_env_info)))
+            elif len(extra_env_info) > len(rewards):
+                extra_env_info = extra_env_info[: len(rewards)]
+            log_data["metadata"] = [
+                json.dumps(m, default=str) if m is not None else "" for m in extra_env_info
+            ]
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{total_steps}.jsonl"
             )
