@@ -1435,10 +1435,21 @@ class MegatronPolicyWorker:
         pp_seq_dim_size = input_seq_dim_size
         pp_grp = get_pipeline_model_parallel_group()
 
+        # If using sequence packing with PP>1, pad full sequence to static PP buffer length
+        pad_full_seq_to = None
+        if (
+            self.cfg["sequence_packing"]["enabled"]
+            and self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+        ):
+            _, pad_full_seq_to = (
+                data.get_microbatch_iterator_for_packable_sequences_len()
+            )
+            pp_seq_dim_size = pad_full_seq_to
+
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pp_seq_dim_size
+            nonlocal pp_seq_dim_size, pad_full_seq_to
             data_dict = next(data_iterator).to("cuda")
 
             pack = self.cfg["sequence_packing"]["enabled"]
@@ -1451,13 +1462,9 @@ class MegatronPolicyWorker:
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
                 if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
                     pad_factor = math.lcm(16, pad_factor)
-                if pp_size > 1:
-                    _, pad_full_seq_to = (
-                        data_dict.get_microbatch_iterator_for_packable_sequences_len()
-                    )
+                # Use the precomputed pad_full_seq_to from the outer scope
+                if pp_size > 1 and pad_full_seq_to is not None:
                     pp_seq_dim_size = pad_full_seq_to
-                else:
-                    pad_full_seq_to = None
 
                 (
                     input_ids_unpacked,
@@ -1506,108 +1513,124 @@ class MegatronPolicyWorker:
             if "generation" in self.cfg and self.cfg["generation"] is not None:
                 output_tensor.div_(self.cfg["generation"]["temperature"])
 
-            tp_grp = get_tensor_model_parallel_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            vocab_shard_size = output_tensor.shape[-1]
-            vocab_start_index = tp_rank * vocab_shard_size
+            def collection_fn(_):
+                # Only the last PP stage produces final logits/top-k; earlier stages return empty
+                # if not is_pipeline_last_stage(ignore_virtual=True):
+                # return output_tensor.new_zeros(()), {}
 
-            chunk_size = None
-            if "logprob_chunk_size" in self.cfg:
-                chunk_size = self.cfg["logprob_chunk_size"]
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                vocab_shard_size = output_tensor.shape[-1]
+                vocab_start_index = tp_rank * vocab_shard_size
 
-            topk_vals_local, topk_idx_local = distributed_vocab_topk(
-                output_tensor,
-                k,
-                tp_grp,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_start_index + vocab_shard_size,
-                chunk_size=chunk_size,
-            )
+                chunk_size = None
+                if "logprob_chunk_size" in self.cfg:
+                    chunk_size = self.cfg["logprob_chunk_size"]
 
-            if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
-                cp_grp = get_context_parallel_group()
-                if pack:
-                    # Per-sequence CP allgather following packed-sequence logic
-                    batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
+                topk_vals_local, topk_idx_local = distributed_vocab_topk(
+                    output_tensor,
+                    k,
+                    tp_grp,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_start_index + vocab_shard_size,
+                    chunk_size=chunk_size,
+                )
 
-                    topk_vals_full = torch.zeros(
-                        (1, total_packed_len, k),
-                        dtype=topk_vals_local.dtype,
-                        device=topk_vals_local.device,
-                    )
-                    topk_idx_full = torch.zeros(
-                        (1, total_packed_len, k),
-                        dtype=topk_idx_local.dtype,
-                        device=topk_idx_local.device,
-                    )
+                if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
+                    cp_grp = get_context_parallel_group()
+                    if pack:
+                        # Per-sequence CP allgather following packed-sequence logic
+                        batch_size = data_dict["input_ids"].shape[0]
+                        total_packed_len = int(cu_seqlens_padded[-1].item())
 
-                    for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
-                        if end_idx > start_idx:
-                            local_vals_slice = topk_vals_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            local_idx_slice = topk_idx_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
-                            )
-                            gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
-                            )
-                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                        topk_vals_full = torch.zeros(
+                            (1, total_packed_len, k),
+                            dtype=topk_vals_local.dtype,
+                            device=topk_vals_local.device,
+                        )
+                        topk_idx_full = torch.zeros(
+                            (1, total_packed_len, k),
+                            dtype=topk_idx_local.dtype,
+                            device=topk_idx_local.device,
+                        )
+
+                        for i in range(batch_size):
+                            start_idx = int(cu_seqlens_padded[i].item())
+                            end_idx = int(cu_seqlens_padded[i + 1].item())
+                            if end_idx > start_idx:
+                                local_vals_slice = topk_vals_local[
+                                    :, start_idx // cp_size : end_idx // cp_size, :
+                                ]
+                                local_idx_slice = topk_idx_local[
+                                    :, start_idx // cp_size : end_idx // cp_size, :
+                                ]
+                                gathered_vals = allgather_cp_sharded_tensor(
+                                    local_vals_slice, cp_grp, seq_dim=1
+                                )
+                                gathered_idx = allgather_cp_sharded_tensor(
+                                    local_idx_slice, cp_grp, seq_dim=1
+                                )
+                                # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
+                                # Flatten leading dims and reshape to [1, expected_len, k] to match target.
+                                expected_len = end_idx - start_idx
+                                if (
+                                    gathered_vals.dim() == 3
+                                    and gathered_vals.shape[1] != expected_len
+                                ):
+                                    gathered_vals = gathered_vals.reshape(
+                                        1, expected_len, gathered_vals.shape[-1]
+                                    )
+                                if (
+                                    gathered_idx.dim() == 3
+                                    and gathered_idx.shape[1] != expected_len
+                                ):
+                                    gathered_idx = gathered_idx.reshape(
+                                        1, expected_len, gathered_idx.shape[-1]
+                                    )
+                                topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
+                                topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                    else:
+                        # CP>1 必须启用 sequence packing
+                        raise RuntimeError(
+                            "Context Parallelism (CP>1) requires sequence packing to be enabled."
+                        )
                 else:
-                    # This path should be unreachable due to the earlier assertion
-                    raise RuntimeError(
-                        "Context Parallelism (CP>1) requires sequence packing to be enabled."
+                    topk_vals_full = topk_vals_local
+                    topk_idx_full = topk_idx_local
+
+                if pack:
+                    batch_size = data_dict["input_ids"].shape[0]
+                    out_vals = torch.zeros(
+                        (batch_size, unpacked_seqlen, k),
+                        dtype=topk_vals_full.dtype,
+                        device=topk_vals_full.device,
                     )
-            else:
-                topk_vals_full = topk_vals_local
-                topk_idx_full = topk_idx_local
-
-            if pack:
-                batch_size = data_dict["input_ids"].shape[0]
-                out_vals = torch.zeros(
-                    (batch_size, unpacked_seqlen, k),
-                    dtype=topk_vals_full.dtype,
-                    device=topk_vals_full.device,
-                )
-                out_idx = torch.zeros(
-                    (batch_size, unpacked_seqlen, k),
-                    dtype=topk_idx_full.dtype,
-                    device=topk_idx_full.device,
-                )
-                for i in range(batch_size):
-                    seq_len = int(seq_lengths[i].item())
-                    start_idx = int(cu_seqlens_padded[i].item())
-                    if seq_len > 0:
-                        out_vals[i, :seq_len, :] = topk_vals_full[
-                            0, start_idx : start_idx + seq_len, :
-                        ]
-                        out_idx[i, :seq_len, :] = topk_idx_full[
-                            0, start_idx : start_idx + seq_len, :
-                        ]
-
-                def collection_fn(_):
+                    out_idx = torch.zeros(
+                        (batch_size, unpacked_seqlen, k),
+                        dtype=topk_idx_full.dtype,
+                        device=topk_idx_full.device,
+                    )
+                    for i in range(batch_size):
+                        seq_len = int(seq_lengths[i].item())
+                        start_idx = int(cu_seqlens_padded[i].item())
+                        if seq_len > 0:
+                            out_vals[i, :seq_len, :] = topk_vals_full[
+                                0, start_idx : start_idx + seq_len, :
+                            ]
+                            out_idx[i, :seq_len, :] = topk_idx_full[
+                                0, start_idx : start_idx + seq_len, :
+                            ]
                     return output_tensor.new_zeros(()), {
                         "topk_logits": out_vals,
                         "topk_indices": out_idx,
                     }
-
-                return output_tensor, collection_fn
-            else:
-
-                def collection_fn(_):
+                else:
                     return output_tensor.new_zeros(()), {
                         "topk_logits": topk_vals_full,
                         "topk_indices": topk_idx_full,
                     }
 
-                return output_tensor, collection_fn
+            return output_tensor, collection_fn
 
         if self.cfg["dynamic_batching"]["enabled"]:
             mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
