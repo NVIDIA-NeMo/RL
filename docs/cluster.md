@@ -25,9 +25,8 @@ sbatch \
     ray.sub
 ```
 
-:::{tip}
-Depending on your Slurm cluster configuration, you may or may not need to include the `--gres=gpu:8` option in the `sbatch` command.
-:::
+> [!TIP]
+> Depending on your Slurm cluster configuration, you may or may not need to include the `--gres=gpu:8` option in the `sbatch` command.
 
 Upon successful submission, Slurm will print the `SLURM_JOB_ID`:
 ```text
@@ -40,9 +39,8 @@ tail -f 1980204-logs/ray-driver.log
 
 ### Interactive Launching
 
-:::{tip}
-A key advantage of running interactively on the head node is the ability to execute multiple multi-node jobs without needing to requeue in the Slurm job queue. This means that during debugging sessions, you can avoid submitting a new `sbatch` command each time. Instead, you can debug and re-submit your NeMo RL job directly from the interactive session.
-:::
+> [!TIP]
+> A key advantage of running interactively on the head node is the ability to execute multiple multi-node jobs without needing to requeue in the Slurm job queue. This means that during debugging sessions, you can avoid submitting a new `sbatch` command each time. Instead, you can debug and re-submit your NeMo RL job directly from the interactive session.
 
 To run interactively, launch the same command as [Batched Job Submission](#batched-job-submission), but omit the `COMMAND` line:
 ```sh
@@ -111,14 +109,13 @@ sbatch ray.sub \
   - Sets the cache dir for downloaded Huggingface datasets.
 ``````
 
-:::{tip}
-When `HF_TOKEN`, `WANDB_API_KEY`, `HF_HOME`, and `HF_DATASETS_CACHE` are set in your shell environment using `export`, they are automatically passed to `ray.sub`. For instance, if you set:
-
-```sh
-export HF_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-```
-this token will be available to your NeMo RL run. Consider adding these exports to your shell configuration file, such as `~/.bashrc`.
-:::
+> [!TIP]
+> When `HF_TOKEN`, `WANDB_API_KEY`, `HF_HOME`, and `HF_DATASETS_CACHE` are set in your shell environment using `export`, they are automatically passed to `ray.sub`. For instance, if you set:
+>
+> ```sh
+> export HF_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+> ```
+> this token will be available to your NeMo RL run. Consider adding these exports to your shell configuration file, such as `~/.bashrc`.
 
 #### Advanced Environment Configuration
 ``````{list-table}
@@ -170,10 +167,9 @@ this token will be available to your NeMo RL run. Consider adding these exports 
   - Maximum port in the range for Ray worker processes.
 ``````
 
-:::{note}
-For the most part, you will not need to change ports unless these
-are already taken by some other service backgrounded on your cluster.
-:::
+> [!NOTE]
+> For the most part, you will not need to change ports unless these
+> are already taken by some other service backgrounded on your cluster.
 
 ## Kubernetes
 

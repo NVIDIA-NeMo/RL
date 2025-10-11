@@ -1787,6 +1787,12 @@ def async_grpo_train(
             timer.reset()
             step += 1
 
+    except Exception as e:
+        print(f"❌ Error in async loop: {e}")
+        import traceback
+
+        traceback.print_exc()
+
     finally:
         # Clean up
         print("🛑 Stopping trajectory collection...")
