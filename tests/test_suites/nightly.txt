@@ -81,7 +81,9 @@ tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-fsdp2tp2-quick.v2.sh
 tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.sh
 
 # Long dtensor
-tests/test_suites/llm/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long.sh
+# Disabling until transformers upgraded to >=4.56
+# Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1343
+# tests/test_suites/llm/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long.sh
 
 ################
 # Distillation #
