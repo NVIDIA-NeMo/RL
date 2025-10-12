@@ -339,9 +339,6 @@ class BaseVllmGenerationWorker:
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
-            # vllm==0.10.0 breaks skip_tokenizer_init=True.
-            # This will be reverted to `self.cfg["vllm_cfg"]["skip_tokenizer_init"]` once https://github.com/NVIDIA-NeMo/RL/issues/818 is resolved.
-            skip_tokenizer_init=False,
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
