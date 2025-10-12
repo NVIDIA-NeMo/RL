@@ -1607,7 +1607,7 @@ class MegatronPolicyWorker:
                                 topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
                                 topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
                     else:
-                        # CP>1 必须启用 sequence packing
+                        # Sequence packing must be enabled when CP > 1
                         raise RuntimeError(
                             "Context Parallelism (CP>1) requires sequence packing to be enabled."
                         )
