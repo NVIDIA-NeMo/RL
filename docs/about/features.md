@@ -5,7 +5,7 @@ _Available now_ | _Coming in v0.4_
 ## Coming in v0.4
 
 - **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion)
-- **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GPRO
+- **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO
 - **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs through the DTensor path
 - **Improved Native Performance** - Improve training time for native PyTorch models
 - **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance
