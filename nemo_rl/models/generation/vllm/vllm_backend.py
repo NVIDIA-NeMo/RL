@@ -18,6 +18,7 @@ import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 try:
     import vllm  # noqa: F401
@@ -32,14 +33,20 @@ except ImportError:
 
 class VllmInternalWorkerExtension:
     def init_collective(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank()
-        rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
+        # Place vLLM ranks after all training ranks so all training workers can join
+        rank = train_world_size + rank_prefix + local_rank
 
         pg = StatelessProcessGroup.create(
             host=ip, port=port, rank=rank, world_size=world_size
@@ -180,18 +187,33 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
+        def _load_model_weights(weights, model_runner):
+            """Load model weights.
+
+            Args:
+                weights: List[(name, tensor)]
+                model_runner: vLLM ModelRunner
+
+            Returns:
+                None
+            """
+            from nemo_rl.models.generation import fp8
+
+            if fp8.is_fp8_model(model_runner.vllm_config):
+                # the fp8 load_weights additionally casts bf16 weights into fp8
+                fp8.load_weights(weights, model_runner)
+            else:
+                model_runner.model.load_weights(weights=weights)
+
+        load_model_weight_func = lambda x: _load_model_weights(x, self.model_runner)
+
         try:
-            for name, (shape, dtype) in self.state_dict_info.items():
-                weight = torch.empty(shape, dtype=dtype, device="cuda")
-                self.model_update_group.broadcast(weight, src=0)
-
-                from nemo_rl.models.generation import fp8
-
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights([(name, weight)], self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=[(name, weight)])
+            packed_broadcast_consumer(
+                iterator=iter(self.state_dict_info.items()),
+                group=self.model_update_group,
+                src=0,
+                post_unpack_func=load_model_weight_func,
+            )
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

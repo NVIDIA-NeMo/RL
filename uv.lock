@@ -22,6 +22,7 @@ members = [
     "megatron-core",
     "nemo-automodel",
     "nemo-rl",
+    "penguin",
 ]
 
 [[manifest.dependency-metadata]]
@@ -2948,6 +2949,9 @@ mcore = [
     { name = "transformer-engine", extra = ["pytorch"] },
     { name = "vllm" },
 ]
+penguin = [
+    { name = "penguin" },
+]
 vllm = [
     { name = "causal-conv1d" },
     { name = "cuda-python" },
@@ -3026,6 +3030,7 @@ requires-dist = [
     { name = "nvidia-nvshmem-cu12" },
     { name = "nvtx" },
     { name = "omegaconf" },
+    { name = "penguin", marker = "extra == 'penguin'", editable = "3rdparty/Penguin-workspace" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "plotly" },
     { name = "ray", extras = ["default"], specifier = "==2.46.0" },
@@ -3049,7 +3054,7 @@ requires-dist = [
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.10.0" },
     { name = "wandb" },
 ]
-provides-extras = ["automodel", "vllm", "mcore"]
+provides-extras = ["automodel", "vllm", "mcore", "penguin"]
 
 [package.metadata.requires-dev]
 build = [
@@ -3827,6 +3832,10 @@ sdist = { url = "https://files.pythonhosted.org/packages/70/b8/2e79377efaa1e5f0d
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/fe/a2da1627aa9cb6310b6034598363bd26ac301c4a99d21f415b1b2855891e/peft-0.17.1-py3-none-any.whl", hash = "sha256:3d129d64def3d74779c32a080d2567e5f7b674e77d546e3585138216d903f99e", size = 504896, upload-time = "2025-08-21T09:25:18.974Z" },
 ]
+
+[[package]]
+name = "penguin"
+source = { editable = "3rdparty/Penguin-workspace" }
 
 [[package]]
 name = "pillow"

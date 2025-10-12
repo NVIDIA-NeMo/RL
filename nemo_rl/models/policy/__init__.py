@@ -61,6 +61,11 @@ class MegatronOptimizerConfig(TypedDict):
     use_distributed_optimizer: bool
     use_precision_aware_optimizer: bool
     clip_grad: float
+    # knob to enable optimizer cpu offload
+    optimizer_cpu_offload: bool
+    # knob to set the fraction of parameters to keep on CPU
+    # currently if optimizer_cpu_offload is true, this knob must be 1.0
+    optimizer_offload_fraction: float
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -99,6 +104,10 @@ class MegatronConfig(TypedDict):
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     defer_fp32_logits: NotRequired[bool]
+    # gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: bool
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: bool
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]

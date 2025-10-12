@@ -305,8 +305,10 @@ def setup(
         # validate and configure resources
         if policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
-            assert inference_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
                 "when policy_nodes = 1 and inference is non-colocated, "
                 f"but got {inference_gpus_per_node}."
             )
@@ -339,14 +341,13 @@ def setup(
                 f"but got {inference_nodes}."
             )
             assert (
-                inference_gpus_per_node is None
-                or inference_gpus_per_node == cluster_config["gpus_per_node"]
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
             ), (
-                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
             )
-            inference_gpus_per_node = cluster_config["gpus_per_node"]
             train_nodes -= inference_nodes
 
         # initialize train cluster
@@ -434,11 +435,17 @@ def setup(
     if not colocated_inference:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # inference cluster + head node of the train cluster
-        world_size = inference_nodes * inference_gpus_per_node + 1
+        # world includes all training workers and all inference workers
+        train_world_size = train_cluster.world_size()
+        inference_world_size = inference_nodes * inference_gpus_per_node
+        world_size = train_world_size + inference_world_size
         # init collective
-        futures_train = policy.init_collective(ip, port, world_size)
-        futures_inference = policy_generation.init_collective(ip, port, world_size)  # type: ignore
+        futures_train = policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = policy_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
@@ -1779,6 +1786,12 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+
+    except Exception as e:
+        print(f"❌ Error in async loop: {e}")
+        import traceback
+
+        traceback.print_exc()
 
     finally:
         # Clean up

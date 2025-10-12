@@ -141,7 +141,7 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         pass
 

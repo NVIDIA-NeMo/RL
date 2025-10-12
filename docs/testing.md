@@ -129,28 +129,24 @@ Which would produce this file in `tests/unit/unit_results.json`:
 }
 ```
 
-:::{tip}
-Past unit test results are logged in `tests/unit/unit_results/`. These are helpful to view trends over time and commits.
-
-Here's an example `jq` command to view trends:
-
-```sh
-jq -r '[.start_time, .git_commit, .metrics["test_hf_ray_policy::test_lm_policy_generation"].avg_prob_mult_error] | @tsv' tests/unit/unit_results/*
-
-# Example output:
-#2025-03-24 23:35:39     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
-#2025-03-24 23:36:37     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
-#2025-03-24 23:37:37     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
-#2025-03-24 23:38:14     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
-#2025-03-24 23:38:50     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
-```
-:::
+> [!TIP]
+> Past unit test results are logged in `tests/unit/unit_results/`. These are helpful to view trends over time and commits.
+>
+> ```sh
+> jq -r '[.start_time, .git_commit, .metrics["test_hf_ray_policy::test_lm_policy_generation"].avg_prob_mult_error] | @tsv' tests/unit/unit_results/*
+>
+> # Example output:
+> #2025-03-24 23:35:39     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
+> #2025-03-24 23:36:37     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
+> #2025-03-24 23:37:37     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
+> #2025-03-24 23:38:14     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
+> #2025-03-24 23:38:50     778d288bb5d2edfd3eec4d07bb7dffffad5ef21b        1.0000039339065552
+> ```
 
 ## Functional Tests
 
-:::{important}
-Functional tests may require multiple GPUs to run. See each script to understand the requirements.
-:::
+> [!IMPORTANT]
+> Functional tests may require multiple GPUs to run. See each script to understand the requirements.
 
 Functional tests are located under `tests/functional/`.
 
