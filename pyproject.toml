@@ -63,6 +63,10 @@ automodel = [
     "flash-attn==2.7.4.post1",
     "mamba-ssm",
     "causal-conv1d",
+    "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
+    "grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4",
+    "transformer-engine[pytorch]==2.5.0",
 ]
 vllm = [
     "cuda-python",
@@ -186,7 +190,7 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep", "grouped_gemm"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -196,6 +200,13 @@ default-groups = ["dev", "build"]
 #  --link-mode=copy (slower but more reliable; supresses warning)
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+deep_gemm = [{ requirement = "torch", match-runtime = true }]
+#grouped_gemm = [{ requirement = "torch", match-runtime = true }]
+
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
