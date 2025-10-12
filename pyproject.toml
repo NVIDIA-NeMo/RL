@@ -196,6 +196,13 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+deep_gemm = [{ requirement = "torch", match-runtime = true }]
+#grouped_gemm = [{ requirement = "torch", match-runtime = true }]
+
+
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"

@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
 ) -> str:
+    import os
     """Create a virtual environment using uv and execute a command within it.
 
     The output can be used as a py_executable for a Ray worker assuming the worker
@@ -77,6 +78,9 @@ def create_local_venv(
 
     logger.info(f"Creating new venv at {venv_path}")
 
+    # for env_var in os.environ:
+    #     logger.info(f"{env_var}: {os.environ[env_var]}")
+
     # Create the virtual environment
     uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
@@ -88,6 +92,9 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    # TODO: joayng WAR for now.
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    logger.info(f"UV_PROJECT_ENVIRONMENT: {env['CUDA_VISIBLE_DEVICES']}")
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
