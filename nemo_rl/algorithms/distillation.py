@@ -185,10 +185,7 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
 
-    # Disallow Megatron paths (generation/training) and SP + packing for distillation
-    assert generation_config["backend"] != "megatron", (
-        "Distillation does not support Megatron generation backend; please use vLLM."
-    )
+    # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
