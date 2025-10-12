@@ -128,6 +128,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -1758,9 +1759,14 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
-        # broadcast from train rank 0 to all other ranks (training and inference)
-        for _, tensor in hf_params_generator:
-            self.model_update_group.broadcast(tensor, src=0)
+
+        # param_iterator will return (name, tensor), we only need tensor
+        packed_broadcast_producer(
+            iterator=hf_params_generator,
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
