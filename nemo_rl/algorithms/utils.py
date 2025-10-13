@@ -30,22 +30,36 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 
 
-def calculate_kl_penalty_joschu2020(
+def calculate_kl_penalty(
     logprobs_policy: torch.Tensor,
     logprobs_reference: torch.Tensor,
+    kl_type: str = "k3",
     clamp_value: Optional[float] = 20.0,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two log_probs.
 
-    From Schulman 2020, always positive.
+    From Schulman 2020, http://joschu.net/blog/kl-approx.html.
 
     logprobs_policy:    torch.Tensor (b, s)
     logprobs_reference: torch.Tensor (b, s)
     """
-    r = logprobs_reference - logprobs_policy
+    logr = logprobs_reference - logprobs_policy
     if clamp_value is not None:
-        r = r.clamp(min=-clamp_value, max=clamp_value)
-    return torch.exp(r) - r - 1
+        logr = logr.clamp(min=-clamp_value, max=clamp_value)
+
+    if kl_type == "k1":
+        kl = -logr
+
+    elif kl_type == "k2":
+        kl = torch.square(logr) / 2
+
+    elif kl_type == "k3":
+        kl = torch.exp(logr) - 1 - logr
+
+    else:
+        raise ValueError(f"Invalid KL type: {kl_type}")
+
+    return kl
 
 
 def calculate_baseline_and_std_per_prompt(
