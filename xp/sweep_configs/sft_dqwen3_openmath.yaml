@@ -18,6 +18,8 @@ policy.model_name: ["nvidia/Nemotron-Diffusion-Research-4B-v0"]
 
 # Data configuration
 data.dataset_name: ["openmathinstruct2"]
+data.split: ["train_1M"]
+data.prompt_file: ["examples/prompts/math.txt"]
 
 # Training steps
 sft.max_num_epochs: [100]
