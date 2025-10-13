@@ -269,14 +269,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     messages_to_last_assistant_message,
                     chat_template,
                     chat_template_content_format,
-                    False,  # add_generation_prompt=False
-                    False,  # continue_final_message=False
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    truncate_prompt_tokens,
-                    add_special_tokens,
+                    add_generation_prompt=False,
+                    continue_final_message=False,
+                    tool_dicts=tool_dicts,
+                    documents=documents,
+                    chat_template_kwargs=chat_template_kwargs,
+                    tool_parser=tool_parser,
+                    truncate_prompt_tokens=truncate_prompt_tokens,
+                    add_special_tokens=add_special_tokens,
                 )
                 actual_corresponding_token_ids = corresponding_res[2][0][
                     "prompt_token_ids"
