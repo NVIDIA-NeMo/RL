@@ -35,6 +35,10 @@ from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 
 # ===============================================================================
 # Configuration
@@ -173,6 +177,7 @@ def eval_pass_k(rewards: torch.Tensor, num_tests_per_prompt: int, k: int) -> flo
     Reference: https://github.com/huggingface/evaluate/blob/32546aafec25cdc2a5d7dd9f941fc5be56ba122f/metrics/code_eval/code_eval.py#L198-L213
     Args:
         rewards: Tensor of shape (batch_size * num_tests_per_prompt)
+        num_tests_per_prompt: int (number of test samples per prompt)
         k: int (pass@k value)
 
     Returns:
@@ -269,7 +274,7 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(vllm_generation, dataloader, env, master_config, tokenizer=None):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
@@ -279,24 +284,25 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        tokenizer: Tokenizer for multi-turn evaluation (required for bfcl_multiturn).
     """
     # Check if async engine is enabled and run appropriate version
     if master_config["generation"]["vllm_cfg"]["async_engine"]:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
+                vllm_generation, dataloader, env, master_config, tokenizer=tokenizer, use_async=True
             )
         )
     else:
         asyncio.run(
             _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
+                vllm_generation, dataloader, env, master_config, tokenizer=tokenizer, use_async=False
             )
         )
 
 
 async def _run_env_eval_impl(
-    vllm_generation, dataloader, env, master_config, use_async=False
+    vllm_generation, dataloader, env, master_config, tokenizer=None, use_async=False
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
@@ -306,9 +312,11 @@ async def _run_env_eval_impl(
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     k_value = eval_config["k_value"]
 
-    # List to collect evaluation data for parquet file
     evaluation_data = []
 
+    # Check if multi-turn evaluation should be used
+    use_multiturn = master_config["env"].get("bfcl_multiturn", {}).get("enable", False)
+    
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
@@ -316,34 +324,100 @@ async def _run_env_eval_impl(
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # get input prompt from message_log
-        prompts = []
-        for message_log in batch["message_log"]:
-            content = [message["content"] for message in message_log]
-            content = "\n".join(content)
-            prompts.append(content)
+        if use_multiturn:
+            if tokenizer is None:
+                raise ValueError("tokenizer is required for multi-turn evaluation (bfcl_multiturn)")
+            unique_task_names = set()
+            if "task_name" in batch:
+                unique_task_names.update(batch["task_name"])
+            else:
+                # Fallback to default task name if not present in batch
+                unique_task_names.add("bfcl_multiturn")
 
-        # generate by vllm
-        inputs = BatchedDataDict({"prompts": prompts})
-        outputs = await _generate_texts(vllm_generation, inputs, use_async)
+            task_to_env = {task_name: env for task_name in unique_task_names}
 
-        # append to message_log
-        for idx, output in enumerate(outputs):
-            batch["message_log"][idx].append(
-                {
-                    "role": "assistant",
-                    "content": output,
-                }
-            )
+            # Ensure batch has a task_name field for downstream rollout/reward code
+            if "task_name" not in batch:
+                default_task_name = next(iter(unique_task_names))
+                batch["task_name"] = [default_task_name] * len(batch["message_log"])
+            
+            # Get rollout parameters from config
+            max_rollout_turns = master_config["env"]["bfcl_multiturn"].get("max_turns", 999999)
+            max_seq_len = None
+            if "generation" in master_config and "vllm_cfg" in master_config["generation"]:
+                max_seq_len = master_config["generation"]["vllm_cfg"].get("max_model_len", 8192)
+            else:
+                max_seq_len = 8192  # fallback
+            
+            # Use rollout function based on async setting
+            if use_async and hasattr(vllm_generation, 'cfg') and \
+               master_config["generation"]["vllm_cfg"].get("async_engine", False):
+                batch, rollout_metrics = run_async_multi_turn_rollout(
+                    policy_generation=vllm_generation,
+                    input_batch=batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=max_rollout_turns,
+                    greedy=False,
+                )
+            else:
+                batch, rollout_metrics = run_multi_turn_rollout(
+                    policy_generation=vllm_generation,
+                    input_batch=batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=max_rollout_turns,
+                    greedy=False,
+                )
+            
+            # Get rewards from rollout result
+            rewards = batch["total_reward"]
+            # For data collection, extract final prompts and outputs
+            prompts = []
+            outputs = []
+            for message_log in batch["message_log"]:
+                # Get initial content as prompt
+                initial_content = []
+                final_response = ""
+                for msg in message_log:
+                    if msg["role"] == "user":
+                        initial_content.append(msg["content"])
+                    elif msg["role"] == "assistant":
+                        final_response = msg["content"]  # keep last assistant response
+                prompts.append("\n".join(initial_content))
+                outputs.append(final_response)
+        else:
+            # Original single-turn evaluation logic
+            # get input prompt from message_log
+            prompts = []
+            for message_log in batch["message_log"]:
+                content = [message["content"] for message in message_log]
+                content = "\n".join(content)
+                prompts.append(content)
 
-        # evaluate generations with the environment
-        to_env = [
-            get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
-            for i in range(len(batch["message_log"]))
-        ]
+            # generate by vllm
+            inputs = BatchedDataDict({"prompts": prompts})
+            outputs = await _generate_texts(vllm_generation, inputs, use_async)
 
-        env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
-        rewards = env_return.rewards
+            # append to message_log
+            for idx, output in enumerate(outputs):
+                batch["message_log"][idx].append(
+                    {
+                        "role": "assistant",
+                        "content": output,
+                    }
+                )
+
+            # evaluate generations with the environment
+            to_env = [
+                get_keys_from_message_log(batch["message_log"][i], ["role", "content"])
+                for i in range(len(batch["message_log"]))
+            ]
+
+            env_return = ray.get(env.step.remote(to_env, batch["extra_env_info"], True))
+            rewards = env_return.rewards
 
         # Collect data for JSON file
         for i, (prompt, output, message_log, reward, extra_info) in enumerate(
@@ -366,6 +440,8 @@ async def _run_env_eval_impl(
                 }
             )
 
+        # accuracy = sum(rewards) / len(rewards)
+        # print("accuracy", accuracy)
         # update stats
         if metric == "pass@k":
             score += eval_pass_k(rewards, num_tests_per_prompt, k_value)

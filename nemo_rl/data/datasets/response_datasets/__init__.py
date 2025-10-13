@@ -16,6 +16,9 @@ from typing import Any
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
+from nemo_rl.data.datasets.response_datasets.bfcl_multiturn import (
+    BFCLMultiturnDataset,
+)
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
@@ -87,6 +90,9 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(
             split=data_config["split"],
         )
+    # for loading HuggingFace repositories with train.jsonl and val.jsonl files
+    elif dataset_name == "bfcl_multiturn":
+        base_dataset: Any = BFCLMultiturnDataset()
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
@@ -121,6 +127,7 @@ __all__ = [
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
     "Geometry3KDataset",
+    "BFCLMultiturnDataset",
     "OpenAIFormatDataset",
     "OasstDataset",
     "OpenMathInstruct2Dataset",

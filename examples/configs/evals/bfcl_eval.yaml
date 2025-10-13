@@ -1,0 +1,16 @@
+# BFCL evaluation Configuration
+defaults: "eval.yaml"
+
+generation:
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  vllm_cfg:
+    max_model_len: 8192    
+    tensor_parallel_size: 1
+
+data:
+  dataset_name: "bfcl_multiturn"
+
+env:
+  bfcl_multiturn:
+    enable: true
+    max_turns: 4
