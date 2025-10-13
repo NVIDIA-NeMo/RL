@@ -35,3 +35,11 @@ if [[ $exit_code -eq 5 ]]; then
 else
     uv run --extra automodel bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
 fi
+
+# Check and run vllm tests
+exit_code=$(uv run --extra vllm pytest tests/unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --collect-only --hf-gated --vllm-only -q >/dev/null 2>&1; echo $?)
+if [[ $exit_code -eq 5 ]]; then
+    echo "No vllm tests to run"
+else
+    uv run --extra vllm bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
+fi
