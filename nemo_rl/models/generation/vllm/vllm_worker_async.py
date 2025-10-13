@@ -95,7 +95,7 @@ def _replace_prefix_tokens(
         return template_token_ids
 
     eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Your model must have an EOS token ID!"
+    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
     model_cut_end = len(model_prefix_token_ids)
     if model_prefix_token_ids:
@@ -395,9 +395,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 # Get the template-tokenized tokens from the result
                 template_token_ids = result.tokens
 
+                # Get the tokenizer from the engine client
+                tokenizer = await self.engine_client.get_tokenizer()
+
                 # Apply _replace_prefix_tokens to fix up the tokenization
                 final_token_ids = _replace_prefix_tokens(
-                    tokenizer=self.tokenizer,
+                    tokenizer=tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=request.required_prefix_token_ids,
                     template_token_ids=template_token_ids,
