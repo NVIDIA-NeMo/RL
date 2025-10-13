@@ -1,4 +1,4 @@
-defaults: ../../grpo_math_1B.yaml
+defaults: ../../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
@@ -48,5 +48,5 @@ logger:
     project: nemo-rl
     name: grpo-qwen3-32b-4n8g-fp8
 cluster:
-  gpus_per_node: 4
-  num_nodes: 8
+  gpus_per_node: 8
+  num_nodes: 4

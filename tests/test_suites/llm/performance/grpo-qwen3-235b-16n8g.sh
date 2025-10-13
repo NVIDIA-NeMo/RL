@@ -1,6 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-source $SCRIPT_DIR/../common.env
+source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=16
@@ -35,5 +35,5 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'mean(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["20"] < 1.1'
+        'data["train/token_mult_prob_error"]["10"] < 1.1'
 fi
