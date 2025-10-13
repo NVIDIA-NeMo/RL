@@ -294,6 +294,7 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
+            # TIS see https://fengyao.notion.site/off-policy-rl
             if self.truncated_importance_sampling_ratio is not None:
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
