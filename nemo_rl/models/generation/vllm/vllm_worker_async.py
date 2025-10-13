@@ -415,12 +415,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict with input_ids and input_lengths
             greedy: Whether to use greedy decoding instead of sampling
+            sampling_params: (Optional) Generation sampling parameters.
+                Note that setting `greedy` will override these parameters.
+                Currently supports: temperature, top_p, top_k.
 
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
@@ -450,8 +454,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             "stop_strings", [[] for _ in range(batch_size)]
         )
 
+        if sampling_params is None:
+            sampling_params = {}
+
         # Create tasks for each sample in the batch
-        async def process_single_sample(sample_idx):
+        async def process_single_sample(sample_idx, sampling_params):
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt = format_prompt_for_vllm_generation(data, sample_idx)
@@ -512,6 +519,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 greedy=greedy,
                 stop_strings=final_stop_strings_for_sample,
                 max_new_tokens=allowed_new_tokens,
+                **sampling_params
             )
 
             request_id = str(uuid.uuid4())
@@ -615,7 +623,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Create tasks for all samples and yield results as they complete
         sample_tasks = [
-            asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
+            asyncio.create_task(process_single_sample(i, sampling_params))
+            for i in range(batch_size)
         ]
 
         # Yield results as they become available
@@ -632,13 +641,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 raise e
 
     async def generate_text_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate text responses asynchronously, yielding results as they are ready.
 
         Args:
             data: BatchedDataDict containing prompts with text strings
             greedy: Whether to use greedy decoding instead of sampling
+            sampling_params: (Optional) Generation sampling parameters.
+                Note that setting `greedy` will override these parameters.
+                Currently supports: temperature, top_p, top_k.
 
         Yields:
             Tuple of (original_index, BatchedDataDict containing single text response)
@@ -660,8 +675,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             "stop_strings", [self.cfg.get("stop_strings")] * batch_size
         )
 
+        if sampling_params is None:
+            sampling_params = {}
+
         # Create tasks for each prompt
-        async def process_single_prompt(prompt_idx):
+        async def process_single_prompt(prompt_idx, sampling_params: dict):
             """Process a single prompt and return the result."""
             prompt = prompts[prompt_idx]
 
@@ -676,15 +694,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
             # Create sampling parameters
-            top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
-            sampling_params = self.SamplingParams(
-                temperature=self.cfg["temperature"] if not greedy else 0,
-                top_p=self.cfg["top_p"],
-                top_k=top_k if not greedy else 1,
-                max_tokens=self.cfg["max_new_tokens"],
-                stop_token_ids=self.cfg["stop_token_ids"],
-                stop=final_stop_strings,
-                include_stop_str_in_output=True,  # returning stop strings like hf
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=final_stop_strings,
+                **sampling_params
             )
 
             request_id = str(uuid.uuid4())
@@ -716,7 +729,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Create tasks for all prompts and yield results as they complete
         prompt_tasks = [
-            asyncio.create_task(process_single_prompt(i)) for i in range(batch_size)
+            asyncio.create_task(process_single_prompt(i, sampling_params))
+            for i in range(batch_size)
         ]
 
         # Yield results as they become available

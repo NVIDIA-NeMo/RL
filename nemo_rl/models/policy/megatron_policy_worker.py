@@ -1425,7 +1425,11 @@ class MegatronPolicyWorker:
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
-        self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        sampling_params: Optional[dict] = None,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using huggingface framework generation.
 
@@ -1437,6 +1441,9 @@ class MegatronPolicyWorker:
                 - logprobs: Log probabilities for each token
                 - generation_lengths: Lengths of each response
         """
+        assert not greedy
+        assert not sampling_params
+
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model.config.flash_decode = True
