@@ -63,7 +63,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "enable_expert_parallel": False,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -133,6 +133,7 @@ def get_basic_megatron_test_config(
     precision: str = "float32",
     activation_checkpointing: bool = False,
     sequence_parallel: bool = False,
+    empty_unused_memory_level: int = 0,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     # Use the exact same model as vLLM tests for perfect compatibility
@@ -158,7 +159,7 @@ def get_basic_megatron_test_config(
         },
         "megatron_cfg": {
             "enabled": True,
-            "empty_unused_memory_level": 0,
+            "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
             "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
@@ -176,6 +177,7 @@ def get_basic_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -191,6 +193,8 @@ def get_basic_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -943,8 +947,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Refit
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1746,9 +1757,15 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    world_size = tensor_parallel_size + 1
-    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1983,7 +2000,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     )
 
     # Megatron config with same model
-    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config = get_basic_megatron_test_config(
+        tp=1, pp=1, precision="float32", empty_unused_memory_level=1
+    )
     megatron_config["model_name"] = model_name
     megatron_config["tokenizer"]["name"] = model_name
 

@@ -80,25 +80,92 @@ Currently, RM training supports only two completions (where the lowest rank is p
 }
 ```
 
-NeMo RL provides a RM-compatible implementation of the [HelpSteer3](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/data/hf_datasets/helpsteer3.py) dataset as an example. This dataset is downloaded from Hugging Face and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
+By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
-We also provide a [PreferenceDataset](../../nemo_rl/data/hf_datasets/preference_dataset.py) class that is compatible with JSONL-formatted preference datasets. You can modify your config as follows to use such a custom preference dataset:
+We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace.. You can modify your config as follows to use such a custom preference dataset:
 ```yaml
 data:
   dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  # multiple validation sets is supported
   val_data_paths:
-    <NameOfValidationDataset>: <LocalPathToValidationDataset>
+    <NameOfValidationDataset>: <PathToValidationDataset1>
+    <NameOfValidationDataset2>: <PathToValidationDataset2>
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
-with support for multiple validation sets achieved with:
+
+We also provide a [BinaryPreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/binary_preference_dataset.py) class, which is a simplified version of PreferenceDataset for pairwise ranked preference with single turn completions. You can use `prompt_key`, `chosen_key` and `rejected_key` to specify which fields in your data correspond to the question, chosen answer and rejected answer respectively. Here's an example configuration:
 ```yaml
 data:
-  dataset_name: PreferenceDataset
-  train_data_path: <LocalPathToTrainingDataset>
-  val_data_paths:
-    <NameOfValidationDataset1>: <LocalPathToValidationDataset1>
-    <NameOfValidationDataset2>: <LocalPathToValidationDataset2>
+  dataset_name: BinaryPreferenceDataset
+  train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  val_data_path: <PathToValidationDataset>
+  prompt_key: <PromptKey>, default is "prompt"
+  chosen_key: <ChosenKey>, default is "chosen"
+  rejected_key: <RejectedKey>, default is "rejected"
+  train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
+
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
+
+## Using Reward Models as Environments
+
+Trained reward models can be used as environments in GRPO training for reinforcement learning from human feedback (RLHF). This allows you to use your trained reward model to provide rewards during policy optimization.
+
+### Reward Model Environment
+
+The Reward Model Environment provides a standardized interface for using trained reward models in RL training:
+
+```python
+from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
+
+env_config = {
+    "enabled": True,
+    "model_name": "path/to/your/trained/reward/model",
+    "tokenizer": {"name": "path/to/your/trained/reward/model"},
+    "precision": "bfloat16",
+    "batch_size": 32,
+    "resources": {"gpus_per_node": 1, "num_nodes": 1},
+    "reward_model_cfg": {
+        "enabled": True,
+        "reward_model_type": "bradley_terry",
+    },
+}
+
+reward_env = RewardModelEnvironment.remote(env_config)
+```
+
+### Integration with GRPO
+
+To use your trained reward model with GRPO, you can use the [examples/run_grpo_rm.py](../../examples/run_grpo_rm.py) script:
+
+```bash
+# Run GRPO training with your trained reward model
+uv run examples/run_grpo_rm.py --config examples/configs/grpo_rm_1B.yaml
+```
+
+### Configuration
+
+In your GRPO configuration, specify the reward model environment:
+
+```yaml
+env:
+  reward_model:
+    enabled: true
+    model_name: "path/to/your/trained/reward/model"
+    tokenizer:
+      name: "path/to/your/trained/reward/model"
+    precision: "bfloat16"
+    batch_size: 32
+    resources:
+      gpus_per_node: 1
+      num_nodes: 1
+    reward_model_cfg:
+      enabled: true
+      reward_model_type: "bradley_terry"
+```
+

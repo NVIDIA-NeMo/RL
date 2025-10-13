@@ -22,6 +22,15 @@
 
 import os
 import sys
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+import git
+from docutils import nodes
+from docutils.transforms import Transform
+from sphinx import addnodes
+from sphinx.application import Sphinx
 
 project = "NeMo-RL"
 copyright = "2025, NVIDIA Corporation"
@@ -99,16 +108,6 @@ html_theme_options = {
 }
 html_extra_path = ["project.json", "versions1.json"]
 
-# -- Supporting rendering GitHub alerts correctly ----------------------------
-# https://github.com/executablebooks/MyST-Parser/issues/845
-
-_GITHUB_ADMONITIONS = {
-    "> [!NOTE]": "note",
-    "> [!TIP]": "tip",
-    "> [!IMPORTANT]": "important",
-    "> [!WARNING]": "warning",
-    "> [!CAUTION]": "caution",
-}
 
 # Github links are now getting rate limited from the Github Actions
 linkcheck_ignore = [
@@ -117,41 +116,141 @@ linkcheck_ignore = [
 ]
 
 
-def convert_gh_admonitions(app, relative_path, parent_docname, contents):
-    # loop through content lines, replace github admonitions
+def _convert_gh_admonitions_inplace(contents: list[str]) -> None:
+    """Mutate contents to convert GitHub blockquote admonitions to MyST.
+
+    https://github.com/executablebooks/MyST-Parser/issues/845
+    """
+    _github_admonitions = {
+        "> [!NOTE]": "note",
+        "> [!TIP]": "tip",
+        "> [!IMPORTANT]": "important",
+        "> [!WARNING]": "warning",
+        "> [!CAUTION]": "caution",
+    }
+    # Use 8 backticks for admonition fences to allow code blocks with 3 or 6 backticks inside
+    FENCE = "````````"
     for i, orig_content in enumerate(contents):
         orig_line_splits = orig_content.split("\n")
         replacing = False
         for j, line in enumerate(orig_line_splits):
-            # look for admonition key
             line_roi = line.lstrip()
-            for admonition_key in _GITHUB_ADMONITIONS:
+            for admonition_key, admonition_name in _github_admonitions.items():
                 if line_roi.startswith(admonition_key):
-                    line = line.replace(
-                        admonition_key,
-                        "```{" + _GITHUB_ADMONITIONS[admonition_key] + "}",
-                    )
-                    # start replacing quotes in subsequent lines
+                    replacement = f"{FENCE}{{{admonition_name}}}"
+                    if replacing:
+                        # Close previous fence before starting new admonition
+                        # Add blank line between admonitions for proper MyST parsing
+                        line = (
+                            f"{FENCE}\n\n{line.replace(admonition_key, replacement, 1)}"
+                        )
+                    else:
+                        line = line.replace(admonition_key, replacement, 1)
                     replacing = True
                     break
-            else:  # no break
+            else:
                 if not replacing:
                     continue
-                # remove GH directive to match MyST directive
-                # since we are replacing on the original line, this will preserve the right indent, if any
                 if line_roi.startswith("> "):
                     line = line.replace("> ", "", 1)
                 elif line_roi.rstrip() == ">":
                     line = line.replace(">", "", 1)
                 else:
-                    # missing "> ", so stop replacing and terminate directive
-                    line = f"```\n{line}"
+                    line = f"{FENCE}\n{line}"
                     replacing = False
-            # swap line back in splits
             orig_line_splits[j] = line
-        # swap line back in original
+        if replacing:
+            orig_line_splits.append(FENCE)
+            replacing = False
         contents[i] = "\n".join(orig_line_splits)
 
 
-def setup(app):
-    app.connect("include-read", convert_gh_admonitions)
+def _convert_gh_admonitions(
+    _app: Sphinx, _relative_path: Path, _parent_docname: str, contents: list[str]
+) -> None:
+    _convert_gh_admonitions_inplace(contents)
+
+
+def _convert_gh_admonitions_source(
+    _app: Sphinx, _docname: str, source: list[str]
+) -> None:
+    # Sphinx "source-read" event
+    _convert_gh_admonitions_inplace(source)
+
+
+class _GitHubLinkTransform(Transform):
+    """Converting the relative path to a file in a Markdown to the URL of that file on GitHub."""
+
+    default_priority = 500  # type: ignore[bad-override]
+
+    @staticmethod
+    def _get_github_source_url(repo: git.Repo) -> str:
+        # Find out which remote GitHub repo should be the source.
+        if "origin" in repo.remotes:
+            url = repo.remotes.origin.url
+        elif len(repo.remotes) == 1:
+            url = repo.remotes[0].url
+        else:
+            raise ValueError(
+                "Cannot determine which remote repo on GitHub this local repo is from."
+            )
+        # Canonicalize the URL.
+        if url.startswith("git@github.com:"):
+            url = url.replace("git@github.com:", "https://github.com/", 1)
+        if url.endswith(".git"):
+            url = url[: -len(".git")]
+        return url
+
+    def apply(self, **kwargs: Any) -> None:  # type: ignore[bad-override]
+        try:
+            local_repo = git.Repo(search_parent_directories=True)
+            # Hardcode github url for now due to errors when building in a different environment
+            # remote_repo_url = self._get_github_source_url(local_repo)
+            remote_repo_url = "https://github.com/NVIDIA-NeMo/RL"
+        except Exception:
+            # Cannot figure out which source url it should be; leave links as-is.
+            return
+        if local_repo.working_tree_dir is None:
+            # If the local repo is a bare repo, the method below won't work.
+            return
+        wt_dir = local_repo.working_tree_dir
+
+        for node in self.document.traverse(addnodes.download_reference):
+            md_dir = Path(node["refdoc"]).parent
+            dst_path = md_dir / Path(node["reftarget"])
+            try:
+                dst_path = dst_path.resolve(strict=True)
+            except OSError:
+                # If the path doesn't exist or a symlink loop is encountered.
+                continue
+            if dst_path.is_file():
+                kind = "blob"
+            elif dst_path.is_dir():
+                kind = "tree"
+            else:
+                # Cannot figure out what type of thing this path is pointing to.
+                continue
+            refuri = "/".join(
+                (
+                    remote_repo_url.rstrip("/"),
+                    kind,
+                    local_repo.head.object.hexsha,
+                    urllib.parse.quote(dst_path.relative_to(wt_dir).as_posix()),
+                )
+            )
+            new_node = nodes.reference(rawsource=node.rawsource, refuri=refuri)
+            # Preserve styling and title if present.
+            if "classes" in node:
+                new_node["classes"] = list(node["classes"])
+            if "title" in node:
+                new_node["title"] = node["title"]
+            if node.children:
+                new_node += node.children
+            node.replace_self(new_node)
+
+
+def setup(app: Sphinx) -> None:
+    app.add_transform(_GitHubLinkTransform)
+    # Convert GH admonitions for included files and top-level sources
+    app.connect("include-read", _convert_gh_admonitions)
+    app.connect("source-read", _convert_gh_admonitions_source)

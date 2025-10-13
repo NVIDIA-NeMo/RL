@@ -98,6 +98,7 @@ def create_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
             "defer_fp32_logits": defer_fp32_logits,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
@@ -114,6 +115,8 @@ def create_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -130,6 +133,12 @@ def create_megatron_test_config(
                 "overlap_param_gather": False,
                 "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
+            },
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": True,
             },
         },
         "optimizer": None,  # Remove default FSDP optimizer
@@ -335,6 +344,7 @@ def training_setup(request):
             {"activation_checkpointing": True},
         ),
         (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
     ],
     indirect=True,
     ids=[
@@ -345,6 +355,7 @@ def training_setup(request):
         "2gpu_dp2_llama_bf16",
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
+        "2gpu_tp2_llama_fp8",
     ],
 )
 def test_megatron_policy_training(training_setup):

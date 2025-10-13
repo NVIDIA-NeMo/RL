@@ -134,7 +134,8 @@ class BaseVllmGenerationWorker:
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
-        self.enable_expert_parallel = self.cfg["vllm_cfg"]["enable_expert_parallel"]
+        self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
+        self.enable_expert_parallel = self.expert_parallel_size > 1
         self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
@@ -333,6 +334,21 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
+        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
+        if self.expert_parallel_size > self.tensor_parallel_size:
+            # set vLLM DP rank
+            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
+            rank = int(os.environ["RANK"]) % world_size
+            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
+            os.environ["VLLM_DP_RANK_LOCAL"] = str((rank % 8) // model_parallel_size)
+            # set vLLM DP address and port
+            leader_rank = int(os.environ["RANK"]) // world_size * world_size
+            addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
+            port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
+            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
+            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -461,7 +477,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         self.llm.collective_rpc(
             "init_collective",
@@ -470,6 +491,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 ip,
                 port,
                 world_size,
+                train_world_size,
             ),
         )
 

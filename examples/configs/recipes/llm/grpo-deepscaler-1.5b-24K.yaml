@@ -1,48 +1,24 @@
-# GRPO Algorithm Configuration
-defaults: "grpo-deepscaler-1.5b-8K.yaml"
-
+defaults:
+  - ../../grpo_math_1B.yaml
+  - grpo-deepscaler-1.5b-8K.yaml
 loss_fn:
   reference_policy_kl_penalty: 0.0001
-  ratio_clip_min: 0.2
   ratio_clip_max: 0.28
-
 policy:
   max_total_sequence_length: 24576
   logprob_batch_size: 2
-
   dtensor_cfg:
-    enabled: true
     cpu_offload: true
     sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 2
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
-  dynamic_batching:
-    enabled: False
-
+    _v2: false
   sequence_packing:
-    enabled: False
-
+    enabled: false
   optimizer:
-    name: "torch.optim.AdamW"
     kwargs:
-      lr: 5.0e-7
-
+      lr: 5.0e-07
   generation:
-    backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
-    temperature: 1.0
-    top_p: 1.0
-    top_k: null
-    stop_token_ids: null
-    stop_strings: null
     vllm_cfg:
-      precision: ${policy.precision}
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      enable_expert_parallel: false
       gpu_memory_utilization: 0.8
-      enforce_eager: True
-      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true

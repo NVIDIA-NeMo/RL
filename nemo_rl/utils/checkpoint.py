@@ -20,6 +20,7 @@ own checkpoint saving function (called by the algorithm loop).
 import glob
 import json
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -41,6 +42,11 @@ class CheckpointingConfig(TypedDict):
     metric_name (str | None): Name of the metric to use for determining best checkpoints.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+    model_save_format (str): Format for saving model ("torch_save" or "safetensors").
+    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
+    model_cache_dir (str): Directory for model cache (for safetensors format).
+    model_repo_id (str): Repository ID for the model (for safetensors format).
+    is_peft (bool): Whether the model uses PEFT.
     """
 
     enabled: bool
@@ -50,6 +56,13 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    # New nemo-automodel integration fields
+    model_save_format: NotRequired[str]  # Default: "safetensors"
+    save_consolidated: NotRequired[bool]  # Default: False
+    model_cache_dir: NotRequired[str]  # Default: ""
+    model_repo_id: NotRequired[str]  # Default: ""
+    is_peft: NotRequired[bool]  # Default: False
+    peft_config: NotRequired[Any]  # Default: None
 
 
 class CheckpointManager:
@@ -80,9 +93,16 @@ class CheckpointManager:
             config (CheckpointingConfig)
         """
         self.checkpoint_dir = Path(config["checkpoint_dir"])
-        self.metric_name = config["metric_name"]
+        self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+
+        # Store nemo-automodel specific config options
+        self.model_save_format = config.get("model_save_format", "safetensors")
+        self.save_consolidated = config.get("save_consolidated", False)
+        self.model_cache_dir = config.get("model_cache_dir", "")
+        self.model_repo_id = config.get("model_repo_id", "")
+        self.is_peft = config.get("is_peft", False)
 
     def init_tmp_checkpoint(
         self,
@@ -113,10 +133,11 @@ class CheckpointManager:
         # save training info
         with open(save_dir / "training_info.json", "w") as f:
             # make any numpy items serializable
-            for k, v in training_info.items():
+            serializable_training_info = dict(training_info)
+            for k, v in serializable_training_info.items():
                 if isinstance(v, torch.Tensor) or isinstance(v, np.ndarray):
-                    training_info[k] = v.item()
-            json.dump(training_info, f)
+                    serializable_training_info[k] = v.item()
+            json.dump(serializable_training_info, f)
 
         # save config
         if run_config is not None:
@@ -181,26 +202,18 @@ class CheckpointManager:
         if self.metric_name is None:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
-            try:
-                assert self.metric_name is not None  # Type checker hint
-                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-                if self.higher_is_better:
-                    # For higher_is_better=True: higher metric values first, then higher step numbers
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
-                    )
-                else:
-                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], -x[0])
-                    )
-            except KeyError:
-                warnings.warn(
-                    f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
+            # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+            if self.higher_is_better:
+                # For higher_is_better=True: higher metric values first, then higher step numbers
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                    reverse=True,
                 )
-                checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-
-                self.metric_name = None
+            else:
+                # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
+                )
 
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
@@ -244,7 +257,11 @@ class CheckpointManager:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
-        step_dirs = glob.glob(str(self.checkpoint_dir / "step_*"))
+        step_dirs = [
+            x
+            for x in glob.glob(str(self.checkpoint_dir / "step_*"))
+            if re.fullmatch(r"step_\d+", Path(x).name)
+        ]
         step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
         if len(step_dirs) == 0:
             return None
@@ -284,7 +301,11 @@ def _load_checkpoint_history(
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
 
     # Find all step directories
-    step_dirs = glob.glob(str(checkpoint_dir / "step_*"))
+    step_dirs = [
+        x
+        for x in glob.glob(str(checkpoint_dir / "step_*"))
+        if re.fullmatch(r"step_\d+", Path(x).name)
+    ]
 
     for step_dir in step_dirs:
         info_file = Path(step_dir) / "training_info.json"

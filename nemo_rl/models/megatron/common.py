@@ -342,14 +342,21 @@ def forward_step_arbitrary_loss(
                 pad_mask_loss=False,
             )
 
+    multimodal_data = data_dict.get_multimodal_dict(
+        as_tensors=True, device=input_ids_cp_sharded.device
+    )
+    if len(multimodal_data) > 0:
+        position_ids = None
+
     with straggler_timer:
         additional_kwargs = {}
         if packed_seq_params is not None:
             additional_kwargs["packed_seq_params"] = packed_seq_params
         output_tensor = model(
-            input_ids_cp_sharded,
-            position_ids,
-            attention_mask,
+            input_ids=input_ids_cp_sharded,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **multimodal_data,
             **additional_kwargs,
         )
 
