@@ -3,9 +3,9 @@ sft:
   max_num_epochs: 1
   max_num_steps: 1000000
   val_period: 500
-  val_batches: 4
+  val_batches: 1
   val_global_batch_size: 128
-  val_micro_batch_size: 2
+  val_micro_batch_size: 4
   val_at_start: true
   seed: 42
 
@@ -19,16 +19,17 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "meta-llama/Llama-3.1-8B"
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
   tokenizer:
-    name: meta-llama/Llama-3.1-8B-Instruct ## specify if you'd like to use a tokenizer different from the model's default
+    name: Qwen/Qwen2.5-7B-Instruct ## specify if you'd like to use a tokenizer different from the model's default
   train_global_batch_size: 512
   train_micro_batch_size: 2
-  max_total_sequence_length: 4096
+  max_total_sequence_length: 64
   precision: "bfloat16"
 
   dtensor_cfg:
     enabled: true
+    _v2: true
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -75,6 +76,7 @@ data:
   add_generation_prompt: true
   output_key: 'generated_solution'
   shuffle: true
+  num_workers: 20
 
 logger:
   log_dir: "logs"  # Base directory for all logs

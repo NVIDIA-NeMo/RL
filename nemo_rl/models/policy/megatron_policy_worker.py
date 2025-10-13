@@ -426,6 +426,9 @@ def destroy_parallel_state():
         pass
 
 
+from functools import wraps
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -439,6 +442,23 @@ class MegatronPolicyWorker:
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+    
+    def get_forward_backward_wraper(self, func):
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            forward_backward_func = func(*args, **kwargs)
+            print(forward_backward_func[0].shape, type(forward_backward_func[0]), forward_backward_func[0].dtype)
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_grp = get_tensor_model_parallel_group()
+            out_list = [torch.zeros_like(forward_backward_func[0]) for _ in range(torch.distributed.get_world_size(tp_grp))]
+            full_logits = torch.distributed.all_gather(out_list, forward_backward_func[0], tp_grp)
+            if tp_rank == 0:
+                full_logits = torch.cat(out_list, dim=-1)
+                self.logits.append(full_logits.cpu())
+
+            return forward_backward_func
+        return wrapper
 
     def __init__(
         self,
@@ -884,6 +904,7 @@ class MegatronPolicyWorker:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.logits = []
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -929,6 +950,8 @@ class MegatronPolicyWorker:
             forward_step = partial(
                 forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
             )
+
+            forward_step = self.get_forward_backward_wraper(forward_step)
             all_mb_metrics = []
             losses = []
             for gb_idx in range(num_global_batches):
@@ -1117,6 +1140,9 @@ class MegatronPolicyWorker:
                 op=torch.distributed.ReduceOp.SUM,
                 group=parallel_state.get_data_parallel_group(),
             )
+        
+        if get_tensor_model_parallel_rank() == 0:
+            all_logits = torch.cat(self.logits, dim=0)
 
         metrics = {
             "global_loss": global_loss.cpu(),
@@ -1127,6 +1153,7 @@ class MegatronPolicyWorker:
             "grad_norm": torch.tensor(
                 mb_metrics["grad_norm"][-1]
             ).cpu(),  # TODO @sahilj: return an average or something later
+            "all_logits": all_logits.cpu() if get_tensor_model_parallel_rank() == 0 else None,
         }
         return metrics
 

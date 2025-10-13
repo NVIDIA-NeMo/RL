@@ -525,6 +525,8 @@ class DTensorPolicyWorkerV2:
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
 
+        self.logits = []
+        print("dtype:", self.dtype)
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
@@ -785,6 +787,10 @@ class DTensorPolicyWorkerV2:
                             global_valid_seqs,
                             global_valid_toks,
                         )
+
+                        full_logits = logits.full_tensor().cpu() if isinstance(logits, DTensor) else logits.cpu()
+                        if self.tp_mesh.get_group().rank() == 0:
+                            self.logits.append(full_logits)
                         del logits
 
                         # skip the update for dummy batches
@@ -858,6 +864,15 @@ class DTensorPolicyWorkerV2:
                 for k, v in m.items():
                     mb_metrics[k].append(v)
 
+            if self.tp_mesh.get_group().rank() == 0:
+                import time
+                start = time.time()
+                print("concatenating logits")
+                all_logits = torch.cat(self.logits, dim=0)
+                end = time.time()
+                print("concatenation time:", end - start)
+                self.logits.clear()
+
             metrics = {
                 "global_loss": global_loss.cpu(),
                 "grad_norm": grad_norm,
@@ -865,6 +880,7 @@ class DTensorPolicyWorkerV2:
                 "gpu_name": torch.cuda.get_device_name(),
                 "model_dtype": self.dtype,
                 "all_mb_metrics": dict(mb_metrics),
+                "all_logits": all_logits if self.tp_mesh.get_group().rank() == 0 else None,
             }
 
             return metrics

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import shutil
 import warnings
 from pathlib import Path
 from typing import NotRequired, Optional, TypedDict, cast
@@ -84,6 +85,57 @@ class MasterConfig(TypedDict):
 
 
 # =======================================================
+# Helper Functions
+# =======================================================
+def get_policy_type_and_tp_size(policy_config: PolicyConfig) -> tuple[str, int]:
+    """Determine policy type (dtensor or megatron) and tensor parallel size from config.
+    
+    Returns:
+        Tuple of (policy_type, tp_size)
+    """
+    megatron_enable = bool(policy_config.get("megatron_cfg", {}).get("enabled", False))
+    dtensor_enable = bool(policy_config.get("dtensor_cfg", {}).get("enabled", False))
+    
+    if megatron_enable:
+        policy_type = "megatron"
+        tp_size = policy_config["megatron_cfg"]["tensor_model_parallel_size"]
+    elif dtensor_enable:
+        policy_type = "dtensor"
+        tp_size = policy_config["dtensor_cfg"]["tensor_parallel_size"]
+    else:
+        raise ValueError(
+            "Could not determine policy type. Neither megatron_cfg.enabled nor dtensor_cfg.enabled is set."
+        )
+    
+    return policy_type, tp_size
+
+
+def setup_logits_output_dir(policy_config: PolicyConfig, base_dir: str = "./logits_output") -> Path:
+    """Setup output directory for saving logits based on policy type and tensor parallel size.
+    
+    Args:
+        policy_config: Policy configuration
+        base_dir: Base directory for logits output
+        
+    Returns:
+        Path to the output directory
+    """
+    policy_type, tp_size = get_policy_type_and_tp_size(policy_config)
+    output_dir = Path(base_dir) / f"{policy_type}/tp{tp_size}"
+    
+    # Clean up existing contents if directory exists
+    if output_dir.exists():
+        print(f"  ⚠️  Cleaning up existing logits directory: {output_dir}")
+        shutil.rmtree(output_dir)
+    
+    # Create fresh directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  ✓ Created logits output directory: {output_dir}")
+    
+    return output_dir
+
+
+# =======================================================
 # Setup & Initialization
 # =======================================================
 def setup(
@@ -101,11 +153,12 @@ def setup(
     CheckpointManager,
     SFTSaveState,
     MasterConfig,
+    Path,
 ]:
     """Main entry point for running SFT algorithm.
 
     Returns:
-        Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
+        Tuple of policy, cluster, train_dataloader, val_dataloader, loss_fn, logger, checkpointer, sft_save_state, master_config, logits_output_dir
     """
     set_seed(master_config["sft"]["seed"])
 
@@ -173,6 +226,12 @@ def setup(
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
     # ==========================
+    #   Logits Output Directory
+    # ==========================
+    print("\n▶ Setting up logits output directory...")
+    logits_output_dir = setup_logits_output_dir(policy_config)
+
+    # ==========================
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
@@ -219,6 +278,7 @@ def setup(
         checkpointer,
         sft_save_state,
         master_config,
+        logits_output_dir,
     )
 
 
@@ -236,6 +296,7 @@ def validate(
     val_batches: int,
     val_batch_size: int,
     val_mbs: int,
+    logits_output_dir: Optional[Path] = None,
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -281,6 +342,8 @@ def validate(
                 }
             )
 
+            print(val_data["input_ids"].shape, val_data["input_lengths"].shape, val_data["token_mask"].shape, val_data["sample_mask"].shape)
+
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
             # When running validation with drop_last=False, we might end up with a partial batch.
@@ -297,6 +360,15 @@ def validate(
                 gbs=val_data.size,
                 mbs=val_mbs,
             )
+
+            all_logits = val_results["all_logits"]
+            print(all_logits.shape, type(all_logits))
+            
+            # Save logits to file if output directory is provided
+            if logits_output_dir is not None:
+                logits_file = logits_output_dir / f"batch_{batch_idx}_logits.pt"
+                torch.save(all_logits, logits_file)
+                print(f"  ✓ Saved logits to {logits_file}")
 
             if len(val_results["all_mb_metrics"]) == 0:
                 warnings.warn(
@@ -355,6 +427,7 @@ def sft_train(
     sft_task_spec,
     checkpointer,
     sft_save_state: SFTSaveState,
+    logits_output_dir: Optional[Path] = None,
 ) -> None:
     # Run basic sft training
     timer = Timer()
@@ -398,6 +471,7 @@ def sft_train(
             val_batches=sft_config["val_batches"],
             val_batch_size=sft_config["val_global_batch_size"],
             val_mbs=sft_config["val_micro_batch_size"],
+            logits_output_dir=logits_output_dir,
         )
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -472,6 +546,7 @@ def sft_train(
                         val_batches=sft_config["val_batches"],
                         val_batch_size=sft_config["val_global_batch_size"],
                         val_mbs=sft_config["val_micro_batch_size"],
+                        logits_output_dir=logits_output_dir,
                     )
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
