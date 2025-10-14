@@ -243,8 +243,7 @@ class ClippedPGLossFn(LossFunction):
                     dim=-1,
                 ).unsqueeze(-1)
                 if self.sequence_level_advantages:
-                    seq_ratio = seq_log_ratio_mean.exp()
-                    ratios = seq_ratio.repeat(1, advantages.shape[1])
+                    ratios = seq_log_ratio_mean.exp().repeat(1, advantages.shape[1])
                 else:
                     stop_seq_log_ratio_mean = seq_log_ratio_mean.detach()
                     stop_curr_logprobs = curr_logprobs.detach()
