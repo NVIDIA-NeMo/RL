@@ -48,6 +48,7 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    sequence_level_advantages: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
