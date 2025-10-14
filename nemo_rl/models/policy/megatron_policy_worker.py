@@ -75,9 +75,6 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
-)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
@@ -95,6 +92,9 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.inference.text_generation.mcore_engine_server import (
+    run_mcore_engine,
+)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
@@ -134,9 +134,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 try:
-    from megatron.core.distributed import (
-        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
-    )
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
 
     HAVE_FSDP2 = True
 except ImportError:
@@ -637,14 +635,6 @@ class MegatronPolicyWorker:
             assert optimizer_offload_fraction == 1.0, (
                 "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
             )
-        if (
-            "logprob_chunk_size" in self.cfg
-            and self.cfg["logprob_chunk_size"] is not None
-            and self.cfg["logprob_chunk_size"] > 0
-        ):
-            assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
-                "defer_fp32_logits must be True if logprob_chunk_size is set"
-            )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -667,22 +657,6 @@ class MegatronPolicyWorker:
         assert "train_iters" in self.cfg["megatron_cfg"], (
             "train_iters must be set in megatron_cfg. For an example, see "
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
-        )
-
-        ## These settings are required for correct gradient computations in mcore
-        ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
-        ## so we handle the scaling in nemo-rl.
-        ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
-        ## on the TP-sharded parameters.
-        model_cfg.calculate_per_token_loss = True
-        model_cfg.perform_initialization = True
-
-        assert (
-            "aux_loss" not in model_cfg.moe_router_load_balancing_type
-            or model_cfg.moe_aux_loss_coeff == 0
-        ), (
-            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
         )
 
         self.megatron_cfg = ConfigContainer(
@@ -710,9 +684,9 @@ class MegatronPolicyWorker:
                 overlap_param_gather=self.cfg["megatron_cfg"][
                     "distributed_data_parallel_config"
                 ]["overlap_param_gather"],
-                # we need to set average_in_collective=False with calculate_per_token_loss=True.
-                # otherwise, mcore throws an assertion error.
-                average_in_collective=False,
+                average_in_collective=self.cfg["megatron_cfg"][
+                    "distributed_data_parallel_config"
+                ]["average_in_collective"],
                 use_distributed_optimizer=self.cfg["megatron_cfg"]["optimizer"][
                     "use_distributed_optimizer"
                 ],
@@ -1109,6 +1083,7 @@ class MegatronPolicyWorker:
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
+                        loss_metrics["grad_norm"] = grad_norm
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
@@ -1157,7 +1132,9 @@ class MegatronPolicyWorker:
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
-            "grad_norm": torch.tensor([grad_norm]),
+            "grad_norm": torch.tensor(
+                mb_metrics["grad_norm"][-1]
+            ).cpu(),  # TODO @sahilj: return an average or something later
         }
         return metrics
 
@@ -2253,56 +2230,6 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
-
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
-        """Report the node IP and GPU ID of the current worker."""
-        ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
-        return (ip, gpu_id)
-
-    def check_tensor_parallel_attributes(self) -> dict[str, Any]:
-        """Check tensor parallel attributes on model parameters.
-
-        Returns:
-            Dictionary containing information about tensor parallel parameters:
-            - tp_params: List of parameter names that have tensor_model_parallel=True
-            - non_tp_params: List of parameter names that have tensor_model_parallel=False
-            - total_params: Total number of parameters checked
-            - tp_size: Tensor parallel size from config
-        """
-        tp_params = []
-        non_tp_params = []
-        total_params = 0
-
-        for name, param in self.model.named_parameters():
-            total_params += 1
-            tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
-
-            if tensor_model_parallel:
-                tp_params.append(
-                    {
-                        "name": name,
-                        "tensor_model_parallel": tensor_model_parallel,
-                        "partition_dim": getattr(param, "partition_dim", None),
-                        "partition_stride": getattr(param, "partition_stride", None),
-                        "shape": list(param.shape),
-                    }
-                )
-            else:
-                non_tp_params.append(
-                    {
-                        "name": name,
-                        "tensor_model_parallel": tensor_model_parallel,
-                        "shape": list(param.shape),
-                    }
-                )
-
-        return {
-            "tp_params": tp_params,
-            "non_tp_params": non_tp_params,
-            "total_params": total_params,
-            "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
-        }
 
 
 class CustomFloat16Module(Float16Module):

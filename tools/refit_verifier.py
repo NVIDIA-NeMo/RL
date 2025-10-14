@@ -282,7 +282,7 @@ def setup_configs(args, tokenizer):
             "async_engine": False,
             "skip_tokenizer_init": False,
             "load_format": "dummy",
-            "enforce_eager": "False",
+            "enforce_eager": False,
         },
         "colocated": {
             "enabled": True,
