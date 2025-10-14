@@ -94,6 +94,7 @@ from nemo_rl.utils.automodel_checkpoint import (
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
 @ray.remote(
@@ -459,17 +460,17 @@ class DTensorPolicyWorkerV2:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
-    def init_collective(self, ip: str, port: int, world_size: int) -> None:
-        """Initialize the collective communication."""
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        if self.rank == 0:
-            pg = StatelessProcessGroup.create(
-                host=ip, port=port, rank=0, world_size=world_size
-            )
-            device = torch.cuda.current_device()
-            self.model_update_group = PyNcclCommunicator(pg, device=device)
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self) -> bool:
         return True
@@ -1766,13 +1767,21 @@ class DTensorPolicyWorkerV2:
             )
             self.model = self.move_to_cuda(self.model)
 
-        # Broadcast the weights for collective communication
-        for _, tensor in self.model.state_dict().items():
+        def _dtensor_post_iter_func(tensor, dtype):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
-            if self.rank == 0:
-                tensor = tensor.to(self.dtype, non_blocking=True)
-                self.model_update_group.broadcast(tensor.data, src=0)
+            tensor = tensor.to(dtype, non_blocking=True)
+            return tensor
+
+        # param_iterator will return (name, tensor), we only need tensor
+        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+
+        packed_broadcast_producer(
+            iterator=iter(self.model.state_dict().items()),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=dtensor_post_iter_func,
+        )
 
         # Manually move model to cpu for cpu offload case
         # cpu offload needs model on CPU before model forward

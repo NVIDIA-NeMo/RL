@@ -3,8 +3,12 @@
 [![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
 
 ## 📣 News
+* [9/30/2025][Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
+* [9/27/2025] [FP8 Quantization in NeMo RL](https://github.com/NVIDIA-NeMo/RL/discussions/1216)
 * [9/25/2025] On-policy Distillation (Qwen3-style)
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
+* [8/15/2025] [NeMo-RL: Journey of Optimizing Weight Transfer in Large MoE Models by 10x](https://github.com/NVIDIA-NeMo/RL/discussions/1189)
+* [7/31/2025] [NeMo-RL V0.3: Scalable and Performant Post-training with Nemo-RL via Megatron-Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Announcement](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
