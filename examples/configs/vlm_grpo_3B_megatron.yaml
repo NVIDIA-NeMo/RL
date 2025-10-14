@@ -156,6 +156,7 @@ data:
   dataset_name: clevr-cogent
   split: trainA
   shuffle: true
+  num_workers: 1
 env:
   clevr-cogent:
     num_workers: 8

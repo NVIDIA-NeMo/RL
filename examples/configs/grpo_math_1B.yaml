@@ -219,6 +219,7 @@ data:
   prompt_file: "examples/prompts/cot.txt"
   system_prompt_file: null
   shuffle: true
+  num_workers: 1
 
   dataset_name: "OpenMathInstruct-2"
   # You can use custom response datasets for training and validation. For example:
