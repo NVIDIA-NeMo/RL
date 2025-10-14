@@ -118,6 +118,10 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_ratios",
             False,
         )
+        self.sequence_level_advantages = cfg.get(
+            "sequence_level_advantages",
+            self.sequence_level_importance_ratios,
+        )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
@@ -232,8 +236,13 @@ class ClippedPGLossFn(LossFunction):
                     token_mask,
                     dim=-1,
                 ).unsqueeze(-1)
-                seq_ratio = seq_log_ratio_mean.exp()
-                ratios = seq_ratio.repeat(1, advantages.shape[1])
+                if self.sequence_level_advantages:
+                    seq_ratio = seq_log_ratio_mean.exp()
+                    ratios = seq_ratio.repeat(1, advantages.shape[1])
+                else:
+                    stop_seq_log_ratio_mean = seq_log_ratio_mean.detach()
+                    stop_curr_logprobs = curr_logprobs.detach()
+                    ratios = (curr_logprobs - stop_curr_logprobs + stop_seq_log_ratio_mean).exp()
             else:
                 ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
