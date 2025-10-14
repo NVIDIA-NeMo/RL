@@ -1012,15 +1012,13 @@ def run_async_penguin_rollout(
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
     # Tensorize all token ids
-    [_tensorize_by_key(r["input_message_log"], "token_ids") for r in results]
-    [_tensorize_by_key(r["message_log"], "token_ids") for r in results]
-    [
+    for r in results:
+        _tensorize_by_key(r["input_message_log"], "token_ids")
+        _tensorize_by_key(r["message_log"], "token_ids")
         _tensorize_by_key(
             [m for m in r["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
-        for r in results
-    ]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
