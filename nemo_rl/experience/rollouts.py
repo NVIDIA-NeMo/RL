@@ -1022,7 +1022,7 @@ def run_async_penguin_rollout(
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
-    max_total_tokens_per_sample = policy_generation.cfg["max_model_len"]
+    max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     all_sample_metrics = [
         {
             "total_reward": r["full_result"]["reward"],
