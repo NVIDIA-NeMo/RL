@@ -248,7 +248,9 @@ class ClippedPGLossFn(LossFunction):
                 else:
                     stop_seq_log_ratio_mean = seq_log_ratio_mean.detach()
                     stop_curr_logprobs = curr_logprobs.detach()
-                    ratios = (curr_logprobs - stop_curr_logprobs + stop_seq_log_ratio_mean).exp()
+                    ratios = (
+                        curr_logprobs - stop_curr_logprobs + stop_seq_log_ratio_mean
+                    ).exp()
             else:
                 ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
