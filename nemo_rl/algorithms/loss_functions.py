@@ -72,6 +72,7 @@ class ClippedPGLossFn(LossFunction):
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - GSPO-token (set sequence_level_importance_ratios = True, sequence_level_advantages = False, and token_level_loss = False) - https://arxiv.org/abs/2507.18071
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -128,6 +129,10 @@ class ClippedPGLossFn(LossFunction):
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
+        else:
+            assert not self.sequence_level_advantages, (
+                "sequence-level advantages not compatible with token-level importance ratios"
             )
 
     def __call__(
