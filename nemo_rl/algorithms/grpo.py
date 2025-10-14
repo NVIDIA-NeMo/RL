@@ -510,14 +510,6 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
         "In order to use Penguin, you must expose the vllm server via `expose_http_server: true`!"
     )
 
-    # Penguin is strictly incompatible with reasoning parser. There is one source
-    serving_chat_kwargs = generation_config["vllm_cfg"].get(
-        "http_server_serving_chat_kwargs", dict()
-    )
-    assert serving_chat_kwargs.get("reasoning_parser") is None, (
-        "Please do not use a reasoning parser in vLLM! There is one source of truth for handling data (including reasoning), which is Penguin!"
-    )
-
     return should_use_penguin
 
 
