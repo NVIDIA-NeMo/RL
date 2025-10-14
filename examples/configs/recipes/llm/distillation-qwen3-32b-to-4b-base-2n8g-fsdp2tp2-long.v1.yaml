@@ -9,11 +9,11 @@ checkpointing:
   save_period: 50
 policy:
   model_name: Qwen/Qwen3-4B-Base
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 20480
   make_sequence_length_divisible_by: 2
 teacher:
   model_name: Qwen/Qwen3-32B
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 20480
   make_sequence_length_divisible_by: 2
 logger:
   log_dir: logs/distillation-qwen3-32b-to-4b-base-long
