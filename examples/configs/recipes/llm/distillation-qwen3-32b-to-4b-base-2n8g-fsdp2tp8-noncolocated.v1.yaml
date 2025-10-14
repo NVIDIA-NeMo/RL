@@ -15,24 +15,7 @@ policy:
   dtensor_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
-  dynamic_batching:
-    enabled: false
   make_sequence_length_divisible_by: 2
-  optimizer:
-    kwargs:
-      lr: 1.0e-05
-  scheduler:
-  - name: torch.optim.lr_scheduler.LinearLR
-    kwargs:
-      start_factor: 0.1
-      end_factor: 1.0
-      total_iters: 10
-  - name: torch.optim.lr_scheduler.CosineAnnealingLR
-    kwargs:
-      T_max: 900
-      eta_min: 1.0e-07
-  - milestones:
-    - 10
   generation:
     colocated:
       enabled: false
@@ -44,24 +27,7 @@ teacher:
   dtensor_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
-  dynamic_batching:
-    enabled: false
   make_sequence_length_divisible_by: 2
-  optimizer:
-    kwargs:
-      lr: 1.0e-05
-  scheduler:
-  - name: torch.optim.lr_scheduler.LinearLR
-    kwargs:
-      start_factor: 0.1
-      end_factor: 1.0
-      total_iters: 100
-  - name: torch.optim.lr_scheduler.CosineAnnealingLR
-    kwargs:
-      T_max: 900
-      eta_min: 1.0e-07
-  - milestones:
-    - 100
   generation:
     colocated:
       enabled: false

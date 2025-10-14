@@ -10,45 +10,11 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-4B-Base
   max_total_sequence_length: 32768
-  dynamic_batching:
-    enabled: false
   make_sequence_length_divisible_by: 2
-  optimizer:
-    kwargs:
-      lr: 1.0e-05
-  scheduler:
-  - name: torch.optim.lr_scheduler.LinearLR
-    kwargs:
-      start_factor: 0.1
-      end_factor: 1.0
-      total_iters: 100
-  - name: torch.optim.lr_scheduler.CosineAnnealingLR
-    kwargs:
-      T_max: 900
-      eta_min: 1.0e-07
-  - milestones:
-    - 100
 teacher:
   model_name: Qwen/Qwen3-32B
   max_total_sequence_length: 32768
-  dynamic_batching:
-    enabled: false
   make_sequence_length_divisible_by: 2
-  optimizer:
-    kwargs:
-      lr: 1.0e-05
-  scheduler:
-  - name: torch.optim.lr_scheduler.LinearLR
-    kwargs:
-      start_factor: 0.1
-      end_factor: 1.0
-      total_iters: 20
-  - name: torch.optim.lr_scheduler.CosineAnnealingLR
-    kwargs:
-      T_max: 900
-      eta_min: 1.0e-07
-  - milestones:
-    - 20
 logger:
   log_dir: logs/distillation-qwen3-32b-to-4b-base-long
   wandb:
