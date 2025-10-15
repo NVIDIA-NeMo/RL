@@ -27,6 +27,7 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.environments.dapo_math_verifier import compute_score as dapo_math_verify
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -42,6 +43,7 @@ class MathEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[list[str]]  # Default stop strings for this env
     verifier_type: Optional[str]
+    math_verify_impl: str
 
 
 @contextlib.contextmanager
@@ -74,6 +76,7 @@ class HFVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
+        math_verify_impl: str = "hf_math_verify",
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
@@ -91,11 +94,21 @@ class HFVerifyWorker:
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
-                ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                 with _mute_output():
-                    ret_score, extracted_answer = self.verify_func(
-                        [ground_truth_parsable], [response]
-                    )
+                    if math_verify_impl == "dapo_math_verify":
+                        # This compute_score is from the DAPO Math Verifier from Verl
+                        reward_dict = dapo_math_verify(response, ground_truth)
+                        ret_score = reward_dict["score"]
+                        extracted_answer = reward_dict["pred"]
+                    elif math_verify_impl == "hf_math_verify":
+                        ground_truth_parsable = "\\boxed{" + ground_truth + "}"
+                        ret_score, extracted_answer = self.verify_func(
+                            [ground_truth_parsable], [response]
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
+                        )
 
                 results.append(float(ret_score))
 
@@ -286,7 +299,10 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         # Process each chunk in parallel
         futures = [
             self.workers[i].verify.remote(
-                chunk, ground_truth_chunk, return_extracted_answer
+                chunk,
+                ground_truth_chunk,
+                return_extracted_answer,
+                self.cfg["math_verify_impl"],
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
