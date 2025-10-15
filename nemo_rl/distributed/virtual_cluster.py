@@ -54,6 +54,9 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = "uv run --locked --extra mcore"
 
+    # Use Penguin dependencies
+    PENGUIN = "uv run --locked --extra penguin"
+
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:

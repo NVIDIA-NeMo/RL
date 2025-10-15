@@ -838,8 +838,15 @@ def distillation_train(
 
             timer.reset()
             step += 1
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
             if step >= max_steps:
-                break
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
 
 
 def validate(
