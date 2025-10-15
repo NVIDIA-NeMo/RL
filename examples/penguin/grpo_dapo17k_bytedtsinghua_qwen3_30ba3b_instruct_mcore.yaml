@@ -1,12 +1,30 @@
 defaults: "grpo_dapo17k_bytedtsinghua_qwen3_4binstruct_nf.yaml"
 
 grpo:
+  # We observe MoE likes more data per optimization step. Here we increase the num prompts per step from the dense 64 to 256.
+  # We retain the 16 generations per prompt for now. Later on this may change for agentic tasks as the action/sample space grows.
+  num_prompts_per_step: 256
   num_generations_per_prompt: 16
+
+# We use GSPO rather than GRPO for MoE models
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_min: 3e-4
+  ratio_clip_max: 4e-4
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  # We observe importance sampling correction here to have very interesting effects on training dynamics. Usually it is fine to leave this off.
+  use_importance_sampling_correction: false
+  # sequence_level_importance_ratios turns GRPO -> GSPO
+  sequence_level_importance_ratios: true
+  # As of Mon Oct 13, token level loss as formulated in the GSPO paper is not yet supported in NeMo RL.
+  token_level_loss: false
 
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
 
-  max_total_sequence_length: 131072
+  # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
+  # max_total_sequence_length: 131072
 
   # Don't use dtensor. optimizer and scheduler are dtensor only (mcore has its own version of these)
   dtensor_cfg:
@@ -62,7 +80,8 @@ policy:
 
     optimizer:
       optimizer: "adam"
-      lr: 1.0e-6
+      # As of Mon Oct 13, we default to 2e-6 here, but it's possible this value may increase/decrease depending on our subsequent observations.
+      lr: 2.0e-6
       min_lr: ${policy.megatron_cfg.optimizer.lr}
       weight_decay: 0.01
       bf16: true

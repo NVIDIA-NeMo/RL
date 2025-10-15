@@ -87,6 +87,7 @@ openai_model:
       api_key: ${policy_api_key}
       model: ${policy_model_name}
       return_token_id_information: true
+      uses_reasoning_parser: true
 """
 
     config = PenguinConfig(
