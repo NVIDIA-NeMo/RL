@@ -32,6 +32,7 @@ policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
   tokenizer:
     name: "meta-llama/Llama-3.2-1B-Instruct"
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
 
   # number of preference samples per batch
   # each preference sample corresponds to a pair of chosen and rejected responses
