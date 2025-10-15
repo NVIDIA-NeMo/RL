@@ -24,7 +24,7 @@ dependencies = [
     "torch==2.7.1",
     "triton",
     "colored==2.2.3",
-    "ray[default]==2.46.0",
+    "ray[default]==2.48.0",
     "transformers>=4.55.4",
     "wandb",
     "numpy",
@@ -59,7 +59,7 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+    "vllm==0.10.1.1",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.7.4.post1",
     "mamba-ssm",
     "causal-conv1d",
@@ -71,7 +71,7 @@ vllm = [
     # sudo apt-get update
     # sudo apt-get install libibverbs-dev
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
-    "vllm==0.10.0",
+    "vllm==0.10.1.1",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.7.4.post1",
@@ -94,11 +94,12 @@ mcore = [
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "vllm==0.10.0",
+    "vllm==0.10.1.1",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.7.4.post1",
+    "flashinfer-python==0.2.11",
 ]
 penguin = [
     "penguin",
