@@ -1466,7 +1466,7 @@ class MegatronPolicyWorker:
         def forward_step_fn(
             data_iterator: Iterator[BatchedDataDict[Any]], model: GPTModel
         ):
-            nonlocal pp_seq_dim_size, pad_full_seq_to
+            nonlocal pad_full_seq_to
             data_dict = next(data_iterator).to("cuda")
 
             pack = self.cfg["sequence_packing"]["enabled"]
@@ -1479,9 +1479,6 @@ class MegatronPolicyWorker:
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
                 if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
                     pad_factor = math.lcm(16, pad_factor)
-                # Use the precomputed pad_full_seq_to from the outer scope
-                if pp_size > 1 and pad_full_seq_to is not None:
-                    pp_seq_dim_size = pad_full_seq_to
 
                 (
                     input_ids_unpacked,
