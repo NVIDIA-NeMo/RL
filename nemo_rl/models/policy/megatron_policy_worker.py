@@ -87,6 +87,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
@@ -637,6 +638,7 @@ class MegatronPolicyWorker:
                     "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                     "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
                 )
+        model_cfg.attention_backend = AttnBackend.unfused
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,

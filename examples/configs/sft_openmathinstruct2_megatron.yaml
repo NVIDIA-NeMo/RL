@@ -52,7 +52,7 @@ policy:
       adam_beta2: 0.98
       adam_eps: 1.0e-8
       bf16: true
-      clip_grad: 0
+      clip_grad: 0Fv
       fp16: false
       lr: 0.00002
       min_lr: 0.00002
@@ -131,7 +131,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
-  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
