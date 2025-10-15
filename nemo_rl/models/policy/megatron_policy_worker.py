@@ -128,6 +128,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -507,6 +508,10 @@ class MegatronPolicyWorker:
                 hf_model_name, pretrained_path, self.cfg["megatron_cfg"]
             )
 
+            if parallel_state.model_parallel_is_initialized():
+                print("Reinitializing model parallel after loading model state.")
+                parallel_state.destroy_model_parallel()
+
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
         )
@@ -599,6 +604,9 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
+            "bias_activation_fusion"
+        ]
         fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
         self.fp8_cfg = fp8_cfg
         if fp8_cfg is not None and fp8_cfg.get("enabled", False):
@@ -613,6 +621,19 @@ class MegatronPolicyWorker:
                     "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                     "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
                 )
+
+        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_cpu_offload"
+        ]
+        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_offload_fraction"
+        ]
+        if optimizer_cpu_offload:
+            # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
+            # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
+            assert optimizer_offload_fraction == 1.0, (
+                "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+            )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -1738,9 +1759,14 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
-        # broadcast from train rank 0 to all other ranks (training and inference)
-        for _, tensor in hf_params_generator:
-            self.model_update_group.broadcast(tensor, src=0)
+
+        # param_iterator will return (name, tensor), we only need tensor
+        packed_broadcast_producer(
+            iterator=hf_params_generator,
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
@@ -1755,7 +1781,11 @@ class MegatronPolicyWorker:
         self.model.train()
 
         # Move optimizer state to CUDA if it exists
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state
             else:
@@ -1782,7 +1812,11 @@ class MegatronPolicyWorker:
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             # Iterate through the state dictionaries for each parameter group
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state
