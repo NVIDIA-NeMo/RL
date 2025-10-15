@@ -1012,18 +1012,17 @@ def run_async_penguin_rollout(
     results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
     # Tensorize all token ids
-    [_tensorize_by_key(r["input_message_log"], "token_ids") for r in results]
-    [_tensorize_by_key(r["message_log"], "token_ids") for r in results]
-    [
+    for r in results:
+        _tensorize_by_key(r["input_message_log"], "token_ids")
+        _tensorize_by_key(r["message_log"], "token_ids")
         _tensorize_by_key(
             [m for m in r["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
-        for r in results
-    ]
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     batch_size = len(penguin_rows)
+    max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     all_sample_metrics = [
         {
             "total_reward": r["full_result"]["reward"],
@@ -1034,6 +1033,7 @@ def run_async_penguin_rollout(
             ),
             "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
             "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
+            "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"]) == max_total_tokens_per_sample,
         }
         for r in results
     ]
@@ -1058,14 +1058,15 @@ def run_async_penguin_rollout(
         **_calculate_single_metric(
             [m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"
         ),
-        # TODO there may be some other metrics here that are good to log.
+        "natural_termination_rate": sum(not m["hit_max_tokens"] for m in all_sample_metrics)
+        / batch_size,
+        "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
+        / batch_size,
+        # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
+        # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
         # "mean_env_tokens_per_sample": sum(
         #     m["env_tokens"] for m in all_sample_metrics
         # )
-        # / batch_size,
-        # "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-        # / batch_size,
-        # "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
         # / batch_size,
     }
 

@@ -802,8 +802,10 @@ def test_run_async_penguin_rollout(
             "total_reward/median": 0.0,
             "total_reward/stddev": 0.0,
             "total_reward/histogram": None,
-            "multineedle_simple_agent/full_result": None,
+            "natural_termination_rate": None,
+            "truncation_rate": None,
             # per agent metrics
+            "multineedle_simple_agent/full_result": None,
             "multineedle_simple_agent/accuracy/histogram": None,
             "multineedle_simple_agent/accuracy/max": 0.0,
             "multineedle_simple_agent/accuracy/mean": 0.0,
