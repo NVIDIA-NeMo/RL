@@ -525,7 +525,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if len(data["input_ids"]) == 0:
             return
 
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         input_ids_batch = data["input_ids"]
         input_lengths_batch = data["input_lengths"]
@@ -633,7 +633,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Create output_ids tensor for this single item
             output_ids_single_item = torch.full(
                 (final_output_tensor_len,),
-                self.cfg["pad_token_id"],
+                self.cfg["_pad_token_id"],
                 dtype=original_input_ids_single_row.dtype,
                 device=original_input_ids_single_row.device,
             )

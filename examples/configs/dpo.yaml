@@ -115,7 +115,7 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
     
     optimizer:
       optimizer: "adam"
@@ -158,6 +158,7 @@ policy:
       overlap_param_gather: true
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
