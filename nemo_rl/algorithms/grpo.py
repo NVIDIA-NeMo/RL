@@ -208,6 +208,7 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
@@ -229,6 +230,7 @@ def setup(
             batch_size=grpo_config["val_batch_size"],
             shuffle=False,
             collate_fn=rl_collate_fn,
+            num_workers=data_config["num_workers"],
         )
         print(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
@@ -436,11 +438,17 @@ def setup(
     if not colocated_inference:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # inference cluster + head node of the train cluster
-        world_size = inference_nodes * inference_gpus_per_node + 1
+        # world includes all training workers and all inference workers
+        train_world_size = train_cluster.world_size()
+        inference_world_size = inference_nodes * inference_gpus_per_node
+        world_size = train_world_size + inference_world_size
         # init collective
-        futures_train = policy.init_collective(ip, port, world_size)
-        futures_inference = policy_generation.init_collective(ip, port, world_size)  # type: ignore
+        futures_train = policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = policy_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
@@ -1846,6 +1854,12 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+
+    except Exception as e:
+        print(f"❌ Error in async loop: {e}")
+        import traceback
+
+        traceback.print_exc()
 
     finally:
         # Clean up

@@ -35,6 +35,22 @@ from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as penguin_tokenizer,  # noqa: F401
 )
 
+try:
+    from penguin import config_types  # noqa: F401
+
+    PENGUIN_INSTALLED = True
+except ImportError:
+    penguin = None
+    PENGUIN_INSTALLED = False
+
+
+@pytest.mark.skipif(
+    not PENGUIN_INSTALLED,
+    reason="Skipping Penguin test since Penguin is not installed!",
+)
+def test_penguin_stub_module():
+    print(f"Penguin test successfully run! Penguin config_types module: {config_types}")
+
 
 @pytest.fixture(scope="function")
 def penguin_vllm_generation(cluster, penguin_tokenizer):  # noqa: F811
@@ -121,6 +137,10 @@ def penguin_sanity_test_data():
     return data
 
 
+@pytest.mark.skipif(
+    not PENGUIN_INSTALLED,
+    reason="Skipping Penguin test since Penguin is not installed!",
+)
 def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation):
     """Test basic functionality of MathEnvironment step with simple messages."""
 

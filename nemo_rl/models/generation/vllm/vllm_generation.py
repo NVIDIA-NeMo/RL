@@ -368,7 +368,7 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         if not self.worker_group or not self.worker_group.workers:
@@ -395,7 +395,12 @@ class VllmGeneration(GenerationInterface):
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+            common_kwargs={
+                "ip": ip,
+                "port": port,
+                "world_size": world_size,
+                "train_world_size": train_world_size,
+            },
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
