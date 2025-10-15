@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -210,6 +210,63 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+
+
+def test_exit_on_timeout(mock_components, capsys):
+    """Test that training loop exits when timeout is reached"""
+    # Set max steps to large number
+    mock_components["master_config"]["distillation"]["max_num_steps"] = 100
+
+    distillation_save_state = _default_distillation_save_state()
+
+    # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
+    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+        mock_timeout_instance = MagicMock()
+        # Create a side_effect that returns False 7 times, then True
+        check_results = [False] * 7 + [True]
+        mock_timeout_instance.check_save.side_effect = check_results
+        mock_timeout_class.return_value = mock_timeout_instance
+
+        # Run training
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
+
+        # Verify training stopped at 8 steps (when check_save returned True)
+        assert mock_components["student_policy"].train.call_count == 8
+
+        # Verify the timeout message was printed and training actually stopped
+        captured = capsys.readouterr()
+        output_lines = captured.out.strip().split("\n")
+
+        # Find the timeout message
+        timeout_line_idx = None
+        for i, line in enumerate(output_lines):
+            if "Timeout has been reached, stopping training early" in line:
+                timeout_line_idx = i
+                break
+
+        assert timeout_line_idx is not None, "Timeout message not found in output"
+
+        # For distillation, verify we don't see more step messages after timeout
+        remaining_lines = output_lines[timeout_line_idx:]
+        for line in remaining_lines:
+            # Distillation doesn't have epochs, but check for step markers
+            assert not line.startswith("Step ") or "Step 8" in line, (
+                f"Training continued after timeout: {line}"
+            )
 
 
 def test_validate_function(mock_components):

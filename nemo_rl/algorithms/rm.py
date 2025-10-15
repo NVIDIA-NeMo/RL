@@ -646,11 +646,16 @@ def rm_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
                 master_config["rm"]["max_num_steps"] != -1
                 and total_steps >= master_config["rm"]["max_num_steps"]
             ):
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1
