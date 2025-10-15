@@ -31,5 +31,13 @@ time uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_cor
 time uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 time uv run --no-sync bash ./tests/functional/distillation.sh
 
+# Research functional tests (self-discovery)
+for test_script in research/*/tests/functional/*.sh; do
+    project_dir=$(dirname $(dirname $test_script))
+    pushd $project_dir
+    time uv run --no-sync bash $test_script
+    popd
+done
+
 cd /opt/nemo-rl/tests
 coverage combine .coverage*
