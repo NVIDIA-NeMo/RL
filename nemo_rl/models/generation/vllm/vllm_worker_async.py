@@ -379,38 +379,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingTokenization(
             NeMoRLOpenAIServingMixin, OpenAIServingTokenization
         ):
-            async def create_tokenize(self, request, raw_request):
-                """Override to handle required_prefix_token_ids for tokenization."""
-                # Call parent's create_tokenize first
-                result = await super().create_tokenize(request, raw_request)
-
-                # If there's an error or no required_prefix_token_ids, return as-is
-                if isinstance(result, ErrorResponse):
-                    return result
-
-                # Only process chat requests (not completion requests)
-                if not hasattr(request, "messages"):
-                    return result
-
-                # Get the template-tokenized tokens from the result
-                template_token_ids = result.tokens
-
-                # Get the tokenizer from the engine client
-                tokenizer = await self.engine_client.get_tokenizer()
-
-                # Apply _replace_prefix_tokens to fix up the tokenization
-                final_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=request.required_prefix_token_ids,
-                    template_token_ids=template_token_ids,
-                )
-
-                # Update the result with the corrected tokens
-                result.tokens = final_token_ids
-                result.count = len(final_token_ids)
-
-                return result
+            pass
 
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             engine_client,
