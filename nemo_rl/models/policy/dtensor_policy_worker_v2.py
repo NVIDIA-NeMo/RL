@@ -1693,6 +1693,9 @@ class DTensorPolicyWorkerV2:
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
