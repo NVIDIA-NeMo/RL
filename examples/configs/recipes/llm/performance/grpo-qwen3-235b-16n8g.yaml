@@ -1,6 +1,6 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 64
+  num_prompts_per_step: 16
   num_generations_per_prompt: 32
   max_num_steps: 500
   val_batch_size: 5
@@ -15,7 +15,7 @@ policy:
     name: Qwen/Qwen3-235B-A22B
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 2048
+  max_total_sequence_length: 8192
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: false
@@ -23,7 +23,10 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
     pipeline_model_parallel_size: 8
+    context_parallel_size: 2
     expert_model_parallel_size: 16
     activation_checkpointing: true
     num_layers_in_first_pipeline_stage: 11
@@ -44,12 +47,12 @@ policy:
     stop_token_ids:
     - 128009
     vllm_cfg:
-      tensor_parallel_size: 32
+      tensor_parallel_size: 16
       async_engine: true
 logger:
   log_dir: logs/grpo-qwen3-235b-16n8g
   wandb_enabled: true
-  tensorboard_enabled: true
+  tensorboard_enabled: false # to avoid a bug
   wandb:
     project: nemo-rl
     name: grpo-qwen3-235b-16n8g
