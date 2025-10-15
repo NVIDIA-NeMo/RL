@@ -1,3 +1,6 @@
+# Fail on errors
+set -e
+
 uv sync --group={build,docs,dev,test} --extra penguin
 
 # Stop pesky previous Ray servers that may have not been able to spin down from previous users.
