@@ -1,5 +1,6 @@
 defaults: ../../distillation_math.yaml
 distillation:
+  num_prompts_per_step: 64
   max_num_steps: 500
   val_batch_size: 512
   val_period: 50
@@ -10,14 +11,12 @@ checkpointing:
   save_period: 10
 policy:
   model_name: Qwen/Qwen3-4B-Base
-  train_global_batch_size: 128
   max_total_sequence_length: 20480
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
 teacher:
   model_name: Qwen/Qwen3-32B
-  train_global_batch_size: 128
   max_total_sequence_length: 20480
 logger:
   log_dir: logs/distillation-qwen3-32b-to-4b-base-long
