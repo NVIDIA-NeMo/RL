@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -127,6 +128,7 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -251,6 +253,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
@@ -264,6 +269,9 @@ def setup_megatron_model(
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
+                # Handle VLM models
+                if hasattr(model_module, "language_model"):
+                    model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router._maintain_float32_expert_bias()
@@ -500,6 +508,10 @@ class MegatronPolicyWorker:
                 hf_model_name, pretrained_path, self.cfg["megatron_cfg"]
             )
 
+            if parallel_state.model_parallel_is_initialized():
+                print("Reinitializing model parallel after loading model state.")
+                parallel_state.destroy_model_parallel()
+
         pretrained_run_config = os.path.join(
             pretrained_path, "iter_0000000/run_config.yaml"
         )
@@ -592,6 +604,36 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        model_cfg.bias_activation_fusion = self.cfg["megatron_cfg"][
+            "bias_activation_fusion"
+        ]
+        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
+        self.fp8_cfg = fp8_cfg
+        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+            try:
+                model_cfg.fp8 = fp8_cfg["fp8"]
+                model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
+                model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            except KeyError as e:
+                raise KeyError(f"Missing key in fp8_cfg: {e}")
+            if model_cfg.fp8_param:
+                warnings.warn(
+                    "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
+                    "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
+                )
+
+        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_cpu_offload"
+        ]
+        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_offload_fraction"
+        ]
+        if optimizer_cpu_offload:
+            # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
+            # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
+            assert optimizer_offload_fraction == 1.0, (
+                "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+            )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -799,17 +841,20 @@ class MegatronPolicyWorker:
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-    def init_collective(self, ip: str, port: int, world_size: int) -> None:
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        if self.rank == 0:
-            pg = StatelessProcessGroup.create(
-                host=ip, port=port, rank=0, world_size=world_size
-            )
-            device = torch.cuda.current_device()
-            self.model_update_group = PyNcclCommunicator(pg, device=device)
+        # world_size = train_world_size + inference_world_size
+        # variable train_world_size is used in inference cluster
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self):
         return True
@@ -942,6 +987,9 @@ class MegatronPolicyWorker:
                     tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                     pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                    if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                        # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                        pad_factor = math.lcm(16, pad_factor)
                     if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
                         _, pad_full_seq_to = (
                             batch.get_microbatch_iterator_for_packable_sequences_len()
@@ -1147,6 +1195,9 @@ class MegatronPolicyWorker:
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                    # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                    pad_factor = math.lcm(16, pad_factor)
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -1178,11 +1229,18 @@ class MegatronPolicyWorker:
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
 
+            multimodal_data = data_dict.get_multimodal_dict(
+                as_tensors=True, device=input_ids.device
+            )
+            if len(multimodal_data) > 0:
+                position_ids = None
+
             output_tensor = model(
-                input_ids_cp_sharded,
-                position_ids,
-                attention_mask,
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
+                **multimodal_data,
             )
 
             # Apply temperature scaling to logits for training
@@ -1351,6 +1409,19 @@ class MegatronPolicyWorker:
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ):
+        raise NotImplementedError(
+            "get_topk_logits (teacher top-k logits for distillation) is not implemented for the Megatron backend yet."
+            " Track progress in the GitHub issue: https://github.com/NVIDIA-NeMo/RL/issues/1151"
+        )
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
@@ -1688,10 +1759,14 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
-        # broadcast from train rank0 worker to inference workers
-        for _, tensor in hf_params_generator:
-            if self.rank == 0:
-                self.model_update_group.broadcast(tensor, src=0)
+
+        # param_iterator will return (name, tensor), we only need tensor
+        packed_broadcast_producer(
+            iterator=hf_params_generator,
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
@@ -1706,7 +1781,11 @@ class MegatronPolicyWorker:
         self.model.train()
 
         # Move optimizer state to CUDA if it exists
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state
             else:
@@ -1733,7 +1812,11 @@ class MegatronPolicyWorker:
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and (not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"])
+        ):
             # Iterate through the state dictionaries for each parameter group
             if isinstance(self.optimizer, ChainedOptimizer):
                 optimizer_state = self.optimizer.state

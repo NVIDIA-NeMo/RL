@@ -368,7 +368,7 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         if not self.worker_group or not self.worker_group.workers:
@@ -395,7 +395,12 @@ class VllmGeneration(GenerationInterface):
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+            common_kwargs={
+                "ip": ip,
+                "port": port,
+                "world_size": world_size,
+                "train_world_size": train_world_size,
+            },
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
@@ -554,6 +559,12 @@ class VllmGeneration(GenerationInterface):
             try:
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
+                    # sample_result is a tuple: (original_idx, BatchedDataDict)
+                    # Tag the result with worker index for downstream attribution
+                    original_idx, result_batch = sample_result
+                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
+                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                    sample_result = (original_idx, result_batch)
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging

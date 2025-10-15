@@ -202,6 +202,16 @@ async def generate_responses_async(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    # Attach worker metadata if present (async vLLM path)
+    if "gen_leader_worker_idx" in generation_outputs:
+        # generation_outputs carries this as a 1-length list per row; convert to int
+        v = generation_outputs["gen_leader_worker_idx"][0]
+        try:
+            gen_metrics["gen_leader_worker_idx"] = (
+                int(v[0]) if isinstance(v, list) else int(v)
+            )
+        except Exception as e:
+            print(f"Error occurred while extracting gen_leader_worker_idx: {e}")
 
     return batch, generated_ids, gen_metrics
 
@@ -515,6 +525,9 @@ def run_multi_turn_rollout(
         "mean_gen_tokens_per_sample": float(
             sample_assistant_token_counts.float().mean().item()
         ),
+        "max_gen_tokens_per_sample": float(
+            sample_assistant_token_counts.float().max().item()
+        ),
         "mean_env_tokens_per_sample": float(
             sample_env_token_counts.float().mean().item()
         ),
@@ -635,6 +648,8 @@ async def run_sample_multi_turn_rollout(
 
     # Track per-turn metrics
     turn_gen_tokens = []
+    # Track per-turn per-worker token accounting if available
+    per_worker_token_counts = {}  # worker_idx -> token_count
 
     for turn in range(max_rollout_turns):
         if terminated or truncated:
@@ -664,6 +679,12 @@ async def run_sample_multi_turn_rollout(
             assistant_token_count += gen_token_count
             token_count += gen_token_count
             turn_gen_tokens.append(gen_token_count)
+            # Per-worker load accounting
+            if "gen_leader_worker_idx" in gen_metrics:
+                worker_idx = int(gen_metrics["gen_leader_worker_idx"])
+                per_worker_token_counts[worker_idx] = (
+                    per_worker_token_counts.get(worker_idx, 0) + gen_token_count
+                )
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
@@ -743,6 +764,8 @@ async def run_sample_multi_turn_rollout(
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
         "turn_gen_tokens": turn_gen_tokens,
+        # Pass-through per-worker per-turn accounting for aggregation at batch level
+        "per_worker_token_counts": per_worker_token_counts,
     }
 
     return final_sample_state, sample_metrics
@@ -879,6 +902,9 @@ def run_async_multi_turn_rollout(
                 m["assistant_tokens"] for m in all_sample_metrics
             )
             / batch_size,
+            "max_gen_tokens_per_sample": max(
+                m["assistant_tokens"] for m in all_sample_metrics
+            ),
             "mean_env_tokens_per_sample": sum(
                 m["env_tokens"] for m in all_sample_metrics
             )
@@ -889,6 +915,14 @@ def run_async_multi_turn_rollout(
             "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
             "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
         }
+
+        # Calculate per-worker token counts
+        if "per_worker_token_counts" in all_sample_metrics[0]:
+            per_worker_token_counts = {}
+            for m in all_sample_metrics:
+                for k, v in m["per_worker_token_counts"].items():
+                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+            rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         return final_batch, rollout_metrics
 

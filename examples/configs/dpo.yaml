@@ -32,6 +32,7 @@ policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
   tokenizer:
     name: "meta-llama/Llama-3.2-1B-Instruct"
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
 
   # number of preference samples per batch
   # each preference sample corresponds to a pair of chosen and rejected responses
@@ -136,6 +137,10 @@ policy:
 
       clip_grad: ${policy.max_grad_norm}
 
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -154,6 +159,7 @@ policy:
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
+  num_workers: 1
 
   dataset_name: HelpSteer3
   # You can use custom preference datasets for training and validation. For example:
@@ -189,6 +195,7 @@ logger:
 
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb:
