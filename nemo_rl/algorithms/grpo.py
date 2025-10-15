@@ -1025,9 +1025,14 @@ def grpo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
-                break
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
             if total_steps >= max_num_steps:
-                break
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
@@ -1195,6 +1200,11 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     timer = Timer()
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
     NEED_REFIT = True
 
     # Setup generation interface
@@ -1684,9 +1694,18 @@ def async_grpo_train(
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config["grpo"]["num_prompts_per_step"]
-                if master_config["checkpointing"]["enabled"] and (
+                timeout.mark_iteration()
+
+                should_save_by_step = (
                     is_last_step
                     or (step + 1) % master_config["checkpointing"]["save_period"] == 0
+                )
+                # +1 because step is 0-indexed
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
 
@@ -1788,6 +1807,15 @@ def async_grpo_train(
 
             timer.reset()
             step += 1
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
+            if step >= master_config["grpo"]["max_num_steps"]:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
 
     except Exception as e:
         print(f"❌ Error in async loop: {e}")
