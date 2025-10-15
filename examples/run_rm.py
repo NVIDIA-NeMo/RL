@@ -108,10 +108,132 @@ def rm_preprocessor(
         assert max(length_chosen, length_rejected) <= max_seq_length
 
     output = {
-        "message_log_chosen": message_log_chosen,
-        "length_chosen": length_chosen,
-        "message_log_rejected": message_log_rejected,
-        "length_rejected": length_rejected,
+        "list_message_log": [message_log_chosen, message_log_rejected],
+        "list_length": [length_chosen, length_rejected],
+        "list_values": [],
+        "list_weights": [],
+        "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+def rm_preprocessor_preferred_among_n(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary for PreferredAmongNAccuracy."""
+    completions = datum_dict["completions"]
+    assert len(completions) >= 2, "Needs at least two completions"
+    # Lowest rank is preferred to all others
+    completions = sorted(completions, key=lambda x: x["rank"])
+    for i in range(len(completions) - 1):
+        assert completions[0]["rank"] < completions[i + 1]["rank"], (
+            "One completion must be preferred to all others"
+        )
+
+    list_messages = [
+        datum_dict["context"] + completion["completion"] for completion in completions
+    ]
+    list_message_log = [
+        get_formatted_message_log(messages, tokenizer, task_data_spec)
+        for messages in list_messages
+    ]
+    list_length = [
+        sum(len(m["token_ids"]) for m in message_log)
+        for message_log in list_message_log
+    ]
+
+    loss_multiplier = 1.0
+    if max(list_length) > max_seq_length:
+        # make smaller and mask out
+
+        logging.warning(
+            f"Truncating chosen and rejected messages to {max_seq_length} tokens"
+        )
+        for message_log in list_message_log:
+            for message in message_log:
+                message["token_ids"] = message["token_ids"][
+                    : min(4, max_seq_length // len(message_log))
+                ]
+
+        loss_multiplier = 0.0
+
+        list_length = [
+            sum(len(m["token_ids"]) for m in message_log)
+            for message_log in list_message_log
+        ]
+        # safeguard against edge case where there are too many turns to fit within the max length
+        assert max(list_length) <= max_seq_length
+
+    output = {
+        "list_message_log": list_message_log,
+        "list_length": list_length,
+        "list_values": [],
+        "list_weights": [],
+        "extra_env_info": None,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+    }
+    return output
+
+
+def rm_preprocessor_best_of_n(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary for RewardBestofNValue."""
+    completions = datum_dict["completions"]
+    assert len(completions) >= 2, "Needs at least two completions"
+    list_values = [completion["value"] for completion in completions]
+    list_weights = [completion.get("weight", 1.0) for completion in completions]
+
+    list_messages = [
+        datum_dict["context"] + completion["completion"] for completion in completions
+    ]
+    list_message_log = [
+        get_formatted_message_log(messages, tokenizer, task_data_spec)
+        for messages in list_messages
+    ]
+    list_length = [
+        sum(len(m["token_ids"]) for m in message_log)
+        for message_log in list_message_log
+    ]
+
+    loss_multiplier = 1.0
+    if max(list_length) > max_seq_length:
+        # make smaller and mask out
+
+        logging.warning(
+            f"Truncating chosen and rejected messages to {max_seq_length} tokens"
+        )
+        for message_log in list_message_log:
+            for message in message_log:
+                message["token_ids"] = message["token_ids"][
+                    : min(4, max_seq_length // len(message_log))
+                ]
+
+        loss_multiplier = 0.0
+
+        list_length = [
+            sum(len(m["token_ids"]) for m in message_log)
+            for message_log in list_message_log
+        ]
+        # safeguard against edge case where there are too many turns to fit within the max length
+        assert max(list_length) <= max_seq_length
+
+    output = {
+        "list_message_log": list_message_log,
+        "list_length": list_length,
+        "list_values": list_values,
+        "list_weights": list_weights,
         "extra_env_info": None,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
@@ -133,16 +255,27 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
     rm_task_spec = data.task_spec
 
-    train_dataset = AllTaskProcessedDataset(
-        train_dataset,
-        tokenizer,
-        rm_task_spec,
-        rm_preprocessor,
-        max_seq_length=data_config["max_input_seq_length"],
-    )
+    train_dataset = {
+        "dataset": AllTaskProcessedDataset(
+            train_dataset,
+            tokenizer,
+            rm_task_spec,
+            rm_preprocessor,
+            max_seq_length=data_config["max_input_seq_length"],
+        ),
+        "loss_fn": "PreferenceLoss",
+    }
 
     # TODO @yukih: unify the code when support multiple datasets for other algorithms
     if "val_data_paths" in data_config and data_config["val_data_paths"]:
+        val_loss_fns = {}
+
+        if "val_loss_fns" in data_config and data_config["val_loss_fns"]:
+            assert isinstance(data_config["val_loss_fns"], dict), (
+                f"Invalid type for val_loss_fns: {type(data_config['val_loss_fns'])}. val_loss_fns must be a dictionary."
+            )
+            val_loss_fns = data_config["val_loss_fns"]
+
         val_dataset = {}
 
         assert isinstance(data_config["val_data_paths"], dict), (
@@ -156,23 +289,38 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             print(
                 f"  ✓ Validation dataset '{val_dataset_name}' loaded with {len(val_data.formatted_ds['train'])} samples."
             )
-            val_dataset[val_dataset_name] = AllTaskProcessedDataset(
-                val_data.formatted_ds["train"],
-                tokenizer,
-                val_data.task_spec,
-                rm_preprocessor,
-                max_seq_length=data_config["max_input_seq_length"],
-            )
+            loss_fn_name = val_loss_fns.get(val_dataset_name, "PreferenceLoss")
+            if loss_fn_name == "PreferenceLoss":
+                preprocessor = rm_preprocessor
+            elif loss_fn_name == "RewardBestofNValue":
+                preprocessor = rm_preprocessor_best_of_n
+            elif loss_fn_name == "PreferredAmongNAccuracy":
+                preprocessor = rm_preprocessor_preferred_among_n
+            else:
+                raise ValueError(f"Invalid loss function name: {loss_fn_name}")
+            val_dataset[val_dataset_name] = {
+                "dataset": AllTaskProcessedDataset(
+                    val_data.formatted_ds["train"],
+                    tokenizer,
+                    val_data.task_spec,
+                    preprocessor,
+                    max_seq_length=data_config["max_input_seq_length"],
+                ),
+                "loss_fn": loss_fn_name,
+            }
     else:
         val_dataset = (
             {
-                "default": AllTaskProcessedDataset(
-                    val_dataset,
-                    tokenizer,
-                    rm_task_spec,
-                    rm_preprocessor,
-                    max_seq_length=data_config["max_input_seq_length"],
-                )
+                "default": {
+                    "dataset": AllTaskProcessedDataset(
+                        val_dataset,
+                        tokenizer,
+                        rm_task_spec,
+                        rm_preprocessor,
+                        max_seq_length=data_config["max_input_seq_length"],
+                    ),
+                    "loss_fn": "PreferenceLoss",
+                }
             }
             if val_dataset
             else {}
@@ -229,7 +377,8 @@ def main():
         cluster,
         train_dataloader,
         val_dataloader,
-        loss_fn,
+        train_loss_fn,
+        val_loss_fn,
         logger,
         checkpointer,
         rm_save_state,
@@ -241,7 +390,8 @@ def main():
         train_dataloader,
         val_dataloader,
         tokenizer,
-        loss_fn,
+        train_loss_fn,
+        val_loss_fn,
         master_config,
         logger,
         rm_task_spec,

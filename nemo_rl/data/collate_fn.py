@@ -16,7 +16,7 @@ from typing import Any, Union
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, DPODatumSpec
+from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -125,7 +125,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
 
 
 def preference_collate_fn(
-    data_batch: list[DPODatumSpec],
+    data_batch: list[PreferenceDatumSpec],
     tokenizer: TokenizerType,
     make_sequence_length_divisible_by: int,
     add_loss_mask: bool,
@@ -149,15 +149,24 @@ def preference_collate_fn(
     loss_multiplier = []
     idx = []
     task_names = []
+    num_completions = []
+    values = []
+    weights = []
     for datum_spec in data_batch:
-        ## interleave chosen and rejected examples
-        message_log.append(datum_spec["message_log_chosen"])
-        message_log.append(datum_spec["message_log_rejected"])
-        length.append(datum_spec["length_chosen"])
-        length.append(datum_spec["length_rejected"])
-        loss_multiplier.extend([datum_spec["loss_multiplier"]] * 2)
-        idx.extend([datum_spec["idx"]] * 2)
-        task_names.extend([datum_spec.get("task_name", None)] * 2)
+        datum_num_completions = len(datum_spec["list_message_log"])
+        message_log.extend(datum_spec["list_message_log"])
+        length.extend(datum_spec["list_length"])
+        loss_multiplier.extend([datum_spec["loss_multiplier"]] * datum_num_completions)
+        idx.extend([datum_spec["idx"]] * datum_num_completions)
+        task_names.extend([datum_spec.get("task_name", None)] * datum_num_completions)
+        num_completions.append(datum_num_completions)
+        if datum_spec.get("list_values") is not None:
+            values.extend(datum_spec["list_values"])
+        if datum_spec.get("list_weights") is not None:
+            weights.extend(datum_spec["list_weights"])
+    assert len(set(num_completions)) == 1, (
+        "all datum_spec must have the same number of completions"
+    )
     length_batch: torch.Tensor = torch.tensor(length)
     loss_multiplier_batch: torch.Tensor = torch.tensor(loss_multiplier)
 
@@ -189,8 +198,17 @@ def preference_collate_fn(
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "sample_mask": batch["loss_multiplier"],
+            "num_completions": torch.ones_like(
+                batch["loss_multiplier"], dtype=torch.int
+            )
+            * num_completions[0],
         }
     )
+    if len(values) > 0:
+        assert len(values) == data["sample_mask"].shape[0]
+        data["values"] = torch.tensor(values)
+        data["weights"] = torch.tensor(weights)
+
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
 

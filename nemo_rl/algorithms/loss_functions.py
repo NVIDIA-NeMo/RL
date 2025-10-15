@@ -542,6 +542,189 @@ class PreferenceLoss(LossFunction):
         }
 
 
+class PreferredAmongNAccuracy(LossFunction):
+    """Preferred Among N Accuracy function.
+
+    Prefer the best response among N responses
+
+    Returns:
+        tuple[torch.Tensor, dict]: A tuple containing:
+            - The preference loss value
+            - A dictionary with metrics including:
+                - accuracy: Fraction of examples where the best response among N responses is chosen
+    """
+
+    def __init__(self):
+        self.loss_type = LossType.SEQUENCE_LEVEL
+
+    def _preference_loss(
+        self,
+        rewards: Tensor,
+        sample_mask: Tensor,
+        global_valid_seqs: Tensor,
+        num_completions: int,
+        beta: float = 1.0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        assert rewards.shape[0] % num_completions == 0, (
+            f"rewards must be divisible by num_completions, got {rewards.shape[0]} and num_completions={num_completions}"
+        )
+
+        rewards_reshaped = rewards.view(-1, num_completions)
+        rewards_chosen = rewards_reshaped[:, 0].unsqueeze(1)
+        rewards_rejected = rewards_reshaped[:, 1:]
+
+        rewards_delta = rewards_chosen - rewards_rejected
+
+        per_sample_loss = (
+            -torch.nn.functional.logsigmoid(beta * rewards_delta).sum(dim=1)
+            * sample_mask[::num_completions]
+        )  ## zero out invalid samples
+
+        return (
+            masked_mean(
+                per_sample_loss,
+                sample_mask[::num_completions],
+                global_normalization_factor=global_valid_seqs / num_completions,
+            ),
+            masked_mean(
+                (rewards_chosen > rewards_rejected).all(dim=1),
+                sample_mask[::num_completions],
+                global_normalization_factor=global_valid_seqs / num_completions,
+            ),
+            masked_mean(
+                rewards_chosen,
+                sample_mask[::num_completions],
+                global_normalization_factor=global_valid_seqs / num_completions,
+            ),
+            masked_mean(
+                rewards_rejected.mean(axis=1),
+                sample_mask[::num_completions],
+                global_normalization_factor=global_valid_seqs / num_completions,
+            ),
+        )
+
+    def __call__(
+        self,
+        rewards: Tensor,
+        data: BatchedDataDict[PreferenceLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        sample_mask = data["sample_mask"]
+        num_completions = data["num_completions"][0]
+
+        rewards = rewards.squeeze(-1)
+
+        (
+            preference_loss,
+            accuracy,
+            rewards_chosen_mean,
+            rewards_rejected_mean,
+        ) = self._preference_loss(
+            rewards, sample_mask, global_valid_seqs, num_completions=num_completions
+        )
+
+        num_valid_samples = sample_mask.sum() / num_completions
+
+        return preference_loss, {
+            "loss": preference_loss.item(),
+            "accuracy": accuracy.item(),
+            "rewards_chosen_mean": rewards_chosen_mean.item(),
+            "rewards_rejected_mean": rewards_rejected_mean.item(),
+            "num_valid_samples": num_valid_samples.item(),
+        }
+
+
+class RewardBestofNValue(LossFunction):
+    """Reward Best of N Value function.
+
+    For i=1, ..., N, return the value and weight (for weighted value aggregation) of the response with the highest reward among the first i responses.
+
+    Returns:
+        tuple[torch.Tensor, dict]: A tuple containing:
+            - A dummy loss value (always 0)
+            - A dictionary with metrics including:
+                - value_best_of_{i}: Value of the response with the highest reward among the first i responses
+                - weight_best_of_{i}: Weight of the response with the highest reward among the first i responses
+    """
+
+    def _preference_loss(
+        self,
+        rewards: Tensor,
+        sample_mask: Tensor,
+        global_valid_seqs: Tensor,
+        num_completions: int,
+        values: Tensor,
+        weights: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        assert rewards.shape[0] % num_completions == 0, (
+            f"rewards must be divisible by num_completions, got {rewards.shape[0]} and num_completions={num_completions}"
+        )
+        mbs = rewards.shape[0] // num_completions
+
+        rewards_reshaped = rewards.view(mbs, num_completions)
+        values_reshaped = values.view(mbs, num_completions)
+        weights_reshaped = weights.view(mbs, num_completions)
+
+        return [
+            (
+                masked_mean(
+                    values_reshaped[
+                        torch.arange(mbs), rewards_reshaped[:, : i + 1].argmax(axis=1)
+                    ],
+                    sample_mask[::num_completions],
+                    global_normalization_factor=global_valid_seqs / num_completions,
+                ),
+                masked_mean(
+                    weights_reshaped[
+                        torch.arange(mbs), rewards_reshaped[:, : i + 1].argmax(axis=1)
+                    ],
+                    sample_mask[::num_completions],
+                    global_normalization_factor=global_valid_seqs / num_completions,
+                ),
+            )
+            for i in range(num_completions)
+        ]
+
+    def __call__(
+        self,
+        rewards: Tensor,
+        data: BatchedDataDict[PreferenceLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        sample_mask = data["sample_mask"]
+        num_completions = data["num_completions"][0]
+        values = data["values"]
+        weights = data["weights"]
+
+        rewards = rewards.squeeze(-1)
+
+        outputs = self._preference_loss(
+            rewards,
+            sample_mask,
+            global_valid_seqs,
+            num_completions=num_completions,
+            values=values,
+            weights=weights,
+        )
+
+        num_valid_samples = sample_mask.sum() / num_completions
+
+        return torch.zeros_like(outputs[0][0]), {
+            "loss": torch.zeros_like(outputs[0][0]).item(),
+            **{
+                f"value_best_of_{i + 1}": output[0].item()
+                for i, output in enumerate(outputs)
+            },
+            **{
+                f"weight_best_of_{i + 1}": output[1].item()
+                for i, output in enumerate(outputs)
+            },
+            "num_valid_samples": num_valid_samples.item(),
+        }
+
+
 class DPOLossConfig(TypedDict):
     reference_policy_kl_penalty: float
     preference_loss_weight: float
