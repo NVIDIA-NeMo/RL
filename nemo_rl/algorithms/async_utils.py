@@ -545,8 +545,13 @@ class AsyncTrajectoryCollector:
             .get("vllm_cfg", {})
         )
         is_async_engine = vllm_cfg.get("async_engine", False)
+        in_flight_weight_updates = (
+            self.master_config.get("grpo", {})
+            .get("async_grpo", {})
+            .get("in_flight_weight_updates", False)
+        )
 
-        if is_async_engine:
+        if is_async_engine and in_flight_weight_updates:
             # vLLM V1 async engine supports in-flight weight updates
             # Ongoing generations will continue with their current KV caches
             # New generations (after weight update) will use the updated weights

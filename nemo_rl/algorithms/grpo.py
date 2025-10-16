@@ -1743,6 +1743,7 @@ def async_grpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         # Get dataloader state from trajectory collector
                         actual_dataloader_state = ray.get(
