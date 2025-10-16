@@ -4,6 +4,7 @@ distillation:
     num_generations_per_prompt: 1
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
+    max_num_epochs: 10
     val_batch_size: 64
     val_period: 20
     val_at_start: false
