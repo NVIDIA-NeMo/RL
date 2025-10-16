@@ -1798,9 +1798,6 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
-            if "per_worker_token_counts" in metrics:
-                del metrics["per_worker_token_counts"]
-
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
