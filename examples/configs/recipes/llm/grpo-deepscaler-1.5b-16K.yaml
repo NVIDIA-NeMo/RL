@@ -9,7 +9,6 @@ policy:
   logprob_batch_size: 2
   dtensor_cfg:
     cpu_offload: true
-    sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 2
     _v2: false
