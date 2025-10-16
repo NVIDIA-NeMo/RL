@@ -8,36 +8,30 @@ distillation:
 loss_fn:
   kl_type: reverse
 checkpointing:
-  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-noncolocated
-  save_period: 50
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-seqpack
 policy:
   model_name: Qwen/Qwen3-4B-Base
   dtensor_cfg:
-    tensor_parallel_size: 8
     context_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: true
   make_sequence_length_divisible_by: 2
-  generation:
-    colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 8
-        num_nodes: 1
 teacher:
   model_name: Qwen/Qwen3-32B
   dtensor_cfg:
     tensor_parallel_size: 8
     context_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: true
   make_sequence_length_divisible_by: 2
-  generation:
-    colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 8
-        num_nodes: 1
 logger:
-  log_dir: logs/distillation-qwen3-32b-to-4b-base-noncolocated
+  log_dir: logs/distillation-qwen3-32b-to-4b-base-seqpack
   wandb:
     project: nemo-rl
-    name: distillation-qwen3-32b-to-4b-base-noncolocated
+    name: distillation-qwen3-32b-to-4b-base-seqpack
 cluster:
   num_nodes: 2
