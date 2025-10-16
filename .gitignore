@@ -1,6 +1,6 @@
 # Adding to .gitignore helps reduce the size of your working_dir
 
-.git
+/.git
 *.out
 *.log
 *.tar
@@ -17,7 +17,6 @@ dist/
 *.vscode/
 release_run*
 ckpts/
-3rdparty/vllm
 
 # Test
 coverage.json
