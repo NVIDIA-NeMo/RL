@@ -27,6 +27,7 @@ policy:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # chat_template can be a Jinja template string or path to a .jinja file
     chat_template: "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
   train_global_batch_size: 32
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
@@ -89,7 +90,9 @@ policy:
     moe_router_bias_update_rate: 1e-3
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
-    apply_rope_fusion: True   
+    apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
 
     optimizer:
       optimizer: "adam"
