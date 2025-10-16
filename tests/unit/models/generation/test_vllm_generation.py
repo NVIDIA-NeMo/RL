@@ -2133,7 +2133,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
