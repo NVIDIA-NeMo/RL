@@ -33,11 +33,8 @@ cluster.gpus_per_node: [8]
 
 # Training configuration
 policy.train_global_batch_size: [64]
-policy.train_micro_batch_size: [4]
+policy.train_micro_batch_size: [2]
 policy.max_total_sequence_length: [4096]
 
 # Learning rate
 policy.optimizer.kwargs.lr: [3e-5]
-
-# Checkpointing configuration
-checkpointing.save_period: [5]
