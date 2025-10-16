@@ -434,6 +434,7 @@ def sft_train(
                         roles_to_train_on=["assistant"],
                     )
 
+                    pad_block_size = 1
                     if is_mdlm:
                         # TODO(mfathi): here we assume single turn instruction tuning. need to make this more general.
                         # we train on padding tokens as well similar to LLaDA and SMDM
@@ -450,7 +451,6 @@ def sft_train(
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
                         pad_block_value_dict = None
-                        pad_block_size = 1
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
