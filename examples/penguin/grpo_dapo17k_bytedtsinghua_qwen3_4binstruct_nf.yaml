@@ -205,7 +205,7 @@ data:
   train_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/bytedtsinghua_dapo17k/train.jsonl
   validation_jsonl_fpath: 3rdparty/Penguin-workspace/Penguin/data/bytedtsinghua_dapo17k/validation.jsonl
   shuffle: true
-  num_workers: 1
+  num_workers: 0
 
 env:
   should_use_penguin: true
