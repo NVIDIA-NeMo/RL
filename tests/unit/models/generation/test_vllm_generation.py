@@ -177,6 +177,7 @@ def get_basic_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -192,6 +193,8 @@ def get_basic_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -944,8 +947,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Refit
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1224,7 +1234,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     assert eos_token_id == 151645
 
     data_fpath = Path(__file__).with_name(
-        "test_VllmAsyncGenerationWorker_replace_prefix_tokens_data.json"
+        "test_vllmasyncgenerationworker_replace_prefix_worker.json"
     )
     with data_fpath.open() as f:
         data = json.load(f)
@@ -1318,34 +1328,70 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     )
     assert result == model_token_ids
 
-    model_prefix_token_ids = model_token_ids[:-16]
-    assert model_prefix_token_ids[-1] == eos_token_id
-    # newline after EOS
-    template_prefix_token_ids = template_token_ids[:-15]
-    assert template_prefix_token_ids[-2] == eos_token_id
-    assert template_prefix_token_ids[-1] != eos_token_id
-    result = _replace_prefix_tokens(
-        tokenizer=tokenizer,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    assert result == model_token_ids
 
-    # no EOS
-    model_prefix_token_ids = model_token_ids[:-17]
-    assert model_prefix_token_ids[-1] != eos_token_id
-    # newline after EOS
-    template_prefix_token_ids = template_token_ids[:-15]
-    assert template_prefix_token_ids[-2] == eos_token_id
-    assert template_prefix_token_ids[-1] != eos_token_id
+def test_replace_prefix_tokens_empty_model_prefix_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = []
+    template_prefix_token_ids = [9, 2]
+    template_token_ids = [9, 2, 33, 44]
     result = _replace_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
     )
-    assert result == model_token_ids
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 2]
+    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
+    template_token_ids = [9, 9, 9, 2, 10]
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+
+
+def test_replace_prefix_tokens_tokenizer_without_eos_raises():
+    class _T:
+        eos_token_id = None
+
+    tokenizer = _T()
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[1],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2],
+        )
+
+
+def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [100, 2]
+    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_token_ids = [9, 2, 9, 2, 77, 88]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == [100, 2, 77, 88]
 
 
 @pytest.mark.asyncio
@@ -1815,9 +1861,15 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    world_size = tensor_parallel_size + 1
-    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info

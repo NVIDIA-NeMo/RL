@@ -75,12 +75,27 @@ def _replace_prefix_tokens(
     re-tokenized into tokens. So if there is a situation like that with images
     and image tokenization is non-unique, then we will need to uppdate this
     function.
+
+    Example (turn-by-turn, concise; eos_token_id = 2):
+        Turn 1:
+            - prefill_T1 (template prefill) = [11,12,13,40,41]
+            - model output = [220,17,2]  # decodes to " 4" + EOS
+            - model_prefix_token_ids = prefill_T1 + model output
+              => [11,12,13,40,41,220,17,2]
+
+        Turn 2 (template retokenizes prior assistant text differently):
+            - template_prefix_token_ids = [11,12,13,40,41,1001,2]  # 1001 decodes to " 4"
+            - template_token_ids = [11,12,13,40,41,1001,2,21,22,40,41]
+
+        _replace_prefix_tokens keeps the exact prior model tokens up to EOS and
+        resumes from the template after that EOS:
+            output => [11,12,13,40,41,220,17,2,21,22,40,41]
     """
     if not model_prefix_token_ids:
         return template_token_ids
 
     eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Your model must have an EOS token ID!"
+    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
     model_cut_end = len(model_prefix_token_ids)
     if model_prefix_token_ids:
@@ -254,14 +269,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     messages_to_last_assistant_message,
                     chat_template,
                     chat_template_content_format,
-                    False,  # add_generation_prompt=False
-                    False,  # continue_final_message=False
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    truncate_prompt_tokens,
-                    add_special_tokens,
+                    add_generation_prompt=False,
+                    continue_final_message=False,
+                    tool_dicts=tool_dicts,
+                    documents=documents,
+                    chat_template_kwargs=chat_template_kwargs,
+                    tool_parser=tool_parser,
+                    truncate_prompt_tokens=truncate_prompt_tokens,
+                    add_special_tokens=add_special_tokens,
                 )
                 actual_corresponding_token_ids = corresponding_res[2][0][
                     "prompt_token_ids"
@@ -455,7 +470,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         return thread, base_url, server
 
     async def init_collective_async(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         await self.llm.collective_rpc(
             "init_collective",
@@ -464,6 +484,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 ip,
                 port,
                 world_size,
+                train_world_size,
             ),
         )
 

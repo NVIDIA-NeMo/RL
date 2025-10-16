@@ -1,3 +1,6 @@
+# Fail on errors
+set -e
+
 uv sync --group={build,docs,dev,test} --extra penguin
 
 # Stop pesky previous Ray servers that may have not been able to spin down from previous users.
@@ -17,6 +20,10 @@ uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_gene
 
 # NeMo Gym communicates not using token ids, but in OpenAI schema. There are some edge cases we need to handle (e.g. token merging upon retokenization, multiple most efficient retokenizations, etc).
 uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_VllmAsyncGenerationWorker_replace_prefix_tokens
+uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_replace_prefix_tokens_empty_model_prefix_returns_template
+uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_replace_prefix_tokens_missing_eos_in_template_prefix_raises
+uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_replace_prefix_tokens_tokenizer_without_eos_raises
+uv run --group test bash tests/run_unit.sh unit/models/generation/test_vllm_generation.py::test_replace_prefix_tokens_uses_last_eos_in_template_prefix
 
 # NeMo RL test. This should pass no matter what the Gym setup is.
 uv run --group test bash tests/run_unit.sh unit/environments/test_math_environment.py::test_math_env_step_basic
