@@ -378,7 +378,10 @@ def setup(
 
     if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(distillation_config["max_num_steps"], len(dataloader))
+        total_train_iters = min(
+            distillation_config["max_num_steps"],
+            distillation_config["max_num_epochs"] * len(dataloader),
+        )
         teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     teacher_policy = Policy(
