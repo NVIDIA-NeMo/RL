@@ -903,6 +903,16 @@ def distillation_train(
                     f" ⚠️ Reached max steps ({max_steps}), stopping training", flush=True
                 )
                 break
+            step += 1
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
+            if step >= max_steps:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
+                return
 
         # End of epoch
         current_epoch += 1
