@@ -38,3 +38,6 @@ policy.max_total_sequence_length: [4096]
 
 # Learning rate
 policy.optimizer.kwargs.lr: [3e-5]
+
+# Checkpointing configuration
+checkpointing.save_period: [5]
