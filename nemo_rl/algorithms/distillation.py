@@ -75,8 +75,8 @@ class DistillationConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
     max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-    max_num_steps: int # maximum number of steps to train for
-    max_num_epochs: int # maximum number of epochs to train for
+    max_num_steps: int  # maximum number of steps to train for
+    max_num_epochs: int  # maximum number of epochs to train for
     val_batch_size: int
     val_period: int
     val_at_start: bool
@@ -378,9 +378,8 @@ def setup(
 
     if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
-        teacher_config["megatron_cfg"]["train_iters"] = distillation_config[
-            "max_num_steps"
-        ]
+        total_train_iters = min(distillation_config["max_num_steps"], len(dataloader))
+        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     teacher_policy = Policy(
         name_prefix="teacher",
@@ -428,9 +427,8 @@ def setup(
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
-        policy_config["megatron_cfg"]["train_iters"] = distillation_config[
-            "max_num_steps"
-        ]
+        total_train_iters = min(distillation_config["max_num_steps"], len(dataloader))
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     student_policy = Policy(
         name_prefix="student",
