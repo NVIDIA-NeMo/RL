@@ -39,28 +39,27 @@ if not OmegaConf.has_resolver("mul"):
 def validate_config_section(
     section_config: Dict[str, Any],
     config_class: Type,
-    section_name: str,
-    config_file: str = "",
+    config_file: str,
 ) -> None:
     """Validate a config section against its TypedDict class using Pydantic.
 
     Raises AssertionError with formatted error messages if validation fails.
     """
     if not isinstance(section_config, dict):
-        raise TypeError(f"Section {section_name} must be a dictionary")
+        raise TypeError("Config must be a dictionary")
 
     # Use Pydantic's TypeAdapter to validate the TypedDict
     adapter = TypeAdapter(config_class)
     try:
         adapter.validate_python(section_config)
     except ValidationError as e:
-        # Format errors nicely with section name prefix and actual values
+        # Format errors nicely with actual values
         error_messages = []
         for error in e.errors():
-            path_parts = [section_name]
+            path_parts = []
             if error["loc"]:
                 path_parts.extend(str(loc) for loc in error["loc"])
-            path = ".".join(path_parts)
+            path = ".".join(path_parts) if path_parts else "root"
 
             # Only include the actual input value for non-missing fields
             # For missing fields, the 'input' is the parent dict which is confusing
@@ -79,15 +78,14 @@ def validate_config_section(
 
         config_info = f"\n\nConfig file: {config_file}" if config_file else ""
         raise AssertionError(
-            f"Config validation failed for section '{section_name}':{config_info}\n"
-            + "\n".join(error_messages)
+            f"Config validation failed:{config_info}\n" + "\n".join(error_messages)
         ) from e
 
 
 absolute_path = os.path.abspath(__file__)
 configs_dir = Path(
     os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
-)
+).resolve()
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
@@ -133,4 +131,4 @@ def test_all_config_files_have_required_keys(config_file):
         )
 
     # Validate the entire config using the appropriate MasterConfig
-    validate_config_section(config_dict, master_config_class, config_type, config_file)
+    validate_config_section(config_dict, master_config_class, config_file)
