@@ -48,6 +48,7 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    sequence_level_advantages: NotRequired[bool]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -72,6 +73,7 @@ class ClippedPGLossFn(LossFunction):
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - GSPO-token (set sequence_level_importance_ratios = True, sequence_level_advantages = False, and token_level_loss = False) - https://arxiv.org/abs/2507.18071
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -118,12 +120,20 @@ class ClippedPGLossFn(LossFunction):
             "sequence_level_importance_ratios",
             False,
         )
+        self.sequence_level_advantages = cfg.get(
+            "sequence_level_advantages",
+            self.sequence_level_importance_ratios,
+        )
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
+        else:
+            assert not self.sequence_level_advantages, (
+                "sequence-level advantages not compatible with token-level importance ratios"
             )
 
     def __call__(
@@ -232,8 +242,14 @@ class ClippedPGLossFn(LossFunction):
                     token_mask,
                     dim=-1,
                 ).unsqueeze(-1)
-                seq_ratio = seq_log_ratio_mean.exp()
-                ratios = seq_ratio.repeat(1, advantages.shape[1])
+                if self.sequence_level_advantages:
+                    ratios = seq_log_ratio_mean.exp().repeat(1, advantages.shape[1])
+                else:
+                    stop_seq_log_ratio_mean = seq_log_ratio_mean.detach()
+                    stop_curr_logprobs = curr_logprobs.detach()
+                    ratios = (
+                        curr_logprobs - stop_curr_logprobs + stop_seq_log_ratio_mean
+                    ).exp()
             else:
                 ratios = log_ratios.exp()
             ratios_clamped = ratios.clamp(
