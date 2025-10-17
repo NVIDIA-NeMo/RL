@@ -741,17 +741,31 @@ def distillation_train(
                         del distillation_save_state["val_reward"]
                     distillation_save_state["consumed_samples"] = consumed_samples
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in distillation_save_state
-                        ):
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
                             warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead.",
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            master_config["checkpointing"]["metric_name"] = None
+                            if full_metric_name in distillation_save_state:
+                                del distillation_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            distillation_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")
