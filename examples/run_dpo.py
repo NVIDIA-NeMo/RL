@@ -162,8 +162,8 @@ def dpo_preprocessor(
     }
 
     if "reward" in chosen_completion and "reward" in rejected_completion:
-        output["reward_chosen"] = chosen_completion["score"]
-        output["reward_rejected"] = rejected_completion["score"]
+        output["reward_chosen"] = chosen_completion["reward"]
+        output["reward_rejected"] = rejected_completion["reward"]
 
     return output
 
