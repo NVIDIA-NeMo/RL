@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add the tests directory to the path so we can import check_metrics
 tests_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(tests_dir))
 
-from check_metrics import mean, min, max, ratio_above, evaluate_check
+from check_metrics import evaluate_check, max, mean, min, ratio_above
 
 
 class TestMeanFunction:
@@ -36,11 +37,11 @@ class TestMeanFunction:
         """Test mean with ignore_top_p to filter outliers."""
         # Data with one clear outlier (100)
         data = {"1": 1.0, "2": 2.0, "3": 3.0, "4": 4.0, "5": 100.0}
-        
+
         # Without filtering
         result_no_filter = mean(data, ignore_top_p=0.0)
         assert result_no_filter == 22.0  # (1+2+3+4+100)/5
-        
+
         # With 20% filtering (should remove the top value: 100)
         result_with_filter = mean(data, ignore_top_p=0.2)
         assert result_with_filter == 2.5  # (1+2+3+4)/4
@@ -50,7 +51,7 @@ class TestMeanFunction:
         # Create data with 20 values where the top one is an outlier
         data = {str(i): float(i) for i in range(1, 20)}  # 1-19
         data["20"] = 1000.0  # outlier
-        
+
         # With 5% filtering (should remove 1 value out of 20 = top 5%)
         result = mean(data, ignore_top_p=0.05)
         # Should be mean of 1-19 = 10.0
@@ -59,7 +60,7 @@ class TestMeanFunction:
     def test_mean_ignore_multiple_outliers(self):
         """Test mean with filtering multiple outliers."""
         data = {str(i): float(i) for i in range(1, 11)}  # 1-10
-        
+
         # With 20% filtering (should remove top 2 values: 9, 10)
         result = mean(data, ignore_top_p=0.2)
         # Mean of 1-8 = 4.5
@@ -68,7 +69,7 @@ class TestMeanFunction:
     def test_mean_with_range_and_ignore_top_p(self):
         """Test that range_start and range_end work with ignore_top_p."""
         data = {str(i): float(i) for i in range(1, 11)}
-        
+
         # Get mean of steps 3-7 (values 3,4,5,6) with 25% filtering
         # Should remove the top value (6), leaving 3,4,5
         result = mean(data, range_start=3, range_end=7, ignore_top_p=0.25)
@@ -97,11 +98,15 @@ class TestMeanFunction:
     def test_mean_ignore_top_p_invalid_range(self):
         """Test that invalid ignore_top_p values raise an error."""
         data = {"1": 1.0, "2": 2.0, "3": 3.0}
-        
-        with pytest.raises(ValueError, match="ignore_top_p must be between 0.0 and 1.0"):
+
+        with pytest.raises(
+            ValueError, match="ignore_top_p must be between 0.0 and 1.0"
+        ):
             mean(data, ignore_top_p=1.5)
-        
-        with pytest.raises(ValueError, match="ignore_top_p must be between 0.0 and 1.0"):
+
+        with pytest.raises(
+            ValueError, match="ignore_top_p must be between 0.0 and 1.0"
+        ):
             mean(data, ignore_top_p=-0.1)
 
     def test_mean_with_offset(self):
@@ -115,7 +120,7 @@ class TestMeanFunction:
     def test_mean_with_negative_range(self):
         """Test mean with negative range indices."""
         data = {str(i): float(i) for i in range(1, 11)}  # 1-10
-        
+
         # Last 3 values (8, 9, 10)
         result = mean(data, range_start=-3, range_end=0)
         assert result == 9.0  # (8+9+10)/3
@@ -189,7 +194,7 @@ class TestRatioAboveFunction:
         data = {"1": 5.0}
         result = ratio_above(data, 3.0)
         assert result == 1.0
-        
+
         result = ratio_above(data, 10.0)
         assert result == 0.0
 
@@ -235,14 +240,14 @@ class TestEvaluateCheck:
     def test_evaluate_check_with_ignore_top_p(self):
         """Test evaluate_check with ignore_top_p parameter."""
         data = {"error": {"1": 1.0, "2": 1.0, "3": 1.0, "4": 1.0, "5": 10.0}}
-        
+
         # Without filtering, mean would be 2.8, which is > 1.5 (should fail the < check)
         passed_no_filter, _, value_no_filter = evaluate_check(
             data, "mean(data['error']) < 1.5"
         )
         assert passed_no_filter is False
         assert value_no_filter == 2.8
-        
+
         # With 20% filtering, mean should be 1.0, which is < 1.5 (should pass)
         passed_with_filter, _, value_with_filter = evaluate_check(
             data, "mean(data['error'], ignore_top_p=0.2) < 1.5"
@@ -262,14 +267,14 @@ class TestEvaluateCheck:
         """Test evaluate_check with complex conditions."""
         data = {
             "train_loss": {"1": 0.5, "2": 0.4, "3": 0.3},
-            "val_loss": {"1": 0.6, "2": 0.5, "3": 0.4}
+            "val_loss": {"1": 0.6, "2": 0.5, "3": 0.4},
         }
-        
+
         # Test less than
         passed, _, value = evaluate_check(data, "mean(data['train_loss']) < 0.5")
         assert passed is True
         assert value == 0.4
-        
+
         # Test greater than
         passed, _, value = evaluate_check(data, "mean(data['val_loss']) > 0.4")
         assert passed is True
@@ -278,11 +283,11 @@ class TestEvaluateCheck:
     def test_evaluate_check_with_min_max(self):
         """Test evaluate_check with min and max functions."""
         data = {"scores": {"1": 1.0, "2": 5.0, "3": 3.0}}
-        
+
         passed, _, value = evaluate_check(data, "min(data['scores']) > 0.5")
         assert passed is True
         assert value == 1.0
-        
+
         passed, _, value = evaluate_check(data, "max(data['scores']) < 10.0")
         assert passed is True
         assert value == 5.0
@@ -290,12 +295,12 @@ class TestEvaluateCheck:
     def test_evaluate_check_with_ratio_above(self):
         """Test evaluate_check with ratio_above function."""
         data = {"error": {"1": 1.0, "2": 1.0, "3": 1.5, "4": 1.0, "5": 2.0}}
-        
+
         # 2 out of 5 values are >= 1.5 (ratio = 0.4)
         passed, _, value = evaluate_check(data, "ratio_above(data['error'], 1.5) < 0.5")
         assert passed is True
         assert value == 0.4
-        
+
         # Should fail when ratio is above threshold
         passed, _, value = evaluate_check(data, "ratio_above(data['error'], 1.5) < 0.3")
         assert passed is False
@@ -315,14 +320,14 @@ class TestRealWorldScenarios:
         }
         # Add a couple large outliers that will skew the mean
         data["train/token_mult_prob_error"]["20"] = 5.0
-        
+
         # Without filtering, mean should be significantly above 1.1
         passed_no_filter, _, value_no_filter = evaluate_check(
             data, 'mean(data["train/token_mult_prob_error"]) < 1.1'
         )
         assert passed_no_filter is False  # Should fail due to outlier
         assert value_no_filter > 1.1
-        
+
         # With 5% filtering (removes 1 out of 20 = top 5%)
         passed_with_filter, _, value_with_filter = evaluate_check(
             data, 'mean(data["train/token_mult_prob_error"], ignore_top_p=0.05) < 1.1'
@@ -337,11 +342,11 @@ class TestRealWorldScenarios:
         # Add 5 outliers
         for i in range(101, 106):
             data["metric"][str(i)] = 10.0
-        
+
         # Without filtering
         mean_no_filter = mean(data["metric"], ignore_top_p=0.0)
         assert mean_no_filter > 1.4  # Significantly affected by outliers
-        
+
         # With 5% filtering (should remove ~5 values, including the outliers)
         mean_with_filter = mean(data["metric"], ignore_top_p=0.05)
         assert mean_with_filter < 1.1  # Should be close to 1.0
@@ -349,13 +354,13 @@ class TestRealWorldScenarios:
     def test_robustness_to_varying_outlier_severity(self):
         """Test that filtering works with outliers of varying severity."""
         base_data = {str(i): 1.0 for i in range(1, 10)}
-        
+
         # Test with mild outlier
         data_mild = base_data.copy()
         data_mild["10"] = 2.0
         result_mild = mean(data_mild, ignore_top_p=0.1)
         assert result_mild == 1.0  # Outlier removed
-        
+
         # Test with severe outlier
         data_severe = base_data.copy()
         data_severe["10"] = 100.0
@@ -373,33 +378,30 @@ class TestRealWorldScenarios:
         }
         # Add a few values above 1.05 (should be 1 out of 100 = 1%)
         data["train/token_mult_prob_error"]["50"] = 1.06
-        
+
         # Check that less than 2% of values are above 1.05
         passed, _, value = evaluate_check(
             data, 'ratio_above(data["train/token_mult_prob_error"], 1.05) < 0.02'
         )
         assert passed is True
         assert value == 0.01  # 1 out of 100
-        
+
     def test_ratio_above_combined_with_mean_ignore_top_p(self):
         """Test combining ratio_above check with mean ignore_top_p."""
         # Create data where a few outliers would skew the mean
-        data = {
-            "metric": {str(i): 1.0 for i in range(1, 96)}
-        }
+        data = {"metric": {str(i): 1.0 for i in range(1, 96)}}
         # Add 5 outliers (5%)
         for i in range(96, 101):
             data["metric"][str(i)] = 10.0
-        
+
         # Without filtering, mean would be high
         mean_no_filter = mean(data["metric"], ignore_top_p=0.0)
         assert mean_no_filter > 1.4
-        
+
         # With 5% filtering, mean should be close to 1.0
         mean_with_filter = mean(data["metric"], ignore_top_p=0.05)
         assert mean_with_filter < 1.1
-        
+
         # Check that exactly 5% are above threshold
         ratio = ratio_above(data["metric"], 5.0)
         assert ratio == 0.05
-
