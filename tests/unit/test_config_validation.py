@@ -47,7 +47,7 @@ def validate_config_section(
     Raises AssertionError with formatted error messages if validation fails.
     """
     if not isinstance(section_config, dict):
-        raise AssertionError(f"Section {section_name} must be a dictionary")
+        raise TypeError(f"Section {section_name} must be a dictionary")
 
     # Use Pydantic's TypeAdapter to validate the TypedDict
     adapter = TypeAdapter(config_class)
@@ -81,7 +81,7 @@ def validate_config_section(
         raise AssertionError(
             f"Config validation failed for section '{section_name}':{config_info}\n"
             + "\n".join(error_messages)
-        )
+        ) from e
 
 
 absolute_path = os.path.abspath(__file__)
