@@ -543,7 +543,7 @@ def distillation_train(
     ]  # max number of steps to train for
 
     # Run validation at the start if configured
-    if val_at_start and current_step == 0:
+    if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
