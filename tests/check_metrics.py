@@ -34,11 +34,11 @@ def max(value):
 
 def ratio_above(value, threshold):
     """Return the ratio of values that are >= threshold.
-    
+
     Args:
         value: Dictionary of step -> value
         threshold: Threshold value to compare against
-        
+
     Returns:
         Float between 0.0 and 1.0 representing the proportion of values >= threshold
     """
@@ -82,7 +82,9 @@ def mean(value, range_start=1, range_end=0, ignore_top_p=0.0):
 
     # Validate ignore_top_p parameter
     if not 0.0 <= ignore_top_p <= 1.0:
-        raise ValueError(f"ignore_top_p must be between 0.0 and 1.0, got {ignore_top_p}")
+        raise ValueError(
+            f"ignore_top_p must be between 0.0 and 1.0, got {ignore_top_p}"
+        )
 
     # Filter out top outliers if requested
     if ignore_top_p > 0.0 and len(vals) > 0:
@@ -102,7 +104,13 @@ def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
         Tuple of (passed, message, value)
     """
     # Create a local context with our custom functions and the data
-    local_context = {"data": data, "min": min, "max": max, "mean": mean, "ratio_above": ratio_above}
+    local_context = {
+        "data": data,
+        "min": min,
+        "max": max,
+        "mean": mean,
+        "ratio_above": ratio_above,
+    }
 
     # Extract the value expression from the check
     value_expr = check.split(">")[0].split("<")[0].split("==")[0].strip()
