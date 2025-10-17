@@ -187,7 +187,7 @@ class BaseVllmGenerationWorker:
 
                     new_lines = [
                         f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE"}',
+                        'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
                     ]
 
                     need_replace = False
