@@ -86,7 +86,7 @@ class DistillationConfig(TypedDict):
 
 
 class DistillationSaveState(TypedDict):
-    total_steps: int  # total number of steps across all epochs
+    total_steps: int  # Track total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
     val_reward: NotRequired[
