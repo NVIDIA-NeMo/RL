@@ -482,6 +482,8 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
