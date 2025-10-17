@@ -22,6 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     async_grpo_train,
+    dynamic_sampling,
     grpo_train,
 )
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
@@ -32,6 +33,10 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.utils.timer import Timer
+from tests.unit.algorithms.utils import (
+    create_mock_batch,
+)
 
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)
@@ -270,26 +275,6 @@ class MockEnvironment(EnvironmentInterface):
         return batch, {}
 
 
-def create_mock_batch(
-    num_samples: int,
-    task_names: list[str],
-    message_logs: list[LLMMessageLogType],
-    extra_env_info: list[dict] = None,
-) -> BatchedDataDict[DatumSpec]:
-    """Helper function to create a mock batch for testing."""
-    if extra_env_info is None:
-        extra_env_info = [{} for _ in range(num_samples)]
-
-    return BatchedDataDict[DatumSpec](
-        {
-            "task_name": task_names,
-            "message_log": message_logs,
-            "extra_env_info": extra_env_info,
-            "loss_multiplier": torch.ones(num_samples),
-        }
-    )
-
-
 @pytest.fixture(scope="module")
 def mock_env():
     """Create a mock environment for single task tests."""
@@ -425,6 +410,291 @@ def test_calculate_rewards_missing_environment():
         calculate_rewards(batch, task_to_env)
 
 
+def test_dapo_dynamic_sampling_filters_nonzero_std():
+    """Test that DAPO dynamic sampling only selects prompts with non-zero standard deviation."""
+    # Create mock batch data with 6 prompts (2 prompts * 3 generations each)
+    batch_size = 6
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i // 3}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    task_names = ["math"] * batch_size
+
+    # Create batch with some prompts having zero std and others non-zero std
+    repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
+    repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 1.0, 0.5, 0.5, 0.0])
+
+    # Mock prompts tensor (2 unique prompts, each repeated 3 times)
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+
+    # First prompt group has std=0.5 (rewards: 1.0, 0.0, 1.0 -> std ≠ 0)
+    # Second prompt group has std=0.25 (rewards: 0.5, 0.5, 0.0 -> std ≠ 0)
+    std = torch.tensor(
+        [0.5, 0.5, 0.5, 0.25, 0.25, 0.25]
+    )  # Both prompts have non-zero std
+    baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33])  # Mock baselines
+
+    # Configuration for dynamic sampling
+    master_config = {
+        "grpo": {
+            "use_dynamic_sampling": True,
+            "num_prompts_per_step": 2,  # Want 2 prompts
+            "num_generations_per_prompt": 3,  # Each with 3 generations
+            "dynamic_sampling_max_gen_batches": 5,
+        }
+    }
+
+    timer = Timer()
+    dynamic_sampling_num_gen_batches = 1
+
+    # Test dynamic sampling
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches,
+        master_config,
+        timer,
+    )
+
+    # Since both prompts have non-zero std, all 6 samples should be selected
+    assert result_batch.size == 6
+    assert is_batch_complete == True
+    assert torch.allclose(result_batch["std"], std)
+    assert torch.allclose(result_batch["baseline"], baseline)
+
+
+def test_dapo_dynamic_sampling_filters_zero_std():
+    """Test that DAPO dynamic sampling filters out prompts with zero standard deviation."""
+    # Create mock batch data
+    batch_size = 6
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i // 3}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    task_names = ["math"] * batch_size
+
+    repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
+    repeated_batch["total_reward"] = torch.tensor(
+        [1.0, 1.0, 1.0, 0.5, 0.5, 0.0]
+    )  # First prompt has same rewards (std=0)
+
+    # Mock prompts tensor
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+            [4, 5, 6],  # prompt 1
+        ]
+    )
+
+    # First prompt has zero std (all rewards are 1.0)
+    # Second prompt has non-zero std (rewards: 0.5, 0.5, 0.0)
+    std = torch.tensor(
+        [0.0, 0.0, 0.0, 0.25, 0.25, 0.25]
+    )  # First prompt has zero std, second has non-zero
+    baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
+
+    master_config = {
+        "grpo": {
+            "use_dynamic_sampling": True,
+            "num_prompts_per_step": 1,  # Want 1 prompt only
+            "num_generations_per_prompt": 3,
+            "dynamic_sampling_max_gen_batches": 5,
+        }
+    }
+
+    timer = Timer()
+    dynamic_sampling_num_gen_batches = 1
+
+    # Test dynamic sampling
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches,
+        master_config,
+        timer,
+    )
+
+    # Only the second prompt (indices 3,4,5) should be selected since first has zero std
+    assert result_batch.size == 3  # Only 3 samples from the second prompt
+    assert is_batch_complete == True
+    assert torch.allclose(
+        result_batch["std"], torch.tensor([0.25, 0.25, 0.25])
+    )  # Only non-zero std
+    assert torch.allclose(result_batch["baseline"], torch.tensor([0.33, 0.33, 0.33]))
+
+    ## verify that only prompt_1 is selected
+    prompts = [
+        result_batch["message_log"][i][0]["content"] for i in range(result_batch.size)
+    ]
+    assert prompts == ["prompt_1", "prompt_1", "prompt_1"]
+
+    # Verify that filtered rewards are correct
+    expected_filtered_rewards = torch.tensor(
+        [
+            0.5,
+            0.5,
+            0.0,
+        ]
+    )
+    assert torch.allclose(result_batch["filtered_reward"], expected_filtered_rewards)
+
+
+def test_dapo_dynamic_sampling_batch_caching():
+    """Test that DAPO dynamic sampling uses batch caching when insufficient non-zero std prompts are found."""
+    # Create mock batch with only 1 prompt having non-zero std, but we need 2
+    batch_size = 3
+    message_logs = [
+        [
+            {"role": "user", "content": "prompt_0"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    task_names = ["math"] * batch_size
+
+    repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
+    repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])  # Non-zero std
+
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+            [1, 2, 3],  # prompt 0
+        ]
+    )
+
+    std = torch.tensor([0.4, 0.4, 0.4])  # Only one prompt with non-zero std
+    baseline = torch.tensor([0.5, 0.5, 0.5])
+
+    master_config = {
+        "grpo": {
+            "use_dynamic_sampling": True,
+            "num_prompts_per_step": 2,  # Need 2 prompts but only have 1
+            "num_generations_per_prompt": 3,
+            "dynamic_sampling_max_gen_batches": 5,
+        }
+    }
+
+    timer = Timer()
+    dynamic_sampling_num_gen_batches = 1
+
+    # Test dynamic sampling - should indicate batch is not complete
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches,
+        master_config,
+        timer,
+    )
+
+    # Should have cached the batch but marked as incomplete
+    assert (
+        result_batch.size == 3
+    )  # All samples from the single prompt with non-zero std
+    assert is_batch_complete == False  # Not enough prompts, need to continue sampling
+    assert batch_cache is not None
+    assert batch_cache == result_batch
+
+    # Run dynamic sampling again with the cached batch
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches,
+        master_config,
+        timer,
+        batch_cache,
+    )
+
+    # After running dynamic sampling again, the batch should be complete
+    assert (
+        result_batch.size == 6
+    )  # All samples from the single prompt with non-zero std
+    assert is_batch_complete == True
+    assert batch_cache is not None
+
+
+def test_dapo_dynamic_sampling_disabled():
+    """Test that when dynamic sampling is disabled, all prompts are kept regardless of std."""
+    batch_size = 6
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i // 3}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    task_names = ["math"] * batch_size
+
+    repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
+    repeated_batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.5, 0.5, 0.0])
+
+    prompts = torch.tensor(
+        [
+            [1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3],
+            [4, 5, 6],
+            [4, 5, 6],
+            [4, 5, 6],
+        ]
+    )
+
+    # Mix of zero and non-zero std
+    std = torch.tensor([0.0, 0.0, 0.0, 0.25, 0.25, 0.25])
+    baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
+
+    # Disable dynamic sampling
+    master_config = {
+        "grpo": {
+            "use_dynamic_sampling": False,
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 3,
+            "dynamic_sampling_max_gen_batches": 5,
+        }
+    }
+
+    timer = Timer()
+    dynamic_sampling_num_gen_batches = 1
+
+    # Test that dynamic sampling is bypassed
+    result_batch, is_batch_complete, batch_cache, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches,
+        master_config,
+        timer,
+    )
+
+    # All samples should be kept when dynamic sampling is disabled
+    assert result_batch.size == 6
+    assert is_batch_complete == True
+    assert batch_cache is None  # No caching when disabled
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     """Test that non-colocated inference requires explicit gpus_per_node when policy_nodes=1."""
     from unittest.mock import MagicMock, patch
@@ -452,6 +722,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "num_prompts_per_step": 1,
             "val_period": 0,
             "val_at_start": False,
+            "use_dynamic_sampling": False,
+            "batch_multiplier": 1,
         },
         "data": {"shuffle": False, "num_workers": 1},
         "logger": {},  # Config extraction requires this key
@@ -508,6 +780,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "num_prompts_per_step": 1,
             "val_period": 0,
             "val_at_start": False,
+            "use_dynamic_sampling": False,
+            "batch_multiplier": 1,
         },
         "data": {"shuffle": False, "num_workers": 1},
         "logger": {},  # Config extraction requires this key
@@ -654,6 +928,9 @@ def mock_grpo_components():
             "use_leave_one_out_baseline": False,
             "normalize_rewards": False,
             "overlong_filtering": False,
+            "reward_scaling": {"enabled": False},
+            "reward_shaping": {"enabled": False},
+            "use_dynamic_sampling": False,
         },
         "policy": {
             "train_global_batch_size": 1,

@@ -36,6 +36,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "grpo": "examples/configs/grpo_math_1B.yaml",
     "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
     "distillation": "examples/configs/distillation_math.yaml",
+    "dapo": "examples/configs/grpo_math_1B.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
