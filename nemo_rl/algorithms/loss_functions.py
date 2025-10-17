@@ -548,8 +548,8 @@ class DPOLossConfig(TypedDict):
     sft_loss_weight: float
     preference_average_log_probs: bool
     sft_average_log_probs: bool
-    preference_loss: NotRequired[str]
-    gt_reward_scale: NotRequired[float]
+    preference_loss: str
+    gt_reward_scale: float
 
 
 class DPOLossDataDict(TypedDict):
@@ -633,8 +633,8 @@ class DPOLossFn(LossFunction):
             - sft_loss_weight (float): Weight for the SFT loss term (w_s)
             - preference_average_log_probs (bool): Whether to average log probs across tokens in preference loss
             - sft_average_log_probs (bool): Whether to average log probs across tokens in SFT loss
-            - preference_loss (Optional, str): Type of preference loss to use, default dpo
-            - gt_reward_scale (Optional, float): Scale of the ground truth rewards (η), default 1
+            - preference_loss (str): Type of preference loss to use, default dpo
+            - gt_reward_scale (float): Scale of the ground truth rewards (η), default 1
 
     Returns:
         tuple[torch.Tensor, dict]: A tuple containing:
@@ -652,8 +652,8 @@ class DPOLossFn(LossFunction):
         self.sft_loss_weight = cfg["sft_loss_weight"]
         self.preference_average_log_probs = cfg["preference_average_log_probs"]
         self.sft_average_log_probs = cfg["sft_average_log_probs"]
-        self.preference_loss = cfg.get("preference_loss", "dpo")
-        self.gt_reward_scale = cfg.get("gt_reward_scale", 1.0)
+        self.preference_loss = cfg["preference_loss"]
+        self.gt_reward_scale = cfg["gt_reward_scale"]
         self.sft_loss = NLLLoss()
 
         self.loss_type = LossType.SEQUENCE_LEVEL

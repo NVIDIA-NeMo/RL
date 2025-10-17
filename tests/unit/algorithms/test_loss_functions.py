@@ -129,6 +129,8 @@ def test_dpo_loss():
             "sft_loss_weight": 0.0,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -151,6 +153,8 @@ def test_dpo_loss():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -190,6 +194,8 @@ def test_dpo_loss_varying_sequence_lengths():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
     dpo_loss_fn_avg = DPOLossFn(
@@ -199,6 +205,8 @@ def test_dpo_loss_varying_sequence_lengths():
             "sft_loss_weight": 0.5,
             "preference_average_log_probs": True,
             "sft_average_log_probs": True,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -320,6 +328,8 @@ def test_dpo_sft_matches_nll_loss():
             "sft_loss_weight": 1.0,  # Only use SFT loss
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
+            "preference_loss": "dpo",
+            "gt_reward_scale": 1.0,
         }
     )
     dpo_loss, dpo_metrics = dpo_loss_fn(
@@ -363,6 +373,7 @@ def test_ipo_loss():
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
             "preference_loss": "ipo",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -398,6 +409,7 @@ def test_rpo_sq_loss():
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
             "preference_loss": "rpo_sq",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -434,6 +446,7 @@ def test_rpo_fwd_kl_loss():
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
             "preference_loss": "rpo_fwd_kl",
+            "gt_reward_scale": 1.0,
         }
     )
 
@@ -470,6 +483,7 @@ def test_rpo_bwd_kl_loss():
             "preference_average_log_probs": False,
             "sft_average_log_probs": False,
             "preference_loss": "rpo_bwd_kl",
+            "gt_reward_scale": 1.0,
         }
     )
 
