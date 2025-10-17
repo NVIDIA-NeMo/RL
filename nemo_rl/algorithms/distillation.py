@@ -86,9 +86,7 @@ class DistillationConfig(TypedDict):
 
 
 class DistillationSaveState(TypedDict):
-    # Maintain backward compatibility for older checkpoints.
-    # Actually tracks total number of steps across all epochs
-    step: int
+    total_steps: int  # total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
     val_reward: NotRequired[
@@ -102,7 +100,7 @@ def _default_distillation_save_state() -> DistillationSaveState:
     return {
         "current_epoch": 0,
         "current_step": 0,
-        "step": 0,
+        "total_steps": 0,
         "val_reward": -99999999.0,  # Aligned with GRPO
         "consumed_samples": 0,
         "total_valid_tokens": 0,
@@ -525,19 +523,13 @@ def distillation_train(
     assert student_generation is not None  # for mypy type check
 
     # common config/state items
-    # Maintain backward compatibility for older checkpoints.
-    if "current_step" not in distillation_save_state:
-        total_steps = distillation_save_state["step"]
-        current_step = total_steps % len(dataloader)
-        current_epoch = total_steps // len(dataloader)
-    else:
-        current_epoch = distillation_save_state["current_epoch"]  # current epoch
-        current_step = distillation_save_state[
-            "current_step"
-        ]  # current step within current epoch
-        total_steps = distillation_save_state[
-            "step"
-        ]  # total number of steps across all epochs
+    current_epoch = distillation_save_state["current_epoch"]  # current epoch
+    current_step = distillation_save_state[
+        "current_step"
+    ]  # current step within current epoch
+    total_steps = distillation_save_state[
+        "total_steps"
+    ]  # total number of steps across all epochs
     consumed_samples = distillation_save_state["consumed_samples"]
     total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
@@ -775,7 +767,7 @@ def distillation_train(
                     or (total_steps + 1) % master_config["checkpointing"]["save_period"]
                     == 0
                 )
-                # +1 because step is 0-indexed
+                # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -786,7 +778,7 @@ def distillation_train(
 
                     distillation_save_state["current_epoch"] = current_epoch
                     distillation_save_state["current_step"] = current_step + 1
-                    distillation_save_state["step"] = total_steps + 1
+                    distillation_save_state["total_steps"] = total_steps + 1
                     distillation_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         distillation_save_state["val_reward"] = val_metrics["accuracy"]
