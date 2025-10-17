@@ -12,6 +12,19 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
