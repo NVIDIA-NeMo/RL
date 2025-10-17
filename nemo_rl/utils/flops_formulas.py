@@ -413,7 +413,7 @@ def deepseekv3(config: FLOPSConfig):
         per_layer_mla_params = config.hs * (
             (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
         )  # Q
-    
+
     per_layer_mla_params += config.hs * config.qk_pos_emb_head_dim  # K^R
     per_layer_mla_params += config.hs * config.kv_lora_rank + config.kv_lora_rank * (
         (config.qk_head_dim + config.v_head_dim) * config.attention_heads
