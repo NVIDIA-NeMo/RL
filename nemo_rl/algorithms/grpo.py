@@ -923,6 +923,8 @@ def grpo_train(
                                 f"You asked to save checkpoints based on {metric_name} but the metric is not found in the {train_or_val} metrics. "
                                 "This checkpoint will not be saved as top-k."
                             )
+                            if full_metric_name in grpo_save_state:
+                                del grpo_save_state[full_metric_name]
                         else:
                             grpo_save_state[full_metric_name] = metrics_source[
                                 metric_name
