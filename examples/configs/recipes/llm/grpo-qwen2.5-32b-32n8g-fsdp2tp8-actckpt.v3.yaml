@@ -13,7 +13,6 @@ policy:
   logprob_batch_size: 2
   max_total_sequence_length: 16384
   dtensor_cfg:
-    sequence_parallel: true
     activation_checkpointing: true
     tensor_parallel_size: 8
   dynamic_batching:
@@ -46,12 +45,12 @@ policy:
 data:
   max_input_seq_length: 16384
 logger:
-  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
+  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
+    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt
 cluster:
   gpus_per_node: 8
   num_nodes: 32

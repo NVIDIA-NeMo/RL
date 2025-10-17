@@ -13,7 +13,6 @@ policy:
   logprob_batch_size: 2
   max_total_sequence_length: 4096
   dtensor_cfg:
-    sequence_parallel: true
     tensor_parallel_size: 4
   dynamic_batching:
     enabled: true
@@ -45,12 +44,12 @@ policy:
 data:
   max_input_seq_length: 4096
 logger:
-  log_dir: logs/grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp
+  log_dir: logs/grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp
+    name: grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4
 cluster:
   gpus_per_node: 8
   num_nodes: 4

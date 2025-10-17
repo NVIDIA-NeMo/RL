@@ -41,7 +41,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv and python
-ARG UV_VERSION=0.7.2
+ARG UV_VERSION=0.9.1
 ARG PYTHON_VERSION=3.12
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
@@ -50,6 +50,10 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
 ENV RAY_USAGE_STATS_ENABLED=0
+# After ray>=2.47, this feature is enabled by default which creates uv venvs for any py_executable starting with `uv run`.
+# There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
+# need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 
@@ -66,15 +70,6 @@ ARG BUILD_CUSTOM_VLLM
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
-
-# This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
-# This layer has to be manually updated
-RUN <<"EOF" bash -exu
-uv venv ${UV_PROJECT_ENVIRONMENT}
-
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
-EOF
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
