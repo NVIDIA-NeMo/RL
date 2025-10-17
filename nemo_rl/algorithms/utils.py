@@ -333,7 +333,30 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
                 .repeat(min_padding),
             ]
         )
-
+        if "num_completions" in batch:
+            # Pad num_completions
+            batch["num_completions"] = torch.cat(
+                [
+                    batch["num_completions"],
+                    batch["num_completions"][-1].repeat(min_padding),
+                ]
+            )
+        if "values" in batch:
+            # Pad values
+            batch["values"] = torch.cat(
+                [
+                    batch["values"],
+                    batch["values"][-1].repeat(min_padding),
+                ]
+            )
+        if "weights" in batch:
+            # Pad weights
+            batch["weights"] = torch.cat(
+                [
+                    batch["weights"],
+                    batch["weights"][-1].repeat(min_padding),
+                ]
+            )
         if "reference_policy_logprobs" in batch:
             # Pad reference_policy_logprobs
             batch["reference_policy_logprobs"] = torch.cat(

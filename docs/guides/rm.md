@@ -80,6 +80,109 @@ Currently, RM training supports only two completions (where the lowest rank is p
 }
 ```
 
+For validation datasets only, you can specify the validation loss function to use: PreferenceLoss (default, also used as training loss), PreferredAmongNAccuracy (one response is preferred among N responses), or RewardBestofNValue (weighted average of the response with the highest reward score among the first i responses, for i=1, ..., N).
+For PreferredAmongNAccuracy, for example:
+```json
+{
+    "context": [
+        {
+            "role": "user",
+            "content": "What's the capital of France?"
+        },
+        {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        },
+        {
+            "role": "user",
+            "content": "Thanks! And what's the capital of Germany?"
+        }
+    ],
+    "completions": [
+        {
+            "rank": 0,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Berlin."
+                }
+            ]
+        },
+        {
+            "rank": 1,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Munich."
+                }
+            ]
+        },
+        {
+            "rank": 2,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Spain is Madrid."
+                }
+            ]
+        }
+    ]
+}
+```
+The reported `accuracy` represents the percentage of samples where the lowest-ranked (preferred) response has the highest reward score.
+For RewardBestofNValue, for example:
+```json
+{
+    "context": [
+        {
+            "role": "user",
+            "content": "What's the capital of France?"
+        },
+        {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+        },
+        {
+            "role": "user",
+            "content": "Thanks! And what's the capital of Germany?"
+        }
+    ],
+    "completions": [
+        {
+            "value": 10,
+            "weight": 2,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Berlin."
+                }
+            ]
+        },
+        {
+            "value": 5,
+            "weight": 1,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Germany is Munich."
+                }
+            ]
+        },
+        {
+            "value": 1,
+            "weight": 4,
+            "completion": [
+                {
+                    "role": "assistant",
+                    "content": "The capital of Spain is Madrid."
+                }
+            ]
+        }
+    ]
+}
+```
+The reported `value_best_of_{i}` represents the weighted average of the best_of_{i} response value. If no completion weights are provided, a default value of 1 will be used.
+
 By default, NeMo RL has support for [HelpSteer3](../../nemo_rl/data/datasets/preference_datasets/helpsteer3.py) and [Tulu3Preference](../../nemo_rl/data/datasets/preference_datasets/tulu3.py) datasets. Both of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [PreferenceDataset](../../nemo_rl/data/datasets/preference_datasets/preference_dataset.py) class that is compatible with jsonl-formatted preference datasets for loading datasets from local path or HuggingFace.. You can modify your config as follows to use such a custom preference dataset:
