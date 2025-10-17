@@ -1,6 +1,5 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 64
   num_generations_per_prompt: 32
   max_num_steps: 500
 loss_fn:
