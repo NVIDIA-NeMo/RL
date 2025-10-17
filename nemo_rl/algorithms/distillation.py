@@ -733,8 +733,10 @@ def distillation_train(
 
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.count(":") == 1, (
-                            "metric_name must contain exactly one colon"
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
                         )
                         parts = full_metric_name.split(":")
                         train_or_val = "val" if "val" in parts[0] else "train"
@@ -743,7 +745,7 @@ def distillation_train(
                         metrics_source = (
                             metrics if train_or_val == "train" else val_metrics
                         )
-                        if metric_name not in metrics_source:
+                        if not metrics_source or metric_name not in metrics_source:
                             warnings.warn(
                                 f"You asked to save checkpoints based on {metric_name} but the metric is not found in the {train_or_val} metrics. "
                                 "This checkpoint will not be saved as top-k.",
