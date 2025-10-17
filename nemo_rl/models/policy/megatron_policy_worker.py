@@ -1762,6 +1762,7 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
         )
 
         # param_iterator will return (name, tensor), we only need tensor
