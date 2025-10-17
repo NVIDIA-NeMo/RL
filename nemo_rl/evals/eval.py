@@ -49,12 +49,17 @@ class EvalConfig(TypedDict):
     save_path: str | None
 
 
+# TODO: this should updated, but is left to avoid breaking changes
+class _PassThroughMathConfig(TypedDict):
+    math: MathEnvConfig
+
+
 class MasterConfig(TypedDict):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
     data: MathDataConfig
-    env: MathEnvConfig
+    env: _PassThroughMathConfig
     cluster: ClusterConfig
 
 

@@ -15,21 +15,24 @@
 from typing import NotRequired, TypedDict
 
 
+# TODO: split this typed dict up so it can be PreferenceDataConfig | ResponseDataConfig | etc
+#       so that we can type check the configs more rigorously as opposed to saying everything
+#       is not required.
 class DataConfig(TypedDict):
     max_input_seq_length: int
-    prompt_file: NotRequired[str]
-    system_prompt_file: NotRequired[str]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
     dataset_name: str
     val_dataset_name: NotRequired[str]
     add_bos: NotRequired[bool]
     add_eos: NotRequired[bool]
     input_key: NotRequired[str]
-    output_key: NotRequired[str]
+    output_key: NotRequired[str | None]
     add_generation_prompt: NotRequired[bool]
     add_system_prompt: NotRequired[bool]
-    split: NotRequired[str]
+    split: NotRequired[str | None]
     shuffle: NotRequired[bool]
-    seed: NotRequired[int]
+    seed: NotRequired[int | None]
     download_dir: NotRequired[str]
     train_data_path: NotRequired[str]
     val_data_paths: NotRequired[dict[str, str]]
@@ -40,6 +43,9 @@ class DataConfig(TypedDict):
     num_workers: NotRequired[int]
 
 
+# TODO: split this typed dict up so it can be MMLUConfig | AIMEConfig | etc
+#       so that we can type check the configs more rigorously as opposed to saying everything
+#       is not required.
 class MathDataConfig(DataConfig):
-    problem_key: str
-    solution_key: str
+    problem_key: NotRequired[str]
+    solution_key: NotRequired[str]

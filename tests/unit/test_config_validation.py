@@ -62,10 +62,17 @@ def validate_config_section(
                 path_parts.extend(str(loc) for loc in error["loc"])
             path = ".".join(path_parts)
 
-            # Include the actual input value if available
-            input_info = (
-                f" (got: {error.get('input', 'N/A')})" if "input" in error else ""
-            )
+            # Only include the actual input value for non-missing fields
+            # For missing fields, the 'input' is the parent dict which is confusing
+            input_info = ""
+            if "input" in error and error["type"] != "missing":
+                input_value = error.get("input")
+                # Truncate very long values for readability
+                input_str = str(input_value)
+                if len(input_str) > 100:
+                    input_str = input_str[:97] + "..."
+                input_info = f" (got: {input_str})"
+
             error_messages.append(
                 f"  {path}: {error['msg']} (type={error['type']}){input_info}"
             )
