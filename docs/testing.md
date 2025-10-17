@@ -177,18 +177,148 @@ in Docker with this script:
 CONTAINER=... bash run_functional_in_docker.sh functional/sft.sh
 ```
 
+The required `CONTAINER` can be built by following the instructions in the [Docker documentation](docker.md).
 
-## Static Type Checking with [MyPy](https://mypy-lang.org/)
-Static type checking can be run with no GPU resources:
+## Bisecting Failing Tests
+
+> [!IMPORTANT]
+> Always rsync the `tools/` directory to `tools.bisect/` before starting a bisect:
+>
+> ```sh
+> rsync -ahP --delete tools/ tools.bisect/
+> ```
+>
+> This creates a stable copy of the bisect scripts that won't change as git checks out different commits during the bisect process. Without this, the scripts themselves may change mid-bisect, leading to inconsistent behavior or failures. All examples below reference `tools.bisect/` to ensure you use the stable copy.
+
+### Bisecting Unit/Functional Tests
+
+Use `tools.bisect/bisect-run.sh` to automatically run your test command across a commit range and find the first bad commit. It forces venv rebuilds so dependencies match each commit.
+
+Basic usage:
 
 ```sh
-uv run --group test mypy {program}.py
+GOOD=<good_ref> BAD=<bad_ref> \
+  tools.bisect/bisect-run.sh uv run --group test pytest tests/unit/test_foobar.py::test_case
 ```
 
-For example,
+Examples:
+
 ```sh
-uv run --group test mypy examples/run_grpo_math.py
-uv run --group test mypy examples/run_sft.py
+GOOD=56a6225 BAD=32faafa \
+  tools.bisect/bisect-run.sh uv run --group dev pre-commit run --all-files
+
+GOOD=464ed38 BAD=c843f1b \
+  tools.bisect/bisect-run.sh uv run --group test pytest tests/unit/test_foobar.py
 ```
 
-mypy.ini controls the configuration of mypy.
+Notes:
+
+- Exit codes drive the classification: 0=good, non-zero=bad, 125=skip.
+- The script pre-verifies that `GOOD` is actually good by running your command on it.
+- On failure or interruption, it saves a timestamped `git bisect log` to `<repo>/bisect-logs/`. You can resume later with `BISECT_REPLAY_LOG` (see below).
+- Set `BISECT_NO_RESET=1` to keep the bisect state after the script exits.
+
+Resume from a saved bisect log:
+
+```sh
+BISECT_REPLAY_LOG=/abs/path/to/bisect-2025....log \
+  tools.bisect/bisect-run.sh uv run --group test pytest tests/unit/test_foobar.py
+```
+
+### Bisecting nightlies
+
+Nightly training scripts can be bisected using the same driver plus a helper that sets up hermetic runs on Slurm.
+
+Vanilla flow:
+
+```sh
+# Copy bisect utilities outside of VCS to ensure a stable runner
+rsync -ahP --delete tools/ tools.bisect/
+
+TEST_CASE=tests/test_suites/llm/sft-llama3.2-1b-1n8g-fsdp2tp1.v3.sh
+
+HF_HOME=... \
+HF_DATASETS_CACHE=... \
+CONTAINER=... \
+MOUNTS=... \
+ACCOUNT=... \
+PARTITION=... \
+GOOD=$(git log --format="%h" --diff-filter=A -- "$TEST_CASE") \
+BAD=HEAD \
+  tools.bisect/bisect-run.sh tools.bisect/launch-bisect.sh "$TEST_CASE"
+```
+
+::::{note}
+The command `GOOD=$(git log --format="%h" --diff-filter=A -- "$TEST_CASE")` selects the commit that introduced the test script. Because the path is typically added only once, this yields the introduction commit to use as the known good baseline.
+::::
+
+- `tools.bisect/launch-bisect-helper.sh` ensures each commit runs in a fresh venv, creates an isolated code snapshot per commit, blocks until metrics are checked, and returns a suitable exit code for bisect.
+
+Progressively more advanced cases:
+
+1) Adjusting the test case on the fly with `SED_CLAUSES`
+
+- If a test script needs small textual edits during bisect (e.g., relax a threshold; drop a noisy metric you don’t care to bisect over when focusing on convergence vs. perf), provide a sed script via `SED_CLAUSES`. You can also use this to adjust runtime controls like `MAX_STEPS`, `STEPS_PER_RUN`, or `NUM_MINUTES` when a perf regression slows runs down so they still complete and emit metrics. The helper applies it and automatically restores the test script after the run.
+
+```sh
+SED_CLAUSES=$(cat <<'SED'
+s#mean(data\["timing/train/total_step_time"\], -6, -1) < 0\.6#mean(data["timing/train/total_step_time"], -6, -1) < 0.63#
+/ray\/node\.0\.gpu\.0\.mem_gb/d
+SED
+) \
+GOOD=$(git log --format="%h" --diff-filter=A -- "$TEST_CASE") \
+BAD=HEAD \
+  tools.bisect/bisect-run.sh tools.bisect/launch-bisect.sh "$TEST_CASE"
+```
+
+1) Passing extra script arguments
+
+- If the nightly script supports Hydra/CLI overrides, pass them via `EXTRA_SCRIPT_ARGS` so each run adopts those overrides (e.g., fix a transient incompatibility):
+
+:::{important}
+Changing script arguments can materially affect performance characteristics and/or convergence behavior. This may influence the validity of the bisect outcome relative to your baseline configuration. Prefer the smallest, clearly-justified overrides, keep them consistent across all commits, and document them alongside your results so conclusions are interpreted correctly.
+:::
+
+```sh
+EXTRA_SCRIPT_ARGS="++data.num_workers=1" \
+GOOD=$(git log --format="%h" --diff-filter=A -- "$TEST_CASE") \
+BAD=HEAD \
+  tools.bisect/bisect-run.sh tools.bisect/launch-bisect.sh "$TEST_CASE"
+```
+
+1) Resuming from an earlier interrupted or misclassified session
+
+- Use `BISECT_REPLAY_LOG` with the bisect driver to replay prior markings and continue running. This is handy if a run failed for an unrelated reason or you manually edited a log to change `bad` → `skip` or to drop an incorrect line.
+
+```sh
+BISECT_REPLAY_LOG=/abs/path/to/bisect-logs/bisect-YYYYmmdd-HHMMSS-<sha>.log \
+HF_HOME=... HF_DATASETS_CACHE=... CONTAINER=... MOUNTS=... ACCOUNT=... PARTITION=... \
+  tools.bisect/bisect-run.sh tools.bisect/launch-bisect.sh "$TEST_CASE"
+```
+
+Tips and conventions:
+
+- Exit code 125 means "skip this commit" in git bisect; our helper returns 125 if required env is missing or if it needs to abort safely.
+- Submodules must be clean. The bisect script enforces `submodule.recurse=true` and `fetch.recurseSubmodules=on-demand` so submodules follow commit checkouts.
+- The bisect script automatically unshallows all submodules at the start to ensure any submodule commit can be checked out during the bisect process. This is important because bisecting may need to jump to arbitrary commits in submodule history.
+- Each commit uses a fresh code snapshot directory and a separate Megatron checkpoint dir to avoid cross-commit contamination.
+- On failure/interrupt, a timestamped bisect log is saved under `<repo>/bisect-logs/`. Use it with `BISECT_REPLAY_LOG` to resume.
+- In some unusual cases, the bisect may fail while updating a submodule because it references a commit that is orphaned or deleted. Git will typically print the commit hash it was unable to find (e.g., `fatal: remote error: upload-pack: not our ref <commit>`). If the commit is simply orphaned, you can try to manually fetch it:
+
+  ```sh
+  # Assuming Automodel is the submodule with the missing commit
+  cd 3rdparty/Automodel-workspace/Automodel/
+  git fetch origin $the_automodel_commit_that_it_could_not_find
+  ```
+
+  If the manual fetch fails, the commit has likely been deleted from the remote. In this case, skip the problematic commit:
+
+  ```sh
+  git bisect skip $the_nemorl_commit_that_has_the_broken_automodel_commit
+  ```
+
+  After skipping, add the skip command to your `BISECT_REPLAY_LOG` file (located in `<repo>/bisect-logs/`) so the bisect will continue from where it left off and skip that commit when you relaunch `tools.bisect/bisect-run.sh`:
+
+  ```sh
+  echo "git bisect skip $the_nemorl_commit_that_has_the_broken_automodel_commit" >> bisect-logs/bisect-<timestamp>-<sha>.log
+  ```
