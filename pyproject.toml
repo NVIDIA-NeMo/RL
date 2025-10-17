@@ -126,9 +126,15 @@ docs = [
     "sphinx-autobuild",  # For live doc serving while editing docs
     "sphinx-autodoc2",  # For documenting Python API
     "sphinx-copybutton",  # Adds a copy button for code blocks
+    "sphinx-design",  # For design components in docs
     "myst_parser",  # For our markdown docs
     "nvidia-sphinx-theme",  # Our NVIDIA theme
     "gitpython>=3.1.45",  # To git-related information
+    "pinecone",  # For Pinecone vector database integration
+    "openai",  # For OpenAI API integration
+    "python-dotenv",  # For environment variable management
+    "sphinxcontrib-mermaid",  # For Mermaid diagram support
+    "swagger-plugin-for-sphinx",  # For Swagger/OpenAPI documentation
 ]
 dev = [
     "pre-commit>=4.2.0",
