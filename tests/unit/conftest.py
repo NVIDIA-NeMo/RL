@@ -117,7 +117,7 @@ def pytest_collection_modifyitems(config, items):
                 "Please run tests with: uv run --extra automodel --group test pytest ..."
             )
         # Include only automodel tests
-        new_items = [item for item in items if item.get_closest_marker("automodel")]
+        new_items = [item for item in new_items if item.get_closest_marker("automodel")]
     else:
         # Exclude automodel tests by default
         new_items = [
