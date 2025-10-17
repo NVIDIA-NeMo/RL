@@ -662,6 +662,9 @@ class MegatronPolicyWorker:
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
         )
 
+        ## TODO: make sure this works with sequence-level losses as well
+        model_cfg.calculate_per_token_loss = True
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
@@ -687,9 +690,7 @@ class MegatronPolicyWorker:
                 overlap_param_gather=self.cfg["megatron_cfg"][
                     "distributed_data_parallel_config"
                 ]["overlap_param_gather"],
-                average_in_collective=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["average_in_collective"],
+                average_in_collective=False, # average in collective is not supported with per-token loss
                 use_distributed_optimizer=self.cfg["megatron_cfg"]["optimizer"][
                     "use_distributed_optimizer"
                 ],
