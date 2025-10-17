@@ -512,7 +512,7 @@ def sft_train(
                     sft_save_state["total_steps"] = total_steps + 1
                     sft_save_state["epoch"] = current_epoch
                     sft_save_state["total_valid_tokens"] = total_valid_tokens
-                    
+
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
@@ -535,7 +535,9 @@ def sft_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            sft_save_state[full_metric_name] = metrics_source[metric_name]
+                            sft_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")

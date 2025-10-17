@@ -594,7 +594,9 @@ def rm_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            rm_save_state[full_metric_name] = metrics_source[metric_name]
+                            rm_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")

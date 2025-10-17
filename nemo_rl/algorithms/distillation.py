@@ -753,7 +753,9 @@ def distillation_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            distillation_save_state[full_metric_name] = metrics_source[metric_name]
+                            distillation_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")

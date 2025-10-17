@@ -666,7 +666,9 @@ def dpo_train(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            dpo_save_state[full_metric_name] = metrics_source[metric_name]
+                            dpo_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
