@@ -345,6 +345,148 @@ def test_dpo_sft_matches_nll_loss():
     torch.testing.assert_close(scaled_dpo_loss, nll_loss)
 
 
+def test_ipo_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 1.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": False,
+            "sft_average_log_probs": False,
+            "preference_loss": "ipo",
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.25))
+
+
+def test_rpo_sq_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 0.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": False,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_sq",
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    ## chosen and rejected rewards are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+
+def test_rpo_fwd_kl_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 0.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": False,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_fwd_kl",
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    ## chosen and rejected rewards are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+
+def test_rpo_bwd_kl_loss():
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    vocab_size = 16
+    batch_size = 1
+    data, next_token_logits = setup_dpo_loss_test_data(
+        vocab_size=vocab_size,
+        batch_size=batch_size,
+    )
+    data["rewards"] = torch.zeros(2 * batch_size).to("cuda")
+    loss_fn = DPOLossFn(
+        cfg={
+            "reference_policy_kl_penalty": 0.0,
+            "preference_loss_weight": 1.0,
+            "sft_loss_weight": 0.0,
+            "preference_average_log_probs": False,
+            "sft_average_log_probs": False,
+            "preference_loss": "rpo_bwd_kl",
+        }
+    )
+
+    loss, metrics_dict = loss_fn(
+        next_token_logits,
+        data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    ## chosen and rejected errors are the same, so difference between them is 0
+    ## chosen and rejected rewards are the same, so difference between them is 0
+    assert torch.isclose(loss.cpu(), torch.tensor(0.0))
+
+
 def _setup_clipped_pg_test_data(batch_size=1, seq_len=4, vocab_size=8, device="cuda"):
     """Sets up basic mock data structure. Tests should fill values."""
     input_ids = torch.randint(  # Input IDs only needed if original loss fn used
