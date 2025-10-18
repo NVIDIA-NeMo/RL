@@ -124,6 +124,7 @@ def mock_components():
     master_config = {
         "distillation": {
             "max_num_steps": 5,
+            "max_num_epochs": 10,
             "val_period": 100,
             "val_batch_size": 1,
             "val_at_start": False,
@@ -511,6 +512,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
             "seed": 42,
             "topk_logits_k": 64,
             "num_prompts_per_step": 1,
+            "max_num_epochs": 10,
+            "max_num_steps": 100,
             "val_period": 0,
             "val_at_start": False,
         },
@@ -545,6 +548,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
 
         def prepare_refit_info(self):
             return {}
+
+        def offload_after_refit(self):
+            return None
 
         def init_collective(self, *args, **kwargs):
             return [MagicMock()]
@@ -613,6 +619,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         "distillation": {
             "seed": 42,
             "topk_logits_k": 64,
+            "max_num_epochs": 10,
+            "max_num_steps": 100,
             "num_prompts_per_step": 1,  # Config extraction requires this key
             "val_period": 0,  # Config extraction requires this key
             "val_at_start": False,  # Config extraction requires this key

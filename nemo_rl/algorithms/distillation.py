@@ -75,7 +75,8 @@ class DistillationConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
     max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-    max_num_steps: int
+    max_num_steps: int  # maximum number of steps to train for
+    max_num_epochs: int  # maximum number of epochs to train for
     val_batch_size: int
     val_period: int
     val_at_start: bool
@@ -85,7 +86,9 @@ class DistillationConfig(TypedDict):
 
 
 class DistillationSaveState(TypedDict):
-    step: int
+    total_steps: int  # Track total number of steps across all epochs
+    current_epoch: int  # Track current epoch
+    current_step: int  # Track step within current epoch
     val_reward: NotRequired[
         float
     ]  # Can be any metric. Setted to 'accuracy' by default in validation.
@@ -95,7 +98,9 @@ class DistillationSaveState(TypedDict):
 
 def _default_distillation_save_state() -> DistillationSaveState:
     return {
-        "step": 0,
+        "current_epoch": 0,
+        "current_step": 0,
+        "total_steps": 0,
         "val_reward": -99999999.0,  # Aligned with GRPO
         "consumed_samples": 0,
         "total_valid_tokens": 0,
@@ -185,17 +190,8 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
 
-    # Disallow Megatron paths (generation/training) and SP + packing for distillation
-    assert generation_config["backend"] != "megatron", (
-        "Distillation does not support Megatron generation backend; please use vLLM."
-    )
+    # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        if "megatron_cfg" in cfg and cfg["megatron_cfg"]["enabled"]:
-            raise AssertionError(
-                f"Distillation does not support Megatron training path ({who} policy). "
-                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1151 for more details."
-            )
-
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
@@ -254,7 +250,9 @@ def setup(
         )
         dataloader.load_state_dict(dataloader_state_dict)
 
-    print(f"  ✓ Training dataloader loaded with {len(train_dataset)} samples")
+    print(
+        f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
+    )
 
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
@@ -269,12 +267,15 @@ def setup(
             shuffle=False,
             collate_fn=rl_collate_fn,
         )
-        print(f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples")
+        print(
+            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
+            flush=True,
+        )
 
     # ==========================
     #          Cluster
     # ==========================
-    print("\n▶ Setting up compute cluster...")
+    print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
 
     if colocated_inference:
@@ -290,9 +291,15 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
-        print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+        print(
+            f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+            flush=True,
+        )
     else:
-        # We has disallow megatron path for distillation above.
+        assert generation_config["backend"] != "megatron", (
+            "Non-colocated inference is not supported for Megatron generation backends. "
+            "Please use vLLM backend for generation."
+        )
 
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
@@ -350,37 +357,14 @@ def setup(
             max_colocated_worker_groups=3,
         )
         print(
-            f"  ✓ Separate clusters created: train={train_nodes}x{train_gpus_per_node}GPUs, inference={inference_nodes}x{inference_gpus_per_node}GPUs"
+            f"  ✓ Separate clusters created: train={train_nodes}x{train_gpus_per_node}GPUs, inference={inference_nodes}x{inference_gpus_per_node}GPUs",
+            flush=True,
         )
-
-    # ==========================
-    #      Student Policy
-    # ==========================
-    print("\n▶ Setting up student policy...")
-
-    # Checkpoint paths
-    if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-    else:
-        weights_path = None
-        optimizer_path = None
-
-    student_policy = Policy(
-        name_prefix="student",
-        cluster=train_cluster,
-        config=policy_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=True,
-        init_reference_model=False,
-    )
 
     # ==========================
     #      Teacher Policy
     # ==========================
-    print("\n▶ Setting up teacher policy...")
+    print("\n▶ Setting up teacher policy...", flush=True)
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
@@ -389,6 +373,14 @@ def setup(
         check_vocab_equality(
             tokenizer, policy_config["model_name"], teacher_config["model_name"]
         )
+
+    if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
+        ## NOTE: this is equal to the total number of scheduler steps
+        total_train_iters = min(
+            distillation_config["max_num_steps"],
+            distillation_config["max_num_epochs"] * len(dataloader),
+        )
+        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     teacher_policy = Policy(
         name_prefix="teacher",
@@ -400,9 +392,10 @@ def setup(
         init_optimizer=False,
         init_reference_model=False,
     )
+    teacher_policy.offload_after_refit()
 
     # ==========================
-    #    Generation Interface
+    #    Student Generation Interface
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
@@ -421,8 +414,41 @@ def setup(
         )
         student_generation.finish_generation()
         print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}"
+            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
         )
+
+    # ==========================
+    #      Student Policy
+    # ==========================
+    print("\n▶ Setting up student policy...", flush=True)
+
+    # Checkpoint paths
+    if last_checkpoint_path:
+        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+    else:
+        weights_path = None
+        optimizer_path = None
+
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        ## NOTE: this is equal to the total number of scheduler steps
+        total_train_iters = min(
+            distillation_config["max_num_steps"],
+            distillation_config["max_num_epochs"] * len(dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+    student_policy = Policy(
+        name_prefix="student",
+        cluster=train_cluster,
+        config=policy_config,
+        tokenizer=tokenizer,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        init_reference_model=False,
+    )
 
     if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
@@ -449,7 +475,7 @@ def setup(
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
-    print("=" * 60 + "\n")
+    print("=" * 60 + "\n", flush=True)
 
     return (
         student_policy,
@@ -501,19 +527,29 @@ def distillation_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
 
-    # common config/state itmes
-    step = distillation_save_state["step"]
+    # common config/state items
+    current_epoch = distillation_save_state["current_epoch"]  # current epoch
+    current_step = distillation_save_state[
+        "current_step"
+    ]  # current step within current epoch
+    total_steps = distillation_save_state[
+        "total_steps"
+    ]  # total number of steps across all epochs
     consumed_samples = distillation_save_state["consumed_samples"]
-    total_valid_tokens = distillation_save_state.get(
-        "total_valid_tokens", 0
-    )  # Default to 0 for backward compatibility with older checkpoints
+    total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
     val_at_start = master_config["distillation"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    max_epochs = master_config["distillation"][
+        "max_num_epochs"
+    ]  # max number of epochs to train for
+    max_steps = master_config["distillation"][
+        "max_num_steps"
+    ]  # max number of steps to train for
 
     # Run validation at the start if configured
-    if val_at_start and step == 0:
-        print("\n🔍 Running initial validation...")
+    if val_at_start and total_steps == 0:
+        print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
                 student_policy, student_generation, colocated_inference
@@ -526,28 +562,35 @@ def distillation_train(
             val_dataloader,
             tokenizer,
             val_task_to_env,
-            step=0,
+            step=total_steps,
             master_config=master_config,
         )
         student_generation.finish_generation()
-        logger.log_metrics(val_metrics, step, prefix="validation")
-        logger.log_metrics(validation_timings, step, prefix="timing/validation")
+        logger.log_metrics(val_metrics, total_steps, prefix="validation")
+        logger.log_metrics(validation_timings, total_steps, prefix="timing/validation")
 
-    # Run distillation training (multi-epoch until reaching max_num_steps)
+    # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
-    max_steps = master_config["distillation"]["max_num_steps"]
 
-    while step < max_steps:
+    while total_steps < max_steps and current_epoch < max_epochs:
+        print(
+            f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
+            flush=True,
+        )
+
         for batch in dataloader:
-            print(f"\n{'=' * 25} Step {step + 1}/{max_steps} {'=' * 25}")
-            maybe_gpu_profile_step(student_policy, step + 1)
+            print(
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_steps)} {'=' * 25}",
+                flush=True,
+            )
+            maybe_gpu_profile_step(student_policy, total_steps + 1)
             if student_policy != student_generation:
-                maybe_gpu_profile_step(student_generation, step + 1)
+                maybe_gpu_profile_step(student_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
             with timer.time("total_step_time"):
                 # Prepare batch
-                print("▶ Preparing batch...")
+                print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
@@ -558,7 +601,8 @@ def distillation_train(
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
-                    f"▶ Generating responses for batch of size {repeated_batch.size}..."
+                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                    flush=True,
                 )
                 with timer.time("prepare_for_generation"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
@@ -644,11 +688,11 @@ def distillation_train(
                     )
                     train_data.to("cpu")
 
-                print("▶ Preparing for teacher logprob inference...")
+                print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     teacher_policy.prepare_for_lp_inference()
 
-                print("▶ Computing teacher logprobs...")
+                print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
                         train_data, k=master_config["distillation"]["topk_logits_k"]
@@ -656,22 +700,23 @@ def distillation_train(
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
-                print("▶ Preparing for training...")
+                print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = student_policy.train(train_data, loss_fn)
 
-                is_last_step = (
-                    step + 1 == master_config["distillation"]["max_num_steps"]
+                is_last_step = (total_steps + 1 >= max_steps) or (
+                    (current_epoch + 1 == max_epochs)
+                    and (current_step + 1 == len(dataloader))
                 )
 
                 # Run validation if it's a validation step
-                if val_period > 0 and (step + 1) % val_period == 0:
+                if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference
@@ -684,14 +729,16 @@ def distillation_train(
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
-                        step=step + 1,
+                        step=total_steps + 1,
                         master_config=master_config,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
+                        validation_timings, total_steps + 1, prefix="timing/validation"
                     )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    logger.log_metrics(
+                        val_metrics, total_steps + 1, prefix="validation"
+                    )
 
                 metrics = {
                     "loss": train_results["loss"].numpy(),
@@ -722,9 +769,10 @@ def distillation_train(
 
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config["checkpointing"]["save_period"] == 0
+                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    == 0
                 )
-                # +1 because step is 0-indexed
+                # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -733,7 +781,9 @@ def distillation_train(
                 ):
                     student_policy.prepare_for_training()
 
-                    distillation_save_state["step"] = step + 1
+                    distillation_save_state["current_epoch"] = current_epoch
+                    distillation_save_state["current_step"] = current_step + 1
+                    distillation_save_state["total_steps"] = total_steps + 1
                     distillation_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         distillation_save_state["val_reward"] = val_metrics["accuracy"]
@@ -754,9 +804,12 @@ def distillation_train(
                             master_config["checkpointing"]["metric_name"] = None
 
                     with timer.time("checkpointing"):
-                        print(f"Saving checkpoint for step {step + 1}...")
+                        print(
+                            f"Saving checkpoint for step {total_steps + 1}...",
+                            flush=True,
+                        )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step + 1, distillation_save_state, master_config
+                            total_steps + 1, distillation_save_state, master_config
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -780,7 +833,9 @@ def distillation_train(
             # Log training data
             log_data = {"content": flat_messages["content"]}
             log_data["input_lengths"] = input_lengths.tolist()
-            logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+            logger.log_batched_dict_as_jsonl(
+                log_data, f"train_data_step{total_steps}.jsonl"
+            )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -800,16 +855,18 @@ def distillation_train(
                 )
                 num_ranks = train_results["num_ranks"]
                 print(
-                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
+                    flush=True,
                 )
                 if "theoretical_tflops" in train_results:
                     theoretical_tflops = train_results["theoretical_tflops"]
                     print(
-                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
+                        flush=True,
                     )
                     metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
 
-            print("\n⏱️  Timing:")
+            print("\n⏱️  Timing:", flush=True)
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
 
@@ -825,7 +882,7 @@ def distillation_train(
                 }
             )
 
-            print(f"  • Total step time: {total_time:.2f}s")
+            print(f"  • Total step time: {total_time:.2f}s", flush=True)
 
             # Display all other timing metrics
             for k, v in sorted(
@@ -833,25 +890,30 @@ def distillation_train(
             ):
                 if k != "total_step_time":
                     percent = (v / total_time * 100) if total_time > 0 else 0
-                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
-            logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
             timer.reset()
-            step += 1
+            current_step += 1
+            total_steps += 1
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= max_steps:
+            if total_steps >= max_steps:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
                 return
+
+        # End of epoch
+        current_epoch += 1
+        current_step = 0  # Reset step counter for new epoch
 
 
 def validate(
@@ -864,18 +926,19 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        print("  ⚠️ No validation dataloader provided, skipping validation")
+        print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
     if val_task_to_env is None:
         print(
-            "  ⚠️ No validation task to environment mapping provided, skipping validation"
+            "  ⚠️ No validation task to environment mapping provided, skipping validation",
+            flush=True,
         )
         return {}, {}
 
     timer = Timer()
     with timer.time("total_validation_time"):
-        print(f"▶ Starting validation at step {step}...")
+        print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
@@ -956,7 +1019,7 @@ def validate(
             )
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
-            print("  ⚠️ Continuing validation without displaying samples...")
+            print("  ⚠️ Continuing validation without displaying samples...", flush=True)
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
@@ -966,12 +1029,12 @@ def validate(
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
-    print(f"    • Samples processed: {len(total_rewards)}")
+    print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")
     validation_time = timing_metrics.get("total_validation_time", 0)
-    print(f"    • Total validation time: {validation_time:.2f}s")
+    print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
 
     # Make sure to reset the timer after validation
     timer.reset()
