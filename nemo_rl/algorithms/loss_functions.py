@@ -42,7 +42,7 @@ class ClippedPGLossConfig(TypedDict):
     ratio_clip_c: float
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
-    truncated_importance_sampling_ratio: NotRequired[float]
+    truncated_importance_sampling_ratio: float | None
     token_level_loss: bool
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
@@ -132,9 +132,6 @@ class ClippedPGLossFn(LossFunction):
         if self.truncated_importance_sampling_ratio is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
-            )
-            assert not self.sequence_level_importance_ratios, (
-                "truncated_importance_sampling_ratio is only supported for token-level importance sampling"
             )
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
@@ -294,12 +291,12 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
-            # TIS see https://fengyao.notion.site/off-policy-rl
-            if self.truncated_importance_sampling_ratio is not None:
-                actor_importance_weights_expanded = torch.clamp(
-                    actor_importance_weights_expanded,
-                    max=self.truncated_importance_sampling_ratio,
-                )
+        # TIS see https://fengyao.notion.site/off-policy-rl
+        if self.truncated_importance_sampling_ratio is not None:
+            actor_importance_weights_expanded = torch.clamp(
+                actor_importance_weights_expanded,
+                max=self.truncated_importance_sampling_ratio,
+            )
         actor_importance_weights = actor_importance_weights_expanded
         del actor_importance_weights_expanded
         if self.use_importance_sampling_correction:

@@ -890,7 +890,10 @@ def test_clipped_pg_loss_on_policy_kl_importance_sampling():
     torch.testing.assert_close(actual_loss, expected_total_loss, atol=1e-4, rtol=1e-3)
 
 
-def test_clipped_pg_loss_on_policy_truncated_importance_sampling():
+@pytest.mark.parametrize("sequence_level_importance_ratios", [True, False])
+def test_clipped_pg_loss_on_policy_truncated_importance_sampling(
+    sequence_level_importance_ratios,
+):
     """Tests PPO loss with truncated importance sampling enabled."""
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
@@ -901,17 +904,17 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling():
     cfg = deepcopy(basic_pg_loss_test_config)
     cfg["use_importance_sampling_correction"] = True
     cfg["truncated_importance_sampling_ratio"] = 0.8
+    if sequence_level_importance_ratios:
+        cfg["sequence_level_importance_ratios"] = True
+        cfg["token_level_loss"] = False
     loss_fn = ClippedPGLossFn(cfg)
 
     adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
     prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
-    curr_lp_masked = torch.tensor(
-        [[-1.69315, -1.0, -0.59453]], device=device
-    )  # approx log(0.5)-1, log(1)-1, log(1.5)-1
-
+    # approx log(0.5)-1, log(1)-1, log(1.5)-1
+    curr_lp_masked = torch.tensor([[-1.69315, -1.0, -0.59453]], device=device)
     ref_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
-
-    # For Importance Sampling
+    # for importance sampling
     gen_lp_masked = torch.tensor([[-0.5, -1.5, -0.8]], device=device)
 
     # Fill full tensors
@@ -921,59 +924,88 @@ def test_clipped_pg_loss_on_policy_truncated_importance_sampling():
     data["reference_policy_logprobs"][0, 1:] = ref_lp_masked
 
     # --- Hand Calculation ---
-    # Actor Loss Calculation
-    actor_importance_weights = torch.exp(
-        prev_lp_masked - gen_lp_masked
-    )  # exp([-1 - (-0.5), -1 - (-1.5), -1 - (-0.8)]) = [0.6065, 1.6487, 0.8187]
+
+    # sequence-level: [[0.9086, 0.9086, 0.9086]]
+    # token-level: [[0.5, 1.0, 1.5]]
+    if sequence_level_importance_ratios:
+        log_ratios = curr_lp_masked - prev_lp_masked
+        seq_log_ratios_mean = torch.mean(log_ratios, dim=-1).unsqueeze(-1)
+        ratios = seq_log_ratios_mean.exp().repeat(1, adv_masked.shape[1])
+    else:
+        ratios = torch.exp(curr_lp_masked - prev_lp_masked)
+
+    # sequence-level: [[0.9086, 0.9086, 0.9086]]
+    # token-level: [[0.8, 1.0, 1.2]]
+    clip_min = cfg["ratio_clip_min"]
+    clip_max = cfg["ratio_clip_max"]
+    ratios_clamped = torch.clamp(ratios, 1.0 - clip_min, 1.0 + clip_max)
+
+    # sequence-level: [[-0.9086, 0.9086, -1.8171]]
+    # token-level: [[-0.5, 1.0, -3.0]]
+    loss1 = -adv_masked * ratios
+
+    # sequence-level: [[-0.9086, 0.9086, -1.8171]]
+    # token-level: [[-0.8, 1.0, -2.4]]
+    loss2 = -adv_masked * ratios_clamped
+
+    # sequence-level: [[-0.9086, 0.9086, -1.8171]]
+    # token-level: [[-0.5, 1.0, -2.4]]
+    max_loss = torch.maximum(loss1, loss2)
+    if sequence_level_importance_ratios:
+        assert torch.allclose(
+            max_loss,
+            torch.tensor([[-0.9086, 0.9086, -1.8171]], device=device),
+            rtol=1e-3,
+        )
+    else:
+        assert torch.allclose(
+            max_loss,
+            torch.tensor([[-0.5, 1.0, -2.4]], device=device),
+            rtol=1e-3,
+        )
+
+    # sequence-level: [[0.8187]]
+    # token-level: [[0.6065, 1.6487, 0.8187]]
+    if sequence_level_importance_ratios:
+        actor_importance_weights = torch.exp(
+            (prev_lp_masked - gen_lp_masked).sum(dim=-1).unsqueeze(-1)
+        )
+    else:
+        actor_importance_weights = torch.exp(prev_lp_masked - gen_lp_masked)
+
+    # sequence-level: [[0.8000]]
+    # token-level: [[0.6065, 0.8000, 0.8000]]
     truncated_actor_importance_weights = torch.clamp(
         actor_importance_weights, max=cfg["truncated_importance_sampling_ratio"]
-    )  # [0.6065, 0.8000, 0.8000]
-    assert torch.allclose(
-        truncated_actor_importance_weights,
-        torch.tensor([[0.6065, 0.8000, 0.8000]], device=device),
-        rtol=1e-3,
     )
 
-    ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # [0.5, 1.0, 1.5]
-    assert torch.allclose(
-        ratios, torch.tensor([[0.5, 1.0, 1.5]], device=device), rtol=1e-3
-    )
+    # sequence-level: [[-0.7268, 0.7268, -1.4537]]
+    # token-level: [[-0.3033, 0.8000, -1.9200]]
+    importance_weighted_max_loss = truncated_actor_importance_weights * max_loss
+    if sequence_level_importance_ratios:
+        assert torch.allclose(
+            importance_weighted_max_loss,
+            torch.tensor([[-0.7268, 0.7268, -1.4537]], device=device),
+            rtol=1e-3,
+        )
+    else:
+        assert torch.allclose(
+            importance_weighted_max_loss,
+            torch.tensor([[-0.3033, 0.8000, -1.9200]], device=device),
+            rtol=1e-3,
+        )
 
-    ratios_clamped = torch.clamp(
-        ratios, 1.0 - cfg["ratio_clip_min"], 1.0 + cfg["ratio_clip_max"]
-    )  # [0.8, 1.0, 1.2]
-    assert torch.allclose(
-        ratios_clamped, torch.tensor([[0.8, 1.0, 1.2]], device=device), rtol=1e-3
-    )
-
-    loss1 = -adv_masked * ratios  # [-0.5, 1.0, -3.0]
-    assert torch.allclose(
-        loss1, torch.tensor([[-0.5, 1.0, -3.0]], device=device), rtol=1e-3
-    )
-
-    loss2 = -adv_masked * ratios_clamped  # [-0.8, 1.0, -2.4]
-    assert torch.allclose(
-        loss2, torch.tensor([[-0.8, 1.0, -2.4]], device=device), rtol=1e-3
-    )
-
-    max_loss = torch.maximum(loss1, loss2)  # [-0.5, 1.0, -2.4]
-    assert torch.allclose(
-        max_loss, torch.tensor([[-0.5, 1.0, -2.4]], device=device), rtol=1e-3
-    )
-
-    importance_weighted_max_loss = (
-        truncated_actor_importance_weights * max_loss
-    )  # [0.6065*(-0.5), 0.8000*1.0, 0.8000*(-2.4)] = [-0.3033, 0.8000, -1.9200]
-    assert torch.allclose(
-        importance_weighted_max_loss,
-        torch.tensor([[-0.3033, 0.8000, -1.9200]], device=device),
-        rtol=1e-3,
-    )
-
-    expected_loss = torch.mean(importance_weighted_max_loss)  # -0.4744
-    assert torch.allclose(
-        expected_loss, torch.tensor(-0.4744, device=device), rtol=1e-3
-    )
+    # sequence-level: -0.4846
+    # token-level: -0.4744
+    expected_loss = torch.mean(importance_weighted_max_loss)
+    if sequence_level_importance_ratios:
+        assert torch.allclose(
+            expected_loss, torch.tensor(-0.4846, device=device), rtol=1e-3
+        )
+    else:
+        assert torch.allclose(
+            expected_loss, torch.tensor(-0.4744, device=device), rtol=1e-3
+        )
 
     input_ids = data["input_ids"]
     dummy_logits = _create_exact_logits(
