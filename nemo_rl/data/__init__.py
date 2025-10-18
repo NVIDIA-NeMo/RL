@@ -78,7 +78,6 @@ class MMLUEvalDataConfig(TypedDict):
         "mmlu_SW-KE",
         "mmlu_YO-NG",
     ]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
@@ -88,7 +87,6 @@ class MMLUProEvalDataConfig(TypedDict):
 
     max_input_seq_length: int
     dataset_name: Literal["mmlu_pro"]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
@@ -98,7 +96,6 @@ class AIMEEvalDataConfig(TypedDict):
 
     max_input_seq_length: int
     dataset_name: Literal["aime2024", "aime2025"]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
@@ -108,7 +105,6 @@ class GPQAEvalDataConfig(TypedDict):
 
     max_input_seq_length: int
     dataset_name: Literal["gpqa", "gpqa_diamond"]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
@@ -118,7 +114,6 @@ class MathEvalDataConfig(TypedDict):
 
     max_input_seq_length: int
     dataset_name: Literal["math", "math500"]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
@@ -136,7 +131,6 @@ class LocalMathEvalDataConfig(TypedDict):
     solution_key: str
     file_format: Literal["csv", "json"]
     split: NotRequired[str | None]
-    shuffle: NotRequired[bool]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
 
