@@ -43,6 +43,7 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
   sequence_level_importance_ratios: false
   token_level_loss: true
 
