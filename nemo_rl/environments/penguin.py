@@ -63,6 +63,18 @@ class Penguin(EnvironmentInterface):
             * len(self.cfg["base_urls"])
         )
 
+        # Get Ray head node address if Ray is initialized
+        if ray.is_initialized():
+            try:
+                ray_context = ray.get_runtime_context()
+                if ray_context.gcs_address:
+                    initial_global_config_dict["ray_head_node_address"] = (
+                        ray_context.gcs_address
+                    )
+                    print(f"Ray head node address: {ray_context.gcs_address}")
+            except Exception as e:
+                print(f"Could not get Ray head node address: {e}")
+
         print(
             f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]}.
 Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg["base_urls"])} * {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} = {initial_global_config_dict["global_aiohttp_connector_limit"]}."""
