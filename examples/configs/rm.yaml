@@ -160,6 +160,13 @@ data:
   #     metric_name: "validation-<NameOfValidationDataset1>_loss"
   #   ...
 
+  # With PreferenceDataset, you can specify which loss function to use for each validation set.
+  #  data:
+  #    val_loss_fns:
+  #      <NameOfValidationDataset1>: <LossFunctionName>
+  #      ...
+  # LossFunctionName can be: PreferenceLoss (default), PreferredAmongNAccuracy, RewardBestofNValue.
+
 logger:
   log_dir: "logs"  # Base directory for all logs
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running

@@ -152,10 +152,10 @@ def dpo_preprocessor(
         loss_multiplier = 0.0
 
     output = {
-        "message_log_chosen": message_log_chosen,
-        "length_chosen": length_chosen,
-        "message_log_rejected": message_log_rejected,
-        "length_rejected": length_rejected,
+        "list_message_log": [message_log_chosen, message_log_rejected],
+        "list_length": [length_chosen, length_rejected],
+        "list_values": [],
+        "list_weights": [],
         "extra_env_info": None,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
