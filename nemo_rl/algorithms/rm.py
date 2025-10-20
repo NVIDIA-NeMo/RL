@@ -151,6 +151,7 @@ def setup(
             add_loss_mask=False,
         ),
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -173,6 +174,7 @@ def setup(
                 add_loss_mask=False,
             ),
             drop_last=False,
+            num_workers=data_config["num_workers"],
         )
         for k, v in val_dataset.items()
     }
@@ -644,11 +646,16 @@ def rm_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
                 master_config["rm"]["max_num_steps"] != -1
                 and total_steps >= master_config["rm"]["max_num_steps"]
             ):
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1
