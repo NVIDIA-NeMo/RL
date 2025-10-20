@@ -977,10 +977,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         await self.llm.wake_up(**wake_up_args)
 
-    def shutdown(self) -> bool:
+    async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
             if self.llm is not None:
+                # Clean up extension resources (e.g., ZMQ sockets)
+                await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
                     self.llm.shutdown()
                 except Exception as e_stop:

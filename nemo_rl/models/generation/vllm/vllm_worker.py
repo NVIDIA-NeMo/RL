@@ -825,6 +825,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         """Clean up vLLM resources."""
         try:
             if self.llm is not None:
+                # Clean up extension resources (e.g., ZMQ sockets)
+                self.llm.collective_rpc("cleanup", args=tuple())
+
                 # Explicitly delete the engine. This may trigger its __del__ method.
                 del self.llm
 

@@ -1901,6 +1901,10 @@ class DTensorPolicyWorkerV2:
 
     def shutdown(self) -> None:
         """Shutdown the policy."""
+        # Clean up extension resources like ZMQ sockets
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

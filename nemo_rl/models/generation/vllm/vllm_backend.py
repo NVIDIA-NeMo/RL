@@ -226,6 +226,13 @@ class VllmInternalWorkerExtension:
 
         return True
 
+    def cleanup(self) -> None:
+        """Shutdown and cleanup resources."""
+        # Close ZMQ socket and context if they exist
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
+
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         torch.cuda.profiler.start()

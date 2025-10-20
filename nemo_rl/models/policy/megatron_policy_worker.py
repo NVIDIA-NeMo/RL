@@ -2216,7 +2216,10 @@ class MegatronPolicyWorker:
 
     def shutdown(self):
         """Shutdown the policy."""
-        pass
+        # Clean up extension resources like ZMQ sockets
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
