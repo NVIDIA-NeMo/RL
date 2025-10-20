@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLaDA generation algorithm with dual caching.
+Basic Fast-dLLM generation without caching.
 """
 
 import logging
@@ -8,26 +8,22 @@ from typing import Tuple
 import torch
 from transformers import PreTrainedModel
 
-from .base import GenerationAlgorithm
+from .base import FastDLLMGeneration
+from ._imports import generate, FAST_DLLM_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
-# Try to import Fast-dLLM dual cache generate function
-try:
-    from generate import generate_with_dual_cache
-    FAST_DLLM_AVAILABLE = True
-except ImportError:
-    generate_with_dual_cache = None
-    FAST_DLLM_AVAILABLE = False
+# Check if basic generation is available
+GENERATION_AVAILABLE = FAST_DLLM_AVAILABLE and generate is not None
 
 
-class DualCacheGeneration(GenerationAlgorithm):
-    """LLaDA generation with dual caching for maximum performance."""
+class BasicGeneration(FastDLLMGeneration):
+    """Basic Fast-dLLM generation without any caching mechanisms."""
     
     def __init__(self):
         super().__init__(
-            name="dual_cache",
-            description="LLaDA generation with dual caching for optimal performance with repeated patterns"
+            name="basic",
+            description="Basic Fast-dLLM generation without caching for maximum compatibility"
         )
     
     def generate(
@@ -43,9 +39,9 @@ class DualCacheGeneration(GenerationAlgorithm):
         factor: float = 1.0,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
-        """Generate text using Fast-dLLM generation with dual caching."""
+        """Generate text using basic Fast-dLLM generation."""
         if not self.is_available():
-            raise RuntimeError("Fast-dLLM dual cache generation is not available")
+            raise RuntimeError("Fast-dLLM basic generation is not available")
         
         validated_args = self.validate_args(
             steps=steps,
@@ -58,9 +54,9 @@ class DualCacheGeneration(GenerationAlgorithm):
             **kwargs
         )
         
-        logger.debug(f"Using dual cache generation with args: {validated_args}")
+        logger.debug(f"Using basic Fast-dLLM generation with args: {validated_args}")
         
-        output, nfe = generate_with_dual_cache(
+        output, nfe = generate(
             model=model,
             prompt=prompt,
             steps=validated_args['steps'],
@@ -75,5 +71,6 @@ class DualCacheGeneration(GenerationAlgorithm):
         return output, nfe
     
     def is_available(self) -> bool:
-        """Check if Fast-dLLM dual cache generation is available."""
-        return FAST_DLLM_AVAILABLE and generate_with_dual_cache is not None
+        """Check if Fast-dLLM basic generation is available."""
+        return GENERATION_AVAILABLE and generate is not None
+

@@ -12,18 +12,42 @@ The generation registry allows you to:
 
 ## Architecture
 
-### Base Classes
+### Module Structure
 
-- `GenerationAlgorithm`: Abstract base class for all generation algorithms
-- `GenerationRegistry`: Registry system for managing algorithms
+```
+llada_generate/
+├── base.py                 # GenerationAlgorithm base class (model loading, tokenization, batching)
+├── fast_dllm/              # Fast-dLLM algorithms (inherit from FastDLLMGeneration)
+│   ├── _imports.py         # Centralized Fast-dLLM imports from submodule
+│   ├── base.py             # FastDLLMGeneration base (LLaDAModelLM loading)
+│   ├── basic.py            # Basic generation (no cache)
+│   ├── prefix_cache.py     # Prefix cache generation
+│   └── dual_cache.py       # Dual cache generation
+├── nemotron.py             # Nemotron native generation
+└── __init__.py             # Registry and public API
+```
+
+### Class Hierarchy
+
+```
+GenerationAlgorithm (base.py)
+├── FastDLLMGeneration (fast_dllm/base.py)
+│   ├── BasicGeneration
+│   ├── PrefixCacheGeneration
+│   └── DualCacheGeneration
+└── NemotronGeneration (nemotron.py)
+```
 
 ### Built-in Algorithms
 
-| Algorithm | Name | Aliases | Description |
-|-----------|------|---------|-------------|
-| Basic | `basic` | `no_cache`, `simple` | Basic LLaDA generation without caching |
-| Prefix Cache | `prefix_cache` | `prefix`, `cache` | Generation with prefix caching for efficiency |
-| Dual Cache | `dual_cache` | `dual`, `double_cache` | Generation with dual caching for maximum performance |
+| Algorithm | Name | Aliases | Description | Family |
+|-----------|------|---------|-------------|--------|
+| Basic | `basic` | `no_cache`, `simple` | Basic Fast-dLLM without caching | Fast-dLLM |
+| Prefix Cache | `prefix_cache` | `prefix`, `cache` | Fast-dLLM with prefix caching | Fast-dLLM |
+| Dual Cache | `dual_cache` | `dual`, `double_cache` | Fast-dLLM with dual caching | Fast-dLLM |
+| Nemotron | `nemotron` | `nemotron_native` | Native Nemotron diffusion | Nemotron |
+
+**Note**: Fast-dLLM algorithms require the Fast-dLLM submodule (`3rdparty/Fast-dLLM`). If unavailable, they gracefully report as unavailable.
 
 ## Usage
 
@@ -102,37 +126,56 @@ The batch server provides new endpoints for algorithm information:
 
 ## Creating Custom Algorithms
 
-To create a custom generation algorithm:
+### Fast-dLLM Variant (Recommended if using Fast-dLLM)
 
-1. Create a new Python file in the `llada_generate/` directory
-2. Subclass `GenerationAlgorithm`
-3. Implement the required methods
-4. Register your algorithm
+Inherit from `FastDLLMGeneration` to reuse model loading:
 
 ```python
-# custom_algorithm.py
-from .base import GenerationAlgorithm
+# fast_dllm/my_algorithm.py
+from .base import FastDLLMGeneration
+from ._imports import my_generate_function, FAST_DLLM_AVAILABLE
 
-class CustomGeneration(GenerationAlgorithm):
+class MyAlgorithm(FastDLLMGeneration):
     def __init__(self):
-        super().__init__(
-            name="custom",
-            description="My custom generation algorithm"
-        )
+        super().__init__(name="my_algo", description="My custom Fast-dLLM algorithm")
     
     def generate(self, model, prompt, **kwargs):
-        # Your generation logic here
         validated_args = self.validate_args(**kwargs)
-        # ... implementation
+        return my_generate_function(model, prompt, **validated_args)
+    
+    def is_available(self):
+        return FAST_DLLM_AVAILABLE and my_generate_function is not None
+```
+
+### Independent Algorithm
+
+For non-Fast-dLLM algorithms, inherit from `GenerationAlgorithm`:
+
+```python
+# my_algorithm.py
+from .base import GenerationAlgorithm
+from transformers import AutoModel
+
+class MyAlgorithm(GenerationAlgorithm):
+    def __init__(self):
+        super().__init__(name="my_algo", description="My custom algorithm")
+    
+    def load_model_class(self, model_path, **kwargs):
+        return AutoModel.from_pretrained(model_path, **kwargs)
+    
+    def generate(self, model, prompt, **kwargs):
+        validated_args = self.validate_args(**kwargs)
+        # Your generation logic
         return output, nfe
     
     def is_available(self):
-        # Check if dependencies are available
-        return True
+        return True  # or check dependencies
+```
 
-# Register the algorithm
-from llada_generate import register_algorithm
-register_algorithm(CustomGeneration(), aliases=['my_custom'])
+Then register in `__init__.py`:
+```python
+from .my_algorithm import MyAlgorithm
+register_algorithm(MyAlgorithm(), aliases=['my_custom'])
 ```
 
 ## Migration Guide
@@ -165,10 +208,30 @@ output, nfe = algorithm.generate(...)
 5. **Maintainability**: Clear separation of concerns
 6. **Dynamic Selection**: No need to restart server to change algorithms
 
+## Key Features
+
+### Algorithm-Based Model Loading
+Each algorithm manages its own model loading:
+- **Fast-dLLM algorithms**: Use optimized `LLaDAModelLM` class when available
+- **Nemotron algorithm**: Uses standard `AutoModel`
+- **Graceful fallback**: Missing Fast-dLLM → algorithms use `AutoModel`
+
+### Centralized Tokenization & Batching
+The base `GenerationAlgorithm` class provides:
+- `tokenize_prompts()`: Chat template support, batching, padding
+- `decode_outputs()`: Batch decoding with prompt exclusion
+- `generate_batch()`: High-level API combining all steps
+
+### Fast-dLLM Import System
+Fast-dLLM algorithms use a centralized import module (`fast_dllm/_imports.py`) that:
+- Automatically adds `3rdparty/Fast-dLLM/llada` to `sys.path`
+- Imports all Fast-dLLM components in one place
+- Gracefully degrades if Fast-dLLM submodule is unavailable
+
 ## Dependencies
 
-- Fast-dLLM (for generation functions)
-- PyTorch
-- Transformers
+- **Required**: PyTorch, Transformers
+- **Optional**: Fast-dLLM (from `3rdparty/Fast-dLLM` submodule)
+- **Optional**: NeMo-RL (for DCP checkpoint loading)
 
-The registry gracefully handles missing dependencies and will mark algorithms as unavailable if their dependencies are not met.
+The registry gracefully handles missing dependencies and marks algorithms as unavailable if their dependencies are not met.

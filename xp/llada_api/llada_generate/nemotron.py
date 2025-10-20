@@ -7,7 +7,7 @@ import logging
 import inspect
 from typing import Tuple
 import torch
-from transformers import PreTrainedModel
+from transformers import AutoModel, PreTrainedModel
 
 from .base import GenerationAlgorithm
 
@@ -21,6 +21,18 @@ class NemotronGeneration(GenerationAlgorithm):
         super().__init__(
             name="nemotron",
             description="Native Nemotron diffusion generation using model's built-in generate method"
+        )
+    
+    def load_model_class(self, model_path: str, **kwargs) -> PreTrainedModel:
+        """
+        Load model class for Nemotron generation.
+        Always uses standard AutoModel for Nemotron.
+        """
+        logger.info("Loading Nemotron model with standard AutoModel")
+        return AutoModel.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            **kwargs
         )
     
     def generate(

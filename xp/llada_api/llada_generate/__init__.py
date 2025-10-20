@@ -121,27 +121,29 @@ def get_algorithm_info(name: str) -> Optional[Dict[str, str]]:
 # Auto-register built-in algorithms
 def _register_builtin_algorithms():
     """Register all built-in generation algorithms."""
+    # Register Fast-dLLM algorithms
     try:
-        from .basic import BasicGeneration
+        from .fast_dllm import BasicGeneration
         register_algorithm(BasicGeneration(), aliases=['basic', 'no_cache', 'simple'])
-        logger.debug("Registered basic generation algorithm")
+        logger.debug("Registered basic Fast-dLLM generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register basic generation: {e}")
     
     try:
-        from .prefix_cache import PrefixCacheGeneration
+        from .fast_dllm import PrefixCacheGeneration
         register_algorithm(PrefixCacheGeneration(), aliases=['prefix_cache', 'prefix', 'cache'])
-        logger.debug("Registered prefix cache generation algorithm")
+        logger.debug("Registered prefix cache Fast-dLLM generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register prefix cache generation: {e}")
     
     try:
-        from .dual_cache import DualCacheGeneration
+        from .fast_dllm import DualCacheGeneration
         register_algorithm(DualCacheGeneration(), aliases=['dual_cache', 'dual', 'double_cache'])
-        logger.debug("Registered dual cache generation algorithm")
+        logger.debug("Registered dual cache Fast-dLLM generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register dual cache generation: {e}")
     
+    # Register Nemotron algorithm
     try:
         from .nemotron import NemotronGeneration
         register_algorithm(NemotronGeneration(), aliases=['nemotron', 'nemotron_native', 'nemotron_diffusion'])

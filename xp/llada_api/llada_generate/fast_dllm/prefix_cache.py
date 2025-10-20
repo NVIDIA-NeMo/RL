@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Basic LLaDA generation algorithm without caching.
+Fast-dLLM generation with prefix caching.
 """
 
 import logging
@@ -8,26 +8,22 @@ from typing import Tuple
 import torch
 from transformers import PreTrainedModel
 
-from .base import GenerationAlgorithm
+from .base import FastDLLMGeneration
+from ._imports import generate_with_prefix_cache, FAST_DLLM_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
-# Try to import Fast-dLLM generate function
-try:
-    from generate import generate
-    FAST_DLLM_AVAILABLE = True
-except ImportError:
-    generate = None
-    FAST_DLLM_AVAILABLE = False
+# Check if prefix cache generation is available
+GENERATION_AVAILABLE = FAST_DLLM_AVAILABLE and generate_with_prefix_cache is not None
 
 
-class BasicGeneration(GenerationAlgorithm):
-    """Basic LLaDA generation without any caching mechanisms."""
+class PrefixCacheGeneration(FastDLLMGeneration):
+    """Fast-dLLM generation with prefix caching for improved efficiency."""
     
     def __init__(self):
         super().__init__(
-            name="basic",
-            description="Basic LLaDA generation without caching for maximum compatibility"
+            name="prefix_cache",
+            description="Fast-dLLM generation with prefix caching to accelerate repeated prompt prefixes"
         )
     
     def generate(
@@ -43,9 +39,9 @@ class BasicGeneration(GenerationAlgorithm):
         factor: float = 1.0,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
-        """Generate text using basic Fast-dLLM generation."""
+        """Generate text using Fast-dLLM generation with prefix caching."""
         if not self.is_available():
-            raise RuntimeError("Fast-dLLM basic generation is not available")
+            raise RuntimeError("Fast-dLLM prefix cache generation is not available")
         
         validated_args = self.validate_args(
             steps=steps,
@@ -58,9 +54,9 @@ class BasicGeneration(GenerationAlgorithm):
             **kwargs
         )
         
-        logger.debug(f"Using basic generation with args: {validated_args}")
+        logger.debug(f"Using prefix cache Fast-dLLM generation with args: {validated_args}")
         
-        output, nfe = generate(
+        output, nfe = generate_with_prefix_cache(
             model=model,
             prompt=prompt,
             steps=validated_args['steps'],
@@ -75,5 +71,6 @@ class BasicGeneration(GenerationAlgorithm):
         return output, nfe
     
     def is_available(self) -> bool:
-        """Check if Fast-dLLM basic generation is available."""
-        return FAST_DLLM_AVAILABLE and generate is not None
+        """Check if Fast-dLLM prefix cache generation is available."""
+        return GENERATION_AVAILABLE and generate_with_prefix_cache is not None
+

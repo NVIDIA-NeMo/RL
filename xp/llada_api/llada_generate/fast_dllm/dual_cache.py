@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LLaDA generation algorithm with prefix caching.
+Fast-dLLM generation with dual caching.
 """
 
 import logging
@@ -8,26 +8,22 @@ from typing import Tuple
 import torch
 from transformers import PreTrainedModel
 
-from .base import GenerationAlgorithm
+from .base import FastDLLMGeneration
+from ._imports import generate_with_dual_cache, FAST_DLLM_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
-# Try to import Fast-dLLM prefix cache generate function
-try:
-    from generate import generate_with_prefix_cache
-    FAST_DLLM_AVAILABLE = True
-except ImportError:
-    generate_with_prefix_cache = None
-    FAST_DLLM_AVAILABLE = False
+# Check if dual cache generation is available
+GENERATION_AVAILABLE = FAST_DLLM_AVAILABLE and generate_with_dual_cache is not None
 
 
-class PrefixCacheGeneration(GenerationAlgorithm):
-    """LLaDA generation with prefix caching for improved efficiency."""
+class DualCacheGeneration(FastDLLMGeneration):
+    """Fast-dLLM generation with dual caching for maximum performance."""
     
     def __init__(self):
         super().__init__(
-            name="prefix_cache",
-            description="LLaDA generation with prefix caching to accelerate repeated prompt prefixes"
+            name="dual_cache",
+            description="Fast-dLLM generation with dual caching for optimal performance with repeated patterns"
         )
     
     def generate(
@@ -43,9 +39,9 @@ class PrefixCacheGeneration(GenerationAlgorithm):
         factor: float = 1.0,
         **kwargs
     ) -> Tuple[torch.Tensor, int]:
-        """Generate text using Fast-dLLM generation with prefix caching."""
+        """Generate text using Fast-dLLM generation with dual caching."""
         if not self.is_available():
-            raise RuntimeError("Fast-dLLM prefix cache generation is not available")
+            raise RuntimeError("Fast-dLLM dual cache generation is not available")
         
         validated_args = self.validate_args(
             steps=steps,
@@ -58,9 +54,9 @@ class PrefixCacheGeneration(GenerationAlgorithm):
             **kwargs
         )
         
-        logger.debug(f"Using prefix cache generation with args: {validated_args}")
+        logger.debug(f"Using dual cache Fast-dLLM generation with args: {validated_args}")
         
-        output, nfe = generate_with_prefix_cache(
+        output, nfe = generate_with_dual_cache(
             model=model,
             prompt=prompt,
             steps=validated_args['steps'],
@@ -75,5 +71,6 @@ class PrefixCacheGeneration(GenerationAlgorithm):
         return output, nfe
     
     def is_available(self) -> bool:
-        """Check if Fast-dLLM prefix cache generation is available."""
-        return FAST_DLLM_AVAILABLE and generate_with_prefix_cache is not None
+        """Check if Fast-dLLM dual cache generation is available."""
+        return GENERATION_AVAILABLE and generate_with_dual_cache is not None
+
