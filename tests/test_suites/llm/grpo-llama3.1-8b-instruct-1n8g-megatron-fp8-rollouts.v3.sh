@@ -4,10 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=40
-MAX_STEPS=40
+STEPS_PER_RUN=100
+MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=180
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -33,7 +33,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # With a few number of steps the logprob can have spikes that can move the average up.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["40"] < 1.1'
+        'mean(data["train/token_mult_prob_error"], ignore_top_p=0.05) < 1.1' \
+        'ratio_above(data["train/token_mult_prob_error"], 1.1) < 0.1'
+    # ratio_above @ 1.1 was 0.03,0.06,0.05: 3sigma ~=0.1
 fi
