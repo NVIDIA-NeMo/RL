@@ -28,25 +28,33 @@ xp/llada_api/
 Use the convenient wrapper scripts from the NeMo-RL project root:
 
 ```bash
-# Batch server with LLaDA (recommended for evaluations)
+# Batch server with LLaDA (auto-selects dInfer engine - 10x+ faster)
 ./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct
 
-# Batch server with Nemotron
+# Batch server with explicit Fast-dLLM engine
+./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct --engine fast-dllm
+
+# Batch server with Nemotron (auto-selects nemotron engine)
 ./scripts/start_llada_batch_server.sh --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 
-# Streaming server (for real-time responses)
-./scripts/start_llada_batch_server.sh --local --streaming --model-path GSAI-ML/LLaDA-8B-Instruct
+# With specific algorithm within engine
+./scripts/start_llada_batch_server.sh --local --model-path GSAI-ML/LLaDA-8B-Instruct --algorithm dinfer_hierarchy
 
-# Local with DCP checkpoint (requires dependencies)
+# Local with DCP checkpoint
 ./scripts/start_llada_batch_server.sh --local --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
-# SLURM execution (full NeMo-RL environment)
+# SLURM execution
 export ACCOUNT=your_slurm_account
 ./scripts/start_llada_batch_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # Connect to SLURM server
 ./connect_to_llada_server.sh --job-id 12345
 ```
+
+**Inference Engines**:
+- `dinfer` - dInfer for LLaDA (10x+ faster, auto-selected)
+- `fast-dllm` - Fast-dLLM for LLaDA (alternative)
+- `nemotron` - Native Nemotron (auto-selected for Nemotron models)
 
 ### From This Directory
 
@@ -89,12 +97,19 @@ scripts/connect_to_llada_server.sh --job-id 12345
 
 ## Key Components
 
-### 1. Main Servers
-- **`llada_openai_server.py`**: Single-request streaming server
-- **`llada_batch_server.py`**: High-throughput batch processing server
+### 1. Main Server
+- **`llada_batch_server.py`**: High-throughput batch processing server (RECOMMENDED)
+  - Engine-based architecture (fast-dllm, dinfer, nemotron)
+  - dInfer support for 10x+ performance improvement
+  - Batch processing for 3-5x additional speedup
+  - Per-request algorithm switching
+  - Systematic model/engine validation
+- **`llada_openai_server.py`**: ⚠️ DEPRECATED - Single-request streaming server (use batch server instead)
+
+Features:
 - FastAPI-based OpenAI-compatible API with model-specific optimizations
 - Supports both HuggingFace and DCP checkpoint loading for LLaDA and Nemotron
-- LLaDA: Fast-dLLM acceleration with KV caching and parallel decoding
+- LLaDA: Fast-dLLM and dInfer acceleration with KV caching and parallel decoding
 - Nemotron: Native diffusion generation using model's built-in methods
 - Includes health checks, error handling, and comprehensive logging
 

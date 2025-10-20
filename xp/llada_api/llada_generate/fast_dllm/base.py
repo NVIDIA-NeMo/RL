@@ -26,6 +26,8 @@ class FastDLLMGeneration(GenerationAlgorithm):
     """
     Base class for Fast-dLLM generation algorithms.
     
+    Engine: 'fast-dllm'
+    
     This class provides common functionality for all Fast-dLLM based generation
     algorithms, including optimized model loading with LLaDAModelLM when available.
     
@@ -33,6 +35,9 @@ class FastDLLMGeneration(GenerationAlgorithm):
     - The specific Fast-dLLM generation function (basic, prefix_cache, dual_cache)
     - is_available() to check if their specific generation function is available
     """
+    
+    def __init__(self, name: str, description: str):
+        super().__init__(name, description, engine="fast-dllm")
     
     def load_model_class(self, model_path: str, **kwargs) -> PreTrainedModel:
         """

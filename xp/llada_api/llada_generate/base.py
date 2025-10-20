@@ -16,9 +16,18 @@ logger = logging.getLogger(__name__)
 class GenerationAlgorithm(ABC):
     """Base class for all LLaDA generation algorithms."""
     
-    def __init__(self, name: str, description: str):
+    def __init__(self, name: str, description: str, engine: str = "unknown"):
+        """
+        Initialize generation algorithm.
+        
+        Args:
+            name: Algorithm name (e.g., 'basic', 'dinfer_blockwise')
+            description: Human-readable description
+            engine: Inference engine (e.g., 'fast-dllm', 'dinfer', 'nemotron', 'hf')
+        """
         self.name = name
         self.description = description
+        self.engine = engine  # Inference engine: 'fast-dllm', 'dinfer', 'nemotron', 'hf'
         self.model: Optional[PreTrainedModel] = None
         self.tokenizer: Optional[PreTrainedTokenizer] = None
         self.device: Optional[str] = None

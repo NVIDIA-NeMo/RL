@@ -80,8 +80,34 @@ class GenerationRegistry:
         return {
             'name': algorithm.name,
             'description': algorithm.description,
+            'engine': algorithm.engine,
             'available': algorithm.is_available()
         }
+    
+    def list_algorithms_by_engine(self, engine: str) -> List[str]:
+        """List all registered algorithms for a specific engine."""
+        return [name for name, algo in self._algorithms.items() if algo.engine == engine]
+    
+    def list_available_algorithms_by_engine(self, engine: str) -> List[str]:
+        """List available algorithms for a specific engine."""
+        return [name for name, algo in self._algorithms.items() 
+                if algo.engine == engine and algo.is_available()]
+    
+    def get_default_algorithm_for_engine(self, engine: str) -> Optional[str]:
+        """Get a recommended default algorithm for an engine."""
+        engine_defaults = {
+            'fast-dllm': 'dual_cache',
+            'dinfer': 'dinfer_blockwise',
+            'nemotron': 'nemotron',
+            'hf': None
+        }
+        default_name = engine_defaults.get(engine)
+        if default_name and self.get(default_name):
+            return default_name
+        
+        # Fallback: return first available algorithm for this engine
+        available = self.list_available_algorithms_by_engine(engine)
+        return available[0] if available else None
     
     def clear(self):
         """Clear all registered algorithms."""
@@ -118,6 +144,21 @@ def get_algorithm_info(name: str) -> Optional[Dict[str, str]]:
     return registry.get_algorithm_info(name)
 
 
+def list_algorithms_by_engine(engine: str) -> List[str]:
+    """List all algorithms for a specific engine."""
+    return registry.list_algorithms_by_engine(engine)
+
+
+def list_available_algorithms_by_engine(engine: str) -> List[str]:
+    """List available algorithms for a specific engine."""
+    return registry.list_available_algorithms_by_engine(engine)
+
+
+def get_default_algorithm_for_engine(engine: str) -> Optional[str]:
+    """Get the recommended default algorithm for an engine."""
+    return registry.get_default_algorithm_for_engine(engine)
+
+
 # Auto-register built-in algorithms
 def _register_builtin_algorithms():
     """Register all built-in generation algorithms."""
@@ -150,6 +191,28 @@ def _register_builtin_algorithms():
         logger.debug("Registered Nemotron generation algorithm")
     except Exception as e:
         logger.warning(f"Failed to register Nemotron generation: {e}")
+    
+    # Register dInfer algorithms
+    try:
+        from .dinfer import BlockWiseGeneration
+        register_algorithm(BlockWiseGeneration(), aliases=['dinfer', 'dinfer_block', 'blockwise'])
+        logger.debug("Registered dInfer BlockWise generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register dInfer BlockWise generation: {e}")
+    
+    try:
+        from .dinfer import HierarchyGeneration
+        register_algorithm(HierarchyGeneration(), aliases=['dinfer_hierarchical'])
+        logger.debug("Registered dInfer Hierarchy generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register dInfer Hierarchy generation: {e}")
+    
+    try:
+        from .dinfer import CreditGeneration
+        register_algorithm(CreditGeneration(), aliases=['dinfer_credit_threshold'])
+        logger.debug("Registered dInfer Credit generation algorithm")
+    except Exception as e:
+        logger.warning(f"Failed to register dInfer Credit generation: {e}")
 
 
 # Register built-in algorithms on import
@@ -167,5 +230,8 @@ __all__ = [
     'get_algorithm',
     'list_algorithms',
     'list_available_algorithms',
-    'get_algorithm_info'
+    'get_algorithm_info',
+    'list_algorithms_by_engine',
+    'list_available_algorithms_by_engine',
+    'get_default_algorithm_for_engine',
 ]

@@ -4,11 +4,12 @@ This module provides a modular generation system for LLaDA models with a registr
 
 ## Overview
 
-The generation registry allows you to:
-- Register different generation algorithms with descriptive names
-- Use aliases for common algorithm names
-- Easily switch between algorithms at runtime
-- Maintain backward compatibility with legacy cache-based configuration
+The generation registry provides a unified interface for different inference engines and algorithms:
+- **Engines**: Inference backends (fast-dllm, dinfer, nemotron) - determines model implementation
+- **Algorithms**: Specific generation strategies within each engine
+- **Auto-detection**: Automatically selects best engine based on model type
+- **Per-request switching**: Change algorithms per request (within same engine)
+- **Validation**: Ensures engine/model compatibility
 
 ## Architecture
 
@@ -23,6 +24,12 @@ llada_generate/
 │   ├── basic.py            # Basic generation (no cache)
 │   ├── prefix_cache.py     # Prefix cache generation
 │   └── dual_cache.py       # Dual cache generation
+├── dinfer/                 # dInfer algorithms (inherit from DInferGeneration)
+│   ├── _imports.py         # Centralized dInfer imports from submodule
+│   ├── base.py             # DInferGeneration base (dInfer LLaDAModelLM + diffusion wrapper)
+│   ├── blockwise.py        # BlockWise with threshold decoder
+│   ├── hierarchy.py        # BlockWise with hierarchical decoder
+│   └── credit.py           # BlockWise with credit decoder
 ├── nemotron.py             # Nemotron native generation
 └── __init__.py             # Registry and public API
 ```
@@ -35,60 +42,76 @@ GenerationAlgorithm (base.py)
 │   ├── BasicGeneration
 │   ├── PrefixCacheGeneration
 │   └── DualCacheGeneration
+├── DInferGeneration (dinfer/base.py)
+│   ├── BlockWiseGeneration
+│   ├── HierarchyGeneration
+│   └── CreditGeneration
 └── NemotronGeneration (nemotron.py)
 ```
 
-### Built-in Algorithms
+### Engines & Algorithms
 
-| Algorithm | Name | Aliases | Description | Family |
-|-----------|------|---------|-------------|--------|
-| Basic | `basic` | `no_cache`, `simple` | Basic Fast-dLLM without caching | Fast-dLLM |
-| Prefix Cache | `prefix_cache` | `prefix`, `cache` | Fast-dLLM with prefix caching | Fast-dLLM |
-| Dual Cache | `dual_cache` | `dual`, `double_cache` | Fast-dLLM with dual caching | Fast-dLLM |
-| Nemotron | `nemotron` | `nemotron_native` | Native Nemotron diffusion | Nemotron |
+**Engines** determine the inference backend and model implementation:
 
-**Note**: Fast-dLLM algorithms require the Fast-dLLM submodule (`3rdparty/Fast-dLLM`). If unavailable, they gracefully report as unavailable.
+| Engine | Model Type | Model Class | Algorithms | Performance |
+|--------|------------|-------------|------------|-------------|
+| `fast-dllm` | LLaDA | Fast-dLLM LLaDAModelLM | basic, prefix_cache, dual_cache | Optimized |
+| `dinfer` | LLaDA | dInfer LLaDAModelLM | dinfer_blockwise, dinfer_hierarchy, dinfer_credit | 10x+ faster (recommended) |
+| `nemotron` | Nemotron | AutoModel | nemotron | Native |
+
+**Algorithms** are specific strategies within each engine:
+
+| Algorithm | Engine | Description | Default |
+|-----------|--------|-------------|---------|
+| `basic` | fast-dllm | Basic without caching | |
+| `prefix_cache` | fast-dllm | Prefix caching | |
+| `dual_cache` | fast-dllm | Dual caching | ✓ |
+| `dinfer_blockwise` | dinfer | Threshold decoder | ✓ |
+| `dinfer_hierarchy` | dinfer | Hierarchical decoder | |
+| `dinfer_credit` | dinfer | Credit threshold decoder | |
+| `nemotron` | nemotron | Native Nemotron | ✓ |
+
+**Engine Selection**:
+- LLaDA models: Auto-selects `dinfer` (or use `--engine fast-dllm`)
+- Nemotron models: Auto-selects `nemotron`
+- Validation ensures engine/model compatibility
 
 ## Usage
 
 ### Server Usage
 
-#### Per-Request Algorithm Selection (Recommended)
+#### Simple (Auto-detected Engine)
 ```bash
-# Start the server (no algorithm specified - algorithms chosen per request)
-python llada_batch_server.py --model-path /path/to/model
+# LLaDA - auto-selects dinfer engine
+python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct
 
-# Send requests with different algorithms
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "llada-8b-instruct",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "generation_algorithm": "basic"
-  }'
-
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "llada-8b-instruct", 
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "generation_algorithm": "prefix_cache"
-  }'
+# Nemotron - auto-selects nemotron engine
+python llada_batch_server.py --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 ```
 
-#### Legacy Cache Parameters (Still Supported)
+#### Explicit Engine Selection
 ```bash
-# Server startup remains the same
-python llada_batch_server.py --model-path /path/to/model
+# LLaDA with Fast-dLLM engine
+python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine fast-dllm
 
-# Requests using legacy cache parameters
+# LLaDA with specific algorithm
+python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine dinfer --algorithm dinfer_hierarchy
+```
+
+#### Per-Request Algorithm Switching (within same engine)
+```bash
+# Server loaded with dinfer engine
+python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine dinfer
+
+# Request 1: Use default (dinfer_blockwise)
 curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+
+# Request 2: Switch to hierarchy decoder
+curl -X POST http://localhost:8000/v1/chat/completions \
   -d '{
-    "model": "llada-8b-instruct",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "use_cache": true,
-    "use_dual_cache": true
+    "messages": [{"role": "user", "content": "Hello"}],
+    "generation_algorithm": "dinfer_hierarchy"
   }'
 ```
 

@@ -1,12 +1,37 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible API server for LLaDA and Nemotron models.
+⚠️ DEPRECATED: Please use llada_batch_server.py instead ⚠️
+
+This server is deprecated and no longer maintained. It lacks the following features:
+- Engine-based architecture (fast-dllm, dinfer, nemotron)
+- dInfer support (10x+ faster than Fast-dLLM)
+- Systematic model/engine validation
+- Per-request algorithm switching within same engine
+- Latest optimizations and bug fixes
+
+RECOMMENDED ALTERNATIVE:
+    Use llada_batch_server.py which supports:
+    - All features from this server
+    - Batch processing for 3-5x additional speedup
+    - Full engine architecture with dInfer support
+    - Better error handling and validation
+
+MIGRATION:
+    Old: python llada_openai_server.py --model-path /path/to/model
+    New: python llada_batch_server.py --model-path /path/to/model
+
+    The batch server is backward compatible with all OpenAI API clients.
+    Streaming is not supported, but most use cases don't need it.
+
+---
+
+OpenAI-compatible API server for LLaDA and Nemotron models (LEGACY VERSION).
 
 This server provides OpenAI API compatibility for diffusion language models:
 - LLaDA models with Fast-dLLM optimizations including KV cache and parallel decoding
 - Nemotron models with built-in diffusion generation
 
-Usage:
+Usage (DEPRECATED - use llada_batch_server.py):
     # For LLaDA models:
     python llada_openai_server.py --model-path /path/to/llada/checkpoint
     
@@ -543,7 +568,28 @@ async def list_generation_algorithms():
 def main():
     global model_type
     
-    parser = argparse.ArgumentParser(description="LLaDA/Nemotron OpenAI API Server")
+    # Print deprecation warning
+    logger.warning("=" * 80)
+    logger.warning("⚠️  DEPRECATION WARNING ⚠️")
+    logger.warning("=" * 80)
+    logger.warning("This server (llada_openai_server.py) is DEPRECATED.")
+    logger.warning("")
+    logger.warning("Please use llada_batch_server.py instead, which includes:")
+    logger.warning("  • Engine architecture (fast-dllm, dinfer, nemotron)")
+    logger.warning("  • dInfer support (10x+ faster than Fast-dLLM)")
+    logger.warning("  • Batch processing (3-5x additional speedup)")
+    logger.warning("  • Per-request algorithm switching")
+    logger.warning("  • Latest bug fixes and optimizations")
+    logger.warning("")
+    logger.warning("Migration:")
+    logger.warning("  Old: python llada_openai_server.py --model-path MODEL")
+    logger.warning("  New: python llada_batch_server.py --model-path MODEL")
+    logger.warning("=" * 80)
+    logger.warning("")
+    
+    parser = argparse.ArgumentParser(
+        description="⚠️ DEPRECATED - LLaDA/Nemotron OpenAI API Server (use llada_batch_server.py instead)"
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--model-path", help="Path to HuggingFace model")

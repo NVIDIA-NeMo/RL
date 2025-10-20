@@ -20,7 +20,8 @@ class NemotronGeneration(GenerationAlgorithm):
     def __init__(self):
         super().__init__(
             name="nemotron",
-            description="Native Nemotron diffusion generation using model's built-in generate method"
+            description="Native Nemotron diffusion generation using model's built-in generate method",
+            engine="nemotron"
         )
     
     def load_model_class(self, model_path: str, **kwargs) -> PreTrainedModel:

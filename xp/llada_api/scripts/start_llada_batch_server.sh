@@ -14,6 +14,8 @@ MODEL_PATH=""
 DCP_PATH=""
 BASE_MODEL="GSAI-ML/LLaDA-8B-Instruct"
 TEMP_DIR="/tmp/llada_hf_converted"
+ENGINE=""  # Auto-detected based on model type (LLaDA→dinfer, Nemotron→nemotron)
+ALGORITHM=""  # Optional specific algorithm within engine
 
 # Default values - Batch Processing
 SERVER_MODE="batch"  # "batch" or "streaming"
@@ -76,6 +78,14 @@ show_usage() {
     echo "  -b, --base-model MODEL  Base model name for DCP conversion (default: $BASE_MODEL)"
     echo "  -t, --temp-dir DIR      Temporary directory for DCP conversion (default: $TEMP_DIR)"
     echo ""
+    echo "Inference Engine Options:"
+    echo "  --engine ENGINE         Inference engine: fast-dllm, dinfer, nemotron"
+    echo "                          (default: auto-detected - dinfer for LLaDA, nemotron for Nemotron)"
+    echo "  --algorithm ALGO        Specific algorithm within engine (optional, uses engine default)"
+    echo "                          fast-dllm: basic, prefix_cache, dual_cache"
+    echo "                          dinfer: dinfer_blockwise, dinfer_hierarchy, dinfer_credit"
+    echo "                          nemotron: nemotron"
+    echo ""
     echo "Batch Processing Options (ignored with --streaming):"
     echo "  --batch-size SIZE       Maximum batch size (default: $BATCH_SIZE)"
     echo "  --max-wait-time TIME    Maximum time to wait for batch in seconds (default: $MAX_WAIT_TIME)"
@@ -100,30 +110,28 @@ show_usage() {
     echo ""
     echo "Examples:"
     echo ""
-    echo "  # Local batch server with HuggingFace model (recommended)"
-    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --batch-size 4"
+    echo "  # Local batch server with LLaDA (auto-selects dInfer - RECOMMENDED)"
+    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct"
     echo ""
-    echo "  # Local streaming server (original behavior)"
-    echo "  $0 --local --streaming --model-path GSAI-ML/LLaDA-8B-Instruct"
+    echo "  # Local with explicit Fast-dLLM engine"
+    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --engine fast-dllm"
     echo ""
-    echo "  # SLURM batch server with optimized settings"
+    echo "  # Local with specific algorithm"
+    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --algorithm dinfer_hierarchy"
+    echo ""
+    echo "  # Nemotron model (auto-selects nemotron engine)"
+    echo "  $0 --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0"
+    echo ""
+    echo "  # SLURM batch server (auto-selects engine)"
     echo "  export ACCOUNT=your_account"
-    echo "  $0 --model-path GSAI-ML/LLaDA-8B-Instruct --batch-size 16 --gpus 2 --mem 128G"
+    echo "  $0 --model-path GSAI-ML/LLaDA-8B-Instruct --batch-size 16 --gpus 2"
     echo ""
     echo "  # SLURM with DCP checkpoint"
     echo "  $0 --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct"
     echo ""
-    echo "  # High-throughput batch server"
-    echo "  $0 --local --model-path /path/to/model --batch-size 32 --max-wait-time 0.05"
-    echo ""
-    echo "  # Debug server with verbose logging"
-    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --verbose"
-    echo ""
-    echo "  # Server with raw text input (no chat template)"
-    echo "  $0 --local --model-path GSAI-ML/LLaDA-8B-Instruct --no-chat-template"
-    echo ""
     echo "Performance Tips:"
-    echo "  • Batch server provides 3-5x speedup for evaluation workloads"
+    echo "  • Engine auto-selects dInfer for LLaDA (10x+ faster than fast-dllm)"
+    echo "  • Batch server provides additional 3-5x speedup for evaluation workloads"
     echo "  • Increase --batch-size for higher throughput (requires more GPU memory)"
     echo "  • Decrease --max-wait-time for lower latency"
     echo "  • Use --streaming only if you need real-time streaming responses"
@@ -168,6 +176,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         -t|--temp-dir)
             TEMP_DIR="$2"
+            shift 2
+            ;;
+        # Engine options
+        --engine)
+            ENGINE="$2"
+            shift 2
+            ;;
+        --algorithm)
+            ALGORITHM="$2"
             shift 2
             ;;
         # Batch processing options
@@ -318,6 +335,16 @@ elif [[ -n "$DCP_PATH" ]]; then
     fi
 fi
 
+# Add engine argument (only if specified)
+if [[ -n "$ENGINE" ]]; then
+    LLADA_ARGS="$LLADA_ARGS --engine '$ENGINE'"
+fi
+
+# Add algorithm argument (only if specified)
+if [[ -n "$ALGORITHM" ]]; then
+    LLADA_ARGS="$LLADA_ARGS --algorithm '$ALGORITHM'"
+fi
+
 # Add batch-specific arguments
 if [[ "$SERVER_MODE" == "batch" ]]; then
     LLADA_ARGS="$LLADA_ARGS --batch-size '$BATCH_SIZE' --max-wait-time '$MAX_WAIT_TIME'"
@@ -380,7 +407,13 @@ run_local() {
     # Show server info
     if [[ "$SERVER_MODE" == "batch" ]]; then
         print_batch_info "Batch server configuration:"
-        echo "  • Server Type: BATCH PROCESSING (3-5x faster for evaluations)"
+        echo "  • Server Type: BATCH PROCESSING"
+        echo "  • Inference Engine: $ENGINE"
+        if [[ -n "$ALGORITHM" ]]; then
+            echo "  • Algorithm: $ALGORITHM"
+        else
+            echo "  • Algorithm: (engine default)"
+        fi
         echo "  • Batch Size: $BATCH_SIZE requests"
         echo "  • Max Wait Time: $MAX_WAIT_TIME seconds"
         echo "  • Host: $HOST"
@@ -390,14 +423,24 @@ run_local() {
         echo "  • Batch Stats: http://$HOST:$PORT/batch/stats"
         echo "  • API Docs: http://$HOST:$PORT/docs"
         echo ""
-        print_batch_info "Batch Processing Benefits:"
-        echo "  • 3-5x faster throughput for NeMo-Skills evaluations"
-        echo "  • Automatic request batching and optimization"
+        print_batch_info "Performance:"
+        if [[ "$ENGINE" == "dinfer" ]]; then
+            echo "  • dInfer engine: 10x+ faster than Fast-dLLM"
+        elif [[ "$ENGINE" == "fast-dllm" ]]; then
+            echo "  • Fast-dLLM engine: Optimized LLaDA inference"
+        fi
+        echo "  • Batch processing: 3-5x additional speedup for evaluations"
         echo "  • Compatible with all existing evaluation scripts"
         echo "  • Note: Streaming responses are not available in batch mode"
     else
         print_status "Streaming server configuration:"
         echo "  • Server Type: STREAMING (real-time responses)"
+        echo "  • Inference Engine: $ENGINE"
+        if [[ -n "$ALGORITHM" ]]; then
+            echo "  • Algorithm: $ALGORITHM"
+        else
+            echo "  • Algorithm: (engine default)"
+        fi
         echo "  • Host: $HOST"
         echo "  • Port: $PORT"
         echo "  • API Base URL: http://$HOST:$PORT"
@@ -448,6 +491,12 @@ run_slurm() {
     if [[ "$SERVER_MODE" == "batch" ]]; then
         print_batch_info "Batch server configuration:"
         echo "  • Server Type: BATCH PROCESSING"
+        echo "  • Inference Engine: $ENGINE"
+        if [[ -n "$ALGORITHM" ]]; then
+            echo "  • Algorithm: $ALGORITHM"
+        else
+            echo "  • Algorithm: (engine default)"
+        fi
         echo "  • Batch Size: $BATCH_SIZE requests"
         echo "  • Max Wait Time: $MAX_WAIT_TIME seconds"
         echo "  • Host: $HOST"
@@ -458,6 +507,18 @@ run_slurm() {
     else
         print_status "Streaming server configuration:"
         echo "  • Server Type: STREAMING"
+        if [[ -n "$ENGINE" ]]; then
+            echo "  • Inference Engine: $ENGINE"
+        else
+            echo "  • Inference Engine: (auto-detected from model type)"
+        fi
+        if [[ -n "$ALGORITHM" ]]; then
+            echo "  • Algorithm: $ALGORITHM"
+        else
+            echo "  • Algorithm: (engine default)"
+        fi
+        echo "  • Batch Size: $BATCH_SIZE requests"
+        echo "  • Max Wait Time: $MAX_WAIT_TIME seconds"
         echo "  • Host: $HOST"
         echo "  • Port: $PORT"
         echo "  • Compute node URL: http://\$SLURMD_NODENAME:$PORT (from within job)"
@@ -620,11 +681,36 @@ EOF
 echo "=============================================================="
 if [[ "$SERVER_MODE" == "batch" ]]; then
     print_batch_info "LLaDA BATCH Server Startup Script"
-    echo "  🚀 Launching BATCH server for 3-5x faster evaluation throughput"
+    echo "  🚀 Launching BATCH server for high-throughput inference"
+    if [[ -n "$ENGINE" ]]; then
+        echo "  ⚡ Engine: $ENGINE"
+        if [[ "$ENGINE" == "dinfer" ]]; then
+            echo "     (dInfer: 10x+ faster than Fast-dLLM)"
+        elif [[ "$ENGINE" == "fast-dllm" ]]; then
+            echo "     (Fast-dLLM: Optimized LLaDA inference)"
+        fi
+    else
+        echo "  ⚡ Engine: (auto-detected from model type)"
+    fi
+    if [[ -n "$ALGORITHM" ]]; then
+        echo "  🔧 Algorithm: $ALGORITHM"
+    else
+        echo "  🔧 Algorithm: (using engine default)"
+    fi
     echo "  📊 Batch size: $BATCH_SIZE | Max wait: ${MAX_WAIT_TIME}s"
 else
     print_status "LLaDA STREAMING Server Startup Script"
     echo "  🌊 Launching STREAMING server for real-time responses"
+    if [[ -n "$ENGINE" ]]; then
+        echo "  ⚡ Engine: $ENGINE"
+    else
+        echo "  ⚡ Engine: (auto-detected from model type)"
+    fi
+    if [[ -n "$ALGORITHM" ]]; then
+        echo "  🔧 Algorithm: $ALGORITHM"
+    else
+        echo "  🔧 Algorithm: (using engine default)"
+    fi
 fi
 
 if [[ "$LOCAL_MODE" == true ]]; then

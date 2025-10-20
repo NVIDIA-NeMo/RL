@@ -49,6 +49,9 @@ from llada_generate import (
     get_algorithm, 
     list_available_algorithms,
     list_algorithms,
+    list_algorithms_by_engine,
+    list_available_algorithms_by_engine,
+    get_default_algorithm_for_engine,
     GenerationAlgorithm
 )
 
@@ -62,22 +65,48 @@ default_algorithm = None  # The default algorithm instance to use
 model_type = None  # 'llada' or 'nemotron'
 
 
-def load_model_with_algorithm(model_path: str = None, dcp_path: str = None, base_model: str = None, temp_dir: str = "/tmp/model_hf_converted", algorithm_name: str = "dual_cache"):
+def load_model_with_engine(
+    model_path: str = None, 
+    dcp_path: str = None, 
+    base_model: str = None, 
+    temp_dir: str = "/tmp/model_hf_converted", 
+    engine: str = "fast-dllm",
+    algorithm_name: str = None
+):
     """
-    Load model using the generation algorithm registry.
-    This replaces the old load_model_from_hf and load_model_from_dcp functions.
+    Load model using the specified inference engine.
+    
+    Engines determine which model/generation backend to use:
+    - 'fast-dllm': Fast-dLLM for LLaDA models
+    - 'dinfer': dInfer for LLaDA models (10x+ faster)
+    - 'nemotron': Native Nemotron generation
+    - 'hf': Standard HuggingFace (fallback)
     
     Args:
         model_path: Path to HuggingFace model (optional)
         dcp_path: Path to DCP checkpoint (optional)
         base_model: Base model name for DCP conversion
         temp_dir: Temporary directory for DCP conversion
-        algorithm_name: Name of the algorithm to use for loading
+        engine: Inference engine to use ('fast-dllm', 'dinfer', 'nemotron', 'hf')
+        algorithm_name: Specific algorithm within engine (optional, uses default if not specified)
         
     Returns:
         True if successful, False otherwise
     """
     global algorithm_instances, default_algorithm, model_type
+    
+    # Determine which algorithm to use
+    if algorithm_name is None:
+        algorithm_name = get_default_algorithm_for_engine(engine)
+        if algorithm_name is None:
+            logger.error(f"No default algorithm found for engine '{engine}'")
+            available = list_available_algorithms_by_engine(engine)
+            if available:
+                logger.error(f"Available algorithms for {engine}: {available}")
+            else:
+                logger.error(f"No algorithms available for engine '{engine}'")
+            return False
+        logger.info(f"Using default algorithm '{algorithm_name}' for engine '{engine}'")
     
     # Get the algorithm from the registry
     algorithm = get_algorithm(algorithm_name)
@@ -85,11 +114,17 @@ def load_model_with_algorithm(model_path: str = None, dcp_path: str = None, base
         logger.error(f"Unknown generation algorithm: {algorithm_name}")
         return False
     
-    if not algorithm.is_available():
-        logger.error(f"Generation algorithm '{algorithm_name}' is not available")
+    # Verify algorithm matches the requested engine
+    if algorithm.engine != engine:
+        logger.error(f"Algorithm '{algorithm_name}' is for engine '{algorithm.engine}', not '{engine}'")
+        logger.error(f"Available algorithms for engine '{engine}': {list_available_algorithms_by_engine(engine)}")
         return False
     
-    logger.info(f"Loading model with {algorithm.name} algorithm: {algorithm.description}")
+    if not algorithm.is_available():
+        logger.error(f"Generation algorithm '{algorithm_name}' (engine: {engine}) is not available")
+        return False
+    
+    logger.info(f"Loading model with engine '{engine}', algorithm '{algorithm.name}': {algorithm.description}")
     
     # Load the model using the algorithm
     try:
@@ -109,31 +144,38 @@ def load_model_with_algorithm(model_path: str = None, dcp_path: str = None, base
         default_algorithm = algorithm
         model_type = algorithm.model_type
         
-        logger.info(f"Model loaded successfully with {algorithm_name} algorithm!")
+        logger.info(f"Model loaded successfully with engine '{engine}', algorithm '{algorithm_name}'!")
         logger.info(f"Model type: {model_type}")
         
-        # Also load models for other compatible algorithms (shared model/tokenizer)
-        # This allows switching between algorithms without reloading
-        _load_other_algorithms(algorithm)
+        # Also load other algorithms from the SAME engine (shared model/tokenizer)
+        # This allows switching between algorithms within the same engine
+        _load_other_algorithms_same_engine(algorithm)
         
         return True
         
     except Exception as e:
-        logger.error(f"Failed to load model with algorithm '{algorithm_name}': {e}")
+        logger.error(f"Failed to load model with engine '{engine}', algorithm '{algorithm_name}': {e}")
         return False
 
 
-def _load_other_algorithms(source_algorithm: GenerationAlgorithm):
+def _load_other_algorithms_same_engine(source_algorithm: GenerationAlgorithm):
     """
-    Load other compatible algorithms using the same model and tokenizer.
-    This allows algorithm switching without reloading the model.
+    Load other algorithms from the SAME engine using the same model and tokenizer.
+    
+    This allows switching between algorithms within an engine without reloading.
+    Different engines use different model classes, so we only share within the same engine.
+    
+    Example:
+    - If loading with 'dinfer' engine, also load other dinfer algorithms
+    - If loading with 'fast-dllm' engine, also load other fast-dllm algorithms
+    - DON'T mix dinfer and fast-dllm (they use different LLaDAModelLM classes)
     """
     global algorithm_instances
     
-    # Get all available algorithms
-    all_algorithms = list_algorithms()
+    # Get all algorithms from the same engine
+    same_engine_algorithms = list_algorithms_by_engine(source_algorithm.engine)
     
-    for algo_name in all_algorithms:
+    for algo_name in same_engine_algorithms:
         if algo_name in algorithm_instances:
             continue  # Already loaded
         
@@ -142,19 +184,76 @@ def _load_other_algorithms(source_algorithm: GenerationAlgorithm):
             continue
         
         # Share the model, tokenizer, and config from the source algorithm
+        # This is safe because they're all from the same engine
         algo.model = source_algorithm.model
         algo.tokenizer = source_algorithm.tokenizer
         algo.device = source_algorithm.device
         algo.model_config = source_algorithm.model_config
         algo.model_type = source_algorithm.model_type
         
+        # For dInfer algorithms, create their own diffusion_llm wrapper
+        # (each algorithm has a different decoder, so they can't share diffusion_llm)
+        if hasattr(algo, 'create_diffusion_llm') and algo.diffusion_llm is None:
+            try:
+                algo.diffusion_llm = algo.create_diffusion_llm()
+                logger.info(f"Created diffusion LLM wrapper for {algo_name}")
+            except Exception as e:
+                logger.warning(f"Failed to create diffusion LLM for {algo_name}: {e}")
+                continue  # Skip this algorithm
+        
         algorithm_instances[algo_name] = algo
-        logger.info(f"Loaded {algo_name} algorithm (shared model with {source_algorithm.name})")
+        logger.info(f"Loaded {algo_name} algorithm from same engine '{source_algorithm.engine}' (shared model with {source_algorithm.name})")
 
 
 def get_algorithm_instance(algorithm_name: str) -> Optional[GenerationAlgorithm]:
-    """Get a loaded algorithm instance by name."""
-    return algorithm_instances.get(algorithm_name, default_algorithm)
+    """Get a loaded algorithm instance by name (returns None if not found)."""
+    return algorithm_instances.get(algorithm_name, None)
+
+
+def detect_model_type(model_path: str = None, base_model: str = None) -> str:
+    """
+    Detect model type from model path or base model name.
+    
+    Args:
+        model_path: Path to model (optional)
+        base_model: Base model name (optional)
+        
+    Returns:
+        'nemotron' or 'llada'
+    """
+    model_identifier = model_path or base_model or ""
+    
+    if "nemotron" in model_identifier.lower():
+        return "nemotron"
+    else:
+        return "llada"
+
+
+def validate_engine_for_model_type(model_type: str, engine: str) -> None:
+    """
+    Validate that the engine is compatible with the model type.
+    Raises ValueError if incompatible.
+    
+    Args:
+        model_type: Model type ('llada' or 'nemotron')
+        engine: Inference engine ('fast-dllm', 'dinfer', 'nemotron')
+        
+    Raises:
+        ValueError: If engine is incompatible with model type
+    """
+    # Define valid engine combinations
+    valid_engines = {
+        'llada': ['fast-dllm', 'dinfer'],
+        'nemotron': ['nemotron']
+    }
+    
+    allowed = valid_engines.get(model_type, [])
+    
+    if engine not in allowed:
+        raise ValueError(
+            f"Incompatible engine '{engine}' for {model_type} model. "
+            f"Valid engines for {model_type}: {allowed}"
+        )
 
 
 
@@ -280,11 +379,32 @@ class BatchProcessor:
                 request = batch_req.request
                 
                 # Determine generation algorithm for this request
-                # For Nemotron models, default to "nemotron" algorithm
-                if model_type == "nemotron":
-                    algorithm_name = request.generation_algorithm or "nemotron"
+                if request.generation_algorithm:
+                    # User specified an algorithm - validate it
+                    algorithm_name = request.generation_algorithm
+                    logger.debug(f"Request specified algorithm: {algorithm_name}")
+                    
+                    # Validate that the requested algorithm is loaded
+                    requested_algo = get_algorithm_instance(algorithm_name)
+                    if requested_algo is None:
+                        error_msg = f"Algorithm '{algorithm_name}' is not loaded. Available algorithms: {list(algorithm_instances.keys())}"
+                        logger.error(error_msg)
+                        raise HTTPException(status_code=400, detail=error_msg)
+                    
+                    if requested_algo.engine != default_algorithm.engine:
+                        error_msg = f"Algorithm '{algorithm_name}' is from engine '{requested_algo.engine}', but server is loaded with engine '{default_algorithm.engine}'. Available algorithms for this server: {list(algorithm_instances.keys())}"
+                        logger.error(error_msg)
+                        raise HTTPException(status_code=400, detail=error_msg)
+                    
+                    logger.info(f"✓ Using requested algorithm '{algorithm_name}' from engine '{requested_algo.engine}'")
                 else:
-                    algorithm_name = request.generation_algorithm or "dual_cache"
+                    # No algorithm specified - use the default algorithm from the loaded engine
+                    algorithm_name = default_algorithm.name if default_algorithm else None
+                    if algorithm_name is None:
+                        error_msg = "No default algorithm available and none specified in request"
+                        logger.error(error_msg)
+                        raise HTTPException(status_code=500, detail=error_msg)
+                    logger.debug(f"No algorithm specified, using default: {algorithm_name}")
                 
                 # Group by algorithm
                 if algorithm_name not in algorithm_groups:
@@ -301,7 +421,7 @@ class BatchProcessor:
                 group_indices = [idx for idx, _ in group_requests]
                 group_batch_requests = [req for _, req in group_requests]
                 
-                logger.info(f"Processing {len(group_batch_requests)} requests with {algorithm_name} algorithm")
+                logger.info(f"🔧 Processing {len(group_batch_requests)} requests with algorithm '{algorithm_name}' (engine: {get_algorithm_instance(algorithm_name).engine if get_algorithm_instance(algorithm_name) else 'unknown'})")
                 
                 try:
                     group_results = await self._process_algorithm_group(algorithm_name, group_batch_requests)
@@ -379,20 +499,40 @@ class BatchProcessor:
                 # Determine whether to use chat template
                 use_chat_template = not (hasattr(app.state, 'no_chat_template') and app.state.no_chat_template)
                 
-                if use_chat_template:
-                    # Use algorithm's tokenization with chat template
-                    batch_input_ids = algorithm.tokenize_prompts(
-                        prompts=[],  # Empty since we're using messages
-                        apply_chat_template=True,
-                        messages=batch_messages
-                    )
+                # Check if this is a dInfer algorithm (has tokenize_prompts_dinfer)
+                is_dinfer = hasattr(algorithm, 'tokenize_prompts_dinfer')
+                
+                if is_dinfer:
+                    # dInfer uses different tokenization (left-padding, returns attention_mask)
+                    if use_chat_template:
+                        batch_input_ids, attention_mask = algorithm.tokenize_prompts_dinfer(
+                            prompts=[],
+                            apply_chat_template=True,
+                            messages=batch_messages
+                        )
+                    else:
+                        batch_input_ids, attention_mask = algorithm.tokenize_prompts_dinfer(
+                            prompts=batch_prompts,
+                            apply_chat_template=False,
+                            messages=None
+                        )
+                    logger.debug(f"dInfer tokenization: input_ids.shape={batch_input_ids.shape}, attention_mask={attention_mask is not None}")
                 else:
-                    # Use algorithm's tokenization without chat template
-                    batch_input_ids = algorithm.tokenize_prompts(
-                        prompts=batch_prompts,
-                        apply_chat_template=False,
-                        messages=None
-                    )
+                    # Fast-dLLM/Nemotron use standard tokenization (right-padding, no attention_mask)
+                    if use_chat_template:
+                        batch_input_ids = algorithm.tokenize_prompts(
+                            prompts=[],
+                            apply_chat_template=True,
+                            messages=batch_messages
+                        )
+                    else:
+                        batch_input_ids = algorithm.tokenize_prompts(
+                            prompts=batch_prompts,
+                            apply_chat_template=False,
+                            messages=None
+                        )
+                    attention_mask = None
+                    logger.debug(f"Standard tokenization: input_ids.shape={batch_input_ids.shape}")
                 
                 logger.debug(f"Batch input shape: {batch_input_ids.shape}")
                 
@@ -491,7 +631,13 @@ class BatchProcessor:
             
             # Use algorithm's decode_outputs method
             try:
-                generated_texts = algorithm.decode_outputs(output, prompt_lengths)
+                # Check if this is a dInfer algorithm (different decode signature)
+                if is_dinfer:
+                    # dInfer needs input_ids to calculate prompt lengths (handles left-padding)
+                    generated_texts = algorithm.decode_outputs_dinfer(output, batch_input_ids)
+                else:
+                    # Fast-dLLM/Nemotron use prompt_lengths
+                    generated_texts = algorithm.decode_outputs(output, prompt_lengths)
                 
                 for i, (batch_req, generated_text) in enumerate(zip(batch_requests, generated_texts)):
                     logger.debug(f"  Processing response {i}/{len(batch_requests)}")
@@ -508,7 +654,12 @@ class BatchProcessor:
                     created = int(time.time())
                     
                     # Calculate token usage
-                    input_tokens = prompt_lengths[i]
+                    if is_dinfer:
+                        # For dInfer, calculate actual prompt length (excluding padding)
+                        input_tokens = (batch_input_ids[i] != algorithm.tokenizer.pad_token_id).sum().item()
+                    else:
+                        input_tokens = prompt_lengths[i]
+                    
                     output_tokens = output.shape[1] - input_tokens
                     total_tokens = input_tokens + output_tokens
                     
@@ -530,7 +681,7 @@ class BatchProcessor:
                         }
                     )
                     results.append(response)
-                    
+            
             except Exception as e:
                 import traceback
                 logger.error(f"❌ Failed to decode responses:")
@@ -643,17 +794,29 @@ async def health_check():
     """Health check endpoint."""
     available_algorithms = list_available_algorithms()
     loaded_algorithms = list(algorithm_instances.keys())
+    loaded_engine = default_algorithm.engine if default_algorithm else None
+    
+    # Get algorithms by engine
+    engines_info = {}
+    for engine in ['fast-dllm', 'dinfer', 'nemotron']:
+        available_for_engine = list_available_algorithms_by_engine(engine)
+        engines_info[engine] = {
+            'available': available_for_engine,
+            'count': len(available_for_engine),
+            'loaded': loaded_engine == engine
+        }
+    
     return {
         "status": "healthy",
         "model_loaded": default_algorithm is not None and default_algorithm.model is not None,
         "model_type": model_type,
         "device": default_algorithm.device if default_algorithm else None,
+        "engine": loaded_engine,
+        "default_algorithm": default_algorithm.name if default_algorithm else None,
         "batch_processor_active": batch_processor is not None,
         "pending_requests": len(batch_processor.pending_requests) if batch_processor else 0,
-        "available_generation_algorithms": available_algorithms,
-        "loaded_generation_algorithms": loaded_algorithms,
-        "total_generation_algorithms": len(list_algorithms()),
-        "default_algorithm": "nemotron" if model_type == "nemotron" else "dual_cache",
+        "loaded_algorithms": loaded_algorithms,
+        "engines": engines_info,
         "chat_template_enabled": not (hasattr(app.state, 'no_chat_template') and app.state.no_chat_template)
     }
 
@@ -689,7 +852,29 @@ async def list_generation_algorithms():
 def main():
     global model_type
     
-    parser = argparse.ArgumentParser(description="LLaDA/Nemotron Batch OpenAI API Server")
+    parser = argparse.ArgumentParser(
+        description="LLaDA/Nemotron Batch OpenAI API Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Engine Options:
+  fast-dllm    Fast-dLLM inference for LLaDA models (algorithms: basic, prefix_cache, dual_cache)
+  dinfer       dInfer inference for LLaDA models - 10x+ faster (algorithms: dinfer_blockwise, dinfer_hierarchy, dinfer_credit)
+  nemotron     Native Nemotron generation (algorithm: nemotron)
+
+Examples:
+  # LLaDA with dInfer (recommended for best performance)
+  python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine dinfer
+  
+  # LLaDA with Fast-dLLM
+  python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine fast-dllm
+  
+  # LLaDA with specific algorithm
+  python llada_batch_server.py --model-path GSAI-ML/LLaDA-8B-Instruct --engine dinfer --algorithm dinfer_hierarchy
+  
+  # Nemotron
+  python llada_batch_server.py --model-path nvidia/Nemotron-Diffusion-Research-4B-v0 --engine nemotron
+        """
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--model-path", help="Path to HuggingFace model")
@@ -698,8 +883,11 @@ def main():
                        help="Base model name for DCP conversion (e.g., GSAI-ML/LLaDA-8B-Instruct, nvidia/Nemotron-Diffusion-Research-4B-v0)")
     parser.add_argument("--temp-dir", default="/tmp/model_hf_converted",
                        help="Temporary directory for DCP conversion")
-    parser.add_argument("--algorithm", default="dual_cache",
-                       help="Generation algorithm to use for loading the model (basic, prefix_cache, dual_cache, nemotron)")
+    parser.add_argument("--engine", default=None,
+                       choices=['fast-dllm', 'dinfer', 'nemotron'],
+                       help="Inference engine to use (default: auto-detected based on model type)")
+    parser.add_argument("--algorithm", default=None,
+                       help="Specific algorithm within engine (optional, uses engine default if not specified)")
     parser.add_argument("--batch-size", type=int, default=8, 
                        help="Maximum batch size for processing requests")
     parser.add_argument("--max-wait-time", type=float, default=0.1,
@@ -718,20 +906,46 @@ def main():
     else:
         logging.getLogger().setLevel(logging.INFO)
     
-    # Determine algorithm to use based on model type if not explicitly specified
-    if args.algorithm == "dual_cache" and args.base_model and "nemotron" in args.base_model.lower():
-        args.algorithm = "nemotron"
-        logger.info(f"Auto-detected Nemotron model, switching to 'nemotron' algorithm")
-    elif args.algorithm == "dual_cache" and args.model_path and "nemotron" in args.model_path.lower():
-        args.algorithm = "nemotron"
-        logger.info(f"Auto-detected Nemotron model, switching to 'nemotron' algorithm")
+    # Detect model type
+    detected_model_type = detect_model_type(
+        model_path=args.model_path,
+        base_model=args.base_model
+    )
+    logger.info(f"Detected model type: {detected_model_type}")
     
-    # Load model using the new algorithm-based loading
-    success = load_model_with_algorithm(
+    # Auto-select engine if not specified
+    if args.engine is None:
+        if detected_model_type == "llada":
+            args.engine = "dinfer"  # Default to dInfer for LLaDA (10x+ faster)
+            logger.info(f"Auto-selected engine 'dinfer' for {detected_model_type} model (10x+ faster than fast-dllm)")
+        elif detected_model_type == "nemotron":
+            args.engine = "nemotron"
+            logger.info(f"Auto-selected engine 'nemotron' for {detected_model_type} model")
+    else:
+        # Engine was explicitly specified - validate compatibility
+        logger.info(f"User specified engine: {args.engine}")
+        try:
+            validate_engine_for_model_type(detected_model_type, args.engine)
+            logger.info(f"✓ Engine '{args.engine}' is compatible with {detected_model_type} model")
+        except ValueError as e:
+            logger.error(str(e))
+            logger.error(f"\nPlease use a compatible engine:")
+            if detected_model_type == "llada":
+                logger.error("  For LLaDA models:")
+                logger.error("    --engine dinfer      (recommended, 10x+ faster)")
+                logger.error("    --engine fast-dllm   (alternative)")
+            elif detected_model_type == "nemotron":
+                logger.error("  For Nemotron models:")
+                logger.error("    --engine nemotron    (required)")
+            return
+    
+    # Load model using the engine-based loading
+    success = load_model_with_engine(
         model_path=args.model_path,
         dcp_path=args.dcp_path,
         base_model=args.base_model,
         temp_dir=args.temp_dir,
+        engine=args.engine,
         algorithm_name=args.algorithm
     )
     
@@ -742,10 +956,14 @@ def main():
     # Log available and loaded generation algorithms
     available_algorithms = list_available_algorithms()
     loaded_algorithms = list(algorithm_instances.keys())
-    logger.info(f"Available generation algorithms: {available_algorithms}")
-    logger.info(f"Loaded generation algorithms: {loaded_algorithms}")
+    loaded_engine = default_algorithm.engine if default_algorithm else None
+    
+    logger.info(f"Loaded engine: {loaded_engine}")
+    logger.info(f"Available algorithms (all engines): {available_algorithms}")
+    logger.info(f"Loaded algorithms (engine '{loaded_engine}'): {loaded_algorithms}")
+    
     if not available_algorithms:
-        logger.warning("No generation algorithms are available. Check Fast-dLLM installation.")
+        logger.warning("No generation algorithms are available. Check Fast-dLLM/dInfer installation.")
     
     # Store batch configuration in app state
     app.state.batch_size = args.batch_size
@@ -753,8 +971,9 @@ def main():
     app.state.no_chat_template = args.no_chat_template
     
     logger.info(f"Starting batch server on {args.host}:{args.port}")
-    logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
+    logger.info(f"Engine: {loaded_engine}")
     logger.info(f"Default algorithm: {default_algorithm.name if default_algorithm else 'None'}")
+    logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
     if args.no_chat_template:
         logger.info("Chat template disabled - using raw text input")
     else:
