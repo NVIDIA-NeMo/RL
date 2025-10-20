@@ -1593,6 +1593,11 @@ def validate(
                     greedy=False,
                 )
             else:
+                num_val_generations = master_config["grpo"].get(
+                    "num_val_generations_per_prompt", 1
+                )
+                if num_val_generations > 1:
+                    val_batch = val_batch.repeat_interleave(num_val_generations)
                 val_batch, gen_metrics = run_multi_turn_rollout(
                     policy_generation,
                     val_batch,
