@@ -11,3 +11,6 @@
 [submodule "3rdparty/Fast-dLLM"]
 	path = 3rdparty/Fast-dLLM
 	url = git@github.com:MahanFathi/Fast-dLLM.git
+[submodule "3rdparty/dInfer"]
+	path = 3rdparty/dInfer
+	url = git@github.com:inclusionAI/dInfer.git
