@@ -302,6 +302,8 @@ class BaseVllmGenerationWorker:
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
+            # Set in nemo_rl.models.generation.configure_generation_config
+            skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
