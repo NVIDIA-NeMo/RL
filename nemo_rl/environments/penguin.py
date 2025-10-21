@@ -64,16 +64,18 @@ class Penguin(EnvironmentInterface):
         )
 
         # Get Ray head node address if Ray is initialized
-        if ray.is_initialized():
-            try:
-                ray_context = ray.get_runtime_context()
-                if ray_context.gcs_address:
-                    initial_global_config_dict["ray_head_node_address"] = (
-                        ray_context.gcs_address
-                    )
-                    print(f"Ray head node address: {ray_context.gcs_address}")
-            except Exception as e:
-                print(f"Could not get Ray head node address: {e}")
+        assert ray.is_initialized(), (
+            "Ray must be initialized before using Penguin environment"
+        )
+        try:
+            ray_context = ray.get_runtime_context()
+            if ray_context.gcs_address:
+                initial_global_config_dict["ray_head_node_address"] = (
+                    ray_context.gcs_address
+                )
+                print(f"Ray head node address: {ray_context.gcs_address}")
+        except Exception as e:
+            print(f"Could not get Ray head node address: {e}")
 
         print(
             f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]}.
