@@ -674,6 +674,8 @@ def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
             "disable_ppo_ratio": False,
             "use_on_policy_kl_approximation": False,
             "use_importance_sampling_correction": False,
+            "truncated_importance_sampling_ratio": None,
+            "sequence_level_importance_ratios": False,
             "token_level_loss": True,
         }
     )

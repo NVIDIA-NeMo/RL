@@ -211,6 +211,7 @@ def convert_dcp_to_hf(
     model_name_or_path: str,
     tokenizer_name_or_path: str,
     overwrite: bool = False,
+    hf_overrides: Optional[dict[str, Any]] = {},
 ) -> str:
     """Convert a Torch DCP checkpoint to a Hugging Face checkpoint.
 
@@ -247,7 +248,9 @@ def convert_dcp_to_hf(
     )
     torch.save(state_dict["model"], weights_path)
 
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=True, **hf_overrides
+    )
     config.save_pretrained(hf_ckpt_path)
 
     # TODO: After the following PR gets merged:
