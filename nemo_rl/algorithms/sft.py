@@ -463,7 +463,7 @@ def sft_train(
                     )
 
                     if is_dqwn:
-                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=-1)
+                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=151662)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass
