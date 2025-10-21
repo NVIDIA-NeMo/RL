@@ -19,8 +19,8 @@ import unittest.mock
 
 import pytest
 import torch
-
 import zmq
+
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
