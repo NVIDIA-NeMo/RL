@@ -15,10 +15,13 @@ import gc
 from typing import Any
 
 import torch
-import zmq
-from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+import zmq
+from nemo_rl.models.policy.utils import (
+    IPCProtocol,
+    calculate_aligned_size,
+    rebuild_cuda_tensor_from_ipc,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
@@ -31,25 +34,6 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
-
-
-def rebuild_cuda_tensor_from_ipc(
-    cuda_ipc_handle: tuple, device_id: int
-) -> torch.Tensor:
-    """Rebuild a CUDA tensor from an IPC handle.
-
-    Args:
-        cuda_ipc_handle: Tuple containing the CUDA IPC handle data
-        device_id: Target CUDA device ID
-
-    Returns:
-        Reconstructed CUDA tensor on the target device
-    """
-    func = rebuild_cuda_tensor
-    args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
-    return func(*list_args)
 
 
 class VllmInternalWorkerExtension:

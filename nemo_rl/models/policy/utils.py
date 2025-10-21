@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Dict
 
 import torch
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -393,3 +394,14 @@ def stream_weights_via_ipc_zmq_impl(
         # Force garbage collection and clear CUDA cache
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def rebuild_cuda_tensor_from_ipc(
+    cuda_ipc_handle: tuple, device_id: int
+) -> torch.Tensor:
+    """Rebuild a CUDA tensor from an IPC handle."""
+    func = rebuild_cuda_tensor
+    args = cuda_ipc_handle[0]
+    list_args = list(args)
+    list_args[6] = device_id
+    return func(*list_args)
