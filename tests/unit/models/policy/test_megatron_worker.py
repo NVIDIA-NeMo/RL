@@ -20,7 +20,12 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, DPOLossFn, NLLLoss
+from nemo_rl.algorithms.loss_functions import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    DPOLossFn,
+    NLLLoss,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -28,6 +33,19 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from tests.unit.test_utils import SimpleLoss
+
+basic_pg_loss_test_config: ClippedPGLossConfig = {
+    "ratio_clip_min": 0.2,
+    "ratio_clip_max": 0.2,
+    "ratio_clip_c": None,
+    "reference_policy_kl_penalty": 0.1,
+    "disable_ppo_ratio": False,
+    "use_on_policy_kl_approximation": False,
+    "use_importance_sampling_correction": False,
+    "truncated_importance_sampling_ratio": None,
+    "sequence_level_importance_ratios": False,
+    "token_level_loss": True,
+}
 
 
 def create_megatron_test_config(
@@ -788,18 +806,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
 
     # Test loss functions
     nll_loss_fn = NLLLoss()
-    pg_loss_fn = ClippedPGLossFn(
-        {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "reference_policy_kl_penalty": 0.1,
-            "disable_ppo_ratio": False,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "token_level_loss": True,
-        }
-    )
+    pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     policy1.prepare_for_training()
     mbs1_nll_results = policy1.train(data, nll_loss_fn)
@@ -2052,18 +2059,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
 
     # Create ClippedPG loss function
-    loss_fn = ClippedPGLossFn(
-        {
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": None,
-            "reference_policy_kl_penalty": 0.1,
-            "disable_ppo_ratio": False,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "token_level_loss": True,
-        }
-    )
+    loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
 
     # Train non-CP model
     policy_no_cp.prepare_for_training()

@@ -35,6 +35,7 @@ loss_fn:
   ratio_clip_c: null
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
   token_level_loss: true
 checkpointing:
   enabled: true
