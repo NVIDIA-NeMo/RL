@@ -752,6 +752,8 @@ def refit_policy_generation(
             if _refit_buffer_size_gb is not None:
                 buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
             else:
+                # Empirically sets ratio as 30% to maximize efficiency.
+                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
                 memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
                 buffer_size_bytes = int(
                     policy.get_free_memory_bytes() * float(memory_ratio)
