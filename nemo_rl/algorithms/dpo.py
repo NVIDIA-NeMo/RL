@@ -176,6 +176,7 @@ def setup(
             add_loss_mask=True,
         ),
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -198,6 +199,7 @@ def setup(
                 add_loss_mask=True,
             ),
             drop_last=False,
+            num_workers=data_config["num_workers"],
         )
         for k, v in val_dataset.items()
     }
@@ -232,6 +234,7 @@ def setup(
             for k in policy_config["megatron_cfg"]["scheduler"]:
                 if "iters" in k:
                     policy_config["megatron_cfg"]["scheduler"][k] *= 2
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
@@ -726,8 +729,13 @@ def dpo_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= master_config["dpo"]["max_num_steps"]:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1

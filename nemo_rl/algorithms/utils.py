@@ -554,6 +554,15 @@ def print_performance_metrics(
             )
 
     # =====================================================
+    # Clean up metrics
+    # =====================================================
+
+    # Clean up metrics to avoid wandb logging errors
+    # Dict structures cannot be logged to wandb
+    if "per_worker_token_counts" in metrics:
+        del metrics["per_worker_token_counts"]
+
+    # =====================================================
     # Logging
     # =====================================================
 
