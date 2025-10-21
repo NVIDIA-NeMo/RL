@@ -327,9 +327,6 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
 
-> [!NOTE]
-> Distillation currently supports the DTensor and vLLM generation backend. Megatron generation/training paths are not supported yet.
-
 ### On-policy Distillation Single Node
 
 To run on-policy distillation on a single GPU using `Qwen/Qwen3-1.7B-Base` as the student and `Qwen/Qwen3-4B` as the teacher:
