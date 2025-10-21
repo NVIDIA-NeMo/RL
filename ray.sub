@@ -252,7 +252,6 @@ ray start --head \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
-    --dashboard-grpc-port=${DASHBOARD_GRPC_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \

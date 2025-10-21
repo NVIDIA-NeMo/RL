@@ -61,9 +61,7 @@ from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.custom_fsdp import (
-    FullyShardedDataParallel as custom_FSDP,
-)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.inference.engines import (
     StaticInferenceEngine,
 )
@@ -90,9 +88,9 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.inference.text_generation.mcore_engine_server import (
-    run_mcore_engine,
-)
+#from megatron.inference.text_generation.mcore_engine_server import (
+#    run_mcore_engine,
+#)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
@@ -262,7 +260,6 @@ def setup_megatron_model(
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
-<<<<<<< HEAD
         # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
         # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
         def re_enable_float32_expert_bias(megatron_model):
@@ -275,10 +272,8 @@ def setup_megatron_model(
                 for layer in model_module.decoder.layers:
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router._maintain_float32_expert_bias()
-=======
         mixed_precision_wrapper = CustomFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
->>>>>>> 40979a31 (update to use mixed_precision_wrapper api)
 
     # If deferring fp32 logits, disable mixed-precision wrapper entirely
     if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
@@ -1173,7 +1168,7 @@ class MegatronPolicyWorker:
                 input_ids = data_dict["input_ids"]
                 input_ids_cp_sharded = input_ids
                 attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                    input_ids, 0, False, False, False
+                    input_ids, 0, 0, False, False, False, False
                 )
                 packed_seq_params = None
                 unpacked_input_ids = input_ids
@@ -1562,6 +1557,10 @@ class MegatronPolicyWorker:
                     ),
                 )
             )
+        #print(f'{[p[0] for p in param_info]=}')
+
+        ## number of weights returned
+        print(f'{len(param_info)=}')
         return param_info
 
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_weights_for_ipc")
@@ -1600,6 +1599,11 @@ class MegatronPolicyWorker:
             self._held_gather_buffer = None
 
         # extract the conversion tasks in this pack
+        ### could this be the problem?? conversion_tasks doesn't cover all the indices?
+        ## it looks like these are okay ... 
+        if torch.distributed.get_rank() == 0:
+            print(f'{keys=}')
+
         conversion_tasks = self.refit_conversion_tasks[
             self.refit_conversion_tasks_current_index : self.refit_conversion_tasks_current_index
             + len(keys)
@@ -1612,6 +1616,10 @@ class MegatronPolicyWorker:
             conversion_tasks=conversion_tasks,
         )
         gathered_hf_params = {name: tensor for name, tensor in hf_params_generator}
+
+        if torch.distributed.get_rank() == 0:
+            print(f'{[n for n in gathered_hf_params]=}')
+            #print(f'{self.model.state_dict().keys()=}')
 
         # Get device UUID for IPC handles
         device_uuid = self.report_device_id()
@@ -1804,7 +1812,7 @@ class MegatronPolicyWorker:
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
-        elif isinstance(model, custom_FSDP):
+        elif isinstance(model, megatron_FSDP):
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":

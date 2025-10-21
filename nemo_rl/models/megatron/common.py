@@ -333,7 +333,7 @@ def forward_step_arbitrary_loss(
         else:
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                input_ids, 0, False, False, False
+                input_ids, 0, 0, False, False, False, False
             )
 
     with straggler_timer:

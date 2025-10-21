@@ -459,6 +459,7 @@ def refit_policy_generation(
                 f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups",
                 flush=True,
             )
+            print(f'{sum(len(k) for k in grouped_param_keys)=}')
             # do update
             for keys in grouped_param_keys:
                 ipc_handles = policy.get_weights_ipc_handles(keys)
