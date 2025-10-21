@@ -11,6 +11,9 @@
 * [9/25/2025] On-policy Distillation (Qwen3-style)
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 
+
+
+
 <details>
 <summary>Previous News</summary>
   
@@ -29,6 +32,8 @@
 ## Overview
 
 **Nemo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+
+![Image](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/snowmanwwg-patch-4/docs/assets/RL_diagram.png)
 
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
