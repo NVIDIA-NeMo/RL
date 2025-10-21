@@ -11,9 +11,6 @@
 * [9/25/2025] On-policy Distillation (Qwen3-style)
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
 
-
-
-
 <details>
 <summary>Previous News</summary>
   
