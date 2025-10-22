@@ -40,6 +40,7 @@ CACHED_DEPENDENCIES = [
     "tdigest>=0.5.2.2",
     "aiohttp",
     "yappi",
+    "ray[default]",
 ]
 
 if src_dir.exists():
