@@ -1594,11 +1594,11 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         )
 
         print("Updating vLLM weights from HF policy...")
-        grouped_param_keys = lm_policy.prepare_weights_for_ipc()
-        for keys in grouped_param_keys:
-            ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
-            assert update_success, "Weight update should succeed"
+
+        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=buffer_size_bytes)
+        update_success = vllm_policy.update_weights_via_ipc_zmq()
+        assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
         print("Running Generation 2 (Weights Updated, Cache Still Active)...")
@@ -1675,7 +1675,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
         lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
 
@@ -2133,7 +2133,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])

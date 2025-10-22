@@ -732,6 +732,7 @@ def refit_policy_generation(
         _refit_buffer_size_gb: The size of the buffer to use for refitting.
             If it is None, the buffer size will be computed by the remaining memory.
             This parameter is primarily used for testing.
+        timer: Optional Timer used to time the prepare/transfer/update phase
     """
     if colocated_inference:
         policy.offload_before_refit()
@@ -748,22 +749,24 @@ def refit_policy_generation(
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
-            grouped_param_keys = policy.prepare_weights_for_ipc(
-                _refit_buffer_size_gb=_refit_buffer_size_gb
-            )
-            total_num_keys = sum(len(k) for k in grouped_param_keys)
-            print(
-                f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups",
-                flush=True,
-            )
-            # do update
-            for keys in grouped_param_keys:
-                ipc_handles = policy.get_weights_ipc_handles(keys)
-                update_success = policy_generation.update_weights_from_ipc_handles(
-                    ipc_handles
+            if _refit_buffer_size_gb is not None:
+                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+            else:
+                # Empirically sets ratio as 30% to maximize efficiency.
+                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
+                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+                buffer_size_bytes = int(
+                    policy.get_free_memory_bytes() * float(memory_ratio)
                 )
-                if not update_success:
-                    break
+
+            futures_train = policy.stream_weights_via_ipc_zmq(
+                buffer_size_bytes=buffer_size_bytes
+            )
+            futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
             futures_train = policy.broadcast_weights_for_collective()
