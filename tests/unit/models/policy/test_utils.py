@@ -21,8 +21,8 @@ import unittest.mock
 
 import pytest
 import torch
-
 import zmq
+
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -212,7 +212,7 @@ def client_process(
                 # Validate tensor
                 assert tensor.shape == expected.shape, f"Shape mismatch for {key}"
                 assert tensor.dtype == expected.dtype, f"Dtype mismatch for {key}"
-                assert torch.allclose(tensor + 1, expected, rtol=1e-7, atol=1e-7), (
+                assert torch.allclose(tensor, expected, rtol=1e-7, atol=1e-7), (
                     f"Values mismatch for {key}"
                 )
 
