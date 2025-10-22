@@ -141,7 +141,7 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -158,11 +158,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
-        pass
-
-    @abstractmethod
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    def stream_weights_via_ipc_zmq(
+        self, *args: Any, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
         pass
 
     @abstractmethod
