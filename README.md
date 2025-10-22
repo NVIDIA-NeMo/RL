@@ -30,7 +30,7 @@
 
 **Nemo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 
-![Image](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/snowmanwwg-patch-4/docs/assets/RL_diagram.png)
+![NeMo RL Architecture Diagram](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/main/docs/assets/RL_diagram.png)
 
 What you can expect:
 - **Flexibility** with a modular design that allows easy integration and customization.
