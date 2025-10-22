@@ -125,6 +125,7 @@ class NemotronGeneration(GenerationAlgorithm):
             'remasking': True,   # Not used by Nemotron but kept for compatibility
             'threshold': 0.9,    # Nemotron default
             'factor': 1.0,       # Not used by Nemotron but kept for compatibility
+            # TODO(mfathi): this is a hack to fix inference for our trained checkpoints using nemo-rl. need to investigate a coherent solution.
             'shift_logits': self.use_chat_template  # True when using chat template, False for raw text
         }
 
