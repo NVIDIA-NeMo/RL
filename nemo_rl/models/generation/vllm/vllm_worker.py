@@ -375,7 +375,7 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
-        if "hf_overrides" not in vllm_kwargs:
+        if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
         vllm_kwargs["hf_overrides"].update(self.cfg["vllm_cfg"].get("hf_overrides", {}))
 
