@@ -67,7 +67,7 @@ class Penguin(EnvironmentInterface):
         assert ray.is_initialized(), (
             "Ray must be initialized before using Penguin environment"
         )
-        ray_context = ray.get_run_context()
+        ray_context = ray.get_runtime_context()
         assert ray_context.gcs_address, "Ray must have a GCS address"
 
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
