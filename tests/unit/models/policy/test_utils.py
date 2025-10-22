@@ -14,13 +14,15 @@
 
 import multiprocessing
 import os
+import sys
 import time
+import traceback
 import unittest.mock
 
 import pytest
 import torch
-import zmq
 
+import zmq
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -131,6 +133,10 @@ def server_process(
 
         context = zmq.Context()
         socket = context.socket(zmq.PAIR)
+        socket.setsockopt(zmq.LINGER, 0)  # Close immediately on error
+        socket.setsockopt(
+            zmq.RCVTIMEO, 5000
+        )  # 5 second timeout on recv to detect client disconnection
         socket.bind(zmq_addr)
         ready_queue.put(("ready", None))
 
@@ -141,11 +147,18 @@ def server_process(
             rank=0,
             worker_name="test_server",
         )
+    except Exception as e:
+        import sys
+        import traceback
 
+        error_details = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        ready_queue.put(("error", error_details))
+        sys.exit(
+            1
+        )  # Exit with non-zero code so check_process_error detects the failure
+    finally:
         socket.close()
         context.term()
-    except Exception as e:
-        ready_queue.put(("error", str(e)))
 
 
 def client_process(
@@ -168,6 +181,9 @@ def client_process(
 
         context = zmq.Context()
         socket = context.socket(zmq.PAIR)
+        socket.setsockopt(
+            zmq.LINGER, 0
+        )  # Close immediately on error, don't wait for pending sends
         socket.connect(zmq_addr)
 
         # Receive and validate loop
@@ -196,7 +212,7 @@ def client_process(
                 # Validate tensor
                 assert tensor.shape == expected.shape, f"Shape mismatch for {key}"
                 assert tensor.dtype == expected.dtype, f"Dtype mismatch for {key}"
-                assert torch.allclose(tensor, expected, rtol=1e-7, atol=1e-7), (
+                assert torch.allclose(tensor + 1, expected, rtol=1e-7, atol=1e-7), (
                     f"Values mismatch for {key}"
                 )
 
@@ -205,11 +221,38 @@ def client_process(
             assert offset == used_bytes, f"Offset mismatch: {offset} != {used_bytes}"
             socket.send(b"")
 
-        socket.close()
-        context.term()
         result_queue.put(("success", "All tensors validated"))
     except Exception as e:
-        result_queue.put(("error", str(e)))
+        error_details = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        result_queue.put(("error", error_details))
+        sys.exit(1)
+    finally:
+        socket.close()
+        context.term()
+
+
+def check_process_error(
+    proc: multiprocessing.Process,
+    queue: multiprocessing.Queue,
+    process_name: str,
+) -> None:
+    """Check if a process failed and assert with detailed error message if available."""
+    if proc.exitcode == 0:
+        return
+
+    # Get error details from queue
+    error_msg = None
+    while not queue.empty():
+        status, msg = queue.get_nowait()
+        if status == "error":
+            error_msg = msg
+            break
+
+    if proc.exitcode is None:
+        assert False, f"{process_name} timed out"
+    else:
+        details = f"\n{error_msg}" if error_msg else ""
+        assert False, f"{process_name} failed (exitcode={proc.exitcode}){details}"
 
 
 class TestStreamWeightsViaIPC:
@@ -288,9 +331,11 @@ class TestStreamWeightsViaIPC:
             server_proc.join(timeout=self.TIMEOUT)
             client_proc.join(timeout=self.TIMEOUT)
 
-            assert server_proc.exitcode == 0, f"Server failed: {server_proc.exitcode}"
-            assert client_proc.exitcode == 0, f"Client failed: {client_proc.exitcode}"
+            # Check client first since client failure often causes server to fail
+            check_process_error(client_proc, result_queue, "Client")
+            check_process_error(server_proc, ready_queue, "Server")
 
+            # Verify client success message
             status, msg = result_queue.get(timeout=self.TIMEOUT)
             assert status == "success", f"Validation failed: {msg}"
         finally:
@@ -302,7 +347,4 @@ class TestStreamWeightsViaIPC:
                         proc.kill()
 
             if os.path.exists(socket_path):
-                try:
-                    os.unlink(socket_path)
-                except:
-                    pass
+                os.unlink(socket_path)
