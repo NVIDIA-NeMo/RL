@@ -134,9 +134,7 @@ def server_process(
         context = zmq.Context()
         socket = context.socket(zmq.PAIR)
         socket.setsockopt(zmq.LINGER, 0)  # Close immediately on error
-        socket.setsockopt(
-            zmq.RCVTIMEO, 5000
-        )  # 5 second timeout on recv to detect client disconnection
+        socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second timeout
         socket.bind(zmq_addr)
         ready_queue.put(("ready", None))
 
@@ -164,7 +162,6 @@ def server_process(
 def client_process(
     zmq_addr: str,
     known_tensors_data: list[tuple[str, tuple, torch.dtype, torch.Tensor]],
-    buffer_size_bytes: int,
     result_queue: multiprocessing.Queue,
 ) -> None:
     """Client process that receives and validates tensors via IPC ZMQ."""
@@ -181,9 +178,8 @@ def client_process(
 
         context = zmq.Context()
         socket = context.socket(zmq.PAIR)
-        socket.setsockopt(
-            zmq.LINGER, 0
-        )  # Close immediately on error, don't wait for pending sends
+        socket.setsockopt(zmq.LINGER, 0)  # Close immediately on error
+        socket.setsockopt(zmq.RCVTIMEO, 10000)  # 10 second timeout
         socket.connect(zmq_addr)
 
         # Receive and validate loop
@@ -258,9 +254,8 @@ def check_process_error(
 class TestStreamWeightsViaIPC:
     """Test suite for IPC weight streaming functionality."""
 
-    TIMEOUT = 10
+    TIMEOUT = 30  # 30 second timeout for additional overhead when running with coverage
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         "test_case,tensor_specs,buffer_size_bytes,test_description",
         [
@@ -322,7 +317,7 @@ class TestStreamWeightsViaIPC:
 
         client_proc = mp_context.Process(
             target=client_process,
-            args=(zmq_addr, known_tensors_data, buffer_size_bytes, result_queue),
+            args=(zmq_addr, known_tensors_data, result_queue),
         )
         client_proc.start()
 
