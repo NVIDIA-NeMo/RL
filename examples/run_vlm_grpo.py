@@ -194,16 +194,29 @@ def hf_data_processor(
 
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
-    if length > max_seq_length:
+    if length >= max_seq_length:
+        # Treat truncated messages as text only
+        vllm_kwargs = {
+            "vllm_content": None,
+            "vllm_images": [],
+        }
+
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
                 : min(4, max_seq_length // len(message_log))
             ]
+            for key, value in chat_message.items():
+                if isinstance(value, PackedTensor):
+                    chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
-        raise NotImplementedError(
-            "Sequence length is too long, please use a shorter sequence length"
-        )
+    else:
+        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
+        # add images for vllm serving
+        vllm_kwargs = {
+            "vllm_content": string_formatted_dialog,
+            "vllm_images": images,
+        }
 
     output: DatumSpec = {
         "message_log": message_log,
@@ -212,10 +225,7 @@ def hf_data_processor(
         "loss_multiplier": loss_multiplier,
         "idx": idx,
         "task_name": task_data_spec.task_name,
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
-        # add images for vllm serving
-        "vllm_content": string_formatted_dialog,
-        "vllm_images": images,
+        **vllm_kwargs,
     }
     return output
 

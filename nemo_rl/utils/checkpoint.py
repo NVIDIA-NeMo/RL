@@ -20,6 +20,7 @@ own checkpoint saving function (called by the algorithm loop).
 import glob
 import json
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -201,25 +202,18 @@ class CheckpointManager:
         if self.metric_name is None:
             checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
-            try:
-                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-                if self.higher_is_better:
-                    # For higher_is_better=True: higher metric values first, then higher step numbers
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
-                    )
-                else:
-                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                    checkpoint_history.sort(
-                        key=lambda x: (x[2][self.metric_name], -x[0])
-                    )
-            except KeyError:
-                warnings.warn(
-                    f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
+            # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+            if self.higher_is_better:
+                # For higher_is_better=True: higher metric values first, then higher step numbers
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                    reverse=True,
                 )
-                checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-
-                self.metric_name = None
+            else:
+                # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                checkpoint_history.sort(
+                    key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
+                )
 
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
@@ -263,7 +257,11 @@ class CheckpointManager:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
         # find checkpoint directory with highest step number
-        step_dirs = glob.glob(str(self.checkpoint_dir / "step_*"))
+        step_dirs = [
+            x
+            for x in glob.glob(str(self.checkpoint_dir / "step_*"))
+            if re.fullmatch(r"step_\d+", Path(x).name)
+        ]
         step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
         if len(step_dirs) == 0:
             return None
@@ -303,7 +301,11 @@ def _load_checkpoint_history(
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
 
     # Find all step directories
-    step_dirs = glob.glob(str(checkpoint_dir / "step_*"))
+    step_dirs = [
+        x
+        for x in glob.glob(str(checkpoint_dir / "step_*"))
+        if re.fullmatch(r"step_\d+", Path(x).name)
+    ]
 
     for step_dir in step_dirs:
         info_file = Path(step_dir) / "training_info.json"

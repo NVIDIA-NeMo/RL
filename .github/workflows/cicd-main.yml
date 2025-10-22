@@ -288,7 +288,7 @@ jobs:
           is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   CI_QA_Gate:
-    name: CI quality check
+    name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
     if: always()
     runs-on: ubuntu-latest
     needs:
@@ -310,17 +310,14 @@ jobs:
               needs.lint-check.result == 'success' &&
               (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
-                needs.pre-flight.outputs.test_level == 'none' ||
+                needs.pre-flight.outputs.test_level != 'none' &&
+                needs.sphinx-build.result == 'success' &&
+                needs.build-container.result == 'success' &&
                 (
-                  needs.pre-flight.outputs.test_level != 'none' &&
-                  needs.sphinx-build.result == 'success' &&
-                  needs.build-container.result == 'success' &&
                   (
-                    (
-                      (needs.cicd-doc-tests.result == 'skipped' || needs.cicd-doc-tests.result == 'success') &&
-                      (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
-                      (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success')
-                    )
+                    needs.cicd-doc-tests.result == 'success' &&
+                    (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
+                    (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success')
                   )
                 )
               )

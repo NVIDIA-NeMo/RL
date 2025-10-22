@@ -30,40 +30,58 @@ class PackedTensor:
     """
 
     def __init__(
-        self, tensors: Union[torch.Tensor, list[torch.Tensor]], dim_to_pack: int
+        self,
+        tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
+        dim_to_pack: int,
     ) -> None:
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
         if isinstance(tensors, torch.Tensor):
-            self.tensors: list[torch.Tensor] = [tensors]
+            self.tensors: list[Optional[torch.Tensor]] = [tensors]
         elif isinstance(tensors, list):
             assert len(tensors) > 0, (
                 "Input tensors to PackedTensor must be a non-empty list"
             )
-            self.tensors: list[torch.Tensor] = tensors
+            self.tensors: list[Optional[torch.Tensor]] = tensors
         else:
             raise ValueError(
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
 
-    def as_tensor(self, device: Optional[torch.device] = None) -> torch.Tensor:
+    def as_tensor(
+        self, device: Optional[torch.device] = None
+    ) -> Optional[torch.Tensor]:
         if device is not None:
-            self.tensors = [item.to(device) for item in self.tensors]
-        return torch.cat(self.tensors, dim=self.dim_to_pack).to(device)
+            # Move only non-None tensors to device, preserve Nones
+            for i, item in enumerate(self.tensors):
+                if item is not None:
+                    self.tensors[i] = item.to(device)
+        non_none_tensors = [t for t in self.tensors if t is not None]
+        if len(non_none_tensors) == 0:
+            return None
+        else:
+            return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
 
     def __len__(self) -> int:
         # this is the number of tensors in this data wrapper
         return len(self.tensors)
 
     def to(self, device: str | torch.device) -> "PackedTensor":
-        self.tensors = [item.to(device) for item in self.tensors]
+        self.tensors = [
+            item.to(device) if item is not None else None for item in self.tensors
+        ]
         return self
 
     def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
         tensors = [self.tensors[i] for i in idx]
         return PackedTensor(tensors, self.dim_to_pack)
+
+    @classmethod
+    def empty_like(cls, other: "PackedTensor") -> "PackedTensor":
+        """Return a new PackedTensor with same length and dim_to_pack as `other`, with all entries None."""
+        return cls([None] * len(other.tensors), other.dim_to_pack)
 
     @classmethod
     def concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":

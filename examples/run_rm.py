@@ -235,6 +235,7 @@ def main():
         rm_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     rm_train(
         policy,
         train_dataloader,

@@ -62,6 +62,10 @@ policy:
       use_precision_aware_optimizer: false #true ## TODO: precision aware optim not working with fp8. Is this expected?
       weight_decay: 0.01
 
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
       ## recently introduced, our current mcore commit doesn't have this
       #fp8_recipe: delayed
 
@@ -85,6 +89,8 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
@@ -126,6 +132,7 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  num_workers: 1
 
 logger:
   log_dir: "logs"  # Base directory for all logs

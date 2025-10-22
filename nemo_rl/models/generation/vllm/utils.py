@@ -67,7 +67,10 @@ def format_prompt_for_vllm_generation(
             prompt_dict = {"prompt": msg}
             # add additional data if present
             images = data.get("vllm_images", None)
-            if images is not None:
+            if images is None or len(images[i]) == 0:
+                prompts.append(_get_regular_prompt(i))
+                continue
+            else:
                 prompt_dict["multi_modal_data"] = {
                     "image": images[i][0] if len(images[i]) == 1 else images[i]
                 }

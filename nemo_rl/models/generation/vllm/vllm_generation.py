@@ -162,6 +162,16 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
+
+        if needs_cross_node_parallelism:
+            # When using cross-node model parallelism with non-colocated inference,
+            # we are disabling NCCL_NVLS_ENABLE to avoid the NCCL error.
+            # See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details.
+            env_vars["NCCL_NVLS_ENABLE"] = "0"
+            print(
+                "[INFO] NCCL_NVLS_ENABLE is set to 0 for non-colocated inference with cross-node model parallelism."
+                "See https://github.com/NVIDIA-NeMo/RL/issues/1352 for more details."
+            )
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.ep_size > self.tp_size:
@@ -368,7 +378,7 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         if not self.worker_group or not self.worker_group.workers:
@@ -395,7 +405,12 @@ class VllmGeneration(GenerationInterface):
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            common_kwargs={"ip": ip, "port": port, "world_size": world_size},
+            common_kwargs={
+                "ip": ip,
+                "port": port,
+                "world_size": world_size,
+                "train_world_size": train_world_size,
+            },
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
@@ -554,6 +569,12 @@ class VllmGeneration(GenerationInterface):
             try:
                 async for sample_result_ref in worker_gen:
                     sample_result = await sample_result_ref
+                    # sample_result is a tuple: (original_idx, BatchedDataDict)
+                    # Tag the result with worker index for downstream attribution
+                    original_idx, result_batch = sample_result
+                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
+                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
+                    sample_result = (original_idx, result_batch)
                     await result_queue.put(("sample", sample_result))
             except Exception as e:
                 # Log the error before putting it in the queue for better debugging
@@ -742,49 +763,26 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
-        """Update weights of the policy using IPC handles, considering tensor parallelism.
-
-        For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
-            return False
+            raise RuntimeError("Worker group is not initialized")
 
         # Choose the appropriate method based on async_engine setting
         method_name = (
-            "update_weights_from_ipc_handles_async"
+            "update_weights_via_ipc_zmq_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "update_weights_from_ipc_handles"
+            else "update_weights_via_ipc_zmq"
         )
 
-        # Only send the ipc handles required by the current worker
-        ipc_handles_list = []
-        for worker_device_uuids in self.device_uuids:
-            worker_ipc_handles = {
-                device_uuid: ipc_handles[device_uuid]
-                for device_uuid in worker_device_uuids
-            }
-            ipc_handles_list.append(worker_ipc_handles)
+        # Use run_all_workers_single_data since no data needs to be passed
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
 
-        try:
-            # Directly pass ipc_handles to the method
-            futures = self.worker_group.run_all_workers_multiple_data(
-                method_name,
-                ipc_handles=ipc_handles_list,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
-            # Wait for all futures to complete
-            results = ray.get(futures)
-            return all(result for result in results if result is not None)
-        except Exception as e:
-            print(f"Error during update weights: {e}")
-            return False
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""

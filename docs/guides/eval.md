@@ -48,6 +48,16 @@ uv run python examples/run_eval.py
 # Run evaluation script with converted model
 uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
 
+# Run evaluation script with Qwen3 model under thinking mode
+uv run python examples/run_eval.py \
+    generation.model_name=Qwen/Qwen3-8B \
+    generation.temperature=0.6 \
+    generation.top_p=0.95 \
+    generation.top_k=20 \
+    generation.vllm_cfg.max_model_len=38912 \
+    tokenizer.chat_template_kwargs.enable_thinking=true \
+    data.prompt_file=examples/prompts/cot.txt
+
 # Run evaluation script with custom config file
 uv run python examples/run_eval.py --config path/to/custom_config.yaml
 
