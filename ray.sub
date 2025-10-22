@@ -62,9 +62,12 @@ METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 PORT=${PORT:-54514}
 RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
-DASHBOARD_GRPC_PORT=${DASHBOARD_GRPC_PORT:-52367}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+RAY_DEBUGGER_ARGS=
+if [ "${RAY_DEBUG:-}" = "legacy" ]; then
+  RAY_DEBUGGER_ARGS="--ray-debugger-external"
+fi
 
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
@@ -269,7 +272,6 @@ ray start --head \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
-    --dashboard-grpc-port=${DASHBOARD_GRPC_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
@@ -278,8 +280,9 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    $RAY_DEBUGGER_ARGS \
     \
-    --block
+    --block 
 EOFINNER
 chmod +x /launch-head.sh
 
@@ -377,8 +380,9 @@ ray start --address "$ip_head" \
           --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
           --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
+          $RAY_DEBUGGER_ARGS \
           \
-          --block
+          --block 
 EOFINNER
 
 count=0

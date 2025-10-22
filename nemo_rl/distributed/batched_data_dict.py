@@ -126,19 +126,40 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     item for sublist in list_of_tensors for item in sublist
                 ]
             elif isinstance(list_of_tensors[0], PackedTensor):
-                tensor_or_list = PackedTensor.flattened_concat(list_of_tensors)
+                tensor_or_list = PackedTensor.concat(list_of_tensors)
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-
-                list_of_tensors = [
-                    row.flatten() for tensor in list_of_tensors for row in tensor
-                ]
-                # TODO: can we avoid padding locally then padding globally?
-                tensor_or_list = torch.nn.utils.rnn.pad_sequence(
-                    list_of_tensors, batch_first=True, padding_value=pad_value
-                )
+                # We now add the following if statement to handle the 3D case in distillation
+                # (i.e., teacher top-k logits and indices); the else branch is the original code.
+                if list_of_tensors[0].ndim == 3:
+                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
+                    # keeping the feature dimension.
+                    max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
+                    padded_tensors = []
+                    for tensor in list_of_tensors:
+                        # Pad along the 1st dimension to max_seq_len.
+                        pad_length = max_seq_len - tensor.shape[1]
+                        padded = torch.nn.functional.pad(
+                            tensor,
+                            # Only pad the last two dimensions (sequence length).
+                            (0, 0, 0, pad_length),
+                            mode="constant",
+                            value=pad_value,
+                        )
+                        padded_tensors.append(padded)
+                    tensor_or_list = torch.cat(
+                        padded_tensors, dim=0
+                    )  # concatenate along the batch dimension
+                else:
+                    list_of_tensors = [
+                        row.flatten() for tensor in list_of_tensors for row in tensor
+                    ]
+                    # TODO: can we avoid padding locally then padding globally?
+                    tensor_or_list = torch.nn.utils.rnn.pad_sequence(
+                        list_of_tensors, batch_first=True, padding_value=pad_value
+                    )
             else:
                 raise NotImplementedError(
                     (

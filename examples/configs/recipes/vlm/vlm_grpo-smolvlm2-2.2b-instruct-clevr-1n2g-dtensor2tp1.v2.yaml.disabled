@@ -1,0 +1,6 @@
+defaults: ../../vlm_grpo_3B.yaml
+checkpointing:
+  checkpoint_dir: results/clevr_grpo
+policy:
+  model_name: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+  max_total_sequence_length: 3072

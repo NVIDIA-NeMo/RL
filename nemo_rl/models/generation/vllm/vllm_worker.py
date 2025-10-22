@@ -375,6 +375,8 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
+        vllm_kwargs["hf_overrides"] = self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -477,7 +479,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
-        self, rank_prefix: int, ip: str, port: int, world_size: int
+        self,
+        rank_prefix: int,
+        ip: str,
+        port: int,
+        world_size: int,
+        train_world_size: int,
     ) -> None:
         self.llm.collective_rpc(
             "init_collective",
@@ -486,6 +493,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 ip,
                 port,
                 world_size,
+                train_world_size,
             ),
         )
 
@@ -698,16 +706,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
-        """Update weights from IPC handles by delegating to the vLLM Worker implementation.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
+    def update_weights_via_ipc_zmq(self) -> bool:
+        """Update weights from IPC handles via ZMQ socket."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
@@ -715,40 +716,13 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             if self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
+                    "update_weights_via_ipc_zmq cannot be used with async_engine=True. Use update_weights_via_ipc_zmq_async instead."
                 )
 
-            if self.tensor_parallel_size == 1:
-                # UniProcExecutor
-                assert len(self.vllm_device_ids) == 1
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_local_ipc_handles",
-                    args=(ipc_handles[self.vllm_device_ids[0]],),
-                )
-            else:
-                """
-                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
-                leading to unnecessary network serialization overhead and potential performance degradation.
-
-                result_or_coro = self.llm.collective_rpc(
-                    "update_weights_from_global_ipc_handles", args=(ipc_handles,)
-                )
-                """
-                ray_worker_outputs = []
-                # MultiProcExecutor
-                for worker, device_id in zip(
-                    self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
-                ):
-                    ray_worker_outputs.append(
-                        worker.execute_method.remote(
-                            "update_weights_from_local_ipc_handles",
-                            ipc_handles[device_id],
-                        )
-                    )
-
-                # Gather the results
-                result_or_coro = ray.get(ray_worker_outputs)
-
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_via_ipc_zmq",
+                args=tuple(),
+            )
             worker_result = result_or_coro[0]
 
             if not worker_result:
@@ -851,6 +825,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         """Clean up vLLM resources."""
         try:
             if self.llm is not None:
+                # Clean up extension resources (e.g., ZMQ sockets)
+                self.llm.collective_rpc("cleanup", args=tuple())
+
                 # Explicitly delete the engine. This may trigger its __del__ method.
                 del self.llm
 

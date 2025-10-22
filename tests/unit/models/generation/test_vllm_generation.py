@@ -33,7 +33,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _maybe_correct_merged_tokens,
+    _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -177,6 +177,7 @@ def get_basic_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -192,6 +193,8 @@ def get_basic_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -944,8 +947,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Refit
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1218,66 +1228,170 @@ def test_vllm_http_server(cluster, tokenizer):
         )
 
 
-def test_VllmAsyncGenerationWorker_maybe_correct_merged_tokens(tokenizer):
+def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     # This test assumes the tokenizer model is for the Qwen 3 family
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id == 151645
 
-    # [26951, 3834] and [94224] both detokenize to " skinny"
-    # Test super simple example of correcting the merged tokens
-    actual_result = _maybe_correct_merged_tokens(
-        tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
-        actual_token_ids=[94224],
+    data_fpath = Path(__file__).with_name(
+        "test_vllmasyncgenerationworker_replace_prefix_worker.json"
     )
-    expected_result = [26951, 3834]
-    assert expected_result == actual_result
+    with data_fpath.open() as f:
+        data = json.load(f)
 
-    actual_result = _maybe_correct_merged_tokens(
+    og_model_token_ids = data["og_model_token_ids"]
+    model_token_ids = data["model_token_ids"]
+    template_token_ids = data["template_token_ids"]
+
+    og_model_str = tokenizer.decode(og_model_token_ids)
+    model_str = tokenizer.decode(model_token_ids)
+    template_str = tokenizer.decode(template_token_ids)
+    assert og_model_str == template_str
+    assert model_str != template_str
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[61830, 65],
-        actual_token_ids=[2435, 20828],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [61830, 65]
-    assert expected_result == actual_result
+    assert result == og_model_token_ids
 
-    actual_result = _maybe_correct_merged_tokens(
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[758, 12601],
-        actual_token_ids=[89038],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [758, 12601]
-    assert expected_result == actual_result
+    assert result == og_model_token_ids
 
-    # Test no-op
-    actual_result = _maybe_correct_merged_tokens(
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=[26951, 3834],
-        actual_token_ids=[26951, 3834],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = [26951, 3834]
+    assert result == og_model_token_ids
 
-    # Test sanity failure assert
-    with pytest.raises(
-        AssertionError, match="Found a non-monotonically increasing trajectory"
-    ):
-        _maybe_correct_merged_tokens(
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+
+def test_replace_prefix_tokens_empty_model_prefix_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = []
+    template_prefix_token_ids = [9, 2]
+    template_token_ids = [9, 2, 33, 44]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 2]
+    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
+    template_token_ids = [9, 9, 9, 2, 10]
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
             tokenizer=tokenizer,
-            reference_token_ids=[26951, 26951, 26951, 26951],
-            actual_token_ids=[26951, 26951, 3834, 3834, 3834],
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
         )
 
-    test_data_fpath = Path(__file__).with_name(
-        "maybe_correct_merged_tokens_test_data.json"
-    )
-    with test_data_fpath.open() as f:
-        test_data = json.load(f)
 
-    actual_result = _maybe_correct_merged_tokens(
+def test_replace_prefix_tokens_tokenizer_without_eos_raises():
+    class _T:
+        eos_token_id = None
+
+    tokenizer = _T()
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[1],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2],
+        )
+
+
+def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [100, 2]
+    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_token_ids = [9, 2, 9, 2, 77, 88]
+    result = _replace_prefix_tokens(
         tokenizer=tokenizer,
-        reference_token_ids=test_data["seen_token_ids"],
-        actual_token_ids=test_data["output_prompt_token_ids"],
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
     )
-    expected_result = test_data["expected_output"]
-    assert expected_result == actual_result
+    assert result == [100, 2, 77, 88]
 
 
 @pytest.mark.asyncio
@@ -1480,11 +1594,11 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         )
 
         print("Updating vLLM weights from HF policy...")
-        grouped_param_keys = lm_policy.prepare_weights_for_ipc()
-        for keys in grouped_param_keys:
-            ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
-            assert update_success, "Weight update should succeed"
+
+        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=buffer_size_bytes)
+        update_success = vllm_policy.update_weights_via_ipc_zmq()
+        assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
         print("Running Generation 2 (Weights Updated, Cache Still Active)...")
@@ -1561,7 +1675,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
         lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
 
@@ -1747,9 +1861,15 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    world_size = tensor_parallel_size + 1
-    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -2013,7 +2133,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])

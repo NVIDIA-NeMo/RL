@@ -719,7 +719,6 @@ def clip_grad_by_total_norm_(
     parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
     max_grad_norm: Union[int, float],
     total_norm: float,
-    dtype: torch.dtype = torch.float32,
 ):
     """Clips gradient of an iterable of parameters by total norm.
 
@@ -737,17 +736,17 @@ def clip_grad_by_total_norm_(
     if isinstance(parameters, (torch.Tensor, DTensor)):
         parameters = [parameters]
 
-    # Grads.
-    grads = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
-    ]
-
     # Scale.
     clip_coeff = max_grad_norm / (total_norm + 1.0e-6)
 
     if clip_coeff < 1.0:
+        # Grads.
+        grads = [
+            to_local_if_dtensor(p.grad.detach())
+            for p in parameters
+            if p.grad is not None
+        ]
+
         for g in grads:
             g.mul_(clip_coeff)
 
@@ -781,9 +780,7 @@ def get_grad_norm(
 
     # Grads.
     grads_for_norm = [
-        to_local_if_dtensor(p.grad.detach()).to(dtype)
-        for p in parameters
-        if p.grad is not None
+        to_local_if_dtensor(p.grad.detach()) for p in parameters if p.grad is not None
     ]
 
     # Norm parameters.
@@ -793,9 +790,7 @@ def get_grad_norm(
     # Calculate norm.
     if norm_type == torch.inf:
         total_norm = max(grad.abs().max().item() for grad in grads_for_norm)
-        total_norm_cuda = torch.tensor(
-            [float(total_norm)], dtype=torch.float, device="cuda"
-        )
+        total_norm_cuda = torch.tensor([float(total_norm)], dtype=dtype, device="cuda")
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
             total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=dp_cp_group
@@ -807,19 +802,19 @@ def get_grad_norm(
         total_norm = float(total_norm_cuda[0].item())
 
     else:
-        total_norm = torch.tensor(0.0, dtype=torch.float32, device="cuda")
+        total_norm_cuda = torch.tensor(0.0, dtype=dtype, device="cuda")
         for grad in grads_for_norm:
-            grad_norm = torch.norm(grad, norm_type)
-            total_norm += torch.pow(grad_norm, norm_type)
+            grad_norm = torch.linalg.vector_norm(grad, ord=norm_type, dtype=dtype)
+            total_norm_cuda += torch.pow(grad_norm, norm_type)
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
         )
 
         torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            total_norm_cuda, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
-        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+        total_norm = float(total_norm_cuda.item() ** (1.0 / norm_type))
 
     return total_norm

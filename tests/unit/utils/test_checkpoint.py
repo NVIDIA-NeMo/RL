@@ -141,6 +141,85 @@ def test_remove_old_checkpoints_topk_bias_recent_if_equal(
     assert sorted(remaining_steps) == sorted(expected_steps)
 
 
+def test_remove_old_checkpoints_topk_some_missing_val_metric(
+    checkpoint_manager, checkpoint_dir
+):
+    # Create checkpoints where some have validation metrics and others don't
+    steps = [1, 2, 3, 4, 10, 11, 12]
+    # Some checkpoints have loss metrics, others don't have any validation metrics
+    training_infos = [
+        {"loss": 0.5},  # step 1 - has loss
+        {"loss": 0.3},  # step 2 - has loss
+        {"other_metric": 0.8},  # step 3 - missing loss metric
+        {"loss": 0.2},  # step 4 - has loss
+        {},  # step 10 - missing loss metric
+        {"loss": 1.0},  # has loss but not in top-k
+        {},  # step 12 - missing loss (latest)
+    ]
+
+    for step, training_info in zip(steps, training_infos):
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Check if only top-k checkpoints are kept
+    remaining_dirs = list(checkpoint_dir.glob("step_*"))
+    assert (
+        len(remaining_dirs) == checkpoint_manager.keep_top_k + 1
+    )  # +1 because we exclude the latest
+
+    # Checkpoints with missing validation metrics should be treated as having the worst possible value
+    # Since higher_is_better=False, missing metrics get float("inf") which is worst
+    # So checkpoints with actual loss values should be preferred over those without
+    remaining_steps = []
+    for dir_path in remaining_dirs:
+        step_num = int(dir_path.name.split("_")[1])
+        remaining_steps.append(step_num)
+
+    # Should keep checkpoints with actual loss values (steps 1, 2, 4, 12)
+    # and exclude those without loss metrics (steps 3, 10)
+    # The latest checkpoint (step 12) is always kept
+    expected_steps = [1, 2, 4, 12]  # Steps with loss metrics, plus latest
+    assert sorted(remaining_steps) == sorted(expected_steps)
+
+
+def test_remove_old_checkpoints_topk_most_missing_val_metric(
+    checkpoint_manager, checkpoint_dir
+):
+    # Create checkpoints where some have validation metrics and others don't
+    steps = [1, 2, 3, 4, 10, 12]
+    # Some checkpoints have loss metrics, others don't have any validation metrics
+    training_infos = [
+        {"loss": 0.2},  # step 1 - has loss
+        {},  # step 2 - has loss
+        {"other_metric": 0.8},  # step 3 - missing loss metric
+        {},  # step 4 - has loss
+        {},  # step 10 - missing loss metric
+        {},  # step 12 - missing loss (latest)
+    ]
+
+    for step, training_info in zip(steps, training_infos):
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Check if only top-k checkpoints are kept
+    remaining_dirs = list(checkpoint_dir.glob("step_*"))
+    assert len(remaining_dirs) == checkpoint_manager.keep_top_k
+
+    # Checkpoints with missing validation metrics should be treated as having the worst possible value
+    # Since higher_is_better=False, missing metrics get float("inf") which is worst
+    # So checkpoints with actual loss values should be preferred over those without
+    remaining_steps = []
+    for dir_path in remaining_dirs:
+        step_num = int(dir_path.name.split("_")[1])
+        remaining_steps.append(step_num)
+
+    # Should keep checkpoints with actual loss values (step 1)
+    # followed by the most recent steps
+    # The latest checkpoint (step 12) is always kept
+    expected_steps = [1, 10, 12]  # Steps with loss metrics, plus latest
+    assert sorted(remaining_steps) == sorted(expected_steps)
+
+
 def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Create multiple checkpoints with different loss values
     steps = [1, 2, 3]
@@ -174,6 +253,24 @@ def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
 
     # Verify it's the checkpoint with highest step number
     assert Path(latest_path).name == f"step_{max(steps)}"
+
+
+def test_get_latest_checkpoint_path_with_suffixes(checkpoint_manager, checkpoint_dir):
+    """Test that having step_*-hf dirs alongside step_* checkpoints doesn't crash."""
+    # Create a checkpoint
+    step = 1
+    training_info = {"loss": 0.5}
+    tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+    checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Create pseudo-converted checkpoint folder
+    (checkpoint_dir / "step_1-hf").mkdir()
+
+    # Get latest checkpoint path
+    latest_path = checkpoint_manager.get_latest_checkpoint_path()
+
+    # Verify the -hf suffix didn't affect the get_latest_checkpoint func
+    assert Path(latest_path).name == "step_1"
 
 
 def test_load_training_metadata(checkpoint_manager, checkpoint_dir):

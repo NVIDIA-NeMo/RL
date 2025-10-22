@@ -73,6 +73,7 @@ def sft_preprocessor(
         add_bos_token=add_bos,
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)
@@ -181,6 +182,7 @@ def main(is_vlm: bool = False):
 
     # setup tokenizer (or processor)
     tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
+
     # setup data
     (
         dataset,
@@ -199,6 +201,7 @@ def main(is_vlm: bool = False):
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     sft_train(
         policy,
         train_dataloader,
