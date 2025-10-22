@@ -71,7 +71,8 @@ def load_model_with_engine(
     base_model: str = None, 
     temp_dir: str = "/tmp/model_hf_converted", 
     engine: str = "fast-dllm",
-    algorithm_name: str = None
+    algorithm_name: str = None,
+    use_chat_template: bool = True
 ):
     """
     Load model using the specified inference engine.
@@ -89,6 +90,7 @@ def load_model_with_engine(
         temp_dir: Temporary directory for DCP conversion
         engine: Inference engine to use ('fast-dllm', 'dinfer', 'nemotron', 'hf')
         algorithm_name: Specific algorithm within engine (optional, uses default if not specified)
+        use_chat_template: Whether to use chat template (affects Nemotron shift_logits)
         
     Returns:
         True if successful, False otherwise
@@ -125,6 +127,11 @@ def load_model_with_engine(
         return False
     
     logger.info(f"Loading model with engine '{engine}', algorithm '{algorithm.name}': {algorithm.description}")
+    
+    # Set chat template preference (affects Nemotron shift_logits)
+    algorithm.use_chat_template = use_chat_template
+    if engine == "nemotron":
+        logger.info(f"Nemotron shift_logits will be set to: {use_chat_template} (chat_template={'enabled' if use_chat_template else 'disabled'})")
     
     # Load the model using the algorithm
     try:
@@ -190,6 +197,7 @@ def _load_other_algorithms_same_engine(source_algorithm: GenerationAlgorithm):
         algo.device = source_algorithm.device
         algo.model_config = source_algorithm.model_config
         algo.model_type = source_algorithm.model_type
+        algo.use_chat_template = source_algorithm.use_chat_template
         
         # For dInfer algorithms, create their own diffusion_llm wrapper
         # (each algorithm has a different decoder, so they can't share diffusion_llm)
@@ -454,31 +462,17 @@ class BatchProcessor:
             if algorithm.model is None or algorithm.tokenizer is None:
                 raise RuntimeError(f"Algorithm '{algorithm_name}' does not have a loaded model")
             
-            # Prepare batch data
-            batch_prompts = []
+            # Prepare batch data using algorithm's abstracted methods
             batch_messages = []
             batch_configs = []
             
             for batch_req in batch_requests:
                 request = batch_req.request
                 
-                # Format messages into prompt
                 try:
-                    if hasattr(app.state, 'no_chat_template') and app.state.no_chat_template:
-                        # Skip chat template - use raw content from last message
-                        if request.messages:
-                            formatted_prompt = request.messages[-1].content
-                        else:
-                            formatted_prompt = ""
-                        logger.debug(f"Using raw text (no chat template): {formatted_prompt[:100]}...")
-                        batch_prompts.append(formatted_prompt)
-                        batch_messages.append(None)  # No messages for raw text mode
-                    else:
-                        # Store messages for chat template application by the algorithm
-                        messages_list = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-                        batch_messages.append(messages_list)
-                        batch_prompts.append(None)  # Will be formatted by algorithm
-                        logger.debug(f"Prepared messages for chat template")
+                    # Convert messages to standard format
+                    messages_list = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+                    batch_messages.append(messages_list)
                     
                     # Store configuration for each request
                     batch_configs.append({
@@ -491,50 +485,22 @@ class BatchProcessor:
                         'factor': request.factor
                     })
                 except Exception as e:
-                    logger.error(f"Failed to format prompt for request {batch_req.request_id}: {e}")
-                    return [HTTPException(status_code=400, detail=f"Failed to format chat template: {e}") for _ in batch_requests]
+                    logger.error(f"Failed to prepare request {batch_req.request_id}: {e}")
+                    return [HTTPException(status_code=400, detail=f"Failed to prepare request: {e}") for _ in batch_requests]
             
-            # Tokenize batch prompts using the algorithm's tokenization method
+            # Tokenize using algorithm's unified tokenization method
             try:
-                # Determine whether to use chat template
-                use_chat_template = not (hasattr(app.state, 'no_chat_template') and app.state.no_chat_template)
+                # Algorithm handles chat template vs raw text internally based on use_chat_template
+                tokenization_result = algorithm.tokenize_batch(batch_messages)
                 
-                # Check if this is a dInfer algorithm (has tokenize_prompts_dinfer)
-                is_dinfer = hasattr(algorithm, 'tokenize_prompts_dinfer')
-                
-                if is_dinfer:
-                    # dInfer uses different tokenization (left-padding, returns attention_mask)
-                    if use_chat_template:
-                        batch_input_ids, attention_mask = algorithm.tokenize_prompts_dinfer(
-                            prompts=[],
-                            apply_chat_template=True,
-                            messages=batch_messages
-                        )
-                    else:
-                        batch_input_ids, attention_mask = algorithm.tokenize_prompts_dinfer(
-                            prompts=batch_prompts,
-                            apply_chat_template=False,
-                            messages=None
-                        )
-                    logger.debug(f"dInfer tokenization: input_ids.shape={batch_input_ids.shape}, attention_mask={attention_mask is not None}")
+                # Handle different return types (dInfer returns tuple, others return tensor)
+                if isinstance(tokenization_result, tuple):
+                    batch_input_ids, attention_mask = tokenization_result
+                    logger.debug(f"Tokenization (with attention mask): input_ids.shape={batch_input_ids.shape}")
                 else:
-                    # Fast-dLLM/Nemotron use standard tokenization (right-padding, no attention_mask)
-                    if use_chat_template:
-                        batch_input_ids = algorithm.tokenize_prompts(
-                            prompts=[],
-                            apply_chat_template=True,
-                            messages=batch_messages
-                        )
-                    else:
-                        batch_input_ids = algorithm.tokenize_prompts(
-                            prompts=batch_prompts,
-                            apply_chat_template=False,
-                            messages=None
-                        )
+                    batch_input_ids = tokenization_result
                     attention_mask = None
-                    logger.debug(f"Standard tokenization: input_ids.shape={batch_input_ids.shape}")
-                
-                logger.debug(f"Batch input shape: {batch_input_ids.shape}")
+                    logger.debug(f"Tokenization (no attention mask): input_ids.shape={batch_input_ids.shape}")
                 
                 # Store individual prompt lengths for later decoding
                 prompt_lengths = [batch_input_ids.shape[1]] * batch_input_ids.shape[0]
@@ -632,7 +598,9 @@ class BatchProcessor:
             # Use algorithm's decode_outputs method
             try:
                 # Check if this is a dInfer algorithm (different decode signature)
-                if is_dinfer:
+                has_dinfer_decode = hasattr(algorithm, 'decode_outputs_dinfer')
+                
+                if has_dinfer_decode:
                     # dInfer needs input_ids to calculate prompt lengths (handles left-padding)
                     generated_texts = algorithm.decode_outputs_dinfer(output, batch_input_ids)
                 else:
@@ -654,7 +622,7 @@ class BatchProcessor:
                     created = int(time.time())
                     
                     # Calculate token usage
-                    if is_dinfer:
+                    if has_dinfer_decode:
                         # For dInfer, calculate actual prompt length (excluding padding)
                         input_tokens = (batch_input_ids[i] != algorithm.tokenizer.pad_token_id).sum().item()
                     else:
@@ -946,7 +914,8 @@ Examples:
         base_model=args.base_model,
         temp_dir=args.temp_dir,
         engine=args.engine,
-        algorithm_name=args.algorithm
+        algorithm_name=args.algorithm,
+        use_chat_template=not args.no_chat_template
     )
     
     if not success:

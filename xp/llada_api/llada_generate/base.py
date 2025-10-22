@@ -33,6 +33,7 @@ class GenerationAlgorithm(ABC):
         self.device: Optional[str] = None
         self.model_config: Optional[Any] = None
         self.model_type: Optional[str] = None  # 'llada' or 'nemotron'
+        self.use_chat_template: bool = True  # Whether to use chat template (default: True)
     
     @abstractmethod
     def generate(
@@ -401,3 +402,63 @@ class GenerationAlgorithm(ABC):
             validated_args['gen_length'] = ((gen_length // block_length) + 1) * block_length
         
         return validated_args
+    
+    def prepare_prompts(self, messages_list: List[List[Dict[str, str]]]) -> List[Optional[str]]:
+        """
+        Prepare prompts from messages based on use_chat_template setting.
+        
+        Args:
+            messages_list: List of message lists, where each message list contains
+                          dicts with 'role' and 'content' keys
+        
+        Returns:
+            List of prepared prompts (or None if using chat template directly)
+        """
+        if self.use_chat_template:
+            # Return None - will apply chat template during tokenization
+            return [None] * len(messages_list)
+        else:
+            # Extract raw text from last message in each conversation
+            prompts = []
+            for messages in messages_list:
+                if messages:
+                    # Use the content from the last message
+                    prompts.append(messages[-1]['content'])
+                else:
+                    prompts.append("")
+            return prompts
+    
+    def tokenize_batch(
+        self, 
+        messages_list: List[List[Dict[str, str]]]
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Tokenize a batch of messages using the appropriate method.
+        
+        This is a unified interface that handles both chat template and raw text modes.
+        Subclasses can override for engine-specific behavior (e.g., dInfer left-padding).
+        
+        Args:
+            messages_list: List of message lists to tokenize
+        
+        Returns:
+            Either input_ids tensor (for Fast-dLLM/Nemotron) or 
+            tuple of (input_ids, attention_mask) for dInfer
+        """
+        # Default implementation: use tokenize_prompts for standard algorithms
+        if self.use_chat_template:
+            input_ids = self.tokenize_prompts(
+                prompts=[],
+                apply_chat_template=True,
+                messages=messages_list
+            )
+        else:
+            # Prepare raw prompts
+            prompts = self.prepare_prompts(messages_list)
+            input_ids = self.tokenize_prompts(
+                prompts=prompts,
+                apply_chat_template=False,
+                messages=None
+            )
+        
+        return input_ids

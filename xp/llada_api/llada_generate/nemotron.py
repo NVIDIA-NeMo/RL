@@ -125,7 +125,7 @@ class NemotronGeneration(GenerationAlgorithm):
             'remasking': True,   # Not used by Nemotron but kept for compatibility
             'threshold': 0.9,    # Nemotron default
             'factor': 1.0,       # Not used by Nemotron but kept for compatibility
-            'shift_logits': False # Nemotron default
+            'shift_logits': self.use_chat_template  # True when using chat template, False for raw text
         }
 
 

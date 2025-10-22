@@ -282,6 +282,30 @@ class DInferGeneration(GenerationAlgorithm):
             'threshold': 0.9,
             'factor': 1.0,  # Not used by dInfer
         }
+    
+    def tokenize_batch(self, messages_list):
+        """
+        dInfer-specific batch tokenization with left-padding.
+        
+        Returns:
+            Tuple of (input_ids, attention_mask) - dInfer needs attention mask
+        """
+        if self.use_chat_template:
+            input_ids, attention_mask = self.tokenize_prompts_dinfer(
+                prompts=[],
+                apply_chat_template=True,
+                messages=messages_list
+            )
+        else:
+            # Prepare raw prompts
+            prompts = self.prepare_prompts(messages_list)
+            input_ids, attention_mask = self.tokenize_prompts_dinfer(
+                prompts=prompts,
+                apply_chat_template=False,
+                messages=None
+            )
+        
+        return input_ids, attention_mask
 
 
 __all__ = [
