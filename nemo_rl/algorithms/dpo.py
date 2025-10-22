@@ -652,7 +652,9 @@ def dpo_train(
                         assert full_metric_name.startswith(
                             "train:"
                         ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'.\n"
+                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                            f" e.g. 'val_loss --> 'val:loss'"
                         )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
