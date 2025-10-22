@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import builtins
 import json
 import statistics
 import sys
@@ -23,24 +24,48 @@ from rich.table import Table
 # Custom functions for working with dictionary values
 def min(value):
     """Return the minimum value in a dictionary."""
-    return __builtins__.min(float(v) for v in value.values())
+    return builtins.min(float(v) for v in value.values())
 
 
 def max(value):
     """Return the maximum value in a dictionary."""
-    return __builtins__.max(float(v) for v in value.values())
+    return builtins.max(float(v) for v in value.values())
 
 
-def mean(value, range_start=1, range_end=0):
+def ratio_above(value, threshold):
+    """Return the ratio of values that are >= threshold.
+
+    Args:
+        value: Dictionary of step -> value
+        threshold: Threshold value to compare against
+
+    Returns:
+        Float between 0.0 and 1.0 representing the proportion of values >= threshold
+    """
+    vals = [float(v) for v in value.values()]
+    if len(vals) == 0:
+        return 0.0
+    count_above = sum(1 for v in vals if v >= threshold)
+    return count_above / len(vals)
+
+
+def mean(value, range_start=1, range_end=0, ignore_top_p=0.0):
     """Return the mean of values (or a range of values) in a dictionary.
 
     Note:
         step, and ranges, are 1 indexed. Range_end is exclusive.
         range_end=0 means to include until the last step in the run
+
+    Args:
+        value: Dictionary of step -> value
+        range_start: Starting step (1-indexed, default=1)
+        range_end: Ending step (1-indexed, exclusive, 0 means last step)
+        ignore_top_p: Proportion of top outliers to ignore (0.0-1.0, default=0.0)
+                     E.g., 0.05 ignores the top 5% of values
     """
 
     ## find potential offset that might arise from resuming from a checkpoint
-    max_step_reached = __builtins__.max([int(s) for s in value.keys()])
+    max_step_reached = builtins.max([int(s) for s in value.keys()])
     ## this is the number of steps that occurred prior to resuming
     offset = max_step_reached - len(value)
 
@@ -55,6 +80,20 @@ def mean(value, range_start=1, range_end=0):
         if range_start <= int(step) and int(step) < range_end:
             vals.append(float(v))
 
+    # Validate ignore_top_p parameter
+    if not 0.0 <= ignore_top_p <= 1.0:
+        raise ValueError(
+            f"ignore_top_p must be between 0.0 and 1.0, got {ignore_top_p}"
+        )
+
+    # Filter out top outliers if requested
+    if ignore_top_p > 0.0 and len(vals) > 0:
+        # Sort values and determine cutoff index
+        sorted_vals = sorted(vals)
+        cutoff_idx = int(len(sorted_vals) * (1.0 - ignore_top_p))
+        # Take only values up to the cutoff (excluding top p%)
+        vals = sorted_vals[:cutoff_idx] if cutoff_idx > 0 else sorted_vals[:1]
+
     return statistics.mean(vals)
 
 
@@ -65,17 +104,23 @@ def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
         Tuple of (passed, message, value)
     """
     # Create a local context with our custom functions and the data
-    local_context = {"data": data, "min": min, "max": max, "mean": mean}
+    local_context = {
+        "data": data,
+        "min": min,
+        "max": max,
+        "mean": mean,
+        "ratio_above": ratio_above,
+    }
 
     # Extract the value expression from the check
     value_expr = check.split(">")[0].split("<")[0].split("==")[0].strip()
 
     try:
         # Try to get the value first
-        value = eval(value_expr, {"__builtins__": __builtins__}, local_context)
+        value = eval(value_expr, {"__builtins__": builtins}, local_context)
 
         # Then evaluate the check
-        result = eval(check, {"__builtins__": __builtins__}, local_context)
+        result = eval(check, {"__builtins__": builtins}, local_context)
         if result:
             return True, f"PASS: {check}", value
         else:
@@ -107,6 +152,8 @@ def main():
       # Use helper functions
       python check_metrics.py results.json "min(data['class_f1']) > 0.6"
       python check_metrics.py results.json "mean(data['accuracies']) > 0.85"
+      python check_metrics.py results.json "mean(data['loss'], ignore_top_p=0.05) < 1.5"
+      python check_metrics.py results.json "ratio_above(data['error'], 1.05) < 0.02"
     """
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     args = parser.parse_args()

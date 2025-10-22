@@ -25,9 +25,7 @@ dependencies = [
     "triton",
     "colored==2.2.3",
     "ray[default]==2.46.0",
-    # transformers==4.54.0/4.54.1 both fail on rm models
-    # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
-    "transformers>=4.51.0,<4.54.0",
+    "transformers>=4.55.4",
     "wandb",
     "numpy",
     "datasets>=4.0.0",
@@ -51,6 +49,8 @@ dependencies = [
     "num2words>=0.5.14",   # for SmolVLM
     "mlflow",
     "nvidia-nvshmem-cu12", # for deep_ep build
+    "swanlab",
+    "pyzmq",
 ]
 
 [project.optional-dependencies]
@@ -105,6 +105,9 @@ adk = [
     "google-adk==1.14.1",
     "google-genai==1.38.0"
 ]
+penguin = [
+    "penguin",
+]
 
 [dependency-groups]
 
@@ -151,6 +154,7 @@ test = [
 megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
+penguin = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -173,6 +177,7 @@ members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/Automodel-workspace/Automodel",
     "3rdparty/Megatron-Bridge-workspace",
+    "3rdparty/Penguin-workspace",
 ]
 
 [[tool.uv.index]]

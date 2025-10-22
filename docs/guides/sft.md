@@ -85,6 +85,76 @@ data:
   val_split: <ValSplit>, default is None  # used for HuggingFace datasets
 ```
 
+### OpenAI Format Datasets (with Tool Calling Support)
+
+NeMo RL also supports datasets in the OpenAI conversation format, which is commonly used for chat models and function calling. This format is particularly useful for training models with tool-use capabilities.
+
+#### Basic Usage
+
+To use an OpenAI format dataset, configure your YAML as follows:
+
+```yaml
+data:
+  dataset_name: openai_format
+  train_data_path: "/path/to/train.jsonl"  # Path to training data
+  val_data_path: "/path/to/val.jsonl"      # Path to validation data
+  chat_key: "messages"                     # Key for messages in the data (default: "messages")
+  system_key: null                         # Key for system message in the data (optional)
+  system_prompt: null                      # Default system prompt if not in data (optional)
+  tool_key: "tools"                        # Key for tools in the data (default: "tools")
+  use_preserving_dataset: false            # Set to true for heterogeneous tool schemas (see below)
+```
+
+#### Data Format
+
+Your JSONL files should contain one JSON object per line with the following structure:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What's the weather in Paris?"},
+    {"role": "assistant", "content": "I'll check the weather for you.", "tool_calls": [
+      {"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}
+    ]},
+    {"role": "tool", "content": "22°C, sunny", "tool_call_id": "call_123"},
+    {"role": "assistant", "content": "The weather in Paris is currently 22°C and sunny."}
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather for a city",
+      "parameters": {
+        "city": {"type": "string", "description": "City name"},
+        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+      }
+    }
+  ]
+}
+```
+
+#### Tool Calling with Heterogeneous Schemas
+
+When your dataset contains tools with different argument structures (heterogeneous schemas), you should enable `use_preserving_dataset: true` to avoid data corruption:
+
+```yaml
+data:
+  dataset_name: openai_format
+  ...
+  use_preserving_dataset: true  # IMPORTANT: Enable this for tool calling datasets
+```
+
+**Why this matters:** Standard HuggingFace dataset loading enforces uniform schemas by adding `None` values for missing keys. For example:
+- Tool A has arguments: `{"query": "search term"}`
+- Tool B has arguments: `{"expression": "2+2", "precision": 2}`
+
+Without `use_preserving_dataset: true`, the loader would incorrectly add:
+- Tool A becomes: `{"query": "search term", "expression": None, "precision": None}`
+- Tool B becomes: `{"query": None, "expression": "2+2", "precision": 2}`
+
+This corrupts your training data and can lead to models generating invalid tool calls. The `PreservingDataset` mode maintains the exact structure of each tool call.
+
+
 Adding a new dataset is a straightforward process.
 As long as your custom dataset has the `formatted_ds` and `task_spec` attributes described above, it can serve as a drop-in replacement for Squad and OpenAssistant.
 

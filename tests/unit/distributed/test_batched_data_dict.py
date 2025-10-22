@@ -546,6 +546,76 @@ def test_get_multimodal_dict_mixed_content_and_device_move():
     ].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def test_from_batches_pads_3d_tensors_along_sequence_dim():
+    """from_batches should pad 3D tensors along the sequence dimension before stacking."""
+
+    pad_value = -5.0
+    batch1 = BatchedDataDict(
+        {
+            "teacher_logits": torch.tensor(
+                [
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                    [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+                ],
+                dtype=torch.float32,
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "teacher_logits": torch.tensor(
+                [
+                    [
+                        [13.0, 14.0],
+                        [15.0, 16.0],
+                        [17.0, 18.0],
+                        [19.0, 20.0],
+                        [21.0, 22.0],
+                    ],
+                    [
+                        [23.0, 24.0],
+                        [25.0, 26.0],
+                        [27.0, 28.0],
+                        [29.0, 30.0],
+                        [31.0, 32.0],
+                    ],
+                ],
+                dtype=torch.float32,
+            )
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"teacher_logits": pad_value}
+    )
+
+    stacked_logits = stacked["teacher_logits"]
+    assert stacked_logits.shape == (4, 5, 2)
+
+    expected_batch1 = torch.tensor(
+        [
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [5.0, 6.0],
+                [pad_value, pad_value],
+                [pad_value, pad_value],
+            ],
+            [
+                [7.0, 8.0],
+                [9.0, 10.0],
+                [11.0, 12.0],
+                [pad_value, pad_value],
+                [pad_value, pad_value],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    expected = torch.cat([expected_batch1, batch2["teacher_logits"]], dim=0)
+
+    assert torch.equal(stacked_logits, expected)
+
+
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
 def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     """Test that microbatch boundaries are correctly maintained across chunks with random sequences."""

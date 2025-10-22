@@ -28,6 +28,7 @@ policy:
     # We don't use the "default" chat template because the Llama tokenizer inserts the current
     # date in the system prompt, which could make the reward model's output date-dependent.
     chat_template: "{{- bos_token }}\n\n{#- This block extracts the system message, so we can slot it into the right place. #}\n{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content']|trim %}\n    {%- set messages = messages[1:] %}\n{%- else %}\n    {%- set system_message = '' %}\n{%- endif %}\n\n{#- System message #}\n{{- '<|start_header_id|>system<|end_header_id|>\n\n' }}\n{{- system_message }}\n{{- '<|eot_id|>' }}\n\n{%- for message in messages %}\n    {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' }}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|start_header_id|>assistant<|end_header_id>\n\n' }}\n{%- endif %}"
+    chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
   train_global_batch_size: 128
   train_micro_batch_size: 1
   max_total_sequence_length: 8192
@@ -105,6 +106,10 @@ policy:
 
       clip_grad: ${policy.max_grad_norm}
 
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -125,6 +130,7 @@ policy:
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
   shuffle: true
+  num_workers: 1
 
   dataset_name: HelpSteer3
   # You can use custom preference datasets for training and validation. For example:
@@ -159,6 +165,7 @@ logger:
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "rm-dev"

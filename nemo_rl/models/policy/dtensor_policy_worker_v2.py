@@ -18,10 +18,11 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional, cast
+from typing import Any, Generator, Optional, cast
 
 import ray
 import torch
+import zmq
 from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
@@ -39,7 +40,6 @@ from nemo_automodel.components.distributed.grad_utils import (
 )
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
-    unshard_fsdp2_model,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -66,7 +66,11 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
+from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
+    get_logprobs_from_vocab_parallel_logits,
+)
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -80,7 +84,6 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_gpu_info,
-    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
     resolve_model_class,
@@ -91,6 +94,7 @@ from nemo_rl.utils.automodel_checkpoint import (
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
 @ray.remote(
@@ -118,6 +122,7 @@ class DTensorPolicyWorkerV2:
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
+        """Initialize the DTensorPolicyWorkerV2."""
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -167,6 +172,8 @@ class DTensorPolicyWorkerV2:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
+        hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -179,6 +186,11 @@ class DTensorPolicyWorkerV2:
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
+            **hf_config_overrides,
+        )
+
+        self.allow_flash_attn_args = self.check_model_allow_flash_attn_args(
+            model_config
         )
 
         self._is_reward_model = (
@@ -438,33 +450,35 @@ class DTensorPolicyWorkerV2:
                 "No weights path provided. Starting from scratch (default policy init)"
             )
 
-        # vars used for refit
-        ## will be initialized in prepare_refit_info
-        self.refit_param_info = None
-        ## used for streaming update inference engine weights
-        self._held_sharded_state_dict_reference: Optional[dict[str, torch.Tensor]] = (
-            None
-        )
-        self._held_streamed_param_reference: Optional[dict[str, torch.Tensor]] = None
-
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
-    def init_collective(self, ip: str, port: int, world_size: int) -> None:
-        """Initialize the collective communication."""
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        if self.rank == 0:
-            pg = StatelessProcessGroup.create(
-                host=ip, port=port, rank=0, world_size=world_size
-            )
-            device = torch.cuda.current_device()
-            self.model_update_group = PyNcclCommunicator(pg, device=device)
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
+        device = torch.cuda.current_device()
+        self.model_update_group = PyNcclCommunicator(pg, device=device)
 
     def is_alive(self) -> bool:
+        return True
+
+    def check_model_allow_flash_attn_args(self, model_config) -> bool:
+        # Some models doesn't support flash_attn_kwargs
+        # Check nemotron nas.
+        if (
+            model_config.architectures[0] == "DeciLMForCausalLM"
+            and model_config.model_type == "nemotron-nas"
+        ):
+            return False
+
         return True
 
     def reset_peak_memory_stats(self) -> None:
@@ -686,6 +700,12 @@ class DTensorPolicyWorkerV2:
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
+                            if (
+                                not self.allow_flash_attn_args
+                                and "flash_attn_kwargs" in model_args
+                            ):
+                                del model_args["flash_attn_kwargs"]
+
                             outputs = self.model(**model_args)
 
                         # Get logprobs
@@ -804,7 +824,6 @@ class DTensorPolicyWorkerV2:
                                 self.model.parameters(),
                                 max_grad_norm=self.max_grad_norm,
                                 total_norm=grad_norm,
-                                dtype=torch.float32,
                             )
                         grad_norm = torch.tensor([grad_norm])
 
@@ -813,6 +832,8 @@ class DTensorPolicyWorkerV2:
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+            # release gradient memory before rollouts
+            self.optimizer.zero_grad()
             # increment scheduler after all batches in rollout are processed
             if not eval_mode:
                 self.scheduler.step()
@@ -879,7 +900,7 @@ class DTensorPolicyWorkerV2:
         all_log_probs = []
         self.model.eval()
 
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -995,6 +1016,12 @@ class DTensorPolicyWorkerV2:
                             **vlm_kwargs,
                         )
                         if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        if (
+                            not self.allow_flash_attn_args
+                            and "flash_attn_kwargs" in model_args
+                        ):
                             del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)
@@ -1158,7 +1185,7 @@ class DTensorPolicyWorkerV2:
                 )
         self.model.eval()
         print("Begin to batch datas")
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
@@ -1270,6 +1297,286 @@ class DTensorPolicyWorkerV2:
         )
         return return_data
 
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits")
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-position top-k logits and corresponding global indices.
+
+        Notes:
+        - Return shapes are [B, S, k].
+        - Computes top-k over the full sequence (no trimming of the last position).
+        - If alignment with next-token targets is required, the caller should handle it.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
+        - Otherwise, computes local top-k on full-vocab tensor.
+        """
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
+        out_topk_vals = []
+        out_topk_idx = []
+        self.model.eval()
+
+        with torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                # dynamic batching support (no CP/packed)
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(topk_batch_size)
+                iterator_len = data.size // topk_batch_size
+
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+
+                batch_size, seq_len = input_ids.shape
+                # Store original shapes for unpacking later
+                original_batch_size = batch_size
+                original_seq_len = seq_len
+
+                if self.enable_seq_packing:
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Build attention mask (right-padded inputs)
+                    attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        attention_mask[i, :length] = 1
+
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+
+                    flash_attn_kwargs = {}
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with get_train_context(False, False, context_parallel_ctx)():
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                        )
+
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    del outputs
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
+
+                    if self.cp_size > 1:
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        # deal with TP first
+                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
+
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(local_logits.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
+
+                        vals, idx = distributed_vocab_topk(
+                            local_logits,
+                            k=k,
+                            tp_group=tp_group,
+                            vocab_start_index=vocab_start_index,
+                            vocab_end_index=vocab_end_index,
+                        )
+                        # [B, S_cp, k]
+
+                        cp_group = self.cp_mesh.get_group()
+
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
+                        )
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
+                        )
+                        # [B, S, k]
+                    else:
+                        # Compute top-k over full sequence length (do not drop last position)
+                        if isinstance(logits, DTensor):
+                            local_logits = logits.to_local()  # [B, S, V_local]
+                            tp_group = self.tp_mesh.get_group()
+                            tp_rank = torch.distributed.get_rank(tp_group)
+                            V_local = int(local_logits.shape[-1])
+                            vocab_start_index = tp_rank * V_local
+                            vocab_end_index = (tp_rank + 1) * V_local
+
+                            vals, idx = distributed_vocab_topk(
+                                local_logits,
+                                k=k,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                        else:
+                            full_logits = logits.to(torch.float32)
+                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
+
+                # Handle sequence packing unpacking
+                if self.enable_seq_packing:
+                    # Unpack top-k results from packed format back to original batch format
+                    # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+
+                    # Create tensors to store unpacked results
+                    unpacked_vals = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=vals.dtype,
+                        device=vals.device,
+                    )
+                    unpacked_idx = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=idx.dtype,
+                        device=idx.device,
+                    )
+
+                    # Get cumulative sequence lengths for unpacking
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+
+                    for i in range(original_batch_size):
+                        start = cu_seqlens[i].item()
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+
+                        # Extract the corresponding portion from packed results
+                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+
+                    # Replace with unpacked results
+                    vals = unpacked_vals
+                    idx = unpacked_idx
+
+                    # Update batch_size and seq_len for consistency
+                    batch_size = original_batch_size
+                    seq_len = original_seq_len
+
+                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
+                # Shapes remain [B, S, k].
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
+        all_topk_vals_padded = []
+        all_topk_idx_padded = []
+        target_seq_len = seq_dim_size
+        for vals, idx in zip(out_topk_vals, out_topk_idx):
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
+            all_topk_vals_padded.append(vals)
+            all_topk_idx_padded.append(idx)
+
+        ret["topk_logits"] = (
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
+
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
@@ -1350,99 +1657,71 @@ class DTensorPolicyWorkerV2:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
+    def get_zmq_address(self):
+        """Get the ZMQ address for the current device."""
+        return f"ipc:///tmp/{self.report_device_id()}.sock"
+
+    def maybe_init_zmq(self):
+        """Initialize the ZMQ socket if it doesn't exist."""
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_socket.bind(self.get_zmq_address())
+
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        state_dict = self.model.state_dict()
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
+        state_dict_info = {}
+        for name, tensor in self.model.state_dict().items():
+            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+            state_dict_info[name] = (tensor.shape, self.dtype)
 
-        if self.is_generation_colocated:
-            # Collect info for streaming multiple tensors
-            self.refit_param_info = []
-            for name, tensor in state_dict.items():
-                # dtensor's numel will return complete tensor instead of only local tensor
-                size_in_bytes = tensor.element_size() * tensor.numel()
-                self.refit_param_info.append((name, size_in_bytes))
+        return state_dict_info
 
-        else:
-            # Collect info for collective communication
-            state_dict_info = {}
-            for name, tensor in state_dict.items():
-                state_dict_info[name] = (tensor.shape, self.dtype)
-
-            return state_dict_info
-
-    @torch.no_grad()
-    def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
-        """Prepare the weights for IPC.
-
-        This function:
-        - Prepares the state_dict of the model.
-        - Collects the info for streaming multiple tensors.
-
-        Returns:
-            list: The list of parameters sizes.
-            float: The total available memory in bytes.
-        """
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
         from nemo_rl.utils.nvml import get_free_memory_bytes
 
+        device_idx = torch.cuda.current_device()
+        return get_free_memory_bytes(device_idx)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
-        # Get state_dict
-        self._held_sharded_state_dict_reference: dict[str, torch.Tensor] = (
-            self.model.state_dict()
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        def dtensor_params_generator():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            for name, tensor in self.model.state_dict().items():
+                if isinstance(tensor, DTensor):
+                    # Convert DTensor to full tensor for streaming
+                    full_tensor = tensor.full_tensor()
+                    # Convert to target dtype
+                    yield (
+                        name,
+                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                    )
+                else:
+                    # Convert to target dtype
+                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=dtensor_params_generator(),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
         )
-
-        # Collect current available memory for refit
-        ## Get current device index from torch
-        device_idx = torch.cuda.current_device()
-        ## Get device free memory using NVML
-        total_available_bytes = get_free_memory_bytes(device_idx)
-        ## Use 80% of the free memory for safety
-        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.8")
-        total_available_bytes *= float(memory_ratio)
-
-        return self.refit_param_info, total_available_bytes
-
-    @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_weights_ipc_handles")
-    def get_weights_ipc_handles(self, keys: Iterable[str]) -> dict[str, Any]:
-        assert self._held_sharded_state_dict_reference is not None, (
-            "prepare_weights_for_ipc must be called before get_weights_ipc_handles"
-        )
-
-        # Clean up the held tensors to reduce peak memory
-        if self._held_streamed_param_reference is not None:
-            del self._held_streamed_param_reference
-            self._held_streamed_param_reference = None
-
-        converted_params = {}
-        for key in keys:
-            # Get full_tensor for dtensor (GPU > 1)
-            tensor = self._held_sharded_state_dict_reference[key]
-            if isinstance(tensor, DTensor):
-                full_tensor = tensor.full_tensor()
-            else:
-                full_tensor = tensor
-            # Convert parameters to the configured dtype
-            converted_params[key] = full_tensor.to(self.dtype, non_blocking=True)
-
-        # Temporary record the full tensor for cleanup
-        # It is needed for cleanup the last full_tensor in the refit process
-        self._held_streamed_param_reference = converted_params
-
-        # Get device UUID for IPC
-        device_uuid = self.report_device_id()
-        # Create handles for the tensors
-        all_handles = []
-        for key, p in converted_params.items():
-            handle = get_handle_from_tensor(p)
-            all_handles.append((key, handle))
-
-        # (pack_tensor_for_ipc: bool, handles: list)
-        serialized = (False, all_handles)
-
-        return {device_uuid: serialized}
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
@@ -1455,13 +1734,21 @@ class DTensorPolicyWorkerV2:
             )
             self.model = self.move_to_cuda(self.model)
 
-        # Broadcast the weights for collective communication
-        for _, tensor in self.model.state_dict().items():
+        def _dtensor_post_iter_func(tensor, dtype):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
-            if self.rank == 0:
-                tensor = tensor.to(self.dtype, non_blocking=True)
-                self.model_update_group.broadcast(tensor.data, src=0)
+            tensor = tensor.to(dtype, non_blocking=True)
+            return tensor
+
+        # param_iterator will return (name, tensor), we only need tensor
+        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+
+        packed_broadcast_producer(
+            iterator=iter(self.model.state_dict().items()),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=dtensor_post_iter_func,
+        )
 
         # Manually move model to cpu for cpu offload case
         # cpu offload needs model on CPU before model forward
@@ -1519,22 +1806,11 @@ class DTensorPolicyWorkerV2:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
     def offload_after_refit(self) -> None:
-        # Offload as much as possible on the CPU
+        """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
-
-        # Clean up the held tensors
-        if self._held_sharded_state_dict_reference is not None:
-            del self._held_sharded_state_dict_reference
-            self._held_sharded_state_dict_reference = None
-        if self._held_streamed_param_reference is not None:
-            del self._held_streamed_param_reference
-            self._held_streamed_param_reference = None
-
-        gc.collect()
-        torch.cuda.empty_cache()
 
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
@@ -1625,6 +1901,10 @@ class DTensorPolicyWorkerV2:
 
     def shutdown(self) -> None:
         """Shutdown the policy."""
+        # Clean up extension resources like ZMQ sockets
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

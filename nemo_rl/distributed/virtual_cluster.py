@@ -51,11 +51,11 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = "uv run --locked --extra automodel"
 
-    # Megatron-core (and nemo dependencies)
-    # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
-    # but the submodules are not downloaded yet. This results in errors where it appears Megatron/Nemo
-    # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
-    MCORE = "uv run --reinstall --extra mcore"
+    # Use NeMo-RL direct dependencies and Megatron.
+    MCORE = "uv run --locked --extra mcore"
+
+    # Use Penguin dependencies
+    PENGUIN = "uv run --locked --extra penguin"
 
     ADK = "uv run --locked --extra adk"
 
