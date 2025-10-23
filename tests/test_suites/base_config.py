@@ -275,11 +275,21 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
 
         return self.project_root / "examples" / script_name
 
-    def build_command(self) -> List[str]:
+    def build_command(
+        self, extra_overrides: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
         """Build the uv run command with YAML config + overrides.
 
         Overrides are applied in Hydra format (key=value).
         The command structure is compatible with Hydra's override system.
+
+        Args:
+            extra_overrides: Optional dictionary of additional overrides to apply
+                           after self.overrides. This allows callers to add
+                           test-specific overrides without modifying the config.
+
+        Returns:
+            Command as a list of strings ready for subprocess execution
         """
         cmd = [
             "uv",
@@ -287,28 +297,17 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             "--no-sync",
             str(self.get_run_script_path()),
             "--config",
-            str(self.config_path),
+            str(self.yaml_config),
         ]
 
         # Apply overrides from self.overrides dict
         for key, value in self.overrides.items():
             cmd.append(f"{key}={value}")
 
-        # Apply test-specific overrides (logs and checkpoints)
-        # Using a dict makes it easier to maintain and see all overrides
-        test_overrides = {
-            "logger.log_dir": str(self.log_dir),
-            "logger.wandb_enabled": True,
-            "logger.wandb.project": "nemo-rl",
-            "logger.wandb.name": self.test_name,
-            "logger.monitor_gpus": True,
-            "logger.tensorboard_enabled": True,
-            "checkpointing.enabled": True,
-            "checkpointing.checkpoint_dir": str(self.ckpt_dir),
-        }
-
-        for key, value in test_overrides.items():
-            cmd.append(f"{key}={value}")
+        # Apply extra overrides if provided
+        if extra_overrides:
+            for key, value in extra_overrides.items():
+                cmd.append(f"{key}={value}")
 
         return cmd
 
@@ -317,154 +316,62 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return os.environ.get("CI_JOB_ID", "local")
 
 
-class BaseNeMoRLTest:  # TODO(ahmadki): to a different file, then create a default test with folder overrides
-    """Base test class with common test methods for NeMo-RL tests.
+@dataclass
+class DefaultNeMoRLTestConfig(NeMoRLTestConfig):
+    """Test configuration with default test overrides pre-applied.
 
-    All test classes should inherit from this class and define a `config` class attribute.
-    This provides the standard test_training_runs_successfully_local() and
-    test_training_runs_successfully_slurm() methods.
+    This config class automatically includes standard overrides for:
+    - Logger configuration (wandb, tensorboard, GPU monitoring)
+    - Checkpointing configuration
+    - Log and checkpoint directories
+
+    Users can still override these defaults by passing custom values in the overrides dict.
 
     Example:
-        class TestMyTraining(BaseNeMoRLTest):
-            config = NeMoRLTestConfig(
-                test_name="my-test",
-                algorithm="sft",
-                test_suites=["nightly"],
-                time_limit_minutes=120,
-            )
+        # Use defaults
+        config = DefaultNeMoRLTestConfig(
+            test_name="my-test",
+            algorithm="sft",
+            model_class="llm",
+        )
+
+        # Override specific defaults
+        config = DefaultNeMoRLTestConfig(
+            test_name="my-test",
+            algorithm="sft",
+            model_class="llm",
+            overrides={
+                "logger.wandb_enabled": False,  # Disable wandb
+                "trainer.max_steps": 100,  # Add custom override
+            }
+        )
     """
 
-    config: NeMoRLTestConfig  # Must be defined by subclass
+    def __post_init__(self):
+        # Apply default test overrides before parent __post_init__
+        # This ensures they're part of the config but can still be overridden
+        default_overrides = {
+            "logger.wandb_enabled": True,
+            "logger.wandb.project": "nemo-rl",
+            "logger.monitor_gpus": True,
+            "logger.tensorboard_enabled": True,
+            "checkpointing.enabled": True,
+        }
 
-    def test_train_local(self):
-        """Test that training completes successfully when run locally."""
-        cmd = self.config.build_command()
-        return_code = run_command(
-            cmd, self.config.run_log_path, cwd=self.config.project_root
-        )
+        # Merge defaults with user overrides (user overrides take precedence)
+        merged_overrides = {**default_overrides, **self.overrides}
+        self.overrides = merged_overrides
 
-        assert return_code == 0, (
-            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
-        )
+        # Call parent __post_init__ which will process all overrides
+        super().__post_init__()
 
-    def test_train_slurm(self, request):
-        """Test that training completes successfully when run via Slurm."""
-        return_code = run_via_slurm(self.config, request.node.nodeid)
+        # Add path-based overrides after directories are set up
+        # These overrides reference paths that are computed in parent __post_init__
+        path_overrides = {
+            "logger.log_dir": str(self.log_dir),
+            "logger.wandb.name": self.test_name,
+            "checkpointing.checkpoint_dir": str(self.ckpt_dir),
+        }
 
-        assert return_code == 0, (
-            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
-        )
-
-
-# TODO(ahmadki): make part of BaseNeMoRLTest ?
-def run_command(cmd: List[str], log_file: Path, cwd: Optional[Path] = None) -> int:
-    """Run a command and log output to a file.
-
-    Args:
-        cmd: Command to run as a list of strings
-        log_file: Path to write output to
-        cwd: Working directory to run command in
-
-    Returns:
-        Return code of the command
-    """
-    with open(log_file, "w") as f:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=cwd,
-            bufsize=1,
-        )
-
-        # Stream output to both console and file
-        if process.stdout:
-            for line in process.stdout:
-                print(line, end="")
-                f.write(line)
-
-        return_code = process.wait()
-
-    return return_code
-
-
-def run_via_slurm(config: NeMoRLTestConfig, pytest_nodeid: str) -> int:
-    """Run a test via Slurm by invoking launch_nemo_rl.py.
-
-    This function is called when pytest is run with --slurm option.
-    It submits the current test to Slurm instead of running locally.
-
-    Args:
-        config: Test configuration
-        pytest_nodeid: Pytest node ID (e.g., "tests/test_suites/llm/sft-test/test_file.py::TestClass::test_method")
-
-    Returns:
-        Return code from the Slurm job
-    """
-    # Get the test folder from the pytest nodeid
-    # Example: "tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch/test_file.py::..."
-    # Extract: "sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch"
-    parts = Path(pytest_nodeid).parts
-    if "llm" in parts or "vlm" in parts:
-        # Find the test folder name (the folder containing the test file)
-        test_folder_idx = -1
-        for i, part in enumerate(parts):
-            if part in ("llm", "vlm") and i + 1 < len(parts):
-                test_folder_idx = i + 1
-                break
-
-        if test_folder_idx != -1:
-            test_folder = parts[test_folder_idx]
-        else:
-            test_folder = config.test_name
-    else:
-        test_folder = config.test_name
-
-    # Build launch command
-    launch_script = config.project_root / "tests" / "test_suites" / "launch_nemo_rl.py"
-
-    launch_cmd = [
-        "python",
-        str(launch_script),
-        "--test-name",
-        test_folder,
-        "--num-nodes",
-        str(config.num_nodes),
-    ]
-
-    # Add optional environment-based arguments
-    env_mappings = {
-        "SLURM_ACCOUNT": "--slurm-account",
-        "CI_JOB_NAME": "--job-name",
-        "TIME": "--job-time",
-        "BUILD_IMAGE_NAME_SBATCH": "--image",
-        "PARTITION": "--partition",
-        "HOST": "--host",
-        "RL_USER": "--user",
-        "IDENTITY": "--identity",
-        "NEMORUN_HOME": "--nemorun-home",
-        "CI_JOB_ID": "--ci-job-id",
-        "HF_HOME": "--hf-home",
-        "HF_DATASETS_CACHE": "--hf-datasets-cache",
-        "HF_HUB_OFFLINE": "--hf-hub-offline",
-        "RL_HF_TOKEN": "--hf-token",
-        "WANDB_API_KEY": "--wandb-api-key",
-        "NRL_DEEPSCALER_8K_CKPT": "--nrl-deepscaler-8k-ckpt",
-        "NRL_DEEPSCALER_16K_CKPT": "--nrl-deepscaler-16k-ckpt",
-        "NRL_DEEPSCALER_24K_CKPT": "--nrl-deepscaler-24k-ckpt",
-    }
-
-    for env_var, arg_name in env_mappings.items():
-        value = os.environ.get(env_var)
-        if value:
-            launch_cmd.extend([arg_name, value])
-
-    print(f"\n{'=' * 80}")
-    print(f"Submitting test to Slurm: {test_folder}")
-    print(f"Command: {' '.join(launch_cmd)}")
-    print(f"{'=' * 80}\n")
-
-    # Run the launch script
-    result = subprocess.run(launch_cmd, cwd=config.project_root)
-    return result.returncode
+        # Merge path overrides with existing overrides (path overrides take precedence)
+        self.overrides = {**self.overrides, **path_overrides}

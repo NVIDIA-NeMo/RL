@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
+from tests.test_suites.base_config import NeMoRLTestConfig
+from tests.test_suites.base_test import BaseNeMoRLTest
 
 
 class TestVlmGrpoQwen25Vl3bInstructClevr1n2gDtensor2tp1V1(BaseNeMoRLTest):
