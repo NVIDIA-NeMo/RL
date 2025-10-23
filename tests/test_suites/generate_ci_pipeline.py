@@ -234,12 +234,14 @@ class GitLabCIPipelineGenerator:
         pytest_args: Optional[List[str]] = None,
         module: str = "nemo_rl",
         extends: Optional[str] = None,
+        test_mode: str = "local",
     ):
         self.tests = tests
         self.base_image = base_image
         self.pytest_args = pytest_args or []
         self.module = module
         self.extends = extends
+        self.test_mode = test_mode
 
     def generate_job(self, test: TestClassInfo) -> Dict:
         """Generate a GitLab CI job configuration for a single test class.
@@ -252,6 +254,29 @@ class GitLabCIPipelineGenerator:
         """
         # Convert time_limit_minutes to "MM:SS" format
         time_str = f"{test.time_limit_minutes}:00"
+
+        # Build pytest command with marker filtering based on test_mode
+        pytest_cmd_parts = ["pytest"]
+
+        # Add test mode marker filter
+        if self.test_mode == "local":
+            # Run all tests except slurm (includes test_train_local + other tests)
+            pytest_cmd_parts.extend(["-m", '"not runner_slurm"'])
+        elif self.test_mode == "slurm":
+            # Run only slurm tests (test_train_slurm only)
+            pytest_cmd_parts.extend(["-m", "runner_slurm"])
+        elif self.test_mode == "all":
+            # Run all tests including both local and slurm
+            pass
+
+        # Add any additional pytest args
+        pytest_cmd_parts.extend(self.pytest_args)
+
+        # Add test path and verbose flag
+        pytest_cmd_parts.append(test.pytest_path)
+        pytest_cmd_parts.append("-v")
+
+        pytest_cmd = " ".join(pytest_cmd_parts)
 
         job = {
             "stage": "test",
@@ -268,7 +293,7 @@ class GitLabCIPipelineGenerator:
                 "echo 'Running test: ${TEST_NAME}'",
                 "echo 'Algorithm: ${ALGORITHM}'",
                 "echo 'Model class: ${MODEL_CLASS}'",
-                f"pytest {' '.join(self.pytest_args)} {test.pytest_path} -v",
+                pytest_cmd,
             ],
         }
 
@@ -445,6 +470,17 @@ def main():
     )
 
     parser.add_argument(
+        "--test-mode",
+        type=str,
+        choices=["local", "slurm", "all"],
+        default="local",
+        help="Test mode: 'local' (run test_train_local + other tests), "
+        "'slurm' (run test_train_slurm only), "
+        "'all' (run both test_train_local and test_train_slurm + other tests) "
+        "(default: local)",
+    )
+
+    parser.add_argument(
         "--list-tests",
         action="store_true",
         help="List discovered tests and exit (don't generate pipeline)",
@@ -495,6 +531,7 @@ def main():
         pytest_args=pytest_args,
         module=args.module,
         extends=args.extends,
+        test_mode=args.test_mode,
     )
     yaml_output = generator.generate_yaml()
 
