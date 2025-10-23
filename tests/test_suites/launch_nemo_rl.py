@@ -1,17 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Launch a NeMo-RL test as a Ray job on a Slurm cluster"""
 
 import argparse
@@ -27,25 +13,6 @@ def parse_args():
         description="Launch a NeMo-RL test as a Ray job on a Slurm cluster"
     )
 
-    # Test specification - support multiple ways to specify tests
-    test_group = parser.add_mutually_exclusive_group(required=True)
-    test_group.add_argument(
-        "--test-path",
-        default=os.environ.get("TEST_PATH"),
-        help="Path to test folder or file (e.g., tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch/)",
-    )
-    test_group.add_argument(
-        "--test-markers",
-        default=os.environ.get("TEST_MARKERS"),
-        help="Pytest markers to filter tests (e.g., 'algo_sft and suite_nightly and num_gpus_8')",
-    )
-    test_group.add_argument(
-        "--test-name",
-        default=os.environ.get("TEST_NAME"),
-        help="Test name (e.g., sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch)",
-    )
-
-    # CI/Infrastructure
     parser.add_argument(
         "--ci-job-id", default=os.environ.get("CI_JOB_ID"), help="CI job ID"
     )
@@ -118,6 +85,11 @@ def parse_args():
     parser.add_argument(
         "--slurm-account", default=os.environ.get("SLURM_ACCOUNT"), help="Slurm account"
     )
+    parser.add_argument(
+        "--test-script",
+        default=os.environ.get("TEST_SCRIPT"),
+        help="Test script to run",
+    )
     parser.add_argument("--user", default=os.environ.get("RL_USER"), help="SSH user")
     parser.add_argument(
         "--wandb-api-key",
@@ -125,43 +97,12 @@ def parse_args():
         help="Weights & Biases API key",
     )
 
-    # Pytest options
-    parser.add_argument(
-        "--pytest-args",
-        default=os.environ.get("PYTEST_ARGS", ""),
-        help="Additional pytest arguments (e.g., '-v -s')",
-    )
-
     return parser.parse_args()
-
-
-def build_pytest_command(args):
-    """Build the pytest command based on arguments."""
-    pytest_cmd = "uv run --no-sync pytest"
-
-    # Determine test target
-    if args.test_path:
-        pytest_cmd += f" {args.test_path}"
-    elif args.test_markers:
-        pytest_cmd += f" -m '{args.test_markers}' tests/test_suites/"
-    elif args.test_name:
-        pytest_cmd += f" tests/test_suites/llm/{args.test_name}/"
-    else:
-        raise ValueError("Must specify --test-path, --test-markers, or --test-name")
-
-    # Add additional pytest arguments
-    if args.pytest_args:
-        pytest_cmd += f" {args.pytest_args}"
-
-    return pytest_cmd
 
 
 def main():
     """Run a NeMo-RL test as a Ray job on a Slurm cluster"""
     args = parse_args()
-
-    # Build pytest command
-    pytest_command = build_pytest_command(args)
 
     executor = SlurmExecutor(
         account=args.slurm_account,
@@ -192,7 +133,7 @@ def main():
 
     job = RayJob(name=f"{args.job_name}-{args.ci_job_id}", executor=executor)
     job.start(
-        command=f"cd /opt/nemo-rl && git init && {pytest_command}",
+        command=f"cd /opt/nemo-rl && git init && uv run --no-sync {args.test_script}",
         workdir=f"{args.nemorun_home}/work_dir",
     )
     job.logs(follow=True, timeout=60 * 60 * 24)

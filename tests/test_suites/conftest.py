@@ -84,32 +84,23 @@ def pytest_collection_modifyitems(config, items):
 
         cfg = test_class.config
 
-        # === Auto-generate markers from TestConfig ===
-
-        # Algorithm marker
+        # Auto-generate markers from NeMoRLTestConfig
         item.add_marker(getattr(pytest.mark, f"algo_{cfg.algorithm}"))
-
-        # Backend marker
         item.add_marker(getattr(pytest.mark, f"backend_{cfg.backend}"))
-
-        # Resource markers
         item.add_marker(getattr(pytest.mark, f"num_nodes_{cfg.num_nodes}"))
         item.add_marker(getattr(pytest.mark, f"num_gpus_{cfg.num_gpus_total}"))
+        item.add_marker(
+            getattr(
+                pytest.mark, f"model_size_{_get_model_size_from_name(cfg.model_name)}"
+            )
+        )
 
-        # Test suite markers
         for suite in cfg.test_suites:
             item.add_marker(getattr(pytest.mark, f"suite_{suite}"))
 
-        # Model size markers (derived from model_name)
-        model_size = _get_model_size_from_name(cfg.model_name)
-        if model_size:
-            item.add_marker(getattr(pytest.mark, f"model_size_{model_size}"))
-
-        # Model class marker (from config metadata)
         if hasattr(cfg, "model_class") and cfg.model_class:
             item.add_marker(getattr(pytest.mark, f"class_{cfg.model_class}"))
 
-        # Parallelism markers
         if cfg.tensor_parallel:
             item.add_marker(pytest.mark.parallelism_tp)
         if cfg.pipeline_parallel:
@@ -117,38 +108,30 @@ def pytest_collection_modifyitems(config, items):
         if cfg.sequence_parallel:
             item.add_marker(pytest.mark.parallelism_sp)
 
-        # === Apply custom filters ===
-
-        # Algorithm filter
+        # Apply filters
         if algorithm_filter and cfg.algorithm != algorithm_filter:
             continue
 
-        # Backend filter
         if backend_filter and cfg.backend != backend_filter:
             continue
 
-        # Suite filter
         if suite_filter and suite_filter not in cfg.test_suites:
             continue
 
-        # Model class filter
         if model_class_filter:
             test_model_class = getattr(cfg, "model_class", "")
             if test_model_class != model_class_filter:
                 continue
 
-        # GPU count filter (total GPUs)
         if num_gpus_filter is not None and cfg.num_gpus_total != num_gpus_filter:
             continue
 
-        # GPUs per node filter
         if (
             num_gpus_per_node_filter is not None
             and cfg.num_gpus_per_node != num_gpus_per_node_filter
         ):
             continue
 
-        # Node count filter
         if num_nodes_filter is not None and cfg.num_nodes != num_nodes_filter:
             continue
 
@@ -185,9 +168,11 @@ def _get_model_size_from_name(model_name: str) -> str:
     elif any(x in model_name_lower for x in ["100b", "175b", "405b"]):
         return "xlarge"
 
-    # Default to medium if we can't determine
+    # Default to medium if we can't determine size
     return "medium"
 
+
+# TODO(ahmadki): reviewed
 
 # TODO(ahmadki)
 # @pytest.fixture
