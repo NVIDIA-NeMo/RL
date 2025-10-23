@@ -235,6 +235,7 @@ class GitLabCIPipelineGenerator:
         module: str = "nemo_rl",
         extends: Optional[str] = None,
         test_mode: str = "local",
+        pipeline_mode: str = "flat",
     ):
         self.tests = tests
         self.base_image = base_image
@@ -242,6 +243,7 @@ class GitLabCIPipelineGenerator:
         self.module = module
         self.extends = extends
         self.test_mode = test_mode
+        self.pipeline_mode = pipeline_mode
 
     def generate_job(self, test: TestClassInfo) -> Dict:
         """Generate a GitLab CI job configuration for a single test class.
@@ -303,8 +305,116 @@ class GitLabCIPipelineGenerator:
 
         return job
 
-    def generate_pipeline(self) -> Dict:
-        """Generate the complete GitLab CI pipeline configuration.
+    def generate_train_job(
+        self, test: TestClassInfo, job_name_suffix: str = "train"
+    ) -> Dict:
+        """Generate a training job for a test class.
+
+        Args:
+            test: Test class information
+            job_name_suffix: Suffix for the job name (default: "train")
+
+        Returns:
+            Dictionary with job configuration for training
+        """
+        time_str = f"{test.time_limit_minutes}:00"
+
+        # Build pytest command to run training test based on test_mode
+        pytest_cmd_parts = ["pytest"]
+
+        if self.test_mode == "slurm":
+            # Run test_train_slurm
+            pytest_cmd_parts.extend(["-m", "runner_slurm"])
+        elif self.test_mode == "local":
+            # Run test_train_local
+            pytest_cmd_parts.extend(["-m", "runner_local"])
+
+        pytest_cmd_parts.extend(self.pytest_args)
+        pytest_cmd_parts.append(test.pytest_path)
+        pytest_cmd_parts.append("-v")
+
+        pytest_cmd = " ".join(pytest_cmd_parts)
+
+        job = {
+            "stage": "train",
+            "variables": {
+                "MODULE": self.module,
+                "TEST_NAME": test.class_name,
+                "TIME": time_str,
+                "NUM_NODES": test.num_nodes,
+                "ALGORITHM": test.algorithm,
+                "MODEL_CLASS": test.model_class,
+                "NUM_GPUS": test.num_gpus_per_node,
+            },
+            "script": [
+                "echo 'Running test: ${TEST_NAME}'",
+                "echo 'Algorithm: ${ALGORITHM}'",
+                "echo 'Model class: ${MODEL_CLASS}'",
+                pytest_cmd,
+            ],
+        }
+
+        if self.extends:
+            job["extends"] = self.extends
+
+        return job
+
+    def generate_validate_job(
+        self,
+        test: TestClassInfo,
+        job_name_suffix: str = "validate",
+        depends_on: Optional[List[str]] = None,
+    ) -> Dict:
+        """Generate a validation job for a test class.
+
+        Args:
+            test: Test class information
+            job_name_suffix: Suffix for the job name (default: "validate")
+            depends_on: List of job names this job depends on
+
+        Returns:
+            Dictionary with job configuration for validation
+        """
+        time_str = f"{test.time_limit_minutes}:00"
+
+        # Build pytest command to run all tests except training tests
+        pytest_cmd_parts = ["pytest"]
+        pytest_cmd_parts.extend(["-m", '"not runner_slurm and not runner_local"'])
+        pytest_cmd_parts.extend(self.pytest_args)
+        pytest_cmd_parts.append(test.pytest_path)
+        pytest_cmd_parts.append("-v")
+
+        pytest_cmd = " ".join(pytest_cmd_parts)
+
+        job = {
+            "stage": "validate",
+            "variables": {
+                "MODULE": self.module,
+                "TEST_NAME": test.class_name,
+                "TIME": time_str,
+                "NUM_NODES": test.num_nodes,
+                "ALGORITHM": test.algorithm,
+                "MODEL_CLASS": test.model_class,
+                "NUM_GPUS": test.num_gpus_per_node,
+            },
+            "script": [
+                "echo 'Running test: ${TEST_NAME}'",
+                "echo 'Algorithm: ${ALGORITHM}'",
+                "echo 'Model class: ${MODEL_CLASS}'",
+                pytest_cmd,
+            ],
+        }
+
+        if depends_on:
+            job["needs"] = depends_on
+
+        if self.extends:
+            job["extends"] = self.extends
+
+        return job
+
+    def generate_flat_pipeline(self) -> Dict:
+        """Generate flat pipeline (one job per test class).
 
         Returns:
             Dictionary with complete pipeline configuration
@@ -326,6 +436,106 @@ class GitLabCIPipelineGenerator:
             pipeline[job_name] = self.generate_job(test)
 
         return pipeline
+
+    def generate_stages_pipeline(self) -> Dict:
+        """Generate pipeline with train/validate stages.
+
+        Returns:
+            Dictionary with complete pipeline configuration
+        """
+        pipeline = {
+            "stages": ["train", "validate"],
+            "default": {
+                "image": self.base_image,
+                "before_script": [
+                    "pip install uv",
+                    "uv sync --all-extras",
+                ],
+            },
+        }
+
+        # Generate train and validate jobs for each test class
+        for test in self.tests:
+            # Train job
+            train_job_name = f"{test.job_name}:train"
+            pipeline[train_job_name] = self.generate_train_job(test)
+
+            # Validate job (depends on train job)
+            validate_job_name = f"{test.job_name}:validate"
+            pipeline[validate_job_name] = self.generate_validate_job(
+                test, depends_on=[train_job_name]
+            )
+
+        return pipeline
+
+    def generate_parent_child_pipelines(self) -> tuple[Dict, Dict[str, Dict]]:
+        """Generate parent pipeline and child pipelines for each test class.
+
+        Returns:
+            Tuple of (parent_pipeline, child_pipelines_dict)
+            where child_pipelines_dict maps test names to their pipeline configs
+        """
+        # Parent pipeline
+        parent_pipeline = {
+            "stages": ["trigger"],
+        }
+
+        # Child pipelines dictionary
+        child_pipelines = {}
+
+        for test in self.tests:
+            # Add trigger job to parent pipeline
+            parent_pipeline[test.job_name] = {
+                "stage": "trigger",
+                "trigger": {
+                    "include": f".gitlab-ci/{test.job_name}.yml",
+                    "strategy": "depend",
+                },
+            }
+
+            # Create child pipeline for this test
+            child_pipeline = {
+                "stages": ["train", "validate"],
+                "default": {
+                    "image": self.base_image,
+                    "before_script": [
+                        "pip install uv",
+                        "uv sync --all-extras",
+                    ],
+                },
+            }
+
+            # Train job
+            train_job_name = "train"
+            child_pipeline[train_job_name] = self.generate_train_job(test)
+
+            # Validate job (depends on train job)
+            validate_job_name = "validate"
+            child_pipeline[validate_job_name] = self.generate_validate_job(
+                test, depends_on=[train_job_name]
+            )
+
+            child_pipelines[test.job_name] = child_pipeline
+
+        return parent_pipeline, child_pipelines
+
+    def generate_pipeline(self) -> Dict:
+        """Generate the complete GitLab CI pipeline configuration based on pipeline_mode.
+
+        Returns:
+            Dictionary with complete pipeline configuration
+        """
+        if self.pipeline_mode == "flat":
+            return self.generate_flat_pipeline()
+        elif self.pipeline_mode == "stages":
+            return self.generate_stages_pipeline()
+        elif self.pipeline_mode == "parent-child":
+            # For parent-child mode, return only the parent pipeline
+            # Child pipelines will be handled separately in generate_yaml
+            parent, _ = self.generate_parent_child_pipelines()
+            return parent
+        else:
+            raise ValueError(f"Unknown pipeline mode: {self.pipeline_mode}")
 
     def generate_yaml(self) -> str:
         """Generate GitLab CI pipeline YAML string.
@@ -481,6 +691,17 @@ def main():
     )
 
     parser.add_argument(
+        "--pipeline-mode",
+        type=str,
+        choices=["flat", "parent-child", "stages"],
+        default="flat",
+        help="Pipeline generation mode: "
+        "'flat' (one job per test class, default), "
+        "'parent-child' (parent pipeline + child pipelines per test class), "
+        "'stages' (single pipeline with train/validate stages and dependencies)",
+    )
+
+    parser.add_argument(
         "--list-tests",
         action="store_true",
         help="List discovered tests and exit (don't generate pipeline)",
@@ -532,15 +753,63 @@ def main():
         module=args.module,
         extends=args.extends,
         test_mode=args.test_mode,
+        pipeline_mode=args.pipeline_mode,
     )
-    yaml_output = generator.generate_yaml()
 
-    # Write output
-    if args.output:
-        args.output.write_text(yaml_output)
-        print(f"Pipeline written to {args.output}", file=sys.stderr)
+    # Handle different pipeline modes
+    if args.pipeline_mode == "parent-child":
+        # Generate parent and child pipelines
+        parent_pipeline, child_pipelines = generator.generate_parent_child_pipelines()
+
+        # Convert parent pipeline to YAML
+        parent_yaml = yaml.dump(
+            parent_pipeline, default_flow_style=False, sort_keys=False, width=120
+        )
+        parent_header = f"""# GitLab CI Pipeline (Parent)
+# Auto-generated from pytest test classes
+# Total test classes: {len(filtered_tests)}
+
+"""
+        parent_yaml_str = parent_header + parent_yaml
+
+        # Write parent pipeline
+        if args.output:
+            output_path = args.output
+        else:
+            output_path = Path(".gitlab-ci.yml")
+
+        output_path.write_text(parent_yaml_str)
+        print(f"Parent pipeline written to {output_path}", file=sys.stderr)
+
+        # Create .gitlab-ci directory for child pipelines
+        child_dir = output_path.parent / ".gitlab-ci"
+        child_dir.mkdir(exist_ok=True)
+
+        # Write child pipelines
+        for test_name, child_pipeline in child_pipelines.items():
+            child_yaml = yaml.dump(
+                child_pipeline, default_flow_style=False, sort_keys=False, width=120
+            )
+            child_header = f"""# GitLab CI Pipeline (Child) - {test_name}
+# Auto-generated from pytest test class
+
+"""
+            child_yaml_str = child_header + child_yaml
+
+            child_path = child_dir / f"{test_name}.yml"
+            child_path.write_text(child_yaml_str)
+            print(f"Child pipeline written to {child_path}", file=sys.stderr)
+
     else:
-        print(yaml_output)
+        # Generate single pipeline (flat or stages mode)
+        yaml_output = generator.generate_yaml()
+
+        # Write output
+        if args.output:
+            args.output.write_text(yaml_output)
+            print(f"Pipeline written to {args.output}", file=sys.stderr)
+        else:
+            print(yaml_output)
 
 
 if __name__ == "__main__":
