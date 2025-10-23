@@ -179,6 +179,46 @@ def _build_pytest_commands(
     return commands
 
 
+def _build_bash_commands(config: Any, tests: List[Dict[str, Any]]) -> List[str]:
+    """Build separate bash commands for each test run with appropriate max_steps.
+
+    For tests with run numbers (e.g., test_train_local_0), calculates the target
+    steps using config.get_target_steps(run_num) and builds a command with that override.
+    For tests without run numbers, uses the default command.
+
+    Args:
+        config: Test configuration object
+        tests: List of test dictionaries with 'name' and other metadata
+
+    Returns:
+        List of bash command strings
+    """
+    commands = []
+    for test in tests:
+        test_name = test["name"]
+
+        # Extract run number from test name (e.g., test_train_local_0 -> 0)
+        # Test names can be: test_train_local, test_train_slurm, or numbered versions
+        import re
+
+        match = re.search(r"_(\d+)$", test_name)
+
+        if match:
+            # Numbered test: use run-specific max_steps
+            run_num = int(match.group(1))
+            target_steps = config.get_target_steps(run_num)
+            cmd = config.build_command_string(
+                extra_overrides={"trainer.max_steps": target_steps}
+            )
+        else:
+            # Non-numbered test: use default command
+            cmd = config.build_command_string()
+
+        commands.append(cmd)
+
+    return commands
+
+
 def _build_job(
     config: Any,
     commands: List[str],
@@ -414,30 +454,70 @@ def generate_stages_pipeline(
                 pipeline["stages"].append(stage)
                 stages_seen.add(stage)
 
-            # Group by job_group
-            tests_by_job_group = defaultdict(list)
-            for test in stage_tests:
-                job_group = test.get("job_group") or "default"
-                tests_by_job_group[job_group].append(test)
-
-            # Create job for each job group
-            for job_group, group_tests in tests_by_job_group.items():
-                job_name = f"{test_name}:{stage}:{job_group}"
-
+            # For training stages, create one job per test with sequential dependencies
+            # For other stages, group by job_group as before
+            if stage == "training":
                 # Sort tests by order marker
                 sorted_tests = sorted(
-                    group_tests,
+                    stage_tests,
                     key=lambda t: t.get("order") if t.get("order") is not None else 0,
                 )
 
-                # Build commands based on stage and train_mode
-                if train_mode == "bash" and stage == "training":
-                    # Use raw training command instead of pytest
-                    commands = [config.build_command_string()]
-                else:
+                # Create individual jobs for each training test
+                prev_job_name = None
+                for idx, test in enumerate(sorted_tests):
+                    job_name = f"{test_name}:{stage}:{idx}"
+
+                    # Build command for this specific test
+                    if train_mode == "bash":
+                        # Use raw training command with appropriate max_steps
+                        commands = _build_bash_commands(config, [test])
+                    else:
+                        # Build pytest command for this test
+                        is_training = True
+                        commands = _build_pytest_commands(
+                            test_mode,
+                            test_file,
+                            pytest_args,
+                            [test["name"]],
+                            is_training,
+                            train_mode,
+                        )
+
+                    # Build job
+                    job = _build_job(
+                        config, commands, job_name, base_image, module, extends, stage
+                    )
+
+                    # Add sequential dependency on previous training job
+                    if prev_job_name:
+                        job["needs"] = [prev_job_name]
+
+                    pipeline[job_name] = job
+                    prev_job_name = job_name
+
+            else:
+                # Non-training stages: group by job_group as before
+                tests_by_job_group = defaultdict(list)
+                for test in stage_tests:
+                    job_group = test.get("job_group") or "default"
+                    tests_by_job_group[job_group].append(test)
+
+                # Create job for each job group
+                for job_group, group_tests in tests_by_job_group.items():
+                    job_name = f"{test_name}:{stage}:{job_group}"
+
+                    # Sort tests by order marker
+                    sorted_tests = sorted(
+                        group_tests,
+                        key=lambda t: t.get("order")
+                        if t.get("order") is not None
+                        else 0,
+                    )
+
                     # Build separate pytest commands for each test
                     test_names = [t["name"] for t in sorted_tests]
-                    is_training = stage == "training"
+                    is_training = False
                     commands = _build_pytest_commands(
                         test_mode,
                         test_file,
@@ -447,36 +527,36 @@ def generate_stages_pipeline(
                         train_mode,
                     )
 
-                # Build job
-                job = _build_job(
-                    config, commands, job_name, base_image, module, extends, stage
-                )
+                    # Build job
+                    job = _build_job(
+                        config, commands, job_name, base_image, module, extends, stage
+                    )
 
-                # Add dependencies from JobDependencies
-                if job_deps:
-                    # Stage dependencies
-                    if stage in job_deps.stages:
-                        stage_deps = job_deps.stages[stage]
-                        if stage_deps.get("depends_on"):
-                            job["needs"] = [
-                                f"{test_name}:{dep_stage}:*"
-                                for dep_stage in stage_deps["depends_on"]
-                            ]
-
-                    # Job group dependencies
-                    if job_group in job_deps.job_groups:
-                        group_deps = job_deps.job_groups[job_group]
-                        if group_deps.get("depends_on"):
-                            if "needs" not in job:
-                                job["needs"] = []
-                            job["needs"].extend(
-                                [
-                                    f"{test_name}:{stage}:{dep_group}"
-                                    for dep_group in group_deps["depends_on"]
+                    # Add dependencies from JobDependencies
+                    if job_deps:
+                        # Stage dependencies (e.g., validation depends on training)
+                        if stage in job_deps.stages:
+                            stage_deps = job_deps.stages[stage]
+                            if stage_deps.get("depends_on"):
+                                job["needs"] = [
+                                    f"{test_name}:{dep_stage}:*"
+                                    for dep_stage in stage_deps["depends_on"]
                                 ]
-                            )
 
-                pipeline[job_name] = job
+                        # Job group dependencies
+                        if job_group in job_deps.job_groups:
+                            group_deps = job_deps.job_groups[job_group]
+                            if group_deps.get("depends_on"):
+                                if "needs" not in job:
+                                    job["needs"] = []
+                                job["needs"].extend(
+                                    [
+                                        f"{test_name}:{stage}:{dep_group}"
+                                        for dep_group in group_deps["depends_on"]
+                                    ]
+                                )
+
+                    pipeline[job_name] = job
 
     return pipeline
 
