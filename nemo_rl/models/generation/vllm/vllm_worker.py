@@ -299,7 +299,7 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(self.cfg["vllm_cfg"].get("hf_overrides", {}))
+        vllm_kwargs["hf_overrides"].update(self.cfg["vllm_cfg"].get("hf_overrides", {}) or {})
 
         llm_kwargs = dict(
             model=self.model_name,
