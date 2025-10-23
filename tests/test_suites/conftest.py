@@ -31,6 +31,14 @@ def pytest_configure(config):
         "markers",
         "runner_slurm: automatically added for tests marked with runner('slurm')",
     )
+    config.addinivalue_line(
+        "markers",
+        "stage(name): mark test with a pipeline stage (e.g., 'training', 'validation')",
+    )
+    config.addinivalue_line(
+        "markers",
+        "job_group(name): mark test with a job group name for pipeline dependencies",
+    )
 
     # Suppress unknown marker warnings for dynamically generated markers
     warnings.filterwarnings(
@@ -59,6 +67,14 @@ def pytest_addoption(parser):
     parser.addoption("--num-gpus", type=int, help="Filter by exact total GPU count")
     parser.addoption("--num-gpus-per-node", type=int, help="Filter by GPUs per node")
     parser.addoption("--num-nodes", type=int, help="Filter by node count")
+    parser.addoption(
+        "--stage",
+        help="Filter by pipeline stage (e.g., training, validation)",
+    )
+    parser.addoption(
+        "--job-group",
+        help="Filter by job group name",
+    )
     parser.addoption(
         "--filter",
         help="Filter using Python expression on config (e.g., 'config.num_gpus_total >= 32 and config.backend == \"fsdp2\"')",
@@ -95,6 +111,8 @@ def pytest_collection_modifyitems(config, items):
     num_gpus_filter = config.getoption("--num-gpus")
     num_gpus_per_node_filter = config.getoption("--num-gpus-per-node")
     num_nodes_filter = config.getoption("--num-nodes")
+    stage_filter = config.getoption("--stage")
+    job_group_filter = config.getoption("--job-group")
     filter_expr = config.getoption("--filter")
 
     filtered_items = []
@@ -162,6 +180,26 @@ def pytest_collection_modifyitems(config, items):
 
         if num_nodes_filter is not None and cfg.num_nodes != num_nodes_filter:
             continue
+
+        # Stage filter - check if test has stage marker matching the filter
+        if stage_filter:
+            stage_markers = list(item.iter_markers("stage"))
+            if not stage_markers:
+                continue  # Skip tests without stage marker
+            test_stages = [marker.args[0] for marker in stage_markers if marker.args]
+            if stage_filter not in test_stages:
+                continue
+
+        # Job group filter - check if test has job_group marker matching the filter
+        if job_group_filter:
+            job_group_markers = list(item.iter_markers("job_group"))
+            if not job_group_markers:
+                continue  # Skip tests without job_group marker
+            test_job_groups = [
+                marker.args[0] for marker in job_group_markers if marker.args
+            ]
+            if job_group_filter not in test_job_groups:
+                continue
 
         # Expression-based filter
         if filter_expr:

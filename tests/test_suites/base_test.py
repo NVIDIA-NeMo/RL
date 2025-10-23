@@ -20,6 +20,16 @@ from typing import List, Optional
 import pytest
 
 from .base_config import NeMoRLTestConfig
+from .job_dependencies import JobDependencies
+
+# Default job dependencies: validation stage depends on training stage
+DEFAULT_JOB_DEPENDENCIES = JobDependencies(
+    stages={
+        "training": {"depends_on": [], "needs": []},
+        "validation": {"depends_on": ["training"], "needs": []},
+    },
+    job_groups={},
+)
 
 
 class BaseNeMoRLTest:
@@ -34,6 +44,14 @@ class BaseNeMoRLTest:
     Pytest Markers:
         - @pytest.mark.runner("local"): Run only local tests
         - @pytest.mark.runner("slurm"): Run only Slurm tests
+        - @pytest.mark.stage("stage_name"): Associate test with a pipeline stage
+        - @pytest.mark.job_group("group_name"): Associate test with a job group
+
+    Job Dependencies:
+        - Define `job_dependencies` class attribute to configure stage and job group
+          dependencies for GitLab CI pipeline generation
+        - Default: validation stage depends on training stage
+        - Override in subclass to customize dependencies
 
     Usage examples:
         # Run only local tests
@@ -82,9 +100,29 @@ class BaseNeMoRLTest:
                     "trainer.max_steps": 100,  # Add custom override
                 },
             )
+
+    Example with custom job dependencies:
+        from .job_dependencies import JobDependencies
+
+        class TestMyTraining(BaseNeMoRLTest):
+            config = NeMoRLTestConfig(...)
+
+            job_dependencies = JobDependencies(
+                stages={
+                    "training": {"depends_on": [], "needs": []},
+                    "validation": {"depends_on": ["training"], "needs": ["train_job"]},
+                },
+                job_groups={
+                    "job_1": {"stage": "validation", "depends_on": [], "needs": []},
+                    "job_2": {"stage": "validation", "depends_on": ["job_1"], "needs": ["job_1"]},
+                },
+            )
     """
 
     config: NeMoRLTestConfig  # Must be defined by subclass
+    job_dependencies: JobDependencies = (
+        DEFAULT_JOB_DEPENDENCIES  # Can be overridden by subclass
+    )
 
     def __init_subclass__(cls, **kwargs):
         """Hook to dynamically generate test methods based on config.steps_per_run.
