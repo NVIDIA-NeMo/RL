@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tests.test_suites.base_config import NeMoRLTestConfig
 from tests.test_suites.base_test import BaseNeMoRLTest
+from tests.test_suites.job_dependencies import JobDependencies
 
 
 class TestDistillationQwen332bTo4bBase2n8gFsdp2tp2LongV1(BaseNeMoRLTest):
@@ -27,3 +30,37 @@ class TestDistillationQwen332bTo4bBase2n8gFsdp2tp2LongV1(BaseNeMoRLTest):
             "distillation.max_num_steps": 100,
         },
     )
+
+    # TODO(ahmadki): dummy job dependencies that doesn't make sense, but here as an example
+    job_dependencies = JobDependencies(
+        stages={
+            "training": {"depends_on": ["validation"], "needs": []},
+            "validation": {"depends_on": [], "needs": []},
+        },
+        job_groups={},
+    )
+
+    # TODO(ahmadki): dummy tests
+    @pytest.mark.stage("validation")
+    def one(self):
+        assert 1 + 1 == 2
+
+    @pytest.mark.stage("validation")
+    def two(self):
+        assert 2 + 2 == 4
+
+    @pytest.mark.stage("validation")
+    def three(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    def four(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    def five(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    def six(self):
+        assert 4 + 4 == 8
