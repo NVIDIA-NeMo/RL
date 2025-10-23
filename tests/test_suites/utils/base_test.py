@@ -22,15 +22,6 @@ import pytest
 from .types.base_config import NeMoRLTestConfig
 from .types.job_dependencies import JobDependencies
 
-# Default job dependencies: validation stage depends on training stage
-DEFAULT_JOB_DEPENDENCIES = JobDependencies(
-    stages={
-        "training": {"depends_on": [], "needs": []},
-        "validation": {"depends_on": ["training"], "needs": []},
-    },
-    job_groups={},
-)
-
 
 class BaseNeMoRLTest:
     """Base test class with common test methods for NeMo-RL tests.
@@ -120,8 +111,12 @@ class BaseNeMoRLTest:
     """
 
     config: NeMoRLTestConfig  # Must be defined by subclass
-    job_dependencies: JobDependencies = (
-        DEFAULT_JOB_DEPENDENCIES  # Can be overridden by subclass
+    job_dependencies: JobDependencies = JobDependencies(
+        stages={
+            "training": {"depends_on": [], "needs": []},
+            "validation": {"depends_on": ["training"], "needs": []},
+        },
+        job_groups={},
     )
 
     def __init_subclass__(cls, **kwargs):
