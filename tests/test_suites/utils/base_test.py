@@ -144,7 +144,7 @@ class BaseNeMoRLTest:
             return
 
         # Calculate number of runs
-        num_runs = config.get_num_runs()
+        num_runs = config.num_runs
 
         # Remove original test methods if they exist
         if hasattr(cls, "test_train_local"):

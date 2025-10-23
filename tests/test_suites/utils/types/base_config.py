@@ -14,7 +14,6 @@
 
 import inspect
 import math
-import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +21,6 @@ from typing import Any, Dict, List, Optional, cast
 
 from omegaconf import OmegaConf
 
-# Import strongly-typed config classes
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import DTensorConfig, MegatronConfig, PolicyConfig
@@ -30,7 +28,6 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import LoggerConfig
 
-# Import type aliases from parent module
 from . import Algorithm, Backend, MasterConfigUnion, ModelClass
 
 
@@ -42,34 +39,6 @@ class NeMoRLTestConfig:
     1. References a YAML config file as the base training configuration
     2. Allows overriding specific YAML values for testing
     3. Stores test-specific metadata (test_name, algorithm, test_suites)
-    4. Auto-extracts metadata from YAML for filtering/classification
-    5. Provides strongly-typed accessors for all config sections
-
-    Strongly-typed Config Accessors:
-        - master_config: MasterConfigUnion - Full config as typed MasterConfig (public attribute)
-        - loaded_yaml_config: MasterConfigUnion - Deprecated alias for master_config
-        - policy_config: PolicyConfig - Policy/model configuration
-        - cluster_config: ClusterConfig - Cluster configuration (nodes, GPUs)
-        - data_config: DataConfig - Dataset configuration
-        - logger_config: LoggerConfig - Logging configuration
-        - checkpointing_config: CheckpointingConfig - Checkpointing configuration
-        - algorithm_config: Dict[str, Any] - Algorithm-specific config (SFT/GRPO/DPO/etc)
-
-    Example:
-        config = NeMoRLTestConfig(
-            test_name="my-test",
-            algorithm="sft",
-            model_class="llm",
-        )
-
-        # Strongly-typed access via properties
-        model_name: str = config.policy_config["model_name"]
-        num_nodes: int = config.cluster_config["num_nodes"]
-        dataset: str = config.data_config["dataset_name"]
-        max_steps: int = config.algorithm_config["max_num_steps"]
-
-        # Direct access to master config
-        full_config: MasterConfigUnion = config.master_config
     """
 
     #######################################################
@@ -89,10 +58,10 @@ class NeMoRLTestConfig:
     #######################################################
     # Model config
     #######################################################
-    # The model hydra/YAML config (auto-derived from test_name if None)
-    yaml_config: Optional[Path] = (
-        None  # The full config path, default to "examples/configs/recipes/{model_class}/{test_name}.yaml"
-    )
+    # The model hydra/YAML config, if full config path not provided then it defaults
+    # to "examples/configs/recipes/{model_class}/{test_name}.yaml" where model_class
+    # and test_name are auto derived from test_name
+    yaml_config: Optional[Path] = None
     overrides: Dict[str, Any] = field(default_factory=dict)
 
     #######################################################
@@ -149,19 +118,12 @@ class NeMoRLTestConfig:
 
         # Loads YAML files with OmegaConf
         config = load_config(self.yaml_config)
-
-        # Apply overrides with Hydra's parser
         if self.overrides:
             override_strings = [f"{k}={v}" for k, v in self.overrides.items()]
             config = parse_hydra_overrides(config, override_strings)
-
-        # Convert to plain dict with all interpolations resolved
         self.master_config: MasterConfigUnion = OmegaConf.to_container(
             config, resolve=True
         )
-
-        # Validate algorithm matches config structure
-        self._validate_algorithm_config()
 
         # Validate configuration
         self.validate_config()
@@ -187,7 +149,6 @@ class NeMoRLTestConfig:
     #######################################################
     # Helper functions for typed config access
     #######################################################
-
     def _get_policy_config(self) -> PolicyConfig:
         """Get policy config with strong typing.
 
@@ -213,45 +174,6 @@ class NeMoRLTestConfig:
         """
         policy = self._get_policy_config()
         return cast(MegatronConfig, policy.get("megatron_cfg", {}))
-
-    #######################################################
-    # Validation methods
-    #######################################################
-
-    def _validate_algorithm_config(self):
-        """Validate that the algorithm field matches the config structure.
-
-        This ensures that:
-        - For algorithm="sft", config has "sft" key with SFTConfig
-        - For algorithm="grpo", config has "grpo" key with GRPOConfig
-        - For algorithm="dpo", config has "dpo" key with DPOConfig
-        - For algorithm="distillation", config has "distillation" key with DistillationConfig
-        - For algorithm="rm", config has "rm" key with RMConfig
-
-        Raises:
-            ValueError: If algorithm doesn't match config structure
-        """
-        # Check if the algorithm-specific config section exists
-        if self.algorithm not in self.master_config:
-            raise ValueError(
-                f"Config validation failed: algorithm='{self.algorithm}' but config "
-                f"does not have '{self.algorithm}' section. "
-                f"Available sections: {list(self.master_config.keys())}"
-            )
-
-        # Additional validation for required sections in MasterConfig
-        required_sections = ["policy", "data", "logger", "cluster", "checkpointing"]
-        missing_sections = [
-            section
-            for section in required_sections
-            if section not in self.master_config
-        ]
-
-        if missing_sections:
-            raise ValueError(
-                f"Config validation failed: Missing required sections: {missing_sections}. "
-                f"Available sections: {list(self.master_config.keys())}"
-            )
 
     def _extract_model_name(self) -> str:
         """Extract and normalize model name from policy config.
@@ -359,9 +281,164 @@ class NeMoRLTestConfig:
             return self._extract_fsdp2_parallelism()
 
     #######################################################
-    # Properties (computed from YAML + overrides)
+    # Utility functions
     #######################################################
+    def validate_config(self):
+        """Validate the loaded configuration."""
+        # Check if the algorithm-specific config section exists
+        if self.algorithm not in self.master_config:
+            raise ValueError(
+                f"Config validation failed: algorithm='{self.algorithm}' but config "
+                f"does not have '{self.algorithm}' section. "
+                f"Available sections: {list(self.master_config.keys())}"
+            )
 
+        # Check if critical paths exist
+        if self.num_nodes < 1:
+            raise ValueError(f"num_nodes must be >= 1, got {self.num_nodes}")
+
+        if self.num_gpus_per_node < 1:
+            raise ValueError(
+                f"num_gpus_per_node must be >= 1, got {self.num_gpus_per_node}"
+            )
+
+        # Validate backend configuration (exactly one should be enabled)
+        dtensor_cfg = self._get_dtensor_config()
+        megatron_cfg = self._get_megatron_config()
+        dtensor_enabled = dtensor_cfg.get("enabled", False)
+        megatron_enabled = megatron_cfg.get("enabled", False)
+        if dtensor_enabled and megatron_enabled:
+            raise ValueError(
+                "Both dtensor and megatron backends are enabled. "
+                "Please enable only one backend."
+            )
+
+        # Warn about tensor/pipeline parallel without proper GPU count
+        if self.tensor_parallel and self.tensor_parallel > self.num_gpus_total:
+            print(
+                f"Warning: tensor_parallel_size ({self.tensor_parallel}) > "
+                f"total GPUs ({self.num_gpus_total})"
+            )
+
+        # Validate steps_per_run if set
+        if self.steps_per_run is not None:
+            if self.steps_per_run <= 0:
+                raise ValueError(f"steps_per_run must be > 0, got {self.steps_per_run}")
+
+            if self.max_steps == 0:
+                raise ValueError(
+                    "steps_per_run is set but max_steps could not be extracted from config. "
+                    "Ensure trainer.max_steps is defined in the YAML config."
+                )
+
+            if self.steps_per_run > self.max_steps:
+                raise ValueError(
+                    f"steps_per_run ({self.steps_per_run}) must be <= max_steps ({self.max_steps})"
+                )
+
+            # Warn if steps_per_run doesn't evenly divide max_steps
+            if self.max_steps % self.steps_per_run != 0:
+                print(
+                    f"Warning: max_steps ({self.max_steps}) is not evenly divisible by "
+                    f"steps_per_run ({self.steps_per_run}). Last run will train for "
+                    f"{self.max_steps % self.steps_per_run} steps."
+                )
+
+    def get_run_script_path(self) -> Path:
+        """Get the path to the main run script based on algorithm.
+
+        Maps each algorithm to its corresponding run script:
+        - sft -> run_sft.py
+        - grpo -> run_grpo_math.py
+        - dpo -> run_dpo.py
+        - distillation -> run_distillation_math.py
+        - rm -> run_rm.py
+        """
+        script_map: dict[Algorithm, str] = {
+            "sft": "run_sft.py",
+            "grpo": "run_grpo_math.py",
+            "dpo": "run_dpo.py",
+            "distillation": "run_distillation_math.py",
+            "rm": "run_rm.py",
+        }
+        script_name = script_map[self.algorithm]  # Type-safe access, no need for get()
+
+        return self.project_root / "examples" / script_name
+
+    def build_command(
+        self, extra_overrides: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
+        """Build the uv run command with YAML config + overrides.
+
+        Overrides are applied in Hydra format (key=value).
+        The command structure is compatible with Hydra's override system.
+
+        Args:
+            extra_overrides: Optional dictionary of additional overrides to apply
+                           after self.overrides. This allows callers to add
+                           test-specific overrides without modifying the config.
+
+        Returns:
+            Command as a list of strings ready for subprocess execution
+        """
+        cmd = [
+            "uv",
+            "run",
+            "--no-sync",
+            str(self.get_run_script_path()),
+            "--config",
+            str(self.yaml_config),
+        ]
+
+        # Apply overrides from self.overrides dict
+        for key, value in self.overrides.items():
+            cmd.append(f"{key}={value}")
+
+        # Apply extra overrides if provided
+        if extra_overrides:
+            for key, value in extra_overrides.items():
+                cmd.append(f"{key}={value}")
+
+        return cmd
+
+    def get_target_steps(self, run_num: int) -> int:
+        """Get the target max_steps for a specific run number.
+
+        Args:
+            run_num: The run number (0-indexed)
+
+        Returns:
+            Target max_steps for this run (min of (run_num + 1) * steps_per_run and max_steps)
+        """
+        if self.steps_per_run is None:
+            return self.max_steps
+        return min((run_num + 1) * self.steps_per_run, self.max_steps)
+
+    def get_dtensor_config(self) -> Optional[DTensorConfig]:
+        """Get DTensor configuration if dtensor is enabled.
+
+        Returns:
+            DTensorConfig dict if dtensor is enabled, None otherwise
+        """
+        dtensor_cfg = self._get_dtensor_config()
+        if dtensor_cfg.get("enabled", False):
+            return dtensor_cfg
+        return None
+
+    def get_megatron_config(self) -> Optional[MegatronConfig]:
+        """Get Megatron configuration if megatron is enabled.
+
+        Returns:
+            MegatronConfig dict if megatron is enabled, None otherwise
+        """
+        megatron_cfg = self._get_megatron_config()
+        if megatron_cfg.get("enabled", False):
+            return megatron_cfg
+        return None
+
+    #######################################################
+    # Properties
+    #######################################################
     @property
     def loaded_yaml_config(self) -> MasterConfigUnion:
         """Get the loaded YAML configuration as a typed MasterConfig.
@@ -438,144 +515,10 @@ class NeMoRLTestConfig:
         algo_config = self.master_config.get(self.algorithm, {})
         return algo_config.get("max_num_steps", 0)
 
-    def validate_config(self):
-        """Validate the loaded configuration.
-
-        This method validates:
-        - Basic cluster configuration (nodes, GPUs)
-        - Policy configuration structure (using PolicyConfig types)
-        - Parallelism settings match GPU counts
-        - Required fields are present
-        """
-        # Check if critical paths exist
-        if self.num_nodes < 1:
-            raise ValueError(f"num_nodes must be >= 1, got {self.num_nodes}")
-
-        if self.num_gpus_per_node < 1:
-            raise ValueError(
-                f"num_gpus_per_node must be >= 1, got {self.num_gpus_per_node}"
-            )
-
-        # Validate policy configuration exists
-        if not self.policy_config:
-            raise ValueError("Policy configuration is missing from YAML")
-
-        # Validate required policy fields
-        required_policy_fields = ["model_name", "tokenizer", "dtensor_cfg"]
-        for field_name in required_policy_fields:
-            if field_name not in self.policy_config:
-                raise ValueError(f"Required policy field '{field_name}' is missing")
-
-        # Validate backend configuration (exactly one should be enabled)
-        # Use helper functions for strong typing
-        dtensor_cfg = self._get_dtensor_config()
-        megatron_cfg = self._get_megatron_config()
-
-        dtensor_enabled = dtensor_cfg.get("enabled", False)
-        megatron_enabled = megatron_cfg.get("enabled", False)
-
-        if dtensor_enabled and megatron_enabled:
-            raise ValueError(
-                "Both dtensor and megatron backends are enabled. "
-                "Please enable only one backend."
-            )
-
-        # Warn about tensor/pipeline parallel without proper GPU count
-        if self.tensor_parallel and self.tensor_parallel > self.num_gpus_total:
-            print(
-                f"Warning: tensor_parallel_size ({self.tensor_parallel}) > "
-                f"total GPUs ({self.num_gpus_total})"
-            )
-
-        # Validate steps_per_run if set
-        if self.steps_per_run is not None:
-            if self.steps_per_run <= 0:
-                raise ValueError(f"steps_per_run must be > 0, got {self.steps_per_run}")
-
-            if self.max_steps == 0:
-                raise ValueError(
-                    "steps_per_run is set but max_steps could not be extracted from config. "
-                    "Ensure trainer.max_steps is defined in the YAML config."
-                )
-
-            if self.steps_per_run > self.max_steps:
-                raise ValueError(
-                    f"steps_per_run ({self.steps_per_run}) must be <= max_steps ({self.max_steps})"
-                )
-
-            # Warn if steps_per_run doesn't evenly divide max_steps
-            if self.max_steps % self.steps_per_run != 0:
-                print(
-                    f"Warning: max_steps ({self.max_steps}) is not evenly divisible by "
-                    f"steps_per_run ({self.steps_per_run}). Last run will train for "
-                    f"{self.max_steps % self.steps_per_run} steps."
-                )
-
     @property
     def num_gpus_total(self) -> int:
         """Total number of GPUs across all nodes."""
         return self.num_nodes * self.num_gpus_per_node
-
-    def get_run_script_path(self) -> Path:
-        """Get the path to the main run script based on algorithm.
-
-        Maps each algorithm to its corresponding run script:
-        - sft -> run_sft.py
-        - grpo -> run_grpo_math.py
-        - dpo -> run_dpo.py
-        - distillation -> run_distillation_math.py
-        - rm -> run_rm.py
-        """
-        script_map: dict[Algorithm, str] = {
-            "sft": "run_sft.py",
-            "grpo": "run_grpo_math.py",
-            "dpo": "run_dpo.py",
-            "distillation": "run_distillation_math.py",
-            "rm": "run_rm.py",
-        }
-        script_name = script_map[self.algorithm]  # Type-safe access, no need for get()
-
-        return self.project_root / "examples" / script_name
-
-    def build_command(
-        self, extra_overrides: Optional[Dict[str, Any]] = None
-    ) -> List[str]:
-        """Build the uv run command with YAML config + overrides.
-
-        Overrides are applied in Hydra format (key=value).
-        The command structure is compatible with Hydra's override system.
-
-        Args:
-            extra_overrides: Optional dictionary of additional overrides to apply
-                           after self.overrides. This allows callers to add
-                           test-specific overrides without modifying the config.
-
-        Returns:
-            Command as a list of strings ready for subprocess execution
-        """
-        cmd = [
-            "uv",
-            "run",
-            "--no-sync",
-            str(self.get_run_script_path()),
-            "--config",
-            str(self.yaml_config),
-        ]
-
-        # Apply overrides from self.overrides dict
-        for key, value in self.overrides.items():
-            cmd.append(f"{key}={value}")
-
-        # Apply extra overrides if provided
-        if extra_overrides:
-            for key, value in extra_overrides.items():
-                cmd.append(f"{key}={value}")
-
-        return cmd
-
-    def get_ci_job_id(self) -> str:
-        """Get CI job ID from environment or use test name."""
-        return os.environ.get("CI_JOB_ID", "local")
 
     @property
     def policy_config(self) -> PolicyConfig:
@@ -590,28 +533,6 @@ class NeMoRLTestConfig:
             dtensor_enabled = config.policy_config["dtensor_cfg"]["enabled"]
         """
         return cast(PolicyConfig, self.master_config.get("policy", {}))
-
-    def get_dtensor_config(self) -> Optional[DTensorConfig]:
-        """Get DTensor configuration if dtensor is enabled.
-
-        Returns:
-            DTensorConfig dict if dtensor is enabled, None otherwise
-        """
-        dtensor_cfg = self._get_dtensor_config()
-        if dtensor_cfg.get("enabled", False):
-            return dtensor_cfg
-        return None
-
-    def get_megatron_config(self) -> Optional[MegatronConfig]:
-        """Get Megatron configuration if megatron is enabled.
-
-        Returns:
-            MegatronConfig dict if megatron is enabled, None otherwise
-        """
-        megatron_cfg = self._get_megatron_config()
-        if megatron_cfg.get("enabled", False):
-            return megatron_cfg
-        return None
 
     @property
     def cluster_config(self) -> ClusterConfig:
@@ -690,7 +611,8 @@ class NeMoRLTestConfig:
         """
         return self.master_config.get(self.algorithm, {})
 
-    def get_num_runs(self) -> int:
+    @property
+    def num_runs(self) -> int:
         """Get the number of training runs based on steps_per_run.
 
         Returns:
@@ -700,54 +622,12 @@ class NeMoRLTestConfig:
             return 1
         return math.ceil(self.max_steps / self.steps_per_run)
 
-    def get_target_steps(self, run_num: int) -> int:
-        """Get the target max_steps for a specific run number.
-
-        Args:
-            run_num: The run number (0-indexed)
-
-        Returns:
-            Target max_steps for this run (min of (run_num + 1) * steps_per_run and max_steps)
-        """
-        if self.steps_per_run is None:
-            return self.max_steps
-        return min((run_num + 1) * self.steps_per_run, self.max_steps)
-
 
 @dataclass
 class DefaultNeMoRLTestConfig(NeMoRLTestConfig):
-    """Test configuration with default test overrides pre-applied.
-
-    This config class automatically includes standard overrides for:
-    - Logger configuration (wandb, tensorboard, GPU monitoring)
-    - Checkpointing configuration
-    - Log and checkpoint directories
-
-    Users can still override these defaults by passing custom values in the overrides dict.
-
-    Example:
-        # Use defaults
-        config = DefaultNeMoRLTestConfig(
-            test_name="my-test",
-            algorithm="sft",
-            model_class="llm",
-        )
-
-        # Override specific defaults
-        config = DefaultNeMoRLTestConfig(
-            test_name="my-test",
-            algorithm="sft",
-            model_class="llm",
-            overrides={
-                "logger.wandb_enabled": False,  # Disable wandb
-                "trainer.max_steps": 100,  # Add custom override
-            }
-        )
-    """
+    """Test configuration with default test overrides pre-applied."""
 
     def __post_init__(self):
-        # Apply default test overrides before parent __post_init__
-        # This ensures they're part of the config but can still be overridden
         default_overrides = {
             "logger.wandb_enabled": True,
             "logger.wandb.project": "nemo-rl",
@@ -765,6 +645,7 @@ class DefaultNeMoRLTestConfig(NeMoRLTestConfig):
 
         # Add path-based overrides after directories are set up
         # These overrides reference paths that are computed in parent __post_init__
+        # TODO(ahmadki): this doesn't feel right, maybe we should delete "Run paths" and make the overrides part of default_overrides ?
         path_overrides = {
             "logger.log_dir": str(self.log_dir),
             "logger.wandb.name": self.test_name,

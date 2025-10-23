@@ -14,14 +14,12 @@
 
 from typing import Literal, Union
 
-# Import MasterConfig types from all algorithms
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 
-# Type aliases for algorithms, model classes, backends, and configs
 Algorithm = Literal["sft", "grpo", "dpo", "distillation", "rm"]
 ModelClass = Literal["llm", "vlm"]
 Backend = Literal["fsdp2", "dtensor", "megatron"]
