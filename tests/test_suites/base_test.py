@@ -122,6 +122,7 @@ class BaseNeMoRLTest:
             def make_local_test(run_num, target_steps):
                 @pytest.mark.runner("local")
                 @pytest.mark.order(run_num)
+                @pytest.mark.stage("training")
                 def test_method(self):
                     cmd = self.config.build_command(
                         extra_overrides={"trainer.max_steps": target_steps}
@@ -140,6 +141,7 @@ class BaseNeMoRLTest:
             def make_slurm_test(run_num, target_steps):
                 @pytest.mark.runner("slurm")
                 @pytest.mark.order(run_num)
+                @pytest.mark.stage("training")
                 def test_method(self, request):
                     return_code = self.run_via_slurm(
                         request.node.nodeid,
@@ -287,6 +289,7 @@ class BaseNeMoRLTest:
         return result.returncode
 
     @pytest.mark.runner("local")
+    @pytest.mark.stage("training")
     def test_train_local(self):
         """Test that training completes successfully when run locally."""
         cmd = self.config.build_command()
@@ -299,6 +302,7 @@ class BaseNeMoRLTest:
         )
 
     @pytest.mark.runner("slurm")
+    @pytest.mark.stage("training")
     def test_train_slurm(self, request):
         """Test that training completes successfully when run via Slurm."""
         return_code = self.run_via_slurm(request.node.nodeid)

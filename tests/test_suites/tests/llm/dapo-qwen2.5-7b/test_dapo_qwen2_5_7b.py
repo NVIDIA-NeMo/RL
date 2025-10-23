@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tests.test_suites.base_config import NeMoRLTestConfig
 from tests.test_suites.base_test import BaseNeMoRLTest
 
@@ -21,7 +23,7 @@ class TestDapoQwen257b(BaseNeMoRLTest):
         test_name="dapo-qwen2.5-7b",
         algorithm="dapo",
         model_class="llm",
-        test_suites=["release"],
+        test_suites=["release", "akiswani"],  # TODO(ahmadki): test_suites
         time_limit_minutes=240,
         overrides={
             "grpo.max_num_steps": 20,
@@ -29,11 +31,35 @@ class TestDapoQwen257b(BaseNeMoRLTest):
     )
 
     # TODO(ahmadki): dummy tests
-    def test_one_plus_one(self):
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    @pytest.mark.order(1)
+    def one(self):
         assert 1 + 1 == 2
 
-    def test_two_plus_two(self):
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    @pytest.mark.order(2)
+    def two(self):
         assert 2 + 2 == 4
 
-    def test_four_plus_four(self):
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    @pytest.mark.order(3)
+    def three(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    def four(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    def five(self):
+        assert 4 + 4 == 8
+
+    @pytest.mark.stage("validation")
+    @pytest.mark.job_group("job_1")
+    def six(self):
         assert 4 + 4 == 8
