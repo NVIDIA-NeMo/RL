@@ -39,37 +39,38 @@ def pytest_addoption(parser):
     )  # TODO(ahmadki): num_gpus_total doesn't work
 
 
-@pytest.fixture
-def project_root(tmp_path):
-    """Return the project root directory."""
-    import subprocess
-    from pathlib import Path
+# TODO(ahmadki)
+# @pytest.fixture
+# def project_root(tmp_path):
+#     """Return the project root directory."""
+#     import subprocess
+#     from pathlib import Path
 
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return Path(result.stdout.strip())
+#     result = subprocess.run(
+#         ["git", "rev-parse", "--show-toplevel"],
+#         capture_output=True,
+#         text=True,
+#         check=True,
+#     )
+#     return Path(result.stdout.strip())
 
 
-@pytest.fixture
-def test_output_dir(tmp_path, request):
-    """Create a temporary output directory for test artifacts.
+# @pytest.fixture
+# def test_output_dir(tmp_path, request):
+#     """Create a temporary output directory for test artifacts.
 
-    This fixture can be overridden by setting the TEST_OUTPUT_DIR environment variable
-    to use a persistent directory instead of tmp_path.
-    """
-    import os
-    from pathlib import Path
+#     This fixture can be overridden by setting the TEST_OUTPUT_DIR environment variable
+#     to use a persistent directory instead of tmp_path.
+#     """
+#     import os
+#     from pathlib import Path
 
-    output_dir = os.environ.get("TEST_OUTPUT_DIR")
-    if output_dir:
-        output_dir = Path(output_dir) / request.node.name
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return output_dir
-    return tmp_path
+#     output_dir = os.environ.get("TEST_OUTPUT_DIR")
+#     if output_dir:
+#         output_dir = Path(output_dir) / request.node.name
+#         output_dir.mkdir(parents=True, exist_ok=True)
+#         return output_dir
+#     return tmp_path
 
 
 @pytest.fixture
