@@ -397,13 +397,17 @@ class NeMoRLTestConfig:
         Returns:
             Command as a list of strings ready for subprocess execution
         """
+        # Use relative paths from project root
+        run_script_rel = self.get_run_script_path().relative_to(self.project_root)
+        yaml_config_rel = self.yaml_config.relative_to(self.project_root)
+
         cmd = [
             "uv",
             "run",
             "--no-sync",
-            str(self.get_run_script_path()),
+            str(run_script_rel),
             "--config",
-            str(self.yaml_config),
+            str(yaml_config_rel),
         ]
 
         # Apply overrides from self.overrides dict
