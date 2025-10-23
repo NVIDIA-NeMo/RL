@@ -116,8 +116,6 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.parallelism_pp)
         if cfg.sequence_parallel:
             item.add_marker(pytest.mark.parallelism_sp)
-        if cfg.fsdp:
-            item.add_marker(pytest.mark.parallelism_fsdp)
 
         # === Apply custom filters ===
 
