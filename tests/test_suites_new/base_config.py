@@ -485,7 +485,7 @@ class BaseNeMoRLTest:
 
     config: NeMoRLTestConfig  # Must be defined by subclass
 
-    def test_training_runs_successfully_local(self):
+    def test_train_local(self):
         """Test that training completes successfully when run locally."""
         cmd = self.config.build_command()
         return_code = run_command(
@@ -496,7 +496,7 @@ class BaseNeMoRLTest:
             f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
         )
 
-    def test_training_runs_successfully_slurm(self, request):
+    def test_train_slurm(self, request):
         """Test that training completes successfully when run via Slurm."""
         return_code = run_via_slurm(self.config, request.node.nodeid)
 
