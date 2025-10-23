@@ -21,10 +21,13 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
 from nemo_rl.models.policy import DTensorConfig, MegatronConfig, PolicyConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
+
+# Import type aliases from parent module
+from . import Algorithm, MasterConfigUnion, ModelClass
 
 
 @dataclass
@@ -42,8 +45,8 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     # Metadata we add to tests (required fields first)
     #######################################################
     test_name: str  # Test identifier
-    algorithm: str  # sft, grpo, dpo
-    model_class: str  # llm, vlm
+    algorithm: Algorithm  # sft, grpo, dpo, distillation, rm (strictly typed)
+    model_class: ModelClass  # llm, vlm (strictly typed)
     test_suites: List[str] = field(
         default_factory=lambda: ["nightly"]
     )  # Suites this test is part of (can set multiple suites)
@@ -113,15 +116,21 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             if not self.yaml_config.exists():
                 raise FileNotFoundError(f"Config file not found: {self.yaml_config}")
 
-        # Loads YAML files with OmegaConf and store as private attribute
-        self._loaded_yaml_config = load_config(self.yaml_config)
+        # Loads YAML files with OmegaConf
+        config = load_config(self.yaml_config)
 
         # Apply overrides with Hydra's parser
         if self.overrides:
             override_strings = [f"{k}={v}" for k, v in self.overrides.items()]
-            self._loaded_yaml_config = parse_hydra_overrides(
-                self._loaded_yaml_config, override_strings
-            )
+            config = parse_hydra_overrides(config, override_strings)
+
+        # Convert to plain dict with all interpolations resolved
+        self._loaded_yaml_config: MasterConfigUnion = OmegaConf.to_container(
+            config, resolve=True
+        )
+
+        # Validate algorithm matches config structure
+        self._validate_algorithm_config()
 
         # Validate configuration
         self.validate_config()
@@ -155,10 +164,45 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    def _validate_algorithm_config(self):
+        """Validate that the algorithm field matches the config structure.
+
+        This ensures that:
+        - For algorithm="sft", config has "sft" key with SFTConfig
+        - For algorithm="grpo", config has "grpo" key with GRPOConfig
+        - For algorithm="dpo", config has "dpo" key with DPOConfig
+        - For algorithm="distillation", config has "distillation" key with DistillationConfig
+        - For algorithm="rm", config has "rm" key with RMConfig
+
+        Raises:
+            ValueError: If algorithm doesn't match config structure
+        """
+        # Check if the algorithm-specific config section exists
+        if self.algorithm not in self._loaded_yaml_config:
+            raise ValueError(
+                f"Config validation failed: algorithm='{self.algorithm}' but config "
+                f"does not have '{self.algorithm}' section. "
+                f"Available sections: {list(self._loaded_yaml_config.keys())}"
+            )
+
+        # Additional validation for required sections in MasterConfig
+        required_sections = ["policy", "data", "logger", "cluster", "checkpointing"]
+        missing_sections = [
+            section
+            for section in required_sections
+            if section not in self._loaded_yaml_config
+        ]
+
+        if missing_sections:
+            raise ValueError(
+                f"Config validation failed: Missing required sections: {missing_sections}. "
+                f"Available sections: {list(self._loaded_yaml_config.keys())}"
+            )
+
     def _extract_model_name(self) -> str:
-        model_name = OmegaConf.select(
-            self._loaded_yaml_config, "policy.model_name", default=""
-        )
+        # Extract model_name from policy config (handle both dict and nested structure)
+        policy_config = self._loaded_yaml_config.get("policy", {})
+        model_name = policy_config.get("model_name", "")
 
         # Clean up model name for filtering (remove org prefix)
         # e.g., "meta-llama/Llama-3.1-8B-Instruct" -> "llama3.1-8b-instruct"
@@ -169,12 +213,12 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return model_name
 
     def _detect_backend(self) -> str:
-        dtensor_enabled = OmegaConf.select(
-            self._loaded_yaml_config, "policy.dtensor_cfg.enabled", default=False
-        )
-        megatron_enabled = OmegaConf.select(
-            self._loaded_yaml_config, "policy.megatron_cfg.enabled", default=False
-        )
+        policy_config = self._loaded_yaml_config.get("policy", {})
+        dtensor_cfg = policy_config.get("dtensor_cfg", {})
+        megatron_cfg = policy_config.get("megatron_cfg", {})
+
+        dtensor_enabled = dtensor_cfg.get("enabled", False)
+        megatron_enabled = megatron_cfg.get("enabled", False)
 
         if dtensor_enabled and megatron_enabled:
             raise ValueError(
@@ -194,41 +238,21 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         Returns:
             Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
         """
+        policy_config = self._loaded_yaml_config.get("policy", {})
+
         if backend == "dtensor":
+            dtensor_cfg = policy_config.get("dtensor_cfg", {})
             return {
-                "tensor_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.dtensor_cfg.tensor_parallel_size",
-                    default=None,
-                ),
-                "pipeline_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.dtensor_cfg.pipeline_parallel_size",
-                    default=None,
-                ),
-                "sequence_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.dtensor_cfg.sequence_parallel",
-                    default=False,
-                ),
+                "tensor_parallel": dtensor_cfg.get("tensor_parallel_size"),
+                "pipeline_parallel": dtensor_cfg.get("pipeline_parallel_size"),
+                "sequence_parallel": dtensor_cfg.get("sequence_parallel", False),
             }
         elif backend == "megatron":
+            megatron_cfg = policy_config.get("megatron_cfg", {})
             return {
-                "tensor_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.megatron_cfg.tensor_model_parallel_size",
-                    default=None,
-                ),
-                "pipeline_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.megatron_cfg.pipeline_model_parallel_size",
-                    default=None,
-                ),
-                "sequence_parallel": OmegaConf.select(
-                    self._loaded_yaml_config,
-                    "policy.megatron_cfg.sequence_parallel",
-                    default=False,
-                ),
+                "tensor_parallel": megatron_cfg.get("tensor_model_parallel_size"),
+                "pipeline_parallel": megatron_cfg.get("pipeline_model_parallel_size"),
+                "sequence_parallel": megatron_cfg.get("sequence_parallel", False),
             }
         else:
             # fsdp2 backend
@@ -243,11 +267,14 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     #######################################################
 
     @cached_property
-    def loaded_yaml_config(self) -> DictConfig:
-        """Get the loaded YAML configuration.
+    def loaded_yaml_config(self) -> MasterConfigUnion:
+        """Get the loaded YAML configuration as a typed MasterConfig.
 
         This property provides access to the loaded and parsed YAML config
-        with overrides applied.
+        with overrides applied and all interpolations resolved.
+
+        Returns:
+            Plain dict typed as MasterConfigUnion (one of SFT, GRPO, DPO, Distillation, RM configs)
         """
         return self._loaded_yaml_config
 
@@ -264,16 +291,14 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     @cached_property
     def num_nodes(self) -> int:
         """Number of nodes from cluster configuration."""
-        return OmegaConf.select(
-            self._loaded_yaml_config, "cluster.num_nodes", default=1
-        )
+        cluster_config = self._loaded_yaml_config.get("cluster", {})
+        return cluster_config.get("num_nodes", 1)
 
     @cached_property
     def num_gpus_per_node(self) -> int:
         """Number of GPUs per node from cluster configuration."""
-        return OmegaConf.select(
-            self._loaded_yaml_config, "cluster.gpus_per_node", default=8
-        )
+        cluster_config = self._loaded_yaml_config.get("cluster", {})
+        return cluster_config.get("gpus_per_node", 8)
 
     @cached_property
     def tensor_parallel(self) -> Optional[int]:
@@ -295,10 +320,17 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
 
     @cached_property
     def max_steps(self) -> int:
-        """Maximum training steps from trainer configuration."""
-        return OmegaConf.select(
-            self._loaded_yaml_config, "trainer.max_steps", default=0
-        )
+        """Maximum training steps from algorithm-specific configuration.
+
+        Different algorithms have different config keys:
+        - SFT: sft.max_num_steps
+        - GRPO: grpo.max_num_steps
+        - DPO: dpo.max_num_steps
+        - Distillation: distillation.max_num_steps
+        - RM: rm.max_num_steps
+        """
+        algo_config = self._loaded_yaml_config.get(self.algorithm, {})
+        return algo_config.get("max_num_steps", 0)
 
     def validate_config(self):
         """Validate the loaded configuration.
@@ -378,17 +410,23 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return self.num_nodes * self.num_gpus_per_node
 
     def get_run_script_path(self) -> Path:
-        """Get the path to the main run script based on algorithm."""
-        script_map = {
+        """Get the path to the main run script based on algorithm.
+
+        Maps each algorithm to its corresponding run script:
+        - sft -> run_sft.py
+        - grpo -> run_grpo_math.py
+        - dpo -> run_dpo.py
+        - distillation -> run_distillation_math.py
+        - rm -> run_rm.py
+        """
+        script_map: dict[Algorithm, str] = {
             "sft": "run_sft.py",
             "grpo": "run_grpo_math.py",
             "dpo": "run_dpo.py",
-            "vlm_grpo": "run_vlm_grpo.py",
-            "dapo": "run_grpo_math.py",
+            "distillation": "run_distillation_math.py",
+            "rm": "run_rm.py",
         }
-        script_name = script_map.get(self.algorithm)
-        if script_name is None:
-            raise ValueError(f"Unknown algorithm: {self.algorithm}")
+        script_name = script_map[self.algorithm]  # Type-safe access, no need for get()
 
         return self.project_root / "examples" / script_name
 
@@ -437,14 +475,14 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         """Get the policy configuration from the loaded YAML as a typed PolicyConfig.
 
         This provides type hints and IDE support when accessing policy configuration.
-        The returned config is a DictConfig but typed as PolicyConfig for convenience.
+        The returned config is a plain dict typed as PolicyConfig for convenience.
 
         Example:
             config = NeMoRLTestConfig(...)
             model_name = config.policy_config["model_name"]
             dtensor_enabled = config.policy_config["dtensor_cfg"]["enabled"]
         """
-        return cast(PolicyConfig, OmegaConf.select(self._loaded_yaml_config, "policy"))
+        return cast(PolicyConfig, self._loaded_yaml_config.get("policy", {}))
 
     def get_dtensor_config(self) -> Optional[DTensorConfig]:
         """Get DTensor configuration if dtensor is enabled.

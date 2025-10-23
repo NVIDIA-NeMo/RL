@@ -21,7 +21,7 @@ from tests.test_suites.utils.types.base_config import NeMoRLTestConfig
 class TestDapoQwen257b(BaseNeMoRLTest):
     config = NeMoRLTestConfig(
         test_name="dapo-qwen2.5-7b",
-        algorithm="dapo",
+        algorithm="grpo",  # DAPO uses GRPO MasterConfig
         model_class="llm",
         test_suites=["release", "akiswani"],  # TODO(ahmadki): test_suites
         time_limit_minutes=240,
