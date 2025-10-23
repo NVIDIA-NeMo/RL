@@ -205,10 +205,8 @@ def _build_job(
     # Join commands with && for TEST_SCRIPT and add quotes
     test_script = " && ".join(commands)
 
-    # Convert minutes to hours:minutes format
-    hours = config.time_limit_minutes // 60
-    minutes = config.time_limit_minutes % 60
-    time_string = f"{hours}:{minutes}"
+    # Format TIME as "minutes:0"
+    time_string = f"{config.time_limit_minutes}:0"
 
     job = {
         "variables": {
