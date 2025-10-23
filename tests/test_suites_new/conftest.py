@@ -1,6 +1,18 @@
 """Pytest configuration and fixtures for NeMo-RL test suites."""
 
+import warnings
+
 import pytest
+
+
+def pytest_configure(config):
+    """Configure pytest for this test suite."""
+    # Suppress unknown marker warnings for dynamically generated markers
+    warnings.filterwarnings(
+        "ignore",
+        message="Unknown pytest.mark.*",
+        category=pytest.PytestUnknownMarkWarning,
+    )
 
 
 def pytest_addoption(parser):
@@ -23,110 +35,12 @@ def pytest_addoption(parser):
         "--suite",
         help="Filter by test suite (e.g., nightly, quick, release, long, performance)",
     )
-    parser.addoption("--num-gpus", type=int, help="Filter by exact GPU count")
+    parser.addoption("--num-gpus", type=int, help="Filter by exact total GPU count")
+    parser.addoption("--num-gpus-per-node", type=int, help="Filter by GPUs per node")
     parser.addoption("--num-nodes", type=int, help="Filter by node count")
     parser.addoption(
         "--filter",
         help="Filter using Python expression on config (e.g., 'config.num_gpus_total >= 32 and config.backend == \"fsdp2\"')",
-    )
-
-
-def pytest_configure(config):
-    """Register custom markers for test filtering.
-
-    Markers are organized into groups using prefixes:
-    - algo_*: Algorithm type
-    - suite_*: Test suite type
-    - model_size_*: Model size category
-    - num_gpus_*: Number of GPUs required
-    - num_nodes_*: Number of nodes required
-    - engine_*: Backend/engine type
-    - parallelism_*: Parallelism strategy
-    - feature_*: Special features
-    """
-    # Algorithm markers (algo_*)
-    config.addinivalue_line("markers", "algo_sft: Supervised Fine-Tuning tests")
-    config.addinivalue_line(
-        "markers", "algo_grpo: GRPO (Group Relative Policy Optimization) tests"
-    )
-    config.addinivalue_line(
-        "markers", "algo_dpo: DPO (Direct Preference Optimization) tests"
-    )
-    config.addinivalue_line(
-        "markers", "algo_vlm_grpo: Vision-Language Model GRPO tests"
-    )
-
-    # Test suite markers (suite_*)
-    config.addinivalue_line("markers", "suite_nightly: Tests that run nightly")
-    config.addinivalue_line("markers", "suite_release: Tests that run before release")
-    config.addinivalue_line("markers", "suite_performance: Performance benchmark tests")
-    config.addinivalue_line("markers", "suite_quick: Quick smoke tests")
-    config.addinivalue_line("markers", "suite_long: Long-running tests")
-
-    # Model size markers (model_size_*)
-    config.addinivalue_line(
-        "markers", "model_size_small: Small models (< 2B parameters)"
-    )
-    config.addinivalue_line(
-        "markers", "model_size_medium: Medium models (2B-10B parameters)"
-    )
-    config.addinivalue_line(
-        "markers", "model_size_large: Large models (10B-100B parameters)"
-    )
-    config.addinivalue_line(
-        "markers", "model_size_xlarge: Extra large models (> 100B parameters)"
-    )
-
-    # GPU requirement markers (num_gpus_*)
-    config.addinivalue_line("markers", "num_gpus_1: Tests requiring 1 GPU")
-    config.addinivalue_line("markers", "num_gpus_2: Tests requiring 2 GPUs")
-    config.addinivalue_line("markers", "num_gpus_4: Tests requiring 4 GPUs")
-    config.addinivalue_line("markers", "num_gpus_8: Tests requiring 8 GPUs")
-    config.addinivalue_line("markers", "num_gpus_16: Tests requiring 16 GPUs")
-    config.addinivalue_line("markers", "num_gpus_32: Tests requiring 32 GPUs")
-    config.addinivalue_line("markers", "num_gpus_64: Tests requiring 64 GPUs")
-    config.addinivalue_line("markers", "num_gpus_128: Tests requiring 128 GPUs")
-    config.addinivalue_line("markers", "num_gpus_256: Tests requiring 256 GPUs")
-
-    # Node requirement markers (num_nodes_*)
-    config.addinivalue_line("markers", "num_nodes_1: Tests requiring 1 node")
-    config.addinivalue_line("markers", "num_nodes_2: Tests requiring 2 nodes")
-    config.addinivalue_line("markers", "num_nodes_4: Tests requiring 4 nodes")
-    config.addinivalue_line("markers", "num_nodes_8: Tests requiring 8 nodes")
-    config.addinivalue_line("markers", "num_nodes_16: Tests requiring 16 nodes")
-    config.addinivalue_line("markers", "num_nodes_32: Tests requiring 32 nodes")
-
-    # Engine/Backend markers (engine_*)
-    config.addinivalue_line("markers", "engine_fsdp2: Tests using FSDP2 backend")
-    config.addinivalue_line(
-        "markers", "engine_mcore: Tests using Megatron-Core backend"
-    )
-    config.addinivalue_line("markers", "engine_dtensor: Tests using DTensor backend")
-
-    # Parallelism strategy markers (parallelism_*)
-    config.addinivalue_line("markers", "parallelism_tp: Tests using tensor parallelism")
-    config.addinivalue_line(
-        "markers", "parallelism_pp: Tests using pipeline parallelism"
-    )
-    config.addinivalue_line(
-        "markers", "parallelism_sp: Tests using sequence parallelism"
-    )
-    config.addinivalue_line("markers", "parallelism_fsdp: Tests using FSDP")
-
-    # Feature markers (feature_*)
-    config.addinivalue_line(
-        "markers",
-        "feature_activation_checkpointing: Tests using activation checkpointing",
-    )
-    config.addinivalue_line("markers", "feature_fp8: Tests using FP8 precision")
-    config.addinivalue_line(
-        "markers", "feature_dynamic_batch: Tests using dynamic batching"
-    )
-    config.addinivalue_line(
-        "markers", "feature_sequence_packing: Tests using sequence packing"
-    )
-    config.addinivalue_line(
-        "markers", "feature_non_colocated: Tests with non-colocated components"
     )
 
 
@@ -234,6 +148,7 @@ def pytest_collection_modifyitems(config, items):
     backend_filter = config.getoption("--backend")
     suite_filter = config.getoption("--suite")
     num_gpus_filter = config.getoption("--num-gpus")
+    num_gpus_per_node_filter = config.getoption("--num-gpus-per-node")
     num_nodes_filter = config.getoption("--num-nodes")
     filter_expr = config.getoption("--filter")
 
@@ -311,8 +226,15 @@ def pytest_collection_modifyitems(config, items):
         if suite_filter and suite_filter not in cfg.test_suites:
             continue
 
-        # GPU count filter
+        # GPU count filter (total GPUs)
         if num_gpus_filter is not None and cfg.num_gpus_total != num_gpus_filter:
+            continue
+
+        # GPUs per node filter
+        if (
+            num_gpus_per_node_filter is not None
+            and cfg.num_gpus_per_node != num_gpus_per_node_filter
+        ):
             continue
 
         # Node count filter

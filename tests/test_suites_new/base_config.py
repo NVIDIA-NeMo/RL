@@ -1,5 +1,6 @@
 """Base configuration and utilities for NeMo-RL test suites."""
 
+import inspect
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from nemo_rl.utils.config import load_config, parse_hydra_overrides
 
 
 @dataclass
-class TestConfig:
+class NeMoRLTestConfig:
     """Test configuration with YAML base + overrides + test metadata.
 
     This class:
@@ -79,11 +80,33 @@ class TestConfig:
                 self.config_yaml if self.config_yaml else f"{self.test_name}.yaml"
             )
 
-            # Map from tests/test_suites/llm/test_name to examples/configs/recipes/llm/test_name.yaml
-            test_suite_path = Path(__file__).parent
-            relative_path = test_suite_path.relative_to(
-                self.project_root / "tests" / "test_suites"
-            )
+            # Get the file path of the caller (the test file that instantiated this config)
+            # We need to walk up the stack to find the first frame outside of this file
+            caller_frame = None
+            for frame_info in inspect.stack():
+                frame_file = Path(frame_info.filename)
+                if frame_file != Path(__file__) and "test_suites_new" in str(
+                    frame_file
+                ):
+                    caller_frame = frame_file
+                    break
+
+            if caller_frame:
+                # Get the directory containing the test file
+                test_file_dir = caller_frame.parent
+                # Map from tests/test_suites_new/llm/test_name to examples/configs/recipes/llm/
+                # The test structure is: tests/test_suites_new/llm/test_name/test_*.py
+                # The config structure is: examples/configs/recipes/llm/test_name.yaml
+                # So we need to go up one level from the test file directory to get to llm/
+                relative_path = test_file_dir.relative_to(
+                    self.project_root / "tests" / "test_suites_new"
+                ).parent
+            else:
+                # Fallback: use current directory (where base_config.py is)
+                test_suite_path = Path(__file__).parent
+                relative_path = test_suite_path.relative_to(
+                    self.project_root / "tests" / "test_suites_new"
+                )
 
             self.config_path = (
                 self.project_root
@@ -362,7 +385,7 @@ def run_command(cmd: List[str], log_file: Path, cwd: Optional[Path] = None) -> i
     return return_code
 
 
-def run_via_slurm(config: TestConfig, pytest_nodeid: str) -> int:
+def run_via_slurm(config: NeMoRLTestConfig, pytest_nodeid: str) -> int:
     """Run a test via Slurm by invoking launch_nemo_rl.py.
 
     This function is called when pytest is run with --slurm option.
@@ -452,7 +475,7 @@ class BaseNeMoRLTest:
 
     Example:
         class TestMyTraining(BaseNeMoRLTest):
-            config = TestConfig(
+            config = NeMoRLTestConfig(
                 test_name="my-test",
                 algorithm="sft",
                 test_suites=["nightly"],
@@ -460,7 +483,7 @@ class BaseNeMoRLTest:
             )
     """
 
-    config: TestConfig  # Must be defined by subclass
+    config: NeMoRLTestConfig  # Must be defined by subclass
 
     def test_training_runs_successfully_local(self):
         """Test that training completes successfully when run locally."""
