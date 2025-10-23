@@ -27,3 +27,13 @@ class TestDapoQwen257b(BaseNeMoRLTest):
             "grpo.max_num_steps": 20,
         },
     )
+
+    # TODO(ahmadki): dummy tests
+    def test_one_plus_one(self):
+        assert 1 + 1 == 2
+
+    def test_two_plus_two(self):
+        assert 2 + 2 == 4
+
+    def test_four_plus_four(self):
+        assert 4 + 4 == 8
