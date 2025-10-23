@@ -17,10 +17,11 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from omegaconf import DictConfig, OmegaConf
 
+from nemo_rl.models.policy import DTensorConfig, MegatronConfig, PolicyConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 
 
@@ -237,8 +238,11 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     def validate_config(self):
         """Validate the loaded configuration.
 
-        This method can be extended to add more validation checks.
-        Currently provides basic warnings for common issues.
+        This method validates:
+        - Basic cluster configuration (nodes, GPUs)
+        - Policy configuration structure (using PolicyConfig types)
+        - Parallelism settings match GPU counts
+        - Required fields are present
         """
         # Check if critical paths exist
         if self.num_nodes < 1:
@@ -247,6 +251,29 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         if self.num_gpus_per_node < 1:
             raise ValueError(
                 f"num_gpus_per_node must be >= 1, got {self.num_gpus_per_node}"
+            )
+
+        # Validate policy configuration exists
+        if not self.policy_config:
+            raise ValueError("Policy configuration is missing from YAML")
+
+        # Validate required policy fields
+        required_policy_fields = ["model_name", "tokenizer", "dtensor_cfg"]
+        for field_name in required_policy_fields:
+            if field_name not in self.policy_config:
+                raise ValueError(f"Required policy field '{field_name}' is missing")
+
+        # Validate backend configuration (exactly one should be enabled)
+        dtensor_cfg = self.policy_config.get("dtensor_cfg", {})
+        megatron_cfg = self.policy_config.get("megatron_cfg", {})
+
+        dtensor_enabled = dtensor_cfg.get("enabled", False)
+        megatron_enabled = megatron_cfg.get("enabled", False)
+
+        if dtensor_enabled and megatron_enabled:
+            raise ValueError(
+                "Both dtensor and megatron backends are enabled. "
+                "Please enable only one backend."
             )
 
         # Warn about tensor/pipeline parallel without proper GPU count
@@ -314,6 +341,42 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     def get_ci_job_id(self) -> str:
         """Get CI job ID from environment or use test name."""
         return os.environ.get("CI_JOB_ID", "local")
+
+    @property
+    def policy_config(self) -> PolicyConfig:
+        """Get the policy configuration from the loaded YAML as a typed PolicyConfig.
+
+        This provides type hints and IDE support when accessing policy configuration.
+        The returned config is a DictConfig but typed as PolicyConfig for convenience.
+
+        Example:
+            config = NeMoRLTestConfig(...)
+            model_name = config.policy_config["model_name"]
+            dtensor_enabled = config.policy_config["dtensor_cfg"]["enabled"]
+        """
+        return cast(PolicyConfig, OmegaConf.select(self.loaded_yaml_config, "policy"))
+
+    def get_dtensor_config(self) -> Optional[DTensorConfig]:
+        """Get DTensor configuration if dtensor is enabled.
+
+        Returns:
+            DTensorConfig dict if dtensor is enabled, None otherwise
+        """
+        policy = self.policy_config
+        if policy and policy.get("dtensor_cfg", {}).get("enabled", False):
+            return cast(DTensorConfig, policy["dtensor_cfg"])
+        return None
+
+    def get_megatron_config(self) -> Optional[MegatronConfig]:
+        """Get Megatron configuration if megatron is enabled.
+
+        Returns:
+            MegatronConfig dict if megatron is enabled, None otherwise
+        """
+        policy = self.policy_config
+        if policy and policy.get("megatron_cfg", {}).get("enabled", False):
+            return cast(MegatronConfig, policy["megatron_cfg"])
+        return None
 
 
 @dataclass
