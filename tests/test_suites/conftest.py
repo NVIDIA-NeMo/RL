@@ -176,9 +176,7 @@ def _get_model_size_from_name(model_name: str) -> str:
     """
     model_name_lower = model_name.lower()
 
-    # Extract parameter count from model name
-    # Examples: "llama3.1-8b", "qwen2.5-32b", "gemma3-27b", "llama3.1-70b"
-    if "1b" in model_name_lower or "1.5b" in model_name_lower:
+    if any(x in model_name_lower for x in ["1b", "1.5b"]):
         return "small"
     elif any(x in model_name_lower for x in ["7b", "8b", "9b"]):
         return "medium"
