@@ -17,7 +17,6 @@ import math
 import os
 import subprocess
 from dataclasses import dataclass, field
-from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -167,17 +166,6 @@ class NeMoRLTestConfig:
         # Validate configuration
         self.validate_config()
 
-        # Access cached properties to trigger computation and early validation
-        # This ensures any errors in config extraction are caught during initialization
-        _ = self.model_name
-        _ = self.backend
-        _ = self.num_nodes
-        _ = self.num_gpus_per_node
-        _ = self.tensor_parallel
-        _ = self.pipeline_parallel
-        _ = self.sequence_parallel
-        _ = self.max_steps
-
         # Test directories
         if self.exp_dir is None:
             self.exp_dir = self.test_file_dir
@@ -295,10 +283,10 @@ class NeMoRLTestConfig:
             }
 
     #######################################################
-    # Cached properties (computed from YAML + overrides)
+    # Properties (computed from YAML + overrides)
     #######################################################
 
-    @cached_property
+    @property
     def loaded_yaml_config(self) -> MasterConfigUnion:
         """Get the loaded YAML configuration as a typed MasterConfig.
 
@@ -312,47 +300,47 @@ class NeMoRLTestConfig:
         """
         return self.master_config
 
-    @cached_property
+    @property
     def model_name(self) -> str:
         """Extract and normalize model name from config."""
         return self._extract_model_name()
 
-    @cached_property
+    @property
     def backend(self) -> str:
         """Detect the backend (fsdp2, dtensor, or megatron)."""
         return self._detect_backend()
 
-    @cached_property
+    @property
     def num_nodes(self) -> int:
         """Number of nodes from cluster configuration."""
         cluster_config = self.master_config.get("cluster", {})
         return cluster_config.get("num_nodes", 1)
 
-    @cached_property
+    @property
     def num_gpus_per_node(self) -> int:
         """Number of GPUs per node from cluster configuration."""
         cluster_config = self.master_config.get("cluster", {})
         return cluster_config.get("gpus_per_node", 8)
 
-    @cached_property
+    @property
     def tensor_parallel(self) -> Optional[int]:
         """Tensor parallel size from backend configuration."""
         parallelism = self._extract_parallelism_config(self.backend)
         return parallelism["tensor_parallel"]
 
-    @cached_property
+    @property
     def pipeline_parallel(self) -> Optional[int]:
         """Pipeline parallel size from backend configuration."""
         parallelism = self._extract_parallelism_config(self.backend)
         return parallelism["pipeline_parallel"]
 
-    @cached_property
+    @property
     def sequence_parallel(self) -> bool:
         """Sequence parallel setting from backend configuration."""
         parallelism = self._extract_parallelism_config(self.backend)
         return parallelism["sequence_parallel"]
 
-    @cached_property
+    @property
     def max_steps(self) -> int:
         """Maximum training steps from algorithm-specific configuration.
 
