@@ -2267,3 +2267,9 @@ class CustomFloat16Module(Float16Module):
                     router, "_maintain_float32_expert_bias"
                 ):
                     router._maintain_float32_expert_bias()
+
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Report the node IP and GPU ID of the current worker."""
+        ip = ray._private.services.get_node_ip_address()
+        gpu_id = ray.get_gpu_ids()[0]
+        return (ip, gpu_id)
