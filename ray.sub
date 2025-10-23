@@ -21,7 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+echo "STARTING_PATH: ${PATH}"
 set -eoux pipefail
 
 ########################################################
@@ -143,6 +143,8 @@ head_cmd=$(cat <<EOF
 touch $LOG_DIR/STARTED_RAY_HEAD
 env
 
+#export PATH=/opt/nemo_rl_venv/bin:\$PATH
+#echo "THIS_IS_THE_PATH: ${PATH}"
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -245,6 +247,8 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   worker_cmd=$(cat <<EOF
 env
 
+#export PATH=/opt/nemo_rl_venv/bin:\$PATH
+#echo "THIS_IS_THE_PATH: ${PATH}"
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true

@@ -85,6 +85,11 @@ def create_parser():
         default=None,
         help="Maximum number of problems to evaluate (for quick testing)"
     )
+    parser.add_argument(
+        "--cluster",
+        default="local",
+        help="If you want to run on a cluster via nemo-skills (defaults to 'local')"
+    )
     
     # Server configuration
     parser.add_argument(
@@ -217,7 +222,7 @@ def main():
         "model": args.model,
         
         # Additional evaluation arguments
-        "cluster": None,  # Use local execution (no SLURM cluster)
+        "cluster": None if args.cluster == "local" else args.cluster,
         "dry_run": args.dry_run,
         
         # Inference settings
