@@ -85,21 +85,26 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             ).strip()
         )
 
+        # Get the file path of the caller (the test file that instantiated this config)
+        # We need to walk up the stack to find the first frame outside of this file
+        caller_frame = None
+        for frame_info in inspect.stack():
+            frame_file = Path(frame_info.filename)
+            if frame_file != Path(__file__) and "test_suites" in str(frame_file):
+                caller_frame = frame_file
+                break
+
+        # Store the test file directory for later use
+        self.test_file_dir = (
+            caller_frame.parent if caller_frame else Path(__file__).parent
+        )
+
         # Compute config path if not provided
         if self.config_path is None:
             # Use config_yaml if provided, otherwise derive from test_name
             yaml_filename = (
                 self.config_yaml if self.config_yaml else f"{self.test_name}.yaml"
             )
-
-            # Get the file path of the caller (the test file that instantiated this config)
-            # We need to walk up the stack to find the first frame outside of this file
-            caller_frame = None
-            for frame_info in inspect.stack():
-                frame_file = Path(frame_info.filename)
-                if frame_file != Path(__file__) and "test_suites" in str(frame_file):
-                    caller_frame = frame_file
-                    break
 
             if caller_frame:
                 # Get the directory containing the test file
@@ -155,8 +160,9 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         self.validate_config()
 
         # Setup output directories
+        # Use the test file directory instead of base_config.py directory
         if self.exp_dir is None:
-            self.exp_dir = Path(__file__).parent / self.test_name
+            self.exp_dir = self.test_file_dir
 
         if self.log_dir is None:
             self.log_dir = self.exp_dir / "logs"
