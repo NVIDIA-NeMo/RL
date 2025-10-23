@@ -295,6 +295,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             "grpo": "run_grpo_math.py",
             "dpo": "run_dpo.py",
             "vlm_grpo": "run_vlm_grpo.py",
+            "dapo": "run_grpo_math.py",
         }
         script_name = script_map.get(self.algorithm)
         if script_name is None:
