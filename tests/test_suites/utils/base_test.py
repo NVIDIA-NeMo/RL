@@ -141,10 +141,10 @@ class BaseNeMoRLTest:
         # Calculate number of runs
         num_runs = config.num_runs
 
-        # Remove original test methods if they exist
-        if hasattr(cls, "test_train_local"):
+        # Remove original test methods if they exist in this class (not inherited)
+        if "test_train_local" in cls.__dict__:
             delattr(cls, "test_train_local")
-        if hasattr(cls, "test_train_slurm"):
+        if "test_train_slurm" in cls.__dict__:
             delattr(cls, "test_train_slurm")
 
         # Create run-specific test methods

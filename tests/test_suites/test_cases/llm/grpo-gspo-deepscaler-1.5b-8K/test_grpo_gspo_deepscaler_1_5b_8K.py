@@ -19,7 +19,7 @@ from tests.test_suites.utils.types.base_config import NeMoRLTestConfig
 class TestGrpoGspoDeepscaler15b8k(BaseNeMoRLTest):
     config = NeMoRLTestConfig(
         test_name="grpo-gspo-deepscaler-1.5b-8K",
-        algorithm="gspo",
+        algorithm="grpo",
         model_class="llm",
         test_suites=["nightly"],
         time_limit_minutes=240,
