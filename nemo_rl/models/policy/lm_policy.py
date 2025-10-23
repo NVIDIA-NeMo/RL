@@ -660,69 +660,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
-    def prepare_weights_for_ipc(
-        self, _refit_buffer_size_gb: Optional[int] = None
-    ) -> list[list[str]]:
-        """Prepare the weights for IPC.
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
+        futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
+        # minimum free memory from all workers for safety
+        free_memory_bytes = min(ray.get(future) for future in futures)
+        return free_memory_bytes
 
-        Returns:
-            list: A list containing the keys of the parameters, which is grouped by size.
-        """
-        # Get the state_dict_info and available memory from all workers
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int) -> list[ray.ObjectRef]:
+        """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_weights_for_ipc"
+            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes
         )
-        results = ray.get(futures)
-
-        # Only get the first worker's state_dict_info since all workers will have the same result
-        state_dict_info = results[0][0]
-
-        if _refit_buffer_size_gb is not None:
-            total_available_bytes = _refit_buffer_size_gb * (1024**3)
-        else:
-            # Get the minimum available memory from all workers
-            total_available_bytes = min(result[1] for result in results)
-
-        # Group tensors by size
-        cur_available_bytes = total_available_bytes
-        grouped_param_keys: list[list[str]] = []
-        keys: list[str] = []
-
-        for key, size_in_bytes in state_dict_info:
-            if size_in_bytes > cur_available_bytes:
-                if keys:
-                    grouped_param_keys.append(keys)
-                    keys = []
-                cur_available_bytes = total_available_bytes
-
-            keys.append(key)
-            cur_available_bytes -= size_in_bytes
-
-        if keys:
-            grouped_param_keys.append(keys)
-
-        return grouped_param_keys
-
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
-        """Fetch weight IPC handles from all workers.
-
-        Returns:
-            dict: A dictionary mapping device UUIDs to parameter IPC handles.
-        """
-        # Collect IPC handles from all workers
-        worker_handles: list[dict[str, Any]] = ray.get(
-            [
-                worker.get_weights_ipc_handles.remote(keys=keys)
-                for worker in self.worker_group.workers
-            ]
-        )
-
-        # Combine all worker handles into a single dictionary
-        all_handles = {}
-        for handle in worker_handles:
-            all_handles.update(handle)
-
-        return all_handles
+        return futures
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
@@ -793,7 +743,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls worker_group.shutdown().
         """
-        self.worker_group.shutdown()
+        if hasattr(self, "worker_group"):
+            self.worker_group.shutdown(cleanup_method="shutdown")
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
