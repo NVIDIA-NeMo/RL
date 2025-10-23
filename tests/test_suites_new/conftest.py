@@ -1,5 +1,3 @@
-"""Pytest configuration and fixtures for NeMo-RL test suites."""
-
 import warnings
 
 import pytest
@@ -25,6 +23,7 @@ def pytest_addoption(parser):
     )
 
     # Custom filtering options based on TestConfig values
+    parser.addoption("--class", help="Filter by model class (e.g., llm, vlm)")
     parser.addoption("--algorithm", help="Filter by algorithm (e.g., sft, grpo, dpo)")
     parser.addoption("--backend", help="Filter by backend (e.g., megatron, dtensor)")
     parser.addoption(
@@ -147,6 +146,7 @@ def pytest_collection_modifyitems(config, items):
     num_gpus_per_node_filter = config.getoption("--num-gpus-per-node")
     num_nodes_filter = config.getoption("--num-nodes")
     filter_expr = config.getoption("--filter")
+    model_class_filter = config.getoption("--class")
 
     filtered_items = []
 
@@ -183,6 +183,10 @@ def pytest_collection_modifyitems(config, items):
         model_size = _get_model_size_from_name(cfg.model_name)
         if model_size:
             item.add_marker(getattr(pytest.mark, f"model_size_{model_size}"))
+
+        # Model class marker (from config metadata)
+        if hasattr(cfg, "model_class") and cfg.model_class:
+            item.add_marker(getattr(pytest.mark, f"class_{cfg.model_class}"))
 
         # Parallelism markers
         if cfg.tensor_parallel:
@@ -221,6 +225,12 @@ def pytest_collection_modifyitems(config, items):
         # Suite filter
         if suite_filter and suite_filter not in cfg.test_suites:
             continue
+
+        # Model class filter
+        if model_class_filter:
+            test_model_class = getattr(cfg, "model_class", "")
+            if test_model_class != model_class_filter:
+                continue
 
         # GPU count filter (total GPUs)
         if num_gpus_filter is not None and cfg.num_gpus_total != num_gpus_filter:

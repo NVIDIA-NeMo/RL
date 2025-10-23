@@ -26,6 +26,7 @@ class NeMoRLTestConfig:
     # === Test Metadata (NOT in YAML) ===
     test_name: str  # Test identifier
     algorithm: str  # sft, grpo, dpo, vlm_grpo - for filtering # TODO(ahmadki):enum, upper and lowercase
+    model_class: str = "llm"  # Model class: llm, vlm, etc. - for filtering
     test_suites: List[str] = field(
         default_factory=lambda: ["nightly"]
     )  # Test suite classification
