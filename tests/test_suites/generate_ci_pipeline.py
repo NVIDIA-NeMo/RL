@@ -233,11 +233,13 @@ class GitLabCIPipelineGenerator:
         base_image: str = "python:3.10",
         pytest_args: Optional[List[str]] = None,
         module: str = "nemo_rl",
+        extends: Optional[str] = None,
     ):
         self.tests = tests
         self.base_image = base_image
         self.pytest_args = pytest_args or []
         self.module = module
+        self.extends = extends
 
     def generate_job(self, test: TestClassInfo) -> Dict:
         """Generate a GitLab CI job configuration for a single test class.
@@ -268,18 +270,11 @@ class GitLabCIPipelineGenerator:
                 "echo 'Model class: ${MODEL_CLASS}'",
                 f"pytest {' '.join(self.pytest_args)} {test.pytest_path} -v",
             ],
-            "artifacts": {
-                "when": "always",
-                "paths": [
-                    f"tests/test_suites/tests/{test.model_class}/{test.test_name}/logs/"
-                ],
-                "expire_in": "7 days",
-            },
-            "retry": {
-                "max": 1,
-                "when": ["runner_system_failure", "stuck_or_timeout_failure"],
-            },
         }
+
+        # Add extends field if specified
+        if self.extends:
+            job["extends"] = self.extends
 
         return job
 
@@ -319,6 +314,27 @@ class GitLabCIPipelineGenerator:
         yaml_str = yaml.dump(
             pipeline, default_flow_style=False, sort_keys=False, width=120
         )
+
+        # Add 1 blank line between jobs
+        # Jobs are top-level keys that are not 'stages' or 'default'
+        lines = yaml_str.split("\n")
+        result_lines = []
+        special_keys = {"stages:", "default:"}
+
+        for i, line in enumerate(lines):
+            # Check if this line is a job name (starts at column 0 and not a special key)
+            if (
+                line
+                and not line[0].isspace()
+                and line not in special_keys
+                and ":" in line
+            ):
+                # This is a job, add 1 blank line before it (unless it's the first line)
+                if result_lines:
+                    result_lines.append("")
+            result_lines.append(line)
+
+        yaml_str = "\n".join(result_lines)
 
         # Add header comment
         header = f"""# GitLab CI Pipeline
@@ -422,6 +438,13 @@ def main():
     )
 
     parser.add_argument(
+        "--extends",
+        type=str,
+        default=None,
+        help="Add 'extends' field to each job (e.g., '.base_job')",
+    )
+
+    parser.add_argument(
         "--list-tests",
         action="store_true",
         help="List discovered tests and exit (don't generate pipeline)",
@@ -471,6 +494,7 @@ def main():
         base_image=args.base_image,
         pytest_args=pytest_args,
         module=args.module,
+        extends=args.extends,
     )
     yaml_output = generator.generate_yaml()
 
