@@ -17,6 +17,7 @@ import math
 import os
 import subprocess
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -72,20 +73,6 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         None  # Path to store run log, default to {exp_dir}/run.log
     )
 
-    #######################################################
-    # Computed fields  # TODO(ahmadki): make private ?
-    #######################################################
-    # These fields are extracted from meta data, config yaml + overrides
-    loaded_yaml_config: DictConfig = field(init=False, repr=False, default=None)
-    model_name: str = field(init=False, default="")
-    backend: str = field(init=False, default="fsdp2")
-    num_nodes: int = field(init=False, default=1)
-    num_gpus_per_node: int = field(init=False, default=8)
-    tensor_parallel: Optional[int] = field(init=False, default=None)
-    pipeline_parallel: Optional[int] = field(init=False, default=None)
-    sequence_parallel: bool = field(init=False, default=False)
-    max_steps: int = field(init=False, default=0)
-
     def __post_init__(self):
         # Get project root from git using this file folder (test_suites) as starting location
         self.project_root = Path(
@@ -126,20 +113,29 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             if not self.yaml_config.exists():
                 raise FileNotFoundError(f"Config file not found: {self.yaml_config}")
 
-        # Loads YAML files with OmegaConf
-        self.loaded_yaml_config = load_config(self.yaml_config)
+        # Loads YAML files with OmegaConf and store as private attribute
+        self._loaded_yaml_config = load_config(self.yaml_config)
 
         # Apply overrides with Hydra's parser
         if self.overrides:
             override_strings = [f"{k}={v}" for k, v in self.overrides.items()]
-            self.loaded_yaml_config = parse_hydra_overrides(
-                self.loaded_yaml_config, override_strings
+            self._loaded_yaml_config = parse_hydra_overrides(
+                self._loaded_yaml_config, override_strings
             )
-        # Extract metadata from YAML (after applying overrides)
-        self._extract_metadata()
 
         # Validate configuration
         self.validate_config()
+
+        # Access cached properties to trigger computation and early validation
+        # This ensures any errors in config extraction are caught during initialization
+        _ = self.model_name
+        _ = self.backend
+        _ = self.num_nodes
+        _ = self.num_gpus_per_node
+        _ = self.tensor_parallel
+        _ = self.pipeline_parallel
+        _ = self.sequence_parallel
+        _ = self.max_steps
 
         # Test directories
         if self.exp_dir is None:
@@ -159,21 +155,9 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    def _extract_metadata(self):
-        self.model_name = self._extract_model_name()
-        self.backend = self._detect_backend()
-        self.num_nodes = OmegaConf.select(self.loaded_yaml_config, "cluster.num_nodes")
-        self.num_gpus_per_node = OmegaConf.select(
-            self.loaded_yaml_config, "cluster.gpus_per_node"
-        )
-        self._extract_parallelism()
-        self.max_steps = OmegaConf.select(
-            self.loaded_yaml_config, "trainer.max_steps", default=0
-        )
-
     def _extract_model_name(self) -> str:
         model_name = OmegaConf.select(
-            self.loaded_yaml_config, "policy.model_name", default=""
+            self._loaded_yaml_config, "policy.model_name", default=""
         )
 
         # Clean up model name for filtering (remove org prefix)
@@ -186,10 +170,10 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
 
     def _detect_backend(self) -> str:
         dtensor_enabled = OmegaConf.select(
-            self.loaded_yaml_config, "policy.dtensor_cfg.enabled", default=False
+            self._loaded_yaml_config, "policy.dtensor_cfg.enabled", default=False
         )
         megatron_enabled = OmegaConf.select(
-            self.loaded_yaml_config, "policy.megatron_cfg.enabled", default=False
+            self._loaded_yaml_config, "policy.megatron_cfg.enabled", default=False
         )
 
         if dtensor_enabled and megatron_enabled:
@@ -204,44 +188,117 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         # Default to fsdp2
         return "fsdp2"
 
-    def _extract_parallelism(self):
-        backend = self._detect_backend()
+    def _extract_parallelism_config(self, backend: str) -> dict:
+        """Extract parallelism configuration based on backend type.
+
+        Returns:
+            Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
+        """
         if backend == "dtensor":
-            self.tensor_parallel = OmegaConf.select(
-                self.loaded_yaml_config,
-                "policy.dtensor_cfg.tensor_parallel_size",
-                default=None,
-            )
-            self.pipeline_parallel = OmegaConf.select(
-                self.loaded_yaml_config,
-                "policy.dtensor_cfg.pipeline_parallel_size",
-                default=None,
-            )
-            self.sequence_parallel = OmegaConf.select(
-                self.loaded_yaml_config,
-                "policy.dtensor_cfg.sequence_parallel",
-                default=False,
-            )
+            return {
+                "tensor_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
+                    "policy.dtensor_cfg.tensor_parallel_size",
+                    default=None,
+                ),
+                "pipeline_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
+                    "policy.dtensor_cfg.pipeline_parallel_size",
+                    default=None,
+                ),
+                "sequence_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
+                    "policy.dtensor_cfg.sequence_parallel",
+                    default=False,
+                ),
+            }
         elif backend == "megatron":
-            # If not found in dtensor_cfg, try megatron_cfg
-            if self.tensor_parallel is None:
-                self.tensor_parallel = OmegaConf.select(
-                    self.loaded_yaml_config,
+            return {
+                "tensor_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
                     "policy.megatron_cfg.tensor_model_parallel_size",
                     default=None,
-                )
-            if self.pipeline_parallel is None:
-                self.pipeline_parallel = OmegaConf.select(
-                    self.loaded_yaml_config,
+                ),
+                "pipeline_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
                     "policy.megatron_cfg.pipeline_model_parallel_size",
                     default=None,
-                )
-            if not self.sequence_parallel:
-                self.sequence_parallel = OmegaConf.select(
-                    self.loaded_yaml_config,
+                ),
+                "sequence_parallel": OmegaConf.select(
+                    self._loaded_yaml_config,
                     "policy.megatron_cfg.sequence_parallel",
                     default=False,
-                )
+                ),
+            }
+        else:
+            # fsdp2 backend
+            return {
+                "tensor_parallel": None,
+                "pipeline_parallel": None,
+                "sequence_parallel": False,
+            }
+
+    #######################################################
+    # Cached properties (computed from YAML + overrides)
+    #######################################################
+
+    @cached_property
+    def loaded_yaml_config(self) -> DictConfig:
+        """Get the loaded YAML configuration.
+
+        This property provides access to the loaded and parsed YAML config
+        with overrides applied.
+        """
+        return self._loaded_yaml_config
+
+    @cached_property
+    def model_name(self) -> str:
+        """Extract and normalize model name from config."""
+        return self._extract_model_name()
+
+    @cached_property
+    def backend(self) -> str:
+        """Detect the backend (fsdp2, dtensor, or megatron)."""
+        return self._detect_backend()
+
+    @cached_property
+    def num_nodes(self) -> int:
+        """Number of nodes from cluster configuration."""
+        return OmegaConf.select(
+            self._loaded_yaml_config, "cluster.num_nodes", default=1
+        )
+
+    @cached_property
+    def num_gpus_per_node(self) -> int:
+        """Number of GPUs per node from cluster configuration."""
+        return OmegaConf.select(
+            self._loaded_yaml_config, "cluster.gpus_per_node", default=8
+        )
+
+    @cached_property
+    def tensor_parallel(self) -> Optional[int]:
+        """Tensor parallel size from backend configuration."""
+        parallelism = self._extract_parallelism_config(self.backend)
+        return parallelism["tensor_parallel"]
+
+    @cached_property
+    def pipeline_parallel(self) -> Optional[int]:
+        """Pipeline parallel size from backend configuration."""
+        parallelism = self._extract_parallelism_config(self.backend)
+        return parallelism["pipeline_parallel"]
+
+    @cached_property
+    def sequence_parallel(self) -> bool:
+        """Sequence parallel setting from backend configuration."""
+        parallelism = self._extract_parallelism_config(self.backend)
+        return parallelism["sequence_parallel"]
+
+    @cached_property
+    def max_steps(self) -> int:
+        """Maximum training steps from trainer configuration."""
+        return OmegaConf.select(
+            self._loaded_yaml_config, "trainer.max_steps", default=0
+        )
 
     def validate_config(self):
         """Validate the loaded configuration.
@@ -387,7 +444,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             model_name = config.policy_config["model_name"]
             dtensor_enabled = config.policy_config["dtensor_cfg"]["enabled"]
         """
-        return cast(PolicyConfig, OmegaConf.select(self.loaded_yaml_config, "policy"))
+        return cast(PolicyConfig, OmegaConf.select(self._loaded_yaml_config, "policy"))
 
     def get_dtensor_config(self) -> Optional[DTensorConfig]:
         """Get DTensor configuration if dtensor is enabled.
