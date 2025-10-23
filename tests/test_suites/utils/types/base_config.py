@@ -31,7 +31,7 @@ from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import LoggerConfig
 
 # Import type aliases from parent module
-from . import Algorithm, MasterConfigUnion, ModelClass
+from . import Algorithm, Backend, MasterConfigUnion, ModelClass
 
 
 @dataclass
@@ -140,7 +140,7 @@ class NeMoRLTestConfig:
             )
             if not self.yaml_config.exists():
                 raise FileNotFoundError(
-                    f"Config file not found: {self.config_path}. "
+                    f"Config file not found: {self.yaml_config}. "
                     f"Expected to find it at the path derived from test name '{self.test_name}'"
                 )
         else:
@@ -184,6 +184,40 @@ class NeMoRLTestConfig:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    #######################################################
+    # Helper functions for typed config access
+    #######################################################
+
+    def _get_policy_config(self) -> PolicyConfig:
+        """Get policy config with strong typing.
+
+        Returns:
+            PolicyConfig with type hints for IDE support
+        """
+        return cast(PolicyConfig, self.master_config.get("policy", {}))
+
+    def _get_dtensor_config(self) -> DTensorConfig:
+        """Get DTensor config with strong typing.
+
+        Returns:
+            DTensorConfig with type hints for IDE support
+        """
+        policy = self._get_policy_config()
+        return cast(DTensorConfig, policy.get("dtensor_cfg", {}))
+
+    def _get_megatron_config(self) -> MegatronConfig:
+        """Get Megatron config with strong typing.
+
+        Returns:
+            MegatronConfig with type hints for IDE support
+        """
+        policy = self._get_policy_config()
+        return cast(MegatronConfig, policy.get("megatron_cfg", {}))
+
+    #######################################################
+    # Validation methods
+    #######################################################
+
     def _validate_algorithm_config(self):
         """Validate that the algorithm field matches the config structure.
 
@@ -220,9 +254,16 @@ class NeMoRLTestConfig:
             )
 
     def _extract_model_name(self) -> str:
-        # Extract model_name from policy config (handle both dict and nested structure)
-        policy_config = self.master_config.get("policy", {})
-        model_name = policy_config.get("model_name", "")
+        """Extract and normalize model name from policy config.
+
+        Uses strong typing from PolicyConfig for type-safe access.
+
+        Returns:
+            Normalized model name (lowercase, no dashes/underscores, no org prefix)
+        """
+        # Get policy config with strong typing
+        policy_config_typed = self._get_policy_config()
+        model_name = policy_config_typed.get("model_name", "")
 
         # Clean up model name for filtering (remove org prefix)
         # e.g., "meta-llama/Llama-3.1-8B-Instruct" -> "llama3.1-8b-instruct"
@@ -232,10 +273,17 @@ class NeMoRLTestConfig:
         model_name = model_name.lower().replace("-", "").replace("_", "")
         return model_name
 
-    def _detect_backend(self) -> str:
-        policy_config = self.master_config.get("policy", {})
-        dtensor_cfg = policy_config.get("dtensor_cfg", {})
-        megatron_cfg = policy_config.get("megatron_cfg", {})
+    def _detect_backend(self) -> Backend:
+        """Detect the backend type (fsdp2, dtensor, or megatron).
+
+        Uses strong typing from PolicyConfig, DTensorConfig, and MegatronConfig for type-safe access.
+
+        Returns:
+            Backend type (one of "fsdp2", "dtensor", "megatron")
+        """
+        # Get backend configs with strong typing
+        dtensor_cfg = self._get_dtensor_config()
+        megatron_cfg = self._get_megatron_config()
 
         dtensor_enabled = dtensor_cfg.get("enabled", False)
         megatron_enabled = megatron_cfg.get("enabled", False)
@@ -252,35 +300,63 @@ class NeMoRLTestConfig:
         # Default to fsdp2
         return "fsdp2"
 
-    def _extract_parallelism_config(self, backend: str) -> dict:
-        """Extract parallelism configuration based on backend type.
+    def _extract_dtensor_parallelism(self) -> Dict[str, Any]:
+        """Extract parallelism configuration from DTensor backend.
 
         Returns:
             Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
         """
-        policy_config = self.master_config.get("policy", {})
+        dtensor_cfg = self._get_dtensor_config()
+        return {
+            "tensor_parallel": dtensor_cfg.get("tensor_parallel_size"),
+            "pipeline_parallel": dtensor_cfg.get("pipeline_parallel_size"),
+            "sequence_parallel": dtensor_cfg.get("sequence_parallel", False),
+        }
 
+    def _extract_megatron_parallelism(self) -> Dict[str, Any]:
+        """Extract parallelism configuration from Megatron backend.
+
+        Returns:
+            Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
+        """
+        megatron_cfg = self._get_megatron_config()
+        return {
+            "tensor_parallel": megatron_cfg.get("tensor_model_parallel_size"),
+            "pipeline_parallel": megatron_cfg.get("pipeline_model_parallel_size"),
+            "sequence_parallel": megatron_cfg.get("sequence_parallel", False),
+        }
+
+    def _extract_fsdp2_parallelism(self) -> Dict[str, Any]:
+        """Extract parallelism configuration from FSDP2 backend.
+
+        FSDP2 doesn't use tensor/pipeline parallelism, so all values are None/False.
+
+        Returns:
+            Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
+        """
+        return {
+            "tensor_parallel": None,
+            "pipeline_parallel": None,
+            "sequence_parallel": False,
+        }
+
+    def _extract_parallelism_config(self, backend: Backend) -> Dict[str, Any]:
+        """Extract parallelism configuration based on backend type.
+
+        Dispatches to backend-specific extraction functions.
+
+        Args:
+            backend: The backend type ("fsdp2", "dtensor", or "megatron")
+
+        Returns:
+            Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
+        """
         if backend == "dtensor":
-            dtensor_cfg = policy_config.get("dtensor_cfg", {})
-            return {
-                "tensor_parallel": dtensor_cfg.get("tensor_parallel_size"),
-                "pipeline_parallel": dtensor_cfg.get("pipeline_parallel_size"),
-                "sequence_parallel": dtensor_cfg.get("sequence_parallel", False),
-            }
+            return self._extract_dtensor_parallelism()
         elif backend == "megatron":
-            megatron_cfg = policy_config.get("megatron_cfg", {})
-            return {
-                "tensor_parallel": megatron_cfg.get("tensor_model_parallel_size"),
-                "pipeline_parallel": megatron_cfg.get("pipeline_model_parallel_size"),
-                "sequence_parallel": megatron_cfg.get("sequence_parallel", False),
-            }
-        else:
-            # fsdp2 backend
-            return {
-                "tensor_parallel": None,
-                "pipeline_parallel": None,
-                "sequence_parallel": False,
-            }
+            return self._extract_megatron_parallelism()
+        else:  # fsdp2
+            return self._extract_fsdp2_parallelism()
 
     #######################################################
     # Properties (computed from YAML + overrides)
@@ -306,21 +382,29 @@ class NeMoRLTestConfig:
         return self._extract_model_name()
 
     @property
-    def backend(self) -> str:
-        """Detect the backend (fsdp2, dtensor, or megatron)."""
+    def backend(self) -> Backend:
+        """Detect the backend (fsdp2, dtensor, or megatron).
+
+        Returns:
+            Backend type (one of "fsdp2", "dtensor", "megatron")
+        """
         return self._detect_backend()
 
     @property
     def num_nodes(self) -> int:
-        """Number of nodes from cluster configuration."""
-        cluster_config = self.master_config.get("cluster", {})
-        return cluster_config.get("num_nodes", 1)
+        """Number of nodes from cluster configuration.
+
+        Uses strong typing from ClusterConfig for type-safe access.
+        """
+        return self.cluster_config.get("num_nodes", 1)
 
     @property
     def num_gpus_per_node(self) -> int:
-        """Number of GPUs per node from cluster configuration."""
-        cluster_config = self.master_config.get("cluster", {})
-        return cluster_config.get("gpus_per_node", 8)
+        """Number of GPUs per node from cluster configuration.
+
+        Uses strong typing from ClusterConfig for type-safe access.
+        """
+        return self.cluster_config.get("gpus_per_node", 8)
 
     @property
     def tensor_parallel(self) -> Optional[int]:
@@ -383,8 +467,9 @@ class NeMoRLTestConfig:
                 raise ValueError(f"Required policy field '{field_name}' is missing")
 
         # Validate backend configuration (exactly one should be enabled)
-        dtensor_cfg = self.policy_config.get("dtensor_cfg", {})
-        megatron_cfg = self.policy_config.get("megatron_cfg", {})
+        # Use helper functions for strong typing
+        dtensor_cfg = self._get_dtensor_config()
+        megatron_cfg = self._get_megatron_config()
 
         dtensor_enabled = dtensor_cfg.get("enabled", False)
         megatron_enabled = megatron_cfg.get("enabled", False)
@@ -512,9 +597,9 @@ class NeMoRLTestConfig:
         Returns:
             DTensorConfig dict if dtensor is enabled, None otherwise
         """
-        policy = self.policy_config
-        if policy and policy.get("dtensor_cfg", {}).get("enabled", False):
-            return cast(DTensorConfig, policy["dtensor_cfg"])
+        dtensor_cfg = self._get_dtensor_config()
+        if dtensor_cfg.get("enabled", False):
+            return dtensor_cfg
         return None
 
     def get_megatron_config(self) -> Optional[MegatronConfig]:
@@ -523,9 +608,9 @@ class NeMoRLTestConfig:
         Returns:
             MegatronConfig dict if megatron is enabled, None otherwise
         """
-        policy = self.policy_config
-        if policy and policy.get("megatron_cfg", {}).get("enabled", False):
-            return cast(MegatronConfig, policy["megatron_cfg"])
+        megatron_cfg = self._get_megatron_config()
+        if megatron_cfg.get("enabled", False):
+            return megatron_cfg
         return None
 
     @property
