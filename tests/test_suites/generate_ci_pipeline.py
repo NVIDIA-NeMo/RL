@@ -143,9 +143,33 @@ def _build_pytest_command(
     return " ".join(pytest_cmd_parts)
 
 
+def _build_pytest_commands(
+    test_mode: str,
+    test_file: str,
+    pytest_args: str,
+    test_names: List[str],
+) -> List[str]:
+    """Build separate pytest commands for each test.
+
+    Args:
+        test_mode: Test mode (local/slurm/all)
+        test_file: Path to test file
+        pytest_args: Additional pytest arguments
+        test_names: List of test names to run
+
+    Returns:
+        List of pytest command strings
+    """
+    commands = []
+    for test_name in test_names:
+        cmd = _build_pytest_command(test_mode, test_file, pytest_args, test_name)
+        commands.append(cmd)
+    return commands
+
+
 def _build_job(
     config: Any,
-    pytest_cmd: str,
+    commands: List[str],
     job_name: str,
     base_image: Optional[str],
     module: str,
@@ -156,7 +180,7 @@ def _build_job(
 
     Args:
         config: Test configuration object
-        pytest_cmd: Pytest command to run
+        commands: List of commands to run
         job_name: Name for the job
         base_image: Docker image (optional)
         module: Module name for MODULE variable
@@ -166,15 +190,18 @@ def _build_job(
     Returns:
         Job configuration dictionary
     """
+    # Join commands with && for TEST_SCRIPT
+    test_script = " && ".join(commands)
+
     job = {
         "variables": {
             "MODULE": module,
             "TEST_NAME": job_name,
-            "TEST_SCRIPT": pytest_cmd,
+            "TEST_SCRIPT": test_script,
             "TIME": f"{config.time_limit_minutes}m",
             "NUM_NODES": str(config.num_nodes),
         },
-        "script": [pytest_cmd],
+        "script": commands,
         "timeout": f"{config.time_limit_minutes}m",
     }
 
@@ -315,11 +342,12 @@ def generate_flat_pipeline(
         job_name = config.test_name
         test_file = test_data["test_file"]
 
-        # Build pytest command
+        # Build pytest command (as a list for consistency)
         pytest_cmd = _build_pytest_command(test_mode, test_file, pytest_args)
+        commands = [pytest_cmd]
 
         # Build job
-        job = _build_job(config, pytest_cmd, job_name, base_image, module, extends)
+        job = _build_job(config, commands, job_name, base_image, module, extends)
 
         pipeline[job_name] = job
 
@@ -333,6 +361,7 @@ def generate_stages_pipeline(
     module: str,
     extends: Optional[str],
     test_mode: str,
+    raw_train_command: bool = False,
 ) -> Dict[str, Any]:
     """Generate pipeline with stages and dependencies.
 
@@ -343,6 +372,7 @@ def generate_stages_pipeline(
         module: Module name for MODULE variable
         extends: Base job to extend
         test_mode: Test mode (local/slurm/all)
+        raw_train_command: Use raw training command for training stages
 
     Returns:
         GitLab CI pipeline dictionary
@@ -382,16 +412,26 @@ def generate_stages_pipeline(
             for job_group, group_tests in tests_by_job_group.items():
                 job_name = f"{test_name}:{stage}:{job_group}"
 
-                # Build pytest command
-                test_names = [t["name"] for t in group_tests]
-                test_filter = " or ".join(test_names)
-                pytest_cmd = _build_pytest_command(
-                    test_mode, test_file, pytest_args, test_filter
+                # Sort tests by order marker
+                sorted_tests = sorted(
+                    group_tests,
+                    key=lambda t: t.get("order") if t.get("order") is not None else 0,
                 )
+
+                # Build commands based on stage and raw_train_command flag
+                if raw_train_command and stage == "training":
+                    # Use raw training command instead of pytest
+                    commands = [config.build_command_string()]
+                else:
+                    # Build separate pytest commands for each test
+                    test_names = [t["name"] for t in sorted_tests]
+                    commands = _build_pytest_commands(
+                        test_mode, test_file, pytest_args, test_names
+                    )
 
                 # Build job
                 job = _build_job(
-                    config, pytest_cmd, job_name, base_image, module, extends, stage
+                    config, commands, job_name, base_image, module, extends, stage
                 )
 
                 # Add dependencies from JobDependencies
@@ -430,6 +470,7 @@ def generate_parent_child_pipeline(
     module: str,
     extends: Optional[str],
     test_mode: str,
+    raw_train_command: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Generate parent-child pipeline structure.
 
@@ -443,6 +484,7 @@ def generate_parent_child_pipeline(
         module: Module name for MODULE variable
         extends: Base job to extend
         test_mode: Test mode (local/slurm/all)
+        raw_train_command: Use raw training command for training stages
 
     Returns:
         Dictionary with 'parent' and 'children' keys containing pipeline YAML
@@ -475,6 +517,7 @@ def generate_parent_child_pipeline(
             module,
             extends,
             test_mode,
+            raw_train_command,
         )
 
         child_pipelines[child_file] = child_pipeline
@@ -576,6 +619,12 @@ def main():
         help="List discovered tests and exit (don't generate pipeline)",
     )
 
+    parser.add_argument(
+        "--raw-train-command",
+        action="store_true",
+        help="Use raw training command for training stages instead of pytest command",
+    )
+
     args = parser.parse_args()
 
     # Build filters
@@ -640,6 +689,7 @@ def main():
             args.module,
             args.extends,
             args.test_mode,
+            args.raw_train_command,
         )
     elif args.pipeline_mode == "parent-child":
         result = generate_parent_child_pipeline(
@@ -649,6 +699,7 @@ def main():
             args.module,
             args.extends,
             args.test_mode,
+            args.raw_train_command,
         )
 
         # For parent-child, we need to write multiple files

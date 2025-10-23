@@ -367,6 +367,20 @@ class NeMoRLTestConfig:
 
         return self.project_root / "examples" / script_name
 
+    def build_command_string(
+        self, extra_overrides: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build training command as a string.
+
+        Args:
+            extra_overrides: Additional overrides to merge with self.overrides
+
+        Returns:
+            Training command as a single string
+        """
+        cmd_list = self.build_command(extra_overrides)
+        return " ".join(cmd_list)
+
     def build_command(
         self, extra_overrides: Optional[Dict[str, Any]] = None
     ) -> List[str]:
