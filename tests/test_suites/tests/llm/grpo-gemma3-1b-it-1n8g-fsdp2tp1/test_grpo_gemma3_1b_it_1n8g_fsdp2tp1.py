@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestGrpoGemma31bIt1n8gFsdp2tp1(BaseNeMoRLTest):
-    """Test grpo-gemma3-1b-it-1n8g-fsdp2tp1."""
-
     config = NeMoRLTestConfig(
         test_name="grpo-gemma3-1b-it-1n8g-fsdp2tp1",
         algorithm="grpo",

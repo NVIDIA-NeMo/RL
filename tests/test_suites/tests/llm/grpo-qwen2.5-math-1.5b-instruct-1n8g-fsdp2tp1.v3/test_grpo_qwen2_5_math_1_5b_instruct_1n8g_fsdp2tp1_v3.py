@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestGrpoQwen25Math15bInstruct1n8gFsdp2tp1V3(BaseNeMoRLTest):
-    """Test grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3."""
-
     config = NeMoRLTestConfig(
         test_name="grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3",
         algorithm="grpo",

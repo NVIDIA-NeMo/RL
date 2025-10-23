@@ -1,5 +1,3 @@
-"""Base configuration and utilities for NeMo-RL test suites."""
-
 import inspect
 import os
 import subprocess
@@ -23,30 +21,31 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     4. Auto-extracts metadata from YAML for filtering/classification
     """
 
+    #######################################################
     # Metadata we add to tests (required fields first)
+    #######################################################
     test_name: str  # Test identifier
-    algorithm: str  # sft, grpo, dpo # TODO(ahmadki):enum, upper and lowercase
-
-    # Optional metadata fields
-    model_class: str = "llm"  # Model class: llm, vlm
+    algorithm: str  # sft, grpo, dpo
+    model_class: str  # llm, vlm
     test_suites: List[str] = field(
         default_factory=lambda: ["nightly"]
-    )  # Test suite classification
+    )  # Test suite classification, can set multiple
     time_limit_minutes: int = 120  # Test timeout, used for slurms jobs
 
-    # The model hydra/YAML config
-    config_yaml: Optional[str] = (
-        None  # YAML config file name (auto-derived from test_name if None)
-    )
-    # Overrides to apply to the YAML config
+    #######################################################
+    # Model config
+    #######################################################
+    # The model hydra/YAML config (auto-derived from test_name if None)
+    config_yaml: Optional[str] = None
     overrides: Dict[str, Any] = field(default_factory=dict)
 
-    # === Paths (computed from test_name if not provided) ===
+    #######################################################
+    # Run paths (computed from test_name if not provided)
+    #######################################################
     config_path: Optional[Path] = None
     exp_dir: Optional[Path] = None
     log_dir: Optional[Path] = None
     ckpt_dir: Optional[Path] = None
-    json_metrics_path: Optional[Path] = None
     run_log_path: Optional[Path] = None
 
     # === Derived/Computed Fields (populated from YAML + overrides) ===
@@ -60,8 +59,6 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     tensor_parallel: Optional[int] = field(init=False, default=None)
     pipeline_parallel: Optional[int] = field(init=False, default=None)
     sequence_parallel: bool = field(init=False, default=False)
-    fsdp: bool = field(init=False, default=False)
-    activation_checkpointing: bool = field(init=False, default=False)
 
     def __post_init__(self):
         """Initialize paths, load YAML, extract metadata, and apply overrides."""
@@ -153,9 +150,6 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         if self.ckpt_dir is None:
             self.ckpt_dir = self.exp_dir / "ckpts"
 
-        if self.json_metrics_path is None:
-            self.json_metrics_path = self.exp_dir / "metrics.json"
-
         if self.run_log_path is None:
             self.run_log_path = self.exp_dir / "run.log"
 
@@ -229,11 +223,6 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         self.sequence_parallel = OmegaConf.select(
             self.yaml_config, "policy.dtensor_cfg.sequence_parallel", default=False
         )
-        self.activation_checkpointing = OmegaConf.select(
-            self.yaml_config,
-            "policy.dtensor_cfg.activation_checkpointing",
-            default=False,
-        )
 
         # If not found in dtensor_cfg, try megatron_cfg
         if self.tensor_parallel is None:
@@ -252,18 +241,6 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             self.sequence_parallel = OmegaConf.select(
                 self.yaml_config, "policy.megatron_cfg.sequence_parallel", default=False
             )
-        if not self.activation_checkpointing:
-            # For megatron, check if activations_checkpoint_granularity is set
-            granularity = OmegaConf.select(
-                self.yaml_config,
-                "policy.megatron_cfg.activations_checkpoint_granularity",
-                default=None,
-            )
-            self.activation_checkpointing = granularity is not None
-
-        # Check for FSDP
-        if "fsdp" in self.backend.lower():
-            self.fsdp = True
 
     def validate_config(self):
         """Validate the loaded configuration.

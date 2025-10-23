@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestGrpoLlama321bInstruct1n8gMegatron(BaseNeMoRLTest):
-    """Test grpo-llama3.2-1b-instruct-1n8g-megatron."""
-
     config = NeMoRLTestConfig(
         test_name="grpo-llama3.2-1b-instruct-1n8g-megatron",
         algorithm="grpo",

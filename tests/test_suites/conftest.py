@@ -4,7 +4,6 @@ import pytest
 
 
 def pytest_configure(config):
-    """Configure pytest for this test suite."""
     # Suppress unknown marker warnings for dynamically generated markers
     warnings.filterwarnings(
         "ignore",
@@ -14,7 +13,6 @@ def pytest_configure(config):
 
 
 def pytest_addoption(parser):
-    """Add custom command line options."""
     parser.addoption(
         "--slurm",
         action="store_true",
@@ -28,7 +26,7 @@ def pytest_addoption(parser):
     parser.addoption("--backend", help="Filter by backend (e.g., megatron, dtensor)")
     parser.addoption(
         "--suite",
-        help="Filter by test suite (e.g., nightly, quick, release, long, performance)",
+        help="Filter by test suite (e.g., nightly, release, long, performance)",
     )
     parser.addoption("--num-gpus", type=int, help="Filter by exact total GPU count")
     parser.addoption("--num-gpus-per-node", type=int, help="Filter by GPUs per node")
@@ -36,7 +34,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--filter",
         help="Filter using Python expression on config (e.g., 'config.num_gpus_total >= 32 and config.backend == \"fsdp2\"')",
-    )  # TODO(ahmadki): num_gpus_total doesn't work
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -106,21 +104,6 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.parallelism_sp)
         if cfg.fsdp:
             item.add_marker(pytest.mark.parallelism_fsdp)
-
-        # # Feature markers
-        # if cfg.activation_checkpointing:
-        #     item.add_marker(pytest.mark.feature_activation_checkpointing)
-
-        # TODO(ahmadki)
-        # # Detect features from test_name
-        # if "fp8" in cfg.test_name.lower():
-        #     item.add_marker(pytest.mark.feature_fp8)
-        # if "dynamicbatch" in cfg.test_name.lower():
-        #     item.add_marker(pytest.mark.feature_dynamic_batch)
-        # if "seqpack" in cfg.test_name.lower():
-        #     item.add_marker(pytest.mark.feature_sequence_packing)
-        # if "noncolocated" in cfg.test_name.lower():
-        #     item.add_marker(pytest.mark.feature_non_colocated)
 
         # === Apply custom filters ===
 

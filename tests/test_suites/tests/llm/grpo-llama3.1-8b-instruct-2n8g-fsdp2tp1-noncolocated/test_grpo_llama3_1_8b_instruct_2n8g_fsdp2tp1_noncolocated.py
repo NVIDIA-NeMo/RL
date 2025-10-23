@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestGrpoLlama318bInstruct2n8gFsdp2tp1Noncolocated(BaseNeMoRLTest):
-    """Test grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated."""
-
     config = NeMoRLTestConfig(
         test_name="grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated",
         algorithm="grpo",

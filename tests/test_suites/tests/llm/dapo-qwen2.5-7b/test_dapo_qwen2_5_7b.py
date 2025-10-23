@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestDapoQwen257b(BaseNeMoRLTest):
-    """Test dapo-qwen2.5-7b."""
-
     config = NeMoRLTestConfig(
         test_name="dapo-qwen2.5-7b",
         algorithm="dapo",

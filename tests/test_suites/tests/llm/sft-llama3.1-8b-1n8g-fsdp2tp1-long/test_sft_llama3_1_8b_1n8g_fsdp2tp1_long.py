@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestSftLlama318b1n8gFsdp2tp1Long(BaseNeMoRLTest):
-    """Test sft-llama3.1-8b-1n8g-fsdp2tp1-long."""
-
     config = NeMoRLTestConfig(
         test_name="sft-llama3.1-8b-1n8g-fsdp2tp1-long",
         algorithm="sft",

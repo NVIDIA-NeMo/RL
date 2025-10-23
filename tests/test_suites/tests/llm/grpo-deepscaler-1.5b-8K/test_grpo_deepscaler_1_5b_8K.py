@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestGrpoDeepscaler15b8k(BaseNeMoRLTest):
-    """Test grpo-deepscaler-1.5b-8K."""
-
     config = NeMoRLTestConfig(
         test_name="grpo-deepscaler-1.5b-8K",
         algorithm="grpo",

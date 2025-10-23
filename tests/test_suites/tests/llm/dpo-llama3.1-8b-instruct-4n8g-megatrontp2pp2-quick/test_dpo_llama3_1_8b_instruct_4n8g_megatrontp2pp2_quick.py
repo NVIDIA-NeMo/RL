@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestDpoLlama318bInstruct4n8gMegatrontp2pp2Quick(BaseNeMoRLTest):
-    """Test dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick."""
-
     config = NeMoRLTestConfig(
         test_name="dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick",
         algorithm="dpo",

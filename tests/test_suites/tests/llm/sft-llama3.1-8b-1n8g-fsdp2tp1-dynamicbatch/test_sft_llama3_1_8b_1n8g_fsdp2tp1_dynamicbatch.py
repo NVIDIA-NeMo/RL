@@ -2,8 +2,6 @@ from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestSftLlama318b1n8gFsdp2tp1Dynamicbatch(BaseNeMoRLTest):
-    """Test sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch."""
-
     config = NeMoRLTestConfig(
         test_name="sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch",
         algorithm="sft",
