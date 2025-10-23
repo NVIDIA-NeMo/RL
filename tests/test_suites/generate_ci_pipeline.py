@@ -109,6 +109,8 @@ def _build_pytest_command(
     test_file: str,
     pytest_args: str,
     test_filter: Optional[str] = None,
+    is_training: bool = False,
+    train_mode: str = "local",
 ) -> str:
     """Build pytest command with filters.
 
@@ -117,17 +119,21 @@ def _build_pytest_command(
         test_file: Path to test file
         pytest_args: Additional pytest arguments
         test_filter: Test name filter for -k option
+        is_training: Whether this is a training stage
+        train_mode: Training mode (local/slurm/bash)
 
     Returns:
         Complete pytest command string
     """
     pytest_cmd_parts = ["pytest"]
 
-    # Add test mode marker
-    if test_mode == "local":
-        pytest_cmd_parts.extend(["-m", "runner_local"])
-    elif test_mode == "slurm":
-        pytest_cmd_parts.extend(["-m", "runner_slurm"])
+    # Add test mode marker only for training stages
+    if is_training:
+        if train_mode == "local":
+            pytest_cmd_parts.extend(["-m", "runner_local"])
+        elif train_mode == "slurm":
+            pytest_cmd_parts.extend(["-m", "runner_slurm"])
+    # For non-training stages (validation, etc.), don't add runner markers
 
     # Add test filter
     if test_filter:
@@ -148,6 +154,8 @@ def _build_pytest_commands(
     test_file: str,
     pytest_args: str,
     test_names: List[str],
+    is_training: bool = False,
+    train_mode: str = "local",
 ) -> List[str]:
     """Build separate pytest commands for each test.
 
@@ -156,13 +164,17 @@ def _build_pytest_commands(
         test_file: Path to test file
         pytest_args: Additional pytest arguments
         test_names: List of test names to run
+        is_training: Whether this is a training stage
+        train_mode: Training mode (local/slurm/bash)
 
     Returns:
         List of pytest command strings
     """
     commands = []
     for test_name in test_names:
-        cmd = _build_pytest_command(test_mode, test_file, pytest_args, test_name)
+        cmd = _build_pytest_command(
+            test_mode, test_file, pytest_args, test_name, is_training, train_mode
+        )
         commands.append(cmd)
     return commands
 
@@ -190,16 +202,21 @@ def _build_job(
     Returns:
         Job configuration dictionary
     """
-    # Join commands with && for TEST_SCRIPT
+    # Join commands with && for TEST_SCRIPT and add quotes
     test_script = " && ".join(commands)
+
+    # Convert minutes to hours:minutes format
+    hours = config.time_limit_minutes // 60
+    minutes = config.time_limit_minutes % 60
+    time_string = f"{hours}:{minutes}"
 
     job = {
         "variables": {
             "MODULE": module,
             "TEST_NAME": job_name,
-            "TEST_SCRIPT": test_script,
-            "TIME": f"{config.time_limit_minutes}m",
-            "NUM_NODES": str(config.num_nodes),
+            "TEST_SCRIPT": f'"{test_script}"',
+            "TIME": time_string,
+            "NUM_NODES": config.num_nodes,
         },
         "script": commands,
         "timeout": f"{config.time_limit_minutes}m",
@@ -361,7 +378,7 @@ def generate_stages_pipeline(
     module: str,
     extends: Optional[str],
     test_mode: str,
-    raw_train_command: bool = False,
+    train_mode: str = "local",
 ) -> Dict[str, Any]:
     """Generate pipeline with stages and dependencies.
 
@@ -372,7 +389,7 @@ def generate_stages_pipeline(
         module: Module name for MODULE variable
         extends: Base job to extend
         test_mode: Test mode (local/slurm/all)
-        raw_train_command: Use raw training command for training stages
+        train_mode: Training mode (local/slurm/bash)
 
     Returns:
         GitLab CI pipeline dictionary
@@ -418,15 +435,21 @@ def generate_stages_pipeline(
                     key=lambda t: t.get("order") if t.get("order") is not None else 0,
                 )
 
-                # Build commands based on stage and raw_train_command flag
-                if raw_train_command and stage == "training":
+                # Build commands based on stage and train_mode
+                if train_mode == "bash" and stage == "training":
                     # Use raw training command instead of pytest
                     commands = [config.build_command_string()]
                 else:
                     # Build separate pytest commands for each test
                     test_names = [t["name"] for t in sorted_tests]
+                    is_training = stage == "training"
                     commands = _build_pytest_commands(
-                        test_mode, test_file, pytest_args, test_names
+                        test_mode,
+                        test_file,
+                        pytest_args,
+                        test_names,
+                        is_training,
+                        train_mode,
                     )
 
                 # Build job
@@ -470,7 +493,7 @@ def generate_parent_child_pipeline(
     module: str,
     extends: Optional[str],
     test_mode: str,
-    raw_train_command: bool = False,
+    train_mode: str = "local",
 ) -> Dict[str, Dict[str, Any]]:
     """Generate parent-child pipeline structure.
 
@@ -484,7 +507,7 @@ def generate_parent_child_pipeline(
         module: Module name for MODULE variable
         extends: Base job to extend
         test_mode: Test mode (local/slurm/all)
-        raw_train_command: Use raw training command for training stages
+        train_mode: Training mode (local/slurm/bash)
 
     Returns:
         Dictionary with 'parent' and 'children' keys containing pipeline YAML
@@ -517,7 +540,7 @@ def generate_parent_child_pipeline(
             module,
             extends,
             test_mode,
-            raw_train_command,
+            train_mode,
         )
 
         child_pipelines[child_file] = child_pipeline
@@ -620,9 +643,14 @@ def main():
     )
 
     parser.add_argument(
-        "--raw-train-command",
-        action="store_true",
-        help="Use raw training command for training stages instead of pytest command",
+        "--train-mode",
+        type=str,
+        choices=["local", "slurm", "bash"],
+        default="local",
+        help="Training mode: 'local' (pytest local test functions), "
+        "'slurm' (pytest slurm test functions), "
+        "'bash' (raw training command) "
+        "(default: local)",
     )
 
     args = parser.parse_args()
@@ -689,7 +717,7 @@ def main():
             args.module,
             args.extends,
             args.test_mode,
-            args.raw_train_command,
+            args.train_mode,
         )
     elif args.pipeline_mode == "parent-child":
         result = generate_parent_child_pipeline(
@@ -699,7 +727,7 @@ def main():
             args.module,
             args.extends,
             args.test_mode,
-            args.raw_train_command,
+            args.train_mode,
         )
 
         # For parent-child, we need to write multiple files
