@@ -633,8 +633,8 @@ class DPOLossFn(LossFunction):
             - sft_loss_weight (float): Weight for the SFT loss term (w_s)
             - preference_average_log_probs (bool): Whether to average log probs across tokens in preference loss
             - sft_average_log_probs (bool): Whether to average log probs across tokens in SFT loss
-            - preference_loss (str): Type of preference loss to use, default dpo
-            - gt_reward_scale (float): Scale of the ground truth rewards (η), default 1
+            - preference_loss (str): Type of preference loss to use
+            - gt_reward_scale (float): Scale of the ground truth rewards (η)
 
     Returns:
         tuple[torch.Tensor, dict]: A tuple containing:
@@ -771,7 +771,11 @@ class DPOLossFn(LossFunction):
                     ) * sample_mask[::2]
             elif self.preference_loss == "rpo_sq":
                 per_sample_loss = (
-                    torch.square(rewards_delta - gt_rewards_delta) * sample_mask[::2]
+                    torch.square(
+                        self.reference_policy_kl_penalty * rewards_delta
+                        - gt_rewards_delta
+                    )
+                    * sample_mask[::2]
                 )
         else:
             raise NotImplementedError(

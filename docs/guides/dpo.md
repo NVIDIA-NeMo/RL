@@ -141,8 +141,8 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 - `dpo.sft_loss_weight`: Weight for the auxiliary SFT loss
 - `dpo.preference_average_log_probs`: Whether to average log probabilities over tokens in the preference loss term
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
-- `dpo.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl; default dpo)
-- `dpo.gt_reward_scale`: Reward scale for ground-truth rewards, only used in RPO (default 1.0)
+- `dpo.preference_loss`: Preference-based objective to use (choose from dpo, ipo, rpo_sq, rpo_fwd_kl, rpo_bwd_kl)
+- `dpo.gt_reward_scale`: Reward scale for ground-truth rewards, only used in RPO
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
 
