@@ -23,15 +23,20 @@ from typing import Any, Dict, List, Optional, cast
 
 from omegaconf import OmegaConf
 
+# Import strongly-typed config classes
+from nemo_rl.data import DataConfig
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import DTensorConfig, MegatronConfig, PolicyConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
+from nemo_rl.utils.logger import LoggerConfig
 
 # Import type aliases from parent module
 from . import Algorithm, MasterConfigUnion, ModelClass
 
 
 @dataclass
-class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
+class NeMoRLTestConfig:
     """Test configuration with YAML base + overrides + test metadata.
 
     This class:
@@ -39,14 +44,41 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     2. Allows overriding specific YAML values for testing
     3. Stores test-specific metadata (test_name, algorithm, test_suites)
     4. Auto-extracts metadata from YAML for filtering/classification
+    5. Provides strongly-typed accessors for all config sections
+
+    Strongly-typed Config Accessors:
+        - master_config: MasterConfigUnion - Full config as typed MasterConfig (public attribute)
+        - loaded_yaml_config: MasterConfigUnion - Deprecated alias for master_config
+        - policy_config: PolicyConfig - Policy/model configuration
+        - cluster_config: ClusterConfig - Cluster configuration (nodes, GPUs)
+        - data_config: DataConfig - Dataset configuration
+        - logger_config: LoggerConfig - Logging configuration
+        - checkpointing_config: CheckpointingConfig - Checkpointing configuration
+        - algorithm_config: Dict[str, Any] - Algorithm-specific config (SFT/GRPO/DPO/etc)
+
+    Example:
+        config = NeMoRLTestConfig(
+            test_name="my-test",
+            algorithm="sft",
+            model_class="llm",
+        )
+
+        # Strongly-typed access via properties
+        model_name: str = config.policy_config["model_name"]
+        num_nodes: int = config.cluster_config["num_nodes"]
+        dataset: str = config.data_config["dataset_name"]
+        max_steps: int = config.algorithm_config["max_num_steps"]
+
+        # Direct access to master config
+        full_config: MasterConfigUnion = config.master_config
     """
 
     #######################################################
     # Metadata we add to tests (required fields first)
     #######################################################
     test_name: str  # Test identifier
-    algorithm: Algorithm  # sft, grpo, dpo, distillation, rm (strictly typed)
-    model_class: ModelClass  # llm, vlm (strictly typed)
+    algorithm: Algorithm
+    model_class: ModelClass
     test_suites: List[str] = field(
         default_factory=lambda: ["nightly"]
     )  # Suites this test is part of (can set multiple suites)
@@ -125,7 +157,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             config = parse_hydra_overrides(config, override_strings)
 
         # Convert to plain dict with all interpolations resolved
-        self._loaded_yaml_config: MasterConfigUnion = OmegaConf.to_container(
+        self.master_config: MasterConfigUnion = OmegaConf.to_container(
             config, resolve=True
         )
 
@@ -178,11 +210,11 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             ValueError: If algorithm doesn't match config structure
         """
         # Check if the algorithm-specific config section exists
-        if self.algorithm not in self._loaded_yaml_config:
+        if self.algorithm not in self.master_config:
             raise ValueError(
                 f"Config validation failed: algorithm='{self.algorithm}' but config "
                 f"does not have '{self.algorithm}' section. "
-                f"Available sections: {list(self._loaded_yaml_config.keys())}"
+                f"Available sections: {list(self.master_config.keys())}"
             )
 
         # Additional validation for required sections in MasterConfig
@@ -190,18 +222,18 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         missing_sections = [
             section
             for section in required_sections
-            if section not in self._loaded_yaml_config
+            if section not in self.master_config
         ]
 
         if missing_sections:
             raise ValueError(
                 f"Config validation failed: Missing required sections: {missing_sections}. "
-                f"Available sections: {list(self._loaded_yaml_config.keys())}"
+                f"Available sections: {list(self.master_config.keys())}"
             )
 
     def _extract_model_name(self) -> str:
         # Extract model_name from policy config (handle both dict and nested structure)
-        policy_config = self._loaded_yaml_config.get("policy", {})
+        policy_config = self.master_config.get("policy", {})
         model_name = policy_config.get("model_name", "")
 
         # Clean up model name for filtering (remove org prefix)
@@ -213,7 +245,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return model_name
 
     def _detect_backend(self) -> str:
-        policy_config = self._loaded_yaml_config.get("policy", {})
+        policy_config = self.master_config.get("policy", {})
         dtensor_cfg = policy_config.get("dtensor_cfg", {})
         megatron_cfg = policy_config.get("megatron_cfg", {})
 
@@ -238,7 +270,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         Returns:
             Dictionary with keys: tensor_parallel, pipeline_parallel, sequence_parallel
         """
-        policy_config = self._loaded_yaml_config.get("policy", {})
+        policy_config = self.master_config.get("policy", {})
 
         if backend == "dtensor":
             dtensor_cfg = policy_config.get("dtensor_cfg", {})
@@ -273,10 +305,12 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         This property provides access to the loaded and parsed YAML config
         with overrides applied and all interpolations resolved.
 
+        DEPRECATED: Use master_config directly instead.
+
         Returns:
             Plain dict typed as MasterConfigUnion (one of SFT, GRPO, DPO, Distillation, RM configs)
         """
-        return self._loaded_yaml_config
+        return self.master_config
 
     @cached_property
     def model_name(self) -> str:
@@ -291,13 +325,13 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     @cached_property
     def num_nodes(self) -> int:
         """Number of nodes from cluster configuration."""
-        cluster_config = self._loaded_yaml_config.get("cluster", {})
+        cluster_config = self.master_config.get("cluster", {})
         return cluster_config.get("num_nodes", 1)
 
     @cached_property
     def num_gpus_per_node(self) -> int:
         """Number of GPUs per node from cluster configuration."""
-        cluster_config = self._loaded_yaml_config.get("cluster", {})
+        cluster_config = self.master_config.get("cluster", {})
         return cluster_config.get("gpus_per_node", 8)
 
     @cached_property
@@ -329,7 +363,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         - Distillation: distillation.max_num_steps
         - RM: rm.max_num_steps
         """
-        algo_config = self._loaded_yaml_config.get(self.algorithm, {})
+        algo_config = self.master_config.get(self.algorithm, {})
         return algo_config.get("max_num_steps", 0)
 
     def validate_config(self):
@@ -482,7 +516,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             model_name = config.policy_config["model_name"]
             dtensor_enabled = config.policy_config["dtensor_cfg"]["enabled"]
         """
-        return cast(PolicyConfig, self._loaded_yaml_config.get("policy", {}))
+        return cast(PolicyConfig, self.master_config.get("policy", {}))
 
     def get_dtensor_config(self) -> Optional[DTensorConfig]:
         """Get DTensor configuration if dtensor is enabled.
@@ -505,6 +539,83 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         if policy and policy.get("megatron_cfg", {}).get("enabled", False):
             return cast(MegatronConfig, policy["megatron_cfg"])
         return None
+
+    @property
+    def cluster_config(self) -> ClusterConfig:
+        """Get the cluster configuration as a typed ClusterConfig.
+
+        Returns:
+            ClusterConfig dict with num_nodes and gpus_per_node
+
+        Example:
+            config = NeMoRLTestConfig(...)
+            num_nodes = config.cluster_config["num_nodes"]
+            gpus_per_node = config.cluster_config["gpus_per_node"]
+        """
+        return cast(ClusterConfig, self.master_config.get("cluster", {}))
+
+    @property
+    def data_config(self) -> DataConfig:
+        """Get the data configuration as a typed DataConfig.
+
+        Returns:
+            DataConfig dict with dataset settings
+
+        Example:
+            config = NeMoRLTestConfig(...)
+            dataset_name = config.data_config["dataset_name"]
+            max_input_length = config.data_config["max_input_seq_length"]
+        """
+        return cast(DataConfig, self.master_config.get("data", {}))
+
+    @property
+    def logger_config(self) -> LoggerConfig:
+        """Get the logger configuration as a typed LoggerConfig.
+
+        Returns:
+            LoggerConfig dict with logging settings
+
+        Example:
+            config = NeMoRLTestConfig(...)
+            wandb_enabled = config.logger_config["wandb_enabled"]
+            log_dir = config.logger_config["log_dir"]
+        """
+        return cast(LoggerConfig, self.master_config.get("logger", {}))
+
+    @property
+    def checkpointing_config(self) -> CheckpointingConfig:
+        """Get the checkpointing configuration as a typed CheckpointingConfig.
+
+        Returns:
+            CheckpointingConfig dict with checkpointing settings
+
+        Example:
+            config = NeMoRLTestConfig(...)
+            enabled = config.checkpointing_config["enabled"]
+            checkpoint_dir = config.checkpointing_config["checkpoint_dir"]
+        """
+        return cast(CheckpointingConfig, self.master_config.get("checkpointing", {}))
+
+    @property
+    def algorithm_config(self) -> Dict[str, Any]:
+        """Get the algorithm-specific configuration.
+
+        Returns the configuration section specific to the algorithm:
+        - For algorithm="sft": returns sft: SFTConfig
+        - For algorithm="grpo": returns grpo: GRPOConfig
+        - For algorithm="dpo": returns dpo: DPOConfig
+        - For algorithm="distillation": returns distillation: DistillationConfig
+        - For algorithm="rm": returns rm: RMConfig
+
+        Returns:
+            Algorithm-specific config dict
+
+        Example:
+            config = NeMoRLTestConfig(algorithm="sft", ...)
+            max_steps = config.algorithm_config["max_num_steps"]
+            val_period = config.algorithm_config["val_period"]
+        """
+        return self.master_config.get(self.algorithm, {})
 
     def get_num_runs(self) -> int:
         """Get the number of training runs based on steps_per_run.
