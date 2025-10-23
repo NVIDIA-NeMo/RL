@@ -1,4 +1,4 @@
-from tests.test_suites_new.base_config import BaseNeMoRLTest, NeMoRLTestConfig
+from tests.test_suites.base_config import BaseNeMoRLTest, NeMoRLTestConfig
 
 
 class TestDPOLlama31_8B_Instruct_SomthingSomthing(BaseNeMoRLTest):

@@ -86,27 +86,25 @@ class NeMoRLTestConfig:
             caller_frame = None
             for frame_info in inspect.stack():
                 frame_file = Path(frame_info.filename)
-                if frame_file != Path(__file__) and "test_suites_new" in str(
-                    frame_file
-                ):
+                if frame_file != Path(__file__) and "test_suites" in str(frame_file):
                     caller_frame = frame_file
                     break
 
             if caller_frame:
                 # Get the directory containing the test file
                 test_file_dir = caller_frame.parent
-                # Map from tests/test_suites_new/llm/test_name to examples/configs/recipes/llm/
-                # The test structure is: tests/test_suites_new/llm/test_name/test_*.py
+                # Map from tests/test_suites/llm/test_name to examples/configs/recipes/llm/
+                # The test structure is: tests/test_suites/llm/test_name/test_*.py
                 # The config structure is: examples/configs/recipes/llm/test_name.yaml
                 # So we need to go up one level from the test file directory to get to llm/
                 relative_path = test_file_dir.relative_to(
-                    self.project_root / "tests" / "test_suites_new"
+                    self.project_root / "tests" / "test_suites"
                 ).parent
             else:
                 # Fallback: use current directory (where base_config.py is)
                 test_suite_path = Path(__file__).parent
                 relative_path = test_suite_path.relative_to(
-                    self.project_root / "tests" / "test_suites_new"
+                    self.project_root / "tests" / "test_suites"
                 )
 
             self.config_path = (
