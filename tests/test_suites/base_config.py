@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -46,6 +47,9 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         default_factory=lambda: ["nightly"]
     )  # Suites this test is part of (can set multiple suites)
     time_limit_minutes: int = 120  # Test timeout, used for slurms jobs
+    steps_per_run: Optional[int] = (
+        None  # If set, split training into multiple runs of this many steps
+    )
 
     #######################################################
     # Model config
@@ -80,6 +84,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     tensor_parallel: Optional[int] = field(init=False, default=None)
     pipeline_parallel: Optional[int] = field(init=False, default=None)
     sequence_parallel: bool = field(init=False, default=False)
+    max_steps: int = field(init=False, default=0)
 
     def __post_init__(self):
         # Get project root from git using this file folder (test_suites) as starting location
@@ -162,6 +167,9 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             self.loaded_yaml_config, "cluster.gpus_per_node"
         )
         self._extract_parallelism()
+        self.max_steps = OmegaConf.select(
+            self.loaded_yaml_config, "trainer.max_steps", default=0
+        )
 
     def _extract_model_name(self) -> str:
         model_name = OmegaConf.select(
@@ -283,6 +291,30 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
                 f"total GPUs ({self.num_gpus_total})"
             )
 
+        # Validate steps_per_run if set
+        if self.steps_per_run is not None:
+            if self.steps_per_run <= 0:
+                raise ValueError(f"steps_per_run must be > 0, got {self.steps_per_run}")
+
+            if self.max_steps == 0:
+                raise ValueError(
+                    "steps_per_run is set but max_steps could not be extracted from config. "
+                    "Ensure trainer.max_steps is defined in the YAML config."
+                )
+
+            if self.steps_per_run > self.max_steps:
+                raise ValueError(
+                    f"steps_per_run ({self.steps_per_run}) must be <= max_steps ({self.max_steps})"
+                )
+
+            # Warn if steps_per_run doesn't evenly divide max_steps
+            if self.max_steps % self.steps_per_run != 0:
+                print(
+                    f"Warning: max_steps ({self.max_steps}) is not evenly divisible by "
+                    f"steps_per_run ({self.steps_per_run}). Last run will train for "
+                    f"{self.max_steps % self.steps_per_run} steps."
+                )
+
     @property
     def num_gpus_total(self) -> int:
         """Total number of GPUs across all nodes."""
@@ -378,6 +410,29 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         if policy and policy.get("megatron_cfg", {}).get("enabled", False):
             return cast(MegatronConfig, policy["megatron_cfg"])
         return None
+
+    def get_num_runs(self) -> int:
+        """Get the number of training runs based on steps_per_run.
+
+        Returns:
+            Number of runs (1 if steps_per_run is None, otherwise ceil(max_steps / steps_per_run))
+        """
+        if self.steps_per_run is None:
+            return 1
+        return math.ceil(self.max_steps / self.steps_per_run)
+
+    def get_target_steps(self, run_num: int) -> int:
+        """Get the target max_steps for a specific run number.
+
+        Args:
+            run_num: The run number (0-indexed)
+
+        Returns:
+            Target max_steps for this run (min of (run_num + 1) * steps_per_run and max_steps)
+        """
+        if self.steps_per_run is None:
+            return self.max_steps
+        return min((run_num + 1) * self.steps_per_run, self.max_steps)
 
 
 @dataclass

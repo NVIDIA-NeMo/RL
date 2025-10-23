@@ -86,9 +86,20 @@ def parse_args():
         "--slurm-account", default=os.environ.get("SLURM_ACCOUNT"), help="Slurm account"
     )
     parser.add_argument(
+        "--test-name",
+        required=True,
+        help="Test name (test folder name)",
+    )
+    parser.add_argument(
         "--test-script",
         default=os.environ.get("TEST_SCRIPT"),
         help="Test script to run",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        help="Config override in key=value format (can be repeated)",
     )
     parser.add_argument("--user", default=os.environ.get("RL_USER"), help="SSH user")
     parser.add_argument(
@@ -131,9 +142,22 @@ def main():
         ),
     )
 
+    # Build command with test script and overrides
+    command_parts = [
+        "cd /opt/nemo-rl",
+        "git init",
+        f"uv run --no-sync {args.test_script if args.test_script else 'pytest tests/test_suites/' + args.test_name}",
+    ]
+
+    # Add overrides if provided
+    if args.override:
+        command_parts[-1] += " " + " ".join(args.override)
+
+    command = " && ".join(command_parts)
+
     job = RayJob(name=f"{args.job_name}-{args.ci_job_id}", executor=executor)
     job.start(
-        command=f"cd /opt/nemo-rl && git init && uv run --no-sync {args.test_script}",
+        command=command,
         workdir=f"{args.nemorun_home}/work_dir",
     )
     job.logs(follow=True, timeout=60 * 60 * 24)

@@ -86,6 +86,84 @@ class BaseNeMoRLTest:
 
     config: NeMoRLTestConfig  # Must be defined by subclass
 
+    def __init_subclass__(cls, **kwargs):
+        """Hook to dynamically generate test methods based on config.steps_per_run.
+
+        If config.steps_per_run is set, this removes the original test_train_local
+        and test_train_slurm methods and creates numbered versions (e.g.,
+        test_train_local_0, test_train_local_1) that train to incremental step counts.
+        """
+        super().__init_subclass__(**kwargs)
+
+        # Check if config is defined
+        if not hasattr(cls, "config"):
+            return
+
+        config = cls.config
+
+        # If steps_per_run is not set, keep original behavior
+        if config.steps_per_run is None:
+            return
+
+        # Calculate number of runs
+        num_runs = config.get_num_runs()
+
+        # Remove original test methods if they exist
+        if hasattr(cls, "test_train_local"):
+            delattr(cls, "test_train_local")
+        if hasattr(cls, "test_train_slurm"):
+            delattr(cls, "test_train_slurm")
+
+        # Create run-specific test methods
+        for run_num in range(num_runs):
+            target_steps = config.get_target_steps(run_num)
+
+            # Create local test method
+            def make_local_test(run_num, target_steps):
+                @pytest.mark.runner("local")
+                @pytest.mark.order(run_num)
+                def test_method(self):
+                    cmd = self.config.build_command(
+                        extra_overrides={"trainer.max_steps": target_steps}
+                    )
+                    return_code = self.run_command(
+                        cmd, self.config.run_log_path, cwd=self.config.project_root
+                    )
+                    assert return_code == 0, (
+                        f"Training failed with return code {return_code}. "
+                        f"Check {self.config.run_log_path}"
+                    )
+
+                return test_method
+
+            # Create slurm test method
+            def make_slurm_test(run_num, target_steps):
+                @pytest.mark.runner("slurm")
+                @pytest.mark.order(run_num)
+                def test_method(self, request):
+                    return_code = self.run_via_slurm(
+                        request.node.nodeid,
+                        extra_overrides={"trainer.max_steps": target_steps},
+                    )
+                    assert return_code == 0, (
+                        f"Training failed with return code {return_code}. "
+                        f"Check {self.config.run_log_path}"
+                    )
+
+                return test_method
+
+            # Set the methods on the class
+            setattr(
+                cls,
+                f"test_train_local_{run_num}",
+                make_local_test(run_num, target_steps),
+            )
+            setattr(
+                cls,
+                f"test_train_slurm_{run_num}",
+                make_slurm_test(run_num, target_steps),
+            )
+
     def run_command(
         self, cmd: List[str], log_file: Path, cwd: Optional[Path] = None
     ) -> int:
@@ -119,7 +197,9 @@ class BaseNeMoRLTest:
 
         return return_code
 
-    def run_via_slurm(self, pytest_nodeid: str) -> int:
+    def run_via_slurm(
+        self, pytest_nodeid: str, extra_overrides: Optional[dict] = None
+    ) -> int:
         """Run a test via Slurm by invoking launch_nemo_rl.py.
 
         This method is called when pytest is run with --slurm option.
@@ -127,6 +207,7 @@ class BaseNeMoRLTest:
 
         Args:
             pytest_nodeid: Pytest node ID (e.g., "tests/test_suites/llm/sft-test/test_file.py::TestClass::test_method")
+            extra_overrides: Optional dictionary of config overrides to pass to the launch script
 
         Returns:
             Return code from the Slurm job
@@ -190,6 +271,11 @@ class BaseNeMoRLTest:
             value = os.environ.get(env_var)
             if value:
                 launch_cmd.extend([arg_name, value])
+
+        # Add extra overrides if provided
+        if extra_overrides:
+            for key, value in extra_overrides.items():
+                launch_cmd.extend(["--override", f"{key}={value}"])
 
         print(f"\n{'=' * 80}")
         print(f"Submitting test to Slurm: {test_folder}")
