@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional
 
+import pytest
+
 from .base_config import NeMoRLTestConfig
 
 
@@ -28,6 +30,23 @@ class BaseNeMoRLTest:
 
     Use with NeMoRLTestConfig for full control over overrides, or use with
     DefaultNeMoRLTestConfig to get standard test overrides automatically applied.
+
+    Pytest Markers:
+        - @pytest.mark.runner("local"): Run only local tests
+        - @pytest.mark.runner("slurm"): Run only Slurm tests
+
+    Usage examples:
+        # Run only local tests
+        pytest -m 'runner_local' tests/test_suites/tests/
+
+        # Run only Slurm tests
+        pytest -m 'runner_slurm' tests/test_suites/tests/
+
+        # Run all tests except Slurm
+        pytest -m "not runner_slurm" tests/test_suites/tests/
+
+        # Run a specific test by name
+        pytest -k test_train_local tests/test_suites/tests/
 
     Example with custom config:
         class TestMyTraining(BaseNeMoRLTest):
@@ -181,6 +200,7 @@ class BaseNeMoRLTest:
         result = subprocess.run(launch_cmd, cwd=self.config.project_root)
         return result.returncode
 
+    @pytest.mark.runner("local")
     def test_train_local(self):
         """Test that training completes successfully when run locally."""
         cmd = self.config.build_command()
@@ -192,6 +212,7 @@ class BaseNeMoRLTest:
             f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
         )
 
+    @pytest.mark.runner("slurm")
     def test_train_slurm(self, request):
         """Test that training completes successfully when run via Slurm."""
         return_code = self.run_via_slurm(request.node.nodeid)

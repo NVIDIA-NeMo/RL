@@ -18,6 +18,20 @@ import pytest
 
 
 def pytest_configure(config):
+    # Register custom markers
+    config.addinivalue_line(
+        "markers",
+        "runner(name): mark test with a runner type - 'local' for local execution, 'slurm' for Slurm cluster",
+    )
+    config.addinivalue_line(
+        "markers",
+        "runner_local: automatically added for tests marked with runner('local')",
+    )
+    config.addinivalue_line(
+        "markers",
+        "runner_slurm: automatically added for tests marked with runner('slurm')",
+    )
+
     # Suppress unknown marker warnings for dynamically generated markers
     warnings.filterwarnings(
         "ignore",
@@ -58,7 +72,21 @@ def pytest_collection_modifyitems(config, items):
     1. Inspects each test class for a 'config' attribute (BaseNeMoRLTest instance)
     2. Auto-generates pytest markers based on config values
     3. Applies custom filters based on command-line options
+    4. Converts runner("local"|"slurm") markers to runner_local/runner_slurm for filtering
     """
+    # First pass: Convert runner markers to filterable markers
+    for item in items:
+        # Check for runner marker and add corresponding filterable marker
+        runner_markers = list(item.iter_markers("runner"))
+        if runner_markers:
+            for marker in runner_markers:
+                if marker.args:
+                    runner_type = marker.args[0]
+                    if runner_type == "local":
+                        item.add_marker(pytest.mark.runner_local)
+                    elif runner_type == "slurm":
+                        item.add_marker(pytest.mark.runner_slurm)
+
     # Get filter options
     model_class_filter = config.getoption("--class")
     algorithm_filter = config.getoption("--algorithm")
