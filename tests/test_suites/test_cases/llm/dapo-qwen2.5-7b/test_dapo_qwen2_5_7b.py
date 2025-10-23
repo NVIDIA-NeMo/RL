@@ -34,32 +34,32 @@ class TestDapoQwen257b(BaseNeMoRLTest):
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
     @pytest.mark.order(1)
-    def one(self):
+    def test_one(self):
         assert 1 + 1 == 2
 
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
     @pytest.mark.order(2)
-    def two(self):
+    def test_two(self):
         assert 2 + 2 == 4
 
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
     @pytest.mark.order(3)
-    def three(self):
+    def test_three(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
-    def four(self):
+    def test_four(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
-    def five(self):
+    def test_five(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
     @pytest.mark.job_group("job_1")
-    def six(self):
+    def test_six(self):
         assert 4 + 4 == 8

@@ -32,25 +32,25 @@ class TestDistillationQwen332bTo4bBase1n8gFsdp2tp2DynamicbatchV1(BaseNeMoRLTest)
 
     # TODO(ahmadki): dummy tests
     @pytest.mark.stage("validation")
-    def one(self):
+    def test_one(self):
         assert 1 + 1 == 2
 
     @pytest.mark.stage("validation")
-    def two(self):
+    def test_two(self):
         assert 2 + 2 == 4
 
     @pytest.mark.stage("validation")
-    def three(self):
+    def test_three(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
-    def four(self):
+    def test_four(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
-    def five(self):
+    def test_five(self):
         assert 4 + 4 == 8
 
     @pytest.mark.stage("validation")
-    def six(self):
+    def test_six(self):
         assert 4 + 4 == 8
