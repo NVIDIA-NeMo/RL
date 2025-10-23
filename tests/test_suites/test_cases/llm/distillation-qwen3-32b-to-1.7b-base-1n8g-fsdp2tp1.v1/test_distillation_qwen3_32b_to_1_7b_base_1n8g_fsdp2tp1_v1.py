@@ -25,7 +25,7 @@ class TestDistillationQwen332bTo17bBase1n8gFsdp2tp1V1(BaseNeMoRLTest):
         model_class="llm",
         test_suites=["nightly", "akiswani"],  # TODO(ahmadki): test_suites
         time_limit_minutes=60,
-        steps_per_run=20,
+        steps_per_run=2,
         overrides={
             "distillation.max_num_steps": 10,
             "distillation.val_period": 20,
