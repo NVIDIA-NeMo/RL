@@ -25,12 +25,8 @@ def pytest_addoption(parser):
     )
 
     # Custom filtering options based on TestConfig values
-    parser.addoption(
-        "--algorithm", help="Filter by algorithm (e.g., sft, grpo, dpo, vlm_grpo)"
-    )
-    parser.addoption(
-        "--backend", help="Filter by backend (e.g., fsdp2, megatron, dtensor)"
-    )
+    parser.addoption("--algorithm", help="Filter by algorithm (e.g., sft, grpo, dpo)")
+    parser.addoption("--backend", help="Filter by backend (e.g., megatron, dtensor)")
     parser.addoption(
         "--suite",
         help="Filter by test suite (e.g., nightly, quick, release, long, performance)",
@@ -41,7 +37,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--filter",
         help="Filter using Python expression on config (e.g., 'config.num_gpus_total >= 32 and config.backend == \"fsdp2\"')",
-    )
+    )  # TODO(ahmadki): num_gpus_total doesn't work
 
 
 @pytest.fixture
