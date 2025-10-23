@@ -13,7 +13,7 @@ from nemo_rl.utils.config import load_config, parse_hydra_overrides
 
 
 @dataclass
-class NeMoRLTestConfig:
+class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     """Test configuration with YAML base + overrides + test metadata.
 
     This class:
@@ -23,23 +23,23 @@ class NeMoRLTestConfig:
     4. Auto-extracts metadata from YAML for filtering/classification
     """
 
-    # === Test Metadata (NOT in YAML) ===
+    # Metadata we add to tests (required fields first)
     test_name: str  # Test identifier
-    algorithm: str  # sft, grpo, dpo, vlm_grpo - for filtering # TODO(ahmadki):enum, upper and lowercase
-    model_class: str = "llm"  # Model class: llm, vlm, etc. - for filtering
+    algorithm: str  # sft, grpo, dpo # TODO(ahmadki):enum, upper and lowercase
+
+    # Optional metadata fields
+    model_class: str = "llm"  # Model class: llm, vlm
     test_suites: List[str] = field(
         default_factory=lambda: ["nightly"]
     )  # Test suite classification
-    time_limit_minutes: int = 120  # Test timeout (not training timeout)
+    time_limit_minutes: int = 120  # Test timeout, used for slurms jobs
 
-    # === YAML Configuration ===
+    # The model hydra/YAML config
     config_yaml: Optional[str] = (
-        None  # YAML file name (auto-derived from test_name if None)
+        None  # YAML config file name (auto-derived from test_name if None)
     )
-
-    # === Configuration Overrides ===
+    # Overrides to apply to the YAML config
     overrides: Dict[str, Any] = field(default_factory=dict)
-    # Override YAML values, e.g., {"dpo.max_num_steps": 20, "cluster.num_nodes": 2}
 
     # === Paths (computed from test_name if not provided) ===
     config_path: Optional[Path] = None
@@ -93,13 +93,19 @@ class NeMoRLTestConfig:
             if caller_frame:
                 # Get the directory containing the test file
                 test_file_dir = caller_frame.parent
-                # Map from tests/test_suites/llm/test_name to examples/configs/recipes/llm/
-                # The test structure is: tests/test_suites/llm/test_name/test_*.py
+                # Map from tests/test_suites/{tests/}llm/test_name to examples/configs/recipes/llm/
+                # The test structure can be either:
+                #   - tests/test_suites/llm/test_name/test_*.py (old structure)
+                #   - tests/test_suites/tests/llm/test_name/test_*.py (new structure)
                 # The config structure is: examples/configs/recipes/llm/test_name.yaml
                 # So we need to go up one level from the test file directory to get to llm/
                 relative_path = test_file_dir.relative_to(
                     self.project_root / "tests" / "test_suites"
                 ).parent
+
+                # Remove the "tests" directory if present (for new test structure)
+                if relative_path.parts and relative_path.parts[0] == "tests":
+                    relative_path = Path(*relative_path.parts[1:])
             else:
                 # Fallback: use current directory (where base_config.py is)
                 test_suite_path = Path(__file__).parent
@@ -122,8 +128,8 @@ class NeMoRLTestConfig:
                     f"Expected to find it at the path derived from test name '{self.test_name}'"
                 )
 
-        # Load YAML configuration
-        self._load_yaml()
+        # Loads YAML files with OmegaConf
+        self.yaml_config = load_config(self.config_path)
 
         # Apply overrides using Hydra's parser before extracting metadata
         # This ensures metadata reflects the overridden values
@@ -157,16 +163,6 @@ class NeMoRLTestConfig:
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    def _load_yaml(self):
-        """Load and parse YAML configuration file using OmegaConf.
-
-        This method uses the nemo_rl load_config utility which:
-        - Loads YAML files with OmegaConf
-        - Supports config inheritance via 'defaults' key
-        - Handles variable interpolation
-        """
-        self.yaml_config = load_config(self.config_path)
 
     def _extract_metadata(self):
         """Extract metadata from YAML configuration for filtering/classification.

@@ -39,107 +39,16 @@ def pytest_addoption(parser):
     )  # TODO(ahmadki): num_gpus_total doesn't work
 
 
-# TODO(ahmadki)
-# @pytest.fixture
-# def project_root(tmp_path):
-#     """Return the project root directory."""
-#     import subprocess
-#     from pathlib import Path
-
-#     result = subprocess.run(
-#         ["git", "rev-parse", "--show-toplevel"],
-#         capture_output=True,
-#         text=True,
-#         check=True,
-#     )
-#     return Path(result.stdout.strip())
-
-
-# @pytest.fixture
-# def test_output_dir(tmp_path, request):
-#     """Create a temporary output directory for test artifacts.
-
-#     This fixture can be overridden by setting the TEST_OUTPUT_DIR environment variable
-#     to use a persistent directory instead of tmp_path.
-#     """
-#     import os
-#     from pathlib import Path
-
-#     output_dir = os.environ.get("TEST_OUTPUT_DIR")
-#     if output_dir:
-#         output_dir = Path(output_dir) / request.node.name
-#         output_dir.mkdir(parents=True, exist_ok=True)
-#         return output_dir
-#     return tmp_path
-
-
-@pytest.fixture
-def skip_if_insufficient_gpus(request):
-    """Skip test if insufficient GPUs are available."""
-    import torch
-
-    # Extract GPU requirement from markers
-    required_gpus = None
-    for marker in request.node.iter_markers():
-        if marker.name.startswith("num_gpus_"):
-            required_gpus = int(marker.name.split("_")[-1])
-            break
-
-    if required_gpus is not None:
-        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if available_gpus < required_gpus:
-            pytest.skip(
-                f"Test requires {required_gpus} GPUs but only {available_gpus} available"
-            )
-
-
-@pytest.fixture(autouse=True)
-def setup_git_safe_directory():
-    """Mark all repos as safe in the test context.
-
-    This is needed because wandb fetches metadata about the repo and it's a
-    catch-22 to get the project root and mark it safe if you don't know the project root.
-    """
-    import subprocess
-
-    subprocess.run(
-        ["git", "config", "--global", "--add", "safe.directory", "*"],
-        check=False,  # Don't fail if this doesn't work
-    )
-
-
-@pytest.fixture
-def env_vars():
-    """Return environment variables needed for tests."""
-    import os
-
-    return {
-        "HF_HOME": os.environ.get("HF_HOME"),
-        "HF_DATASETS_CACHE": os.environ.get("HF_DATASETS_CACHE"),
-        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "1"),
-        "HF_TOKEN": os.environ.get("RL_HF_TOKEN"),
-        "WANDB_API_KEY": os.environ.get("WANDB_API_KEY"),
-        "NRL_DEEPSCALER_8K_CKPT": os.environ.get("NRL_DEEPSCALER_8K_CKPT"),
-        "NRL_DEEPSCALER_16K_CKPT": os.environ.get("NRL_DEEPSCALER_16K_CKPT"),
-        "NRL_DEEPSCALER_24K_CKPT": os.environ.get("NRL_DEEPSCALER_24K_CKPT"),
-    }
-
-
-@pytest.fixture
-def use_slurm(request):
-    """Return True if tests should be submitted to Slurm."""
-    return request.config.getoption("--slurm")
-
-
 def pytest_collection_modifyitems(config, items):
-    """Auto-generate markers from TestConfig and apply custom filters.
+    """Auto-generate markers from BaseNeMoRLTest and apply custom filters.
 
     This hook:
-    1. Inspects each test class for a 'config' attribute (TestConfig instance)
+    1. Inspects each test class for a 'config' attribute (BaseNeMoRLTest instance)
     2. Auto-generates pytest markers based on config values
     3. Applies custom filters based on command-line options
     """
     # Get filter options
+    model_class_filter = config.getoption("--class")
     algorithm_filter = config.getoption("--algorithm")
     backend_filter = config.getoption("--backend")
     suite_filter = config.getoption("--suite")
@@ -147,7 +56,6 @@ def pytest_collection_modifyitems(config, items):
     num_gpus_per_node_filter = config.getoption("--num-gpus-per-node")
     num_nodes_filter = config.getoption("--num-nodes")
     filter_expr = config.getoption("--filter")
-    model_class_filter = config.getoption("--class")
 
     filtered_items = []
 
@@ -199,19 +107,20 @@ def pytest_collection_modifyitems(config, items):
         if cfg.fsdp:
             item.add_marker(pytest.mark.parallelism_fsdp)
 
-        # Feature markers
-        if cfg.activation_checkpointing:
-            item.add_marker(pytest.mark.feature_activation_checkpointing)
+        # # Feature markers
+        # if cfg.activation_checkpointing:
+        #     item.add_marker(pytest.mark.feature_activation_checkpointing)
 
-        # Detect features from test_name
-        if "fp8" in cfg.test_name.lower():
-            item.add_marker(pytest.mark.feature_fp8)
-        if "dynamicbatch" in cfg.test_name.lower():
-            item.add_marker(pytest.mark.feature_dynamic_batch)
-        if "seqpack" in cfg.test_name.lower():
-            item.add_marker(pytest.mark.feature_sequence_packing)
-        if "noncolocated" in cfg.test_name.lower():
-            item.add_marker(pytest.mark.feature_non_colocated)
+        # TODO(ahmadki)
+        # # Detect features from test_name
+        # if "fp8" in cfg.test_name.lower():
+        #     item.add_marker(pytest.mark.feature_fp8)
+        # if "dynamicbatch" in cfg.test_name.lower():
+        #     item.add_marker(pytest.mark.feature_dynamic_batch)
+        # if "seqpack" in cfg.test_name.lower():
+        #     item.add_marker(pytest.mark.feature_sequence_packing)
+        # if "noncolocated" in cfg.test_name.lower():
+        #     item.add_marker(pytest.mark.feature_non_colocated)
 
         # === Apply custom filters ===
 
@@ -285,3 +194,99 @@ def _get_model_size_from_name(model_name: str) -> str:
 
     # Default to medium if we can't determine
     return "medium"
+
+
+# TODO(ahmadki)
+# @pytest.fixture
+# def project_root(tmp_path):
+#     """Return the project root directory."""
+#     import subprocess
+#     from pathlib import Path
+
+# TODO(ahmadki)
+#     result = subprocess.run(
+#         ["git", "rev-parse", "--show-toplevel"],
+#         capture_output=True,
+#         text=True,
+#         check=True,
+#     )
+#     return Path(result.stdout.strip())
+
+# TODO(ahmadki)
+# @pytest.fixture
+# def test_output_dir(tmp_path, request):
+#     """Create a temporary output directory for test artifacts.
+
+#     This fixture can be overridden by setting the TEST_OUTPUT_DIR environment variable
+#     to use a persistent directory instead of tmp_path.
+#     """
+#     import os
+#     from pathlib import Path
+
+#     output_dir = os.environ.get("TEST_OUTPUT_DIR")
+#     if output_dir:
+#         output_dir = Path(output_dir) / request.node.name
+#         output_dir.mkdir(parents=True, exist_ok=True)
+#         return output_dir
+#     return tmp_path
+
+
+# TODO(ahmadki)
+# @pytest.fixture
+# def skip_if_insufficient_gpus(request):
+#     """Skip test if insufficient GPUs are available."""
+#     import torch
+
+#     # Extract GPU requirement from markers
+#     required_gpus = None
+#     for marker in request.node.iter_markers():
+#         if marker.name.startswith("num_gpus_"):
+#             required_gpus = int(marker.name.split("_")[-1])
+#             break
+
+#     if required_gpus is not None:
+#         available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+#         if available_gpus < required_gpus:
+#             pytest.skip(
+#                 f"Test requires {required_gpus} GPUs but only {available_gpus} available"
+#             )
+
+
+# TODO(ahmadki)
+# @pytest.fixture(autouse=True)
+# def setup_git_safe_directory():
+#     """Mark all repos as safe in the test context.
+
+#     This is needed because wandb fetches metadata about the repo and it's a
+#     catch-22 to get the project root and mark it safe if you don't know the project root.
+#     """
+#     import subprocess
+
+#     subprocess.run(
+#         ["git", "config", "--global", "--add", "safe.directory", "*"],
+#         check=False,  # Don't fail if this doesn't work
+#     )
+
+# TODO(ahmadki)
+# @pytest.fixture
+# def env_vars():
+#     """Return environment variables needed for tests."""
+#     import os
+
+#     return {
+#         "HF_HOME": os.environ.get("HF_HOME"),
+#         "HF_DATASETS_CACHE": os.environ.get("HF_DATASETS_CACHE"),
+#         "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "1"),
+#         "HF_TOKEN": os.environ.get("RL_HF_TOKEN"),
+#         "WANDB_API_KEY": os.environ.get("WANDB_API_KEY"),
+#         "NRL_DEEPSCALER_8K_CKPT": os.environ.get("NRL_DEEPSCALER_8K_CKPT"),
+#         "NRL_DEEPSCALER_16K_CKPT": os.environ.get("NRL_DEEPSCALER_16K_CKPT"),
+#         "NRL_DEEPSCALER_24K_CKPT": os.environ.get("NRL_DEEPSCALER_24K_CKPT"),
+#     }
+
+
+# TODO(ahmadki)
+# @pytest.fixture
+# def use_slurm(request):
+#     """Return True if tests should be submitted to Slurm."""
+#     return request.config.getoption("--slurm")
