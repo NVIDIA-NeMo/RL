@@ -50,20 +50,25 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     # Model config
     #######################################################
     # The model hydra/YAML config (auto-derived from test_name if None)
-    config_yaml: Optional[str] = None
+    yaml_config: Optional[Path] = (
+        None  # The full config path, default to "examples/configs/recipes/{model_class}/{test_name}.yaml"
+    )
     overrides: Dict[str, Any] = field(default_factory=dict)
 
     #######################################################
-    # Run paths (computed from test_name if not provided)
+    # Run paths  # TODO(ahmadki): extract from yaml !!
     #######################################################
-    config_path: Optional[Path] = None
-    exp_dir: Optional[Path] = None
-    log_dir: Optional[Path] = None
-    ckpt_dir: Optional[Path] = None
-    run_log_path: Optional[Path] = None
+    exp_dir: Optional[Path] = (
+        None  # Base experiment directory, default to test file directory
+    )
+    log_dir: Optional[Path] = None  # Log directory, default to {exp_dir}/logs
+    ckpt_dir: Optional[Path] = None  # Checkpoint directory, default to {exp_dir}/ckpts
+    run_log_path: Optional[Path] = (
+        None  # Path to store run log, default to {exp_dir}/run.log
+    )
 
     #######################################################
-    # Computed fields
+    # Computed fields  # TODO(ahmadki): make private ?
     #######################################################
     # These fields are extracted from meta data, config yaml + overrides
     loaded_yaml_config: DictConfig = field(init=False, repr=False, default=None)
@@ -76,7 +81,7 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
     sequence_parallel: bool = field(init=False, default=False)
 
     def __post_init__(self):
-        # Get project root from git using the test file folder as starting location
+        # Get project root from git using this file folder (test_suites) as starting location
         self.project_root = Path(
             subprocess.check_output(
                 ["git", "rev-parse", "--show-toplevel"],
@@ -85,84 +90,52 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
             ).strip()
         )
 
-        # Get the file path of the caller (the test file that instantiated this config)
-        # We need to walk up the stack to find the first frame outside of this file
+        # Get the file path of the test file that instantiated this config
         caller_frame = None
         for frame_info in inspect.stack():
             frame_file = Path(frame_info.filename)
             if frame_file != Path(__file__) and "test_suites" in str(frame_file):
                 caller_frame = frame_file
                 break
-
-        # Store the test file directory for later use
         self.test_file_dir = (
             caller_frame.parent if caller_frame else Path(__file__).parent
         )
 
-        # Compute config path if not provided
-        if self.config_path is None:
-            # Use config_yaml if provided, otherwise derive from test_name
-            yaml_filename = (
-                self.config_yaml if self.config_yaml else f"{self.test_name}.yaml"
-            )
-
-            if caller_frame:
-                # Get the directory containing the test file
-                test_file_dir = caller_frame.parent
-                # Map from tests/test_suites/{tests/}llm/test_name to examples/configs/recipes/llm/
-                # The test structure can be either:
-                #   - tests/test_suites/llm/test_name/test_*.py (old structure)
-                #   - tests/test_suites/tests/llm/test_name/test_*.py (new structure)
-                # The config structure is: examples/configs/recipes/llm/test_name.yaml
-                # So we need to go up one level from the test file directory to get to llm/
-                relative_path = test_file_dir.relative_to(
-                    self.project_root / "tests" / "test_suites"
-                ).parent
-
-                # Remove the "tests" directory if present (for new test structure)
-                if relative_path.parts and relative_path.parts[0] == "tests":
-                    relative_path = Path(*relative_path.parts[1:])
-            else:
-                # Fallback: use current directory (where base_config.py is)
-                test_suite_path = Path(__file__).parent
-                relative_path = test_suite_path.relative_to(
-                    self.project_root / "tests" / "test_suites"
-                )
-
-            self.config_path = (
+        # Compute the yaml config path if not provided
+        if self.yaml_config is None:
+            self.yaml_config = (
                 self.project_root
                 / "examples"
                 / "configs"
                 / "recipes"
-                / relative_path
-                / yaml_filename
+                / self.model_class
+                / f"{self.test_name}.yaml"
             )
-
-            if not self.config_path.exists():
+            if not self.yaml_config.exists():
                 raise FileNotFoundError(
                     f"Config file not found: {self.config_path}. "
                     f"Expected to find it at the path derived from test name '{self.test_name}'"
                 )
+        else:
+            if not self.yaml_config.exists():
+                raise FileNotFoundError(f"Config file not found: {self.yaml_config}")
 
         # Loads YAML files with OmegaConf
-        self.loaded_yaml_config = load_config(self.config_path)
+        self.loaded_yaml_config = load_config(self.yaml_config)
 
-        # Apply overrides using Hydra's parser before extracting metadata
-        # This ensures metadata reflects the overridden values
+        # Apply overrides with Hydra's parser
         if self.overrides:
             override_strings = [f"{k}={v}" for k, v in self.overrides.items()]
             self.loaded_yaml_config = parse_hydra_overrides(
                 self.loaded_yaml_config, override_strings
             )
-
         # Extract metadata from YAML (after applying overrides)
         self._extract_metadata()
 
         # Validate configuration
         self.validate_config()
 
-        # Setup output directories
-        # Use the test file directory instead of base_config.py directory
+        # Test directories
         if self.exp_dir is None:
             self.exp_dir = self.test_file_dir
 
@@ -175,35 +148,21 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         if self.run_log_path is None:
             self.run_log_path = self.exp_dir / "run.log"
 
-        # Create directories
+        # Create directories  # TODO(ahmadki): move to run funtions
         self.exp_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     def _extract_metadata(self):
-        """Extract metadata from YAML configuration for filtering/classification.
-
-        Uses OmegaConf.select() for safer nested access with defaults.
-        """
-        # Extract model name
         self.model_name = self._extract_model_name()
-
-        # Detect backend
         self.backend = self._detect_backend()
-
-        # Extract cluster resources using OmegaConf.select() for safer access
-        self.num_nodes = OmegaConf.select(
-            self.loaded_yaml_config, "cluster.num_nodes", default=1
-        )
+        self.num_nodes = OmegaConf.select(self.loaded_yaml_config, "cluster.num_nodes")
         self.num_gpus_per_node = OmegaConf.select(
-            self.loaded_yaml_config, "cluster.gpus_per_node", default=8
+            self.loaded_yaml_config, "cluster.gpus_per_node"
         )
-
-        # Extract parallelism settings
         self._extract_parallelism()
 
     def _extract_model_name(self) -> str:
-        """Extract model name from YAML using OmegaConf.select()."""
         model_name = OmegaConf.select(
             self.loaded_yaml_config, "policy.model_name", default=""
         )
@@ -217,62 +176,63 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return model_name
 
     def _detect_backend(self) -> str:
-        """Detect backend from YAML structure using OmegaConf.select()."""
-        # Check for dtensor
         dtensor_enabled = OmegaConf.select(
             self.loaded_yaml_config, "policy.dtensor_cfg.enabled", default=False
         )
-        if dtensor_enabled:
-            return "dtensor"
-
-        # Check for megatron
         megatron_enabled = OmegaConf.select(
             self.loaded_yaml_config, "policy.megatron_cfg.enabled", default=False
         )
+
+        if dtensor_enabled and megatron_enabled:
+            raise ValueError(
+                "Both dtensor and megatron backends are enabled in the config. "
+                "Please enable only one."
+            )
+        if dtensor_enabled:
+            return "dtensor"
         if megatron_enabled:
             return "megatron"
-
         # Default to fsdp2
         return "fsdp2"
 
     def _extract_parallelism(self):
-        """Extract parallelism settings from YAML using OmegaConf.select()."""
-        # Try extracting from dtensor_cfg first
-        self.tensor_parallel = OmegaConf.select(
-            self.loaded_yaml_config,
-            "policy.dtensor_cfg.tensor_parallel_size",
-            default=None,
-        )
-        self.pipeline_parallel = OmegaConf.select(
-            self.loaded_yaml_config,
-            "policy.dtensor_cfg.pipeline_parallel_size",
-            default=None,
-        )
-        self.sequence_parallel = OmegaConf.select(
-            self.loaded_yaml_config,
-            "policy.dtensor_cfg.sequence_parallel",
-            default=False,
-        )
-
-        # If not found in dtensor_cfg, try megatron_cfg
-        if self.tensor_parallel is None:
+        backend = self._detect_backend()
+        if backend == "dtensor":
             self.tensor_parallel = OmegaConf.select(
                 self.loaded_yaml_config,
-                "policy.megatron_cfg.tensor_model_parallel_size",
+                "policy.dtensor_cfg.tensor_parallel_size",
                 default=None,
             )
-        if self.pipeline_parallel is None:
             self.pipeline_parallel = OmegaConf.select(
                 self.loaded_yaml_config,
-                "policy.megatron_cfg.pipeline_model_parallel_size",
+                "policy.dtensor_cfg.pipeline_parallel_size",
                 default=None,
             )
-        if not self.sequence_parallel:
             self.sequence_parallel = OmegaConf.select(
                 self.loaded_yaml_config,
-                "policy.megatron_cfg.sequence_parallel",
+                "policy.dtensor_cfg.sequence_parallel",
                 default=False,
             )
+        elif backend == "megatron":
+            # If not found in dtensor_cfg, try megatron_cfg
+            if self.tensor_parallel is None:
+                self.tensor_parallel = OmegaConf.select(
+                    self.loaded_yaml_config,
+                    "policy.megatron_cfg.tensor_model_parallel_size",
+                    default=None,
+                )
+            if self.pipeline_parallel is None:
+                self.pipeline_parallel = OmegaConf.select(
+                    self.loaded_yaml_config,
+                    "policy.megatron_cfg.pipeline_model_parallel_size",
+                    default=None,
+                )
+            if not self.sequence_parallel:
+                self.sequence_parallel = OmegaConf.select(
+                    self.loaded_yaml_config,
+                    "policy.megatron_cfg.sequence_parallel",
+                    default=False,
+                )
 
     def validate_config(self):
         """Validate the loaded configuration.
@@ -357,6 +317,46 @@ class NeMoRLTestConfig:  # TODO(ahmadki): use native policy dicts ?
         return os.environ.get("CI_JOB_ID", "local")
 
 
+class BaseNeMoRLTest:  # TODO(ahmadki): to a different file, then create a default test with folder overrides
+    """Base test class with common test methods for NeMo-RL tests.
+
+    All test classes should inherit from this class and define a `config` class attribute.
+    This provides the standard test_training_runs_successfully_local() and
+    test_training_runs_successfully_slurm() methods.
+
+    Example:
+        class TestMyTraining(BaseNeMoRLTest):
+            config = NeMoRLTestConfig(
+                test_name="my-test",
+                algorithm="sft",
+                test_suites=["nightly"],
+                time_limit_minutes=120,
+            )
+    """
+
+    config: NeMoRLTestConfig  # Must be defined by subclass
+
+    def test_train_local(self):
+        """Test that training completes successfully when run locally."""
+        cmd = self.config.build_command()
+        return_code = run_command(
+            cmd, self.config.run_log_path, cwd=self.config.project_root
+        )
+
+        assert return_code == 0, (
+            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
+        )
+
+    def test_train_slurm(self, request):
+        """Test that training completes successfully when run via Slurm."""
+        return_code = run_via_slurm(self.config, request.node.nodeid)
+
+        assert return_code == 0, (
+            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
+        )
+
+
+# TODO(ahmadki): make part of BaseNeMoRLTest ?
 def run_command(cmd: List[str], log_file: Path, cwd: Optional[Path] = None) -> int:
     """Run a command and log output to a file.
 
@@ -468,42 +468,3 @@ def run_via_slurm(config: NeMoRLTestConfig, pytest_nodeid: str) -> int:
     # Run the launch script
     result = subprocess.run(launch_cmd, cwd=config.project_root)
     return result.returncode
-
-
-class BaseNeMoRLTest:
-    """Base test class with common test methods for NeMo-RL tests.
-
-    All test classes should inherit from this class and define a `config` class attribute.
-    This provides the standard test_training_runs_successfully_local() and
-    test_training_runs_successfully_slurm() methods.
-
-    Example:
-        class TestMyTraining(BaseNeMoRLTest):
-            config = NeMoRLTestConfig(
-                test_name="my-test",
-                algorithm="sft",
-                test_suites=["nightly"],
-                time_limit_minutes=120,
-            )
-    """
-
-    config: NeMoRLTestConfig  # Must be defined by subclass
-
-    def test_train_local(self):
-        """Test that training completes successfully when run locally."""
-        cmd = self.config.build_command()
-        return_code = run_command(
-            cmd, self.config.run_log_path, cwd=self.config.project_root
-        )
-
-        assert return_code == 0, (
-            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
-        )
-
-    def test_train_slurm(self, request):
-        """Test that training completes successfully when run via Slurm."""
-        return_code = run_via_slurm(self.config, request.node.nodeid)
-
-        assert return_code == 0, (
-            f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
-        )
