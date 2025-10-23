@@ -19,8 +19,8 @@ from typing import List, Optional
 
 import pytest
 
-from .base_config import NeMoRLTestConfig
-from .job_dependencies import JobDependencies
+from .types.base_config import NeMoRLTestConfig
+from .types.job_dependencies import JobDependencies
 
 # Default job dependencies: validation stage depends on training stage
 DEFAULT_JOB_DEPENDENCIES = JobDependencies(

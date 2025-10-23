@@ -14,8 +14,8 @@
 
 import pytest
 
-from tests.test_suites.base_config import NeMoRLTestConfig
-from tests.test_suites.base_test import BaseNeMoRLTest
+from tests.test_suites.utils.base_test import BaseNeMoRLTest
+from tests.test_suites.utils.types.base_config import NeMoRLTestConfig
 
 
 class TestDistillationQwen332bTo4bBase1n8gFsdp2tp2DynamicbatchV1(BaseNeMoRLTest):
