@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, cast
 
 from omegaconf import OmegaConf
 
+OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import DTensorConfig, MegatronConfig, PolicyConfig
