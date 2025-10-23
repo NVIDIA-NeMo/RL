@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Union
+
+import numpy as np
+import torch
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
@@ -31,6 +35,25 @@ MasterConfigUnion = Union[
     RMMasterConfig,
 ]
 
+# Functional testing types
+TensorLike = Union[np.ndarray, torch.Tensor, List, float, int]
+
+
+@dataclass
+class StatResult:
+    """Output of a reducer (pure statistics; no pass/fail)."""
+
+    results: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CriterionResult:
+    """Judgment after applying a Criterion to a StatResult."""
+
+    passed: bool
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
 __all__ = [
     "Algorithm",
     "ModelClass",
@@ -41,4 +64,7 @@ __all__ = [
     "GRPOMasterConfig",
     "RMMasterConfig",
     "SFTMasterConfig",
+    "TensorLike",
+    "StatResult",
+    "CriterionResult",
 ]

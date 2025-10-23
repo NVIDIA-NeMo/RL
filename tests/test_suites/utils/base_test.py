@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -33,8 +34,8 @@ class BaseNeMoRLTest:
     DefaultNeMoRLTestConfig to get standard test overrides automatically applied.
 
     Pytest Markers:
-        - @pytest.mark.runner("local"): Run only local tests
-        - @pytest.mark.runner("slurm"): Run only Slurm tests
+        - @pytest.mark.runner("local"): Run tests locally
+        - @pytest.mark.runner("slurm"): Run tests on slurm
         - @pytest.mark.stage("stage_name"): Associate test with a pipeline stage
         - @pytest.mark.job_group("group_name"): Associate test with a job group
 
@@ -343,3 +344,65 @@ class BaseNeMoRLTest:
         assert return_code == 0, (
             f"Training failed with return code {return_code}. Check {self.config.run_log_path}"
         )
+
+    # Functional testing methods from BaseFunctionalTest
+    @pytest.fixture(scope="class")
+    def golden_data(self, request):
+        """Load golden reference data from JSON file.
+
+        Looks for data in the same directory as the test file (data/golden.json).
+        """
+        test_file = Path(request.node.fspath)
+        data_path = test_file.parent / "data" / "golden.json"
+
+        with open(data_path, "r") as f:
+            return json.load(f)
+
+    @pytest.fixture(scope="class")
+    def experiment_data(self, request):
+        """Load experiment data from JSON file.
+
+        Looks for data in the same directory as the test file (data/experiment.json).
+        """
+        test_file = Path(request.node.fspath)
+        data_path = test_file.parent / "data" / "experiment.json"
+
+        with open(data_path, "r") as f:
+            return json.load(f)
+
+    def get_metric_arrays(
+        self,
+        golden_data,
+        experiment_data,
+        metric_key: str,
+    ):
+        """Extract arrays for a specific metric from both datasets."""
+        import numpy as np
+
+        if metric_key not in golden_data:
+            raise KeyError(f"Metric '{metric_key}' not found in golden data")
+        if metric_key not in experiment_data:
+            raise KeyError(f"Metric '{metric_key}' not found in experiment data")
+
+        ref_dict = golden_data[metric_key]
+        exp_dict = experiment_data[metric_key]
+
+        # Convert to arrays of values (sorted by timestep)
+        ref_values = [ref_dict[str(k)] for k in sorted(map(int, ref_dict.keys()))]
+        exp_values = [exp_dict[str(k)] for k in sorted(map(int, exp_dict.keys()))]
+
+        return np.array(ref_values), np.array(exp_values)
+
+    def validate_data_completeness(self, golden_data, experiment_data) -> None:
+        """Validate that both datasets have the same metrics available."""
+        golden_keys = set(golden_data.keys())
+        experiment_keys = set(experiment_data.keys())
+
+        # Check that all golden metrics exist in experiment
+        missing_in_exp = golden_keys - experiment_keys
+        extra_in_exp = experiment_keys - golden_keys
+
+        if missing_in_exp:
+            raise AssertionError(f"Missing metrics in experiment: {missing_in_exp}")
+        if extra_in_exp:
+            raise AssertionError(f"Extra metrics in experiment: {extra_in_exp}")
