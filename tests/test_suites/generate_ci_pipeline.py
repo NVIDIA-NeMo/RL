@@ -205,15 +205,12 @@ def _build_job(
     # Join commands with && for TEST_SCRIPT and add quotes
     test_script = " && ".join(commands)
 
-    # Format TIME as "minutes:0"
-    time_string = f"{config.time_limit_minutes}:0"
-
     job = {
         "variables": {
             "MODULE": module,
             "TEST_NAME": job_name,
-            "TEST_SCRIPT": f'"{test_script}"',
-            "TIME": time_string,
+            "TEST_SCRIPT": f"{test_script}",
+            "TIME": f"{config.time_limit_minutes}:0",
             "NUM_NODES": config.num_nodes,
         },
         "script": commands,
