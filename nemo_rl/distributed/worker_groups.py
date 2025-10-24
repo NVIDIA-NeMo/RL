@@ -554,6 +554,7 @@ class RayWorkerGroup:
                         "worker_idx": worker_idx,
                         "node_idx": pg_idx,
                         "local_rank": local_rank,
+                        "bundle_idx": bundle_idx,
                         "global_rank": global_rank,
                         "name": name,
                         "bundle_indices": worker_bundle_indices,
@@ -581,12 +582,78 @@ class RayWorkerGroup:
                 {
                     "node_idx": info["node_idx"],
                     "local_rank": info["local_rank"],
+                    "bundle_idx": info["bundle_idx"],
                     "global_rank": info["global_rank"],
                     "name": info["name"],
                     "bundle_indices": info["bundle_indices"],
                     "dp_shard_idx": info["group_idx"],
                 }
             )
+
+        self._print_worker_to_node_gpu_mapping()
+
+    def _print_worker_to_node_gpu_mapping(self) -> None:
+        """Print mapping from workers to physical nodes and GPU indices."""
+        try:
+            print("================================================", flush=True)
+            print("Printing worker-to-node GPU mapping...", flush=True)
+            print("================================================", flush=True)
+            placement_groups = self.cluster.get_placement_groups()
+            # Build PG -> bundle_idx -> node_id map
+            pg_bundle_to_node: dict[int, dict[int, str]] = {}
+            for i, pg in enumerate(placement_groups):
+                try:
+                    pg_table = ray.util.placement_group_table(pg)
+                    pg_bundle_to_node[i] = pg_table.get("bundles_to_node_id", {})
+                except Exception:
+                    pg_bundle_to_node[i] = {}
+
+            # Map ray node_id -> ip for readability
+            node_id_to_ip: dict[str, str] = {}
+            try:
+                for node in ray.nodes():
+                    node_id_to_ip[node.get("NodeID", "")] = node.get(
+                        "NodeManagerAddress", "unknown"
+                    )
+            except Exception:
+                pass
+
+            # Determine role label from cluster name
+            role = "Worker"
+            cname = getattr(self.cluster, "name", "").lower()
+            if "train" in cname:
+                role = "Training"
+            elif "inference" in cname or "policy" in cname:
+                role = "Generation"
+
+            # Group workers by physical node
+            node_to_workers: dict[str, list[tuple[int, int, str]]] = {}
+            for meta in self._worker_metadata:
+                pg_idx = int(meta.get("node_idx", 0))
+                bundle_idx = int(meta.get("bundle_idx", meta.get("local_rank", 0)))
+                global_rank = int(meta.get("global_rank", 0))
+                node_id = pg_bundle_to_node.get(pg_idx, {}).get(bundle_idx, "unknown")
+                node_to_workers.setdefault(node_id, []).append(
+                    (global_rank, bundle_idx, meta.get("name", f"{role}-{global_rank}"))
+                )
+
+            # Stable ordering by node IP then ranks
+            for node_id in sorted(
+                node_to_workers.keys(), key=lambda nid: node_id_to_ip.get(nid, nid)
+            ):
+                ip = node_id_to_ip.get(node_id, node_id)
+                print(f"{role} Node {ip}:", flush=True)
+                # Pretty tree-like printing
+                workers_sorted = sorted(node_to_workers[node_id], key=lambda t: t[0])
+                for i, (global_rank, bundle_idx, _) in enumerate(workers_sorted):
+                    connector = "└─" if i == len(workers_sorted) - 1 else "├─"
+                    print(
+                        f"  {connector} {role} worker {global_rank} → bundle {bundle_idx}",
+                        flush=True,
+                    )
+            print("================================================", flush=True)
+        except Exception:
+            pass
 
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:
