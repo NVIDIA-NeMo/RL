@@ -321,7 +321,7 @@ def stream_weights_via_ipc_zmq_impl(
         """Pack tensor into buffer and return new used_bytes."""
         tensor_bytes = tensor.nbytes
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
-            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+            tensor.data.view(-1).view(dtype=torch.uint8)
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 

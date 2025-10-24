@@ -1954,7 +1954,8 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching,
+            reuse_buffer_from_cache=True,
         )
 
         # Use the shared implementation
