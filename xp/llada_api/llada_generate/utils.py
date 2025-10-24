@@ -69,13 +69,18 @@ class LeftPaddingStripWrapper(nn.Module):
         .device for Fast-dLLM, etc.) are accessible through the wrapper.
         """
         # Avoid recursion for our own attributes
-        if name in ['model', 'pad_token_id', '_forward_attrs', '_modules', '_parameters', '_buffers']:
-            return object.__getattribute__(self, name)
+        # Note: 'model' should NOT be in this list because it's set in __init__
+        # and should be accessed normally via object.__getattribute__
+        if name in ['pad_token_id', '_forward_attrs']:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         
-        # Forward to wrapped model
+        # Try to get from wrapped model first
         try:
-            return getattr(self.model, name)
+            # Use object.__getattribute__ to avoid infinite recursion
+            wrapped_model = object.__getattribute__(self, 'model')
+            return getattr(wrapped_model, name)
         except AttributeError:
+            # If not found in wrapped model, raise error
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
     
     def strip_left_padding(self, input_ids: torch.Tensor) -> torch.Tensor:
