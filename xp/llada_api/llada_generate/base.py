@@ -31,6 +31,7 @@ class GenerationAlgorithm(ABC):
         self.model: Optional[PreTrainedModel] = None
         self.tokenizer: Optional[PreTrainedTokenizer] = None
         self.device: Optional[str] = None
+        self.device_ids: Optional[List[int]] = None  # For multi-GPU DataParallel
         self.model_config: Optional[Any] = None
         self.model_type: Optional[str] = None  # 'llada' or 'nemotron'
         self.use_chat_template: bool = True  # Whether to use chat template (default: True)
@@ -89,13 +90,15 @@ class GenerationAlgorithm(ABC):
         """
         pass
     
-    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None) -> bool:
+    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None, device_ids: Optional[List[int]] = None) -> bool:
         """
         Load model from HuggingFace format.
         
         Args:
             model_path: Path to HuggingFace model (local or remote)
             model_type: Optional model type override ('llada' or 'nemotron')
+            device_ids: Optional list of GPU device IDs for multi-GPU (e.g., [0, 1, 2, 3])
+                       If None, uses single GPU. If provided, uses DataParallel.
             
         Returns:
             True if successful, False otherwise
@@ -117,8 +120,16 @@ class GenerationAlgorithm(ABC):
             logger.info(f"Using specified model type '{model_type}' for {path_type}: {model_path}")
         
         try:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            logger.info(f"Using device: {self.device}")
+            # Multi-GPU setup
+            if device_ids is not None and len(device_ids) > 1:
+                self.device_ids = device_ids
+                self.device = f'cuda:{device_ids[0]}'  # Primary device
+                logger.info(f"Multi-GPU mode enabled with {len(device_ids)} GPUs: {device_ids}")
+                logger.info(f"Primary device: {self.device}")
+            else:
+                self.device_ids = None
+                self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                logger.info(f"Using single device: {self.device}")
             
             # Load tokenizer
             logger.info("Loading tokenizer...")
@@ -128,6 +139,12 @@ class GenerationAlgorithm(ABC):
             logger.info("Loading model...")
             self.model = self.load_model_class(model_path, torch_dtype=torch.bfloat16)
             self.model = self.model.to(self.device).eval()
+            
+            # Wrap with DataParallel for multi-GPU
+            if self.device_ids is not None and len(self.device_ids) > 1:
+                logger.info(f"Wrapping model with DataParallel for devices: {self.device_ids}")
+                self.model = torch.nn.DataParallel(self.model, device_ids=self.device_ids)
+                logger.info(f"✓ Model distributed across {len(self.device_ids)} GPUs")
             
             # Load config
             logger.info("Loading model config...")
@@ -141,7 +158,7 @@ class GenerationAlgorithm(ABC):
             logger.error(f"Failed to load model from {path_type} '{model_path}': {e}")
             return False
     
-    def load_model_from_dcp(self, dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted") -> bool:
+    def load_model_from_dcp(self, dcp_path: str, base_model: str, temp_dir: str = "/tmp/model_hf_converted", device_ids: Optional[List[int]] = None) -> bool:
         """
         Load model from DCP checkpoint by converting to HF format first.
         
@@ -149,6 +166,7 @@ class GenerationAlgorithm(ABC):
             dcp_path: Path to DCP checkpoint
             base_model: Base model name for conversion
             temp_dir: Temporary directory for conversion
+            device_ids: Optional list of GPU device IDs for multi-GPU (e.g., [0, 1, 2, 3])
             
         Returns:
             True if successful, False otherwise
@@ -208,7 +226,7 @@ class GenerationAlgorithm(ABC):
                 logger.info(f"Detected LLaDA model from base model: {base_model}")
             
             # Load from converted HF format
-            return self.load_model_from_hf(hf_path, model_type=model_type)
+            return self.load_model_from_hf(hf_path, model_type=model_type, device_ids=device_ids)
             
         except Exception as e:
             logger.error(f"Failed to convert or load DCP checkpoint: {e}")

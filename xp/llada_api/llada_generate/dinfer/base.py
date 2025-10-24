@@ -65,14 +65,19 @@ class DInferGeneration(GenerationAlgorithm):
                 "dInfer is not available. Please install dInfer or use Fast-dLLM algorithms instead."
             )
     
-    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None) -> bool:
+    def load_model_from_hf(self, model_path: str, model_type: Optional[str] = None, device_ids: Optional[list[int]] = None) -> bool:
         """
         Load model from HuggingFace format and create diffusion LLM wrapper.
         
         Extends parent method to also create the dInfer diffusion LLM wrapper.
+        
+        Note: dInfer's BlockWiseDiffusionLLM is not an nn.Module, so we can't wrap it
+        with DataParallel. Instead, we wrap the base model, and dInfer's code already
+        handles DataParallel-wrapped models (see BlockWiseDiffusionLLMCont line 133-136).
         """
         # Call parent to load model, tokenizer, config
-        success = super().load_model_from_hf(model_path, model_type)
+        # Let parent handle DataParallel wrapping of the base model
+        success = super().load_model_from_hf(model_path, model_type, device_ids=device_ids)
         
         if success:
             # Ensure tokenizer has pad token for batching
@@ -82,9 +87,15 @@ class DInferGeneration(GenerationAlgorithm):
                 logger.info("Set pad_token to eos_token for batch padding")
             
             # Create the diffusion LLM wrapper
+            # If self.model is DataParallel-wrapped, dInfer will handle it correctly
             try:
                 self.diffusion_llm = self.create_diffusion_llm()
                 logger.info(f"Created dInfer diffusion LLM wrapper: {type(self.diffusion_llm).__name__}")
+                
+                # Log multi-GPU status if applicable
+                if device_ids is not None and len(device_ids) > 1:
+                    logger.info(f"✓ dInfer will use DataParallel-wrapped model across {len(device_ids)} GPUs")
+                    
             except Exception as e:
                 logger.error(f"Failed to create diffusion LLM wrapper: {e}")
                 return False

@@ -72,7 +72,8 @@ def load_model_with_engine(
     temp_dir: str = "/tmp/model_hf_converted", 
     engine: str = "fast-dllm",
     algorithm_name: str = None,
-    use_chat_template: bool = True
+    use_chat_template: bool = True,
+    device_ids: Optional[List[int]] = None
 ):
     """
     Load model using the specified inference engine.
@@ -91,6 +92,7 @@ def load_model_with_engine(
         engine: Inference engine to use ('fast-dllm', 'dinfer', 'nemotron', 'hf')
         algorithm_name: Specific algorithm within engine (optional, uses default if not specified)
         use_chat_template: Whether to use chat template (affects Nemotron shift_logits)
+        device_ids: Optional list of GPU device IDs for multi-GPU (e.g., [0, 1, 2, 3])
         
     Returns:
         True if successful, False otherwise
@@ -136,9 +138,9 @@ def load_model_with_engine(
     # Load the model using the algorithm
     try:
         if model_path:
-            success = algorithm.load_model_from_hf(model_path)
+            success = algorithm.load_model_from_hf(model_path, device_ids=device_ids)
         elif dcp_path:
-            success = algorithm.load_model_from_dcp(dcp_path, base_model, temp_dir)
+            success = algorithm.load_model_from_dcp(dcp_path, base_model, temp_dir, device_ids=device_ids)
         else:
             logger.error("Either model_path or dcp_path must be provided")
             return False
@@ -195,6 +197,7 @@ def _load_other_algorithms_same_engine(source_algorithm: GenerationAlgorithm):
         algo.model = source_algorithm.model
         algo.tokenizer = source_algorithm.tokenizer
         algo.device = source_algorithm.device
+        algo.device_ids = source_algorithm.device_ids
         algo.model_config = source_algorithm.model_config
         algo.model_type = source_algorithm.model_type
         algo.use_chat_template = source_algorithm.use_chat_template
@@ -774,11 +777,29 @@ async def health_check():
             'loaded': loaded_engine == engine
         }
     
+    # Multi-GPU info
+    multi_gpu_info = {}
+    if default_algorithm and default_algorithm.device_ids and len(default_algorithm.device_ids) > 1:
+        multi_gpu_info = {
+            "enabled": True,
+            "num_gpus": len(default_algorithm.device_ids),
+            "device_ids": default_algorithm.device_ids,
+            "primary_device": default_algorithm.device
+        }
+    else:
+        multi_gpu_info = {
+            "enabled": False,
+            "num_gpus": 1,
+            "device_ids": None,
+            "primary_device": default_algorithm.device if default_algorithm else None
+        }
+    
     return {
         "status": "healthy",
         "model_loaded": default_algorithm is not None and default_algorithm.model is not None,
         "model_type": model_type,
         "device": default_algorithm.device if default_algorithm else None,
+        "multi_gpu": multi_gpu_info,
         "engine": loaded_engine,
         "default_algorithm": default_algorithm.name if default_algorithm else None,
         "batch_processor_active": batch_processor is not None,
@@ -864,6 +885,8 @@ Examples:
                        help="Enable verbose debug logging (very verbose, use for troubleshooting)")
     parser.add_argument("--no-chat-template", action="store_true",
                        help="Disable chat template application (feed raw text to tokenizer)")
+    parser.add_argument("--gpus", type=int, default=None,
+                       help="Number of GPUs to use for multi-GPU inference (e.g., 4 to use GPUs 0-3). If not specified, uses single GPU.")
     
     args = parser.parse_args()
     
@@ -873,6 +896,35 @@ Examples:
         logger.info("🔍 VERBOSE MODE ENABLED - Logging will be very verbose!")
     else:
         logging.getLogger().setLevel(logging.INFO)
+    
+    # Parse GPU count for multi-GPU
+    device_ids = None
+    if args.gpus:
+        num_gpus = args.gpus
+        
+        # Validate GPU availability
+        if not torch.cuda.is_available():
+            logger.error("CUDA is not available. Cannot use multi-GPU mode.")
+            return
+        
+        num_gpus_available = torch.cuda.device_count()
+        if num_gpus > num_gpus_available:
+            logger.error(f"Requested {num_gpus} GPUs but only {num_gpus_available} GPUs are available.")
+            return
+        
+        if num_gpus < 1:
+            logger.error(f"Number of GPUs must be at least 1, got {num_gpus}")
+            return
+        
+        # Create device IDs list: [0, 1, 2, ..., num_gpus-1]
+        device_ids = list(range(num_gpus))
+        
+        if num_gpus == 1:
+            logger.warning(f"Only one GPU specified. Multi-GPU benefits require 2+ GPUs.")
+            device_ids = None  # Use single GPU mode for consistency
+        else:
+            logger.info(f"Multi-GPU mode: using {num_gpus} GPUs {device_ids}")
+            logger.info(f"✓ Multi-GPU validation passed: {num_gpus} GPUs will be used")
     
     # Detect model type
     detected_model_type = detect_model_type(
@@ -915,7 +967,8 @@ Examples:
         temp_dir=args.temp_dir,
         engine=args.engine,
         algorithm_name=args.algorithm,
-        use_chat_template=not args.no_chat_template
+        use_chat_template=not args.no_chat_template,
+        device_ids=device_ids
     )
     
     if not success:
@@ -943,6 +996,12 @@ Examples:
     logger.info(f"Engine: {loaded_engine}")
     logger.info(f"Default algorithm: {default_algorithm.name if default_algorithm else 'None'}")
     logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
+    if device_ids and len(device_ids) > 1:
+        logger.info(f"🚀 Multi-GPU mode: Using {len(device_ids)} GPUs {device_ids}")
+    elif device_ids and len(device_ids) == 1:
+        logger.info(f"Single GPU mode: Using GPU {device_ids[0]}")
+    else:
+        logger.info(f"Single GPU mode: Using default GPU")
     if args.no_chat_template:
         logger.info("Chat template disabled - using raw text input")
     else:
