@@ -95,10 +95,14 @@ show_usage() {
     echo "  --verbose               Enable verbose debug logging (helpful for troubleshooting)"
     echo "  --no-chat-template      Disable chat template application (feed raw text to tokenizer)"
     echo ""
+    echo "GPU Options:"
+    echo "  --gpus NUM              Number of GPUs (default: $GPUS_PER_NODE)"
+    echo "                          If NUM > 1: automatically enables multi-GPU mode with load balancing"
+    echo "                          If NUM = 1: runs standard single-GPU server"
+    echo ""
     echo "SLURM Job Options (ignored with --local):"
     echo "  --job-name NAME         SLURM job name (default: $JOB_NAME)"
     echo "  --time TIME             Job time limit (default: $TIME)"
-    echo "  --gpus NUM              GPUs per node (default: $GPUS_PER_NODE)"
     echo "  --cpus NUM              CPUs per task (default: $CPUS_PER_TASK)"
     echo "  --mem SIZE              Memory per node (default: $MEM)"
     echo "  --partition PART        SLURM partition (default: $PARTITION)"
@@ -129,9 +133,17 @@ show_usage() {
     echo "  # SLURM with DCP checkpoint"
     echo "  $0 --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct"
     echo ""
+    echo "  # Multi-GPU mode (auto-enabled when --gpus > 1)"
+    echo "  $0 --local --gpus 4 --model-path GSAI-ML/LLaDA-8B-Instruct"
+    echo ""
+    echo "  # Multi-GPU on SLURM"
+    echo "  export ACCOUNT=your_account"
+    echo "  $0 --gpus 8 --model-path GSAI-ML/LLaDA-8B-Instruct"
+    echo ""
     echo "Performance Tips:"
     echo "  • Engine auto-selects dInfer for LLaDA (10x+ faster than fast-dllm)"
     echo "  • Batch server provides additional 3-5x speedup for evaluation workloads"
+    echo "  • Multi-GPU mode (--gpus > 1) scales linearly with load balancing"
     echo "  • Increase --batch-size for higher throughput (requires more GPU memory)"
     echo "  • Decrease --max-wait-time for lower latency"
     echo "  • Use --streaming only if you need real-time streaming responses"
@@ -726,7 +738,73 @@ fi
 echo "=============================================================="
 echo
 
-# Execute based on mode
+# Check if multi-GPU mode should be enabled (automatically when GPUs > 1)
+if [[ "$GPUS_PER_NODE" -gt 1 ]]; then
+    # Redirect to multi-GPU scripts
+    print_status "Multi-GPU mode enabled (${GPUS_PER_NODE} GPUs) - delegating to multi-GPU launcher"
+    
+    # Build arguments to pass through
+    MULTI_GPU_ARGS=""
+    
+    if [[ -n "$MODEL_PATH" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --model-path '$MODEL_PATH'"
+    fi
+    
+    if [[ -n "$DCP_PATH" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --dcp-path '$DCP_PATH'"
+    fi
+    
+    if [[ -n "$BASE_MODEL" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --base-model '$BASE_MODEL'"
+    fi
+    
+    if [[ -n "$ENGINE" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --engine '$ENGINE'"
+    fi
+    
+    if [[ -n "$ALGORITHM" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --algorithm '$ALGORITHM'"
+    fi
+    
+    MULTI_GPU_ARGS="$MULTI_GPU_ARGS --num-gpus $GPUS_PER_NODE"
+    MULTI_GPU_ARGS="$MULTI_GPU_ARGS --port $PORT"
+    MULTI_GPU_ARGS="$MULTI_GPU_ARGS --batch-size $BATCH_SIZE"
+    MULTI_GPU_ARGS="$MULTI_GPU_ARGS --max-wait-time $MAX_WAIT_TIME"
+    
+    if [[ "$VERBOSE" == true ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --verbose"
+    fi
+    
+    if [[ "$NO_CHAT_TEMPLATE" == true ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --no-chat-template"
+    fi
+    
+    # Determine which multi-GPU script to use
+    if [[ "$LOCAL_MODE" == true ]]; then
+        # Local multi-GPU mode
+        MULTI_GPU_SCRIPT="$SCRIPT_DIR/start_multi_gpu_server.sh"
+        print_status "Launching local multi-GPU server with $GPUS_PER_NODE GPUs"
+        eval "$MULTI_GPU_SCRIPT $MULTI_GPU_ARGS"
+    else
+        # SLURM multi-GPU mode
+        MULTI_GPU_SCRIPT="$SCRIPT_DIR/start_multi_gpu_slurm.sh"
+        
+        # Add SLURM-specific args
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --job-name '$JOB_NAME'"
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --time '$TIME'"
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --cpus $CPUS_PER_TASK"
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --mem '$MEM'"
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --partition '$PARTITION'"
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --container '$CONTAINER_IMAGE'"
+        
+        print_status "Launching SLURM multi-GPU server with $GPUS_PER_NODE GPUs"
+        eval "$MULTI_GPU_SCRIPT $MULTI_GPU_ARGS"
+    fi
+    
+    exit 0
+fi
+
+# Execute based on mode (single GPU)
 if [[ "$LOCAL_MODE" == true ]]; then
     run_local
 else
