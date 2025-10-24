@@ -1851,12 +1851,13 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
             "attention_mask": attention_mask,
             "labels": labels,
             "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones_like(input_ids),
         }
     )
     
     # Test configurations: (num_gpus, tp, pp, description)
     test_configs = [
-        (1, 1, 1, "DP1TP1")
+        (1, 1, 1, "DP1TP1"),
         (2, 1, 1, "DP2"),  # Data parallel with 2 GPUs
         (2, 2, 1, "TP2"),  # Tensor parallel with 2 GPUs
     ]
@@ -1895,7 +1896,7 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
         )
         
         # Use SimpleLoss for consistent comparison
-        loss_fn = SimpleLoss()
+        loss_fn = NLLLoss()
         
         try:
             # Prepare for training
@@ -1932,6 +1933,8 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
     print("\n=== Comparing gradient norms across configurations ===")
     
     # Get reference values from DP2 configuration
+    # NOTE: even if TP2 config passes these tests, it doesn't necessarily imply
+    # there are no bugs. Sometimes bugs with grad norm are hard to catch.
     reference_config = "DP1TP1"
     reference_grad_norm = grad_norms[reference_config]
     reference_loss = losses[reference_config]

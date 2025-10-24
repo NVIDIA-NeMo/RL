@@ -664,7 +664,12 @@ class MegatronPolicyWorker:
         ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
         ## on the TP-sharded parameters.
         model_cfg.calculate_per_token_loss = True
-        model_cfg.perform_initialization = True
+        model_cfg.perform_initialization = False
+
+        assert (
+           "aux_loss" not in self.model_cfg.moe_router_load_balancing_type or
+           self.model_cfg.moe_aux_loss_coeff == 0
+        ), "MoE aux loss is currently not supported due to a known but in Megatron-LM. See ## TODO: link to GH issue"
 
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
@@ -711,10 +716,6 @@ class MegatronPolicyWorker:
             ),
         )
         self.megatron_cfg.validate()
-        assert (
-           "aux_loss" not in self.megatron_cfg.moe_router_load_balancing_type or 
-           self.megatron_cfg.moe_aux_loss_coeff == 0
-        ), "MoE aux loss is currently not supported due to a known but in Megatron-LM. See ## TODO: link to GH issue"
         (
             self.mcore_state,
             self.model,
