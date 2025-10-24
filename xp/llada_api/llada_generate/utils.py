@@ -163,10 +163,18 @@ class LeftPaddingStripWrapper(nn.Module):
     
     def generate(self, prompt: torch.Tensor, *args, **kwargs):
         """
-        Generation method with automatic left-padding stripping.
+        Generation method with automatic left-padding stripping and re-padding.
         
         Some models (like dInfer diffusion_llm) use a .generate() method instead of
         forward(). We intercept this as well.
+        
+        This method:
+        1. Strips left-padding from the prompt before generation
+        2. Calls the model's generate method with stripped prompt
+        3. Re-adds the padding tokens to the output to match original prompt length
+        
+        This ensures the output shape matches what the caller expects based on
+        the original (padded) prompt length.
         
         Args:
             prompt: Input prompt tensor (potentially with left-padding)
@@ -174,11 +182,55 @@ class LeftPaddingStripWrapper(nn.Module):
             **kwargs: Additional keyword arguments
             
         Returns:
-            Generated output
+            Generated output with padding tokens prepended to match original prompt length
         """
+        # Track original prompt shape
+        original_prompt_length = prompt.shape[1]
+        
         # Strip left-padding if needed
         stripped_prompt = self.strip_left_padding(prompt)
+        stripped_prompt_length = stripped_prompt.shape[1]
+        
+        # Calculate how many padding tokens were stripped
+        num_padding_tokens = original_prompt_length - stripped_prompt_length
         
         # Forward to the model's generate method
-        return self.model.generate(stripped_prompt, *args, **kwargs)
+        output = self.model.generate(stripped_prompt, *args, **kwargs)
+        
+        # Handle tuple return (e.g., Nemotron returns (output_ids, nfe))
+        if isinstance(output, tuple):
+            output_ids, *extra = output
+            is_tuple_output = True
+        else:
+            output_ids = output
+            is_tuple_output = False
+        
+        # If we stripped padding, we need to re-add it to the output
+        if num_padding_tokens > 0:
+            # output_ids shape: (batch_size, prompt_length + generated_length)
+            # We need to prepend num_padding_tokens padding tokens
+            batch_size = output_ids.shape[0]
+            
+            # Create padding tokens to prepend
+            padding = torch.full(
+                (batch_size, num_padding_tokens),
+                self.pad_token_id,
+                dtype=output_ids.dtype,
+                device=output_ids.device
+            )
+            
+            # Prepend padding to output
+            output_ids = torch.cat([padding, output_ids], dim=1)
+            
+            logger.debug(
+                f"[GPU {torch.cuda.current_device() if torch.cuda.is_available() else 'CPU'}] "
+                f"Re-added {num_padding_tokens} padding tokens to output: "
+                f"stripped output shape -> padded output shape"
+            )
+        
+        # Return in the same format as received
+        if is_tuple_output:
+            return (output_ids, *extra)
+        else:
+            return output_ids
 
