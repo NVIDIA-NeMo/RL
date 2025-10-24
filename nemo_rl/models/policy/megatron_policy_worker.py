@@ -664,6 +664,21 @@ class MegatronPolicyWorker:
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
         )
 
+        ## These settings are required for correct gradient computations in mcore
+        ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
+        ## so we handle the scaling in nemo-rl.
+        ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
+        ## on the TP-sharded parameters.
+        model_cfg.calculate_per_token_loss = True
+        model_cfg.perform_initialization = False
+
+        assert (
+            "aux_loss" not in self.model_cfg.moe_router_load_balancing_type
+            or self.model_cfg.moe_aux_loss_coeff == 0
+        ), (
+            "MoE aux loss is currently not supported due to a known but in Megatron-LM. See ## TODO: link to GH issue"
+        )
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
@@ -689,9 +704,9 @@ class MegatronPolicyWorker:
                 overlap_param_gather=self.cfg["megatron_cfg"][
                     "distributed_data_parallel_config"
                 ]["overlap_param_gather"],
-                average_in_collective=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["average_in_collective"],
+                # we need to set average_in_collective=False with calculate_per_token_loss=True.
+                # otherwise, mcore throws an assertion error.
+                average_in_collective=False,
                 use_distributed_optimizer=self.cfg["megatron_cfg"]["optimizer"][
                     "use_distributed_optimizer"
                 ],
