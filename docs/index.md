@@ -63,6 +63,7 @@ apidocs/index.rst
 :hidden:
 
 design-docs/design-and-philosophy.md
+design-docs/dependency-management.md
 design-docs/padding.md
 design-docs/logger.md
 design-docs/uv.md
