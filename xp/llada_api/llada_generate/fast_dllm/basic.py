@@ -10,6 +10,7 @@ from transformers import PreTrainedModel
 
 from .base import FastDLLMGeneration
 from ._imports import generate, FAST_DLLM_AVAILABLE
+from ..utils import split_batch_across_gpus
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,18 @@ class BasicGeneration(FastDLLMGeneration):
         
         logger.debug(f"Using basic Fast-dLLM generation with args: {validated_args}")
         
-        # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
-        output, nfe = generate(
+        # Use the shared multi-GPU batch splitting utility
+        def fast_dllm_generate_fn(model_instance, prompt_batch, **kwargs):
+            return generate(
+                model=model_instance,
+                prompt=prompt_batch,
+                **kwargs
+            )
+        
+        output, nfe = split_batch_across_gpus(
             model=model,
             prompt=prompt,
+            generate_fn=fast_dllm_generate_fn,
             steps=validated_args['steps'],
             gen_length=validated_args['gen_length'],
             block_length=validated_args['block_length'],

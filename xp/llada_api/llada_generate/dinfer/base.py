@@ -14,6 +14,7 @@ import torch
 from transformers import PreTrainedModel
 
 from ..base import GenerationAlgorithm
+from ..utils import split_batch_across_gpus
 from ._imports import LLaDAModelLM, DINFER_AVAILABLE, MASK_ID, EOS_ID
 
 logger = logging.getLogger(__name__)
@@ -273,18 +274,28 @@ class DInferGeneration(GenerationAlgorithm):
         
         logger.debug(f"Using dInfer generation with args: {validated_args}")
         
-        # Generate using dInfer
-        # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
-        with torch.no_grad():
-            output_ids = self.diffusion_llm.generate(
-                prompt=prompt,
-                gen_length=validated_args['gen_length'],
-                block_length=validated_args['block_length']
-            )
+        # Use the shared multi-GPU batch splitting utility
+        # Note: dInfer's diffusion_llm wraps the model, so we pass the full model and 
+        # use a lambda that calls diffusion_llm.generate() instead of model.generate()
+        def dinfer_generate_fn(model_instance, prompt_batch, **kwargs):
+            # For dInfer, we don't use model_instance directly - we use self.diffusion_llm
+            # which wraps the model. This is okay because diffusion_llm uses the same
+            # underlying model that gets properly handled by LeftPaddingStripWrapper
+            with torch.no_grad():
+                output = self.diffusion_llm.generate(
+                    prompt=prompt_batch,
+                    **kwargs
+                )
+            # dInfer doesn't return NFE, return placeholder
+            return output, -1
         
-        # dInfer doesn't return NFE directly, estimate it
-        # For now, we'll use a placeholder (can be improved later)
-        nfe = -1  # Placeholder - dInfer doesn't expose this
+        output_ids, nfe = split_batch_across_gpus(
+            model=model,  # model is only used for DataParallel detection, not passed to diffusion_llm
+            prompt=prompt,
+            generate_fn=dinfer_generate_fn,
+            gen_length=validated_args['gen_length'],
+            block_length=validated_args['block_length']
+        )
         
         return output_ids, nfe
     
