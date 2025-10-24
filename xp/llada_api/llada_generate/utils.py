@@ -242,11 +242,14 @@ def split_batch_across_gpus(
     **generation_kwargs
 ) -> Tuple[torch.Tensor, Any]:
     """
-    Split a batch across multiple GPUs for generation methods that don't use DataParallel.
+    Split a batch for sequential generation to handle left-padding correctly.
     
-    DataParallel only parallelizes .forward(), not custom methods like .generate().
-    This utility manually splits the batch across GPUs, calls the generation function
-    on each split, and merges the results.
+    When using DataParallel with batch_size > 1, we need to process samples one at a time
+    (or in small batches) so that LeftPaddingStripWrapper can properly strip padding
+    (it only strips when batch_size == 1).
+    
+    Note: This processes samples sequentially on the primary GPU. While not truly parallel,
+    it ensures correct padding handling and identical results to single-GPU mode.
     
     Args:
         model: The model (potentially DataParallel-wrapped)
@@ -257,66 +260,42 @@ def split_batch_across_gpus(
         
     Returns:
         Tuple of (merged_output_ids, merged_metadata)
-        
-    Example:
-        output, nfe = split_batch_across_gpus(
-            model=model,
-            prompt=prompt,
-            generate_fn=lambda m, p, **kw: m.generate(p, **kw),
-            max_new_tokens=128,
-            steps=16
-        )
     """
     batch_size = prompt.shape[0]
     is_data_parallel = isinstance(model, torch.nn.DataParallel)
     
-    # If batch_size == 1 or not using DataParallel, call directly
-    if batch_size == 1 or not is_data_parallel:
-        actual_model = model.module if is_data_parallel else model
+    # Get the actual model (unwrap DataParallel if present)
+    actual_model = model.module if is_data_parallel else model
+    
+    # If batch_size == 1, call directly - no splitting needed
+    if batch_size == 1:
         return generate_fn(actual_model, prompt, **generation_kwargs)
     
-    # Multi-sample with DataParallel: manually split across GPUs
-    device_ids = model.device_ids
-    num_gpus = len(device_ids)
+    # For batch_size > 1: process one sample at a time to enable padding stripping
+    # This is necessary because LeftPaddingStripWrapper only strips when batch_size == 1
+    logger.debug(f"Processing batch_size={batch_size} sequentially to handle left-padding correctly")
     
-    logger.debug(f"Multi-GPU generation: splitting batch_size={batch_size} across {num_gpus} GPUs")
-    
-    # Calculate samples per GPU
-    samples_per_gpu = [
-        batch_size // num_gpus + (1 if i < batch_size % num_gpus else 0) 
-        for i in range(num_gpus)
-    ]
-    
-    # Split the prompt tensor
-    prompt_splits = torch.split(prompt, samples_per_gpu, dim=0)
-    
-    # Get the underlying model (LeftPaddingStripWrapper or BaseModel)
-    underlying_model = model.module
-    
-    # Process each split on its corresponding GPU
     outputs = []
     metadata_list = []
     
-    for gpu_id, prompt_split in zip(device_ids, prompt_splits):
-        # Move prompt to the GPU
-        prompt_gpu = prompt_split.to(f'cuda:{gpu_id}')
+    for i in range(batch_size):
+        # Get single sample (keeps it as batch_size=1)
+        prompt_single = prompt[i:i+1]
         
-        # Generate on this GPU
-        with torch.cuda.device(gpu_id):
-            result = generate_fn(underlying_model, prompt_gpu, **generation_kwargs)
-            
-            # Handle different return types
-            if isinstance(result, tuple):
-                output_gpu, metadata = result
-                outputs.append(output_gpu)
-                metadata_list.append(metadata)
-            else:
-                outputs.append(result)
-                metadata_list.append(None)
+        # Generate for this single sample
+        result = generate_fn(actual_model, prompt_single, **generation_kwargs)
+        
+        # Handle different return types
+        if isinstance(result, tuple):
+            output_single, metadata = result
+            outputs.append(output_single)
+            metadata_list.append(metadata)
+        else:
+            outputs.append(result)
+            metadata_list.append(None)
     
-    # Merge outputs back to primary device
-    primary_device = f'cuda:{device_ids[0]}'
-    merged_output = torch.cat([o.to(primary_device) for o in outputs], dim=0)
+    # Merge outputs
+    merged_output = torch.cat(outputs, dim=0)
     
     # Merge metadata (average for numeric values like NFE)
     if metadata_list and metadata_list[0] is not None:
@@ -335,7 +314,7 @@ def split_batch_across_gpus(
     else:
         merged_metadata = None
     
-    logger.debug(f"Multi-GPU generation complete: output shape={merged_output.shape}")
+    logger.debug(f"Sequential generation complete: output shape={merged_output.shape}")
     
     if merged_metadata is not None:
         return merged_output, merged_metadata
