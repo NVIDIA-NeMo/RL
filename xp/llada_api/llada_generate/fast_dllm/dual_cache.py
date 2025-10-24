@@ -56,14 +56,10 @@ class DualCacheGeneration(FastDLLMGeneration):
         
         logger.debug(f"Using dual cache Fast-dLLM generation with args: {validated_args}")
         
-        # Strip left-padding if batch_size == 1 (critical for multi-GPU with DataParallel)
-        # When DataParallel splits batch across GPUs and num_gpus == batch_size,
-        # each GPU gets a single left-padded sequence which confuses generation
-        prompt_stripped, _ = self.strip_left_padding(prompt, attention_mask=None)
-        
+        # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
         output, nfe = generate_with_dual_cache(
             model=model,
-            prompt=prompt_stripped,
+            prompt=prompt,
             steps=validated_args['steps'],
             gen_length=validated_args['gen_length'],
             block_length=validated_args['block_length'],

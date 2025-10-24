@@ -232,13 +232,23 @@ class GenerationAlgorithm(ABC):
             # Wrap with DataParallel for multi-GPU
             if self.device_ids is not None and len(self.device_ids) > 1:
                 logger.info(f"Wrapping model with DataParallel for devices: {self.device_ids}")
+                
+                # Wrap the model with left-padding stripping before DataParallel
+                # This ensures padding is stripped AFTER DataParallel splits the batch
+                from llada_generate.utils import LeftPaddingStripWrapper
+                self.model = LeftPaddingStripWrapper(
+                    self.model, 
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+                
+                # Now wrap with DataParallel
                 self.model = torch.nn.DataParallel(self.model, device_ids=self.device_ids)
                 
                 # Add .device property to DataParallel for compatibility with Fast-dLLM/dInfer
                 # Fast-dLLM accesses model.device, but DataParallel doesn't have this attribute
                 self.model.device = self.device
                 
-                logger.info(f"✓ Model distributed across {len(self.device_ids)} GPUs")
+                logger.info(f"✓ Model distributed across {len(self.device_ids)} GPUs with automatic padding stripping")
             
             # Load config
             logger.info("Loading model config...")

@@ -71,12 +71,16 @@ class DInferGeneration(GenerationAlgorithm):
         
         Extends parent method to also create the dInfer diffusion LLM wrapper.
         
-        Note: dInfer's BlockWiseDiffusionLLM is not an nn.Module, so we can't wrap it
-        with DataParallel. Instead, we wrap the base model, and dInfer's code already
-        handles DataParallel-wrapped models (see BlockWiseDiffusionLLMCont line 133-136).
+        For dInfer with multi-GPU:
+        1. Load base model
+        2. Wrap with LeftPaddingStripWrapper (happens in parent for multi-GPU)
+        3. Wrap with DataParallel (happens in parent for multi-GPU)
+        4. Create diffusion_llm wrapper around the DataParallel-wrapped model
+        
+        dInfer's code handles DataParallel-wrapped models correctly (see Block WiseDiffusionLLMCont line 133-136).
         """
         # Call parent to load model, tokenizer, config
-        # Let parent handle DataParallel wrapping of the base model
+        # Parent handles LeftPaddingStripWrapper + DataParallel wrapping for multi-GPU
         success = super().load_model_from_hf(model_path, model_type, device_ids=device_ids)
         
         if success:
@@ -87,14 +91,15 @@ class DInferGeneration(GenerationAlgorithm):
                 logger.info("Set pad_token to eos_token for batch padding")
             
             # Create the diffusion LLM wrapper
-            # If self.model is DataParallel-wrapped, dInfer will handle it correctly
+            # self.model may be: BaseModel (single GPU) or DataParallel(LeftPaddingStripWrapper(BaseModel)) (multi-GPU)
+            # In both cases, dInfer will work correctly
             try:
                 self.diffusion_llm = self.create_diffusion_llm()
                 logger.info(f"Created dInfer diffusion LLM wrapper: {type(self.diffusion_llm).__name__}")
                 
                 # Log multi-GPU status if applicable
                 if device_ids is not None and len(device_ids) > 1:
-                    logger.info(f"✓ dInfer will use DataParallel-wrapped model across {len(device_ids)} GPUs")
+                    logger.info(f"✓ dInfer will use DataParallel-wrapped model with padding stripping across {len(device_ids)} GPUs")
                     
             except Exception as e:
                 logger.error(f"Failed to create diffusion LLM wrapper: {e}")
@@ -268,15 +273,11 @@ class DInferGeneration(GenerationAlgorithm):
         
         logger.debug(f"Using dInfer generation with args: {validated_args}")
         
-        # Strip left-padding if batch_size == 1 (critical for multi-GPU with DataParallel)
-        # When DataParallel splits batch across GPUs and num_gpus == batch_size,
-        # each GPU gets a single left-padded sequence which confuses generation
-        prompt_stripped, _ = self.strip_left_padding(prompt, attention_mask=None)
-        
         # Generate using dInfer
+        # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
         with torch.no_grad():
             output_ids = self.diffusion_llm.generate(
-                prompt=prompt_stripped,
+                prompt=prompt,
                 gen_length=validated_args['gen_length'],
                 block_length=validated_args['block_length']
             )

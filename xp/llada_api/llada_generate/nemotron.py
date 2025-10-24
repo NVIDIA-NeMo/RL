@@ -70,19 +70,15 @@ class NemotronGeneration(GenerationAlgorithm):
         
         logger.debug(f"Using Nemotron native generation with args: {validated_args}")
         
-        # Strip left-padding if batch_size == 1 (critical for multi-GPU with DataParallel)
-        # When DataParallel splits batch across GPUs and num_gpus == batch_size,
-        # each GPU gets a single left-padded sequence which confuses generation
-        prompt_stripped, _ = self.strip_left_padding(prompt, attention_mask=None)
-        
         try:
             # Unwrap DataParallel if needed to call the actual model's generate method
+            # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
             actual_model = model.module if hasattr(model, 'module') else model
             
             # Call Nemotron's native generate method
             # Note: Nemotron doesn't use temperature, remasking, or factor - these are LLaDA-specific
             output_ids, nfe = actual_model.generate(
-                prompt_stripped,
+                prompt,
                 max_new_tokens=validated_args['gen_length'],
                 steps=validated_args['steps'],
                 block_length=validated_args['block_length'],
