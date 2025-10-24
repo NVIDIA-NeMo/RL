@@ -229,3 +229,20 @@ def test_mcore_py_executable():
             assert "megatron-bridge is imported" in result.stdout
             assert "megatron-core is imported" in result.stdout
             assert "megatron-training is imported" in result.stdout
+
+
+def test_create_sorted_bundle_indices_for_unified_pg():
+    """Test that sorted bundle indices are created for a unified placement group."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster._init_placement_groups(strategy=None, use_unified_pg=True)
+    assert cluster._sorted_bundle_indices is not None
+    assert len(cluster._sorted_bundle_indices) == 2
+    assert 0 in cluster._sorted_bundle_indices
+    assert 1 in cluster._sorted_bundle_indices
+
+
+def test_not_create_sorted_bundle_indices_for_per_node_pg():
+    """Test that sorted bundle indices are not created for a per-node placement group."""
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster._init_placement_groups(strategy=None, use_unified_pg=False)
+    assert cluster._sorted_bundle_indices is None
