@@ -167,22 +167,18 @@ Use this flowchart to determine which workflow applies to you:
 flowchart TD
     A[Start] --> B{Are you modifying<br/>dependencies or submodules?}
     
-    subgraph " "
-        C[Production Workflow]
-        D[Development Workflow]
-    end
+    B -->|No| C{Container built from<br/>same commit as code?}
+    B -->|Yes| D{Small scale<br/>or testing?}
     
-    B -->|No| C
-    B -->|Yes| D
+    C ---->|Yes| F["✓ Run with
+    NRL_FORCE_REBUILD_VENVS=true uv run examples/..."]
+    C -->|No| D
     
-    C --> E{Container built from<br/>same commit as code?}
-    E -->|Yes| F[✓ Run directly<br/>uv run examples/...]
-    E -->|No| G{Small scale<br/>or testing?}
+    D -->|Yes| E["✓ Run directly
+    uv run examples/..."]
+    D -->|No| G[✓ Rebuild container with new dependencies]
     
-    D --> G
-    
-    G -->|Yes| H[✓ Use NRL_FORCE_REBUILD_VENVS=true]
-    G -->|No| I[✓ Rebuild container with new dependencies]
+    G --> E
 ```
 
 ## Summary
