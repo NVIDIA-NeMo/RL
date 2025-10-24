@@ -763,49 +763,26 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
-        """Update weights of the policy using IPC handles, considering tensor parallelism.
-
-        For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+    def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
+        """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:
-            return False
+            raise RuntimeError("Worker group is not initialized")
 
         # Choose the appropriate method based on async_engine setting
         method_name = (
-            "update_weights_from_ipc_handles_async"
+            "update_weights_via_ipc_zmq_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "update_weights_from_ipc_handles"
+            else "update_weights_via_ipc_zmq"
         )
 
-        # Only send the ipc handles required by the current worker
-        ipc_handles_list = []
-        for worker_device_uuids in self.device_uuids:
-            worker_ipc_handles = {
-                device_uuid: ipc_handles[device_uuid]
-                for device_uuid in worker_device_uuids
-            }
-            ipc_handles_list.append(worker_ipc_handles)
+        # Use run_all_workers_single_data since no data needs to be passed
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
 
-        try:
-            # Directly pass ipc_handles to the method
-            futures = self.worker_group.run_all_workers_multiple_data(
-                method_name,
-                ipc_handles=ipc_handles_list,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
-            # Wait for all futures to complete
-            results = ray.get(futures)
-            return all(result for result in results if result is not None)
-        except Exception as e:
-            print(f"Error during update weights: {e}")
-            return False
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
