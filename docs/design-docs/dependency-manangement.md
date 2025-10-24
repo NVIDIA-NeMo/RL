@@ -69,18 +69,13 @@ Executes your driver script within the activated environment.
 
 ```mermaid
 graph TD
-    A[uv run examples/run_grpo_math.py] --> B[Driver Script Environment]
-    B --> C[Default dependencies from pyproject.toml]
-    B --> D[Starts Ray Worker Groups]
-    D --> E[Policy Workers]
-    D --> F[Generation Workers]
-    D --> G[Environment Workers]
-    E --> H[Separate venv: MCORE]
-    F --> I[Separate venv: VLLM]
-    G --> J[Separate venv: SYSTEM]
-    H --> K[Cached in release container]
-    I --> K
-    J --> K
+    subgraph Container["uv run examples/run_grpo_math.py"]
+        A[Driver Script Environment<br/>Default dependencies from pyproject.toml]
+        A --> B[Starts Ray Worker Groups]
+        B --> C[Policy Workers<br/>Separate venv: MCORE]
+        B --> D[Generation Workers<br/>Separate venv: VLLM]
+        B --> E[Environment Workers<br/>Separate venv: SYSTEM]
+    end
 ```
 
 The driver script (`examples/run_grpo_math.py`) runs with the [default dependencies specified in `pyproject.toml`](https://github.com/NVIDIA-NeMo/RL/blob/main/pyproject.toml#L21-L54) (without optional extras like `mcore` or `vllm`). However, the application creates multiple worker groups, each potentially requiring different Python environments.
@@ -139,6 +134,8 @@ export NRL_FORCE_REBUILD_VENVS=true
 uv run examples/run_grpo_math.py
 ```
 
+This approach works on both single-node and multi-node setups. On multi-node runs, each node will independently rebuild its virtual environments.
+
 > [!TIP]
 > This approach is convenient for local development and small-scale experiments. It automatically rebuilds environments to match your current dependency specifications without requiring a container rebuild.
 
@@ -172,9 +169,9 @@ flowchart TD
     B -->|No| C[Production Workflow]
     B -->|Yes| D[Development Workflow]
     C --> E{Container built from<br/>same commit as code?}
+    D --> G{Small scale<br/>or testing?}
     E -->|Yes| F[✓ Run directly<br/>uv run examples/...]
-    E -->|No| G{Small scale<br/>or testing?}
-    D --> G
+    E -->|No| G
     G -->|Yes| H[✓ Use NRL_FORCE_REBUILD_VENVS=true]
     G -->|No| I[✓ Rebuild container with new dependencies]
 ```
@@ -184,7 +181,7 @@ flowchart TD
 NeMo RL's dependency management balances flexibility and performance:
 
 - **Production workflows** leverage pre-cached environments for fast, reliable startup
-- **Development workflows** can dynamically rebuild environments as needed
+- **Development workflows** can dynamically rebuild environments as needed (this works on multi-node setups as well)
 - **Container rebuilds** provide the best performance for large-scale production runs
 - **`NRL_FORCE_REBUILD_VENVS`** offers flexibility for development without container rebuilds
 
