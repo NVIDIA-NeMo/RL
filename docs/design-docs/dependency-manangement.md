@@ -67,7 +67,7 @@ Executes your driver script within the activated environment.
 
 ## Multi-Environment Architecture
 
-```{mermaid}
+```mermaid
 graph TD
     A[uv run examples/run_grpo_math.py] --> B[Driver Script Environment]
     B --> C[Default dependencies from pyproject.toml]
@@ -166,7 +166,7 @@ The rebuilt container will have all virtual environments pre-cached with your up
 
 Use this flowchart to determine which workflow applies to you:
 
-```{mermaid}
+```mermaid
 flowchart TD
     A[Start] --> B{Are you modifying<br/>dependencies or submodules?}
     B -->|No| C[Production Workflow]
