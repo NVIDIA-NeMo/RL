@@ -54,7 +54,24 @@ class NemotronGeneration(GenerationAlgorithm):
             raise RuntimeError("Nemotron generation is not available - model does not have native generate method")
         
         if not self._is_nemotron_model(model):
-            raise RuntimeError("Model does not appear to be a Nemotron model with native generate method")
+            logger.error(f"Model validation failed!")
+            logger.error(f"Model type: {type(model)}")
+            logger.error(f"Model class name: {model.__class__.__name__}")
+            if hasattr(model, 'module'):
+                logger.error(f"Model.module type: {type(model.module)}")
+                logger.error(f"Model.module class: {model.module.__class__.__name__}")
+            
+            unwrapped = self.unwrap_model(model)
+            logger.error(f"Unwrapped model type: {type(unwrapped)}")
+            logger.error(f"Unwrapped model class: {unwrapped.__class__.__name__}")
+            logger.error(f"Has generate: {hasattr(unwrapped, 'generate')}")
+            
+            raise RuntimeError(
+                f"Model does not appear to be a Nemotron model with native generate method. "
+                f"Model class: {unwrapped.__class__.__name__}. "
+                f"Are you trying to use Nemotron engine with a LLaDA model? "
+                f"Use --engine dinfer or --engine fast-dllm for LLaDA models."
+            )
         
         # Validate and adjust parameters for Nemotron
         validated_args = self.validate_args(
@@ -113,23 +130,48 @@ class NemotronGeneration(GenerationAlgorithm):
     
     def _is_nemotron_model(self, model: PreTrainedModel) -> bool:
         """Check if the model is a Nemotron model with native generate method."""
+        logger.info(f"=== NEMOTRON MODEL VALIDATION ===")
+        logger.info(f"Input model type: {type(model)}")
+        logger.info(f"Input model class: {model.__class__.__name__}")
+        
         # Unwrap to get the base model (removes DataParallel and LeftPaddingStripWrapper)
         actual_model = self.unwrap_model(model)
         
+        logger.info(f"After unwrap_model():")
+        logger.info(f"  Unwrapped model type: {type(actual_model)}")
+        logger.info(f"  Unwrapped model class: {actual_model.__class__.__name__}")
+        
         if not hasattr(actual_model, 'generate'):
+            logger.error(f"ERROR: Model does not have 'generate' method")
             return False
+        
+        logger.info(f"  Has 'generate' method: True")
         
         # Check if the generate method has the expected Nemotron signature
         try:
             sig = inspect.signature(actual_model.generate)
             params = list(sig.parameters.keys())
             
+            logger.info(f"  generate() parameters: {params}")
+            
             # Nemotron's generate method should have these parameters
             expected_params = ['max_new_tokens', 'steps', 'block_length', 'threshold', 'shift_logits']
-            return all(param in params for param in expected_params)
+            has_all_params = all(param in params for param in expected_params)
+            
+            if not has_all_params:
+                missing = [p for p in expected_params if p not in params]
+                logger.error(f"ERROR: Missing Nemotron parameters: {missing}")
+                logger.error(f"  Expected: {expected_params}")
+                logger.error(f"  Got: {params}")
+            else:
+                logger.info(f"  ✓ All Nemotron parameters present")
+            
+            return has_all_params
             
         except Exception as e:
-            logger.debug(f"Could not inspect model.generate signature: {e}")
+            logger.error(f"ERROR: Could not inspect model.generate signature: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def get_required_args(self):

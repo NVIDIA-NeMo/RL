@@ -54,7 +54,8 @@ class GenerationAlgorithm(ABC):
             model = model.module
         
         # Unwrap LeftPaddingStripWrapper if present (multi-GPU)
-        if hasattr(model, 'model') and model.__class__.__name__ == 'LeftPaddingStripWrapper':
+        # Check the class name specifically to avoid false positives
+        if model.__class__.__name__ == 'LeftPaddingStripWrapper':
             model = model.model
         
         return model
