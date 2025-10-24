@@ -258,16 +258,16 @@ $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepencies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If very spiky, it can indicate a bug in the inference framework or buggy weight refitting.
 
-### KL Divergence
+### KL Divergence Error
 This feature is controlled by the following metrics:
-* `gen_kl`: $D_{\text{KL}}(P_{gen} || P_{policy})$
+* `gen_kl_error`: $D_{\text{KL}}(P_{gen} || P_{policy})$
   - the generation distribution as ground truth
-* `policy_kl`: $D_{\text{KL}}(P_{policy} || P_{gen})$
+* `policy_kl_error`: $D_{\text{KL}}(P_{policy} || P_{gen})$
   - the policy (training) distribution as ground truth
-* `js_divergence` or (Jensen–Shannon divergence): $(D_{\text{KL}}(P_{policy} || P_{m}) + D_{\text{KL}}(P_{gen} || P_{m})) / 2$, where $P_{m} = (P_{policy} + P_{gen}) / 2$
+* `js_divergence_error` or (Jensen–Shannon divergence): $(D_{\text{KL}}(P_{policy} || P_{m}) + D_{\text{KL}}(P_{gen} || P_{m})) / 2$, where $P_{m} = (P_{policy} + P_{gen}) / 2$
   - uses the mean mixture distribution as reference
 
-According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda#271211a558b78046af48c3129693f3f1), `gen_kl` was introduced (referred to as `vllm-kl` in the paper). Empirically, the mismatch is approximately 1e-3, and the divergence is bigger for low-probability tokens as predicted by the generation inference engine (like vLLM).
+According to the paper [When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda#271211a558b78046af48c3129693f3f1), `gen_kl_error` was introduced (referred to as `vllm-kl` in the paper) as the key metric to measure mismatch between policy and generation distribution. Empirically, the mismatch is approximately 1e-3, and the divergence is bigger for low-probability tokens as predicted by the generation inference engine (like vLLM).
 
 The three divergence metrics provide complementary perspectives on distribution mismatch. For example:
 
@@ -281,9 +281,9 @@ We observed a case where vLLM assigned a disproportionately high probability to 
 ```
 Assuming other tokens have near-zero divergence, this single token's metrics are:
 
-* `gen_kl`: exp(-15 + 5) - (-15 + 5) - 1 ≈ 9 (moderate mismatch)
-* `policy_kl`: exp(-5 + 15) - (-5 + 15) - 1 ≈ 22,015 (severe mismatch dominating the metric)
-* `js_divergence`: ≈ 9, close to `gen_kl` since the mixture distribution (~-5.69) is dominated by the higher-probability value (logp_gen in this example)
+* `gen_kl_error`: exp(-15 + 5) - (-15 + 5) - 1 ≈ 9 (moderate mismatch)
+* `policy_kl_error`: exp(-5 + 15) - (-5 + 15) - 1 ≈ 22,015 (severe mismatch dominating the metric)
+* `js_divergence_error`: ≈ 9, close to `gen_kl_error` since the mixture distribution (~-5.69) is dominated by the higher-probability value (logp_gen in this example)
 
 Ideally, all KL divergence metrics should be close to 0, with values below 1e-3 considered acceptable. Investigate any metric that shows spikes above this threshold.
 

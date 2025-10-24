@@ -170,7 +170,7 @@ class ClippedPGLossFn(LossFunction):
 
         # gen-kl(kl(P_gen || P_train)) = torch.exp(log_ratio) - log_ratio - 1
         # where log_ratio = prev_logprobs - generation_logprobs
-        gen_kl = masked_mean(
+        gen_kl_error = masked_mean(
             torch.exp(prev_logprobs - generation_logprobs)
             - (prev_logprobs - generation_logprobs)
             - 1,
@@ -180,7 +180,7 @@ class ClippedPGLossFn(LossFunction):
 
         # policy-kl(kl(P_train || P_gen)) = torch.exp(log_ratio) - log_ratio - 1
         # where log_ratio = prev_logprobs - generation_logprobs
-        policy_kl = masked_mean(
+        policy_kl_error = masked_mean(
             torch.exp(generation_logprobs - prev_logprobs)
             - (generation_logprobs - prev_logprobs)
             - 1,
@@ -206,7 +206,7 @@ class ClippedPGLossFn(LossFunction):
             - 1
         )
 
-        js_divergence = masked_mean(
+        js_divergence_error = masked_mean(
             0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
             mask,
             global_normalization_factor=global_valid_toks,
@@ -413,9 +413,9 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_clamped": probs_ratio_clamped,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
                 "token_mult_prob_error": mult_prob_error,
-                "gen_kl_error": gen_kl,
-                "policy_kl_error": policy_kl,
-                "js_divergence_error": js_divergence,
+                "gen_kl_error": gen_kl_error,
+                "policy_kl_error": policy_kl_error,
+                "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
