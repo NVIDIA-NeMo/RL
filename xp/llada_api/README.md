@@ -58,8 +58,9 @@ export ACCOUNT=your_slurm_account
 ./scripts/start_llada_batch_server.sh --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct
 
 # SLURM with multi-GPU (8 GPUs for maximum throughput)
+# Note: --num-gpus automatically matches --gpus for SLURM
 export ACCOUNT=your_slurm_account
-./scripts/start_llada_batch_server.sh --model-path GSAI-ML/LLaDA-8B-Instruct --gpus 8 --num-gpus 8 --batch-size 64
+./scripts/start_llada_batch_server.sh --model-path GSAI-ML/LLaDA-8B-Instruct --gpus 8 --batch-size 64
 
 # Connect to SLURM server
 ./connect_to_llada_server.sh --job-id 12345

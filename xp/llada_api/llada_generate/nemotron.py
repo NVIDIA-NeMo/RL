@@ -71,9 +71,12 @@ class NemotronGeneration(GenerationAlgorithm):
         logger.debug(f"Using Nemotron native generation with args: {validated_args}")
         
         try:
+            # Unwrap DataParallel if needed to call the actual model's generate method
+            actual_model = model.module if hasattr(model, 'module') else model
+            
             # Call Nemotron's native generate method
             # Note: Nemotron doesn't use temperature, remasking, or factor - these are LLaDA-specific
-            output_ids, nfe = model.generate(
+            output_ids, nfe = actual_model.generate(
                 prompt,
                 max_new_tokens=validated_args['gen_length'],
                 steps=validated_args['steps'],
@@ -99,12 +102,15 @@ class NemotronGeneration(GenerationAlgorithm):
     
     def _is_nemotron_model(self, model: PreTrainedModel) -> bool:
         """Check if the model is a Nemotron model with native generate method."""
-        if not hasattr(model, 'generate'):
+        # Unwrap DataParallel if needed
+        actual_model = model.module if hasattr(model, 'module') else model
+        
+        if not hasattr(actual_model, 'generate'):
             return False
         
         # Check if the generate method has the expected Nemotron signature
         try:
-            sig = inspect.signature(model.generate)
+            sig = inspect.signature(actual_model.generate)
             params = list(sig.parameters.keys())
             
             # Nemotron's generate method should have these parameters

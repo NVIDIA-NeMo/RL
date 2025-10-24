@@ -128,9 +128,12 @@ echo ""
 echo "  # Nemotron model (auto-selects nemotron engine)"
 echo "  $0 --local --model-path nvidia/Nemotron-Diffusion-Research-4B-v0"
     echo ""
-    echo "  # SLURM batch server (auto-selects engine)"
+    echo "  # SLURM batch server (auto-selects engine, --num-gpus auto-set from --gpus)"
     echo "  export ACCOUNT=your_account"
     echo "  $0 --model-path GSAI-ML/LLaDA-8B-Instruct --batch-size 16 --gpus 2"
+    echo ""
+    echo "  # SLURM with 8 GPUs (--num-gpus automatically matches --gpus)"
+    echo "  $0 --model-path GSAI-ML/LLaDA-8B-Instruct --gpus 8 --batch-size 64"
     echo ""
     echo "  # SLURM with DCP checkpoint"
     echo "  $0 --dcp-path /path/to/checkpoint.dcp --base-model GSAI-ML/LLaDA-8B-Instruct"
@@ -277,6 +280,12 @@ if [[ "$LOCAL_MODE" == false ]]; then
         print_error "ACCOUNT environment variable must be set for SLURM jobs"
         echo "  export ACCOUNT=your_slurm_account"
         exit 1
+    fi
+    
+    # Auto-bind --num-gpus to --gpus if not specified
+    if [[ -z "$NUM_GPUS" ]] && [[ "$GPUS_PER_NODE" -gt 1 ]]; then
+        NUM_GPUS="$GPUS_PER_NODE"
+        print_status "Auto-setting --num-gpus=$NUM_GPUS to match SLURM --gpus=$GPUS_PER_NODE"
     fi
     
     # Update job name based on server mode
