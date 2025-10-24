@@ -40,6 +40,11 @@ class GenerationAlgorithm(ABC):
         """
         Unwrap model to get the base model, removing DataParallel and wrapper layers.
         
+        This method recursively unwraps models until we reach the base model:
+        - DataParallel(LeftPaddingStripWrapper(BaseModel)) → BaseModel
+        - LeftPaddingStripWrapper(BaseModel) → BaseModel
+        - DataParallel(BaseModel) → BaseModel
+        
         Args:
             model: Model to unwrap (uses self.model if None)
             
@@ -49,14 +54,10 @@ class GenerationAlgorithm(ABC):
         if model is None:
             model = self.model
         
-        # Unwrap DataParallel if present
-        if hasattr(model, 'module'):
+        # Recursively unwrap until we reach the base model
+        # Both DataParallel and LeftPaddingStripWrapper expose .module property
+        while hasattr(model, 'module'):
             model = model.module
-        
-        # Unwrap LeftPaddingStripWrapper if present (multi-GPU)
-        # Check the class name specifically to avoid false positives
-        if model.__class__.__name__ == 'LeftPaddingStripWrapper':
-            model = model.model
         
         return model
     

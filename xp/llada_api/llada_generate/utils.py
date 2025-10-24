@@ -54,11 +54,14 @@ class LeftPaddingStripWrapper(nn.Module):
     @property
     def module(self):
         """
-        Forward module property for compatibility with DataParallel checks.
+        Forward module property for compatibility with DataParallel checks and unwrapping.
         
         Some code checks isinstance(model, DataParallel) and then accesses model.module.
         This property allows code to access the base model through the wrapper.
+        Additionally, unwrap_model() uses this to unwrap the LeftPaddingStripWrapper.
         """
+        # Access self.model which is stored in PyTorch's _modules registry
+        # We can safely use normal attribute access here since this is a property
         return self.model
     
     def __getattr__(self, name):
@@ -67,21 +70,28 @@ class LeftPaddingStripWrapper(nn.Module):
         
         This ensures that model-specific attributes (like .h2e for dInfer,
         .device for Fast-dLLM, etc.) are accessible through the wrapper.
-        """
-        # Avoid recursion for our own attributes
-        # Note: 'model' should NOT be in this list because it's set in __init__
-        # and should be accessed normally via object.__getattribute__
-        if name in ['pad_token_id', '_forward_attrs']:
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         
-        # Try to get from wrapped model first
+        Note: This is only called when normal attribute lookup fails.
+        PyTorch's nn.Module stores submodules in self._modules, so self.model
+        is accessed via nn.Module.__getattr__ which looks in _modules.
+        """
+        # First try PyTorch's default __getattr__ (looks in _modules, _parameters, etc.)
         try:
-            # Use object.__getattribute__ to avoid infinite recursion
-            wrapped_model = object.__getattribute__(self, 'model')
-            return getattr(wrapped_model, name)
+            return super().__getattr__(name)
         except AttributeError:
-            # If not found in wrapped model, raise error
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+            pass
+        
+        # If PyTorch couldn't find it, try to forward to the wrapped model
+        try:
+            # Get the wrapped model from PyTorch's _modules registry
+            wrapped_model = self._modules.get('model')
+            if wrapped_model is not None:
+                return getattr(wrapped_model, name)
+        except (AttributeError, KeyError):
+            pass
+        
+        # Attribute not found anywhere
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
     
     def strip_left_padding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
