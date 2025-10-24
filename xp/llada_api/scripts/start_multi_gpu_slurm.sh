@@ -196,34 +196,34 @@ PROJECT_DIR="$(cd "$LLADA_API_DIR/../.." && pwd)"
 WORKER_SCRIPT="$LLADA_API_DIR/llada_batch_server.py"
 LB_SCRIPT="$LLADA_API_DIR/llada_load_balancer.py"
 
-# Build worker arguments
-WORKER_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
+# Build base worker arguments (DCP args will be added per-worker in the script)
+WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
 if [[ -n "$MODEL_PATH" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --model-path '$MODEL_PATH'"
-elif [[ -n "$DCP_PATH" ]]; then
-    if [[ -d "$DCP_PATH" ]]; then
-        DCP_ABS_PATH=$(realpath "$DCP_PATH")
-        WORKER_ARGS="$WORKER_ARGS --dcp-path '$DCP_ABS_PATH' --base-model '$BASE_MODEL' --temp-dir '$TEMP_DIR'"
-    else
-        WORKER_ARGS="$WORKER_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL' --temp-dir '$TEMP_DIR'"
-    fi
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$MODEL_PATH'"
 fi
 
 if [[ -n "$ENGINE" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --engine '$ENGINE'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --engine '$ENGINE'"
 fi
 
 if [[ -n "$ALGORITHM" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --algorithm '$ALGORITHM'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --algorithm '$ALGORITHM'"
 fi
 
 if [[ "$VERBOSE" == true ]]; then
-    WORKER_ARGS="$WORKER_ARGS --verbose"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --verbose"
 fi
 
 if [[ "$NO_CHAT_TEMPLATE" == true ]]; then
-    WORKER_ARGS="$WORKER_ARGS --no-chat-template"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --no-chat-template"
+fi
+
+# Prepare DCP path (make absolute if it's a local directory)
+if [[ -n "$DCP_PATH" ]] && [[ -d "$DCP_PATH" ]]; then
+    DCP_ABS_PATH=$(realpath "$DCP_PATH")
+else
+    DCP_ABS_PATH="$DCP_PATH"
 fi
 
 # Build worker ports list
@@ -284,7 +284,18 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     WORKER_PORT=$((BASE_WORKER_PORT_PLACEHOLDER + i))
     echo "Starting worker $i on GPU $i (port $WORKER_PORT)"
     
-    CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT WORKER_ARGS_PLACEHOLDER > "/tmp/worker_${i}.log" 2>&1 &
+    # Build worker-specific arguments
+    WORKER_ARGS="WORKER_BASE_ARGS_PLACEHOLDER"
+    
+    # Add DCP-specific arguments with unique temp directory per worker
+    if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
+        # Each worker gets its own temp directory to avoid race conditions
+        WORKER_TEMP_DIR="/tmp/llada_hf_converted_gpu_${i}_$$"
+        WORKER_ARGS="$WORKER_ARGS --dcp-path 'DCP_ABS_PATH_PLACEHOLDER' --base-model 'BASE_MODEL_PLACEHOLDER' --temp-dir '$WORKER_TEMP_DIR'"
+        echo "Worker $i temp dir: $WORKER_TEMP_DIR"
+    fi
+    
+    CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
     WORKER_PIDS+=($!)
     echo "Worker $i started (PID: ${WORKER_PIDS[$i]})"
 done
@@ -335,9 +346,11 @@ COMMAND_BLOCK="${COMMAND_BLOCK//BASE_WORKER_PORT_PLACEHOLDER/$BASE_WORKER_PORT}"
 COMMAND_BLOCK="${COMMAND_BLOCK//LOAD_BALANCER_PORT_PLACEHOLDER/$LOAD_BALANCER_PORT}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_SCRIPT_PLACEHOLDER/$WORKER_SCRIPT}"
 COMMAND_BLOCK="${COMMAND_BLOCK//LB_SCRIPT_PLACEHOLDER/$LB_SCRIPT}"
-COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_ARGS_PLACEHOLDER/$WORKER_ARGS}"
+COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_BASE_ARGS_PLACEHOLDER/$WORKER_BASE_ARGS}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_PORTS_PLACEHOLDER/${WORKER_PORTS[*]}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//DCP_PATH_PLACEHOLDER/${DCP_PATH:-}}"
+COMMAND_BLOCK="${COMMAND_BLOCK//DCP_ABS_PATH_PLACEHOLDER/${DCP_ABS_PATH:-}}"
+COMMAND_BLOCK="${COMMAND_BLOCK//BASE_MODEL_PLACEHOLDER/$BASE_MODEL}"
 COMMAND_BLOCK="${COMMAND_BLOCK//TEMP_DIR_PLACEHOLDER/$TEMP_DIR}"
 
 if [[ "$VERBOSE" == true ]]; then

@@ -205,29 +205,27 @@ fi
 # Set PYTHONPATH
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 
-# Build worker arguments
-WORKER_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
+# Build base worker arguments (common to all workers)
+WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
 if [[ -n "$MODEL_PATH" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --model-path '$MODEL_PATH'"
-elif [[ -n "$DCP_PATH" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$MODEL_PATH'"
 fi
 
 if [[ -n "$ENGINE" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --engine '$ENGINE'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --engine '$ENGINE'"
 fi
 
 if [[ -n "$ALGORITHM" ]]; then
-    WORKER_ARGS="$WORKER_ARGS --algorithm '$ALGORITHM'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --algorithm '$ALGORITHM'"
 fi
 
 if [[ "$VERBOSE" == true ]]; then
-    WORKER_ARGS="$WORKER_ARGS --verbose"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --verbose"
 fi
 
 if [[ "$NO_CHAT_TEMPLATE" == true ]]; then
-    WORKER_ARGS="$WORKER_ARGS --no-chat-template"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --no-chat-template"
 fi
 
 # Print configuration
@@ -287,6 +285,17 @@ for i in "${!GPU_ARRAY[@]}"; do
     WORKER_PORT=$((BASE_WORKER_PORT + i))
     
     print_gpu "Starting worker $i on GPU $GPU_ID (port $WORKER_PORT)"
+    
+    # Build worker-specific arguments
+    WORKER_ARGS="$WORKER_BASE_ARGS"
+    
+    # Add DCP-specific arguments with unique temp directory per worker
+    if [[ -n "$DCP_PATH" ]]; then
+        # Each worker gets its own temp directory to avoid race conditions
+        WORKER_TEMP_DIR="/tmp/llada_hf_converted_gpu_${GPU_ID}_$$"
+        WORKER_ARGS="$WORKER_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL' --temp-dir '$WORKER_TEMP_DIR'"
+        print_gpu "Worker $i temp dir: $WORKER_TEMP_DIR"
+    fi
     
     # Build the command
     CMD="CUDA_VISIBLE_DEVICES=$GPU_ID python3 '$WORKER_SCRIPT' --port $WORKER_PORT $WORKER_ARGS"
