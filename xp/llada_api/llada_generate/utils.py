@@ -41,8 +41,33 @@ class LeftPaddingStripWrapper(nn.Module):
         # This ensures compatibility with code that accesses model attributes
         self._forward_attrs = True
     
+    @property
+    def device(self):
+        """Forward device property to wrapped model for Fast-dLLM compatibility."""
+        return self.model.device if hasattr(self.model, 'device') else next(self.model.parameters()).device
+    
+    @property  
+    def h2e(self):
+        """Forward h2e attribute for dInfer BlockWiseDiffusionLLMCont compatibility."""
+        return self.model.h2e if hasattr(self.model, 'h2e') else None
+    
+    @property
+    def module(self):
+        """
+        Forward module property for compatibility with DataParallel checks.
+        
+        Some code checks isinstance(model, DataParallel) and then accesses model.module.
+        This property allows code to access the base model through the wrapper.
+        """
+        return self.model
+    
     def __getattr__(self, name):
-        """Forward attribute access to the wrapped model."""
+        """
+        Forward attribute access to the wrapped model.
+        
+        This ensures that model-specific attributes (like .h2e for dInfer,
+        .device for Fast-dLLM, etc.) are accessible through the wrapper.
+        """
         # Avoid recursion for our own attributes
         if name in ['model', 'pad_token_id', '_forward_attrs', '_modules', '_parameters', '_buffers']:
             return object.__getattribute__(self, name)

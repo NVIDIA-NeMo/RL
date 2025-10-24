@@ -36,9 +36,32 @@ class GenerationAlgorithm(ABC):
         self.model_type: Optional[str] = None  # 'llada' or 'nemotron'
         self.use_chat_template: bool = True  # Whether to use chat template (default: True)
     
+    def unwrap_model(self, model: Optional[PreTrainedModel] = None) -> PreTrainedModel:
+        """
+        Unwrap model to get the base model, removing DataParallel and wrapper layers.
+        
+        Args:
+            model: Model to unwrap (uses self.model if None)
+            
+        Returns:
+            Unwrapped base model
+        """
+        if model is None:
+            model = self.model
+        
+        # Unwrap DataParallel if present
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        # Unwrap LeftPaddingStripWrapper if present (multi-GPU)
+        if hasattr(model, 'model') and model.__class__.__name__ == 'LeftPaddingStripWrapper':
+            model = model.model
+        
+        return model
+    
     def get_model_device(self, model: Optional[PreTrainedModel] = None) -> torch.device:
         """
-        Get the device of the model, handling DataParallel wrapping.
+        Get the device of the model, handling DataParallel and wrapper layers.
         
         Args:
             model: Model to get device from (uses self.model if None)
@@ -46,16 +69,12 @@ class GenerationAlgorithm(ABC):
         Returns:
             torch.device object
         """
-        if model is None:
-            model = self.model
-        
-        # If wrapped with DataParallel, get the underlying module
-        if hasattr(model, 'module'):
-            model = model.module
+        # Unwrap to base model
+        unwrapped_model = self.unwrap_model(model)
         
         # Get device from model parameters
         try:
-            return next(model.parameters()).device
+            return next(unwrapped_model.parameters()).device
         except StopIteration:
             # Model has no parameters, fall back to self.device
             return torch.device(self.device if self.device else 'cuda')

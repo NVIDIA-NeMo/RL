@@ -71,11 +71,21 @@ class NemotronGeneration(GenerationAlgorithm):
         logger.debug(f"Using Nemotron native generation with args: {validated_args}")
         
         try:
-            # Unwrap DataParallel if needed to call the actual model's generate method
-            # Note: For multi-GPU, LeftPaddingStripWrapper handles stripping inside DataParallel
-            actual_model = model.module if hasattr(model, 'module') else model
+            # For multi-GPU: model is DataParallel(LeftPaddingStripWrapper(BaseModel))
+            # DataParallel doesn't have a generate() method, so we need to unwrap it
+            # But we keep the LeftPaddingStripWrapper which DOES have generate()
+            actual_model = model
             
-            # Call Nemotron's native generate method
+            # Unwrap DataParallel if present (but keep LeftPaddingStripWrapper)
+            if hasattr(actual_model, 'module'):
+                actual_model = actual_model.module
+            
+            # Now actual_model is either:
+            # - LeftPaddingStripWrapper(BaseModel) for multi-GPU
+            # - BaseModel for single-GPU
+            # Both have .generate() methods
+            
+            # Call the generate method
             # Note: Nemotron doesn't use temperature, remasking, or factor - these are LLaDA-specific
             output_ids, nfe = actual_model.generate(
                 prompt,
@@ -103,8 +113,8 @@ class NemotronGeneration(GenerationAlgorithm):
     
     def _is_nemotron_model(self, model: PreTrainedModel) -> bool:
         """Check if the model is a Nemotron model with native generate method."""
-        # Unwrap DataParallel if needed
-        actual_model = model.module if hasattr(model, 'module') else model
+        # Unwrap to get the base model (removes DataParallel and LeftPaddingStripWrapper)
+        actual_model = self.unwrap_model(model)
         
         if not hasattr(actual_model, 'generate'):
             return False
