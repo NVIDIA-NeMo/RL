@@ -36,6 +36,30 @@ class GenerationAlgorithm(ABC):
         self.model_type: Optional[str] = None  # 'llada' or 'nemotron'
         self.use_chat_template: bool = True  # Whether to use chat template (default: True)
     
+    def get_model_device(self, model: Optional[PreTrainedModel] = None) -> torch.device:
+        """
+        Get the device of the model, handling DataParallel wrapping.
+        
+        Args:
+            model: Model to get device from (uses self.model if None)
+            
+        Returns:
+            torch.device object
+        """
+        if model is None:
+            model = self.model
+        
+        # If wrapped with DataParallel, get the underlying module
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        # Get device from model parameters
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            # Model has no parameters, fall back to self.device
+            return torch.device(self.device if self.device else 'cuda')
+    
     @abstractmethod
     def generate(
         self,
@@ -144,6 +168,11 @@ class GenerationAlgorithm(ABC):
             if self.device_ids is not None and len(self.device_ids) > 1:
                 logger.info(f"Wrapping model with DataParallel for devices: {self.device_ids}")
                 self.model = torch.nn.DataParallel(self.model, device_ids=self.device_ids)
+                
+                # Add .device property to DataParallel for compatibility with Fast-dLLM/dInfer
+                # Fast-dLLM accesses model.device, but DataParallel doesn't have this attribute
+                self.model.device = self.device
+                
                 logger.info(f"✓ Model distributed across {len(self.device_ids)} GPUs")
             
             # Load config
