@@ -159,6 +159,45 @@ docker buildx build --target release -f docker/Dockerfile --tag my-registry/nemo
 
 The rebuilt container will have all virtual environments pre-cached with your updated dependencies, eliminating runtime overhead.
 
+### Option 3: Classic Workflow - Mounting Modified Submodules
+
+For situations where you're **only changing submodules** (like nemo-automodel, Penguin, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
+
+The container's NeMo RL code is located at `/opt/nemo-rl`. By mounting your local `3rdparty/` directory over the container's `/opt/nemo-rl/3rdparty/`, you can swap out submodules without rebuilding environments or containers.
+
+**Example - Mounting Modified Submodules on Slurm:**
+
+Assuming you're launching from the root of your local NeMo RL clone:
+
+```bash
+# Run from the root of NeMo RL repo
+
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD,$PWD/3rdparty:/opt/nemo-rl/3rdparty" \
+sbatch \
+    --nodes=1 \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=1:0:0 \
+    ray.sub
+```
+
+This mounts:
+1. `$PWD:$PWD` - Your local NeMo RL directory to the same path in the container
+2. `$PWD/3rdparty:/opt/nemo-rl/3rdparty` - Your local submodules override the container's submodules at `/opt/nemo-rl/3rdparty`
+
+> [!NOTE]
+> This approach works because Python packages are already installed in the cached virtual environments. You're only swapping out the source code in the `3rdparty/` submodules, which doesn't require reinstalling packages or rebuilding environments.
+
+> [!IMPORTANT]
+> This workflow is **only suitable when**:
+> - Python package versions in `pyproject.toml` and `uv.lock` haven't changed
+> - You're only modifying code within submodules (nemo-automodel, Penguin, Megatron-LM, Megatron-Bridge)
+> - The submodule commits/branches are compatible with the installed package versions
+
+If you've changed Python package versions or dependencies outside of submodules, use Option 1 (`NRL_FORCE_REBUILD_VENVS=true`) or Option 2 (rebuild the container) instead.
+
 ## Decision Guide
 
 Use this flowchart to determine which workflow applies to you:
@@ -187,8 +226,12 @@ NeMo RL's dependency management balances flexibility and performance:
 
 - **Production workflows** leverage pre-cached environments for fast, reliable startup
 - **Development workflows** can dynamically rebuild environments as needed (this works on multi-node setups as well)
+- **Submodule-only changes** can use the classic mount workflow to swap submodules without rebuilding environments
 - **Container rebuilds** provide the best performance for large-scale production runs
 - **`NRL_FORCE_REBUILD_VENVS`** offers flexibility for development without container rebuilds
 
-Choose the approach that best fits your scale and development velocity. For most users, the production workflow with pre-built containers will provide the optimal experience.
+Choose the approach that best fits your scale and development velocity:
+- For most users, the **production workflow** with pre-built containers provides the optimal experience
+- When iterating on submodule code, the **classic mount workflow** offers a fast middle ground
+- For significant dependency changes, use **`NRL_FORCE_REBUILD_VENVS`** for small runs or **rebuild containers** for large-scale deployments
 
