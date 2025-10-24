@@ -166,12 +166,21 @@ Use this flowchart to determine which workflow applies to you:
 ```mermaid
 flowchart TD
     A[Start] --> B{Are you modifying<br/>dependencies or submodules?}
-    B -->|No| C[Production Workflow]
-    B -->|Yes| D[Development Workflow]
+    
+    subgraph " "
+        C[Production Workflow]
+        D[Development Workflow]
+    end
+    
+    B -->|No| C
+    B -->|Yes| D
+    
     C --> E{Container built from<br/>same commit as code?}
-    D --> G{Small scale<br/>or testing?}
     E -->|Yes| F[✓ Run directly<br/>uv run examples/...]
-    E -->|No| G
+    E -->|No| G{Small scale<br/>or testing?}
+    
+    D --> G
+    
     G -->|Yes| H[✓ Use NRL_FORCE_REBUILD_VENVS=true]
     G -->|No| I[✓ Rebuild container with new dependencies]
 ```
