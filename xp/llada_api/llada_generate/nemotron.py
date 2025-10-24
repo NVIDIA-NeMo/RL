@@ -89,31 +89,80 @@ class NemotronGeneration(GenerationAlgorithm):
         
         try:
             # For multi-GPU: model is DataParallel(LeftPaddingStripWrapper(BaseModel))
-            # DataParallel doesn't have a generate() method, so we need to unwrap it
-            # But we keep the LeftPaddingStripWrapper which DOES have generate()
-            actual_model = model
+            # We need to handle batch splitting properly:
+            # - If batch_size == 1, we can call generate() directly (no DataParallel needed)
+            # - If batch_size > 1 AND we have DataParallel, we need to manually split and merge
             
-            # Unwrap DataParallel if present (but keep LeftPaddingStripWrapper)
-            if hasattr(actual_model, 'module'):
-                actual_model = actual_model.module
+            batch_size = prompt.shape[0]
+            is_data_parallel = isinstance(model, torch.nn.DataParallel)
             
-            # Now actual_model is either:
-            # - LeftPaddingStripWrapper(BaseModel) for multi-GPU
-            # - BaseModel for single-GPU
-            # Both have .generate() methods
+            if batch_size == 1 or not is_data_parallel:
+                # Single sample or no DataParallel: call generate() directly
+                # Unwrap to get to the actual model (either LeftPaddingStripWrapper or BaseModel)
+                actual_model = model.module if is_data_parallel else model
+                
+                output_ids, nfe = actual_model.generate(
+                    prompt,
+                    max_new_tokens=validated_args['gen_length'],
+                    steps=validated_args['steps'],
+                    block_length=validated_args['block_length'],
+                    threshold=validated_args['threshold'],
+                    shift_logits=validated_args['shift_logits']
+                )
+                
+                return output_ids, nfe
             
-            # Call the generate method
-            # Note: Nemotron doesn't use temperature, remasking, or factor - these are LLaDA-specific
-            output_ids, nfe = actual_model.generate(
-                prompt,
-                max_new_tokens=validated_args['gen_length'],
-                steps=validated_args['steps'],
-                block_length=validated_args['block_length'],
-                threshold=validated_args['threshold'],
-                shift_logits=validated_args['shift_logits']
-            )
-            
-            return output_ids, nfe
+            else:
+                # Multiple samples with DataParallel: manually split across GPUs
+                # This is necessary because DataParallel only parallelizes .forward(), not .generate()
+                device_ids = model.device_ids
+                num_gpus = len(device_ids)
+                
+                logger.debug(f"Multi-GPU generation: splitting batch_size={batch_size} across {num_gpus} GPUs")
+                
+                # Split batch across GPUs
+                # Calculate samples per GPU
+                samples_per_gpu = [batch_size // num_gpus + (1 if i < batch_size % num_gpus else 0) 
+                                   for i in range(num_gpus)]
+                
+                # Split the prompt tensor
+                prompt_splits = torch.split(prompt, samples_per_gpu, dim=0)
+                
+                # Get the underlying model (LeftPaddingStripWrapper or BaseModel)
+                underlying_model = model.module
+                
+                # Process each split on its corresponding GPU
+                outputs = []
+                total_nfe = 0
+                
+                for gpu_id, prompt_split in zip(device_ids, prompt_splits):
+                    # Move prompt to the GPU
+                    prompt_gpu = prompt_split.to(f'cuda:{gpu_id}')
+                    
+                    # Generate on this GPU
+                    with torch.cuda.device(gpu_id):
+                        output_gpu, nfe_gpu = underlying_model.generate(
+                            prompt_gpu,
+                            max_new_tokens=validated_args['gen_length'],
+                            steps=validated_args['steps'],
+                            block_length=validated_args['block_length'],
+                            threshold=validated_args['threshold'],
+                            shift_logits=validated_args['shift_logits']
+                        )
+                    
+                    outputs.append(output_gpu)
+                    total_nfe += nfe_gpu
+                
+                # Merge outputs back to primary device
+                primary_device = f'cuda:{device_ids[0]}'
+                output_ids = torch.cat([o.to(primary_device) for o in outputs], dim=0)
+                
+                # Average NFE across GPUs
+                avg_nfe = total_nfe // num_gpus
+                
+                logger.debug(f"Multi-GPU generation complete: output shape={output_ids.shape}")
+                
+                return output_ids, avg_nfe
             
         except Exception as e:
             logger.error(f"Nemotron generation failed: {e}")
