@@ -1982,6 +1982,7 @@ def async_grpo_train(
                         "reward",
                         "global_valid_seqs",
                         "global_valid_toks",
+                        "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:
