@@ -268,10 +268,15 @@ class DInferGeneration(GenerationAlgorithm):
         
         logger.debug(f"Using dInfer generation with args: {validated_args}")
         
+        # Strip left-padding if batch_size == 1 (critical for multi-GPU with DataParallel)
+        # When DataParallel splits batch across GPUs and num_gpus == batch_size,
+        # each GPU gets a single left-padded sequence which confuses generation
+        prompt_stripped, _ = self.strip_left_padding(prompt, attention_mask=None)
+        
         # Generate using dInfer
         with torch.no_grad():
             output_ids = self.diffusion_llm.generate(
-                prompt=prompt,
+                prompt=prompt_stripped,
                 gen_length=validated_args['gen_length'],
                 block_length=validated_args['block_length']
             )

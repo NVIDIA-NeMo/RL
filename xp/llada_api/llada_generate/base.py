@@ -60,6 +60,71 @@ class GenerationAlgorithm(ABC):
             # Model has no parameters, fall back to self.device
             return torch.device(self.device if self.device else 'cuda')
     
+    def strip_left_padding(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Strip left-padding from input sequences when batch size is 1.
+        
+        This is critical for multi-GPU scenarios where DataParallel splits
+        the batch across GPUs. When num_gpus == batch_size, each GPU receives
+        a single sequence that may be left-padded, causing generation algorithms
+        to attend to padding tokens.
+        
+        Args:
+            input_ids: Input tensor of shape (batch_size, seq_len)
+            attention_mask: Optional attention mask of shape (batch_size, seq_len)
+            
+        Returns:
+            Tuple of (stripped_input_ids, stripped_attention_mask)
+            If batch_size > 1, returns inputs unchanged.
+            If batch_size == 1, strips left padding.
+        """
+        batch_size = input_ids.shape[0]
+        
+        # Only strip padding when batch size is 1
+        if batch_size != 1:
+            return input_ids, attention_mask
+        
+        # Get pad token ID
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            # No padding token defined, return unchanged
+            return input_ids, attention_mask
+        
+        # Find the first non-pad token
+        # input_ids shape: (1, seq_len)
+        seq = input_ids[0]  # Shape: (seq_len,)
+        
+        # Find first non-padding token
+        non_pad_mask = seq != pad_token_id
+        if not non_pad_mask.any():
+            # All padding - this shouldn't happen, but handle gracefully
+            logger.warning("Entire sequence is padding tokens")
+            return input_ids, attention_mask
+        
+        # Find the index of the first non-pad token
+        first_non_pad_idx = non_pad_mask.nonzero(as_tuple=True)[0][0].item()
+        
+        if first_non_pad_idx == 0:
+            # No left padding present
+            return input_ids, attention_mask
+        
+        # Strip left padding
+        stripped_input_ids = input_ids[:, first_non_pad_idx:]
+        stripped_attention_mask = None
+        if attention_mask is not None:
+            stripped_attention_mask = attention_mask[:, first_non_pad_idx:]
+        
+        logger.debug(
+            f"Stripped {first_non_pad_idx} left-padding tokens "
+            f"(batch_size=1): {input_ids.shape} -> {stripped_input_ids.shape}"
+        )
+        
+        return stripped_input_ids, stripped_attention_mask
+    
     @abstractmethod
     def generate(
         self,

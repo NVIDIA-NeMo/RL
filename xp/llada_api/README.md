@@ -95,6 +95,8 @@ Expected throughput improvements:
 
 See [docs/MULTI_GPU.md](docs/MULTI_GPU.md) for detailed multi-GPU guide.
 
+**Note**: Multi-GPU mode automatically handles left-padding issues when batch size equals GPU count. See [docs/multi_gpu_padding_fix.md](docs/multi_gpu_padding_fix.md) for technical details.
+
 ```
 
 **Inference Engines**:

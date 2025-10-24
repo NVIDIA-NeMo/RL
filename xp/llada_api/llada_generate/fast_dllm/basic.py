@@ -56,9 +56,14 @@ class BasicGeneration(FastDLLMGeneration):
         
         logger.debug(f"Using basic Fast-dLLM generation with args: {validated_args}")
         
+        # Strip left-padding if batch_size == 1 (critical for multi-GPU with DataParallel)
+        # When DataParallel splits batch across GPUs and num_gpus == batch_size,
+        # each GPU gets a single left-padded sequence which confuses generation
+        prompt_stripped, _ = self.strip_left_padding(prompt, attention_mask=None)
+        
         output, nfe = generate(
             model=model,
-            prompt=prompt,
+            prompt=prompt_stripped,
             steps=validated_args['steps'],
             gen_length=validated_args['gen_length'],
             block_length=validated_args['block_length'],
