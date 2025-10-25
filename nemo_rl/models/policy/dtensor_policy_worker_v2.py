@@ -281,6 +281,10 @@ class DTensorPolicyWorkerV2:
             print(
                 "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. Enable tp_size > 1 to use sequence parallelism."
             )
+        elif sequence_parallel_enabled and tp_size > 1:
+            raise RuntimeError(
+                "Sequence parallel + tp_size >1 is currently broken in torch==2.8.0. See https://github.com/NVIDIA-NeMo/Automodel/issues/652 for more details."
+            )
 
         if cp_size > 1:
             assert not isinstance(self.model, Gemma3ForCausalLM), (
@@ -303,12 +307,19 @@ class DTensorPolicyWorkerV2:
         dp_replicate_size = 1
         dp_shard_size = dp_size
 
+        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
+        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
+        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
+        prev_local_rank = os.environ["LOCAL_RANK"]
+        os.environ["LOCAL_RANK"] = "0"
+
         # Create device mesh with HSDP structure for FSDP2 compatibility
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda",
             (dp_replicate_size, dp_shard_size, cp_size, tp_size),
             mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
         )
+        os.environ["LOCAL_RANK"] = prev_local_rank
 
         # Create flattened submeshes for different use cases
         # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
@@ -656,6 +667,9 @@ class DTensorPolicyWorkerV2:
                         )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
+                            assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
+                                "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
+                            )
 
                     context_parallel_ctx = None
                     if self.cp_size > 1:

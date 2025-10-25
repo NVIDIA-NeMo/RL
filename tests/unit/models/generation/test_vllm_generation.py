@@ -1160,6 +1160,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 },
                 "finish_reason": "length",
                 "stop_reason": None,
+                "token_ids": None,
             }
         ],
         "service_tier": None,
@@ -1171,6 +1172,7 @@ def test_vllm_http_server(cluster, tokenizer):
             "prompt_tokens_details": None,
         },
         "prompt_logprobs": None,
+        "prompt_token_ids": None,
         "kv_transfer_params": None,
     }
 

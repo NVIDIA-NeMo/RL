@@ -25,7 +25,9 @@ src_dir = Path("Penguin")
 
 
 CACHED_DEPENDENCIES = [
-    "openai<=1.97.1",
+    # TODO: openai was un-pinned in https://github.com/NVIDIA-NeMo/RL/pull/1334 to comply with the version vllm mandates
+    # When penguin is actually added, this install will fail and we'll need penguin to ensure compatibility.
+    "openai",
     "tqdm",
     "pydantic",
     "pydantic_core",

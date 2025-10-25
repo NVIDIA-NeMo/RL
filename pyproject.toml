@@ -21,10 +21,10 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "setuptools",
     "ninja",  # for flash-attn parallel build
-    "torch==2.7.1",
+    "torch==2.8.0",
     "triton",
     "colored==2.2.3",
-    "ray[default]==2.46.0",
+    "ray[default]==2.49.2",
     "transformers>=4.55.4",
     "wandb",
     "numpy",
@@ -60,8 +60,8 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "vllm==0.10.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
-    "flash-attn==2.7.4.post1",
+    "vllm==0.11.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+    "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
 ]
@@ -72,10 +72,10 @@ vllm = [
     # sudo apt-get update
     # sudo apt-get install libibverbs-dev
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
-    "vllm==0.10.0",
+    "vllm==0.11.0",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "flash-attn==2.7.4.post1",
+    "flash-attn==2.8.1",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "mamba-ssm",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
@@ -91,15 +91,15 @@ mcore = [
     # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
     # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
     # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-    "transformer-engine[pytorch]==2.5.0",
+    "transformer-engine[pytorch]==2.8.0",
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "vllm==0.10.0",
+    "vllm==0.11.0",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "flash-attn==2.7.4.post1",
+    "flash-attn==2.8.1",
 ]
 penguin = [
     "penguin",
@@ -110,7 +110,7 @@ penguin = [
 # This is a default group so that we install these even with bare `uv sync`
 build = [
     # Build requirement for TE
-    "torch==2.7.1",
+    "torch==2.8.0",
     # Build requirement for TE
     "setuptools",
     "packaging",
@@ -154,15 +154,15 @@ penguin = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
-  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 triton = [
-  { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
@@ -182,11 +182,12 @@ url = "https://pypi.org/simple"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv]
+preview = true  # Enable preview features like extra-build-dependencies
 no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -197,11 +198,40 @@ default-groups = ["dev", "build"]
 #  --link-mode=copy (slower but more reliable; supresses warning)
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
+# This override is needed because automodel/mbridge we are on is still on 2.5.0
+override-dependencies = ["transformer-engine[pytorch]==2.8.0"]
+
+# Augment build dependencies for packages that need torch at build time
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+# Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+deep_gemm = [{ requirement = "torch", match-runtime = true }]
+transformer-engine = [{ requirement = "torch", match-runtime = true }]
+transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
+mamba-ssm = [{ requirement = "torch", match-runtime = true }]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "causal-conv1d"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
+
+[[tool.uv.dependency-metadata]]
+name = "deep_ep"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "deep_gemm"
+requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.black]
 line-length = 120
@@ -223,6 +253,7 @@ markers = [
     "mcore: marks tests that require the mcore extra",
     "hf_gated: marks tests that require HuggingFace token access for gated models",
     "automodel: marks tests that require the automodel extra",
+    "vllm: marks tests that require the vllm extra",
 ]
 
 [tool.pyrefly]
