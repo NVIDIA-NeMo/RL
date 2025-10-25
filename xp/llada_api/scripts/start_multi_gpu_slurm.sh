@@ -200,6 +200,9 @@ LB_SCRIPT="$LLADA_API_DIR/llada_load_balancer.py"
 # If DCP path is provided, we'll convert it once inside the container before starting workers
 WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
+# Add timeout configuration for long evaluations (9000s = 2.5 hours, handles 1319 samples with 4x slowdown buffer)
+WORKER_BASE_ARGS="$WORKER_BASE_ARGS --timeout-keep-alive 9000"
+
 # For HF models, add model-path directly
 if [[ -n "$MODEL_PATH" ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path $MODEL_PATH"
@@ -461,7 +464,7 @@ echo "All workers initialized successfully!"
 sleep 10
 
 echo "[5/5] Starting load balancer..."
-$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 300 --request-timeout 600 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
+$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 9000 --request-timeout 12000 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
     echo "$line"
     
     if [[ "$line" =~ "Uvicorn running on".*":LOAD_BALANCER_PORT_PLACEHOLDER" ]]; then

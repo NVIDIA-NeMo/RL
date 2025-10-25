@@ -271,6 +271,9 @@ fi
 # Build base worker arguments (common to all workers)
 WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
+# Add timeout configuration for long evaluations (9000s = 2.5 hours, handles 1319 samples with 4x slowdown buffer)
+WORKER_BASE_ARGS="$WORKER_BASE_ARGS --timeout-keep-alive 9000"
+
 # Use converted model path if DCP was converted, otherwise use MODEL_PATH
 if [[ -n "$CONVERTED_MODEL_PATH" ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$CONVERTED_MODEL_PATH'"
@@ -386,8 +389,8 @@ done
 print_lb "Starting load balancer on port $LOAD_BALANCER_PORT"
 LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-host localhost --worker-ports ${WORKER_PORTS[*]}"
 
-# Add timeout configuration for long evaluations (fixes timeout issues after ~40 samples)
-LB_CMD="$LB_CMD --timeout-keep-alive 300 --request-timeout 600"
+# Add timeout configuration for long evaluations (9000s/12000s = handles 1319 samples with 4x slowdown)
+LB_CMD="$LB_CMD --timeout-keep-alive 9000 --request-timeout 12000"
 
 if [[ "$VERBOSE" == true ]]; then
     LB_CMD="$LB_CMD --verbose"
