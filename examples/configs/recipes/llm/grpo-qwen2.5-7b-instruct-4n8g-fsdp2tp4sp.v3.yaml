@@ -37,8 +37,6 @@ policy:
     - 13
   generation:
     max_new_tokens: 4096
-    stop_token_ids:
-    - 151645
     vllm_cfg:
       tensor_parallel_size: 4
       max_model_len: 4096
