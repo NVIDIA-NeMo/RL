@@ -1,0 +1,232 @@
+checkpointing:
+  checkpoint_dir: /lustre/fs1/portfolios/coreai/users/ffrujeri/nemorl-vs-verl/nemo-rl/code_snapshots/grpo-acemath_rl-tp2/results/grpo-acemath_rl-tp2
+  checkpoint_must_save_by: 00:03:35:00
+  enabled: true
+  higher_is_better: true
+  keep_top_k: 50
+  metric_name: null
+  save_period: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
+data:
+  dataset_name: ResponseDataset
+  input_key: problem
+  max_input_seq_length: 16384
+  output_key: expected_answer
+  prompt:
+    config_dir: null
+    examples_type: null
+    prompt_config: qwen/math-cot
+    prompt_template: qwen-instruct
+    template_dir: null
+  prompt_file: "examples/prompts/qwen_math_cot.txt"
+  shuffle: false
+  system_prompt_file: null
+  train_data_path: /lustre/fsw/coreai_dlalgo_genai/ffrujeri/datasets/acemath_rl_46k_grpo_original_verl_shuffled.jsonl
+  val_data_path: null
+  num_workers: 16
+env:
+  math:
+    env_cls: nemo_skills.training.nemo_rl.environments.math_environment.MathEnvironment
+    num_workers: 16
+grpo:
+  max_num_epochs: 30
+  max_num_steps: 1000000
+  max_rollout_turns: 1
+  max_val_samples: 256
+  normalize_rewards: true
+  num_generations_per_prompt: 16
+  num_prompts_per_step: 128
+  overlong_filtering: false
+  seed: 42
+  use_leave_one_out_baseline: false
+  val_at_start: false
+  val_batch_size: 256
+  val_period: 0
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+logger:
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+  log_dir: logs/exp_003
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+  mlflow_enabled: false
+  monitor_gpus: false
+  num_val_samples_to_print: 0
+  swanlab_enabled: false
+  tensorboard: {}
+  tensorboard_enabled: false
+  wandb:
+    id: grpo-acemath_rl-tp2
+    name: grpo-acemath_rl-tp2
+    project: nemo-rl-acemath-rl
+  wandb_enabled: true
+loss_fn:
+  ratio_clip_c: 3
+  ratio_clip_max: 0.2
+  ratio_clip_min: 0.2
+  reference_policy_kl_penalty: 0.0
+  token_level_loss: true
+  use_importance_sampling_correction: false
+  use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
+  sequence_level_importance_ratios: false
+policy:
+  activation_checkpointing_enabled: false
+  context_parallel_size: 1
+  dtensor_cfg:
+    activation_checkpointing: true
+    context_parallel_size: 1
+    cpu_offload: false
+    custom_parallel_plan: null
+    enabled: true
+    sequence_parallel: true
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+    logprob_mb_tokens: 32768
+    sequence_length_round: 64
+    train_mb_tokens: 16384
+  fsdp_offload_enabled: false
+  generation:
+    backend: vllm
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: 8
+        num_nodes: null
+    max_new_tokens: 16384
+    model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    pad_token_id: 151643
+    stop_strings: null
+    stop_token_ids:
+    - 151643
+    temperature: 1.0
+    top_k: null
+    top_p: 1.0
+    vllm_cfg:
+      async_engine: false
+      enable_expert_parallel: false
+      enforce_eager: false
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      load_format: dummy
+      max_model_len: 16384
+      pipeline_parallel_size: 1
+      precision: bfloat16
+      skip_tokenizer_init: true
+      tensor_parallel_size: 2
+    vllm_kwargs:
+      compilation_config:
+        use_inductor: false
+  generation_batch_size: 32
+  logprob_batch_size: 2
+  lr: 1.0e-06
+  make_sequence_length_divisible_by: 4
+  max_grad_norm: 1.0
+  max_total_sequence_length: 16384
+  megatron_cfg:
+    activation_checkpointing: false
+    apply_rope_fusion: true
+    context_parallel_size: 1
+    converter_type: Qwen2ForCausalLM
+    distributed_data_parallel_config:
+      average_in_collective: true
+      data_parallel_sharding_strategy: optim_grads_params
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+    empty_unused_memory_level: 0
+    enabled: false
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    freeze_moe_router: true
+    moe_router_bias_update_rate: 0.0
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    optimizer:
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      bf16: true
+      clip_grad: 1.0
+      fp16: false
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      optimizer: adam
+      params_dtype: float32
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      weight_decay: 0.01
+    pipeline_dtype: bfloat16
+    pipeline_model_parallel_size: 1
+    scheduler:
+      end_weight_decay: 0.01
+      lr_decay_iters: 1000000
+      lr_decay_style: cosine
+      lr_warmup_init: 1.0e-06
+      lr_warmup_iters: 0
+      start_weight_decay: 0.01
+      weight_decay_incr_style: constant
+    sequence_parallel: false
+    tensor_model_parallel_size: 1
+  min_lr: 1.0e-06
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  optimizer:
+    kwargs:
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+      lr: 1.0e-06
+      weight_decay: 0.01
+    name: torch.optim.AdamW
+  pipeline_model_parallel_size: 1
+  precision: bfloat16
+  refit_buffer_size_gb: 4
+  scheduler:
+  - kwargs:
+      end_factor: 1.0
+      start_factor: 1.0
+      total_iters: 1
+    name: torch.optim.lr_scheduler.LinearLR
+  - kwargs:
+      T_max: 1000000
+      eta_min: 1.0e-06
+    name: torch.optim.lr_scheduler.CosineAnnealingLR
+  - milestones:
+    - 0
+  sequence_packing:
+    algorithm: modified_first_fit_decreasing
+    enabled: false
+    logprob_mb_tokens: 32768
+    sequence_length_round: 64
+    train_mb_tokens: 16384
+  tensor_model_parallel_size: 1
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  weight_decay: 0.01
