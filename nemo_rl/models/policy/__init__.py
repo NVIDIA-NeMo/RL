@@ -161,6 +161,7 @@ class PolicyConfig(TypedDict):
         int
     ]  # used in static batched (framework) generation
     precision: str
+    offload_optimizer_states_for_logprob: bool
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig
     megatron_cfg: NotRequired[MegatronConfig]

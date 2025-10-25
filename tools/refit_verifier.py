@@ -168,6 +168,7 @@ def setup_configs(args, tokenizer):
             },
         },
         "precision": "bfloat16",
+        "offload_optimizer_states_for_logprob": False,
         "pipeline_dtype": "bfloat16",
         "parallel_output": True,
         "max_total_sequence_length": args.max_sequence_length,

@@ -1781,6 +1781,7 @@ class DTensorPolicyWorkerV2:
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.cpu_offload
+            and self.cfg["offload_optimizer_states_for_logprob"]
         ):
             for state in self.optimizer.state.values():
                 for k, v in state.items():
@@ -1794,7 +1795,11 @@ class DTensorPolicyWorkerV2:
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and self.cfg["offload_optimizer_states_for_logprob"]
+        ):
             for state in self.optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, (DTensor, torch.Tensor)):

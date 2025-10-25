@@ -71,6 +71,7 @@ def create_megatron_test_config(
         "logprob_batch_size": 2,
         "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
+        "offload_optimizer_states_for_logprob": False,
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,

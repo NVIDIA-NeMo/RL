@@ -55,6 +55,7 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 2048
   precision: bfloat16
+  offload_optimizer_states_for_logprob: false
   dtensor_cfg:
     _v2: true
     enabled: false
