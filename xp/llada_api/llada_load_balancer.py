@@ -30,13 +30,14 @@ logger = logging.getLogger(__name__)
 class WorkerPool:
     """Manages a pool of worker servers and distributes requests among them."""
     
-    def __init__(self, worker_urls: List[str], health_check_interval: float = 30.0):
+    def __init__(self, worker_urls: List[str], health_check_interval: float = 30.0, request_timeout: float = 600.0):
         self.worker_urls = worker_urls
         self.current_index = 0
         self.healthy_workers = set(range(len(worker_urls)))
         self.health_check_interval = health_check_interval
+        self.request_timeout = request_timeout
         self.lock = asyncio.Lock()
-        self.client = httpx.AsyncClient(timeout=300.0)  # 5 minute timeout for generation
+        self.client = httpx.AsyncClient(timeout=request_timeout)
         
         # Stats
         self.total_requests = 0
@@ -46,6 +47,7 @@ class WorkerPool:
         logger.info(f"Initialized worker pool with {len(worker_urls)} workers:")
         for i, url in enumerate(worker_urls):
             logger.info(f"  Worker {i}: {url}")
+        logger.info(f"Request timeout: {request_timeout}s")
     
     async def start_health_checks(self):
         """Start periodic health checks for all workers."""
@@ -270,6 +272,8 @@ Examples:
                        help="Ports of worker servers (e.g., 8001 8002 8003 8004)")
     parser.add_argument("--health-check-interval", type=float, default=30.0,
                        help="Interval between health checks in seconds")
+    parser.add_argument("--request-timeout", type=float, default=600.0,
+                       help="Request timeout in seconds (default: 600, increase for long evaluations)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -283,7 +287,11 @@ Examples:
     worker_urls = [f"http://{args.worker_host}:{port}" for port in args.worker_ports]
     
     # Initialize worker pool
-    worker_pool = WorkerPool(worker_urls, health_check_interval=args.health_check_interval)
+    worker_pool = WorkerPool(
+        worker_urls, 
+        health_check_interval=args.health_check_interval,
+        request_timeout=args.request_timeout
+    )
     
     logger.info(f"Starting load balancer on {args.host}:{args.port}")
     logger.info(f"Distributing across {len(worker_urls)} workers")

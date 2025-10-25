@@ -868,6 +868,8 @@ Examples:
                        help="Enable verbose debug logging (very verbose, use for troubleshooting)")
     parser.add_argument("--no-chat-template", action="store_true",
                        help="Disable chat template application (feed raw text to tokenizer)")
+    parser.add_argument("--timeout-keep-alive", type=int, default=300,
+                       help="HTTP keep-alive timeout in seconds (default: 300, increase for long evaluations)")
     
     args = parser.parse_args()
     
@@ -947,11 +949,19 @@ Examples:
     logger.info(f"Engine: {loaded_engine}")
     logger.info(f"Default algorithm: {default_algorithm.name if default_algorithm else 'None'}")
     logger.info(f"Batch size: {args.batch_size}, Max wait time: {args.max_wait_time}s")
+    logger.info(f"HTTP keep-alive timeout: {args.timeout_keep_alive}s")
     if args.no_chat_template:
         logger.info("Chat template disabled - using raw text input")
     else:
         logger.info("Chat template enabled (default)")  
-    uvicorn.run(app, host=args.host, port=args.port)
+    
+    uvicorn.run(
+        app, 
+        host=args.host, 
+        port=args.port,
+        timeout_keep_alive=args.timeout_keep_alive,
+        timeout_graceful_shutdown=30,
+    )
 
 if __name__ == "__main__":
     main()
