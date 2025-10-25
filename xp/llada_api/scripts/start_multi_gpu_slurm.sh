@@ -371,8 +371,9 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     
     # Build worker command
     # Note: For DCP checkpoints, model path is added here after conversion
+    # Also pass base-model to ensure correct model type detection
     if [[ -n "$CONVERTED_MODEL_PATH" ]]; then
-        WORKER_CMD="CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT WORKER_BASE_ARGS_PLACEHOLDER --model-path $CONVERTED_MODEL_PATH"
+        WORKER_CMD="CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT WORKER_BASE_ARGS_PLACEHOLDER --model-path $CONVERTED_MODEL_PATH --base-model BASE_MODEL_PLACEHOLDER"
     else
         WORKER_CMD="CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT WORKER_BASE_ARGS_PLACEHOLDER"
     fi

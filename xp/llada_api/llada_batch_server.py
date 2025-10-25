@@ -229,9 +229,13 @@ def detect_model_type(model_path: str = None, base_model: str = None) -> str:
     Returns:
         'nemotron' or 'llada'
     """
+    # Check both model_path and base_model for "nemotron"
+    # This ensures correct detection even when using converted DCP checkpoints
+    # where model_path is a temp dir but base_model indicates the architecture
     model_identifier = model_path or base_model or ""
+    base_identifier = base_model or ""
     
-    if "nemotron" in model_identifier.lower():
+    if "nemotron" in model_identifier.lower() or "nemotron" in base_identifier.lower():
         return "nemotron"
     else:
         return "llada"
