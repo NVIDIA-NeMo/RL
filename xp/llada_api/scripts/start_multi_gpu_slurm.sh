@@ -202,18 +202,18 @@ WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX
 
 # For HF models, add model-path directly
 if [[ -n "$MODEL_PATH" ]]; then
-    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$MODEL_PATH'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path $MODEL_PATH"
 fi
 
 # For DCP models, we'll convert once and then use the converted path
 # (conversion happens inside container, so we don't add it to WORKER_BASE_ARGS yet)
 
 if [[ -n "$ENGINE" ]]; then
-    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --engine '$ENGINE'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --engine $ENGINE"
 fi
 
 if [[ -n "$ALGORITHM" ]]; then
-    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --algorithm '$ALGORITHM'"
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --algorithm $ALGORITHM"
 fi
 
 if [[ "$VERBOSE" == true ]]; then
@@ -369,19 +369,19 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     WORKER_PORT=$((BASE_WORKER_PORT_PLACEHOLDER + i))
     echo "Starting worker $i on GPU $i (port $WORKER_PORT)"
     
-    # Build worker arguments
-    WORKER_ARGS="WORKER_BASE_ARGS_PLACEHOLDER"
-    
-    # If DCP was converted, add the converted model path
+    # Build worker command
+    # Note: For DCP checkpoints, model path is added here after conversion
     if [[ -n "$CONVERTED_MODEL_PATH" ]]; then
-        WORKER_ARGS="$WORKER_ARGS --model-path '$CONVERTED_MODEL_PATH'"
+        WORKER_CMD="CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT WORKER_BASE_ARGS_PLACEHOLDER --model-path $CONVERTED_MODEL_PATH"
+    else
+        WORKER_CMD="CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT WORKER_BASE_ARGS_PLACEHOLDER"
     fi
     
     # Log the full command for debugging
-    echo "  Command: CUDA_VISIBLE_DEVICES=$i python WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT $WORKER_ARGS"
+    echo "  Command: $WORKER_CMD"
     
     # Start worker with detailed logging (both stdout and stderr to log file)
-    CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
+    eval "$WORKER_CMD" > "/tmp/worker_${i}.log" 2>&1 &
     WORKER_PID=$!
     WORKER_PIDS+=($WORKER_PID)
     echo "Worker $i started (PID: $WORKER_PID, log: /tmp/worker_${i}.log)"
