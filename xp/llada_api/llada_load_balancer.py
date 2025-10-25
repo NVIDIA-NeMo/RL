@@ -37,7 +37,21 @@ class WorkerPool:
         self.health_check_interval = health_check_interval
         self.request_timeout = request_timeout
         self.lock = asyncio.Lock()
-        self.client = httpx.AsyncClient(timeout=request_timeout)
+        
+        # Configure httpx client with proper timeouts and connection limits
+        # This is crucial for long-running evaluations with many concurrent requests
+        timeout_config = httpx.Timeout(
+            connect=10.0,              # 10s to establish connection
+            read=request_timeout,       # Long read timeout for diffusion generation
+            write=30.0,                # 30s to send request
+            pool=None                  # No timeout waiting for connection from pool
+        )
+        limits = httpx.Limits(
+            max_connections=1000,      # Support many concurrent requests
+            max_keepalive_connections=100,  # Keep more connections alive
+            keepalive_expiry=300.0     # Keep connections alive for 5 minutes
+        )
+        self.client = httpx.AsyncClient(timeout=timeout_config, limits=limits)
         
         # Stats
         self.total_requests = 0
@@ -47,7 +61,10 @@ class WorkerPool:
         logger.info(f"Initialized worker pool with {len(worker_urls)} workers:")
         for i, url in enumerate(worker_urls):
             logger.info(f"  Worker {i}: {url}")
-        logger.info(f"Request timeout: {request_timeout}s")
+        logger.info(f"HTTP client configuration:")
+        logger.info(f"  Request timeout: {request_timeout}s (read)")
+        logger.info(f"  Connection limits: {limits.max_connections} max, {limits.max_keepalive_connections} keepalive")
+        logger.info(f"  Keepalive expiry: {limits.keepalive_expiry}s")
     
     async def start_health_checks(self):
         """Start periodic health checks for all workers."""
