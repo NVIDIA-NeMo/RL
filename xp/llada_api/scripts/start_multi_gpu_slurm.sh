@@ -196,12 +196,17 @@ PROJECT_DIR="$(cd "$LLADA_API_DIR/../.." && pwd)"
 WORKER_SCRIPT="$LLADA_API_DIR/llada_batch_server.py"
 LB_SCRIPT="$LLADA_API_DIR/llada_load_balancer.py"
 
-# Build base worker arguments (DCP args will be added per-worker in the script)
+# Build base worker arguments
+# If DCP path is provided, we'll convert it once inside the container before starting workers
 WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
+# For HF models, add model-path directly
 if [[ -n "$MODEL_PATH" ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$MODEL_PATH'"
 fi
+
+# For DCP models, we'll convert once and then use the converted path
+# (conversion happens inside container, so we don't add it to WORKER_BASE_ARGS yet)
 
 if [[ -n "$ENGINE" ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --engine '$ENGINE'"
@@ -267,16 +272,73 @@ else
 fi
 
 # Install dependencies
-echo "[1/4] Syncing dependencies..."
+echo "[1/5] Syncing dependencies..."
 uv sync --locked --no-install-project --extra vllm
 uv pip install fastapi uvicorn httpx
 
-# Create temp dir if needed
-if [[ -n "DCP_PATH_PLACEHOLDER" ]]; then
-    mkdir -p "TEMP_DIR_PLACEHOLDER"
+# Convert DCP checkpoint once if needed (before starting workers)
+CONVERTED_MODEL_PATH=""
+if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
+    echo "[2/5] Converting DCP checkpoint to HuggingFace format (shared by all workers)..."
+    
+    # Use a single shared temp directory for all workers
+    SHARED_TEMP_DIR="/tmp/llada_hf_converted_shared_$$"
+    mkdir -p "$SHARED_TEMP_DIR"
+    
+    # Run the conversion using Python
+    $VENV_DIR/bin/python - <<EOF
+import sys
+import os
+
+try:
+    from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf
+    
+    dcp_path = "DCP_ABS_PATH_PLACEHOLDER"
+    temp_dir = "$SHARED_TEMP_DIR"
+    base_model = "BASE_MODEL_PLACEHOLDER"
+    
+    # Check if this is a structured checkpoint
+    weights_dir = os.path.join(dcp_path, "weights")
+    tokenizer_dir = os.path.join(dcp_path, "tokenizer")
+    
+    if os.path.exists(weights_dir) and os.path.exists(tokenizer_dir):
+        print(f"Detected structured DCP checkpoint")
+        hf_path = convert_structured_dcp_to_hf(
+            dcp_root_path=dcp_path,
+            hf_ckpt_path=temp_dir,
+            model_name_or_path=base_model,
+            overwrite=True
+        )
+    else:
+        print(f"Using legacy DCP checkpoint format")
+        hf_path = convert_dcp_to_hf(
+            dcp_ckpt_path=dcp_path,
+            hf_ckpt_path=temp_dir,
+            model_name_or_path=base_model,
+            tokenizer_name_or_path=base_model,
+            overwrite=True
+        )
+    
+    print(f"Conversion completed: {hf_path}")
+    
+except Exception as e:
+    print(f"Error during conversion: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+EOF
+    
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to convert DCP checkpoint"
+        exit 1
+    fi
+    
+    CONVERTED_MODEL_PATH="$SHARED_TEMP_DIR"
+    echo "DCP converted successfully to: $CONVERTED_MODEL_PATH"
+    echo "All workers will load from this shared HF checkpoint"
 fi
 
-echo "[2/4] Starting GPU workers..."
+echo "[3/5] Starting GPU workers..."
 
 # Start workers
 WORKER_PIDS=()
@@ -284,15 +346,12 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     WORKER_PORT=$((BASE_WORKER_PORT_PLACEHOLDER + i))
     echo "Starting worker $i on GPU $i (port $WORKER_PORT)"
     
-    # Build worker-specific arguments
+    # Build worker arguments
     WORKER_ARGS="WORKER_BASE_ARGS_PLACEHOLDER"
     
-    # Add DCP-specific arguments with unique temp directory per worker
-    if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
-        # Each worker gets its own temp directory to avoid race conditions
-        WORKER_TEMP_DIR="/tmp/llada_hf_converted_gpu_${i}_$$"
-        WORKER_ARGS="$WORKER_ARGS --dcp-path 'DCP_ABS_PATH_PLACEHOLDER' --base-model 'BASE_MODEL_PLACEHOLDER' --temp-dir '$WORKER_TEMP_DIR'"
-        echo "Worker $i temp dir: $WORKER_TEMP_DIR"
+    # If DCP was converted, add the converted model path
+    if [[ -n "$CONVERTED_MODEL_PATH" ]]; then
+        WORKER_ARGS="$WORKER_ARGS --model-path '$CONVERTED_MODEL_PATH'"
     fi
     
     CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
@@ -300,10 +359,10 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     echo "Worker $i started (PID: ${WORKER_PIDS[$i]})"
 done
 
-echo "[3/4] Waiting for workers to initialize..."
+echo "[4/5] Waiting for workers to initialize..."
 sleep 15
 
-echo "[4/4] Starting load balancer..."
+echo "[5/5] Starting load balancer..."
 $VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
     echo "$line"
     
@@ -336,6 +395,12 @@ done
 for PID in "${WORKER_PIDS[@]}"; do
     kill $PID 2>/dev/null || true
 done
+
+# Clean up shared temp directory if it was created
+if [[ -n "$CONVERTED_MODEL_PATH" ]] && [[ -d "$CONVERTED_MODEL_PATH" ]]; then
+    echo "Cleaning up shared temp directory: $CONVERTED_MODEL_PATH"
+    rm -rf "$CONVERTED_MODEL_PATH"
+fi
 EOF_OUTER
 )
 
@@ -348,10 +413,8 @@ COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_SCRIPT_PLACEHOLDER/$WORKER_SCRIPT}"
 COMMAND_BLOCK="${COMMAND_BLOCK//LB_SCRIPT_PLACEHOLDER/$LB_SCRIPT}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_BASE_ARGS_PLACEHOLDER/$WORKER_BASE_ARGS}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_PORTS_PLACEHOLDER/${WORKER_PORTS[*]}}"
-COMMAND_BLOCK="${COMMAND_BLOCK//DCP_PATH_PLACEHOLDER/${DCP_PATH:-}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//DCP_ABS_PATH_PLACEHOLDER/${DCP_ABS_PATH:-}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//BASE_MODEL_PLACEHOLDER/$BASE_MODEL}"
-COMMAND_BLOCK="${COMMAND_BLOCK//TEMP_DIR_PLACEHOLDER/$TEMP_DIR}"
 
 if [[ "$VERBOSE" == true ]]; then
     COMMAND_BLOCK="${COMMAND_BLOCK//VERBOSE_FLAG_PLACEHOLDER/--verbose}"

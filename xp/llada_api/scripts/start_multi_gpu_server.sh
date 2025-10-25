@@ -205,10 +205,76 @@ fi
 # Set PYTHONPATH
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 
+# Convert DCP checkpoint once if needed (before starting workers)
+CONVERTED_MODEL_PATH=""
+if [[ -n "$DCP_PATH" ]]; then
+    print_status "Converting DCP checkpoint to HuggingFace format (shared by all workers)..."
+    
+    # Use a single shared temp directory for all workers
+    SHARED_TEMP_DIR="/tmp/llada_hf_converted_shared_$$"
+    mkdir -p "$SHARED_TEMP_DIR"
+    
+    # Run the conversion using Python
+    CONVERSION_SCRIPT=$(cat <<EOF
+import sys
+import os
+sys.path.insert(0, "$PROJECT_DIR")
+
+try:
+    from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf, convert_structured_dcp_to_hf
+    
+    dcp_path = "$DCP_PATH"
+    temp_dir = "$SHARED_TEMP_DIR"
+    base_model = "$BASE_MODEL"
+    
+    # Check if this is a structured checkpoint
+    weights_dir = os.path.join(dcp_path, "weights")
+    tokenizer_dir = os.path.join(dcp_path, "tokenizer")
+    
+    if os.path.exists(weights_dir) and os.path.exists(tokenizer_dir):
+        print(f"Detected structured DCP checkpoint")
+        hf_path = convert_structured_dcp_to_hf(
+            dcp_root_path=dcp_path,
+            hf_ckpt_path=temp_dir,
+            model_name_or_path=base_model,
+            overwrite=True
+        )
+    else:
+        print(f"Using legacy DCP checkpoint format")
+        hf_path = convert_dcp_to_hf(
+            dcp_ckpt_path=dcp_path,
+            hf_ckpt_path=temp_dir,
+            model_name_or_path=base_model,
+            tokenizer_name_or_path=base_model,
+            overwrite=True
+        )
+    
+    print(f"Conversion completed: {hf_path}")
+    
+except Exception as e:
+    print(f"Error during conversion: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+)
+    
+    python3 -c "$CONVERSION_SCRIPT"
+    if [ $? -ne 0 ]; then
+        print_error "Failed to convert DCP checkpoint"
+        exit 1
+    fi
+    
+    CONVERTED_MODEL_PATH="$SHARED_TEMP_DIR"
+    print_status "DCP converted successfully to: $CONVERTED_MODEL_PATH"
+    print_status "All workers will load from this shared HF checkpoint"
+fi
+
 # Build base worker arguments (common to all workers)
 WORKER_BASE_ARGS="--host localhost --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
-if [[ -n "$MODEL_PATH" ]]; then
+# Use converted model path if DCP was converted, otherwise use MODEL_PATH
+if [[ -n "$CONVERTED_MODEL_PATH" ]]; then
+    WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$CONVERTED_MODEL_PATH'"
+elif [[ -n "$MODEL_PATH" ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --model-path '$MODEL_PATH'"
 fi
 
@@ -269,6 +335,12 @@ cleanup() {
         fi
     done
     
+    # Clean up shared temp directory if it was created
+    if [[ -n "${CONVERTED_MODEL_PATH:-}" ]] && [[ -d "$CONVERTED_MODEL_PATH" ]]; then
+        print_status "Cleaning up shared temp directory: $CONVERTED_MODEL_PATH"
+        rm -rf "$CONVERTED_MODEL_PATH"
+    fi
+    
     print_status "All processes stopped"
     exit 0
 }
@@ -286,16 +358,8 @@ for i in "${!GPU_ARRAY[@]}"; do
     
     print_gpu "Starting worker $i on GPU $GPU_ID (port $WORKER_PORT)"
     
-    # Build worker-specific arguments
+    # All workers use the same base arguments (including shared converted model path if DCP was used)
     WORKER_ARGS="$WORKER_BASE_ARGS"
-    
-    # Add DCP-specific arguments with unique temp directory per worker
-    if [[ -n "$DCP_PATH" ]]; then
-        # Each worker gets its own temp directory to avoid race conditions
-        WORKER_TEMP_DIR="/tmp/llada_hf_converted_gpu_${GPU_ID}_$$"
-        WORKER_ARGS="$WORKER_ARGS --dcp-path '$DCP_PATH' --base-model '$BASE_MODEL' --temp-dir '$WORKER_TEMP_DIR'"
-        print_gpu "Worker $i temp dir: $WORKER_TEMP_DIR"
-    fi
     
     # Build the command
     CMD="CUDA_VISIBLE_DEVICES=$GPU_ID python3 '$WORKER_SCRIPT' --port $WORKER_PORT $WORKER_ARGS"
