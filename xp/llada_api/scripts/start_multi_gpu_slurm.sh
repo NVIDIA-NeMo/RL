@@ -354,13 +354,58 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
         WORKER_ARGS="$WORKER_ARGS --model-path '$CONVERTED_MODEL_PATH'"
     fi
     
+    # Log the full command for debugging
+    echo "  Command: CUDA_VISIBLE_DEVICES=$i python WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT $WORKER_ARGS"
+    
     CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
     WORKER_PIDS+=($!)
     echo "Worker $i started (PID: ${WORKER_PIDS[$i]})"
 done
 
 echo "[4/5] Waiting for workers to initialize..."
-sleep 15
+sleep 5
+
+# Check if workers are still running and show their logs if they crashed
+echo "Checking worker health..."
+CRASHED_WORKERS=()
+for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
+    PID=${WORKER_PIDS[$i]}
+    if ! kill -0 $PID 2>/dev/null; then
+        echo "WARNING: Worker $i (PID $PID) has crashed!"
+        CRASHED_WORKERS+=($i)
+    else
+        echo "Worker $i (PID $PID) is running"
+    fi
+done
+
+# If any workers crashed, show their logs and exit
+if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
+    echo ""
+    echo "========== WORKER CRASH DETECTED =========="
+    echo "The following workers crashed during startup:"
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo "  - Worker $i"
+    done
+    echo ""
+    echo "Showing logs from crashed workers:"
+    echo "==========================================="
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo ""
+        echo "---------- Worker $i Log (last 50 lines) ----------"
+        tail -50 "/tmp/worker_${i}.log" 2>/dev/null || echo "Log file not found"
+        echo ""
+    done
+    echo "==========================================="
+    echo ""
+    echo "Stopping all remaining workers..."
+    for PID in "${WORKER_PIDS[@]}"; do
+        kill $PID 2>/dev/null || true
+    done
+    exit 1
+fi
+
+echo "All workers initialized successfully!"
+sleep 10
 
 echo "[5/5] Starting load balancer..."
 $VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
@@ -390,6 +435,44 @@ $VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER
         echo
     fi
 done
+
+# Check worker health after load balancer starts (or fails)
+echo ""
+echo "========== FINAL HEALTH CHECK =========="
+echo "Checking if all workers are still running..."
+CRASHED_WORKERS=()
+for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
+    PID=${WORKER_PIDS[$i]}
+    if ! kill -0 $PID 2>/dev/null; then
+        echo "✗ Worker $i (PID $PID) has CRASHED"
+        CRASHED_WORKERS+=($i)
+    else
+        echo "✓ Worker $i (PID $PID) is running"
+    fi
+done
+
+# If any workers crashed, show their logs
+if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
+    echo ""
+    echo "=========================================="
+    echo "DETECTED ${#CRASHED_WORKERS[@]} CRASHED WORKER(S)"
+    echo "=========================================="
+    echo ""
+    echo "Crashed workers:"
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo "  - Worker $i"
+    done
+    echo ""
+    echo "Showing logs from crashed workers:"
+    echo "=========================================="
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo ""
+        echo "---------- Worker $i Log ----------"
+        tail -100 "/tmp/worker_${i}.log" 2>/dev/null || echo "Log file not found: /tmp/worker_${i}.log"
+        echo ""
+    done
+    echo "=========================================="
+fi
 
 # Cleanup on exit
 for PID in "${WORKER_PIDS[@]}"; do

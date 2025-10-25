@@ -373,7 +373,7 @@ for i in "${!GPU_ARRAY[@]}"; do
 done
 
 echo ""
-print_status "All workers started. Waiting 10 seconds for initialization..."
+print_status "All workers started. Waiting for initialization..."
 sleep 10
 
 # Build worker ports list for load balancer
@@ -423,6 +423,68 @@ echo "     tail -f /tmp/llada_worker_0.log"
 echo ""
 echo "=============================================================="
 print_status "Press Ctrl+C to stop all servers"
+echo "=============================================================="
+
+# Give everything a moment to stabilize, then check health
+sleep 5
+
+echo ""
+echo "=============================================================="
+print_status "Final Health Check"
+echo "=============================================================="
+print_status "Checking if all workers are still running..."
+
+CRASHED_WORKERS=()
+for i in "${!WORKER_PIDS[@]}"; do
+    PID=${WORKER_PIDS[$i]}
+    GPU_ID=${GPU_ARRAY[$i]}
+    if ! kill -0 $PID 2>/dev/null; then
+        print_error "✗ Worker $i (GPU $GPU_ID, PID $PID) has CRASHED"
+        CRASHED_WORKERS+=($i)
+    else
+        print_gpu "✓ Worker $i (GPU $GPU_ID, PID $PID) is running"
+    fi
+done
+
+# Check load balancer
+if [[ -n "${LB_PID:-}" ]]; then
+    if ! kill -0 $LB_PID 2>/dev/null; then
+        print_error "✗ Load balancer (PID $LB_PID) has CRASHED"
+    else
+        print_lb "✓ Load balancer (PID $LB_PID) is running"
+    fi
+fi
+
+# If any workers crashed, show their logs
+if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
+    echo ""
+    echo "=============================================================="
+    print_error "DETECTED ${#CRASHED_WORKERS[@]} CRASHED WORKER(S)"
+    echo "=============================================================="
+    echo ""
+    echo "Crashed workers:"
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo "  - Worker $i (GPU ${GPU_ARRAY[$i]})"
+    done
+    echo ""
+    echo "Showing logs from crashed workers:"
+    echo "=============================================================="
+    for i in "${CRASHED_WORKERS[@]}"; do
+        echo ""
+        echo "---------- Worker $i (GPU ${GPU_ARRAY[$i]}) Log ----------"
+        tail -100 "/tmp/llada_worker_${i}.log" 2>/dev/null || echo "Log file not found"
+        echo ""
+    done
+    echo "=============================================================="
+    echo ""
+    print_warning "Some workers have crashed. Server may not work correctly."
+    echo "Check the logs above for error details."
+else
+    echo ""
+    print_status "✅ All workers are healthy!"
+fi
+
+echo ""
 echo "=============================================================="
 
 # Wait for user interrupt
