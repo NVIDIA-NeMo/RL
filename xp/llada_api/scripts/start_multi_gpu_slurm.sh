@@ -286,7 +286,8 @@ if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
     mkdir -p "$SHARED_TEMP_DIR"
     
     # Run the conversion using Python
-    $VENV_DIR/bin/python - <<EOF
+    # Capture both stdout and stderr from the conversion
+    CONVERSION_OUTPUT=$($VENV_DIR/bin/python - 2>&1 <<EOF
 import sys
 import os
 
@@ -302,7 +303,7 @@ try:
     tokenizer_dir = os.path.join(dcp_path, "tokenizer")
     
     if os.path.exists(weights_dir) and os.path.exists(tokenizer_dir):
-        print(f"Detected structured DCP checkpoint")
+        print(f"Detected structured DCP checkpoint", flush=True)
         hf_path = convert_structured_dcp_to_hf(
             dcp_root_path=dcp_path,
             hf_ckpt_path=temp_dir,
@@ -310,7 +311,7 @@ try:
             overwrite=True
         )
     else:
-        print(f"Using legacy DCP checkpoint format")
+        print(f"Using legacy DCP checkpoint format", flush=True)
         hf_path = convert_dcp_to_hf(
             dcp_ckpt_path=dcp_path,
             hf_ckpt_path=temp_dir,
@@ -319,17 +320,39 @@ try:
             overwrite=True
         )
     
-    print(f"Conversion completed: {hf_path}")
+    print(f"Conversion completed: {hf_path}", flush=True)
     
 except Exception as e:
-    print(f"Error during conversion: {e}", file=sys.stderr)
+    print(f"ERROR: DCP conversion failed: {e}", flush=True)
     import traceback
     traceback.print_exc()
     sys.exit(1)
 EOF
+)
+    CONVERSION_EXIT_CODE=$?
     
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to convert DCP checkpoint"
+    # Always print the conversion output
+    echo "$CONVERSION_OUTPUT"
+    
+    if [ $CONVERSION_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "=========================================="
+        echo "ERROR: DCP CHECKPOINT CONVERSION FAILED"
+        echo "=========================================="
+        echo ""
+        echo "The DCP to HuggingFace conversion failed with the output above."
+        echo ""
+        echo "Possible causes:"
+        echo "  1. Missing dependencies (torch.distributed.checkpoint)"
+        echo "  2. Corrupted DCP checkpoint files"
+        echo "  3. Incompatible base model"
+        echo "  4. Insufficient disk space"
+        echo ""
+        echo "DCP Path: DCP_ABS_PATH_PLACEHOLDER"
+        echo "Base Model: BASE_MODEL_PLACEHOLDER"
+        echo "Target Path: $SHARED_TEMP_DIR"
+        echo ""
+        echo "=========================================="
         exit 1
     fi
     
@@ -357,13 +380,18 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     # Log the full command for debugging
     echo "  Command: CUDA_VISIBLE_DEVICES=$i python WORKER_SCRIPT_PLACEHOLDER --port $WORKER_PORT $WORKER_ARGS"
     
-    CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
-    WORKER_PIDS+=($!)
-    echo "Worker $i started (PID: ${WORKER_PIDS[$i]})"
+    # Start worker with detailed logging (both stdout and stderr to log file)
+    CUDA_VISIBLE_DEVICES=$i $VENV_DIR/bin/python -u "WORKER_SCRIPT_PLACEHOLDER" --port $WORKER_PORT $WORKER_ARGS > "/tmp/worker_${i}.log" 2>&1 &
+    WORKER_PID=$!
+    WORKER_PIDS+=($WORKER_PID)
+    echo "Worker $i started (PID: $WORKER_PID, log: /tmp/worker_${i}.log)"
+    
+    # Small delay between worker starts to avoid race conditions
+    sleep 0.5
 done
 
 echo "[4/5] Waiting for workers to initialize..."
-sleep 5
+sleep 10
 
 # Check if workers are still running and show their logs if they crashed
 echo "Checking worker health..."
@@ -381,26 +409,50 @@ done
 # If any workers crashed, show their logs and exit
 if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
     echo ""
-    echo "========== WORKER CRASH DETECTED =========="
+    echo "=========================================="
+    echo "ERROR: WORKER CRASH DETECTED DURING STARTUP"
+    echo "=========================================="
+    echo ""
     echo "The following workers crashed during startup:"
     for i in "${CRASHED_WORKERS[@]}"; do
-        echo "  - Worker $i"
+        echo "  - Worker $i (GPU $i)"
     done
     echo ""
-    echo "Showing logs from crashed workers:"
-    echo "==========================================="
+    echo "Detailed logs from crashed workers:"
+    echo "=========================================="
     for i in "${CRASHED_WORKERS[@]}"; do
         echo ""
-        echo "---------- Worker $i Log (last 50 lines) ----------"
-        tail -50 "/tmp/worker_${i}.log" 2>/dev/null || echo "Log file not found"
+        echo "---------- Worker $i (GPU $i) Full Log ----------"
+        if [ -f "/tmp/worker_${i}.log" ]; then
+            # Show full log if small, or last 100 lines if large
+            LOG_LINES=$(wc -l < "/tmp/worker_${i}.log" 2>/dev/null || echo "0")
+            if [ "$LOG_LINES" -lt 100 ]; then
+                cat "/tmp/worker_${i}.log"
+            else
+                echo "(Showing last 100 lines of $LOG_LINES total lines)"
+                echo ""
+                tail -100 "/tmp/worker_${i}.log"
+            fi
+        else
+            echo "ERROR: Log file not found at /tmp/worker_${i}.log"
+            echo "This usually means the worker failed before any output was generated."
+        fi
         echo ""
+        echo "------------------------------------------------"
     done
-    echo "==========================================="
+    echo "=========================================="
     echo ""
     echo "Stopping all remaining workers..."
     for PID in "${WORKER_PIDS[@]}"; do
         kill $PID 2>/dev/null || true
     done
+    echo ""
+    echo "TROUBLESHOOTING:"
+    echo "  - Check if the model path is accessible"
+    echo "  - Verify GPU availability and CUDA setup"
+    echo "  - Check if required Python packages are installed"
+    echo "  - Review the error messages in the logs above"
+    echo ""
     exit 1
 fi
 
@@ -455,23 +507,44 @@ done
 if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
     echo ""
     echo "=========================================="
-    echo "DETECTED ${#CRASHED_WORKERS[@]} CRASHED WORKER(S)"
+    echo "ERROR: DETECTED ${#CRASHED_WORKERS[@]} CRASHED WORKER(S)"
     echo "=========================================="
     echo ""
     echo "Crashed workers:"
     for i in "${CRASHED_WORKERS[@]}"; do
-        echo "  - Worker $i"
+        echo "  - Worker $i (GPU $i)"
     done
     echo ""
-    echo "Showing logs from crashed workers:"
+    echo "Detailed logs from crashed workers:"
     echo "=========================================="
     for i in "${CRASHED_WORKERS[@]}"; do
         echo ""
-        echo "---------- Worker $i Log ----------"
-        tail -100 "/tmp/worker_${i}.log" 2>/dev/null || echo "Log file not found: /tmp/worker_${i}.log"
+        echo "---------- Worker $i (GPU $i) Full Log ----------"
+        if [ -f "/tmp/worker_${i}.log" ]; then
+            # Show full log if small, or last 100 lines if large
+            LOG_LINES=$(wc -l < "/tmp/worker_${i}.log" 2>/dev/null || echo "0")
+            if [ "$LOG_LINES" -lt 100 ]; then
+                cat "/tmp/worker_${i}.log"
+            else
+                echo "(Showing last 100 lines of $LOG_LINES total lines)"
+                echo ""
+                tail -100 "/tmp/worker_${i}.log"
+            fi
+        else
+            echo "ERROR: Log file not found at /tmp/worker_${i}.log"
+        fi
         echo ""
+        echo "------------------------------------------------"
     done
     echo "=========================================="
+    echo ""
+    echo "TROUBLESHOOTING:"
+    echo "  - Check if the model path is accessible in the container"
+    echo "  - Verify GPU availability (nvidia-smi)"
+    echo "  - Check for CUDA/PyTorch compatibility issues"
+    echo "  - Review the error messages in the logs above"
+    echo "  - Look for OOM (out of memory) errors"
+    echo ""
 fi
 
 # Cleanup on exit
