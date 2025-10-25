@@ -386,6 +386,9 @@ done
 print_lb "Starting load balancer on port $LOAD_BALANCER_PORT"
 LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-host localhost --worker-ports ${WORKER_PORTS[*]}"
 
+# Add timeout configuration for long evaluations (fixes timeout issues after ~40 samples)
+LB_CMD="$LB_CMD --timeout-keep-alive 300 --request-timeout 600"
+
 if [[ "$VERBOSE" == true ]]; then
     LB_CMD="$LB_CMD --verbose"
 fi

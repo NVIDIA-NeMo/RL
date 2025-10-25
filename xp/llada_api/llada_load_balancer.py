@@ -274,6 +274,8 @@ Examples:
                        help="Interval between health checks in seconds")
     parser.add_argument("--request-timeout", type=float, default=600.0,
                        help="Request timeout in seconds (default: 600, increase for long evaluations)")
+    parser.add_argument("--timeout-keep-alive", type=int, default=300,
+                       help="HTTP keep-alive timeout in seconds (default: 300, increase for long evaluations)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     
     args = parser.parse_args()
@@ -295,9 +297,16 @@ Examples:
     
     logger.info(f"Starting load balancer on {args.host}:{args.port}")
     logger.info(f"Distributing across {len(worker_urls)} workers")
+    logger.info(f"Timeout settings: request={args.request_timeout}s, keep-alive={args.timeout_keep_alive}s")
     
-    # Start the server
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Start the server with proper timeout configuration
+    uvicorn.run(
+        app, 
+        host=args.host, 
+        port=args.port,
+        timeout_keep_alive=args.timeout_keep_alive,
+        timeout_graceful_shutdown=30,
+    )
 
 
 if __name__ == "__main__":

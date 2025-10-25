@@ -461,7 +461,7 @@ echo "All workers initialized successfully!"
 sleep 10
 
 echo "[5/5] Starting load balancer..."
-$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
+$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 300 --request-timeout 600 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
     echo "$line"
     
     if [[ "$line" =~ "Uvicorn running on".*":LOAD_BALANCER_PORT_PLACEHOLDER" ]]; then
