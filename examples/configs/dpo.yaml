@@ -117,7 +117,11 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
+<<<<<<< HEAD
     defer_fp32_logits: False
+=======
+    defer_fp32_logits: null
+>>>>>>> 4a69edff (chore: major version bump (torch 2.8, vllm 0.11, ray 2.49) & SP fixes (#1334))
     
     optimizer:
       optimizer: "adam"
