@@ -874,7 +874,9 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "attention_mask": attention_mask,
-            "token_mask": torch.triu(torch.ones(global_batch_size, seq_len), diagonal=1),
+            "token_mask": torch.triu(
+                torch.ones(global_batch_size, seq_len), diagonal=1
+            ),
             "sample_mask": torch.ones((global_batch_size,)),
             "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
         }
@@ -895,7 +897,9 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
     config1 = create_megatron_test_config(tiny_llama_model_path)
     config1["train_global_batch_size"] = global_batch_size
     config1["train_micro_batch_size"] = 1
-    config1["generation"] = configure_generation_config(config1["generation"], tokenizer)
+    config1["generation"] = configure_generation_config(
+        config1["generation"], tokenizer
+    )
 
     policy1 = Policy(
         cluster=cluster1,
@@ -921,7 +925,9 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
     config2 = create_megatron_test_config(tiny_llama_model_path)
     config2["train_global_batch_size"] = global_batch_size
     config2["train_micro_batch_size"] = 2
-    config2["generation"] = configure_generation_config(config2["generation"], tokenizer)
+    config2["generation"] = configure_generation_config(
+        config2["generation"], tokenizer
+    )
 
     policy2 = Policy(
         cluster=cluster2,
@@ -937,6 +943,7 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
 
     policy2.shutdown()
     cluster2.shutdown()
+
 
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
