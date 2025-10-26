@@ -15,13 +15,15 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
-uv run tests/unit/prepare_unit_test_assets.py
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
 
-cd /opt/nemo-rl
+cd ${PROJECT_ROOT}
+uv run tests/unit/prepare_unit_test_assets.py
 uv run --no-sync bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 
 # Check and run mcore tests
-exit_code=$(uv run --extra mcore pytest tests/unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --collect-only --hf-gated --mcore-only -q >/dev/null 2>&1; echo $?)
+exit_code=$(uv run --extra mcore pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --mcore-only -q >/dev/null 2>&1; echo $?)
 if [[ $exit_code -eq 5 ]]; then
     echo "No mcore tests to run"
 else
@@ -29,7 +31,7 @@ else
 fi
 
 # Check and run automodel tests
-exit_code=$(uv run --extra automodel pytest tests/unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
+exit_code=$(uv run --extra automodel pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
 if [[ $exit_code -eq 5 ]]; then
     echo "No automodel tests to run"
 else
@@ -37,7 +39,7 @@ else
 fi
 
 # Check and run vllm tests
-exit_code=$(uv run --extra vllm pytest tests/unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --collect-only --hf-gated --vllm-only -q >/dev/null 2>&1; echo $?)
+exit_code=$(uv run --extra vllm pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --vllm-only -q >/dev/null 2>&1; echo $?)
 if [[ $exit_code -eq 5 ]]; then
     echo "No vllm tests to run"
 else
