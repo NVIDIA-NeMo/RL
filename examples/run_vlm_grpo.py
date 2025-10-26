@@ -341,6 +341,12 @@ def main() -> None:
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], processor.tokenizer
     )
+    if "vllm_cfg" in config["policy"]["generation"]:
+        assert (
+            config["policy"]["generation"]["vllm_cfg"]["skip_tokenizer_init"] == False
+        ), (
+            "VLMs require tokenizer to be initialized before generation, so skip_tokenizer_init must be set to False."
+        )
 
     # setup data
     # this function is local to this script, and can be extended to other VLM datasets

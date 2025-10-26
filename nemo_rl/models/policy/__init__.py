@@ -90,6 +90,8 @@ class MegatronDDPConfig(TypedDict):
 class MegatronConfig(TypedDict):
     enabled: bool
     env_vars: NotRequired[dict[str, str]]
+    # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
+    # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
     activation_checkpointing: bool
     converter_type: str
@@ -108,6 +110,8 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
+    # Force overwrite of the initial checkpoint even if it exists (default: False)
+    force_overwrite_initial_ckpt: NotRequired[bool]
 
     optimizer: NotRequired[MegatronOptimizerConfig]
     scheduler: NotRequired[MegatronSchedulerConfig]

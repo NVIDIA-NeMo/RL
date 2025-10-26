@@ -162,7 +162,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.7.2"
+          version: "0.9.1"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner

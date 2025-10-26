@@ -22,7 +22,6 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
     converter_type: LlamaForCausalLM
     tensor_model_parallel_size: 4
     expert_model_parallel_size: 8

@@ -216,7 +216,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 documents=None,
                 chat_template_kwargs=None,
                 tool_parser=None,
-                truncate_prompt_tokens=None,
                 add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
@@ -240,7 +239,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents,
                     chat_template_kwargs,
                     tool_parser,
-                    truncate_prompt_tokens,
                     add_special_tokens,
                 )
 
@@ -275,7 +273,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents=documents,
                     chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                     add_special_tokens=add_special_tokens,
                 )
                 actual_corresponding_token_ids = corresponding_res[2][0][
@@ -353,7 +350,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
@@ -431,7 +428,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())

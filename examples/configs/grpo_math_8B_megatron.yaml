@@ -30,7 +30,7 @@ policy:
 
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 1
     # On H100, can run with pp=1 for better performance with expandable segments (which is enabled by default)
