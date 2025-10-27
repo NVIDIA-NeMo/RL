@@ -538,6 +538,25 @@ def setup(
 # ===============================================================================
 
 
+def normalize_advantages_with_epsilon(
+    advantages: torch.Tensor,
+    std: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Normalize advantages by standard deviation with epsilon to avoid division by zero.
+
+    Args:
+        advantages: Tensor of shape (batch_size, 1) containing advantage values
+        std: Tensor of shape (batch_size,) containing standard deviation values
+        epsilon: Small value to avoid division by zero, defaults to 1e-6
+
+    Returns:
+        Normalized advantages tensor of same shape as input advantages
+    """
+    # Use epsilon to avoid division by zero instead of masking
+    return advantages / (std.unsqueeze(-1) + epsilon)
+
+
 def dynamic_sampling(
     repeated_batch: BatchedDataDict[DatumSpec],
     std: torch.Tensor,
@@ -1056,10 +1075,9 @@ def grpo_train(
                     advantages = (rewards - baseline).unsqueeze(-1)
 
                     if master_config["grpo"]["normalize_rewards"]:
-                        # don't sharpen the ones with no variation
-                        zero_std_mask = std > 0
-                        advantages[zero_std_mask] = (
-                            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                        advantages = normalize_advantages_with_epsilon(
+                            advantages=advantages,
+                            std=std,
                         )
 
                 with timer.time("data_processing"):
@@ -1178,6 +1196,10 @@ def grpo_train(
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
+                    # Add advantages tracking metrics
+                    "advantages/mean": torch.mean(advantages).detach().item(),
+                    "advantages/max": torch.max(advantages).detach().item(),
+                    "advantages/min": torch.min(advantages).detach().item(),
                     **ds_metrics,
                 }
                 if master_config["grpo"]["use_dynamic_sampling"]:
@@ -1929,10 +1951,11 @@ def async_grpo_train(
                     )
 
                     if master_config["grpo"]["normalize_rewards"]:
-                        zero_std_mask = std > 0
-                        advantages[zero_std_mask] = (
-                            advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                        advantages = normalize_advantages_with_epsilon(
+                            advantages=advantages,
+                            std=std,
                         )
+
                         print(
                             f"  📊 Normalized advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                         )
@@ -2066,6 +2089,10 @@ def async_grpo_train(
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
+                    # Add advantages tracking metrics
+                    "advantages/mean": torch.mean(advantages).detach().item(),
+                    "advantages/max": torch.max(advantages).detach().item(),
+                    "advantages/min": torch.min(advantages).detach().item(),
                 }
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
