@@ -377,6 +377,11 @@ def forward_step_arbitrary_loss(
 
         loss_data = data_dict
 
+    if policy_cfg is not None:
+        logprob_chunk_size = policy_cfg.get("logprob_chunk_size", None)
+    else:
+        logprob_chunk_size = None
+
     loss_fn_wrapped = partial(
         loss_fn,
         data=loss_data,
@@ -385,6 +390,7 @@ def forward_step_arbitrary_loss(
         vocab_parallel_rank=get_tensor_model_parallel_rank(),
         vocab_parallel_group=get_tensor_model_parallel_group(),
         context_parallel_group=get_context_parallel_group(),
+        logprob_chunk_size=logprob_chunk_size,
     )
 
     if cp_normalize:
