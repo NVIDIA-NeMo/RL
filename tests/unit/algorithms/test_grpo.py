@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from nemo_rl.algorithms.grpo import (
     async_grpo_train,
     dynamic_sampling,
     grpo_train,
+    normalize_advantages_with_epsilon,
 )
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -1207,3 +1209,438 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
             assert not (line.startswith("Step ") and "Step 9" in line), (
                 f"Training continued to next step after timeout: {line}"
             )
+
+
+# ============================================================================
+# Tests for normalize_advantages_with_epsilon function
+# ============================================================================
+
+
+def test_normalize_advantages_with_epsilon_basic():
+    """Test basic functionality of normalize_advantages_with_epsilon."""
+    # Test case with normal values
+    advantages = torch.tensor([[2.0], [4.0], [6.0]])
+    std = torch.tensor([1.0, 2.0, 3.0])
+    epsilon = 1e-6
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    expected = torch.tensor([[2.0], [2.0], [2.0]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_zero_std():
+    """Test normalize_advantages_with_epsilon when std contains zeros."""
+    advantages = torch.tensor([[1.0], [2.0], [3.0]])
+    std = torch.tensor([0.0, 1.0, 0.0])  # Zero std for indices 0 and 2
+    epsilon = 1e-6
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    # When std=0, result should be advantages / epsilon
+    expected = torch.tensor([[1.0 / epsilon], [2.0], [3.0 / epsilon]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_all_zero_std():
+    """Test normalize_advantages_with_epsilon when all std values are zero."""
+    advantages = torch.tensor([[1.5], [2.5], [3.5]])
+    std = torch.tensor([0.0, 0.0, 0.0])
+    epsilon = 1e-8
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    expected = advantages / epsilon
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_different_epsilons():
+    """Test normalize_advantages_with_epsilon with different epsilon values."""
+    advantages = torch.tensor([[1.0], [2.0]])
+    std = torch.tensor([0.0, 0.5])
+
+    # Test with different epsilon values
+    epsilons = [1e-6, 1e-8, 1e-4]
+
+    for eps in epsilons:
+        result = normalize_advantages_with_epsilon(advantages, std, eps)
+        expected = torch.tensor([[1.0 / eps], [2.0 / 0.5]])
+        assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_tensor_shapes():
+    """Test normalize_advantages_with_epsilon with different tensor shapes."""
+    # Test with batch size 1
+    advantages = torch.tensor([[5.0]])
+    std = torch.tensor([2.0])
+    result = normalize_advantages_with_epsilon(advantages, std)
+    expected = torch.tensor([[2.5]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+    # Test with larger batch
+    batch_size = 10
+    advantages = torch.ones(batch_size, 1) * 3.0
+    std = torch.ones(batch_size) * 1.5
+    result = normalize_advantages_with_epsilon(advantages, std)
+    expected = torch.ones(batch_size, 1) * 2.0
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_negative_advantages():
+    """Test normalize_advantages_with_epsilon with negative advantages."""
+    advantages = torch.tensor([[-2.0], [3.0], [-1.5]])
+    std = torch.tensor([1.0, 1.5, 0.5])
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+
+    expected = torch.tensor([[-2.0], [2.0], [-3.0]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_very_small_std():
+    """Test normalize_advantages_with_epsilon with very small std values."""
+    advantages = torch.tensor([[1.0], [2.0]])
+    std = torch.tensor([1e-10, 2e-9])  # Very small but non-zero std
+    epsilon = 1e-6
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    # Since std values are much smaller than epsilon, result should be close to advantages/epsilon
+    expected = torch.tensor([[1.0 / epsilon], [2.0 / epsilon]])
+    assert torch.allclose(result, expected, rtol=1e-3)
+
+
+def test_normalize_advantages_with_epsilon_gradient_flow():
+    """Test that normalize_advantages_with_epsilon preserves gradients."""
+    advantages = torch.tensor([[2.0], [4.0]], requires_grad=True)
+    std = torch.tensor([1.0, 2.0])
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+    loss = result.sum()
+    loss.backward()
+
+    # Check that gradients are computed correctly
+    assert advantages.grad is not None
+    expected_grad = torch.tensor([[1.0], [0.5]])
+    assert torch.allclose(advantages.grad, expected_grad, rtol=1e-5)
+
+
+# ============================================================================
+# Tests for advantages metrics tracking in GRPO
+# ============================================================================
+
+
+def test_grpo_advantages_metrics_tracking(mock_grpo_components):
+    """Test that advantages metrics (mean, max, min) are correctly tracked during GRPO training."""
+    from unittest.mock import patch
+
+    # Set up config to enable reward normalization (where advantages metrics are logged)
+    mock_grpo_components["master_config"]["grpo"]["normalize_rewards"] = True
+    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = (
+        2  # Just run 2 steps
+    )
+
+    grpo_save_state = _default_grpo_save_state()
+
+    # Mock batch with specific rewards to get predictable advantages
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    }
+                ]
+            ]
+            * 4,
+            "task_name": ["math"] * 4,
+            "extra_env_info": [{}] * 4,
+            "loss_multiplier": torch.tensor([1.0, 1.0, 1.0, 1.0]),
+            "idx": torch.tensor([0, 1, 2, 3]),
+            "length": torch.tensor([3, 3, 3, 3]),
+            "total_reward": torch.tensor(
+                [1.0, 3.0, 2.0, 4.0]
+            ),  # Known rewards for predictable advantages
+        }
+    )
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    # Capture the logged metrics
+    logged_metrics = []
+    original_log_metrics = mock_grpo_components["logger"].log_metrics
+
+    def capture_log_metrics(metrics, step):
+        logged_metrics.append((dict(metrics), step))
+        return original_log_metrics(metrics, step)
+
+    mock_grpo_components["logger"].log_metrics.side_effect = capture_log_metrics
+
+    with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+        mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
+
+        # Run GRPO training
+        grpo_train(
+            mock_grpo_components["policy"],
+            None,  # policy_generation
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            grpo_save_state,
+            mock_grpo_components["master_config"],
+        )
+
+    # Verify that advantages metrics were logged
+    assert len(logged_metrics) >= 2, "Should have logged metrics for at least 2 steps"
+
+    # Check each logged step for advantages metrics
+    for metrics_dict, step in logged_metrics:
+        if "advantages/mean" in metrics_dict:
+            # Verify that all three advantages metrics are present
+            assert "advantages/mean" in metrics_dict
+            assert "advantages/max" in metrics_dict
+            assert "advantages/min" in metrics_dict
+
+            # Verify that the values are reasonable (should be numeric)
+            assert isinstance(metrics_dict["advantages/mean"], (int, float))
+            assert isinstance(metrics_dict["advantages/max"], (int, float))
+            assert isinstance(metrics_dict["advantages/min"], (int, float))
+
+            # Verify logical relationships between min, mean, max
+            assert metrics_dict["advantages/min"] <= metrics_dict["advantages/mean"]
+            assert metrics_dict["advantages/mean"] <= metrics_dict["advantages/max"]
+
+
+# ============================================================================
+# Integration tests for GRPO with new advantage normalization logic
+# ============================================================================
+
+
+def test_grpo_integration_with_new_normalization(mock_grpo_components):
+    """Integration test for GRPO training with the new advantage normalization logic."""
+    from unittest.mock import patch
+
+    # Enable reward normalization to test the new normalization logic
+    mock_grpo_components["master_config"]["grpo"]["normalize_rewards"] = True
+    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = 3
+
+    grpo_save_state = _default_grpo_save_state()
+
+    # Create test batch with mixed std scenarios (including zero std cases)
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    }
+                ]
+            ]
+            * 6,
+            "task_name": ["math"] * 6,
+            "extra_env_info": [{}] * 6,
+            "loss_multiplier": torch.tensor([1.0] * 6),
+            "idx": torch.tensor([0, 1, 2, 3, 4, 5]),
+            "length": torch.tensor([3] * 6),
+            # Mix of rewards: some with variation, some identical (zero std)
+            "total_reward": torch.tensor([1.0, 1.0, 1.0, 2.0, 4.0, 6.0]),
+        }
+    )
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    # Track calls to normalize_advantages_with_epsilon
+    original_normalize = normalize_advantages_with_epsilon
+    normalize_calls = []
+
+    def track_normalize_calls(advantages, std, epsilon=1e-6):
+        normalize_calls.append((advantages.clone(), std.clone(), epsilon))
+        return original_normalize(advantages, std, epsilon)
+
+    # Capture logged metrics to verify advantages tracking
+    logged_metrics = []
+    original_log_metrics = mock_grpo_components["logger"].log_metrics
+
+    def capture_log_metrics(metrics, step):
+        logged_metrics.append((dict(metrics), step))
+        return original_log_metrics(metrics, step)
+
+    mock_grpo_components["logger"].log_metrics.side_effect = capture_log_metrics
+
+    with (
+        patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout,
+        patch(
+            "nemo_rl.algorithms.grpo.normalize_advantages_with_epsilon",
+            side_effect=track_normalize_calls,
+        ) as mock_normalize,
+    ):
+        mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
+
+        # Run GRPO training
+        grpo_train(
+            mock_grpo_components["policy"],
+            None,  # policy_generation
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            grpo_save_state,
+            mock_grpo_components["master_config"],
+        )
+
+    # Verify that normalize_advantages_with_epsilon was called
+    assert len(normalize_calls) >= 3, (
+        "normalize_advantages_with_epsilon should be called for each training step"
+    )
+    assert mock_normalize.call_count >= 3, (
+        "Should have called normalization function at least 3 times"
+    )
+
+    # Verify the function was called with expected parameters
+    for advantages, std, epsilon in normalize_calls:
+        # Verify tensor shapes are correct
+        assert advantages.dim() == 2, "Advantages should be 2D tensor"
+        assert advantages.shape[1] == 1, "Advantages should have shape (batch_size, 1)"
+        assert std.dim() == 1, "Std should be 1D tensor"
+        assert advantages.shape[0] == std.shape[0], (
+            "Advantages and std should have same batch size"
+        )
+
+        # Verify epsilon is the expected default
+        assert epsilon == 1e-6, "Should use default epsilon value"
+
+        # Verify that std values are non-negative (after baseline calculation)
+        assert (std >= 0).all(), "All std values should be non-negative"
+
+    # Verify advantages metrics are logged
+    advantages_metrics_found = False
+    for metrics_dict, step in logged_metrics:
+        if "advantages/mean" in metrics_dict:
+            advantages_metrics_found = True
+            # Verify all three metrics are present
+            assert "advantages/mean" in metrics_dict
+            assert "advantages/max" in metrics_dict
+            assert "advantages/min" in metrics_dict
+
+            # Verify metrics are finite numbers
+            assert math.isfinite(metrics_dict["advantages/mean"])
+            assert math.isfinite(metrics_dict["advantages/max"])
+            assert math.isfinite(metrics_dict["advantages/min"])
+
+    assert advantages_metrics_found, (
+        "Should have logged advantages metrics during training"
+    )
+
+    # Verify training completed successfully (no exceptions raised)
+    assert mock_grpo_components["policy"].train.call_count == 3, (
+        "Should have completed 3 training steps"
+    )
+
+
+def test_grpo_normalization_with_all_zero_std(mock_grpo_components):
+    """Test GRPO training when all prompts have zero standard deviation."""
+    from unittest.mock import patch
+
+    # Enable reward normalization
+    mock_grpo_components["master_config"]["grpo"]["normalize_rewards"] = True
+    mock_grpo_components["master_config"]["grpo"]["max_num_steps"] = 1
+
+    grpo_save_state = _default_grpo_save_state()
+
+    # Create batch where all rewards are identical (zero std everywhere)
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    }
+                ]
+            ]
+            * 4,
+            "task_name": ["math"] * 4,
+            "extra_env_info": [{}] * 4,
+            "loss_multiplier": torch.tensor([1.0] * 4),
+            "idx": torch.tensor([0, 1, 2, 3]),
+            "length": torch.tensor([3] * 4),
+            "total_reward": torch.tensor([2.5, 2.5, 2.5, 2.5]),  # All identical rewards
+        }
+    )
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    # Track normalization calls to verify epsilon is used properly
+    normalize_calls = []
+    original_normalize = normalize_advantages_with_epsilon
+
+    def track_normalize_calls(advantages, std, epsilon=1e-6):
+        normalize_calls.append((advantages.clone(), std.clone(), epsilon))
+        return original_normalize(advantages, std, epsilon)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout,
+        patch(
+            "nemo_rl.algorithms.grpo.normalize_advantages_with_epsilon",
+            side_effect=track_normalize_calls,
+        ),
+    ):
+        mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
+
+        # Run GRPO training - should complete without errors even with all zero std
+        grpo_train(
+            mock_grpo_components["policy"],
+            None,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            grpo_save_state,
+            mock_grpo_components["master_config"],
+        )
+
+    # Verify normalization was called and handled zero std correctly
+    assert len(normalize_calls) >= 1, "Should have called normalization at least once"
+
+    for advantages, std, epsilon in normalize_calls:
+        # When all rewards are identical, std should be 0
+        if (std == 0).all():
+            # Verify that normalized advantages = advantages / epsilon
+            expected_normalized = advantages / epsilon
+            actual_normalized = normalize_advantages_with_epsilon(
+                advantages, std, epsilon
+            )
+            assert torch.allclose(actual_normalized, expected_normalized, rtol=1e-5)
+
+    # Verify training completed successfully
+    assert mock_grpo_components["policy"].train.call_count == 1
