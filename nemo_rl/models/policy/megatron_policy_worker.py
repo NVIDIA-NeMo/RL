@@ -667,8 +667,8 @@ class MegatronPolicyWorker:
         model_cfg.perform_initialization = False
 
         assert (
-            "aux_loss" not in self.model_cfg.moe_router_load_balancing_type
-            or self.model_cfg.moe_aux_loss_coeff == 0
+            "aux_loss" not in model_cfg.moe_router_load_balancing_type
+            or model_cfg.moe_aux_loss_coeff == 0
         ), (
             "MoE aux loss is currently not supported due to a known but in Megatron-LM. See ## TODO: link to GH issue"
         )
