@@ -279,10 +279,58 @@ echo "[1/5] Syncing dependencies..."
 uv sync --locked --no-install-project --extra vllm
 uv pip install fastapi uvicorn httpx
 
+echo "[2/5] Pre-caching model if needed..."
+
+# Pre-cache HuggingFace model if needed (before starting workers)
+# This prevents HuggingFace API rate limiting when 8 workers try to download simultaneously
+MODEL_PATH_TO_CHECK="WORKER_BASE_ARGS_PLACEHOLDER"
+if [[ "$MODEL_PATH_TO_CHECK" == *"--model-path"* ]] && [[ -z "DCP_ABS_PATH_PLACEHOLDER" ]]; then
+    # Extract model path from WORKER_BASE_ARGS (it contains --model-path MODELNAME)
+    # This is a HuggingFace model name (DCP_PATH is empty)
+    
+    # Use Python to pre-cache model metadata
+    $VENV_DIR/bin/python - <<'EOF_PRECACHE'
+import sys
+import os
+
+try:
+    from transformers import AutoTokenizer, AutoConfig
+    
+    # Extract model name from command line args
+    args = "WORKER_BASE_ARGS_PLACEHOLDER"
+    if "--model-path" in args:
+        parts = args.split("--model-path")
+        if len(parts) > 1:
+            model_name = parts[1].strip().split()[0]
+            
+            # Check if it's a local path (skip if it is)
+            if model_name.startswith('/') or model_name.startswith('./') or model_name.startswith('../'):
+                print(f"Skipping pre-cache: {model_name} is a local path", flush=True)
+                sys.exit(0)
+            
+            print(f"Pre-caching HuggingFace model: {model_name}", flush=True)
+            
+            # Use HF_TOKEN if available
+            token = os.environ.get('HF_TOKEN', None)
+            
+            # Download config and tokenizer (lightweight)
+            config = AutoConfig.from_pretrained(model_name, token=token)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+            
+            print(f"✓ Model metadata cached successfully", flush=True)
+            print(f"  Config: {type(config).__name__}", flush=True)
+            print(f"  Tokenizer: {type(tokenizer).__name__}", flush=True)
+            
+except Exception as e:
+    print(f"Warning: Could not pre-cache model: {e}", flush=True)
+    print("Workers will attempt to load directly", flush=True)
+EOF_PRECACHE
+fi
+
 # Convert DCP checkpoint once if needed (before starting workers)
 CONVERTED_MODEL_PATH=""
 if [[ -n "DCP_ABS_PATH_PLACEHOLDER" ]]; then
-    echo "[2/5] Converting DCP checkpoint to HuggingFace format (shared by all workers)..."
+    echo "Converting DCP checkpoint to HuggingFace format (shared by all workers)..."
     
     # Use a single shared temp directory for all workers
     SHARED_TEMP_DIR="/tmp/llada_hf_converted_shared_$$"
@@ -390,12 +438,26 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     WORKER_PIDS+=($WORKER_PID)
     echo "Worker $i started (PID: $WORKER_PID, log: /tmp/worker_${i}.log)"
     
-    # Small delay between worker starts to avoid race conditions
-    sleep 0.5
+    # Stagger worker starts to avoid race conditions
+    # Increased from 0.5s to 1.0s for consistency with local script
+    # This prevents:
+    # - Port binding conflicts
+    # - HuggingFace cache access conflicts
+    # - CUDA initialization conflicts
+    # - Model loading resource contention
+    if [ $i -lt $((NUM_GPUS_PLACEHOLDER - 1)) ]; then
+        sleep 1.0
+        echo "Waiting 1s before starting next worker..."
+    fi
 done
 
-echo "[4/5] Waiting for workers to initialize..."
-sleep 10
+echo "[4/5] Waiting for model loading and initialization..."
+# Increased from 10s to 20s to allow for:
+# - Model weight loading from HuggingFace cache
+# - CUDA context initialization
+# - Uvicorn server startup
+# This prevents premature health checks
+sleep 20
 
 # Check if workers are still running and show their logs if they crashed
 echo "Checking worker health..."
@@ -461,7 +523,10 @@ if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
 fi
 
 echo "All workers initialized successfully!"
-sleep 10
+
+# Additional wait to ensure workers are fully stable before load balancer
+# This reduces the chance of race conditions during load balancer startup
+sleep 5
 
 echo "[5/5] Starting load balancer..."
 $VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 9000 --request-timeout 12000 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do

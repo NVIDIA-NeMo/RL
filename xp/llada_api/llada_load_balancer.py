@@ -198,9 +198,13 @@ async def lifespan(app: FastAPI):
     
     logger.info("Starting load balancer...")
     
-    # Wait a bit for workers to start up
-    logger.info("Waiting 5 seconds for workers to initialize...")
-    await asyncio.sleep(5)
+    # Wait for workers to start up and load models
+    # Increased from 5s to 20s to allow for:
+    # - Model weight loading from HuggingFace cache
+    # - CUDA context initialization
+    # - Uvicorn server startup
+    logger.info("Waiting 20 seconds for workers to initialize...")
+    await asyncio.sleep(20)
     
     # Initial health check
     logger.info("Performing initial health check...")

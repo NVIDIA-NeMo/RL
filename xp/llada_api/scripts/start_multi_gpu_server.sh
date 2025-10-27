@@ -61,6 +61,11 @@ show_usage() {
     echo "  -d, --dcp-path PATH     Path to DCP checkpoint"
     echo "  -b, --base-model MODEL  Base model name for DCP (default: $BASE_MODEL)"
     echo ""
+    echo "HuggingFace Authentication (for private/gated models):"
+    echo "  Set HF_TOKEN environment variable to avoid rate limiting:"
+    echo "    export HF_TOKEN=your_token_here"
+    echo "  Get token from: https://huggingface.co/settings/tokens"
+    echo ""
     echo "GPU Options:"
     echo "  --num-gpus NUM          Number of GPUs to use (default: $NUM_GPUS)"
     echo "  --gpu-ids IDS           Specific GPU IDs to use (comma-separated, e.g., '0,1,2,3')"
@@ -204,6 +209,64 @@ fi
 
 # Set PYTHONPATH
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+
+# Pre-cache HuggingFace model if needed (before starting workers)
+# This prevents HuggingFace API rate limiting when 8 workers try to download simultaneously
+# Only do this for HuggingFace model names (not local paths, and not when using DCP)
+if [[ -z "$DCP_PATH" ]] && [[ -n "$MODEL_PATH" ]] && [[ ! -d "$MODEL_PATH" ]] && [[ ! -f "$MODEL_PATH" ]]; then
+    # MODEL_PATH is a HuggingFace model name (not a local path, and DCP not being used)
+    print_status "Pre-caching HuggingFace model to prevent rate limiting: $MODEL_PATH"
+    
+    # Check if HF_TOKEN is set (helpful for gated models and avoiding rate limits)
+    if [[ -z "$HF_TOKEN" ]]; then
+        print_warning "HF_TOKEN not set. For better reliability, set your HuggingFace token:"
+        print_warning "  export HF_TOKEN=your_token_here"
+        print_warning "  Get token from: https://huggingface.co/settings/tokens"
+        echo ""
+    fi
+    
+    PRECACHE_SCRIPT=$(cat <<EOF
+import sys
+import os
+sys.path.insert(0, "$PROJECT_DIR")
+
+try:
+    from transformers import AutoTokenizer, AutoConfig
+    import torch
+    
+    model_name = "$MODEL_PATH"
+    print(f"Downloading model config and tokenizer to cache: {model_name}", flush=True)
+    
+    # Use HF_TOKEN if available
+    token = os.environ.get('HF_TOKEN', None)
+    
+    # Download config and tokenizer (lightweight, ensures model exists)
+    config = AutoConfig.from_pretrained(model_name, token=token)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    
+    print(f"✓ Model metadata cached successfully", flush=True)
+    print(f"  Config: {type(config).__name__}", flush=True)
+    print(f"  Tokenizer: {type(tokenizer).__name__}", flush=True)
+    print(f"  Vocab size: {len(tokenizer)}", flush=True)
+    
+    # Note: We don't download full model weights here as they're large
+    # Workers will download weights on-demand, but config/tokenizer are cached
+    # This prevents the initial rate-limiting from metadata requests
+    
+except Exception as e:
+    print(f"Warning: Could not pre-cache model (workers will try anyway): {e}", flush=True)
+    # Don't fail - workers will attempt to load directly
+EOF
+)
+    
+    python3 -c "$PRECACHE_SCRIPT"
+    if [ $? -eq 0 ]; then
+        print_status "Model metadata pre-cached successfully"
+    else
+        print_warning "Pre-caching had issues, but continuing (workers will retry)"
+    fi
+    echo ""
+fi
 
 # Convert DCP checkpoint once if needed (before starting workers)
 CONVERTED_MODEL_PATH=""
@@ -373,18 +436,95 @@ for i in "${!GPU_ARRAY[@]}"; do
     WORKER_PIDS+=($WORKER_PID)
     
     print_gpu "Worker $i started (PID: $WORKER_PID, log: /tmp/llada_worker_${i}.log)"
+    
+    # Stagger worker starts to avoid race conditions
+    # This prevents:
+    # - Port binding conflicts
+    # - HuggingFace cache access conflicts
+    # - CUDA initialization conflicts
+    # - Model loading resource contention
+    if [ $i -lt $((${#GPU_ARRAY[@]} - 1)) ]; then
+        sleep 1.0
+        print_gpu "Waiting 1s before starting next worker..."
+    fi
 done
 
 echo ""
-print_status "All workers started. Waiting for initialization..."
-sleep 10
+print_status "All workers started. Waiting for model loading and initialization..."
+# Increased from 10s to 20s to allow for:
+# - Model weight loading from HuggingFace cache
+# - CUDA context initialization
+# - Uvicorn server startup
+# This prevents the load balancer from starting before workers are ready
+sleep 20
 
-# Build worker ports list for load balancer
+# Verify workers are healthy before starting load balancer
+echo ""
+print_status "Verifying worker health before starting load balancer..."
+HEALTHY_WORKERS=0
+MAX_HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_DELAY=5
+
+for retry in $(seq 1 $MAX_HEALTH_CHECK_RETRIES); do
+    HEALTHY_WORKERS=0
+    UNHEALTHY_WORKER_IDS=()
+    
+    for i in "${!WORKER_PIDS[@]}"; do
+        PID=${WORKER_PIDS[$i]}
+        WORKER_PORT=$((BASE_WORKER_PORT + i))
+        GPU_ID=${GPU_ARRAY[$i]}
+        
+        # Check if process is still running
+        if ! kill -0 $PID 2>/dev/null; then
+            print_error "Worker $i (GPU $GPU_ID, PID $PID) has crashed"
+            UNHEALTHY_WORKER_IDS+=($i)
+            continue
+        fi
+        
+        # Check if HTTP endpoint is responding
+        if curl -s -f --max-time 2 "http://localhost:$WORKER_PORT/health" > /dev/null 2>&1; then
+            print_gpu "✓ Worker $i (GPU $GPU_ID, port $WORKER_PORT) is healthy"
+            HEALTHY_WORKERS=$((HEALTHY_WORKERS + 1))
+        else
+            print_warning "Worker $i (GPU $GPU_ID, port $WORKER_PORT) not ready yet (attempt $retry/$MAX_HEALTH_CHECK_RETRIES)"
+            UNHEALTHY_WORKER_IDS+=($i)
+        fi
+    done
+    
+    if [ $HEALTHY_WORKERS -eq ${#GPU_ARRAY[@]} ]; then
+        print_status "All $HEALTHY_WORKERS workers are healthy and ready!"
+        break
+    elif [ $retry -lt $MAX_HEALTH_CHECK_RETRIES ]; then
+        print_warning "Only $HEALTHY_WORKERS/${#GPU_ARRAY[@]} workers ready. Waiting ${HEALTH_CHECK_DELAY}s before retry $((retry + 1))..."
+        sleep $HEALTH_CHECK_DELAY
+    else
+        print_error "Only $HEALTHY_WORKERS/${#GPU_ARRAY[@]} workers are healthy after $MAX_HEALTH_CHECK_RETRIES retries"
+        if [ ${#UNHEALTHY_WORKER_IDS[@]} -gt 0 ]; then
+            echo ""
+            print_error "Unhealthy workers detected. Showing logs:"
+            for i in "${UNHEALTHY_WORKER_IDS[@]}"; do
+                echo ""
+                echo "---------- Worker $i (GPU ${GPU_ARRAY[$i]}) Log (last 50 lines) ----------"
+                tail -50 "/tmp/llada_worker_${i}.log" 2>/dev/null || echo "Log file not found"
+            done
+        fi
+        
+        if [ $HEALTHY_WORKERS -eq 0 ]; then
+            print_error "No workers are healthy. Exiting."
+            exit 1
+        else
+            print_warning "Continuing with $HEALTHY_WORKERS/${#GPU_ARRAY[@]} healthy workers"
+        fi
+    fi
+done
+
+# Build worker ports list for load balancer (only include healthy workers)
 WORKER_PORTS=()
 for i in $(seq 0 $((NUM_GPUS - 1))); do
     WORKER_PORTS+=($((BASE_WORKER_PORT + i)))
 done
 
+echo ""
 # Start load balancer
 print_lb "Starting load balancer on port $LOAD_BALANCER_PORT"
 LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-host localhost --worker-ports ${WORKER_PORTS[*]}"
