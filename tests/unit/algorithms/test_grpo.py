@@ -889,6 +889,8 @@ def mock_grpo_components():
             "ratio_clip_c": 1.0,
             "use_on_policy_kl_approximation": False,
             "use_importance_sampling_correction": False,
+            "truncated_importance_sampling_ratio": None,
+            "sequence_level_importance_ratios": False,
             "token_level_loss": True,
         }
     )

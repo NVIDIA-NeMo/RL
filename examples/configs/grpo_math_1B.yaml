@@ -44,6 +44,7 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
   sequence_level_importance_ratios: false
   token_level_loss: true
 
@@ -84,7 +85,7 @@ policy:
   
   megatron_cfg:
     enabled: false
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1

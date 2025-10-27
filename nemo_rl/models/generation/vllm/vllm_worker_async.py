@@ -216,7 +216,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 documents=None,
                 chat_template_kwargs=None,
                 tool_parser=None,
-                truncate_prompt_tokens=None,
                 add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
@@ -240,7 +239,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents,
                     chat_template_kwargs,
                     tool_parser,
-                    truncate_prompt_tokens,
                     add_special_tokens,
                 )
 
@@ -275,7 +273,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     documents=documents,
                     chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
                     add_special_tokens=add_special_tokens,
                 )
                 actual_corresponding_token_ids = corresponding_res[2][0][
@@ -353,7 +350,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
@@ -431,7 +428,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.code
+                    content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
@@ -850,17 +847,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    async def update_weights_from_ipc_handles_async(
-        self, ipc_handles: dict[str, Any]
+    async def update_weights_via_ipc_zmq_async(
+        self,
     ) -> bool:
-        """Async version of update_weights_from_ipc_handles.
-
-        Args:
-            ipc_handles (dict): Dictionary mapping device UUIDs (str) to parameter IPC handles.
-
-        Returns:
-            bool: True if weights were successfully updated, False otherwise.
-        """
+        """Async version of update_weights_via_ipc_zmq."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
@@ -868,12 +858,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
             if not self.cfg["vllm_cfg"]["async_engine"]:
                 raise RuntimeError(
-                    "update_weights_from_ipc_handles_async can only be used with async_engine=True. Use update_weights_from_ipc_handles instead."
+                    "update_weights_via_ipc_zmq_async can only be used with async_engine=True. Use update_weights_via_ipc_zmq instead."
                 )
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_global_ipc_handles", args=(ipc_handles,)
+                "update_weights_via_ipc_zmq", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -984,10 +974,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         await self.llm.wake_up(**wake_up_args)
 
-    def shutdown(self) -> bool:
+    async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
             if self.llm is not None:
+                # Clean up extension resources (e.g., ZMQ sockets)
+                await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
                     self.llm.shutdown()
                 except Exception as e_stop:
