@@ -1,0 +1,167 @@
+dpo:
+  max_num_epochs: 1
+  max_num_steps: 235
+  val_period: 30
+  val_batches: 16
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: false
+  seed: 42
+
+  reference_policy_kl_penalty: 0.05
+  preference_average_log_probs: False
+  sft_average_log_probs: ${.preference_average_log_probs}
+  preference_loss_weight: 1
+  sft_loss_weight: 0.0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "/tmp/run_outputs/${logger.wandb.name}"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 10
+  save_period: 30
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "Qwen/Qwen3-8B-Base"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  max_total_sequence_length: 8192
+  precision: "bfloat16"
+
+  dtensor_cfg:
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "Qwen2ForCausalLM"
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_permute_fusion: false # TODO(ahmadki): wasn't set
+    #gives ~20% training perf speedup with sequence packing
+    apply_rope_fusion: True
+    bias_activation_fusion: false # TODO(ahmadki): wasn't set
+
+    optimizer:
+      optimizer: "adam"
+      lr: 5.0e-6
+      min_lr: 5.0e-7
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+    
+      #adam
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1e-8
+      
+      #sgd
+      sgd_momentum: 0.9
+      
+      #distributed optimizer
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+  
+      clip_grad: ${policy.max_grad_norm}
+      # optimizer cpu offload
+      optimizer_cpu_offload: false  # TODO(ahmadki): wasn't set
+      optimizer_offload_fraction: 0.0  # TODO(ahmadki): wasn't set
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 2 # TODO(ahmadki) was null
+      lr_warmup_iters: 1
+      lr_warmup_init: 5.0e-7
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  # Setting below is one "trick" to force padding to max sequence length, which
+  # is very useful to test peak of memory consumption.
+  # make_sequence_length_divisible_by: ${policy.max_total_sequence_length}
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1e-8
+      foreach: False
+      fused: False
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.000000001
+        end_factor: 1.0
+        total_iters: 1
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [1]
+
+data:
+  dataset_name: "Tulu3Preference"
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 4
+
+logger:
+  log_dir: "/tmp/logs/${logger.wandb.name}"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: false
+  swanlab_enabled: false
+  wandb:
+    project: rl-bug-1293
+    name: megatron
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+
