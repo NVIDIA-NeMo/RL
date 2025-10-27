@@ -390,12 +390,26 @@ for i in $(seq 0 $((NUM_GPUS_PLACEHOLDER - 1))); do
     WORKER_PIDS+=($WORKER_PID)
     echo "Worker $i started (PID: $WORKER_PID, log: /tmp/worker_${i}.log)"
     
-    # Small delay between worker starts to avoid race conditions
-    sleep 0.5
+    # Stagger worker starts to avoid race conditions
+    # Increased from 0.5s to 1.0s for consistency with local script
+    # This prevents:
+    # - Port binding conflicts
+    # - HuggingFace cache access conflicts
+    # - CUDA initialization conflicts
+    # - Model loading resource contention
+    if [ $i -lt $((NUM_GPUS_PLACEHOLDER - 1)) ]; then
+        sleep 1.0
+        echo "Waiting 1s before starting next worker..."
+    fi
 done
 
-echo "[4/5] Waiting for workers to initialize..."
-sleep 10
+echo "[4/5] Waiting for model loading and initialization..."
+# Increased from 10s to 20s to allow for:
+# - Model weight loading from HuggingFace cache
+# - CUDA context initialization
+# - Uvicorn server startup
+# This prevents premature health checks
+sleep 20
 
 # Check if workers are still running and show their logs if they crashed
 echo "Checking worker health..."
@@ -461,7 +475,10 @@ if [ ${#CRASHED_WORKERS[@]} -gt 0 ]; then
 fi
 
 echo "All workers initialized successfully!"
-sleep 10
+
+# Additional wait to ensure workers are fully stable before load balancer
+# This reduces the chance of race conditions during load balancer startup
+sleep 5
 
 echo "[5/5] Starting load balancer..."
 $VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 9000 --request-timeout 12000 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do

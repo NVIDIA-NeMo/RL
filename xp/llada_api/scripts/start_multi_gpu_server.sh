@@ -373,18 +373,95 @@ for i in "${!GPU_ARRAY[@]}"; do
     WORKER_PIDS+=($WORKER_PID)
     
     print_gpu "Worker $i started (PID: $WORKER_PID, log: /tmp/llada_worker_${i}.log)"
+    
+    # Stagger worker starts to avoid race conditions
+    # This prevents:
+    # - Port binding conflicts
+    # - HuggingFace cache access conflicts
+    # - CUDA initialization conflicts
+    # - Model loading resource contention
+    if [ $i -lt $((${#GPU_ARRAY[@]} - 1)) ]; then
+        sleep 1.0
+        print_gpu "Waiting 1s before starting next worker..."
+    fi
 done
 
 echo ""
-print_status "All workers started. Waiting for initialization..."
-sleep 10
+print_status "All workers started. Waiting for model loading and initialization..."
+# Increased from 10s to 20s to allow for:
+# - Model weight loading from HuggingFace cache
+# - CUDA context initialization
+# - Uvicorn server startup
+# This prevents the load balancer from starting before workers are ready
+sleep 20
 
-# Build worker ports list for load balancer
+# Verify workers are healthy before starting load balancer
+echo ""
+print_status "Verifying worker health before starting load balancer..."
+HEALTHY_WORKERS=0
+MAX_HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_DELAY=5
+
+for retry in $(seq 1 $MAX_HEALTH_CHECK_RETRIES); do
+    HEALTHY_WORKERS=0
+    UNHEALTHY_WORKER_IDS=()
+    
+    for i in "${!WORKER_PIDS[@]}"; do
+        PID=${WORKER_PIDS[$i]}
+        WORKER_PORT=$((BASE_WORKER_PORT + i))
+        GPU_ID=${GPU_ARRAY[$i]}
+        
+        # Check if process is still running
+        if ! kill -0 $PID 2>/dev/null; then
+            print_error "Worker $i (GPU $GPU_ID, PID $PID) has crashed"
+            UNHEALTHY_WORKER_IDS+=($i)
+            continue
+        fi
+        
+        # Check if HTTP endpoint is responding
+        if curl -s -f --max-time 2 "http://localhost:$WORKER_PORT/health" > /dev/null 2>&1; then
+            print_gpu "✓ Worker $i (GPU $GPU_ID, port $WORKER_PORT) is healthy"
+            HEALTHY_WORKERS=$((HEALTHY_WORKERS + 1))
+        else
+            print_warning "Worker $i (GPU $GPU_ID, port $WORKER_PORT) not ready yet (attempt $retry/$MAX_HEALTH_CHECK_RETRIES)"
+            UNHEALTHY_WORKER_IDS+=($i)
+        fi
+    done
+    
+    if [ $HEALTHY_WORKERS -eq ${#GPU_ARRAY[@]} ]; then
+        print_status "All $HEALTHY_WORKERS workers are healthy and ready!"
+        break
+    elif [ $retry -lt $MAX_HEALTH_CHECK_RETRIES ]; then
+        print_warning "Only $HEALTHY_WORKERS/${#GPU_ARRAY[@]} workers ready. Waiting ${HEALTH_CHECK_DELAY}s before retry $((retry + 1))..."
+        sleep $HEALTH_CHECK_DELAY
+    else
+        print_error "Only $HEALTHY_WORKERS/${#GPU_ARRAY[@]} workers are healthy after $MAX_HEALTH_CHECK_RETRIES retries"
+        if [ ${#UNHEALTHY_WORKER_IDS[@]} -gt 0 ]; then
+            echo ""
+            print_error "Unhealthy workers detected. Showing logs:"
+            for i in "${UNHEALTHY_WORKER_IDS[@]}"; do
+                echo ""
+                echo "---------- Worker $i (GPU ${GPU_ARRAY[$i]}) Log (last 50 lines) ----------"
+                tail -50 "/tmp/llada_worker_${i}.log" 2>/dev/null || echo "Log file not found"
+            done
+        fi
+        
+        if [ $HEALTHY_WORKERS -eq 0 ]; then
+            print_error "No workers are healthy. Exiting."
+            exit 1
+        else
+            print_warning "Continuing with $HEALTHY_WORKERS/${#GPU_ARRAY[@]} healthy workers"
+        fi
+    fi
+done
+
+# Build worker ports list for load balancer (only include healthy workers)
 WORKER_PORTS=()
 for i in $(seq 0 $((NUM_GPUS - 1))); do
     WORKER_PORTS+=($((BASE_WORKER_PORT + i)))
 done
 
+echo ""
 # Start load balancer
 print_lb "Starting load balancer on port $LOAD_BALANCER_PORT"
 LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-host localhost --worker-ports ${WORKER_PORTS[*]}"
