@@ -19,7 +19,6 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
     converter_type: LlamaForCausalLM
     pipeline_model_parallel_size: 2
     activation_checkpointing: true

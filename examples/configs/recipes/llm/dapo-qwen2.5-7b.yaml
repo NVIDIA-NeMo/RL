@@ -1,0 +1,104 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 16
+  batch_multiplier: 3 # Multiplier for dataloader batch size calculation (batch_multiplier × num_prompts_per_step). Following DAPO dynamic sampling, the actual training batch size equals num_prompts_per_step × num_generations_per_prompt.
+  max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 20
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 2048
+    max_response_length: 14336
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/dapo-qwen2.5-7b
+  keep_top_k: 5
+  save_period: 5
+  model_save_format: "dcp"
+policy:
+  model_name: Qwen/Qwen2.5-Math-7B
+  hf_config_overrides:
+    max_position_embeddings: 16384
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    _v2: false
+    context_parallel_size: 4
+  megatron_cfg:
+    empty_unused_memory_level: 1
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${mul:${policy.dtensor_cfg.tensor_parallel_size},
+    ${mul:2, ${policy.dtensor_cfg.context_parallel_size}}}
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+data:
+  max_input_seq_length: 2048
+  prompt_file: null
+  dataset_name: DAPOMath17K
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: "dapo_math_verify"
+
+logger:
+  monitor_gpus: false
+  wandb:
+    project: dapo-dev
+    name: dapo-dev-logger
+  mlflow:
+    experiment_name: dapo-dev
+    run_name: dapo-dev-logger
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
