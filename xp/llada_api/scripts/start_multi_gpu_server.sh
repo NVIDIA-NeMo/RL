@@ -61,6 +61,11 @@ show_usage() {
     echo "  -d, --dcp-path PATH     Path to DCP checkpoint"
     echo "  -b, --base-model MODEL  Base model name for DCP (default: $BASE_MODEL)"
     echo ""
+    echo "HuggingFace Authentication (for private/gated models):"
+    echo "  Set HF_TOKEN environment variable to avoid rate limiting:"
+    echo "    export HF_TOKEN=your_token_here"
+    echo "  Get token from: https://huggingface.co/settings/tokens"
+    echo ""
     echo "GPU Options:"
     echo "  --num-gpus NUM          Number of GPUs to use (default: $NUM_GPUS)"
     echo "  --gpu-ids IDS           Specific GPU IDs to use (comma-separated, e.g., '0,1,2,3')"
@@ -204,6 +209,64 @@ fi
 
 # Set PYTHONPATH
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+
+# Pre-cache HuggingFace model if needed (before starting workers)
+# This prevents HuggingFace API rate limiting when 8 workers try to download simultaneously
+# Only do this for HuggingFace model names (not local paths, and not when using DCP)
+if [[ -z "$DCP_PATH" ]] && [[ -n "$MODEL_PATH" ]] && [[ ! -d "$MODEL_PATH" ]] && [[ ! -f "$MODEL_PATH" ]]; then
+    # MODEL_PATH is a HuggingFace model name (not a local path, and DCP not being used)
+    print_status "Pre-caching HuggingFace model to prevent rate limiting: $MODEL_PATH"
+    
+    # Check if HF_TOKEN is set (helpful for gated models and avoiding rate limits)
+    if [[ -z "$HF_TOKEN" ]]; then
+        print_warning "HF_TOKEN not set. For better reliability, set your HuggingFace token:"
+        print_warning "  export HF_TOKEN=your_token_here"
+        print_warning "  Get token from: https://huggingface.co/settings/tokens"
+        echo ""
+    fi
+    
+    PRECACHE_SCRIPT=$(cat <<EOF
+import sys
+import os
+sys.path.insert(0, "$PROJECT_DIR")
+
+try:
+    from transformers import AutoTokenizer, AutoConfig
+    import torch
+    
+    model_name = "$MODEL_PATH"
+    print(f"Downloading model config and tokenizer to cache: {model_name}", flush=True)
+    
+    # Use HF_TOKEN if available
+    token = os.environ.get('HF_TOKEN', None)
+    
+    # Download config and tokenizer (lightweight, ensures model exists)
+    config = AutoConfig.from_pretrained(model_name, token=token)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    
+    print(f"✓ Model metadata cached successfully", flush=True)
+    print(f"  Config: {type(config).__name__}", flush=True)
+    print(f"  Tokenizer: {type(tokenizer).__name__}", flush=True)
+    print(f"  Vocab size: {len(tokenizer)}", flush=True)
+    
+    # Note: We don't download full model weights here as they're large
+    # Workers will download weights on-demand, but config/tokenizer are cached
+    # This prevents the initial rate-limiting from metadata requests
+    
+except Exception as e:
+    print(f"Warning: Could not pre-cache model (workers will try anyway): {e}", flush=True)
+    # Don't fail - workers will attempt to load directly
+EOF
+)
+    
+    python3 -c "$PRECACHE_SCRIPT"
+    if [ $? -eq 0 ]; then
+        print_status "Model metadata pre-cached successfully"
+    else
+        print_warning "Pre-caching had issues, but continuing (workers will retry)"
+    fi
+    echo ""
+fi
 
 # Convert DCP checkpoint once if needed (before starting workers)
 CONVERTED_MODEL_PATH=""
