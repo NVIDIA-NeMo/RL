@@ -64,6 +64,7 @@ automodel = [
     "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
+    "grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4",
 ]
 vllm = [
     "cuda-python",
@@ -188,7 +189,7 @@ explicit = true
 
 [tool.uv]
 preview = true  # Enable preview features like extra-build-dependencies
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep"]
+no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "deep_gemm", "deep_ep"]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
@@ -199,7 +200,7 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # This override is needed because automodel/mbridge we are on is still on 2.5.0
-override-dependencies = ["transformer-engine[pytorch]==2.8.0"]
+override-dependencies = ["transformer-engine[pytorch]==2.8.0", "opencv-python-headless>=4.11.0"]
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
@@ -210,7 +211,8 @@ deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
-causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+causal-conv1d = ["torch", "setuptools"]
+grouped-gemm = ["torch"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
