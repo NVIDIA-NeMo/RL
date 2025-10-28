@@ -75,6 +75,9 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.text_generation_server.run_mcore_engine import (
+    run_mcore_engine,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
@@ -92,9 +95,6 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.inference.text_generation_server.run_mcore_engine import (
-    run_mcore_engine,
-)
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
@@ -134,7 +134,9 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+    from megatron.core.distributed import (
+        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
+    )
 
     HAVE_FSDP2 = True
 except ImportError:
@@ -2231,6 +2233,12 @@ class MegatronPolicyWorker:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
 
+    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Report the node IP and GPU ID of the current worker."""
+        ip = ray._private.services.get_node_ip_address()
+        gpu_id = ray.get_gpu_ids()[0]
+        return (ip, gpu_id)
+
 
 class CustomFloat16Module(Float16Module):
     """Float 16 Module.
@@ -2267,9 +2275,3 @@ class CustomFloat16Module(Float16Module):
                     router, "_maintain_float32_expert_bias"
                 ):
                     router._maintain_float32_expert_bias()
-
-    def report_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
-        """Report the node IP and GPU ID of the current worker."""
-        ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
-        return (ip, gpu_id)
