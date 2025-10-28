@@ -96,6 +96,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
+
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                raise RuntimeError(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is required in Megatron backend. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
+                )
+
         else:
             if not dtensor_enable:
                 raise ValueError(
