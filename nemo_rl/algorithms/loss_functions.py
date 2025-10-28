@@ -168,6 +168,50 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
+        # gen-kl(kl(P_gen || P_train)) = torch.exp(log_ratio) - log_ratio - 1
+        # where log_ratio = prev_logprobs - generation_logprobs
+        gen_kl_error = masked_mean(
+            torch.exp(prev_logprobs - generation_logprobs)
+            - (prev_logprobs - generation_logprobs)
+            - 1,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+        # policy-kl(kl(P_train || P_gen)) = torch.exp(log_ratio) - log_ratio - 1
+        # where log_ratio = prev_logprobs - generation_logprobs
+        policy_kl_error = masked_mean(
+            torch.exp(generation_logprobs - prev_logprobs)
+            - (generation_logprobs - prev_logprobs)
+            - 1,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+        # Jensen-Shannon divergence
+        # M = 0.5 * (P_train + P_gen)
+        # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
+        log_mixture = torch.log(
+            0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
+        )
+        # KL(P_train || M)
+        kl_prev_to_mixture = (
+            torch.exp(prev_logprobs - log_mixture) - (prev_logprobs - log_mixture) - 1
+        )
+
+        # KL(P_gen || M)
+        kl_gen_to_mixture = (
+            torch.exp(generation_logprobs - log_mixture)
+            - (generation_logprobs - log_mixture)
+            - 1
+        )
+
+        js_divergence_error = masked_mean(
+            0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
         next_token_logits = next_token_logits.to(torch.float32)
 
         if vocab_parallel_group is not None:
@@ -369,6 +413,9 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_clamped": probs_ratio_clamped,
                 "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
                 "token_mult_prob_error": mult_prob_error,
+                "gen_kl_error": gen_kl_error,
+                "policy_kl_error": policy_kl_error,
+                "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
