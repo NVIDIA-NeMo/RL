@@ -92,7 +92,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.inference.text_generation.mcore_engine_server import (
+from megatron.core.inference.text_generation_server.run_mcore_engine import (
     run_mcore_engine,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
