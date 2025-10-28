@@ -1,0 +1,43 @@
+defaults: ../../distillation_math.yaml
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 20
+  val_batch_size: 256
+  val_period: 10
+  max_val_samples: 256
+loss_fn:
+  kl_type: reverse
+checkpointing:
+  checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-noncolocated
+  save_period: 50
+policy:
+  model_name: Qwen/Qwen3-4B-Base
+  dtensor_cfg:
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+  make_sequence_length_divisible_by: 2
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+teacher:
+  model_name: Qwen/Qwen3-32B
+  dtensor_cfg:
+    tensor_parallel_size: 8
+    context_parallel_size: 1
+  make_sequence_length_divisible_by: 2
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+logger:
+  log_dir: logs/distillation-qwen3-32b-to-4b-base-noncolocated
+  wandb:
+    project: nemo-rl
+    name: distillation-qwen3-32b-to-4b-base-noncolocated
+cluster:
+  num_nodes: 2

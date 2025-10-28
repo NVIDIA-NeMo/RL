@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from copy import deepcopy
 
 import pytest
@@ -45,6 +44,7 @@ large_model_vllm_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 8,
         "pipeline_parallel_size": 2,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": True,
@@ -61,14 +61,6 @@ large_model_vllm_config: VllmConfig = {
     },
     "vllm_kwargs": {},
 }
-
-
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-    yield
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
 
 
 @pytest.fixture(scope="function")

@@ -1,0 +1,61 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 1000000
+  val_period: 500
+  val_batches: 4
+  val_global_batch_size: 128
+  val_at_start: false
+checkpointing:
+  checkpoint_dir: results/sft-llama3.1-70b-8n8g-tp4pp2-long-megatron
+  save_period: 100
+policy:
+  model_name: meta-llama/Llama-3.1-70B
+  tokenizer:
+    name: meta-llama/Llama-3.1-8B-Instruct
+    chat_template: default
+  train_global_batch_size: 512
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      lr: 2.0e-05
+      min_lr: 2.0e-05
+      weight_decay: 0.01
+      bf16: true
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      clip_grad: 0.0
+    scheduler:
+      lr_warmup_iters: 1
+      lr_warmup_init: 2.0e-05
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: null
+  optimizer:
+    kwargs:
+      lr: 2.0e-05
+      weight_decay: 0.01
+      eps: 1.0e-08
+data:
+  dataset_name: openmathinstruct2
+  prompt_file: examples/prompts/math.txt
+  split: train_1M
+  add_generation_prompt: true
+  output_key: generated_solution
+  seed: 42
+logger:
+  monitor_gpus: false
+  wandb:
+    name: openmathinstruct-nemorl-1M_train
+  tensorboard:
+    log_dir: tb_logs-openmathinstruct-nemorl-1M_train
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

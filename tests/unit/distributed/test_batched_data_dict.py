@@ -14,6 +14,7 @@
 import pytest
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -467,6 +468,152 @@ def test_sequence_packing_with_dynamic_batching_conflict():
             sequence_packing_args=sequence_packing_args,
             dynamic_batching_args=dynamic_batching_args,
         )
+
+
+def test_shard_by_batch_size_with_packed_multimodal():
+    """Sharding should slice PackedTensor items correctly and preserve types."""
+    text = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
+    images = [
+        torch.randn(2, 3, 8, 8),
+        torch.randn(3, 3, 8, 8),
+        torch.randn(1, 3, 8, 8),
+        torch.randn(5, 3, 8, 8),
+    ]
+    packed = PackedTensor(images, dim_to_pack=0)
+    batch = BatchedDataDict(
+        {
+            "input_ids": text,
+            "pixel_values": packed,
+            "labels": [0, 1, 2, 3],
+        }
+    )
+
+    shards = batch.shard_by_batch_size(shards=2)
+    assert len(shards) == 2
+    # First shard should contain first two items
+    assert torch.equal(shards[0]["input_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert isinstance(shards[0]["pixel_values"], PackedTensor)
+    assert len(shards[0]["pixel_values"]) == 2
+    assert shards[0]["labels"] == [0, 1]
+    # Packed lengths along dim 0: 2 + 3
+    assert tuple(shards[0]["pixel_values"].as_tensor().shape) == (5, 3, 8, 8)
+    # Second shard should contain last two items
+    assert torch.equal(shards[1]["input_ids"], torch.tensor([[7, 8, 9], [10, 11, 12]]))
+    assert isinstance(shards[1]["pixel_values"], PackedTensor)
+    assert len(shards[1]["pixel_values"]) == 2
+    assert shards[1]["labels"] == [2, 3]
+    # Packed lengths along dim 0: 1 + 5
+    assert tuple(shards[1]["pixel_values"].as_tensor().shape) == (6, 3, 8, 8)
+
+
+def test_get_multimodal_dict_mixed_content_and_device_move():
+    """get_multimodal_dict should include PackedTensor and optional keys, and support device movement."""
+    images = [torch.randn(2, 3, 8, 8), torch.randn(1, 3, 8, 8)]
+    packed = PackedTensor(images, dim_to_pack=0)
+    token_type_ids = torch.ones(2, 4, dtype=torch.long)
+    regular = torch.arange(2)
+
+    batch = BatchedDataDict(
+        {
+            "pixel_values": packed,
+            "token_type_ids": token_type_ids,
+            "regular_tensor": regular,
+            "labels": [0, 1],
+        }
+    )
+
+    # as tensors
+    mm_dict_t = batch.get_multimodal_dict(as_tensors=True)
+    assert set(mm_dict_t.keys()) == {"pixel_values", "token_type_ids"}
+    assert (
+        torch.is_tensor(mm_dict_t["pixel_values"])
+        and mm_dict_t["pixel_values"].shape[0] == 3
+    )
+    assert torch.is_tensor(mm_dict_t["token_type_ids"]) and tuple(
+        mm_dict_t["token_type_ids"].shape
+    ) == (2, 4)
+
+    # as packed
+    mm_dict_p = batch.get_multimodal_dict(as_tensors=False)
+    assert isinstance(mm_dict_p["pixel_values"], PackedTensor)
+
+    # move device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    moved = BatchedDataDict({"pixel_values": packed}).to(device)
+    mm_after_move = moved.get_multimodal_dict(as_tensors=True)
+    assert torch.is_tensor(mm_after_move["pixel_values"]) and mm_after_move[
+        "pixel_values"
+    ].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def test_from_batches_pads_3d_tensors_along_sequence_dim():
+    """from_batches should pad 3D tensors along the sequence dimension before stacking."""
+
+    pad_value = -5.0
+    batch1 = BatchedDataDict(
+        {
+            "teacher_logits": torch.tensor(
+                [
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                    [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+                ],
+                dtype=torch.float32,
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "teacher_logits": torch.tensor(
+                [
+                    [
+                        [13.0, 14.0],
+                        [15.0, 16.0],
+                        [17.0, 18.0],
+                        [19.0, 20.0],
+                        [21.0, 22.0],
+                    ],
+                    [
+                        [23.0, 24.0],
+                        [25.0, 26.0],
+                        [27.0, 28.0],
+                        [29.0, 30.0],
+                        [31.0, 32.0],
+                    ],
+                ],
+                dtype=torch.float32,
+            )
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"teacher_logits": pad_value}
+    )
+
+    stacked_logits = stacked["teacher_logits"]
+    assert stacked_logits.shape == (4, 5, 2)
+
+    expected_batch1 = torch.tensor(
+        [
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [5.0, 6.0],
+                [pad_value, pad_value],
+                [pad_value, pad_value],
+            ],
+            [
+                [7.0, 8.0],
+                [9.0, 10.0],
+                [11.0, 12.0],
+                [pad_value, pad_value],
+                [pad_value, pad_value],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    expected = torch.cat([expected_batch1, batch2["teacher_logits"]], dim=0)
+
+    assert torch.equal(stacked_logits, expected)
 
 
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])

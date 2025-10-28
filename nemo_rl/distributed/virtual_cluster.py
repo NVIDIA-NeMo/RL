@@ -21,6 +21,7 @@ import ray
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
+    placement_group_table,
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -48,25 +49,37 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = "uv run --locked --extra vllm"
 
-    # Megatron-core (and nemo dependencies)
-    # We always run with --reinstall to avoid issues where someone runs "uv run ... --extra mcore ..."
-    # but the submodules are not downloaded yet. This results in errors where it appears Megatron/Nemo
-    # aren't installed. Simple workaround is to always run the mcore py_executable with --reinstall.
-    MCORE = "uv run --reinstall --extra mcore"
+    # Use NeMo-RL direct dependencies and nemo-automodel.
+    AUTOMODEL = "uv run --locked --extra automodel"
+
+    # Use NeMo-RL direct dependencies and Megatron.
+    MCORE = "uv run --locked --extra mcore"
+
+    # Use Penguin dependencies
+    PENGUIN = "uv run --locked --extra penguin"
 
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:
-    import socket
+    return _get_node_ip_local(), _get_free_port_local()
 
+
+def _get_node_ip_local() -> str:
     # Get the IP address of the current node
     node_ip = ray._private.services.get_node_ip_address()
+
+    return node_ip
+
+
+def _get_free_port_local() -> int:
+    import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))  # Bind to port 0 to get a random free port
         s.listen(1)
         port = s.getsockname()[1]
-    return node_ip, port
+
+    return port
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
@@ -75,6 +88,9 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     Try to attach to an existing local cluster.
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
+
+    Args:
+        log_dir: Optional directory to store Ray logs and temp files.
     """
     # Set up runtime environment
     env_vars = dict(os.environ)
@@ -155,6 +171,14 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     )
 
 
+@ray.remote(num_gpus=1)
+class GetGPUIDActor:  # pragma: no cover
+    """Util actor class to return GPU id of the current worker."""
+
+    def get_gpu_id(self):
+        return ray.get_gpu_ids()[0]
+
+
 class ResourceInsufficientError(Exception):
     """Exception raised when the cluster does not have enough resources to satisfy the requested configuration."""
 
@@ -195,6 +219,7 @@ class RayVirtualCluster:
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
+        self._sorted_bundle_indices: Optional[list[int]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
@@ -236,6 +261,8 @@ class RayVirtualCluster:
                 self._node_placement_groups = self._create_placement_groups_internal(
                     strategy, use_unified_pg
                 )
+                if use_unified_pg and self.use_gpus:
+                    self._sorted_bundle_indices = self._get_sorted_bundle_indices()
                 return self._node_placement_groups
             except ResourceInsufficientError as e:
                 print(e)
@@ -345,6 +372,42 @@ class RayVirtualCluster:
     def node_count(self) -> int:
         return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
 
+    def get_available_address_and_port(
+        self, pg_idx: int, bundle_idx: int
+    ) -> tuple[str, int]:
+        """Gets an available address and port for the given placement group index and bundle index.
+
+        Returns:
+            Tuple of (address, port)
+        """
+        # Get placement groups if not already created
+        if not self._node_placement_groups:
+            self.get_placement_groups()
+
+        # Get the placement group
+        placement_groups = self.get_placement_groups()
+        if len(placement_groups) == 1:
+            pg = placement_groups[0]
+        else:
+            pg = placement_groups[pg_idx]
+
+        if pg.bundle_specs:
+            # Launch port finder on the given bundle of this placement group
+            addr, port = ray.get(
+                _get_node_ip_and_free_port.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=bundle_idx
+                    ),
+                    # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
+                    num_cpus=0,
+                ).remote()
+            )
+            return addr, port
+
+        raise RuntimeError(
+            "No valid placement groups found to get available address and port"
+        )
+
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
 
@@ -355,23 +418,61 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # Use the first bundle of the first placement group
-        # This works for both unified PG and per-node PGs
-        pg = self.get_placement_groups()[0]
-        if pg.bundle_specs:
-            # Launch port finder on the first bundle of this placement group
-            addr, port = ray.get(
-                _get_node_ip_and_free_port.options(
+        # If sorted bundle indices are available, get the address and port for the first bundle index
+        if self._sorted_bundle_indices is not None:
+            return self.get_available_address_and_port(
+                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
+            )
+
+        # Otherwise, get the address and port for bundle index 0
+        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+
+    def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
+        """Gets the sorted bundle indices for the placement groups."""
+        if self._node_placement_groups is None:
+            raise ValueError(
+                "Placement groups must be initialized before calling _get_sorted_bundle_indices"
+            )
+
+        if not self.use_gpus:
+            return None
+
+        if len(self._node_placement_groups) != 1:
+            return None
+
+        pg = self._node_placement_groups[0]
+        pg_data = placement_group_table(pg)
+        num_bundles = len(pg_data["bundles"])
+        bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+        # use info actor to get the GPU id
+        info_actors = []
+        for i in range(num_bundles):
+            info_actors.append(
+                GetGPUIDActor.options(
+                    num_cpus=0.01,  # set both num_cpus and num_gpus to be small values to enable assignment in colocated case
+                    num_gpus=0.01,
+                    resources=None,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=0
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
                     ),
-                    # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
-                    num_cpus=0,
                 ).remote()
             )
-            return addr, port
 
-        raise RuntimeError("No valid placement groups found to get master address")
+        gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+        for actor in info_actors:
+            ray.kill(actor)
+
+        # original index, node_id, gpu_id
+        bundle_infos = [
+            (i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)
+        ]
+        pg_reordered_bundle_indices = [
+            bundle_info[0]
+            for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+        ]  # sort by node_id, then gpu_id
+        return pg_reordered_bundle_indices
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.

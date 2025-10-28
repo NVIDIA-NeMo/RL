@@ -37,42 +37,16 @@ EOF
 
 uv run --extra mcore --no-build-isolation python <<"EOF"
 import is_megatron_installed
-import is_nemo_installed
+import is_megatron_bridge_installed
 assert is_megatron_installed.INSTALLED, "Megatron is not installed. Please check if the submodule has been initialized. May need to run `git submodule update --init --recursive`"
-assert is_nemo_installed.INSTALLED, "NeMo is not installed. Please check if the submodule has been initialized. May need to run `git submodule update --init --recursive`"
+assert is_megatron_bridge_installed.INSTALLED, "Megatron Bridge is not installed. Please check if the submodule has been initialized. May need to run `git submodule update --init --recursive`"
 
 # This must be the first import to get all of the megatron non-core packages added to the path
 import nemo_rl
 import megatron.core
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from nemo.tron.init import initialize_megatron
-from nemo.tron.config import (
-    ConfigContainer,
-    TrainingConfig,
-    LoggerConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    CheckpointConfig,
-    DistributedDataParallelConfig,
-)
-from nemo.tron.utils.common_utils import get_rank_safe
-from nemo.tron.config import TokenizerConfig
-from nemo.tron.model import get_model_from_config
-from nemo.tron.checkpointing import checkpoint_exists, load_checkpoint
-from nemo.tron.init import initialize_megatron, set_jit_fusion_options
-from nemo.tron.setup import _init_checkpointing_context, _update_model_config_funcs
-from nemo.tron.state import GlobalState
-from nemo.tron.optim import setup_optimizer
-from nemo.tron import fault_tolerance
-from nemo.tron.tokenizers.tokenizer import build_tokenizer
-from nemo.tron.utils.train_utils import (
-    calc_params_l2_norm,
-    logical_and_across_model_parallel_group,
-    reduce_max_stat_across_model_parallel_group,
-)
-from nemo.tron.train import train_step
-from nemo.tron.setup import HAVE_FSDP2
-print("[Nemo/Mcore imports successful]")
+from megatron.bridge import AutoBridge
+print("[Megatron-Core/Megatron-Bridge imports successful]")
 EOF
 
 # Sync just to return the environment to the original base state

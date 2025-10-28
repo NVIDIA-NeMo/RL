@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -18,8 +19,9 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import ray
+import torch
 from ray.util.queue import Queue as RayQueue
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import (
@@ -42,7 +44,10 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
+    TopkLogitsOutputSpec,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_default_hf_config,
@@ -64,6 +69,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
+        processor: Optional[AutoProcessor] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -75,7 +81,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_size = 1
         cp_size = 1
 
-        megatron_enable = config.get("megatron_cfg", {}).get("enabled", False)
+        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        if megatron_enable and dtensor_enable:
+            raise ValueError(
+                "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
+                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
         if megatron_enable:
             worker_builder_cls = (
                 "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker"
@@ -86,17 +98,46 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            assert config["dtensor_cfg"]["enabled"], (
-                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
-            )
-            worker_builder_cls = (
-                "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
-            )
+            if not dtensor_enable:
+                raise ValueError(
+                    "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                )
+
+            # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
+            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
+            if use_v2:
+                worker_builder_cls = "nemo_rl.models.policy.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+            else:
+                worker_builder_cls = (
+                    "nemo_rl.models.policy.dtensor_policy_worker.DTensorPolicyWorker"
+                )
+
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+        # Validate world_size compatibility with parallelism configuration
+        model_parallel_size = pp_size * cp_size * tp_size
+        actual_world_size = cluster.world_size()
+
+        if actual_world_size < model_parallel_size:
+            raise ValueError(
+                f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
+                f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+
+        if actual_world_size % model_parallel_size != 0:
+            dp_size_float = actual_world_size / model_parallel_size
+            raise ValueError(
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
+                f"Please adjust your cluster size or parallelism parameters."
+            )
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -118,6 +159,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_builder_cls,
             config,
             tokenizer=tokenizer,
+            processor=processor,
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
@@ -126,14 +168,33 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        self.worker_group = RayWorkerGroup(
-            cluster,
-            worker_builder,
-            name_prefix=name_prefix,
-            workers_per_node=workers_per_node,
-            sharding_annotations=self.sharding_annotations,
-            env_vars=env_vars,
-        )
+        if cluster._sorted_bundle_indices is not None:
+            # The cluster has initialized a unified placemenet group across nodes
+            # In this case, we need to create workers based on sorted bundle indices
+            group_size = cluster.num_gpus_per_node
+            tied_groups = [
+                (i // group_size, [bundle_idx])
+                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+            ]
+
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                bundle_indices_list=tied_groups,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
+
+        else:
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                workers_per_node=workers_per_node,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
@@ -165,17 +226,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
+            sequence_length_pad_multiple = (
+                cp_size * 2 * tp_size if cp_size > 1 else tp_size
+            )
+            if (
+                config["megatron_cfg"]["enabled"]
+                and config["megatron_cfg"].get("fp8_cfg", None) is not None
+                and config["megatron_cfg"]["fp8_cfg"].get("enabled", False)
+            ):
+                # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                # Ref: https://github.com/NVIDIA/TransformerEngine/blob/5b3092a0e40654436bec5ea0a0b0f7ad2887b20d/transformer_engine/pytorch/utils.py#L437-L441
+                sequence_length_pad_multiple = math.lcm(
+                    16, sequence_length_pad_multiple
+                )
             self.sequence_packing_args: SequencePackingArgs = {
-                "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
-                "logprob_mb_tokens": config["sequence_packing"].get(
-                    "logprob_mb_tokens", None
-                ),
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_pad_multiple": (cp_size * 2 * tp_size)
-                if cp_size > 1
-                else tp_size,
+                "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
@@ -186,11 +254,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.cfg = config
 
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
-            "init_collective", ip=ip, port=port, world_size=world_size
+            "init_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            train_world_size=train_world_size,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
@@ -325,6 +397,72 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return logprobs
 
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data: list[SlicedDataDict]
+        unsorted_data_indices: list[int]
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            # we just shard into DP shards here as Sequence packing allows for CP.
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_topk_logits",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+        )
+
+        # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
+        all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
+
+        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
+        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
+        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            stacked.reorder_data(unsorted_data_indices)
+
+        return stacked
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -400,10 +538,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
-            aggregated_results["num_ranks"] = len(results)
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
 
             try:
-                aggregated_results["theoretical_tflops"] = sum(
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
                     get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
                     for r in results
                 )
@@ -470,6 +609,51 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return result
 
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
+        # Verify input data is right-padded
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "score",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={},
+        )
+
+        result: BatchedDataDict[ScoreOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+        )
+        required_keys = [
+            "scores",
+        ]
+        missing_keys = [key for key in required_keys if key not in result]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for ScoreOutputSpec: {missing_keys}"
+            )
+
+        return result
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here
         return True
@@ -504,69 +688,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
-    def prepare_weights_for_ipc(
-        self, _refit_buffer_size_gb: Optional[int] = None
-    ) -> list[list[str]]:
-        """Prepare the weights for IPC.
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
+        futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
+        # minimum free memory from all workers for safety
+        free_memory_bytes = min(ray.get(future) for future in futures)
+        return free_memory_bytes
 
-        Returns:
-            list: A list containing the keys of the parameters, which is grouped by size.
-        """
-        # Get the state_dict_info and available memory from all workers
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int) -> list[ray.ObjectRef]:
+        """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_weights_for_ipc"
+            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes
         )
-        results = ray.get(futures)
-
-        # Only get the first worker's state_dict_info since all workers will have the same result
-        state_dict_info = results[0][0]
-
-        if _refit_buffer_size_gb is not None:
-            total_available_bytes = _refit_buffer_size_gb * (1024**3)
-        else:
-            # Get the minimum available memory from all workers
-            total_available_bytes = min(result[1] for result in results)
-
-        # Group tensors by size
-        cur_available_bytes = total_available_bytes
-        grouped_param_keys: list[list[str]] = []
-        keys: list[str] = []
-
-        for key, size_in_bytes in state_dict_info:
-            if size_in_bytes > cur_available_bytes:
-                if keys:
-                    grouped_param_keys.append(keys)
-                    keys = []
-                cur_available_bytes = total_available_bytes
-
-            keys.append(key)
-            cur_available_bytes -= size_in_bytes
-
-        if keys:
-            grouped_param_keys.append(keys)
-
-        return grouped_param_keys
-
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
-        """Fetch weight IPC handles from all workers.
-
-        Returns:
-            dict: A dictionary mapping device UUIDs to parameter IPC handles.
-        """
-        # Collect IPC handles from all workers
-        worker_handles: list[dict[str, Any]] = ray.get(
-            [
-                worker.get_weights_ipc_handles.remote(keys=keys)
-                for worker in self.worker_group.workers
-            ]
-        )
-
-        # Combine all worker handles into a single dictionary
-        all_handles = {}
-        for handle in worker_handles:
-            all_handles.update(handle)
-
-        return all_handles
+        return futures
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
@@ -591,14 +725,34 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the model."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "save_checkpoint",
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            tokenizer_path=tokenizer_path,
-        )
+        # Only pass checkpointing_cfg for DTensor v2
+        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+
+        if use_v2:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+            )
+        else:
+            if (
+                checkpointing_cfg is not None
+                and checkpointing_cfg.get("model_save_format") == "safetensors"
+            ):
+                raise ValueError(
+                    "safetensors is only supported with DTensorPolicyWorkerV2 (_v2=true)."
+                )
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
         ray.get(futures)
 
     def shutdown(self) -> bool:
@@ -617,7 +771,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls worker_group.shutdown().
         """
-        self.worker_group.shutdown()
+        if hasattr(self, "worker_group"):
+            self.worker_group.shutdown(cleanup_method="shutdown")
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -628,3 +783,36 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Print the node IP and GPU ID of the current worker."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "report_node_ip_and_gpu_id",
+            )
+        )
+        all_node_ips = sorted(set([result[0] for result in results]))
+        all_gpu_ids = sorted(set([result[1] for result in results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+
+        table = PrettyTable()
+        table.title = "Policy worker mapping to Nodes and GPUs"
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)

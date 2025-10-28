@@ -19,14 +19,15 @@ from typing import NotRequired, Optional, TypedDict, cast
 import numpy as np
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss_functions import (
     NLLLoss,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
@@ -49,6 +50,7 @@ class SFTSaveState(TypedDict):
     total_steps: int  # Track total number of steps across all epochs
     val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
 def _default_sft_save_state() -> SFTSaveState:
@@ -57,6 +59,7 @@ def _default_sft_save_state() -> SFTSaveState:
         "step": 0,
         "total_steps": 0,
         "consumed_samples": 0,
+        "total_valid_tokens": 0,
     }
 
 
@@ -137,6 +140,7 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -150,7 +154,8 @@ def setup(
         batch_size=sft_config["val_global_batch_size"],
         shuffle=False,
         collate_fn=rl_collate_fn,
-        drop_last=True,
+        drop_last=False,
+        num_workers=data_config["num_workers"],
     )
 
     # ==========================
@@ -171,10 +176,23 @@ def setup(
     #   Training
     # ==========================
     print("\n▶ Setting up model...")
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
+        total_train_iters = min(
+            sft_config["max_num_steps"],
+            sft_config["max_num_epochs"] * len(train_dataloader),
+        )
+        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+    # check if tokenizer is a processor (e.g. for VLMs)
+    processor = None
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        processor = tokenizer
+        tokenizer = processor.tokenizer
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
+        processor=processor,
         weights_path=Path(last_checkpoint_path) / "policy" / "weights"
         if last_checkpoint_path
         else None,
@@ -184,6 +202,9 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
+
     loss_fn = NLLLoss()
     print("  ✓ Model initialized")
 
@@ -221,6 +242,9 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
+        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
+            "val_dataloader is None, so dpo.val_period must be 0"
+        )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
@@ -233,7 +257,7 @@ def validate(
         # val_total = len(val_dataloader)
 
         val_metrics = {"val_loss": 0.0}
-        num_valid_batches = 0
+        sum_num_valid_tokens = 0
 
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
@@ -260,12 +284,20 @@ def validate(
                 }
             )
 
+            # update multimodal data
+            val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
+            # When running validation with drop_last=False, we might end up with a partial batch.
+            # Check if we need to pad the final batch to make it divisible by micro_batch_size * dp_size.
+            if val_data.size < val_batch_size:
+                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
+
             ## just run model fwd
             val_results = policy.train(
                 val_data,
                 loss_fn,
                 eval_mode=True,
-                gbs=val_batch_size,
+                gbs=val_data.size,
                 mbs=val_mbs,
             )
 
@@ -275,14 +307,17 @@ def validate(
                     " This is likely because there were no valid samples."
                 )
             else:
-                val_metrics["val_loss"] += float(val_results["loss"])
-                num_valid_batches += 1
+                num_valid_tokens = (
+                    val_data["sample_mask"].unsqueeze(-1) * val_data["token_mask"]
+                ).sum()
+                val_metrics["val_loss"] += float(val_results["loss"]) * num_valid_tokens
+                sum_num_valid_tokens += num_valid_tokens
 
             if val_batches > 0 and batch_idx >= val_batches - 1:
                 break
 
-        if num_valid_batches > 0:
-            val_metrics["val_loss"] /= num_valid_batches
+        if sum_num_valid_tokens > 0:
+            val_metrics["val_loss"] /= sum_num_valid_tokens
         else:
             warnings.warn(
                 "No validation metrics were collected."
@@ -296,7 +331,7 @@ def validate(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if num_valid_batches > 0:
+    if sum_num_valid_tokens > 0:
         # Print summary of validation results
         print("\n📊 Validation Results:")
         print(f"    • Validation loss: {val_metrics['val_loss']:.4f}")
@@ -337,10 +372,14 @@ def sft_train(
         current_epoch = 0
         current_step = 0
         total_steps = 0
+        total_valid_tokens = 0
     else:
         current_epoch = sft_save_state["epoch"]
         current_step = sft_save_state["step"]
         total_steps = sft_save_state["total_steps"]
+        total_valid_tokens = sft_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     sft_config = master_config["sft"]
     # Validation configuration
@@ -408,6 +447,9 @@ def sft_train(
                             "sample_mask": batch["loss_multiplier"],
                         }
                     )
+                    train_data.update(
+                        cat_and_padded.get_multimodal_dict(as_tensors=False)
+                    )
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
@@ -440,6 +482,17 @@ def sft_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
                 sft_save_state["consumed_samples"] += master_config["policy"][
@@ -461,6 +514,7 @@ def sft_train(
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     sft_save_state["total_steps"] = total_steps + 1
                     sft_save_state["epoch"] = current_epoch
+                    sft_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
                         sft_save_state["val_loss"] = val_metrics["val_loss"]
                     elif "val_loss" in sft_save_state:
@@ -473,9 +527,8 @@ def sft_train(
                         ):
                             warnings.warn(
                                 f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
+                                "This checkpoint will not be saved as top-k."
                             )
-                            master_config["checkpointing"]["metric_name"] = None
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
@@ -493,6 +546,7 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -500,17 +554,6 @@ def sft_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
-            losses = train_results["loss"]
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
@@ -544,6 +587,13 @@ def sft_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
@@ -551,7 +601,14 @@ def sft_train(
             current_step += 1
             total_steps += 1
 
+            if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
+                return
             if total_steps >= master_config["sft"]["max_num_steps"]:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1
