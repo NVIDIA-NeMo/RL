@@ -36,10 +36,12 @@ def configure_generation_config(
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 
-        # set skip_tokenizer_init
-        if is_eval or config["stop_strings"] is not None:
-            config["vllm_cfg"]["skip_tokenizer_init"] = False
-        else:
-            config["vllm_cfg"]["skip_tokenizer_init"] = True
+        # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
+        if "skip_tokenizer_init" not in config["vllm_cfg"]:
+            # set skip_tokenizer_init
+            if is_eval or config["stop_strings"] is not None:
+                config["vllm_cfg"]["skip_tokenizer_init"] = False
+            else:
+                config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     return config

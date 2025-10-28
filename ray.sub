@@ -64,6 +64,15 @@ RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+RAY_DEBUGGER_ARGS=
+if [ "${RAY_DEBUG:-}" = "legacy" ]; then
+  RAY_DEBUGGER_ARGS="--ray-debugger-external"
+fi
+
+# After ray>=2.47, this feature is enabled by default which creates uv venvs for any py_executable starting with `uv run`.
+# There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
+# need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
@@ -276,8 +285,9 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    $RAY_DEBUGGER_ARGS \
     \
-    --block
+    --block 
 EOFINNER
 chmod +x /launch-head.sh
 
@@ -375,8 +385,9 @@ ray start --address "$ip_head" \
           --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
           --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
+          $RAY_DEBUGGER_ARGS \
           \
-          --block
+          --block 
 EOFINNER
 
 count=0

@@ -202,6 +202,9 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
+
     loss_fn = NLLLoss()
     print("  ✓ Model initialized")
 
@@ -599,8 +602,13 @@ def sft_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= master_config["sft"]["max_num_steps"]:
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1

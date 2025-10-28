@@ -401,6 +401,11 @@ def print_performance_metrics(
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
             performance_metrics["average_token_imbalance"] = average_token_imbalance
 
+    if "mean_total_tokens_per_sample" in metrics:
+        print(
+            f"  • Mean Total Tokens per Sample: {metrics['mean_total_tokens_per_sample']:.2f}"
+        )
+
     # =====================================================
     # Throughputs
     # =====================================================
@@ -552,6 +557,15 @@ def print_performance_metrics(
             performance_metrics["train_fp_utilization"] = (
                 total_tflops / theoretical_tflops
             )
+
+    # =====================================================
+    # Clean up metrics
+    # =====================================================
+
+    # Clean up metrics to avoid wandb logging errors
+    # Dict structures cannot be logged to wandb
+    if "per_worker_token_counts" in metrics:
+        del metrics["per_worker_token_counts"]
 
     # =====================================================
     # Logging

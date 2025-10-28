@@ -3,7 +3,7 @@ sft:
   max_num_steps: 350
   val_period: 500
 checkpointing:
-  checkpoint_dir: results/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
+  checkpoint_dir: results/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2
   save_period: 20
 policy:
   model_name: meta-llama/Llama-3.1-8B
@@ -14,7 +14,6 @@ policy:
   train_micro_batch_size: 2
   max_total_sequence_length: 4096
   dtensor_cfg:
-    sequence_parallel: true
     tensor_parallel_size: 2
   make_sequence_length_divisible_by: 2
   optimizer:
@@ -30,10 +29,10 @@ data:
   output_key: generated_solution
   seed: 42
 logger:
-  log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
+  log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp2
   wandb:
     project: nemo-rl
-    name: sft-llama3.1-8b-instruct-1n8g-fsdp2tp2sp
+    name: sft-llama3.1-8b-instruct-1n8g-fsdp2tp2
   tensorboard:
     log_dir: tb_logs-sft-dev-openmathinstruct2
 cluster:

@@ -46,6 +46,7 @@ from nemo_rl.package_info import (
 )
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 
 def _patch_nsight_file():
