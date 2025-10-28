@@ -44,8 +44,6 @@ policy:
     fp8_cfg:
       enabled: false
   generation:
-    stop_token_ids:
-    - 128009
     vllm_cfg:
       tensor_parallel_size: 16
       async_engine: true

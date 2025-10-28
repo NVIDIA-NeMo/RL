@@ -1,7 +1,7 @@
 defaults: ../../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 16
-  num_generations_per_prompt: 32
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
   max_num_steps: 500
   val_batch_size: 5
   max_val_samples: 16
@@ -42,8 +42,6 @@ policy:
     fp8_cfg:
       enabled: false
   generation:
-    stop_token_ids:
-    - 128009
     vllm_cfg:
       tensor_parallel_size: 32
       async_engine: true
