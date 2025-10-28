@@ -10,7 +10,7 @@ checkpointing:
 policy:
   logprob_batch_size: 2
   megatron_cfg:
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 16
     expert_model_parallel_size: 16
   generation:
