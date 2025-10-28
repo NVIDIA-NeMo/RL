@@ -1083,7 +1083,6 @@ class MegatronPolicyWorker:
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
-                        loss_metrics["grad_norm"] = grad_norm
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
@@ -1132,9 +1131,7 @@ class MegatronPolicyWorker:
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
-            "grad_norm": torch.tensor(
-                mb_metrics["grad_norm"][-1]
-            ).cpu(),  # TODO @sahilj: return an average or something later
+            "grad_norm": torch.tensor([grad_norm]),
         }
         return metrics
 
