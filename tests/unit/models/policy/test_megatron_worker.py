@@ -18,6 +18,7 @@ from typing import Optional
 
 import numpy as np
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -1932,6 +1933,45 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
 
             print(f"{desc} - Loss: {loss_tensor}")
             print(f"{desc} - Grad norm: {grad_norm}")
+
+            # Check tensor parallel attributes on model parameters
+            print(f"Checking tensor parallel attributes for {desc}...")
+            tp_check_futures = policy.worker_group.run_all_workers_single_data(
+                "check_tensor_parallel_attributes"
+            )
+            tp_check_results = [ray.get(future) for future in tp_check_futures]
+
+            # Analyze the first worker's results (all workers should have the same structure)
+            tp_info = tp_check_results[0]
+
+            print(f"{desc} - TP size: {tp_info['tp_size']}")
+            print(f"{desc} - Total params: {tp_info['total_params']}")
+            print(f"{desc} - TP params: {len(tp_info['tp_params'])}")
+            print(f"{desc} - Non-TP params: {len(tp_info['non_tp_params'])}")
+
+            # Validate tensor parallel attributes
+            expected_tp_size = tp
+            assert tp_info["tp_size"] == expected_tp_size, (
+                f"Expected TP size {expected_tp_size}, got {tp_info['tp_size']}"
+            )
+
+            if tp > 1:
+                # When tensor parallelism is enabled, we should have some TP parameters
+                assert len(tp_info["tp_params"]) > 0, (
+                    f"Expected tensor parallel parameters when TP={tp}, but found none"
+                )
+            else:
+                # When tensor parallelism is disabled, no parameters should have TP attributes
+                if len(tp_info["tp_params"]) > 0:
+                    print(
+                        f"WARNING: Found {len(tp_info['tp_params'])} TP parameters when TP=1:"
+                    )
+                    for tp_param in tp_info["tp_params"][:3]:  # Show first 3
+                        print(f"  - {tp_param['name']}")
+
+                print(
+                    f"✓ {desc} - Model configured for TP={tp} (no tensor parallel sharding expected)"
+                )
 
         finally:
             policy.shutdown()

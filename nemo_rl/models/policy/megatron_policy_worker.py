@@ -2034,3 +2034,47 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def check_tensor_parallel_attributes(self) -> dict[str, Any]:
+        """Check tensor parallel attributes on model parameters.
+
+        Returns:
+            Dictionary containing information about tensor parallel parameters:
+            - tp_params: List of parameter names that have tensor_model_parallel=True
+            - non_tp_params: List of parameter names that have tensor_model_parallel=False
+            - total_params: Total number of parameters checked
+            - tp_size: Tensor parallel size from config
+        """
+        tp_params = []
+        non_tp_params = []
+        total_params = 0
+
+        for name, param in self.model.named_parameters():
+            total_params += 1
+            tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
+
+            if tensor_model_parallel:
+                tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "partition_dim": getattr(param, "partition_dim", None),
+                        "partition_stride": getattr(param, "partition_stride", None),
+                        "shape": list(param.shape),
+                    }
+                )
+            else:
+                non_tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "shape": list(param.shape),
+                    }
+                )
+
+        return {
+            "tp_params": tp_params,
+            "non_tp_params": non_tp_params,
+            "total_params": total_params,
+            "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
+        }
