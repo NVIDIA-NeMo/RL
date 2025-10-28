@@ -41,6 +41,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
+    in_flight_weight_updates: false  # Enable for faster weight synchronization
 ```
 
 ### Complete Example Config
@@ -65,6 +66,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    in_flight_weight_updates: false  # Enable for faster weight synchronization
 
 cluster:
   num_nodes: 2
@@ -157,6 +159,8 @@ sequenceDiagram
 2. **Age Limits**: Start with `max_trajectory_age_steps: 1` and increase if needed for higher throughput
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
+
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
 
 ## Why Importance Sampling Correction Is Required for Async
 
