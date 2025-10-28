@@ -3,7 +3,7 @@
 # Default target shows help
 .DEFAULT_GOAL := help
 
-.PHONY: help docs-html docs-clean docs-live docs-env docs-publish
+.PHONY: help docs-html docs-clean docs-live docs-publish ensure-docs-env check-uv
 
 # Help target
 help: ## Show this help message
@@ -12,16 +12,12 @@ help: ## Show this help message
 	@echo "=============================="
 	@echo ""
 	@echo "Available targets:"
-	@echo "  make docs-env       Set up documentation environment"
 	@echo "  make docs-html      Build HTML documentation"
 	@echo "  make docs-live      Start live-reload server"
 	@echo "  make docs-publish   Build for publication (fail on warnings)"
 	@echo "  make docs-clean     Clean built documentation"
 	@echo ""
-	@echo "Typical workflow:"
-	@echo "  1. make docs-env    # First time setup"
-	@echo "  2. make docs-html   # Build docs"
-	@echo "  3. make docs-live   # Or start live server for development"
+	@echo "Note: Environment is automatically set up on first run."
 	@echo ""
 
 # Detect OS for cross-platform compatibility
@@ -38,11 +34,40 @@ else
     ECHO_BLANK = @echo ""
 endif
 
-docs-html:
+# Check if uv is installed
+check-uv:
+ifeq ($(OS),Windows_NT)
+	@where uv >nul 2>&1 || ( \
+		echo. && \
+		echo ❌ uv is not installed or not in PATH && \
+		echo. && \
+		echo Please install uv: https://docs.astral.sh/uv/getting-started/installation/ && \
+		exit 1 \
+	)
+else
+	@command -v uv >/dev/null 2>&1 || ( \
+		echo ""; \
+		echo "❌ uv is not installed or not in PATH"; \
+		echo ""; \
+		echo "Please install uv: https://docs.astral.sh/uv/getting-started/installation/"; \
+		echo ""; \
+		exit 1; \
+	)
+endif
+
+# Ensure docs environment exists and is up to date
+ensure-docs-env: check-uv
+	@if [ ! -f "$(VENV_PYTHON)" ]; then \
+		echo "📦 Setting up docs environment with uv..."; \
+		cd .. && uv venv .venv-docs && uv pip install --group docs --python .venv-docs; \
+		echo "✅ Environment ready!"; \
+	fi
+
+docs-html: ensure-docs-env
 	@echo "Building HTML documentation..."
 	$(VENV_PYTHON) -m sphinx -b html . _build/html
 
-docs-publish:
+docs-publish: ensure-docs-env
 	@echo "Building HTML documentation for publication (fail on warnings)..."
 	$(VENV_PYTHON) -m sphinx --fail-on-warning --builder html . _build/html
 
@@ -50,11 +75,9 @@ docs-clean:
 	@echo "Cleaning built documentation..."
 	$(RM_CMD)
 
-docs-live:
+docs-live: ensure-docs-env
 	@echo "Starting live-reload server (sphinx-autobuild)..."
 	$(VENV_PYTHON) -m sphinx_autobuild --port 8001 . _build/html
-
-docs-env:
 	@echo "Setting up docs virtual environment with uv..."
 ifeq ($(OS),Windows_NT)
 	@where uv >nul 2>&1 || ( \
