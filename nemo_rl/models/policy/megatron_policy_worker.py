@@ -670,7 +670,7 @@ class MegatronPolicyWorker:
         ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
         ## on the TP-sharded parameters.
         model_cfg.calculate_per_token_loss = True
-        model_cfg.perform_initialization = False
+        model_cfg.perform_initialization = True
 
         assert (
             "aux_loss" not in model_cfg.moe_router_load_balancing_type

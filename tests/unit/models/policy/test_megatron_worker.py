@@ -2354,7 +2354,7 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
 
             # Extract metrics
             loss_tensor = results["loss"]
-            all_metrics = results["all_mb_metrics"]
+            grad_norm = results["grad_norm"]
 
             # Verify loss is valid
             assert not torch.isnan(loss_tensor).any(), (
@@ -2363,12 +2363,6 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
             assert not torch.isinf(loss_tensor).any(), (
                 f"Loss should not be Inf for {desc}"
             )
-
-            # Extract gradient norm
-            assert "grad_norm" in all_metrics, (
-                f"grad_norm should be in metrics for {desc}"
-            )
-            grad_norm = all_metrics["grad_norm"]
 
             # Store results for comparison
             grad_norms[desc] = grad_norm
@@ -2399,21 +2393,10 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
             )
 
             if tp > 1:
+                tp_sharded_names = [item["name"] for item in tp_info["tp_params"]]
                 # When tensor parallelism is enabled, we should have some TP parameters
-                assert len(tp_info["tp_params"]) > 0, (
-                    f"Expected tensor parallel parameters when TP={tp}, but found none"
-                )
-            else:
-                # When tensor parallelism is disabled, no parameters should have TP attributes
-                if len(tp_info["tp_params"]) > 0:
-                    print(
-                        f"WARNING: Found {len(tp_info['tp_params'])} TP parameters when TP=1:"
-                    )
-                    for tp_param in tp_info["tp_params"][:3]:  # Show first 3
-                        print(f"  - {tp_param['name']}")
-
-                print(
-                    f"✓ {desc} - Model configured for TP={tp} (no tensor parallel sharding expected)"
+                assert "module.embedding.word_embeddings.weight" in tp_sharded_names, (
+                    f"Expected module.embedding.word_embeddings.weight to be TP-sharded when TP={tp}"
                 )
 
         finally:
@@ -2425,7 +2408,7 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
 
     # Get reference values from DP2 configuration
     # NOTE: even if TP2 config passes these tests, it doesn't necessarily imply
-    # there are no bugs. Sometimes bugs with grad norm are hard to catch.
+    # there are no bugs. That's why we also check that TP attributes are set correctly above
     reference_config = "DP1TP1"
     reference_grad_norm = grad_norms[reference_config]
     reference_loss = losses[reference_config]
@@ -2433,6 +2416,9 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
     for config_name, grad_norm in grad_norms.items():
         if config_name == reference_config:
             continue
+
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
 
         print(f"\nComparing {config_name} with {reference_config}:")
         print(f"  {reference_config} grad norm: {reference_grad_norm}")
@@ -2452,13 +2438,13 @@ def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_
                 grad_diff = abs(gn - ref_gn)
                 relative_diff = grad_diff / (ref_gn + 1e-8)
                 print(
-                    f"    Microbatch {i}: {ref_gn} vs {gn}, diff={grad_diff:.6f}, rel_diff={relative_diff:.6f}"
+                    f"    Microbatch {i}: {ref_gn} vs {gn}, diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f}"
                 )
 
                 # Allow small differences due to floating point precision and parallelization
                 assert relative_diff < 0.01 or grad_diff < 1e-6, (
                     f"Gradient norm difference too large for microbatch {i}: "
-                    f"{ref_gn} vs {gn} (diff={grad_diff:.6f}, rel_diff={relative_diff:.6f})"
+                    f"{ref_gn} vs {gn} (diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f})"
                 )
 
         # Compare losses (should also be identical for same computation)
