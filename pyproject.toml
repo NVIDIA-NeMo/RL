@@ -64,6 +64,7 @@ automodel = [
     "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
+    "grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4",
 ]
 vllm = [
     "cuda-python",
@@ -215,6 +216,7 @@ transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+grouped-gemm = ["torch"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
