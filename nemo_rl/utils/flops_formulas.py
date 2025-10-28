@@ -402,9 +402,18 @@ def deepseekv3(config: FLOPSConfig):
         )
 
     # linear layer flops
-    per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
-        (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
-    )  # Q
+    # Q projection: check if using MLA (q_lora_rank is set) or standard attention
+    if config.q_lora_rank is not None:
+        # MLA for Q (e.g., DeepSeek-V3)
+        per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
+            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
+        )  # Q
+    else:
+        # Standard attention for Q (e.g., Moonlight)
+        per_layer_mla_params = config.hs * (
+            (config.qk_head_dim + config.qk_pos_emb_head_dim) * config.attention_heads
+        )  # Q
+
     per_layer_mla_params += config.hs * config.qk_pos_emb_head_dim  # K^R
     per_layer_mla_params += config.hs * config.kv_lora_rank + config.kv_lora_rank * (
         (config.qk_head_dim + config.v_head_dim) * config.attention_heads
