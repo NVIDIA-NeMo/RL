@@ -1,4 +1,4 @@
-# Features
+# Features and Roadmap
 
 _Available now_ | _Coming in v0.4_
 
