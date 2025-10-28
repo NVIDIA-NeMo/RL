@@ -28,6 +28,7 @@ uv run examples/run_sft.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    ~policy.tokenizer.chat_template \
     $@ \
     2>&1 | tee $RUN_LOG
 
@@ -38,5 +39,5 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["80"] < 0.301' \
-        'data["validation/loss"]["80"] < 0.304'
+        'data["validation/val_loss"]["80"] < 0.304'
 fi

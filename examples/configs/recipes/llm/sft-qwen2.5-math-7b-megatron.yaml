@@ -1,6 +1,7 @@
 defaults: ../../sft.yaml
 sft:
   max_num_steps: 80
+  seed: 42
 checkpointing:
   enabled: false
 policy:
