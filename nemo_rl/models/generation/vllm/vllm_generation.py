@@ -679,7 +679,11 @@ class VllmGeneration(GenerationInterface):
             return True
 
         async for result in self._async_generate_base(
-            data, "generate_text_async", validate_text_data, greedy, guided_decoding_params=guided_decoding_params
+            data,
+            "generate_text_async",
+            validate_text_data,
+            greedy,
+            guided_decoding_params=guided_decoding_params,
         ):
             yield result
 
@@ -705,7 +709,11 @@ class VllmGeneration(GenerationInterface):
             return True
 
         async for result in self._async_generate_base(
-            data, "generate_async", validate_generate_data, greedy, guided_decoding_config=guided_decoding_config
+            data,
+            "generate_async",
+            validate_generate_data,
+            greedy,
+            guided_decoding_config=guided_decoding_config,
         ):
             yield result
 
