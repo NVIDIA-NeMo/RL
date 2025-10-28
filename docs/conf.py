@@ -42,7 +42,7 @@ release = "latest"
 
 extensions = [
     "myst_parser",  # For our markdown docs
-    # "autodoc2" - Added conditionally below based on package availability
+    "autodoc2",  # For automatic API documentation generation
     "sphinx.ext.viewcode",  # For adding a link to view source code in docs
     "sphinx.ext.doctest",  # Allows testing in docstrings
     "sphinx.ext.napoleon",  # For google style docstrings
