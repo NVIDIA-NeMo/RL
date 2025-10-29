@@ -34,7 +34,8 @@ def calculate_kl_penalty(
     logprobs_policy: torch.Tensor,
     logprobs_reference: torch.Tensor,
     kl_type: str = "k3",
-    clamp_value: Optional[float] = 20.0,
+    input_clamp_value: float | None = 20.0,
+    output_clamp_value: float | None = 10.0,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two log_probs.
 
@@ -44,8 +45,8 @@ def calculate_kl_penalty(
     logprobs_reference: torch.Tensor (b, s)
     """
     logr = logprobs_reference - logprobs_policy
-    if clamp_value is not None:
-        logr = logr.clamp(min=-clamp_value, max=clamp_value)
+    if input_clamp_value is not None:
+        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
 
     if kl_type == "k1":
         kl = -logr
@@ -58,6 +59,9 @@ def calculate_kl_penalty(
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if output_clamp_value is not None:
+        kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
 
     return kl
 
