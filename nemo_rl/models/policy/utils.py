@@ -29,7 +29,7 @@ from transformers import (
 
 # Try to import nemo_automodel classes, fallback to None if not available
 try:
-    from nemo_automodel.components._transformers.auto_model import (
+    from nemo_automodel._transformers.auto_model import (
         NeMoAutoModelForCausalLM,
         NeMoAutoModelForImageTextToText,
         NeMoAutoModelForTextToWaveform,
