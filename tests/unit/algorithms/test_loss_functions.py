@@ -24,7 +24,7 @@ from nemo_rl.algorithms.loss_functions import (
     DPOLossFn,
     NLLLoss,
 )
-from nemo_rl.algorithms.utils import masked_mean
+from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 basic_pg_loss_test_config: ClippedPGLossConfig = {
@@ -557,6 +557,47 @@ def test_clipped_pg_loss_reinforce_mode():
         ),
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+@pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
+def test_calculate_kl(kl_type):
+    """Tests KL calculations."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    logprobs = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    logprobs_reference = torch.tensor([[-0.0, -15.0, -30.0]], device=device)
+
+    # test un-clamped KL
+    expected_kl = {
+        "k1": torch.tensor([[-1.0, 14.0, 29.0]], device=device),
+        "k2": torch.tensor([[0.5, 98.0, 420.5]], device=device),
+        "k3": torch.tensor([[0.7183, 13.0, 28.0]], device=device),
+    }
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type=kl_type,
+        input_clamp_value=None,
+        output_clamp_value=None,
+    )
+    assert torch.allclose(kl, expected_kl[kl_type], rtol=1e-3)
+
+    # test clamped KL
+    expected_kl_clamped = {
+        "k1": torch.tensor([[-1.0, 10.0, 10.0]], device=device),
+        "k2": torch.tensor([[0.5, 10.0, 10.0]], device=device),
+        "k3": torch.tensor([[0.7183, 10.0, 10.0]], device=device),
+    }
+    kl_clamped = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type=kl_type,
+        input_clamp_value=20.0,
+        output_clamp_value=10.0,
+    )
+    assert torch.allclose(kl_clamped, expected_kl_clamped[kl_type], rtol=1e-3)
 
 
 # Simplified KL Penalty Test using original Loss
