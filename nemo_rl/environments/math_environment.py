@@ -76,7 +76,7 @@ class HFVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
-        math_verify_impl: str = "hf_math_verify",
+        **kwargs,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
@@ -95,12 +95,13 @@ class HFVerifyWorker:
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
                 with _mute_output():
-                    if math_verify_impl == "dapo_math_verify":
+                    math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
+                    if kwargs.get("math_verify_impl") == "dapo_math_verify":
                         # This compute_score is from the DAPO Math Verifier from Verl
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
-                    elif math_verify_impl == "hf_math_verify":
+                    elif kwargs.get("math_verify_impl") == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
                             [ground_truth_parsable], [response]
@@ -146,6 +147,7 @@ class MultilingualMultichoiceVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
+        **kwargs,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
@@ -191,6 +193,7 @@ class EnglishMultichoiceVerifyWorker:
         pred_responses: list[str],
         ground_truths: list[str],
         return_extracted_answer: bool = False,
+        **kwargs,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify the correctness of the predicted responses against the ground truth.
 
@@ -241,6 +244,7 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         assert isinstance(verifier_type, str), (
             f"{verifier_type=} must be a string but was {type(verifier_type)}"
         )
+
         worker_cls = {
             "math": HFVerifyWorker,
             "english_multichoice": EnglishMultichoiceVerifyWorker,
@@ -302,7 +306,7 @@ class MathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
-                self.cfg["math_verify_impl"],
+                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)

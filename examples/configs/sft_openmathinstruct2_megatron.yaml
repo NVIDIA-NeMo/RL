@@ -132,6 +132,7 @@ data:
   add_eos: true
   add_generation_prompt: true
   output_key: 'generated_solution'
+  num_workers: 1
 
 logger:
   log_dir: "logs"  # Base directory for all logs
