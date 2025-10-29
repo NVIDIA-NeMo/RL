@@ -49,6 +49,10 @@ Usage:
     # Advanced settings for specific models
     python eval_llada.py --generation-algorithm dual_cache --threshold 0.8 --factor 2.0  # LLaDA Fast-dLLM
     python eval_llada.py --generation-algorithm nemotron --steps 128 --threshold 0.9      # Nemotron native
+    
+    # Handle truncated outputs (when model cuts off mid-reasoning)
+    python eval_llada.py --keep-thinking                    # Don't remove <think> tags, extract answer from full output
+    python eval_llada.py --keep-thinking --tokens-to-generate 1024  # Increase tokens + keep thinking mode
 """
 
 import os
@@ -186,6 +190,11 @@ def create_parser():
         action="store_true", 
         help="Run quick test mode (10 problems, single sample, overrides some settings)"
     )
+    parser.add_argument(
+        "--keep-thinking",
+        action="store_true",
+        help="Keep <think> tags in generation (don't remove them). Useful when model outputs are truncated."
+    )
     
     return parser
 
@@ -232,6 +241,7 @@ def main():
         "tokens_to_generate": args.tokens_to_generate,
         "max_samples": args.max_samples,
         "quick_test": args.quick_test,
+        "keep_thinking": args.keep_thinking,
         
         # LLaDA-specific settings
         "steps": args.steps,
@@ -360,6 +370,13 @@ def main():
                 generation_args.append("++max_samples=10")  # Only 10 problems
             print(f"\n🚀 QUICK TEST MODE: Running with {config['benchmarks']} and limited samples")
         
+        # Build extra_eval_args for evaluation-time parameters
+        extra_eval_args = []
+        if config["keep_thinking"]:
+            extra_eval_args.append("++remove_thinking=False")
+            print("\n⚠️  Keep-thinking mode enabled: <think> tags will NOT be removed from generations")
+            print("   This helps when model outputs are truncated and missing </think> tags")
+        
         # Call the evaluation function with direct parameters
         result = eval(
             ctx=wrap_arguments(" ".join(generation_args)),
@@ -376,6 +393,7 @@ def main():
             # Optional parameters
             cluster=config["cluster"],
             dry_run=config["dry_run"],
+            extra_eval_args=" ".join(extra_eval_args) if extra_eval_args else None,
         )
         
         print("\n" + "=" * 60)
