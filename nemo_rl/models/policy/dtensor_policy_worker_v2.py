@@ -30,6 +30,8 @@ from nemo_automodel import (
 from nemo_automodel._transformers.utils import (
     sliding_window_overwrite,
 )
+from nemo_automodel.components.moe.parallelizer import parallelize_model as moe_parallelize_model
+from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
@@ -107,6 +109,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 from transformers.utils import TRANSFORMERS_CACHE
+from transformers import PreTrainedModel
 
 
 @ray.remote(
@@ -340,17 +343,33 @@ class DTensorPolicyWorkerV2:
         self.tp_size = manager.tp_size
         self.cp_size = manager.cp_size
 
-        # Parallelize model (FSDP2 + TP plan)
-        self.model = manager.parallelize(self.model)
+        # Parallelize model
+        if not isinstance(self.model, PreTrainedModel):
+            moe_parallelize_model(
+                model=self.model,
+                world_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                pp_enabled=False,
+                dp_axis_names=(
+                    ("dp_replicate", "dp_shard_cp")
+                    if "dp_replicate" in self.device_mesh.mesh_dim_names
+                    and "dp_shard_cp" in self.device_mesh.mesh_dim_names
+                    else ("dp_shard_cp",)
+                ),
+                cp_axis_name="cp",
+                tp_axis_name="tp",
+                ep_axis_name="ep",
+                ep_shard_axis_names=("ep_shard",),
+            )
+        else:
+            self.model = manager.parallelize(self.model)
 
         # Load base model weights across all ranks using Automodel Checkpointer
         # This mirrors build_model_and_optimizer's is_meta_device + load_weights path
         self._ensure_checkpointer(
             config_updates={
                 "model_repo_id": model_name,
-                "model_cache_dir": hf_config_overrides.get("cache_dir", ""),
-                "save_consolidated": False,
-                "is_peft": False,
+                "dequantize_base_checkpoint": self.cfg.get("dequantize_base_checkpoint", False),
             },
             checkpoint_root=None,
         )
@@ -703,10 +722,14 @@ class DTensorPolicyWorkerV2:
                             outputs = self.model(**model_args)
 
                         # Get logprobs
-                        if not hasattr(outputs, "logits"):
-                            logits = self.model.lm_head(outputs.last_hidden_state)
+                        if isinstance(outputs, (torch.Tensor, DTensor)):
+                            # custom models (e.g., those coming from AutoModel) can output logits directly
+                            logits = outputs
                         else:
-                            logits = outputs.logits
+                            if not hasattr(outputs, "logits"):
+                                logits = self.model.lm_head(outputs.last_hidden_state)
+                            else:
+                                logits = outputs.logits
                         del outputs
 
                         # Apply temperature scaling
