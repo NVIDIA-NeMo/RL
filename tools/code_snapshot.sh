@@ -36,11 +36,7 @@ fi
 
 echo2 "Copying git-tracked files and submodules..."
 rsync -a --files-from=<(
-  {
-    git ls-files
-    echo .gitmodules
-    git submodule foreach --recursive --quiet 'git ls-files | sed "s|^|$path/|"'
-  }
+  git ls-files --recurse-submodules --cached --full-name
 ) ./ $SNAPSHOT_DIR/
 
 
