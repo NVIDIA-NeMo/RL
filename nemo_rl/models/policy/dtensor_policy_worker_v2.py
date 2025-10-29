@@ -41,6 +41,9 @@ from nemo_automodel.components.distributed.grad_utils import (
 from nemo_automodel.components.distributed.parallelizer import (
     fsdp2_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.fsdp2 import (
+    FSDP2Manager,
+)
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
@@ -103,6 +106,8 @@ from nemo_automodel.components.checkpoint._backports.filesystem import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
+from transformers.utils import TRANSFORMERS_CACHE
+
 
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
@@ -156,6 +161,11 @@ class DTensorPolicyWorkerV2:
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
 
+        # We initialize the AutoModel checkpointer here. This needs to be persistent because of async checkpointing support
+        # once NeMo-RL is >= torch 2.9.0
+        self.checkpointer = None
+        self.checkpoint_config = None
+
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
@@ -181,6 +191,14 @@ class DTensorPolicyWorkerV2:
 
         hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
 
+        # Choose attention implementation consistent with train_ft.py logic
+        # - Packed sequence requires FA2 and CP must be 1
+        # - CP > 1 requires SDPA
+        cp_size_cfg = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        attn_impl = (
+            "flash_attention_2" if (self.enable_seq_packing and cp_size_cfg == 1) else ("sdpa" if cp_size_cfg > 1 else None)
+        )
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -190,9 +208,7 @@ class DTensorPolicyWorkerV2:
             **sliding_window_overwrite(
                 model_name
             ),  # due to https://github.com/huggingface/transformers/issues/38002
-            attn_implementation="flash_attention_2"
-            if self.enable_seq_packing
-            else None,
+            attn_implementation=attn_impl,
             **hf_config_overrides,
         )
 
@@ -233,24 +249,6 @@ class DTensorPolicyWorkerV2:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
             model_class = resolve_model_class(model_config.model_type)
 
-        full_state_dict = None
-        model_state_dict_keys = None
-        if self.rank == 0:
-            print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-            model = model_class.from_pretrained(
-                model_name,
-                device_map="cpu",  # load weights onto CPU initially
-                trust_remote_code=True,
-                config=model_config,
-                use_liger_kernel=False,
-                torch_dtype=str(model_config.torch_dtype),
-            )
-
-            full_state_dict = model.state_dict()
-            # Store the original model state dict keys before any parallelization
-            model_state_dict_keys = list(full_state_dict.keys())
-            del model
-
         print(f"[Rank {self.rank}] Initializing empty model for FSDP...")
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
@@ -261,28 +259,26 @@ class DTensorPolicyWorkerV2:
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
             self.model = model_class.from_config(
                 model_config,
-                attn_implementation="flash_attention_2"
-                if self.enable_seq_packing
-                else None,
+                attn_implementation=attn_impl,
                 use_liger_kernel=False,
                 trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
             )
 
+        # Hold a copy of model state_dict keys before any parallelization (as in train_ft.py)
+        self.model_state_dict_keys = list(self.model.state_dict().keys())
+
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
 
-        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
-        cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
+        tp_size = self.cfg["dtensor_cfg"].get("tensor_parallel_size", 1)
+        cp_size = self.cfg["dtensor_cfg"].get("context_parallel_size", 1)
+        ep_size = self.cfg["dtensor_cfg"].get("expert_parallel_size", 1)
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
             )
-        dp_size = world_size // tp_size // cp_size
         sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
-        assert world_size == dp_size * tp_size * cp_size, (
-            f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
-        )
 
         if sequence_parallel_enabled and tp_size == 1:
             print(
@@ -309,87 +305,67 @@ class DTensorPolicyWorkerV2:
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-        # For FSDP2 compatibility, we need to support HSDP structure
-        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
-        dp_replicate_size = 1
-        dp_shard_size = dp_size
-
-        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
-        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
-        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
-        prev_local_rank = os.environ["LOCAL_RANK"]
-        os.environ["LOCAL_RANK"] = "0"
-
-        # Create device mesh with HSDP structure for FSDP2 compatibility
-        device_mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (dp_replicate_size, dp_shard_size, cp_size, tp_size),
-            mesh_dim_names=("dp_replicate", "dp_shard", "cp", "tp"),
-        )
-        os.environ["LOCAL_RANK"] = prev_local_rank
-
-        # Create flattened submeshes for different use cases
-        # Flatten dp_replicate + dp_shard for the "dp" dimension (backward compatibility)
-        device_mesh[("dp_replicate", "dp_shard")]._flatten(mesh_dim_name="dp")
-
-        # Flatten dp_shard + cp for FSDP2 sharding
-        device_mesh[("dp_shard", "cp")]._flatten(mesh_dim_name="dp_shard_cp")
-
-        # Flatten dp_replicate + dp_shard + cp for gradient operations
-        device_mesh[("dp_replicate", "dp_shard", "cp")]._flatten(mesh_dim_name="dp_cp")
-
-        # Store mesh references for backward compatibility
-        self.dp_cp_mesh = device_mesh["dp_cp"]
-        self.dp_mesh = device_mesh["dp"]
-        self.tp_mesh = device_mesh["tp"]
-        self.cp_mesh = device_mesh["cp"]
-
-        self.dp_size = dp_size
-        self.tp_size = tp_size
-        self.cp_size = cp_size
-        self.device_mesh = device_mesh
-
         # ------------------------------------------------
-        # 3) Move to GPU + Composable FSDP
-        #    (Initialize device mesh, shard submodules, then shard entire model)
+        # Build device mesh and parallelize
         # ------------------------------------------------
-        self.model = fsdp2_strategy_parallelize(
-            self.model,
-            device_mesh=self.device_mesh,
+        manager = FSDP2Manager(
+            dp_size=None,
+            dp_replicate_size=1,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            sequence_parallel=sequence_parallel_enabled,
+            use_hf_tp_plan=self.cfg["dtensor_cfg"].get("use_hf_tp_plan", False),
             mp_policy=MixedPrecisionPolicy(
                 param_dtype=self.dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             ),
-            offload_policy=CPUOffloadPolicy(pin_memory=False)
-            if self.cpu_offload
-            else OffloadPolicy(),
-            sequence_parallel=sequence_parallel_enabled,
-            activation_checkpointing=self.cfg["dtensor_cfg"][
-                "activation_checkpointing"
-            ],
-            tp_shard_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
-            dp_replicate_mesh_name="dp_replicate",
-            dp_shard_cp_mesh_name="dp_shard_cp",
-            tp_mesh_name="tp",
+            offload_policy=CPUOffloadPolicy(pin_memory=False) if self.cpu_offload else None,
+            backend="nccl",
+            world_size=world_size,
+            activation_checkpointing=self.cfg["dtensor_cfg"]["activation_checkpointing"],
         )
 
-        print(f"[Rank {self.rank}] Loading state dict from rank 0...")
-        # This will broadcast the state dict from rank 0 to all other ranks
-        # and load it into the FSDP model.
-        set_model_state_dict(
+        # Store mesh references for downstream usage
+        self.device_mesh = manager.device_mesh
+        self.dp_cp_mesh = self.device_mesh["dp_cp"]
+        self.dp_mesh = self.device_mesh["dp"]
+        self.tp_mesh = self.device_mesh["tp"]
+        self.cp_mesh = self.device_mesh["cp"]
+        self.moe_mesh = getattr(manager, "moe_mesh", None)
+
+        self.dp_size = manager.dp_size
+        self.tp_size = manager.tp_size
+        self.cp_size = manager.cp_size
+
+        # Parallelize model (FSDP2 + TP plan)
+        self.model = manager.parallelize(self.model)
+
+        # Load base model weights across all ranks using Automodel Checkpointer
+        # This mirrors build_model_and_optimizer's is_meta_device + load_weights path
+        self._ensure_checkpointer(
+            config_updates={
+                "model_repo_id": model_name,
+                "model_cache_dir": hf_config_overrides.get("cache_dir", ""),
+                "save_consolidated": False,
+                "is_peft": False,
+            },
+            checkpoint_root=None,
+        )
+        self.checkpointer.config.model_state_dict_keys = self.model_state_dict_keys
+
+        # Load base HF weights unless an explicit checkpoint is provided later
+        # This puts shards directly into the parallelized model
+        self.checkpointer.load_base_model(
             self.model,
-            model_state_dict=full_state_dict,
-            options=StateDictOptions(
-                full_state_dict=True,
-                broadcast_from_rank0=True,
-            ),
+            device=torch.cuda.current_device(),
+            root_dir=hf_config_overrides.get("cache_dir", TRANSFORMERS_CACHE),
+            model_name=model_name,
+            peft_init_method=None,  # TODO: change for LoRA
+            load_base_model=True,
         )
-
-        # Broadcast model state dict keys to all ranks and store as instance variable
-        keys_to_broadcast = [model_state_dict_keys]
-        torch.distributed.broadcast_object_list(keys_to_broadcast, src=0)
-        self.model_state_dict_keys = keys_to_broadcast[0]
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
@@ -405,10 +381,6 @@ class DTensorPolicyWorkerV2:
 
             if embed_tokens_weight is not None:
                 self.model.lm_head.weight = embed_tokens_weight
-
-        # Manually broadcast buffers
-        for _, buf in self.model.named_buffers():
-            torch.distributed.broadcast(to_local_if_dtensor(buf), src=0)
 
         if self.cpu_offload:
             self.model = self.move_to_device(self.model, "cpu")
@@ -465,13 +437,9 @@ class DTensorPolicyWorkerV2:
             self.load_checkpoint(weights_path, optimizer_path)
         else:
             print(
-                "No weights path provided. Starting from scratch (default policy init)"
+                "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
             )
 
-        # We initialize the AutoModel checkpointer here. This needs to be persistent because of async checkpointing support
-        # once NeMo-RL is >= torch 2.9.0
-        self.checkpointer = None
-        self.checkpoint_config = None
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
