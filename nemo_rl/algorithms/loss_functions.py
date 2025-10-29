@@ -324,7 +324,10 @@ class NLLLoss(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # logits shape: [batch_size, seq_len, vocab_size]
         # Get the next token logits for each position
-        token_mask = data["token_mask"][:, 1:]
+        if not mdlm_loss:
+            token_mask = data["token_mask"][:, 1:]
+        else:
+            token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -351,13 +354,17 @@ class NLLLoss(LossFunction):
                 next_token_logits, data["input_ids"]
             )
         else:
-            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
-            next_token_logprobs = torch.nn.functional.log_softmax(
-                next_token_logits, dim=-1
-            )
             if not mdlm_loss:
+                next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+                next_token_logprobs = torch.nn.functional.log_softmax(
+                    next_token_logits, dim=-1
+                )
                 logprobs = next_token_logprobs[:, :-1]  # Remove last position's logits
             else:
+                next_tokens = data["input_ids"].cuda()
+                next_token_logprobs = torch.nn.functional.log_softmax(
+                    next_token_logits, dim=-1
+                )
                 logprobs = next_token_logprobs
             token_logprobs = logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
@@ -371,7 +378,7 @@ class NLLLoss(LossFunction):
             if dpo_average_log_probs:
                 loss = loss / num_unmasked_tokens.clamp(min=1)
         elif mdlm_loss:
-            p_mask = data["p_mask"][:, 1:]
+            p_mask = data["p_mask"]
             loss = -masked_mean(token_logprobs / p_mask, mask, global_normalization_factor=mask.sum())
         else:
             ## single scalar loss

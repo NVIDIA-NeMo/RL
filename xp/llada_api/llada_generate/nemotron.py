@@ -32,6 +32,7 @@ class NemotronGeneration(GenerationAlgorithm):
         logger.info("Loading Nemotron model with standard AutoModel")
         return AutoModel.from_pretrained(
             model_path,
+            dlm_paradigm="bidirectional",
             trust_remote_code=True,
             **kwargs
         )
@@ -126,7 +127,7 @@ class NemotronGeneration(GenerationAlgorithm):
             'threshold': 0.9,    # Nemotron default
             'factor': 1.0,       # Not used by Nemotron but kept for compatibility
             # TODO(mfathi): this is a hack to fix inference for our trained checkpoints using nemo-rl. need to investigate a coherent solution.
-            'shift_logits': self.use_chat_template  # True when using chat template, False for raw text
+            'shift_logits': False #self.use_chat_template  # True when using chat template, False for raw text
         }
 
 

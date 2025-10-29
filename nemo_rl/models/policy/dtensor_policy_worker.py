@@ -95,7 +95,6 @@ def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
             if isinstance(module, FSDPModule):
                 module.reshard()
 
-
 @torch.no_grad()
 def get_cpu_state_dict(
     state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
@@ -249,6 +248,9 @@ class DTensorPolicyWorker:
                 print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
                 from transformers import AutoModel
                 model_class = AutoModel
+                model_config.dlm_type = "llada"
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
+                    model_config.dlm_paradigm = "block_diff"
             else:
                 model_class = AutoModelForCausalLM
 
