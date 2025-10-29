@@ -16,7 +16,6 @@ policy:
   max_total_sequence_length: 8192
   dtensor_cfg:
     cpu_offload: true
-    sequence_parallel: true
     activation_checkpointing: true
     _v2: false
   sequence_packing:

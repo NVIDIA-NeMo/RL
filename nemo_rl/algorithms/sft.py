@@ -202,6 +202,9 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
+
     loss_fn = NLLLoss()
     print("  ✓ Model initialized")
 

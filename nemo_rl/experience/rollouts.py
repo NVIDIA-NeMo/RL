@@ -158,10 +158,9 @@ async def generate_responses_async(
         "Generation returned no outputs for a non-empty batch."
     )
 
-    pad_token_id = policy_generation.cfg.get("pad_token_id", tokenizer.pad_token_id)
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
+        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
     )
 
     # Extract everything we need from the generation outputs

@@ -248,6 +248,9 @@ def setup(
         init_optimizer=True,
         init_reference_model=True,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
+
     loss_fn = DPOLossFn(master_config["dpo"])
     print("  ✓ Model initialized")
 
