@@ -17,7 +17,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.utils import calculate_kl_penalty, masked_mean
+from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
@@ -172,22 +172,32 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        # gen-kl(kl(P_gen || P_train)) = torch.exp(log_ratio) - log_ratio - 1
+        # gen-kl: kl(P_gen || P_train)
         # where log_ratio = prev_logprobs - generation_logprobs
+        gen_kl_error = calculate_kl(
+            logprobs=generation_logprobs,
+            logprobs_reference=prev_logprobs,
+            kl_type=self.reference_policy_kl_type,
+            input_clamp_value=None,
+            output_clamp_value=None,
+        )
         gen_kl_error = masked_mean(
-            torch.exp(prev_logprobs - generation_logprobs)
-            - (prev_logprobs - generation_logprobs)
-            - 1,
+            gen_kl_error,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        # policy-kl(kl(P_train || P_gen)) = torch.exp(log_ratio) - log_ratio - 1
-        # where log_ratio = prev_logprobs - generation_logprobs
+        # policy-kl: kl(P_train || P_gen)
+        # where log_ratio = generation_logprobs - prev_logprobs
+        policy_kl_error = calculate_kl(
+            logprobs=prev_logprobs,
+            logprobs_reference=generation_logprobs,
+            kl_type=self.reference_policy_kl_type,
+            input_clamp_value=None,
+            output_clamp_value=None,
+        )
         policy_kl_error = masked_mean(
-            torch.exp(generation_logprobs - prev_logprobs)
-            - (generation_logprobs - prev_logprobs)
-            - 1,
+            policy_kl_error,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
@@ -264,8 +274,8 @@ class ClippedPGLossFn(LossFunction):
             kl = (
                 kl_importance_weights
                 * self.reference_policy_kl_penalty
-                * calculate_kl_penalty(
-                    logprobs_policy=curr_logprobs,
+                * calculate_kl(
+                    logprobs=curr_logprobs,
                     logprobs_reference=reference_policy_logprobs,
                     kl_type=self.reference_policy_kl_type,
                     input_clamp_value=self.kl_input_clamp_value,

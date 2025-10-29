@@ -279,7 +279,7 @@ We observed a case where vLLM assigned a disproportionately high probability to 
    logp_gen     (from vLLM):      -5.xxx
    logp_policy (from Mcore):      -15.xxx
 ```
-Assuming other tokens have near-zero divergence, this single token's metrics are:
+Assuming other tokens have near-zero divergence, this single token's metrics with `kl_type=k3` are:
 
 * `gen_kl_error`: exp(-15 + 5) - (-15 + 5) - 1 ≈ 9 (moderate mismatch)
 * `policy_kl_error`: exp(-5 + 15) - (-5 + 15) - 1 ≈ 22,015 (severe mismatch dominating the metric)

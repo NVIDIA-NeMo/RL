@@ -30,8 +30,8 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 
 
-def calculate_kl_penalty(
-    logprobs_policy: torch.Tensor,
+def calculate_kl(
+    logprobs: torch.Tensor,
     logprobs_reference: torch.Tensor,
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
@@ -41,10 +41,10 @@ def calculate_kl_penalty(
 
     From Schulman 2020, http://joschu.net/blog/kl-approx.html.
 
-    logprobs_policy:    torch.Tensor (b, s)
+    logprobs:           torch.Tensor (b, s)
     logprobs_reference: torch.Tensor (b, s)
     """
-    logr = logprobs_reference - logprobs_policy
+    logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
         logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
 
