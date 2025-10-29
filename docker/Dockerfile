@@ -71,6 +71,9 @@ ARG BUILD_CUSTOM_VLLM
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
+# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh

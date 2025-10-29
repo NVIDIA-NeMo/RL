@@ -72,6 +72,7 @@ def import_model_from_hf_name(
             "num_layers_in_last_pipeline_stage"
         ]
         model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
+    model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
