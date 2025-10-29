@@ -65,7 +65,6 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -106,7 +105,6 @@ class CheckpointManager:
         self.model_cache_dir = config.get("model_cache_dir", "")
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
-        self.is_async = config.get("is_async", False)
 
     def init_tmp_checkpoint(
         self,
