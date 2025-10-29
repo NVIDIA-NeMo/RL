@@ -340,7 +340,8 @@ class DTensorPolicyWorkerV2:
         self.cp_size = manager.cp_size
 
         # Parallelize model
-        if not isinstance(self.model, PreTrainedModel):
+        is_moe_model = any(["expert" in key for key in self.model_state_dict_keys])
+        if not isinstance(self.model, PreTrainedModel) and is_moe_model:
             moe_parallelize_model(
                 model=self.model,
                 world_mesh=self.device_mesh,
