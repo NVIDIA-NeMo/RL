@@ -77,7 +77,6 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
-  optimizer: null
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -137,7 +136,7 @@ policy:
     apply_rope_fusion: true
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
     optimizer:
       optimizer: adam
       lr: 2.0e-07

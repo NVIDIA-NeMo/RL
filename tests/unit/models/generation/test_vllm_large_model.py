@@ -168,7 +168,7 @@ async def test_vllm_large_model(
 
         # Extract in correct order
         outputs = [item for _, item in collected_indexed_outputs]
-        pad_token_id = async_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+        pad_token_id = async_policy.cfg.get("_pad_token_id", tokenizer.pad_token_id)
         outputs = BatchedDataDict.from_batches(
             outputs,
             pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},

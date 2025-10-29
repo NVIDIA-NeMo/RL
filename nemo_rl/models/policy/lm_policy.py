@@ -582,7 +582,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         assert self.cfg["generation"] is not None, "Generation config is not set"
         result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures),
-            pad_value_dict={"output_ids": self.cfg["generation"]["pad_token_id"]},
+            pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
         )
 
         # Verify the output has all required fields
@@ -733,10 +733,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         else:
             if (
                 checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format") == "safetensors"
+                and checkpointing_cfg.get("model_save_format", None) is not None
             ):
                 raise ValueError(
-                    "safetensors is only supported with DTensorPolicyWorkerV2 (_v2=true)."
+                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
                 )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",

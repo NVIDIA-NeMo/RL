@@ -89,7 +89,7 @@ class VllmGeneration(GenerationInterface):
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         # The vLLM sampler patch only supports temperature scaling and does not handle top_p/top_k correctly.
         # However, we allow values above certain thresholds for token filtering purposes.
-        top_k: int | None = self.cfg.get("top_k")
+        top_k = self.cfg["top_k"]
         if top_k is not None and top_k != -1 and top_k < TOP_K_THRESHOLD:
             raise ValueError(
                 (
@@ -117,6 +117,10 @@ class VllmGeneration(GenerationInterface):
         missing_keys = [
             key for key in VllmConfig.__required_keys__ if key not in self.cfg
         ]
+        # Also check for model_name which is required by VllmGenerationWorker but marked as NotRequired in GenerationConfig because it's not expected to be set in the job yaml.
+        if "model_name" not in self.cfg:
+            missing_keys.append("model_name")
+
         assert not missing_keys, (
             f"VLLM Configuration Error: Missing required keys in VllmConfig.\n"
             f"Missing keys: {', '.join(missing_keys)}\n"
@@ -446,7 +450,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields
@@ -497,7 +501,7 @@ class VllmGeneration(GenerationInterface):
 
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["pad_token_id"]}
+            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
 
         # Verify the output has all required fields

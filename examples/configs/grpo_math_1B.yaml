@@ -63,7 +63,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
-  hf_config_overrides: null
+  hf_config_overrides: {} 
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -105,7 +105,7 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
 
     optimizer:
       optimizer: "adam"

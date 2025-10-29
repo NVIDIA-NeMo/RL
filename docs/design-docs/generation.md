@@ -16,7 +16,7 @@ The core of the generation system is defined in `interfaces.py`, which establish
        max_new_tokens: int       # Maximum number of tokens to generate
        temperature: float        # Sampling temperature
        top_p: float              # Top-p sampling parameter
-       top_k: int                # Top-k sampling parameter
+       top_k: int | None         # Top-k sampling parameter
        model_name: str           # Name or path of the model
    ```
 
