@@ -27,7 +27,7 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
-from nemo_automodel.components._transformers.utils import (
+from nemo_automodel._transformers.utils import (
     sliding_window_overwrite,
 )
 from nemo_automodel.components.distributed.cp_utils import (
@@ -88,11 +88,18 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-from nemo_rl.utils.automodel_checkpoint import (
-    load_checkpoint,
-    save_checkpoint,
-)
+# from nemo_rl.utils.automodel_checkpoint import (
+#     load_checkpoint as _unused_wrapper_load_checkpoint,  # backward compat: keep import to avoid breaking external users
+#     save_checkpoint as _unused_wrapper_save_checkpoint,  # not used after direct Checkpointer usage
+# )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig as AutomodelCheckpointingConfig,
+)
+from nemo_automodel.components.checkpoint._backports.filesystem import (
+    SerializationFormat,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
@@ -460,6 +467,11 @@ class DTensorPolicyWorkerV2:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
+
+        # We initialize the AutoModel checkpointer here. This needs to be persistent because of async checkpointing support
+        # once NeMo-RL is >= torch 2.9.0
+        self.checkpointer = None
+        self.checkpoint_config = None
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
@@ -1884,34 +1896,127 @@ class DTensorPolicyWorkerV2:
                 "save_consolidated",
                 "is_peft",
                 "peft_config",
+                "model_cache_dir",
+                "model_repo_id",
+                "is_async",
+                "dequantize_base_checkpoint",
             }
         }
 
-        save_checkpoint(
+        checkpoint_root = _infer_checkpoint_root(weights_path)
+
+        # Ensure a persistent Checkpointer exists and is configured
+        self._ensure_checkpointer(config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root)
+
+        self.checkpointer.save_model(
             model=self.model,
             weights_path=weights_path,
-            optimizer=self.optimizer if optimizer_path else None,
-            scheduler=self.scheduler if optimizer_path else None,
-            optimizer_path=optimizer_path,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            model_state_dict_keys=self.model_state_dict_keys,
-            **checkpoint_kwargs,
+            peft_config=checkpoint_kwargs.get("peft_config"),
+            tokenizer=self.tokenizer if tokenizer_path is None else None,
         )
+
+        if optimizer_path and self.optimizer is not None:
+            self.checkpointer.save_optimizer(
+                optimizer=self.optimizer,
+                model=self.model,
+                weights_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
+
+        # TODO: needed?
+        if tokenizer_path and self.tokenizer is not None:
+            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+            self.tokenizer.save_pretrained(tokenizer_path)
 
     def load_checkpoint(
         self,
         weights_path: str,
         optimizer_path: Optional[str] = None,
     ) -> None:
-        """Load a checkpoint into the model."""
-        load_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer if optimizer_path else None,
-            scheduler=self.scheduler if optimizer_path else None,
-            optimizer_path=optimizer_path,
+        """Load a checkpoint into the model using Automodel Checkpointer."""
+        print(f"Loading weights from {weights_path}")
+
+        model_save_format, is_peft = detect_checkpoint_format(weights_path)
+
+        weights_dir = os.path.dirname(weights_path)
+        checkpoint_root = (
+            os.path.dirname(weights_dir) if weights_dir.endswith("weights") else weights_dir
         )
+
+        # Ensure a persistent Checkpointer exists and is configured
+        self._ensure_checkpointer(
+            config_updates={
+                "model_save_format": model_save_format,
+                "is_peft": is_peft,
+            },
+            checkpoint_root=checkpoint_root,
+        )
+
+        model_dir = weights_path if weights_path.endswith("/model") else os.path.join(weights_path, "model")
+
+        self.checkpointer.load_model(
+            model=self.model,
+            model_path=model_dir,
+        )
+
+        if optimizer_path and self.optimizer is not None:
+            self.checkpointer.load_optimizer(
+                optimizer=self.optimizer,
+                model=self.model,
+                weights_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
+
+    def _ensure_checkpointer(self, config_updates=None, checkpoint_root: Optional[str] = None) -> None:
+        """Create or update a persistent Automodel Checkpointer bound to this worker ranks.
+
+        Args:
+            config_updates: Dict of CheckpointingConfig fields to update.
+            checkpoint_root: Optional root directory for checkpoints.
+        """
+        if config_updates is None:
+            config_updates = {}
+
+        # Compute dp/tp ranks
+        dp_rank = torch.distributed.get_rank(self.dp_mesh.get_group())
+        tp_rank = torch.distributed.get_rank(self.tp_mesh.get_group())
+        pp_rank = 0
+
+        if self.checkpointer is None:
+            # Initialize a base config with sensible defaults
+            base_cfg = AutomodelCheckpointingConfig(
+                enabled=True,
+                checkpoint_dir=checkpoint_root or "",
+                model_save_format=config_updates.get("model_save_format", "safetensors"),
+                model_cache_dir=config_updates.get("model_cache_dir", ""),
+                model_repo_id=config_updates.get("model_repo_id", ""),
+                save_consolidated=config_updates.get("save_consolidated", False),
+                is_peft=config_updates.get("is_peft", False),
+                model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
+                is_async=config_updates.get("is_async", False),
+                dequantize_base_checkpoint=config_updates.get("dequantize_base_checkpoint", False),
+            )
+            self.checkpoint_config = base_cfg
+            self.checkpointer = Checkpointer(
+                config=base_cfg,
+                dp_rank=dp_rank,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                moe_mesh=None,
+            )
+        else:
+            # Update mutable config fields on the existing instance
+            cfg = self.checkpointer.config
+            if checkpoint_root is not None:
+                cfg.checkpoint_dir = checkpoint_root
+            for k, v in config_updates.items():
+                if k == "model_save_format":
+                    # Ensure enum type
+                    v = SerializationFormat[v.upper()] if isinstance(v, str) else v
+                setattr(cfg, k, v)
+            # Ensure model_state_dict_keys is current
+            if getattr(self, "model_state_dict_keys", None) is not None:
+                cfg.model_state_dict_keys = self.model_state_dict_keys
 
     def shutdown(self) -> None:
         """Shutdown the policy."""
@@ -1919,6 +2024,9 @@ class DTensorPolicyWorkerV2:
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()
             self.zmq_context.term()
+        # Close checkpointer resources
+        if hasattr(self, "checkpointer") and self.checkpointer is not None:
+            self.checkpointer.close()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -1933,3 +2041,54 @@ class DTensorPolicyWorkerV2:
         ip = ray._private.services.get_node_ip_address()
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
+
+def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
+    """Detect model save format and PEFT status from checkpoint directory.
+
+    Args:
+        weights_path: Path to the checkpoint directory (e.g., weights/model)
+
+    Returns:
+        tuple: (model_save_format, is_peft) where:
+               model_save_format is "torch_save" for DCP or "safetensors" for safetensors
+               is_peft is True if PEFT/adapter patterns are detected
+    """
+    is_peft = False
+    model_save_format = "safetensors"
+    try:
+        # Iterate through all subdirectories and files recursively
+        all_files = []
+        for root, dirs, files in os.walk(weights_path):
+            all_files.extend(files)
+
+        if any(f.endswith(".distcp") for f in all_files):
+            model_save_format = "torch_save"
+        elif any(f.endswith(".safetensors") for f in all_files):
+            model_save_format = "safetensors"
+        elif any(f.endswith((".bin", ".pt", ".pth")) for f in all_files):
+            model_save_format = "torch_save"
+
+        if not is_peft:
+            is_peft = any("adapter" in f.lower() for f in all_files)
+
+    except (OSError, PermissionError):
+        pass
+
+    return model_save_format, is_peft
+
+def _infer_checkpoint_root(weights_path: str) -> str:
+    """Infer checkpoint root directory from weights path.
+
+    When weights_path ends with "…/weights/model", we need the parent of
+    the weights directory (the checkpoint root), not the weights directory itself.
+
+    Args:
+        weights_path: Path to model weights (e.g., "/path/to/policy/weights/model")
+
+    Returns:
+        str: Checkpoint root directory (e.g., "/path/to/policy")
+    """
+    weights_dir = os.path.dirname(weights_path)
+    if weights_dir.endswith("weights"):
+        return os.path.dirname(weights_dir)
+    return weights_dir
