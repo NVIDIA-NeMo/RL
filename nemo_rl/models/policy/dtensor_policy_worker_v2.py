@@ -30,8 +30,9 @@ from nemo_automodel import (
 from nemo_automodel._transformers.utils import (
     sliding_window_overwrite,
 )
-from nemo_automodel.components.moe.parallelizer import parallelize_model as moe_parallelize_model
-from nemo_automodel.components.config.loader import _resolve_target
+from nemo_automodel.components.moe.parallelizer import (
+    parallelize_model as moe_parallelize_model,
+)
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
@@ -39,9 +40,6 @@ from nemo_automodel.components.distributed.cp_utils import (
 from nemo_automodel.components.distributed.grad_utils import (
     clip_grad_by_total_norm_,
     get_grad_norm,
-)
-from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
 )
 from nemo_automodel.components.distributed.fsdp2 import (
     FSDP2Manager,
@@ -51,14 +49,9 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from torch import nn
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    set_model_state_dict,
-)
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
 from transformers import (
@@ -93,10 +86,7 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-# from nemo_rl.utils.automodel_checkpoint import (
-#     load_checkpoint as _unused_wrapper_load_checkpoint,  # backward compat: keep import to avoid breaking external users
-#     save_checkpoint as _unused_wrapper_save_checkpoint,  # not used after direct Checkpointer usage
-# )
+
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -199,7 +189,9 @@ class DTensorPolicyWorkerV2:
         # - CP > 1 requires SDPA
         cp_size_cfg = self.cfg["dtensor_cfg"]["context_parallel_size"]
         attn_impl = (
-            "flash_attention_2" if (self.enable_seq_packing and cp_size_cfg == 1) else ("sdpa" if cp_size_cfg > 1 else None)
+            "flash_attention_2"
+            if (self.enable_seq_packing and cp_size_cfg == 1)
+            else ("sdpa" if cp_size_cfg > 1 else None)
         )
 
         model_config = AutoConfig.from_pretrained(
@@ -325,10 +317,14 @@ class DTensorPolicyWorkerV2:
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             ),
-            offload_policy=CPUOffloadPolicy(pin_memory=False) if self.cpu_offload else None,
+            offload_policy=CPUOffloadPolicy(pin_memory=False)
+            if self.cpu_offload
+            else None,
             backend="nccl",
             world_size=world_size,
-            activation_checkpointing=self.cfg["dtensor_cfg"]["activation_checkpointing"],
+            activation_checkpointing=self.cfg["dtensor_cfg"][
+                "activation_checkpointing"
+            ],
         )
 
         # Store mesh references for downstream usage
@@ -369,7 +365,9 @@ class DTensorPolicyWorkerV2:
         self._ensure_checkpointer(
             config_updates={
                 "model_repo_id": model_name,
-                "dequantize_base_checkpoint": self.cfg.get("dequantize_base_checkpoint", False),
+                "dequantize_base_checkpoint": self.cfg.get(
+                    "dequantize_base_checkpoint", False
+                ),
             },
             checkpoint_root=None,
         )
@@ -458,7 +456,6 @@ class DTensorPolicyWorkerV2:
             print(
                 "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
             )
-
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
@@ -1897,7 +1894,9 @@ class DTensorPolicyWorkerV2:
         checkpoint_root = _infer_checkpoint_root(weights_path)
 
         # Ensure a persistent Checkpointer exists and is configured
-        self._ensure_checkpointer(config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root)
+        self._ensure_checkpointer(
+            config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root
+        )
 
         self.checkpointer.save_model(
             model=self.model,
@@ -1931,7 +1930,9 @@ class DTensorPolicyWorkerV2:
 
         weights_dir = os.path.dirname(weights_path)
         checkpoint_root = (
-            os.path.dirname(weights_dir) if weights_dir.endswith("weights") else weights_dir
+            os.path.dirname(weights_dir)
+            if weights_dir.endswith("weights")
+            else weights_dir
         )
 
         # Ensure a persistent Checkpointer exists and is configured
@@ -1943,7 +1944,11 @@ class DTensorPolicyWorkerV2:
             checkpoint_root=checkpoint_root,
         )
 
-        model_dir = weights_path if weights_path.endswith("/model") else os.path.join(weights_path, "model")
+        model_dir = (
+            weights_path
+            if weights_path.endswith("/model")
+            else os.path.join(weights_path, "model")
+        )
 
         self.checkpointer.load_model(
             model=self.model,
@@ -1958,7 +1963,9 @@ class DTensorPolicyWorkerV2:
                 scheduler=self.scheduler,
             )
 
-    def _ensure_checkpointer(self, config_updates=None, checkpoint_root: Optional[str] = None) -> None:
+    def _ensure_checkpointer(
+        self, config_updates=None, checkpoint_root: Optional[str] = None
+    ) -> None:
         """Create or update a persistent Automodel Checkpointer bound to this worker ranks.
 
         Args:
@@ -1978,14 +1985,18 @@ class DTensorPolicyWorkerV2:
             base_cfg = AutomodelCheckpointingConfig(
                 enabled=True,
                 checkpoint_dir=checkpoint_root or "",
-                model_save_format=config_updates.get("model_save_format", "safetensors"),
+                model_save_format=config_updates.get(
+                    "model_save_format", "safetensors"
+                ),
                 model_cache_dir=config_updates.get("model_cache_dir", ""),
                 model_repo_id=config_updates.get("model_repo_id", ""),
                 save_consolidated=config_updates.get("save_consolidated", False),
                 is_peft=config_updates.get("is_peft", False),
                 model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
                 is_async=config_updates.get("is_async", False),
-                dequantize_base_checkpoint=config_updates.get("dequantize_base_checkpoint", False),
+                dequantize_base_checkpoint=config_updates.get(
+                    "dequantize_base_checkpoint", False
+                ),
             )
             self.checkpoint_config = base_cfg
             self.checkpointer = Checkpointer(
@@ -2033,6 +2044,7 @@ class DTensorPolicyWorkerV2:
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
 
+
 def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
     """Detect model save format and PEFT status from checkpoint directory.
 
@@ -2066,6 +2078,7 @@ def detect_checkpoint_format(weights_path: str) -> tuple[str, bool]:
         pass
 
     return model_save_format, is_peft
+
 
 def _infer_checkpoint_root(weights_path: str) -> str:
     """Infer checkpoint root directory from weights path.
