@@ -37,12 +37,21 @@ def calculate_kl(
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
 ) -> torch.Tensor:
-    """Calculates a per-token estimate of the KL Divergence between two log_probs.
+    """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
     From Schulman 2020, http://joschu.net/blog/kl-approx.html.
 
-    logprobs:           torch.Tensor (b, s)
-    logprobs_reference: torch.Tensor (b, s)
+    Args:
+        logprobs: torch.Tensor (b, s)
+        logprobs_reference: torch.Tensor (b, s)
+        kl_type: Type of KL approximation to use. Valid values: "k1", "k2", "k3".
+        input_clamp_value: Optional clamping value for logr to prevent numerical instability.
+                           If None, no clamping is applied.
+        output_clamp_value: Optional clamping value for kl to prevent numerical instability.
+                           If None, no clamping is applied.
+
+    Returns:
+        torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
