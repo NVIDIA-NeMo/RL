@@ -25,13 +25,9 @@ from nemo_automodel.components.checkpoint._backports.filesystem import (
 # Apply torch backports for compatibility with torch==2.7.1
 from nemo_automodel.components.checkpoint._torch_backports import apply_patches
 
-# Import from nemo-automodel
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
-    load_model,
-    load_optimizer,
-    save_model,
-    save_optimizer,
+    Checkpointer,
 )
 
 # Apply torch backports for compatibility with torch==2.7.1
