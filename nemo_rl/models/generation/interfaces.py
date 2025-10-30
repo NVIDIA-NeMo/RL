@@ -104,9 +104,15 @@ class ResourcesConfig(TypedDict):
     num_nodes: int
 
 
+class OptionalResourcesConfig(TypedDict):
+    # Same as ResourcesConfig, but fields can be null and are validated in grpo.py
+    gpus_per_node: int | None
+    num_nodes: int | None
+
+
 class ColocationConfig(TypedDict):
     enabled: bool
-    resources: NotRequired[ResourcesConfig]
+    resources: OptionalResourcesConfig
 
 
 class GuidedDecodingConfig(TypedDict):
@@ -140,13 +146,14 @@ class GenerationConfig(TypedDict):
     max_new_tokens: int
     temperature: float
     top_p: float
-    top_k: int
-    model_name: str
-    stop_token_ids: list[int]
-    stop_strings: NotRequired[list[str]]
-    pad_token_id: NotRequired[int]
+    top_k: int | None
+    model_name: NotRequired[str]  # Not Required b/c GRPO writes this
+    stop_token_ids: list[int] | None
+    stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
     guided_decoding: NotRequired[GuidedDecodingConfig]
+    # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
+    _pad_token_id: NotRequired[int]
 
 
 class GenerationDatumSpec(TypedDict):
