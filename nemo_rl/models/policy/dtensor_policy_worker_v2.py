@@ -48,6 +48,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.config.loader import _resolve_target
 from torch import nn
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
@@ -171,7 +172,6 @@ class DTensorPolicyWorkerV2:
         else:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
-        print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
         self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
         if self.enable_seq_packing:
             assert not self.is_vlm, (
@@ -248,6 +248,18 @@ class DTensorPolicyWorkerV2:
         # All ranks initialize model on meta device, so FSDP can shard it.
         # The actual weights will be broadcast from rank 0.
 
+        automodel_model_kwargs = self.cfg.get("automodel_model_kwargs", {})
+        if automodel_model_kwargs.get("backend", None) is not None:
+            backend_class = _resolve_target(
+                automodel_model_kwargs.get("backend", None)["_target_"]
+            )
+            backend_kwargs = automodel_model_kwargs.get("backend")
+            backend_kwargs.pop("_target_")
+            backend = backend_class(
+                **backend_kwargs,
+            )
+            automodel_model_kwargs["backend"] = backend
+
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
@@ -255,9 +267,8 @@ class DTensorPolicyWorkerV2:
             self.model = model_class.from_config(
                 model_config,
                 attn_implementation=attn_impl,
-                use_liger_kernel=False,
-                trust_remote_code=True,
                 torch_dtype=str(model_config.torch_dtype),
+                **automodel_model_kwargs,
             )
 
         # Hold a copy of model state_dict keys before any parallelization (as in train_ft.py)
@@ -269,6 +280,7 @@ class DTensorPolicyWorkerV2:
         tp_size = self.cfg["dtensor_cfg"].get("tensor_parallel_size", 1)
         cp_size = self.cfg["dtensor_cfg"].get("context_parallel_size", 1)
         ep_size = self.cfg["dtensor_cfg"].get("expert_parallel_size", 1)
+        dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
@@ -304,7 +316,7 @@ class DTensorPolicyWorkerV2:
         # Build device mesh and parallelize
         # ------------------------------------------------
         manager = FSDP2Manager(
-            dp_size=None,
+            dp_size=dp_size,
             dp_replicate_size=1,
             tp_size=tp_size,
             cp_size=cp_size,
@@ -363,6 +375,7 @@ class DTensorPolicyWorkerV2:
 
         # Load base model weights across all ranks using Automodel Checkpointer
         # This mirrors build_model_and_optimizer's is_meta_device + load_weights path
+        print(self.model)
         self._ensure_checkpointer(
             config_updates={
                 "model_repo_id": model_name,
@@ -2097,3 +2110,4 @@ def _infer_checkpoint_root(weights_path: str) -> str:
     if weights_dir.endswith("weights"):
         return os.path.dirname(weights_dir)
     return weights_dir
+                                           
