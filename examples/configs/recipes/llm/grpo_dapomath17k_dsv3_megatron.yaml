@@ -8,7 +8,7 @@ checkpointing:
   checkpoint_dir: results/grpo_dapomath17k_dsv3_megatron
   keep_top_k: 100
 policy:
-  model_name: /lustre/fsw/portfolios/coreai/users/yifuw/hf_checkpoints/dsv3/DeepSeek-V3-BF16
+  model_name: /path/to/dsv3-bf16-checkpoint
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
