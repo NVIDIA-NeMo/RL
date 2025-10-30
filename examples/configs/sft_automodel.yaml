@@ -22,8 +22,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  model_name: "/adasif/models/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee/"
-  # model_name: "/adasif/models/models--moonshotai--Moonlight-16B-A3B/snapshots/ce8bc137e6e29c3b7540ebdd515bbc5bdb20d915/"
+  model_name: "openai/gpt-oss-20b"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # chat_template can be a Jinja template string or path to a .jinja file
@@ -160,7 +159,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
-  shuffle: false
+  shuffle: true
   num_workers: 1
 
   dataset_name: "squad"
@@ -199,9 +198,8 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "adil-workspace"
-    entity: "Nemo-automodel"
-    name: "nemo-rl-sft-gpt-oss-20b-ep-8"
+    project: "sft-dev"
+    name: "sft-dev-${data.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
   mlflow:
