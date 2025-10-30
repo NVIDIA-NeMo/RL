@@ -1253,7 +1253,7 @@ def grpo_train(
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
             log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{total_steps}.jsonl"
+                log_data, f"train_data_step{total_steps + 1}.jsonl"
             )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -2095,7 +2095,9 @@ def async_grpo_train(
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
             log_data["input_lengths"] = input_lengths.tolist()
-            logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+            logger.log_batched_dict_as_jsonl(
+                log_data, f"train_data_step{step + 1}.jsonl"
+            )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"

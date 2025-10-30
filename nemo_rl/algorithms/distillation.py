@@ -851,7 +851,7 @@ def distillation_train(
             log_data = {"content": flat_messages["content"]}
             log_data["input_lengths"] = input_lengths.tolist()
             logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{total_steps}.jsonl"
+                log_data, f"train_data_step{total_steps + 1}.jsonl"
             )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
