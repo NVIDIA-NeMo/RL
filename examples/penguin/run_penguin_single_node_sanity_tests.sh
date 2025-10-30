@@ -7,9 +7,6 @@ uv sync --group={build,docs,dev,test} --extra penguin
 uv run ray stop --force
 uv run python -c "import ray; ray.shutdown()"
 
-# This will take 5-10 mins
-uv run tests/unit/prepare_unit_test_assets.py
-
 # The first time I ran this, it took roughly 5 mins to setup the vLLM deps.
 # This took me 2-3 mins to run this one test.
 # NeMo RL test. This should pass no matter what the Gym setup is.
