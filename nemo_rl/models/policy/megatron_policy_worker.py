@@ -676,7 +676,8 @@ class MegatronPolicyWorker:
             "aux_loss" not in model_cfg.moe_router_load_balancing_type
             or model_cfg.moe_aux_loss_coeff == 0
         ), (
-            "MoE aux loss is currently not supported due to a known but in Megatron-LM. See ## TODO: link to GH issue"
+            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
+            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
         )
 
         self.megatron_cfg = ConfigContainer(
