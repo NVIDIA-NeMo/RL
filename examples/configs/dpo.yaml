@@ -22,7 +22,7 @@ dpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/dpo"
-  metric_name: "val_loss"
+  metric_name: "val:validation-default_loss"
   higher_is_better: false
   keep_top_k: 3
   save_period: 50
@@ -190,7 +190,7 @@ data:
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:

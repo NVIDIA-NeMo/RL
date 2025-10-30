@@ -40,6 +40,8 @@ class CheckpointingConfig(TypedDict):
     enabled (bool): Whether checkpointing is enabled.
     checkpoint_dir (PathLike): Directory where checkpoints will be saved.
     metric_name (str | None): Name of the metric to use for determining best checkpoints.
+        Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
+        the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
     model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).

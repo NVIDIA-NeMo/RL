@@ -15,7 +15,7 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft"
-  metric_name: "val_loss" ## set to null to save most recent k checkpoints
+  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 3
   save_period: 10

@@ -40,7 +40,7 @@ loss_fn:
 checkpointing:
   enabled: true
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
-  metric_name: val_reward
+  metric_name: val:accuracy # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
