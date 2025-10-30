@@ -522,7 +522,7 @@ def sft_train(
                             "train:"
                         ) or full_metric_name.startswith("val:"), (
                             f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f"followed by the corresponding name in the \"val\" or \"train\" metrics dictionary."
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
                             f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
                             f" e.g. 'val_loss --> 'val:val_loss'"
                         )
