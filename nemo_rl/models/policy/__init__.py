@@ -82,7 +82,6 @@ class MegatronDDPConfig(TypedDict):
     grad_reduce_in_fp32: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
-    average_in_collective: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
 
