@@ -33,6 +33,9 @@ basic_pg_loss_test_config: ClippedPGLossConfig = {
     "ratio_clip_c": None,
     "disable_ppo_ratio": False,
     "reference_policy_kl_penalty": 0.0,  # Disable KL
+    "reference_policy_kl_type": "k3",
+    "kl_input_clamp_value": 20.0,
+    "kl_output_clamp_value": 10.0,
     "use_on_policy_kl_approximation": False,
     "use_importance_sampling_correction": False,
     "truncated_importance_sampling_ratio": None,  # Disable TIS
