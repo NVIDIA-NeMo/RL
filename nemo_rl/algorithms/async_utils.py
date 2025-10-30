@@ -44,7 +44,7 @@ class ReplayBuffer:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
-        self.trajectories = []
+        self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
         self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
@@ -278,8 +278,12 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step
-        max_inflight = int(self.master_config["grpo"]["num_prompts_per_step"]) or 1
+        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
+        # This value limits the parallelism of the generation requests.
+        max_inflight = (
+            int(self.master_config["grpo"]["num_prompts_per_step"])
+            * int(self.master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"])
+        ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers
@@ -668,8 +672,8 @@ class AsyncTrajectoryCollector:
                                     )
                         break
                     elif status == "full":
-                        # Exponential backoff up to 1 second
-                        time.sleep(min(backoff_delay, 1.0))
+                        # Exponential backoff up to 0.5 second
+                        time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
                     else:
                         # Unexpected status, wait briefly
