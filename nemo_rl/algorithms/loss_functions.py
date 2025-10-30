@@ -39,7 +39,8 @@ class ClippedPGLossConfig(TypedDict):
     reference_policy_kl_penalty: float
     ratio_clip_min: float
     ratio_clip_max: float
-    ratio_clip_c: float
+    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
+    ratio_clip_c: float | None
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     truncated_importance_sampling_ratio: float | None
