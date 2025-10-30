@@ -28,7 +28,7 @@ In this guide, we'll walk through how we handle:
 
 We support training with multiple RL "Environments" at the same time.
 
-An [Environment](../../nemo_rl/environments/interfaces.py) is an object that accepts a state/action history and returns an update state and rewards for the step. They run as Ray Remote Actors. Example [MathEnvironment](../../nemo_rl/environments/math_environment.py).
+An [Environment](../../nemo_rl/environments/interfaces.py) is an object that accepts a state/action history and returns an updated state and rewards for the step. They run as Ray Remote Actors. Example [MathEnvironment](../../nemo_rl/environments/math_environment.py).
 
 To support this, we need to know:
 
@@ -163,9 +163,8 @@ L(\theta) = E_t \Big[ \max \Big( \min \big(r_t(\theta) A_t, \text{clip}(r_t(\the
 $$
 
 where:
-- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is
-    usually set as 3 empirically
-- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has change
+- c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set as 3 empirically
+- $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed
 
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
