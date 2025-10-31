@@ -578,6 +578,26 @@ class AsyncTrajectoryCollector:
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
+
+        # Invalidate&recompute vLLM caches after the in-flight weight updates if
+        # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
+        # Otherwise, keep using the stale KV caches (Magistral-style implementation).
+        async_cfg = self.master_config.get("grpo", {}).get("async_grpo", {})
+        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
+            "recompute_kv_cache_after_weight_updates", False
+        ):
+            try:
+                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                invalidated = self.policy_generation.invalidate_kv_cache()
+                if invalidated:
+                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                else:
+                    print(
+                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                    )
+            except Exception as e:
+                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+
         self._refit_pause_cleared.set()
 
     def wait_for_pending_generations(self) -> None:
