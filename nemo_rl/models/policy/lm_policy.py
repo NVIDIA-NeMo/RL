@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import os
+import torch
 import warnings
 from collections import defaultdict
 from typing import Any, Optional, Union
@@ -330,6 +331,114 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             logprobs.reorder_data(unsorted_data_indices)
 
         return logprobs
+    
+    def get_linear_predictions_old(
+        self, data: BatchedDataDict[GenerationDatumSpec], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get the logprobs of the model for a data dict.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        cp_size = self.sharding_annotations.get_axis_size("context_parallel")
+        sharded_data: list[SlicedDataDict]
+        unsorted_data_indices: list[int]
+
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                cp_size * dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                cp_size * dp_size,
+                batch_size=None,
+                allow_uneven_shards=True,
+            )
+
+        sharded_data_2d = []
+        shard_idx = 0
+        # Convert to 2d dim array
+        for _ in range(dp_size):
+            cp_data = []
+            for _ in range(cp_size):
+                cp_data.append(sharded_data[shard_idx])
+                shard_idx += 1
+            sharded_data_2d.append(cp_data)
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_linear_predictions",
+            data=sharded_data_2d,
+            in_sharded_axes=["data_parallel", "context_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+        )
+        preds: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures)
+        )
+
+        # dynamic batching sorts the inputs by sequence length to improve load balancing,
+        # so change it back here
+        if self.use_dynamic_batches:
+            preds.reorder_data(unsorted_data_indices)
+
+        return preds
+    
+    def get_linear_predictions(
+        self, data: BatchedDataDict[GenerationDatumSpec], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        shards = data.shard_by_batch_size(dp_size, batch_size=None, allow_uneven_shards=True)
+        
+        max_bsize = max([x["input_ids"].shape[0] for x in shards])
+        num_inserts = 0
+        for x in shards:
+            if x["input_ids"].shape[0] < max_bsize:
+                x["input_ids"] = torch.cat([x["input_ids"], torch.zeros((max_bsize - x["input_ids"].shape[0], x["input_ids"].shape[-1]), device=x["input_ids"].device, dtype=x["input_ids"].dtype)], dim=0)
+                x["input_lengths"] = torch.cat([x["input_lengths"], torch.tensor([1], device=x["input_lengths"].device, dtype=x["input_lengths"].dtype)], dim=0)
+                num_inserts += 1
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "get_linear_predictions",
+            data=shards,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"micro_batch_size": micro_batch_size},
+        )
+        '''
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "get_linear_predictions",
+            data=[data],
+            run_rank_0_only_axes=["data_parallel", "tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"micro_batch_size": micro_batch_size},
+        )
+        '''
+        #futures = self.worker_group.run_single_worker_single_data(
+        #    "get_linear_predictions",
+        #    worker_idx=0,
+        #    data=data,
+        #    micro_batch_size=micro_batch_size,
+        #)
+        #preds: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(ray.get(futures))
+        
+        preds: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures)
+        )
+        preds = preds["logprobs"].tolist()
+        
+        if num_inserts > 0:
+            preds = preds[:-num_inserts]
+
+        return preds
 
     def get_reference_policy_logprobs(
         self,

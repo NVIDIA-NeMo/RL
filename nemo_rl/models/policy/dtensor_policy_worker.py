@@ -269,6 +269,7 @@ class DTensorPolicyWorker:
                 trust_remote_code=True,
                 config=model_config,
             )
+            model.bt_beta = torch.nn.Linear(model_config.hidden_size, 1, bias=True, device="cpu", dtype=torch.float32)
             full_state_dict = model.state_dict()
             del model
 
@@ -280,6 +281,7 @@ class DTensorPolicyWorker:
                 model_config,
                 trust_remote_code=True,
             )
+            self.model.bt_beta = torch.nn.Linear(model_config.hidden_size, 1, bias=True, device="cpu", dtype=torch.float32)
 
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = tokenizer.pad_token_id
@@ -733,6 +735,7 @@ class DTensorPolicyWorker:
                                 position_ids=position_ids,
                                 use_cache=False,
                                 flash_attn_kwargs=flash_attn_kwargs,
+                                output_hidden_states=True,
                                 **vlm_kwargs,
                             )
 
@@ -753,6 +756,11 @@ class DTensorPolicyWorker:
                             logits = self.model.lm_head(outputs.last_hidden_state)
                         else:
                             logits = outputs.logits
+                        # Get last_hidden_state
+                        if hasattr(outputs, "last_hidden_state"):
+                            last_hidden_state = outputs.last_hidden_state
+                        else:
+                            last_hidden_state = outputs.hidden_states[-1]
                         del outputs
 
                         # Apply temperature scaling
@@ -804,6 +812,25 @@ class DTensorPolicyWorker:
                                     device_mesh=self.device_mesh[("cp", "tp")],
                                     placements=[Shard(sequence_dim), Shard(-1)],
                                 )
+                            if isinstance(last_hidden_state, DTensor):
+                                # Must be tp sharded
+                                assert (
+                                    last_hidden_state.device_mesh.ndim == 1
+                                    and last_hidden_state.device_mesh.mesh_dim_names[0] == "tp"
+                                ), "last_hidden_state must be tp sharded"
+
+                                # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                                last_hidden_state = DTensor.from_local(
+                                    last_hidden_state.to_local(),
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
+                            else:
+                                last_hidden_state = DTensor.from_local(
+                                    last_hidden_state,
+                                    device_mesh=self.device_mesh[("cp", "tp")],
+                                    placements=[Shard(sequence_dim), Shard(-1)],
+                                )
 
                         if self.enable_seq_packing:
                             loss_fn_ = SequencePackingLossWrapper(
@@ -818,8 +845,10 @@ class DTensorPolicyWorker:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            model_obj=self.model,
+                            last_hidden_state=last_hidden_state
                         )
-                        del logits
+                        del logits, last_hidden_state
 
                         # skip the update for dummy batches
                         if mb_idx < iterator_len:
@@ -865,6 +894,13 @@ class DTensorPolicyWorker:
                                 total_norm=grad_norm,
                             )
                         grad_norm = torch.tensor([grad_norm])
+                        grad_norm_bt_beta = get_grad_norm(
+                            [self.model.bt_beta.weight, self.model.bt_beta.bias],
+                            dp_cp_group=self.dp_cp_mesh.get_group(),
+                            tp_group=self.tp_mesh.get_group(),
+                            dtype=torch.float32,
+                        )
+                        print("###### BT_BETA_GRAD_NORM: ", grad_norm_bt_beta, flush=True)
 
                     # Update parameters
                     self.optimizer.step()
@@ -930,11 +966,13 @@ class DTensorPolicyWorker:
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        '''
         for k, v in data.items():
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
                 )
+        '''
 
         all_log_probs = []
         self.model.eval()
@@ -1201,6 +1239,307 @@ class DTensorPolicyWorker:
                 )
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+
+        return return_data
+    
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_linear_predictions_orig")
+    def get_linear_predictions_orig(
+        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        # dim 1 is always assumed to be the sequence dim, sanity check this here
+        #sequence_dim = 1
+        #seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        #for k, v in data.items():
+        #    if torch.is_tensor(v) and len(v.shape) > 1:
+        #        assert v.shape[sequence_dim] == seq_dim_size, (
+        #            f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+        #        )
+
+        all_log_probs = []
+        self.model.eval()
+        # unshard_fsdp2_model(self.model), 
+        with torch.no_grad():
+            data.to("cuda")
+            mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
+
+            for lp_batch in mb_iterator:
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+                #print("*** EOT_CHECK: ", [self.tokenizer.decode(input_ids[x, :input_lengths[x]].cpu().tolist()) for x in range(len(input_lengths))], flush=True)
+                batch_size, seq_len = input_ids.shape
+                # Create attention mask for right-padded data
+                attention_mask = torch.zeros(
+                    (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                )
+                for i, length in enumerate(input_lengths):
+                    # For right-padded sequence, set 1s at the beginning of the sequence
+                    attention_mask[i, :length] = 1
+
+                # explicitly create position ids for the input, otherwise the sharding
+                # for DTensor will be incorrect
+                position_ids = torch.arange(seq_len, device=input_ids.device).repeat(
+                    batch_size, 1
+                )
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    # DTensor requires the casual attention kernel to hit,
+                    # yet our attention mask above is not always all 1s
+                    # this is fine because we mask with the actual attention mask
+                    # later, but for input it has to be all 1s
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
+
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask_input_all_ones,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+
+                # Get last_hidden_state
+                if hasattr(outputs, "last_hidden_state"):
+                    last_hidden_state = outputs.last_hidden_state
+                else:
+                    last_hidden_state = outputs.hidden_states[-1]
+
+                linear_head = self.model.bt_beta
+                last_hidden_state = last_hidden_state.to(linear_head.weight.dtype)
+                linear_output = linear_head(last_hidden_state * attention_mask.unsqueeze(-1))
+                last_state = torch.sigmoid(linear_output[torch.arange(input_lengths.shape[0], device=linear_output.device), input_lengths - 1, :]).squeeze(-1)
+                print("*** INSIDE_SIGMOID_OUT: ", last_state, flush=True)
+
+                all_log_probs.append(last_state.cpu())
+        
+        return_data = BatchedDataDict[LogprobOutputSpec]()
+        return_data["logprobs"] = torch.cat(all_log_probs, dim=0).cpu()
+
+        return return_data
+    
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_linear_predictions")
+    def get_linear_predictions(
+        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        #logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+
+        # dim 1 is always assumed to be the sequence dim, sanity check this here
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+        '''
+        for k, v in data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_dim_size, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
+                )
+        '''
+
+        all_log_probs = []
+        self.model.eval()
+
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+            dummy_iterator = iter([])
+            if self.cfg["dynamic_batching"]["enabled"]:
+                mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+                iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            elif self.enable_seq_packing:
+                mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
+                max_batch_ct = torch.tensor([iterator_len], device="cuda")
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
+
+                # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
+                # We add dummy batches to the end of the iterator to make the batch counts equal.
+                dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+                dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
+            else:
+                mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
+                iterator_len = data.size // logprob_batch_size
+
+            step = 0
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
+                step += 1
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+                vlm_kwargs = lp_batch.get_multimodal_dict(
+                    as_tensors=True, device=input_ids.device
+                )
+                
+                print("*** get_linear_predictions_EOT_CHECK: ", [self.tokenizer.decode(input_ids[x, :input_lengths[x]].cpu().tolist()) for x in range(len(input_lengths))], flush=True)
+
+                batch_size, seq_len = input_ids.shape
+                if self.enable_seq_packing:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for sequence packing"
+                    )
+                    input_ids, position_ids, _ = pack_sequences(
+                        input_ids=input_ids,
+                        input_lengths=input_lengths,
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
+                        padding_value=self.tokenizer.eos_token_id,
+                        return_attention_mask=False,
+                    )
+                    seq_len = input_ids.shape[1]
+                    attention_mask = None
+                    flash_attn_kwargs = get_flash_attention_kwargs(
+                        input_lengths=input_lengths,
+                    )
+                else:
+                    # Create post_attention_mask for right-padded data for masking token after forwarding.
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
+                    for i, length in enumerate(input_lengths):
+                        # For right-padded sequence, set 1s at the beginning of the sequence
+                        post_attention_mask[i, :length] = 1
+
+                    # explicitly create position ids for the input, otherwise the sharding
+                    # for DTensor will be incorrect
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
+                    flash_attn_kwargs = {}
+
+                    # DTensor requires the casual attention kernel to hit,
+                    # yet our attention mask above is not always all 1s
+                    # this is fine because we mask with the actual attention mask
+                    # later, but for input it has to be all 1s
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+
+                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
+                if len(vlm_kwargs) > 0:
+                    position_ids = None
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for context parallel"
+                    )
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                            output_hidden_states=True,
+                            **vlm_kwargs,
+                        )
+                        if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+
+                        outputs = self.model(**model_args)
+
+                        # Get last_hidden_state
+                        if hasattr(outputs, "last_hidden_state"):
+                            last_hidden_state = outputs.last_hidden_state
+                        else:
+                            last_hidden_state = outputs.hidden_states[-1]
+                        
+                        linear_head = self.model.bt_beta
+                        last_hidden_state = last_hidden_state.to(linear_head.weight.dtype)
+                        linear_output = linear_head(last_hidden_state * post_attention_mask.unsqueeze(-1))
+                        last_state = torch.sigmoid(linear_output[torch.arange(input_lengths.shape[0], device=linear_output.device), input_lengths - 1, :]).squeeze(-1)
+                        print("*** INSIDE_SIGMOID_OUT: ", last_state, flush=True)
+
+                    if self.cp_size > 1:
+                        seq_index_tensor = (
+                            DTensor.from_local(
+                                seq_index,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(1)],
+                            )
+                            .full_tensor()
+                            .squeeze(0)
+                        )
+
+                        input_ids_dtensor = DTensor.from_local(
+                            input_ids,
+                            device_mesh=self.cp_mesh,
+                            placements=[Shard(sequence_dim)],
+                        )
+
+                        if isinstance(last_state, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                last_state.device_mesh.ndim == 1
+                                and last_state.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            last_state = DTensor.from_local(
+                                last_state.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            last_state = DTensor.from_local(
+                                last_state,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+
+                        #assert last_state.shape[1] == seq_len - 1
+                        final_last_state = last_state.full_tensor()
+                    else:
+                        if isinstance(last_state, DTensor):
+                            final_last_state = last_state.full_tensor()
+                        else:
+                            final_last_state = last_state.to(torch.float32)
+
+                del outputs
+
+                # skip keeping the logprobs for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
+                all_log_probs.append(final_last_state)
+
+        # Concatenate all batches
+        return_data = BatchedDataDict[LogprobOutputSpec]()
+
+        return_data["logprobs"] = torch.cat(all_log_probs, dim=0).cpu()
 
         return return_data
 
@@ -1755,6 +2094,8 @@ class DTensorPolicyWorker:
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
             for name, tensor in self.model.state_dict().items():
+                if "bt_beta" in name:
+                    continue
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()

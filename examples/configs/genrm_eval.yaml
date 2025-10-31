@@ -1,0 +1,46 @@
+# GenRM Evaluation Configuration
+eval:
+  dataset_name: "judgebench"  # Options: judgebench, rmbench, rewardbench
+  batch_size: 8
+  seed: 42
+  output_file: "results/genrm_eval.json"
+
+generation:
+  backend: "vllm"
+  max_new_tokens: 8192
+  temperature: 0.6
+  num_prompts_per_step: -1
+  model_name: "results/grpo_genrm/HF/step_100"  # Update with your checkpoint path results/grpo_genrm/HF/step_65
+  stop_token_ids: null
+  stop_strings: null
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 16384
+    enable_expert_parallel: false
+    enforce_eager: false
+  colocated:
+    # true: generation shares training GPUs
+    # false: uses dedicated generation resources
+    enabled: true
+    # only relevant when enabled is false
+    resources:
+      gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+      num_nodes: null # Decides number of nodes to be dedicated to generation
+
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+
+
+    
+data:
+  max_input_seq_length: 16384
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1

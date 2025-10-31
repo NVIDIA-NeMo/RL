@@ -246,7 +246,8 @@ def convert_dcp_to_hf(
     assert set(state_dict.keys()) == {"model"}, (
         f"We expect that the state dict only has the top level model key, but found: {state_dict.keys()}"
     )
-    torch.save(state_dict["model"], weights_path)
+    #torch.save(state_dict["model"], weights_path)
+    torch.save({k:v for k,v in state_dict["model"].items() if "bt_beta" not in k}, weights_path)
 
     config = AutoConfig.from_pretrained(
         model_name_or_path, trust_remote_code=True, **hf_overrides

@@ -1,0 +1,169 @@
+# GRPO GenRM Configuration for 1B model
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 5
+  val_at_start: true
+  overlong_filtering: false
+  batch_multiplier: 1
+  use_dynamic_sampling: false
+  max_val_samples: 64
+  val_batch_size: 8
+  seed: 42
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.generation.max_new_tokens}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+loss_fn:
+  reference_policy_kl_penalty: 0.02  # initial_policy_kl_penalty from the script
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true  # importance_sample_correct from the script
+  truncated_importance_sampling_ratio: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo_genrm"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 5
+  save_period: 5
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 8
+  logprob_batch_size: 4
+  max_total_sequence_length: 16384  # Controls overall max length allowed, prompt + output
+  precision: "bfloat16"
+  activation_checkpointing_enabled: false
+  logprob_chunk_size: null
+
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  dynamic_batching:
+    enabled: false
+
+  sequence_packing:
+    enabled: false
+
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-7  # Matching the script's learning rate
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 5
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [5]
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${int_div:${policy.max_total_sequence_length}, 2}  # How many tokens to generate just for the generation
+    temperature: 1.0  # Matching the script
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}   # what is the max length allowed, prompt + output
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+    colocated:
+      # true: generation shares training GPUs
+      # false: uses dedicated generation resources
+      enabled: true
+      # only relevant when enabled is false
+      resources:
+        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+        num_nodes: null # Decides number of nodes to be dedicated to generation
+
+
+
+data:
+  train_data_path: "/home/yizhujiao/datasets/hs3_genrm/train_data.jsonl"
+  val_data_path: "/home/yizhujiao/datasets/hs3_genrm/val_data.jsonl"
+  max_input_seq_length: ${subtract:${policy.max_total_sequence_length}, ${policy.generation.max_new_tokens}}  # what is the max len of all input tokens counting multi-turn
+  prompt_file: null
+  system_prompt_file: null
+  dataset_name: "HelpSteer3-GenRM"
+  shuffle_seed_for_training: -1  # -1 for not shuffling
+  shuffle: true
+  num_workers: 1
+
+env:
+  genrm:
+    num_workers: 1
+    reward_design: "rb0"
+
+logger:
+  log_dir: "logs/grpo_genrm"
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  tensorboard_enabled: false
+  monitor_gpus: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  wandb:
+    project: "nemo_rl_genrm"
+    name: "grpo-genrm-1b"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

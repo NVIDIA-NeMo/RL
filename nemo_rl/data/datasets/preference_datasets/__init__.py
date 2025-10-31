@@ -20,6 +20,12 @@ from nemo_rl.data.datasets.preference_datasets.preference_dataset import (
 )
 from nemo_rl.data.datasets.preference_datasets.tulu3 import Tulu3PreferenceDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
+from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import (
+    JudgeBenchDataset,
+    RMBenchDataset,
+    RewardBench2Dataset,
+    HelpSteer3LocalDataset,
+)
 
 
 def load_preference_dataset(data_config):
@@ -83,4 +89,8 @@ __all__ = [
     "HelpSteer3Dataset",
     "PreferenceDataset",
     "Tulu3PreferenceDataset",
+    "JudgeBenchDataset",
+    "RMBenchDataset",
+    "RewardBench2Dataset",
+    "HelpSteer3LocalDataset",
 ]

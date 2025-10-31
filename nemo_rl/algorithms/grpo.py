@@ -848,6 +848,7 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    baseline_no_genrm = master_config["loss_fn"].get("baseline_no_genrm", False)
 
     # Run validation at the start if configured
     if val_at_start and current_step == 0:
@@ -898,11 +899,17 @@ def grpo_train(
                         )
                     )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
+                    batched_flat, input_lengths_no_gen = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     input_ids = batched_flat["token_ids"]
+                    input_lengths_no_gen = input_lengths_no_gen - 3
+                # if doing the baseline (no GRPO, no genRM part) you need these checks instead
+                #print("*** CHECK: ", tokenizer.decode(input_ids[0][:input_lengths_no_gen[0]]), flush=True)
+                #print("*** TOKENIZER_EOS_ID: ", input_ids_no_gen[torch.arange(len(input_lengths_no_gen)), input_lengths_no_gen-1] == tokenizer.eos_token_id, flush=True)
+                #print("*** EOS_TOKEN: ", tokenizer.eos_token, flush=True)
+                #raise RuntimeError("all stop")
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
@@ -1056,15 +1063,29 @@ def grpo_train(
                         ],
                     )
 
+                    if baseline_no_genrm:
+                        gen_lengths = input_lengths_no_gen
+                        flat_messages["token_ids"][torch.arange(flat_messages["token_ids"].shape[0]), input_lengths_no_gen - 1] = tokenizer.eos_token_id
+                        last_tokens = flat_messages["token_ids"][torch.arange(flat_messages["token_ids"].shape[0]), input_lengths_no_gen - 1]
+                    else:
+                        gen_lengths = torch.LongTensor([sum([len(iml["token_ids"]) for iml in oml if iml['role'] in ('user', 'assistant')]) for oml in repeated_batch["message_log"]])
+                        last_tokens = flat_messages["token_ids"][torch.arange(flat_messages["token_ids"].shape[0], device=flat_messages["token_ids"].device), gen_lengths - 1]
                     # Create training data from flattened messages
                     train_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": flat_messages["token_ids"],
                             "input_lengths": input_lengths,
+                            "gen_lengths": gen_lengths,
                             "advantages": flat_messages["advantages"],
                             "generation_logprobs": flat_messages["generation_logprobs"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            #"score_indices": repeated_batch["score_indices"],
+                            "metadata": repeated_batch["extra_env_info"],
+                            "last_token_chk": last_tokens == tokenizer.eos_token_id,
+                            "parsed_pref_rank": repeated_batch["parsed_pref_rank"],
+                            #"score_tokens": [tokenizer.convert_tokens_to_ids(["1","2","3","4","5"])] * len(repeated_batch["score_indices"]),
+                            #"score_tokens": torch.LongTensor(tokenizer.convert_tokens_to_ids(["1","2","3","4","5"])).repeat(len(repeated_batch["score_indices"]), 1),
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
@@ -1072,6 +1093,7 @@ def grpo_train(
                         flat_messages.get_multimodal_dict(as_tensors=False)
                     )
                     train_data.to("cpu")
+                    print("*** LAST_TOKEN_CHK: ", [tokenizer.decode(flat_messages["token_ids"][idx][gen_lengths[idx]- 1]) for idx in range(len(flat_messages["token_ids"]))], flush=True)
 
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
@@ -1133,6 +1155,7 @@ def grpo_train(
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
+                    "gen_ranking_acc": np.nan_to_num(np.mean([x for x in repeated_batch["ranking_acc"] if x != -1])),
                     **ds_metrics,
                 }
                 if master_config["grpo"]["use_dynamic_sampling"]:
@@ -1367,6 +1390,7 @@ def validate(
 
         total_rewards = []
         total_lengths = []
+        total_ranking_acc = []
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
@@ -1402,6 +1426,7 @@ def validate(
 
             total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            total_ranking_acc.extend([x for x in val_batch["ranking_acc"].tolist() if x != -1])
 
             # Collect message logs for later display
             to_env = [
@@ -1426,10 +1451,12 @@ def validate(
         avg_length = (
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
+        avg_ranking_acc = sum(total_ranking_acc) / len(total_ranking_acc) if len(total_ranking_acc) > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            "gen_ranking_acc": np.nan_to_num(avg_ranking_acc),
         }
 
         # Print sample conversations only once at the end of validation

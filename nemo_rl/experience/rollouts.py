@@ -507,6 +507,10 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    current_batch["score_indices"] = torch.tensor([obs["score_indices"] for obs in env_output.observations], dtype=torch.long)
+    #current_batch["parsed_pref_rank"] = torch.tensor([obs["parsed_pref_rank"] for obs in env_output.observations], dtype=torch.long)
+    current_batch["parsed_pref_rank"] = torch.tensor(env_output.answers, dtype=torch.long)
+    current_batch["ranking_acc"] = torch.tensor([obs["ranking_acc"] for obs in env_output.observations], dtype=torch.long)
 
     # Calculate aggregate metrics
     rollout_metrics = {

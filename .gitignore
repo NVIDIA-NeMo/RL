@@ -45,3 +45,9 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+# GenRM scripts
+convert_dcp_to_hf.sh
+evaluate_genrm_all_steps.sh
+evaluate_genrm_one_step.sh
+evaluate_genrm_one_step_linear.sh

@@ -137,6 +137,10 @@ class ClippedPGLossFn(LossFunction):
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
             )
+        self.bt_alpha = cfg.get("bt_alpha", 1.0)
+        self.stop_linear_grad = cfg.get("stop_linear_grad", False)
+        self.bt_gamma = cfg.get("bt_gamma", 1.0)
+        self.baseline_no_genrm = cfg.get("baseline_no_genrm", False)
 
     def __call__(
         self,
@@ -147,6 +151,7 @@ class ClippedPGLossFn(LossFunction):
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss function."""
         token_mask = data["token_mask"][:, 1:]
@@ -156,6 +161,18 @@ class ClippedPGLossFn(LossFunction):
         generation_logprobs = data["generation_logprobs"][:, 1:]
         reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
         seq_index = data.get("seq_index", None)
+        #score_indices = data["score_indices"]
+        #score_tokens = data["score_tokens"].squeeze(0)
+        gen_lengths = data["gen_lengths"]
+        last_token_chk = data["last_token_chk"]
+        parsed_pref_rank = data["parsed_pref_rank"]
+        #print("*** INSIDE_LOSS_INPUT_LENGTHS: ", gen_lengths, flush=True)
+        #print("*** INSIDE_LOSS_SCORE_TOKENS: ", score_tokens, flush=True)
+        #print("*** INSIDE_LOSS_SAMPLE_MASK: ", sample_mask, flush=True)
+        #print("*** INSIDE_LOSS_LAST_TOKEN_CHK: ", last_token_chk, flush=True)
+        print("*** INSIDE_LOSS_PARSED_PREF_RANK: ", parsed_pref_rank, flush=True)
+        metadata = data["metadata"]
+        #print("*** INSIDE_LOSS_METADATA: ", metadata, flush=True)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -245,6 +262,60 @@ class ClippedPGLossFn(LossFunction):
             curr_logprobs = next_token_logprobs.gather(
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
+        
+        # Calculate the BT loss using the linear head
+        if "model_obj" in kwargs and "last_hidden_state" in kwargs:
+            linear_head = kwargs.get("model_obj").bt_beta
+            last_hidden_state = kwargs.pop("last_hidden_state")
+            last_hidden_state = last_hidden_state.to(linear_head.weight.dtype)
+            #print("*** INSIDE_LOSS_LAST_HIDDEN_STATE_SHAPE: ", last_hidden_state.shape, flush=True)
+            if self.stop_linear_grad:
+                last_hidden_state = last_hidden_state.detach()
+                linear_output = linear_head(last_hidden_state)
+            else:
+                linear_output = linear_head(self.bt_gamma * last_hidden_state + (1.0 - self.bt_gamma) * last_hidden_state.detach())
+                        
+            # this will be shape (B,1)
+            last_state = torch.sigmoid(linear_output[torch.arange(gen_lengths.shape[0], device=linear_output.device), gen_lengths - 1, :]).squeeze(-1)
+            #print("*** INSIDE_LOSS_SIGMOID_OUT: ", last_state, flush=True)
+            #gt = torch.tensor([x['preference_ranking'] <= 3 for x in metadata], dtype=last_state.dtype, device=last_state.device)
+            gt = torch.tensor([x['preference'] for x in metadata], dtype=last_state.dtype, device=last_state.device)
+            
+            bt_loss = torch.sum(torch.nn.functional.binary_cross_entropy(last_state, gt, reduction="none") * last_token_chk * sample_mask)
+            bt_loss = bt_loss / (global_valid_seqs + 1e-8)
+            
+            if sample_mask.sum() > 0:
+                bt_accuracy = torch.sum(gt.to(torch.bool) == (last_state < 0.5)).item() / sample_mask.sum().item()
+                genrm_pref_linear_match = torch.sum(parsed_pref_rank == (last_state < 0.5).to(torch.long)).item() / sample_mask.sum().item()
+            else:
+                bt_accuracy = 0.0
+                genrm_pref_linear_match = 0.0
+
+            print("*** INSIDE_LOSS_BT_LOSS: ", bt_loss, flush=True)
+            print("*** INSIDE_LOSS_BT_ACC: ", bt_accuracy, flush=True)
+        else:
+            bt_loss = torch.tensor([0], dtype=torch.float32, device=next_token_logits.device)
+        
+        if self.baseline_no_genrm:
+            return (
+                bt_loss,
+                {                    
+                    "loss": bt_loss.item(),
+                    #"probs_ratio": probs_ratio,
+                    #"probs_ratio_clamped": probs_ratio_clamped,
+                    #"kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                    "token_mult_prob_error": mult_prob_error,
+                    "gen_kl_error": gen_kl_error,
+                    "policy_kl_error": policy_kl_error,
+                    "js_divergence_error": js_divergence_error,
+                    #"sampling_importance_ratio": sample_importance_ratio.item(),
+                    "num_valid_samples": sample_mask.sum().item(),
+                    #"approx_entropy": seq_entropy_approx.item(),
+                    #"bt_loss": bt_loss.item(),
+                    "bt_accuracy": bt_accuracy / (global_valid_seqs.cpu().item() + 1e-8),
+                    "genrm_pref_linear_match": genrm_pref_linear_match / (global_valid_seqs.cpu().item() + 1e-8),
+                },
+            )
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -390,7 +461,7 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        loss = actor_loss + kl
+        loss = actor_loss + kl + self.bt_alpha * bt_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -420,6 +491,9 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                "bt_loss": bt_loss.item(),
+                "bt_accuracy": bt_accuracy / (global_valid_seqs.cpu().item() + 1e-8),
+                "genrm_pref_linear_match": genrm_pref_linear_match / (global_valid_seqs.cpu().item() + 1e-8),
             },
         )
 

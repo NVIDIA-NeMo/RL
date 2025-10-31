@@ -43,6 +43,8 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.penguin.Penguin": PY_EXECUTABLES.PENGUIN,
+    "nemo_rl.environments.genrm_environment.GenRMEnvironment": PY_EXECUTABLES.SYSTEM,
+    "nemo_rl.environments.binary_genrm_environment.GenRMEnvironment": PY_EXECUTABLES.SYSTEM,
 }
 
 
