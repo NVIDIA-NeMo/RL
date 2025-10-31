@@ -1512,6 +1512,16 @@ def async_grpo_train(
     assert master_config["loss_fn"]["use_importance_sampling_correction"] is True, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+
+    if master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"] > 1:
+        if not master_config["grpo"]["async_grpo"].get(
+            "in_flight_weight_updates", False
+        ):
+            print(
+                "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
+                "Without in-flight weight updates, having more max_trajectory_age_steps will not give any performance benefit."
+            )
+
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
@@ -1725,7 +1735,7 @@ def async_grpo_train(
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
-                with timer.time("buffer_sampling"):
+                with timer.time("exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
                         f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
@@ -2078,6 +2088,7 @@ def async_grpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         # Get dataloader state from trajectory collector
                         actual_dataloader_state = ray.get(
