@@ -15,7 +15,7 @@ rm:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/rm"
-  metric_name: "val_loss"
+  metric_name: "val:validation-default_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 3
   save_period: ${rm.val_period}

@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union
 
 import ray
 import torch
@@ -41,8 +41,9 @@ from nemo_rl.evals import answer_parsing
 
 class MathEnvConfig(TypedDict):
     num_workers: int
-    stop_strings: Optional[list[str]]  # Default stop strings for this env
-    verifier_type: Optional[str]
+    stop_strings: NotRequired[list[str] | None]  # Default stop strings for this env
+    # The verifier type. None defaults to "math".
+    verifier_type: NotRequired[str | None]
 
 
 @contextlib.contextmanager
