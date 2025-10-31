@@ -73,8 +73,8 @@ class DPOConfig(TypedDict):
     sft_average_log_probs: bool
     ## TODO(@ashors) support other loss functions
     ## https://github.com/NVIDIA-NeMo/RL/issues/193
-    # preference_loss: str
-    # gt_reward_scale: float
+    preference_loss: str
+    gt_reward_scale: float
     preference_loss_weight: float
     sft_loss_weight: float
 

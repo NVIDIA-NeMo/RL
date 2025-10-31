@@ -47,6 +47,8 @@ class DPODatumSpec(TypedDict):
     length_rejected: int
     loss_multiplier: float
     idx: int
+    reward_chosen: NotRequired[float]
+    reward_rejected: NotRequired[float]
 
 
 @dataclass
