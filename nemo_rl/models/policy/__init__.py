@@ -81,7 +81,7 @@ class MegatronSchedulerConfig(TypedDict):
     end_weight_decay: float
     weight_decay_incr_style: str
     lr_decay_style: str
-    lr_decay_iters: NotRequired[int]
+    lr_decay_iters: NotRequired[int | None]
     lr_warmup_iters: int
     lr_warmup_init: float
 
