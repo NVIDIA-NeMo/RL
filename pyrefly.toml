@@ -37,6 +37,7 @@ project-includes = [
     "nemo_rl/algorithms/__init__.py",
     "nemo_rl/algorithms/interfaces.py",
     "nemo_rl/algorithms/utils.py",
+    "nemo_rl/algorithms/reward_functions.py",
     "nemo_rl/data/__init__.py",
     "nemo_rl/data/chat_templates.py",
     "nemo_rl/data/collate_fn.py",

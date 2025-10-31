@@ -12,6 +12,19 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
@@ -22,11 +35,12 @@ loss_fn:
   ratio_clip_c: null
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
+  truncated_importance_sampling_ratio: null
   token_level_loss: true
 checkpointing:
   enabled: true
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
-  metric_name: val_reward
+  metric_name: val:accuracy # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
@@ -63,7 +77,6 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
-  optimizer: null
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -94,6 +107,8 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: false
       enable_expert_parallel: false
+      # VLMs require tokenizer to be initialized before generation, so we set skip_tokenizer_init to False.
+      skip_tokenizer_init: False
     colocated:
       enabled: true
       resources:
@@ -101,7 +116,7 @@ policy:
         num_nodes: null
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
     converter_type: Qwen2ForCausalLM
     tensor_model_parallel_size: 1
@@ -119,6 +134,9 @@ policy:
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: false
     apply_rope_fusion: true
+    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
+    bias_activation_fusion: True
+    defer_fp32_logits: False
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -134,6 +152,9 @@ policy:
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
       clip_grad: ${policy.max_grad_norm}
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
