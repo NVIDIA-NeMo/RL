@@ -8,7 +8,6 @@ loss_fn:
   kl_type: reverse
 checkpointing:
   checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-long
-  save_period: 10
 policy:
   model_name: Qwen/Qwen3-4B-Base
   max_total_sequence_length: 20480

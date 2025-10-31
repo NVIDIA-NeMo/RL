@@ -14,7 +14,7 @@ sft:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft_openmathinstruct2"
-  metric_name: "val_loss"
+  metric_name: "val:val_loss" # one of "val:" or "train:" followed by the metric name
   higher_is_better: false
   keep_top_k: 100
   save_period: 500
@@ -40,6 +40,7 @@ policy:
       grad_reduce_in_fp32: true
       overlap_grad_reduce: true
       overlap_param_gather: true
+      use_custom_fsdp: false
     empty_unused_memory_level: 1
     enabled: true
     expert_tensor_parallel_size: 1
