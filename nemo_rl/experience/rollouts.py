@@ -1019,6 +1019,7 @@ def run_async_penguin_rollout(
     timer.start(f"{timer_prefix}/postprocessing")
 
     # Tensorize all token ids
+    # TODO optimize this.
     with timer.time(f"{timer_prefix}/tensorize_by_key"):
         for r in results:
             _tensorize_by_key(r["input_message_log"], "token_ids")
@@ -1081,6 +1082,7 @@ def run_async_penguin_rollout(
         }
 
     # Per-agent misc metrics
+    # TODO optimize this
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for penguin_row, result in zip(penguin_rows, results):
