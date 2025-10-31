@@ -945,9 +945,6 @@ def _tensorize_by_key(message_logs: list, key: str):
 
 @ray.remote
 def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> dict:
-    """
-    In place to save memory and time.
-    """
     _tensorize_by_key(r["input_message_log"], "token_ids")
     _tensorize_by_key(r["message_log"], "token_ids")
     _tensorize_by_key(
