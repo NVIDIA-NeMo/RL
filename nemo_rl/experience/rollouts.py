@@ -1109,8 +1109,11 @@ def run_async_penguin_rollout(
                 r = copy.deepcopy(r)
                 # Remove tokens from logging
                 for output_item in r["response"]["output"]:
-                    output_item.pop("prompt_token_ids", None)
-                    output_item.pop("generation_token_ids", None)
+                    if not output_item.get("prompt_token_ids"):
+                        continue
+
+                    output_item["prompt_str"] = tokenizer.decode(output_item["prompt_token_ids"])
+                    output_item["generation_str"] = tokenizer.decode(output_item["generation_token_ids"])
                     output_item.pop("generation_log_probs", None)
 
                 r = json.dumps(r, separators=((",", ":")))
