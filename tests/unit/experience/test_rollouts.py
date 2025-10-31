@@ -777,6 +777,13 @@ def test_run_async_penguin_rollout(
         },
         "rollout_metrics": {
             # core metrics
+            "timing/rollout/total": 0.0,
+            "timing/rollout/run_rollouts": 0.0,
+            "timing/rollout/postprocessing": 0.0,
+            "timing/rollout/tensorize_by_key": 0.0,
+            "timing/rollout/prepare_for_metrics_calculation": 0.0,
+            "timing/rollout/aggregate_metrics": 0.0,
+            "timing/rollout/per_agent_misc_metrics": 0.0,
             "mean_gen_tokens_per_sample": None,
             "turns_per_sample/mean": 2.0,
             "turns_per_sample/max": 2,
