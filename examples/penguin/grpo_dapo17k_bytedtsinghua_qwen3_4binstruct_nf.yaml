@@ -34,13 +34,14 @@ loss_fn:
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
   use_importance_sampling_correction: false
   token_level_loss: true
 
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo"
-  metric_name: "val_reward"
+  metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
   save_period: 1
@@ -51,6 +52,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+  hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -72,6 +74,7 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true
     converter_type: "Qwen2ForCausalLM"  # Apparently this is comptible with Qwen 3 dense models.
