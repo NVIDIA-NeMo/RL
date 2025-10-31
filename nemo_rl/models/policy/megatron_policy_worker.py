@@ -288,9 +288,6 @@ def setup_megatron_model(
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
-        wrap_cast_model_output_to_fp32=(
-            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", False)
-        ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -672,6 +669,9 @@ class MegatronPolicyWorker:
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
         )
 
+        model_cfg.calculate_per_token_loss = True
+        model_cfg.perform_initialization = True
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
@@ -775,9 +775,6 @@ class MegatronPolicyWorker:
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
                 mixed_precision_wrapper=ref_mixed_precision_wrapper,
-                wrap_cast_model_output_to_fp32=(
-                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", False)
-                ),
             )
             print("Loading the Reference Model")
             if (
