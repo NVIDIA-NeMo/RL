@@ -943,6 +943,28 @@ def _tensorize_by_key(message_logs: list, key: str):
         m[key] = torch.tensor(m[key])
 
 
+@ray.remote
+def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> None:
+    """
+    In place to save memory and time.
+    """
+    _tensorize_by_key(r["input_message_log"], "token_ids")
+    _tensorize_by_key(r["message_log"], "token_ids")
+    _tensorize_by_key(
+        [m for m in r["message_log"] if m["role"] == "assistant"],
+        "generation_logprobs",
+    )
+
+    # Remove tokens from logging
+    for output_item in r["full_result"]["response"]["output"]:
+        if not output_item.get("prompt_token_ids"):
+            continue
+
+        output_item["prompt_str"] = tokenizer.decode(output_item["prompt_token_ids"])
+        output_item["generation_str"] = tokenizer.decode(output_item["generation_token_ids"])
+        output_item.pop("generation_log_probs", None)
+
+
 @dataclass
 class AsyncPenguinRolloutResult:
     input_ids: torch.Tensor
@@ -1016,18 +1038,15 @@ def run_async_penguin_rollout(
         penguin_environment = task_to_env["penguin"]
         results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
-    timer.start(f"{timer_prefix}/postprocessing")
+    timer.start(f"{timer_prefix}/postprocessing_total")
 
     # Tensorize all token ids
     # TODO optimize this.
-    with timer.time(f"{timer_prefix}/tensorize_by_key"):
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids")
-            _tensorize_by_key(r["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+    with timer.time(f"{timer_prefix}/postprocess_results"):
+        tasks = [
+            _postprocess_single_result.remote(r, tokenizer) for r in results
+        ]
+        ray.get(tasks)
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1093,11 +1112,9 @@ def run_async_penguin_rollout(
         for agent_name, agent_results in agent_to_results.items():
             keys = agent_results[0].keys()
             for key in keys:
-                values = []
-                for r in agent_results:
-                    if isinstance(r.get(key), (bool, int, float)):
-                        values.append(float(r[key]))
-
+                values = [
+                    float(r[key]) for r in agent_results if isinstance(r.get(key), (bool, int, float))
+                ]
                 if values:
                     per_agent_metrics.update(
                         _calculate_single_metric(
@@ -1106,21 +1123,7 @@ def run_async_penguin_rollout(
                     )
 
             # Log the full result
-            to_log = []
-            for r in agent_results:
-                r = copy.deepcopy(r)
-                # Remove tokens from logging
-                for output_item in r["response"]["output"]:
-                    if not output_item.get("prompt_token_ids"):
-                        continue
-
-                    output_item["prompt_str"] = tokenizer.decode(output_item["prompt_token_ids"])
-                    output_item["generation_str"] = tokenizer.decode(output_item["generation_token_ids"])
-                    output_item.pop("generation_log_probs", None)
-
-                r = json.dumps(r, separators=((",", ":")))
-                to_log.append([r])
-
+            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
             per_agent_metrics[f"{agent_name}/full_result"] = Table(
                 data=to_log, columns=["Full result"]
             )
@@ -1131,7 +1134,7 @@ def run_async_penguin_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
-    timer.stop(f"{timer_prefix}/postprocessing")
+    timer.stop(f"{timer_prefix}/postprocessing_total")
     timer.stop(f"{timer_prefix}/total")
     rollout_metrics.update(timer.get_timing_metrics("sum"))
 
