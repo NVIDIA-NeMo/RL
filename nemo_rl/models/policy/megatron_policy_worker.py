@@ -286,6 +286,9 @@ def setup_megatron_model(
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        wrap_cast_model_output_to_fp32=(
+            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", False)
+        ),
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -635,6 +638,14 @@ class MegatronPolicyWorker:
             assert optimizer_offload_fraction == 1.0, (
                 "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
             )
+        if (
+            "logprob_chunk_size" in self.cfg
+            and self.cfg["logprob_chunk_size"] is not None
+            and self.cfg["logprob_chunk_size"] > 0
+        ):
+            assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
+                "defer_fp32_logits must be True if logprob_chunk_size is set"
+            )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -762,6 +773,9 @@ class MegatronPolicyWorker:
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
                 mixed_precision_wrapper=ref_mixed_precision_wrapper,
+                wrap_cast_model_output_to_fp32=(
+                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", False)
+                ),
             )
             print("Loading the Reference Model")
             if (
@@ -1083,7 +1097,6 @@ class MegatronPolicyWorker:
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
-                        loss_metrics["grad_norm"] = grad_norm
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
@@ -1132,9 +1145,7 @@ class MegatronPolicyWorker:
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
             "all_mb_metrics": dict(mb_metrics),
-            "grad_norm": torch.tensor(
-                mb_metrics["grad_norm"][-1]
-            ).cpu(),  # TODO @sahilj: return an average or something later
+            "grad_norm": torch.tensor([grad_norm]),
         }
         return metrics
 
