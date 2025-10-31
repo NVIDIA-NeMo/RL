@@ -102,6 +102,7 @@ class AsyncGRPOConfig(TypedDict):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int
+    in_flight_weight_updates: NotRequired[bool]
 
 
 class GRPOConfig(TypedDict):
