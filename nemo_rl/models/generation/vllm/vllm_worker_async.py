@@ -178,7 +178,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
-            BaseModelPath(name=model_config.model, model_path=model_config.model)
+            BaseModelPath(name=model_config.served_model_name, model_path=model_config.model),
+            BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
         openai_serving_models = OpenAIServingModels(

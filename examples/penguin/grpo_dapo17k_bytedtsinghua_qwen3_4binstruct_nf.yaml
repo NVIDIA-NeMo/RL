@@ -12,6 +12,20 @@ grpo:
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
   val_batch_size: null
   seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -20,13 +34,14 @@ loss_fn:
   ratio_clip_c: null
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
+  truncated_importance_sampling_ratio: null
   use_importance_sampling_correction: false
   token_level_loss: true
 
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo"
-  metric_name: "val_reward"
+  metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
   save_period: 1
@@ -37,6 +52,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
+  hf_config_overrides: {}
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}  # Match the total rollouts per step
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -58,6 +74,7 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # We might want to consider setting this value higher (e.g. to 1) and raising the vllm generation max mem utilization
     empty_unused_memory_level: 0
     activation_checkpointing: true
     converter_type: "Qwen2ForCausalLM"  # Apparently this is comptible with Qwen 3 dense models.
@@ -181,6 +198,7 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
         # This is the tool parser for Qwen 3 4B Instruct. This needs to be changed for other models.
         enable_auto_tools: true
