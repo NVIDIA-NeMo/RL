@@ -957,8 +957,8 @@ def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> dict:
         if not output_item.get("prompt_token_ids"):
             continue
 
-        output_item["prompt_str"] = tokenizer.decode(output_item["prompt_token_ids"])
-        output_item["generation_str"] = tokenizer.decode(output_item["generation_token_ids"])
+        output_item["prompt_str"] = tokenizer.decode(output_item.pop("prompt_token_ids"))
+        output_item["generation_str"] = tokenizer.decode(output_item.pop("generation_token_ids"))
         output_item.pop("generation_log_probs", None)
 
     return r
