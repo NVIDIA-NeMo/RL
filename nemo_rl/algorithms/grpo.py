@@ -1276,6 +1276,7 @@ def grpo_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            print(f"  • Token Mult Prob Error: {metrics['token_mult_prob_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
