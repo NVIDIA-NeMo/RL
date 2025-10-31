@@ -944,22 +944,13 @@ def _tensorize_by_key(message_logs: list, key: str):
 
 
 @ray.remote
-def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> dict:
+def _tensorize_result(r: dict) -> dict:
     _tensorize_by_key(r["input_message_log"], "token_ids")
     _tensorize_by_key(r["message_log"], "token_ids")
     _tensorize_by_key(
         [m for m in r["message_log"] if m["role"] == "assistant"],
         "generation_logprobs",
     )
-
-    # Remove tokens from logging
-    for output_item in r["full_result"]["response"]["output"]:
-        if not output_item.get("prompt_token_ids"):
-            continue
-
-        output_item["prompt_str"] = tokenizer.decode(output_item.pop("prompt_token_ids"))
-        output_item["generation_str"] = tokenizer.decode(output_item.pop("generation_token_ids"))
-        output_item.pop("generation_log_probs", None)
 
     return r
 
@@ -1041,11 +1032,37 @@ def run_async_penguin_rollout(
 
     # Tensorize all token ids
     # TODO optimize this.
-    with timer.time(f"{timer_prefix}/postprocess_results"):
+    with timer.time(f"{timer_prefix}/tensorize_result"):
         tasks = [
-            _postprocess_single_result.remote(r, tokenizer) for r in results
+            _tensorize_result.remote(r) for r in results
         ]
         results = ray.get(tasks)
+
+    with timer.time(f"{timer_prefix}/detokenizer"):
+        decode_batch = []
+        for r in results:
+            for output_item in r["full_result"]["response"]["output"]:
+                if not output_item.get("prompt_token_ids"):
+                    continue
+
+                # We pop to remove larger tensors from logging.
+                decode_batch.append(output_item["prompt_token_ids"])
+                decode_batch.append(output_item["generation_token_ids"])
+
+        decoded_strs = tokenizer.batch_decode(decode_batch)
+        decoded_strs_iter = iter(decoded_strs)
+        for r in results:
+            for output_item in r["full_result"]["response"]["output"]:
+                if not output_item.get("prompt_token_ids"):
+                    continue
+
+                # We pop to remove larger tensors from logging.
+                output_item.pop("prompt_token_ids")
+                output_item.pop("generation_token_ids")
+                output_item.pop("generation_log_probs")
+
+                output_item["prompt_str"] = next(decoded_strs_iter)
+                output_item["generation_str"] = next(decoded_strs_iter)
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1100,7 +1117,6 @@ def run_async_penguin_rollout(
         }
 
     # Per-agent misc metrics
-    # TODO optimize this
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for penguin_row, result in zip(penguin_rows, results):
