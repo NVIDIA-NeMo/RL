@@ -2124,4 +2124,3 @@ def _infer_checkpoint_root(weights_path: str) -> str:
     if weights_dir.endswith("weights"):
         return os.path.dirname(weights_dir)
     return weights_dir
-                                           
