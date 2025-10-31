@@ -1441,8 +1441,8 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     _wait_for_vllm_http_server_spinup(base_urls[0])
 
-    # Check that the re-tokenized ids are the same with the model and different without the model.
-    # WITHOUT model token IDs
+    # Check that the re-tokenized ids are the same with the reference and different without the reference.
+    # WITHOUT reference token IDs
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
     actual_result = response.json()
     expected_result = {
@@ -1463,7 +1463,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     }
     assert expected_result == actual_result
 
-    # WITH model token IDs
+    # WITH reference token IDs
     initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
     initial_tokenized_query_ids = [
         *initial_tokenized_query_ids_prefix,
@@ -1473,11 +1473,11 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         77091,
         198,
     ]
-    body_with_model_prefix_token_ids = body | {
+    body_with_reference_token_ids = body | {
         "required_prefix_token_ids": initial_tokenized_query_ids_prefix
     }
     response = requests.post(
-        url=f"{base_urls[0]}/../tokenize", json=body_with_model_prefix_token_ids
+        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
     )
     actual_result = response.json()
     expected_result = {
@@ -1490,7 +1490,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     # Generate and check result
     response = requests.post(
-        url=f"{base_urls[0]}/chat/completions", json=body_with_model_prefix_token_ids
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
     )
     vllm_http_server_result = response.json()
     vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
