@@ -170,6 +170,10 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
                 message["token_ids"] = []
             if "generation_logprobs" in message:
                 message["generation_logprobs"] = []
+            if "prompt_str" in message:
+                message["prompt_str"] = "dummy prompt_str"
+            if "generation_str" in message:
+                message["generation_str"] = "dummy generation_str"
 
         return d
 
