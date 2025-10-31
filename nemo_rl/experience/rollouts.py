@@ -1032,7 +1032,8 @@ def run_async_penguin_rollout(
             ),
             "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
             "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-            "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"]) == max_total_tokens_per_sample,
+            "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
+            == max_total_tokens_per_sample,
         }
         for r in results
     ]
@@ -1057,7 +1058,9 @@ def run_async_penguin_rollout(
         **_calculate_single_metric(
             [m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"
         ),
-        "natural_termination_rate": sum(not m["hit_max_tokens"] for m in all_sample_metrics)
+        "natural_termination_rate": sum(
+            not m["hit_max_tokens"] for m in all_sample_metrics
+        )
         / batch_size,
         "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
         / batch_size,
