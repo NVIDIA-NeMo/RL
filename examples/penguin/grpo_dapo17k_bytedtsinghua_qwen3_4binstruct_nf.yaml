@@ -12,6 +12,20 @@ grpo:
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
   val_batch_size: null
   seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
 
 loss_fn:
   reference_policy_kl_penalty: 0
