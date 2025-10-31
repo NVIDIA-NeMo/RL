@@ -11,18 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo_rl.data.datasets.eval_datasets import load_eval_dataset
-from nemo_rl.data.datasets.preference_datasets import load_preference_dataset
-from nemo_rl.data.datasets.processed_dataset import AllTaskProcessedDataset
-from nemo_rl.data.datasets.response_datasets import load_response_dataset
-from nemo_rl.data.datasets.utils import assert_no_double_bos
-from nemo_rl.data.datasets.random_dataset import RandomDataset
+from typing import Callable
 
-__all__ = [
-    "AllTaskProcessedDataset",
-    "load_eval_dataset",
-    "load_preference_dataset",
-    "load_response_dataset",
-    "assert_no_double_bos",
-    "RandomDataset",
-]
+import numpy as np
+
+
+def get_sequence_length_generator(sequence_length_generator_cfg: dict) -> Callable:
+    mean = sequence_length_generator_cfg["mean"]
+    std = sequence_length_generator_cfg["std"]
+    length = int(np.round(np.random.normal(mean, std)))
+    length = max(1, length)
+    return length

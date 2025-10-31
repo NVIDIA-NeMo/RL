@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, Dict, NotRequired, TypedDict, Union
 
 import ray
 import torch
@@ -122,10 +122,12 @@ class GenerationConfig(TypedDict):
     max_new_tokens: int
     temperature: float
     top_p: float
-    top_k: int | None
-    model_name: NotRequired[str]  # Not Required b/c GRPO writes this
-    stop_token_ids: list[int] | None
-    stop_strings: list[str] | None
+    top_k: int
+    model_name: str
+    stop_token_ids: list[int]
+    stop_strings: NotRequired[list[str]]
+    ignore_eos: bool
+    output_len_or_output_len_generator: NotRequired[Dict[str, Any] | int]
     colocated: NotRequired[ColocationConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
