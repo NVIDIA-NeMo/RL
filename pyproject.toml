@@ -282,7 +282,7 @@ ignore = ["D417", "D10", "F841"]
 convention = "google"
 
 # Section to exclude errors for different file types
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
 # Ignore all files that end in `_test.py`.

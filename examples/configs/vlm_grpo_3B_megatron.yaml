@@ -40,7 +40,7 @@ loss_fn:
 checkpointing:
   enabled: true
   checkpoint_dir: results/clevr_grpo_${policy.model_name}
-  metric_name: val_reward
+  metric_name: val:accuracy # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
@@ -77,7 +77,6 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
-  optimizer: null
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -137,7 +136,7 @@ policy:
     apply_rope_fusion: true
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
     optimizer:
       optimizer: adam
       lr: 2.0e-07

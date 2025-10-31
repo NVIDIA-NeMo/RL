@@ -71,6 +71,7 @@ repos:
             base="examples/configs/dpo.yaml"; for f in examples/configs/recipes/llm/dpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
             base="examples/configs/grpo_math_1B.yaml"; for f in examples/configs/recipes/llm/grpo-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
             base="examples/configs/sft.yaml"; for f in examples/configs/recipes/llm/sft-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
+            base="examples/configs/distillation_math.yaml"; for f in examples/configs/recipes/llm/distillation-*.yaml; do [ -e "$f" ] && ./tools/config_cli.py minimize-check "$base" "$f"; done
       - id: configs-minimize-check-vlm
         name: minimize-check vlm recipes
         language: system

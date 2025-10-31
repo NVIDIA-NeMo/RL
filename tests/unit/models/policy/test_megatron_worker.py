@@ -855,6 +855,96 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
     cluster2.shutdown()
 
 
+@pytest.mark.timeout(240)
+@pytest.mark.hf_gated
+def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model_path):
+    """Verify grad_norm is invariant to number of microbatches."""
+    num_gpus = 2
+    global_batch_size = 4
+    seq_len = 64
+    vocab_size = 32000
+
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, vocab_size, (global_batch_size, seq_len))
+    attention_mask = torch.ones(global_batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": torch.triu(
+                torch.ones(global_batch_size, seq_len), diagonal=1
+            ),
+            "sample_mask": torch.ones((global_batch_size,)),
+            "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
+        }
+    )
+
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+    nll_loss_fn = NLLLoss()
+
+    cluster1 = RayVirtualCluster(
+        name="test-gradnorm-mbs1",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=1, num_microbatches=4
+    config1 = create_megatron_test_config(tiny_llama_model_path)
+    config1["train_global_batch_size"] = global_batch_size
+    config1["train_micro_batch_size"] = 1
+    config1["generation"] = configure_generation_config(
+        config1["generation"], tokenizer
+    )
+
+    policy1 = Policy(
+        cluster=cluster1,
+        config=config1,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy1.prepare_for_training()
+    res1 = policy1.train(data, nll_loss_fn, gbs=global_batch_size, mbs=1)
+    grad_norm_1 = res1["grad_norm"].cpu()
+    policy1.shutdown()
+    cluster1.shutdown()
+
+    cluster2 = RayVirtualCluster(
+        name="test-gradnorm-mbs2",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=2, num_microbatches=2
+    config2 = create_megatron_test_config(tiny_llama_model_path)
+    config2["train_global_batch_size"] = global_batch_size
+    config2["train_micro_batch_size"] = 2
+    config2["generation"] = configure_generation_config(
+        config2["generation"], tokenizer
+    )
+
+    policy2 = Policy(
+        cluster=cluster2,
+        config=config2,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy2.prepare_for_training()
+    res2 = policy2.train(data, nll_loss_fn, gbs=global_batch_size, mbs=2)
+    grad_norm_2 = res2["grad_norm"].cpu()
+
+    torch.testing.assert_close(grad_norm_1, grad_norm_2, rtol=1e-5, atol=1e-5)
+
+    policy2.shutdown()
+    cluster2.shutdown()
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
 def test_megatron_reference_policy_functionality(tiny_llama_model_path):
