@@ -65,6 +65,8 @@ automodel = [
     "mamba-ssm",
     "causal-conv1d",
     "grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@v1.1.4",
+    "transformer-engine[pytorch]==2.8.0",
+    "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
 ]
 vllm = [
     "cuda-python",
