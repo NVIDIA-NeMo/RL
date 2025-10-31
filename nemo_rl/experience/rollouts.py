@@ -1038,7 +1038,7 @@ def run_async_penguin_rollout(
         ]
         results = ray.get(tasks)
 
-    with timer.time(f"{timer_prefix}/detokenizer"):
+    with timer.time(f"{timer_prefix}/detokenize"):
         decode_batch = []
         for r in results:
             for output_item in r["full_result"]["response"]["output"]:
