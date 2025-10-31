@@ -944,7 +944,7 @@ def _tensorize_by_key(message_logs: list, key: str):
 
 
 @ray.remote
-def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> None:
+def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> dict:
     """
     In place to save memory and time.
     """
@@ -963,6 +963,8 @@ def _postprocess_single_result(r: dict, tokenizer: TokenizerType) -> None:
         output_item["prompt_str"] = tokenizer.decode(output_item["prompt_token_ids"])
         output_item["generation_str"] = tokenizer.decode(output_item["generation_token_ids"])
         output_item.pop("generation_log_probs", None)
+
+    return r
 
 
 @dataclass
@@ -1046,7 +1048,7 @@ def run_async_penguin_rollout(
         tasks = [
             _postprocess_single_result.remote(r, tokenizer) for r in results
         ]
-        ray.get(tasks)
+        results = ray.get(tasks)
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
