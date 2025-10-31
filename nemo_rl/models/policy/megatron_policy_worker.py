@@ -672,6 +672,22 @@ class MegatronPolicyWorker:
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
         )
 
+        ## These settings are required for correct gradient computations in mcore
+        ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
+        ## so we handle the scaling in nemo-rl.
+        ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
+        ## on the TP-sharded parameters.
+        model_cfg.calculate_per_token_loss = True
+        model_cfg.perform_initialization = True
+
+        assert (
+            "aux_loss" not in model_cfg.moe_router_load_balancing_type
+            or model_cfg.moe_aux_loss_coeff == 0
+        ), (
+            "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
+            "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
+        )
+
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
             checkpoint=checkpoint_config,
@@ -697,9 +713,9 @@ class MegatronPolicyWorker:
                 overlap_param_gather=self.cfg["megatron_cfg"][
                     "distributed_data_parallel_config"
                 ]["overlap_param_gather"],
-                average_in_collective=self.cfg["megatron_cfg"][
-                    "distributed_data_parallel_config"
-                ]["average_in_collective"],
+                # we need to set average_in_collective=False with calculate_per_token_loss=True.
+                # otherwise, mcore throws an assertion error.
+                average_in_collective=False,
                 use_distributed_optimizer=self.cfg["megatron_cfg"]["optimizer"][
                     "use_distributed_optimizer"
                 ],
@@ -2239,3 +2255,47 @@ class MegatronPolicyWorker:
         ip = ray._private.services.get_node_ip_address()
         gpu_id = ray.get_gpu_ids()[0]
         return (ip, gpu_id)
+
+    def check_tensor_parallel_attributes(self) -> dict[str, Any]:
+        """Check tensor parallel attributes on model parameters.
+
+        Returns:
+            Dictionary containing information about tensor parallel parameters:
+            - tp_params: List of parameter names that have tensor_model_parallel=True
+            - non_tp_params: List of parameter names that have tensor_model_parallel=False
+            - total_params: Total number of parameters checked
+            - tp_size: Tensor parallel size from config
+        """
+        tp_params = []
+        non_tp_params = []
+        total_params = 0
+
+        for name, param in self.model.named_parameters():
+            total_params += 1
+            tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
+
+            if tensor_model_parallel:
+                tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "partition_dim": getattr(param, "partition_dim", None),
+                        "partition_stride": getattr(param, "partition_stride", None),
+                        "shape": list(param.shape),
+                    }
+                )
+            else:
+                non_tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "shape": list(param.shape),
+                    }
+                )
+
+        return {
+            "tp_params": tp_params,
+            "non_tp_params": non_tp_params,
+            "total_params": total_params,
+            "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
+        }
