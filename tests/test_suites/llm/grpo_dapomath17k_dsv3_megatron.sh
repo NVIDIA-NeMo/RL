@@ -12,7 +12,7 @@ NUM_MINUTES=240
 
 exit_if_max_steps_reached
 
-# Use checkpoint created from the 8K checkpoint in grpo-deepscaler-1.5b-8K.sh
+# Use the DeepSeek-V3 checkpoint converted to BF16.
 if [[ -z "$NRL_DEEPSEEK_V3_BF16_CKPT" ]]; then
     echo "Need to set NRL_DEEPSEEK_V3_BF16_CKPT to the path of DeepSeek-V3 checkpoint converted to BF16. See docs/guides/deepseek.md for more details."
     exit 1
