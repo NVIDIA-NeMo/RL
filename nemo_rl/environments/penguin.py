@@ -115,7 +115,7 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
 
         nemo_rl_results = []
         for task in penguin_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_result"):
+            with timer.time(label=f"{timer_prefix}/await_results"):
                 penguin_result = await task
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):

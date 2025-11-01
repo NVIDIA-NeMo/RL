@@ -779,9 +779,8 @@ def test_run_async_penguin_rollout(
             # core metrics
             "timing/rollout/total": 0.0,
             "timing/rollout/run_rollouts": 0.0,
-            "timing/rollout/postprocessing_total": 0.0,
-            "timing/rollout/tensorize_result": 0.0,
-            "timing/rollout/detokenize": 0.0,
+            "timing/rollout/await_results": 0.0,
+            "timing/rollout/postprocess_results": 0.0,
             "timing/rollout/prepare_for_metrics_calculation": 0.0,
             "timing/rollout/aggregate_metrics": 0.0,
             "timing/rollout/per_agent_misc_metrics": 0.0,
