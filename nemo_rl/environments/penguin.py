@@ -46,7 +46,7 @@ class Penguin(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = self.cfg["initial_global_config_dict"]
+        initial_global_config_dict = self.cfg.get("initial_global_config_dict") or dict()
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
