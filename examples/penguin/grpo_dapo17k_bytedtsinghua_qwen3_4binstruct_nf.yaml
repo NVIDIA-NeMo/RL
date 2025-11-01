@@ -26,6 +26,7 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: true
 
 loss_fn:
   reference_policy_kl_penalty: 0

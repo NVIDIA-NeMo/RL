@@ -118,6 +118,7 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
+    skip_reference_policy_logprobs_calculation: bool
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
@@ -854,6 +855,9 @@ def grpo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
+    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
     total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
@@ -1121,11 +1125,13 @@ def grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
-                    )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data
+                        )["reference_logprobs"]
+                        train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
