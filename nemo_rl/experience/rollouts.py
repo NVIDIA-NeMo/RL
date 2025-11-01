@@ -17,7 +17,7 @@
 
 import asyncio
 import copy
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -41,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    GuidedDecodingConfig,
 )
 
 TokenizerType = PreTrainedTokenizerBase
@@ -54,6 +55,7 @@ def generate_responses(
     input_lengths: torch.Tensor,
     include_logprobs: bool = True,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
     """Generate responses from policy using synchronous generation."""
     # Add stop_strings to generation_input_data if present in the batch
@@ -65,7 +67,9 @@ def generate_responses(
 
     # Always use synchronous generation
     generation_outputs = policy_generation.generate(
-        generation_input_data, greedy=greedy
+        generation_input_data,
+        greedy=greedy,
+        guided_decoding_config=guided_decoding_config,
     )
 
     # Extract everything we need from the generation outputs
@@ -118,6 +122,7 @@ async def generate_responses_async(
     input_lengths: torch.Tensor,
     include_logprobs: bool = True,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], list[torch.Tensor], dict[str, float | int]]:
     """Async version of generate_responses that properly calls generate_async."""
     # Add stop_strings to generation_input_data if present in the batch
@@ -144,7 +149,9 @@ async def generate_responses_async(
         tuple[int, BatchedDataDict[GenerationOutputSpec]]
     ] = []
     async for original_idx, single_item_output in policy_generation.generate_async(
-        generation_input_data, greedy=greedy
+        generation_input_data,
+        greedy=greedy,
+        guided_decoding_config=guided_decoding_config,
     ):
         collected_indexed_outputs.append((original_idx, single_item_output))
 
@@ -330,6 +337,7 @@ def run_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Runs a multi-turn rollout loop, interacting with the environment.
 
@@ -341,6 +349,7 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
+        guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
     Returns:
         Tuple containing:
@@ -417,6 +426,7 @@ def run_multi_turn_rollout(
             tokenizer,
             input_lengths=active_input_lengths,
             greedy=greedy,
+            guided_decoding_config=guided_decoding_config,
         )
 
         # Record token usage - assistant
@@ -541,6 +551,7 @@ async def async_generate_response_for_sample_turn(
     tokenizer: TokenizerType,
     max_seq_len: int,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -551,6 +562,7 @@ async def async_generate_response_for_sample_turn(
         tokenizer: Tokenizer to use
         max_seq_len: Maximum sequence length
         greedy: Whether to use greedy decoding
+        guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
     Returns:
         Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
@@ -610,6 +622,7 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -625,6 +638,7 @@ async def run_sample_multi_turn_rollout(
         max_seq_len: Maximum sequence length
         max_rollout_turns: Maximum number of turns
         greedy: Whether to use greedy decoding
+        guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -670,6 +684,7 @@ async def run_sample_multi_turn_rollout(
                 tokenizer,
                 max_seq_len,
                 greedy=greedy,
+                guided_decoding_config=guided_decoding_config,
             )
             current_message_log = updated_message_log
 
@@ -778,6 +793,7 @@ def run_async_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    guided_decoding_config: Optional[GuidedDecodingConfig] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run multi-turn rollouts with sample-level processing.
 
@@ -792,6 +808,7 @@ def run_async_multi_turn_rollout(
         max_seq_len: Maximum sequence length allowed
         max_rollout_turns: Maximum number of agent-environment interaction turns
         greedy: Whether to use greedy decoding
+        guided_decoding_config: Configuration for guided decoding, None to disable guided decoding.
 
     Returns:
         Tuple containing:
@@ -828,6 +845,7 @@ def run_async_multi_turn_rollout(
                     max_seq_len=max_seq_len,
                     max_rollout_turns=max_rollout_turns,
                     greedy=greedy,
+                    guided_decoding_config=guided_decoding_config,
                 )
                 return result
             except Exception as e:
