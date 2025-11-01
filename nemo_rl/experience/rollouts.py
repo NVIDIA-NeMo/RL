@@ -1010,32 +1010,6 @@ def run_async_penguin_rollout(
 
     timer.start(f"{timer_prefix}/postprocessing_total")
 
-    with timer.time(f"{timer_prefix}/detokenize"):
-        decode_batch = []
-        for r in results:
-            for output_item in r["full_result"]["response"]["output"]:
-                if not output_item.get("prompt_token_ids"):
-                    continue
-
-                # We pop to remove larger tensors from logging.
-                decode_batch.append(output_item["prompt_token_ids"])
-                decode_batch.append(output_item["generation_token_ids"])
-
-        decoded_strs = tokenizer.batch_decode(decode_batch)
-        decoded_strs_iter = iter(decoded_strs)
-        for r in results:
-            for output_item in r["full_result"]["response"]["output"]:
-                if not output_item.get("prompt_token_ids"):
-                    continue
-
-                # We pop to remove larger tensors from logging.
-                output_item.pop("prompt_token_ids")
-                output_item.pop("generation_token_ids")
-                output_item.pop("generation_log_probs")
-
-                output_item["prompt_str"] = next(decoded_strs_iter)
-                output_item["generation_str"] = next(decoded_strs_iter)
-
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(penguin_rows)

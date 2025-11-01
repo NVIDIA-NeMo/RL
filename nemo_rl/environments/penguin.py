@@ -158,6 +158,11 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
+            # We pop to remove larger tensors from logging.
+            output_item_dict["prompt_str"] = tokenizer.decode(output_item_dict.pop("prompt_token_ids"))
+            output_item_dict["generation_str"] = next(output_item_dict.pop("generation_token_ids"))
+            output_item_dict.pop("generation_log_probs")
+
         return {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
