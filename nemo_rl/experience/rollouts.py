@@ -26,7 +26,6 @@ from typing import Any, Optional
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-import numpy as np
 from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (

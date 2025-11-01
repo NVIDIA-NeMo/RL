@@ -25,6 +25,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from wandb import Histogram
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -1173,7 +1174,7 @@ def grpo_train(
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
-                    "baseline_reward": baseline.numpy(),
+                    "baseline_reward/histogram": Histogram(baseline.numpy()),
                     **ds_metrics,
                 }
                 if master_config["grpo"]["use_dynamic_sampling"]:
