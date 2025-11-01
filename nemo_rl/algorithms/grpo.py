@@ -1198,8 +1198,8 @@ def grpo_train(
                 metrics.update(rollout_metrics)
                 baseline: torch.Tensor
                 metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
-                metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).int().mean().item()
-                metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).int().mean().item()
+                metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
+                metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
                 metrics["baseline_reward/pct_mixed"] = 100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
                 total_valid_tokens += metrics["global_valid_toks"]
 
