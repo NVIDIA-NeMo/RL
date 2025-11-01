@@ -40,6 +40,7 @@ policy:
       grad_reduce_in_fp32: true
       overlap_grad_reduce: true
       overlap_param_gather: true
+      use_custom_fsdp: false
     empty_unused_memory_level: 1
     enabled: true
     expert_tensor_parallel_size: 1

@@ -113,6 +113,7 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    defer_fp32_logits: False
     
     optimizer:
       optimizer: "adam"
@@ -155,6 +156,7 @@ policy:
       overlap_param_gather: true
       average_in_collective: true
       data_parallel_sharding_strategy: "optim_grads_params"
+      use_custom_fsdp: false
     
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
