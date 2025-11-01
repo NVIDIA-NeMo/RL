@@ -16,6 +16,7 @@ from typing import Any, Dict, List, TypedDict
 
 import ray
 import torch
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
@@ -104,17 +105,19 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
     def health_check(self) -> bool:
         return True
 
-    async def run_rollouts(self, penguin_examples: list[dict]) -> list[dict]:
-        penguin_results = await self.rch.run_examples(
+    async def run_rollouts(self, penguin_examples: list[dict], tokenizer: PreTrainedTokenizerBase) -> list[dict]:
+        penguin_result_iterator = self.rch.run_examples(
             examples=penguin_examples, head_server_config=self.head_server_config
         )
+        nemo_rl_results = []
+        for task in penguin_result_iterator:
+            penguin_result = await task
+            nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(penguin_result, tokenizer)
+            nemo_rl_results.append(nemo_rl_result)
 
-        nemo_rl_results = list(
-            map(self._postprocess_penguin_to_nemo_rl_result, penguin_results)
-        )
         return nemo_rl_results
 
-    def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict) -> dict:
+    def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in penguin_result["response"]["output"]:
@@ -138,17 +141,17 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": output_item_dict["prompt_token_ids"][
+                    "token_ids": torch.tensor(output_item_dict["prompt_token_ids"][
                         len(seen_token_ids) :
-                    ],
+                    ]),
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": output_item_dict["generation_token_ids"],
-                    "generation_logprobs": output_item_dict["generation_log_probs"],
+                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                    "generation_logprobs": torch.tensor(output_item_dict["generation_log_probs"]),
                 }
             )
 

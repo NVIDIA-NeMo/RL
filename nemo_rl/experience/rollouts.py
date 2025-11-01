@@ -935,20 +935,6 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
-def _tensorize_by_key(message_logs: list, key: str, tensor_iter = None) -> list[list]:
-    if not message_logs or key not in message_logs[0]:
-        return
-
-    to_tensorize = []
-    for m in message_logs:
-        if tensor_iter:
-            m[key] = next(tensor_iter)
-        else:
-            to_tensorize.append(m[key])
-
-    return to_tensorize
-
-
 @dataclass
 class AsyncPenguinRolloutResult:
     input_ids: torch.Tensor
@@ -1023,31 +1009,6 @@ def run_async_penguin_rollout(
         results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
 
     timer.start(f"{timer_prefix}/postprocessing_total")
-
-    # Tensorize all token ids
-    # TODO optimize this.
-    with timer.time(f"{timer_prefix}/tensorize_result"):
-        batch_list_to_tensorize = []
-        for r in results:
-            batch_list_to_tensorize.extend(_tensorize_by_key(r["input_message_log"], "token_ids"))
-            batch_list_to_tensorize.extend(_tensorize_by_key(r["message_log"], "token_ids"))
-            batch_list_to_tensorize.extend(
-                _tensorize_by_key(
-                    [m for m in r["message_log"] if m["role"] == "assistant"],
-                    "generation_logprobs",
-                )
-            )
-
-        batch_tensor = torch.nested.nested_tensor(batch_list_to_tensorize)
-        batch_tensor_iter = iter(batch_tensor)
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids", batch_tensor_iter)
-            _tensorize_by_key(r["message_log"], "token_ids", batch_tensor_iter)
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-                batch_tensor_iter,
-            )
 
     with timer.time(f"{timer_prefix}/detokenize"):
         decode_batch = []
