@@ -22,6 +22,7 @@ loss_fn:
 
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  logprob_chunk_size: null
 
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
   # max_total_sequence_length: 131072
