@@ -209,6 +209,8 @@ class DTensorPolicyWorker:
             )
             print(f"[Rank {self.rank}] Using FlashAttention2 for sequence packing")
 
+        hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.
@@ -221,6 +223,7 @@ class DTensorPolicyWorker:
             attn_implementation="flash_attention_2"
             if self.enable_seq_packing
             else None,
+            **hf_config_overrides,
         )
 
         # reward model
