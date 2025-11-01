@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from megatron.bridge import AutoBridge
 
@@ -24,6 +24,7 @@ def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
     megatron_config: Optional[MegatronConfig] = None,
+    **config_overrides: Any,
 ):
     """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
 
@@ -32,7 +33,9 @@ def import_model_from_hf_name(
         output_path: Directory to write the Megatron checkpoint (e.g., /tmp/megatron_ckpt).
         megatron_config: Optional megatron config with paralellism settings for distributed megatron model import.
     """
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
+    bridge = AutoBridge.from_hf_pretrained(
+        hf_model_name, trust_remote_code=True, **config_overrides
+    )
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
@@ -98,6 +101,7 @@ def export_model_from_megatron(
     output_path: str,
     hf_tokenizer_path: str,
     overwrite: bool = False,
+    hf_overrides: Optional[dict[str, Any]] = {},
 ):
     if os.path.exists(output_path) and not overwrite:
         raise FileExistsError(
@@ -111,7 +115,9 @@ def export_model_from_megatron(
     except ImportError:
         raise ImportError("megatron.bridge.training is not available.")
 
-    bridge = AutoBridge.from_hf_pretrained(hf_model_name, trust_remote_code=True)
+    bridge = AutoBridge.from_hf_pretrained(
+        hf_model_name, trust_remote_code=True, **hf_overrides
+    )
 
     # Export performs on CPU with proper distributed context
     with temporary_distributed_context(backend="gloo"):
