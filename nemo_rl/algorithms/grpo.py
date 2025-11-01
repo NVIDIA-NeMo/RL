@@ -1127,7 +1127,7 @@ def grpo_train(
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
 
-                    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+                    if not master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
                         reference_logprobs = policy.get_reference_policy_logprobs(
                             train_data
                         )["reference_logprobs"]
