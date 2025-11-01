@@ -152,7 +152,6 @@ def calculate_baseline_and_std_per_prompt(
                 .nan_to_num(0)
             )
 
-    std = (sq_baseline - baseline.square()).sqrt().nan_to_num(0)
     return baseline, std
 
 
