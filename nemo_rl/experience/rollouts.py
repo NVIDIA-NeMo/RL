@@ -1039,7 +1039,7 @@ def run_async_penguin_rollout(
                 )
             )
 
-        batch_tensor = torch.tensor(np.array(batch_list_to_tensorize))
+        batch_tensor = torch.nested.nested_tensor(batch_list_to_tensorize)
         batch_tensor_iter = iter(batch_tensor)
         for r in results:
             _tensorize_by_key(r["input_message_log"], "token_ids", batch_tensor_iter)
