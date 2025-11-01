@@ -1174,7 +1174,6 @@ def grpo_train(
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
-                    "baseline_reward/histogram": Histogram(baseline.numpy()),
                     **ds_metrics,
                 }
                 if master_config["grpo"]["use_dynamic_sampling"]:
@@ -1197,6 +1196,7 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
 
                 metrics.update(rollout_metrics)
+                metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
