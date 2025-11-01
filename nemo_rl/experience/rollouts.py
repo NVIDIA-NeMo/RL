@@ -26,6 +26,7 @@ from typing import Any, Optional
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
+import numpy as np
 from wandb import Histogram, Table
 
 from nemo_rl.data.interfaces import (
@@ -935,24 +936,18 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
-def _tensorize_by_key(message_logs: list, key: str):
+def _tensorize_by_key(message_logs: list, key: str, tensor_iter = None) -> list[list]:
     if not message_logs or key not in message_logs[0]:
         return
 
+    to_tensorize = []
     for m in message_logs:
-        m[key] = torch.tensor(m[key])
+        if tensor_iter:
+            m[key] = next(tensor_iter)
+        else:
+            to_tensorize.append(m[key])
 
-
-@ray.remote
-def _tensorize_result(r: dict) -> dict:
-    _tensorize_by_key(r["input_message_log"], "token_ids")
-    _tensorize_by_key(r["message_log"], "token_ids")
-    _tensorize_by_key(
-        [m for m in r["message_log"] if m["role"] == "assistant"],
-        "generation_logprobs",
-    )
-
-    return r
+    return to_tensorize
 
 
 @dataclass
@@ -1033,10 +1028,27 @@ def run_async_penguin_rollout(
     # Tensorize all token ids
     # TODO optimize this.
     with timer.time(f"{timer_prefix}/tensorize_result"):
-        tasks = [
-            _tensorize_result.remote(r) for r in results
-        ]
-        results = ray.get(tasks)
+        batch_list_to_tensorize = []
+        for r in results:
+            batch_list_to_tensorize.extend(_tensorize_by_key(r["input_message_log"], "token_ids"))
+            batch_list_to_tensorize.extend(_tensorize_by_key(r["message_log"], "token_ids"))
+            batch_list_to_tensorize.extend(
+                _tensorize_by_key(
+                    [m for m in r["message_log"] if m["role"] == "assistant"],
+                    "generation_logprobs",
+                )
+            )
+
+        batch_tensor = torch.tensor(np.array(batch_list_to_tensorize))
+        batch_tensor_iter = iter(batch_tensor)
+        for r in results:
+            _tensorize_by_key(r["input_message_log"], "token_ids", batch_tensor_iter)
+            _tensorize_by_key(r["message_log"], "token_ids", batch_tensor_iter)
+            _tensorize_by_key(
+                [m for m in r["message_log"] if m["role"] == "assistant"],
+                "generation_logprobs",
+                batch_tensor_iter,
+            )
 
     with timer.time(f"{timer_prefix}/detokenize"):
         decode_batch = []
