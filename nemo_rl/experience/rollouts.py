@@ -1006,9 +1006,9 @@ def run_async_penguin_rollout(
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
         penguin_environment = task_to_env["penguin"]
-        results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
-
-    timer.start(f"{timer_prefix}/postprocessing_total")
+        results, rollout_loop_timing_metrics = ray.get(
+            penguin_environment.run_rollouts.remote(penguin_rows, tokenizer, timer_prefix)
+        )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1032,6 +1032,7 @@ def run_async_penguin_rollout(
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
         rollout_metrics = {
+            **rollout_loop_timing_metrics,
             **_calculate_single_metric(
                 [m["turn_count"] for m in all_sample_metrics],
                 batch_size,
@@ -1095,7 +1096,6 @@ def run_async_penguin_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
-    timer.stop(f"{timer_prefix}/postprocessing_total")
     timer.stop(f"{timer_prefix}/total")
     rollout_metrics.update(timer.get_timing_metrics("sum"))
 

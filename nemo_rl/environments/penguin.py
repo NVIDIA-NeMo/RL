@@ -21,6 +21,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.utils.timer import Timer
 
 
 class PenguinConfig(TypedDict):
@@ -105,17 +106,24 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
     def health_check(self) -> bool:
         return True
 
-    async def run_rollouts(self, penguin_examples: list[dict], tokenizer: PreTrainedTokenizerBase) -> list[dict]:
+    async def run_rollouts(self, penguin_examples: list[dict], tokenizer: PreTrainedTokenizerBase, timer_prefix: str) -> list[dict]:
+        timer = Timer()
+
         penguin_result_iterator = self.rch.run_examples(
             examples=penguin_examples, head_server_config=self.head_server_config
         )
+
         nemo_rl_results = []
         for task in penguin_result_iterator:
-            penguin_result = await task
-            nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(penguin_result, tokenizer)
+            with timer.time(label=f"{timer_prefix}/await_result"):
+                penguin_result = await task
+
+            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(penguin_result, tokenizer)
+
             nemo_rl_results.append(nemo_rl_result)
 
-        return nemo_rl_results
+        return nemo_rl_results, timer.get_timing_metrics("sum")
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
         nemo_rl_message_log = []
