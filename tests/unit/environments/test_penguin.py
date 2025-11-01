@@ -142,7 +142,7 @@ def penguin_sanity_test_data():
     not PENGUIN_INSTALLED,
     reason="Skipping Penguin test since Penguin is not installed!",
 )
-def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation):
+def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation, penguin_tokenizer):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
     # We need to match NeMo RL generation config params before sending to Penguin
@@ -155,7 +155,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
     actual_result = ray.get(
-        penguin.run_rollouts.remote(penguin_sanity_test_data["input"])
+        penguin.run_rollouts.remote(penguin_sanity_test_data["input"], penguin_tokenizer, "")
     )
     expected_result = penguin_sanity_test_data["expected_output"]
 
