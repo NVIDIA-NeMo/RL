@@ -56,12 +56,14 @@ class Penguin(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        # Set these values incredibly high.
-        global_aiohttp_connector_limit_per_host = initial_global_config_dict.get("global_aiohttp_connector_limit_per_host")
-        global_aiohttp_connector_limit_per_host = global_aiohttp_connector_limit_per_host or 1024
-        global_aiohttp_connector_limit_per_host = global_aiohttp_connector_limit_per_host * len(self.cfg["base_urls"])
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = global_aiohttp_connector_limit_per_host
-        initial_global_config_dict["global_aiohttp_connector_limit"] = global_aiohttp_connector_limit_per_host
+        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = (
+            initial_global_config_dict.get("global_aiohttp_connector_limit_per_host")
+            or 2048
+        )
+        initial_global_config_dict["global_aiohttp_connector_limit"] = (
+            initial_global_config_dict["global_aiohttp_connector_limit_per_host"]
+            * len(self.cfg["base_urls"])
+        )
 
         # Get Ray head node address if Ray is initialized
         assert ray.is_initialized(), (
