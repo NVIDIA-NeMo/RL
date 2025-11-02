@@ -6,3 +6,9 @@ data:
 env:
   penguin:
     is_trajectory_collection: true  # Set this to true to enable trajectory collection (no training)
+
+policy:
+  generation:
+    vllm_cfg:
+      # Raise thie GPU mem utilization from 0.5 -> 0.9 since we dont need to worry about train mem
+      gpu_memory_utilization: 0.9
