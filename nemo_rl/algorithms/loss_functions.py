@@ -285,8 +285,8 @@ class ClippedPGLossFn(LossFunction):
             bt_loss = bt_loss / (global_valid_seqs + 1e-8)
             
             if sample_mask.sum() > 0:
-                bt_accuracy = torch.sum(gt.to(torch.bool) == (last_state < 0.5)).item() / sample_mask.sum().item()
-                genrm_pref_linear_match = torch.sum(parsed_pref_rank == (last_state < 0.5).to(torch.long)).item() / sample_mask.sum().item()
+                bt_accuracy = torch.sum(gt.to(torch.bool) == (last_state >= 0.5)).item() / sample_mask.sum().item()
+                genrm_pref_linear_match = torch.sum(parsed_pref_rank == (last_state >= 0.5).to(torch.long)).item() / sample_mask.sum().item()
             else:
                 bt_accuracy = 0.0
                 genrm_pref_linear_match = 0.0

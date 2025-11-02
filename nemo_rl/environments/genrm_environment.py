@@ -446,7 +446,6 @@ class GenRMEnvironment(EnvironmentInterface):
                 assistant_response, meta["num_responses"], strict_mode=strict_mode
             )
             
-            
             if not is_valid_format:
                 # Apply format penalty
                 reward = self.format_penalty

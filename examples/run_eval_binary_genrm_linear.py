@@ -497,7 +497,7 @@ def calculate_metrics_linear(results):
             # Convert preference to expected ranking
             true_pref = result["metadata"]["preference"]
             extracted_pred_rank = result["linear_ranking"]
-            pred_rank = 0 if extracted_pred_rank >= 0.5 else 1
+            pred_rank = 1 if extracted_pred_rank >= 0.5 else 0
                 
             if pred_rank == true_pref:
                 correct_rankings += 1

@@ -432,9 +432,9 @@ def calculate_metrics(results):
     
     for result in results:
         total_rankings += 1
-        if "predicted_ranking" in result and result["metadata"].get("preference_ranking") is not None:
+        if "predicted_ranking" in result and result["metadata"].get("preference") is not None:
             # Convert preference to expected ranking
-            true_pref = result["metadata"]["preference_ranking"]
+            true_pref = result["metadata"]["preference"]
             extracted_pred_rank = result["predicted_ranking"]
             pred_rank = 0 if extracted_pred_rank <= 3 else 1
                 
@@ -456,11 +456,11 @@ def calculate_metrics_linear(results):
     
     for result in results:
         total_rankings += 1
-        if "linear_ranking" in result and result["metadata"].get("preference_ranking") is not None:
+        if "linear_ranking" in result and result["metadata"].get("preference") is not None:
             # Convert preference to expected ranking
-            true_pref = result["metadata"]["preference_ranking"]
+            true_pref = result["metadata"]["preference"]
             extracted_pred_rank = result["linear_ranking"]
-            pred_rank = 0 if extracted_pred_rank >= 0.5 else 1
+            pred_rank = 1 if extracted_pred_rank >= 0.5 else 0
                 
             if pred_rank == true_pref:
                 correct_rankings += 1

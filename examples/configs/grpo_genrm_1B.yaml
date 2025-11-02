@@ -8,7 +8,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5
-  val_at_start: true
+  val_at_start: false
   overlong_filtering: false
   batch_multiplier: 1
   use_dynamic_sampling: false
@@ -41,11 +41,13 @@ loss_fn:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo_genrm"
-  metric_name: "val_reward"
+  metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 5
   save_period: 5
   checkpoint_must_save_by: null
+  model_save_format: null
+  save_consolidated: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
