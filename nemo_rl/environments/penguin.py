@@ -111,6 +111,7 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
             examples=penguin_examples, head_server_config=self.head_server_config
         )
 
+        timer.start("_run_rollouts_total")
         nemo_rl_results = []
         for task in penguin_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
@@ -121,7 +122,12 @@ Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances
 
             nemo_rl_results.append(nemo_rl_result)
 
-        return nemo_rl_results, timer.get_timing_metrics("sum")
+        timer.stop("_run_rollouts_total")
+        timing_metrics = timer.get_timing_metrics("sum")
+        total_time = timing_metrics.pop("_run_rollouts_total")
+        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = 100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+
+        return nemo_rl_results, timing_metrics
 
     def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
         nemo_rl_message_log = []
