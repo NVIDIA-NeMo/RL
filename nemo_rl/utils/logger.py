@@ -933,7 +933,7 @@ class Logger(LoggerInterface):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         # Write to JSONL file
-        with open(filepath, "w") as f:
+        with open(filepath, "a") as f:
             for sample in to_log:
                 f.write(sample + "\n")
 
