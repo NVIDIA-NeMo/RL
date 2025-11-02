@@ -105,6 +105,8 @@ class AsyncGRPOConfig(TypedDict):
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: NotRequired[bool]
+    # Recomputes the KV cache after the in-flight weight updates.
+    recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
 class GRPOConfig(TypedDict):
