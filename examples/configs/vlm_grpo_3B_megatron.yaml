@@ -147,6 +147,8 @@ policy:
       sgd_momentum: 0.9
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
       clip_grad: ${policy.max_grad_norm}
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
