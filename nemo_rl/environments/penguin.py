@@ -56,13 +56,11 @@ class Penguin(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        initial_global_config_dict["global_aiohttp_connector_limit_per_host"] = (
-            initial_global_config_dict.get("global_aiohttp_connector_limit_per_host")
-            or 2048
-        )
-        initial_global_config_dict["global_aiohttp_connector_limit"] = (
-            initial_global_config_dict["global_aiohttp_connector_limit_per_host"]
-            * len(self.cfg["base_urls"])
+        initial_global_config_dict.setdefault("global_aiohttp_connector_limit_per_host", 16_384)
+        initial_global_config_dict.setdefault("global_aiohttp_connector_limit", 65_536)
+        print(
+            f"""Set global_aiohttp_connector_limit_per_host={initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} and global_aiohttp_connector_limit={initial_global_config_dict["global_aiohttp_connector_limit"]}.
+Depending on your data shape, you may want to change these values."""
         )
 
         # Get Ray head node address if Ray is initialized
@@ -74,11 +72,6 @@ class Penguin(EnvironmentInterface):
 
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
-
-        print(
-            f"""Set `global_aiohttp_connector_limit_per_host` to a flat {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]}.
-Since there are {len(self.cfg["base_urls"])} data-parallel vLLM worker instances, the `global_aiohttp_connector_limit` has been set to {len(self.cfg["base_urls"])} * {initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} = {initial_global_config_dict["global_aiohttp_connector_limit"]}."""
-        )
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
