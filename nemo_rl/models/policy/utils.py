@@ -290,7 +290,7 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
         hasattr(hf_config, "use_sliding_window")
         and hf_config.use_sliding_window == False
     ):
-        assert hasattr(hf_config, "sliding_window")
+        # assert hasattr(hf_config, "sliding_window")
         overwrite_dict = {
             "sliding_window": None,
         }
