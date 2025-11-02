@@ -159,6 +159,13 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
     )
     expected_result = penguin_sanity_test_data["expected_output"]
 
+    # These are tensors originally and we swap them back to a list for comparison below
+    for d in actual_result:
+        for message in d["input_message_log"]:
+            message["token_ids"] = message["token_ids"].tolist()
+        for message in d["message_log"][:1]:
+            message["token_ids"] = message["token_ids"].tolist()
+
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
