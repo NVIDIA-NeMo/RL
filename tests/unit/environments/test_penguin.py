@@ -154,7 +154,7 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
-    actual_result = ray.get(
+    actual_result, _, _ = ray.get(
         penguin.run_rollouts.remote(penguin_sanity_test_data["input"], penguin_tokenizer, "")
     )
     expected_result = penguin_sanity_test_data["expected_output"]
