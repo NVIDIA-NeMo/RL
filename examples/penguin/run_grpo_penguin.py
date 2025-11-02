@@ -241,6 +241,7 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
+    is_trajectory_collection = config["env"]["penguin"].pop("is_trajectory_collection") or False
     penguin_config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
@@ -258,7 +259,6 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
-    is_trajectory_collection = config["env"]["penguin"].pop("is_trajectory_collection") or False
     if is_trajectory_collection:
         collect_trajectories(
             policy=policy,
