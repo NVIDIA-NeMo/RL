@@ -21,8 +21,21 @@ from typing import Optional
 
 import ray
 from omegaconf import OmegaConf
+from wandb import Table
 
-from nemo_rl.algorithms.grpo import MasterConfig, _should_use_penguin, grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    ColocatablePolicyInterface,
+    EnvironmentInterface,
+    GenerationInterface,
+    Logger,
+    MasterConfig,
+    StatefulDataLoader,
+    TokenizerType,
+    _should_use_penguin,
+    grpo_train,
+    setup,
+    refit_policy_generation,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -36,6 +49,7 @@ from nemo_rl.environments.penguin import (
     penguin_example_to_nemo_rl_datum_spec,
     setup_penguin_config,
 )
+from nemo_rl.experience.rollouts import run_async_penguin_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -88,6 +102,54 @@ def setup_single_penguin_dataset(
         None,
         passthrough_task_processor,
     )
+
+
+# These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
+def collect_trajectories(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    val_dataloader: StatefulDataLoader,
+    tokenizer: TokenizerType,
+    val_task_to_env: dict[str, EnvironmentInterface],
+    logger: Logger,
+    master_config: MasterConfig,
+) -> None:
+    """Run trajectory collection."""
+    # common config/state items
+    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    refit_policy_generation(policy, policy_generation, colocated_inference)
+
+    log_filename = "trajectory_collection.jsonl"
+
+    print("\n🔍 Running trajectory collection...", flush=True)
+    generation_config = master_config["policy"]["generation"]
+    for val_batch in val_dataloader:
+        penguin_rollout_result = run_async_penguin_rollout(
+            policy_generation=policy_generation,
+            input_batch=val_batch,
+            tokenizer=tokenizer,
+            task_to_env=val_task_to_env,
+            max_seq_len=None,
+            generation_config=generation_config,
+            max_rollout_turns=None,
+            greedy=False,
+        )
+
+        rows_to_log: list[str] = []
+        for key, value in penguin_rollout_result.rollout_metrics.items():
+            if "full_result" not in key:
+                continue
+
+            value: Table
+            data: list[list[str]] = value.data  # (n, 1)
+            rows_to_log.extend(v[0] for v in data)
+
+        logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+
+        # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
+        # And also leverage the TimeoutChecker functionality as well
+
+    policy_generation.finish_generation()
 
 
 def main() -> None:
