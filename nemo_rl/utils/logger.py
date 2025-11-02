@@ -921,6 +921,24 @@ class Logger(LoggerInterface):
 
         print(f"Logged data to {filepath}")
 
+    def log_string_list_as_jsonl(self, to_log: list[str], filename: str) -> None:
+        """Log a list of strings to a JSONL file.
+
+        Args:
+            to_log: list of strings to log
+            filename: Filename to log to (within the log directory)
+        """
+        # Create full path within log directory
+        filepath = os.path.join(self.base_log_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        # Write to JSONL file
+        with open(filepath, "w") as f:
+            for sample in to_log:
+                f.write(sample + "\n")
+
+        print(f"Logged data to {filepath}")
+
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str
     ) -> None:
