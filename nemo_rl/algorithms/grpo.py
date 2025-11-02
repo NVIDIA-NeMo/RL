@@ -857,6 +857,9 @@ def grpo_train(
 
     if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
         assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+        print(
+            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+        )
 
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
