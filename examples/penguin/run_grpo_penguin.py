@@ -258,20 +258,32 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"penguin": penguin}
     val_task_to_env = task_to_env
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    )
+    is_trajectory_collection = config["env"]["penguin"].pop("is_trajectory_collection") or False
+    if is_trajectory_collection:
+        collect_trajectories(
+            policy=policy,
+            policy_generation=policy_generation,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            master_config=master_config,
+        )
+    else:
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":
