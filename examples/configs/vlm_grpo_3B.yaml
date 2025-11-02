@@ -93,7 +93,7 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
 
     optimizer:
       optimizer: "adam"
@@ -115,6 +115,10 @@ policy:
       #distributed optimizer
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
 
       clip_grad: ${policy.max_grad_norm}
 
