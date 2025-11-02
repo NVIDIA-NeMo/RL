@@ -10,5 +10,5 @@ env:
 policy:
   generation:
     vllm_cfg:
-      # Raise thie GPU mem utilization from 0.5 -> 0.9 since we dont need to worry about train mem
-      gpu_memory_utilization: 0.9
+      # Raise thie GPU mem utilization from 0.5 -> 0.8 since we dont need to worry about train mem
+      gpu_memory_utilization: 0.8
