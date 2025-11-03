@@ -6,21 +6,18 @@ build-backend = "setuptools.build_meta"
 packages = ["nemo_rl"]
 
 [tool.setuptools.dynamic]
-version = {attr = "nemo_rl.__version__"}  # any module attribute compatible with ast.literal_eval
-readme = {file = "README.md", content-type = "text/markdown"}
+version = { attr = "nemo_rl.__version__" }                      # any module attribute compatible with ast.literal_eval
+readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]
 name = "nemo-rl"
-dynamic = [
-    "version",
-    "readme",
-]
+dynamic = ["version", "readme"]
 description = "NeMo RL: A Scalable and Efficient Post-Training Library for Models Ranging from 1 GPU to 1000s, and from Tiny to >100B Parameters"
 requires-python = ">=3.12"
-license = {text = "Apache 2.0"}
+license = { text = "Apache 2.0" }
 dependencies = [
     "setuptools",
-    "ninja",  # for flash-attn parallel build
+    "ninja",                # for flash-attn parallel build
     "torch==2.8.0",
     "triton",
     "colored==2.2.3",
@@ -46,9 +43,9 @@ dependencies = [
     "sympy>=1.14.0",
     "pillow>=11.3.0",
     "torchvision>=0.22.0",
-    "num2words>=0.5.14",   # for SmolVLM
+    "num2words>=0.5.14",    # for SmolVLM
     "mlflow",
-    "nvidia-nvshmem-cu12", # for deep_ep build
+    "nvidia-nvshmem-cu12",  # for deep_ep build
     "swanlab",
     "pyzmq",
 ]
@@ -60,7 +57,7 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "vllm==0.11.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+    "vllm==0.11.0",      # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
@@ -101,9 +98,7 @@ mcore = [
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
     "flash-attn==2.8.1",
 ]
-penguin = [
-    "penguin",
-]
+penguin = ["penguin"]
 
 [dependency-groups]
 
@@ -124,18 +119,16 @@ build = [
 ]
 docs = [
     "sphinx",
-    "sphinx-autobuild",  # For live doc serving while editing docs
-    "sphinx-autodoc2",  # For documenting Python API
-    "sphinx-copybutton",  # Adds a copy button for code blocks
-    "sphinx-design",  # For design components in docs
-    "myst_parser",  # For our markdown docs
-    "nvidia-sphinx-theme",  # Our NVIDIA theme
-    "gitpython>=3.1.45",  # To git-related information
-    "pinecone",  # For Pinecone vector database integration
-    "openai",  # For OpenAI API integration
-    "python-dotenv",  # For environment variable management
-    "sphinxcontrib-mermaid",  # For Mermaid diagram support
-    "swagger-plugin-for-sphinx",  # For Swagger/OpenAPI documentation
+    "sphinx-autobuild",          # For live doc serving while editing docs
+    "sphinx-autodoc2",           # For documenting Python API
+    "sphinx-copybutton",         # Adds a copy button for code blocks
+    "sphinx-design",             # For design components in docs
+    "myst_parser",               # For our markdown docs
+    "nvidia-sphinx-theme",       # Our NVIDIA theme
+    "gitpython>=3.1.45",         # To git-related information
+    "python-dotenv",             # For environment variable management
+    "sphinxcontrib-mermaid",     # For Mermaid diagram support
+    "swagger-plugin-for-sphinx", # For Swagger/OpenAPI documentation
 ]
 dev = [
     "pre-commit>=4.2.0",
@@ -160,16 +153,16 @@ penguin = { workspace = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
-  { index = "pypi", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+    { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
-  { index = "pypi", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+    { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 triton = [
-  { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
-  { index = "pypi", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
+    { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
@@ -193,8 +186,16 @@ url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv]
-preview = true  # Enable preview features like extra-build-dependencies
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "causal-conv1d", "deep_gemm", "deep_ep"]
+preview = true # Enable preview features like extra-build-dependencies
+no-build-isolation-package = [
+    "transformer-engine-torch",
+    "transformer-engine",
+    "flash-attn",
+    "mamba-ssm",
+    "causal-conv1d",
+    "deep_gemm",
+    "deep_ep",
+]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.
