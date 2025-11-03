@@ -16,7 +16,9 @@ import tempfile
 import time
 from typing import Optional
 
+import numpy as np
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -149,7 +151,6 @@ def create_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
             "fp8_cfg": {
@@ -2264,6 +2265,202 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
 
     print(
         "✓ SUCCESS: CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing"
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_path):
+    """Test that gradient norms are consistent across different TP and DP configurations.
+
+    This test validates that the same model produces identical gradient norms
+    regardless of tensor parallelism (TP) and data parallelism (DP) settings.
+    """
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create reproducible test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones_like(input_ids),
+        }
+    )
+
+    # Test configurations: (num_gpus, tp, pp, description)
+    test_configs = [
+        (1, 1, 1, "DP1TP1"),
+        (2, 1, 1, "DP2"),  # Data parallel with 2 GPUs
+        (2, 2, 1, "TP2"),  # Tensor parallel with 2 GPUs
+    ]
+
+    grad_norms = {}
+    losses = {}
+
+    for num_gpus, tp, pp, desc in test_configs:
+        print(
+            f"\n=== Testing {desc} configuration (GPUs={num_gpus}, TP={tp}, PP={pp}) ==="
+        )
+
+        cluster = RayVirtualCluster(
+            name=f"test-grad-norm-{desc.lower()}",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        config = create_megatron_test_config(
+            model_name=tiny_llama_model_path,
+            tp=tp,
+            pp=pp,
+            precision="float32",  # Use float32 for more stable gradient comparisons
+        )
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Use SimpleLoss for consistent comparison
+        loss_fn = NLLLoss()
+
+        try:
+            # Prepare for training
+            policy.prepare_for_training()
+
+            # Perform one forward/backward step
+            print(f"Performing forward/backward pass for {desc}...")
+            results = policy.train(data, loss_fn)
+
+            # Extract metrics
+            loss_tensor = results["loss"]
+            grad_norm = results["grad_norm"]
+
+            # Verify loss is valid
+            assert not torch.isnan(loss_tensor).any(), (
+                f"Loss should not be NaN for {desc}"
+            )
+            assert not torch.isinf(loss_tensor).any(), (
+                f"Loss should not be Inf for {desc}"
+            )
+
+            # Store results for comparison
+            grad_norms[desc] = grad_norm
+            losses[desc] = loss_tensor.cpu().numpy()
+
+            print(f"{desc} - Loss: {loss_tensor}")
+            print(f"{desc} - Grad norm: {grad_norm}")
+
+            # Check tensor parallel attributes on model parameters
+            print(f"Checking tensor parallel attributes for {desc}...")
+            tp_check_futures = policy.worker_group.run_all_workers_single_data(
+                "check_tensor_parallel_attributes"
+            )
+            tp_check_results = [ray.get(future) for future in tp_check_futures]
+
+            # Analyze the first worker's results (all workers should have the same structure)
+            tp_info = tp_check_results[0]
+
+            print(f"{desc} - TP size: {tp_info['tp_size']}")
+            print(f"{desc} - Total params: {tp_info['total_params']}")
+            print(f"{desc} - TP params: {len(tp_info['tp_params'])}")
+            print(f"{desc} - Non-TP params: {len(tp_info['non_tp_params'])}")
+
+            # Validate tensor parallel attributes
+            expected_tp_size = tp
+            assert tp_info["tp_size"] == expected_tp_size, (
+                f"Expected TP size {expected_tp_size}, got {tp_info['tp_size']}"
+            )
+
+            if tp > 1:
+                tp_sharded_names = [item["name"] for item in tp_info["tp_params"]]
+                # When tensor parallelism is enabled, we should have some TP parameters
+                assert "module.embedding.word_embeddings.weight" in tp_sharded_names, (
+                    f"Expected module.embedding.word_embeddings.weight to be TP-sharded when TP={tp}"
+                )
+
+        finally:
+            policy.shutdown()
+            cluster.shutdown()
+
+    # Compare gradient norms across configurations
+    print("\n=== Comparing gradient norms across configurations ===")
+
+    # Get reference values from DP2 configuration
+    # NOTE: even if TP2 config passes these tests, it doesn't necessarily imply
+    # there are no bugs. That's why we also check that TP attributes are set correctly above
+    reference_config = "DP1TP1"
+    reference_grad_norm = grad_norms[reference_config]
+    reference_loss = losses[reference_config]
+
+    for config_name, grad_norm in grad_norms.items():
+        if config_name == reference_config:
+            continue
+
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+
+        print(f"\nComparing {config_name} with {reference_config}:")
+        print(f"  {reference_config} grad norm: {reference_grad_norm}")
+        print(f"  {config_name} grad norm: {grad_norm}")
+
+        # Compare gradient norms
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+            reference_grad_norm = [reference_grad_norm]
+        if isinstance(grad_norm, list) and isinstance(reference_grad_norm, list):
+            # Handle case where grad_norm is a list (multiple microbatches)
+            assert len(grad_norm) == len(reference_grad_norm), (
+                f"Number of gradient norm values should match: {len(grad_norm)} vs {len(reference_grad_norm)}"
+            )
+
+            for i, (gn, ref_gn) in enumerate(zip(grad_norm, reference_grad_norm)):
+                grad_diff = abs(gn - ref_gn)
+                relative_diff = grad_diff / (ref_gn + 1e-8)
+                print(
+                    f"    Microbatch {i}: {ref_gn} vs {gn}, diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f}"
+                )
+
+                # Allow small differences due to floating point precision and parallelization
+                assert relative_diff < 0.01 or grad_diff < 1e-6, (
+                    f"Gradient norm difference too large for microbatch {i}: "
+                    f"{ref_gn} vs {gn} (diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f})"
+                )
+
+        # Compare losses (should also be identical for same computation)
+        loss_diff = np.max(np.abs(reference_loss - losses[config_name]))
+        relative_loss_diff = loss_diff / (np.mean(np.abs(reference_loss)) + 1e-8)
+        print(
+            f"    Loss diff: {loss_diff:.6f}, relative loss diff: {relative_loss_diff:.6f}"
+        )
+
+        # Allow small differences in loss as well
+        assert relative_loss_diff < 0.01 or loss_diff < 1e-6, (
+            f"Loss difference too large: "
+            f"max diff={loss_diff:.6f}, rel_diff={relative_loss_diff:.6f}"
+        )
+
+    print(
+        "\n✓ SUCCESS: Gradient norms are consistent across all parallelization configurations!"
     )
 
 
