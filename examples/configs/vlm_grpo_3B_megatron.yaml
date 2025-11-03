@@ -12,6 +12,19 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
@@ -64,7 +77,6 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: modified_first_fit_decreasing
     sequence_length_round: 64
-  optimizer: null
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -120,6 +132,7 @@ policy:
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: false
     apply_rope_fusion: true
+    defer_fp32_logits: False
     optimizer:
       optimizer: adam
       lr: 2.0e-07
@@ -134,6 +147,8 @@ policy:
       sgd_momentum: 0.9
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
       clip_grad: ${policy.max_grad_norm}
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}

@@ -375,6 +375,12 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
+        if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
+            vllm_kwargs["hf_overrides"] = {}
+        vllm_kwargs["hf_overrides"].update(
+            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
+        )
+
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
@@ -534,7 +540,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
 
         # verify inputs have correct padding
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
@@ -568,7 +574,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             # Create a new tensor with the right size and fill with padding token
             full_output = torch.full(
-                (total_length,), self.cfg["pad_token_id"], dtype=input_ids.dtype
+                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype
             )
 
             # Copy original input (with padding) into the beginning

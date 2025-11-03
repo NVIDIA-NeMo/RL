@@ -289,7 +289,7 @@ def setup_megatron_model(
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
         wrap_cast_model_output_to_fp32=(
-            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", None)
+            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", False)
         ),
     )
     if load_optimizer:
@@ -506,8 +506,12 @@ class MegatronPolicyWorker:
         if pt_checkpoint_exists:
             print(f"Checkpoint already exists at {pretrained_path}. Skipping import.")
         else:
+            hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
             import_model_from_hf_name(
-                hf_model_name, pretrained_path, self.cfg["megatron_cfg"]
+                hf_model_name,
+                pretrained_path,
+                self.cfg["megatron_cfg"],
+                **hf_config_overrides,
             )
 
             if parallel_state.model_parallel_is_initialized():
@@ -632,6 +636,14 @@ class MegatronPolicyWorker:
             # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
             assert optimizer_offload_fraction == 1.0, (
                 "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
+            )
+        if (
+            "logprob_chunk_size" in self.cfg
+            and self.cfg["logprob_chunk_size"] is not None
+            and self.cfg["logprob_chunk_size"] > 0
+        ):
+            assert self.cfg["megatron_cfg"]["defer_fp32_logits"], (
+                "defer_fp32_logits must be True if logprob_chunk_size is set"
             )
 
         checkpoint_config = CheckpointConfig(
@@ -769,7 +781,7 @@ class MegatronPolicyWorker:
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
                 wrap_cast_model_output_to_fp32=(
-                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", None)
+                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", False)
                 ),
             )
             print("Loading the Reference Model")

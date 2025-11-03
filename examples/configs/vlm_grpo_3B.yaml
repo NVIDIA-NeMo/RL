@@ -14,6 +14,19 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
@@ -80,7 +93,7 @@ policy:
     moe_permute_fusion: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
 
     optimizer:
       optimizer: "adam"
@@ -102,6 +115,10 @@ policy:
       #distributed optimizer
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
+
+      # optimizer cpu offload
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
 
       clip_grad: ${policy.max_grad_norm}
 
