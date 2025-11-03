@@ -22,6 +22,7 @@ checkpointing:
 
 policy:
   is_mdlm: false
+  is_dqwn: false
   model_name: "meta-llama/Llama-3.2-1B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
