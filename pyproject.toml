@@ -51,6 +51,7 @@ dependencies = [
     "nvidia-nvshmem-cu12", # for deep_ep build
     "swanlab",
     "pyzmq",
+    "ai-dynamo",
 ]
 
 [project.optional-dependencies]
