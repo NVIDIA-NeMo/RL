@@ -664,6 +664,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
         pass
