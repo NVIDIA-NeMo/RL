@@ -1,0 +1,115 @@
+# SFT on Tulu3-SFT-Mixture dataset
+sft:
+  max_num_epochs: 1
+  max_num_steps: 50
+  val_period: 5
+  val_batches: 8
+  val_global_batch_size: 128
+  val_micro_batch_size: 1
+  val_at_start: true
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sft_nemotron_super_49b"
+  metric_name: "val_loss"
+  higher_is_better: false
+  keep_top_k: 100
+  save_period: 500
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "/lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf"
+  tokenizer:
+    name: ${policy.model_name}
+  max_total_sequence_length: 32768
+  precision: "bfloat16"
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: true
+    context_parallel_size: 8
+    cpu_offload: false
+    enabled: true
+    sequence_parallel: false
+    tensor_parallel_size: 4
+    custom_parallel_plan: examples.configs.recipes.llm.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
+
+  megatron_cfg:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 8192
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # makes the training sequence length divisible by the tensor parallel size
+  # this is useful for sequence parallel training
+  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size}, 2}, ${policy.max_total_sequence_length}}
+  max_grad_norm: null
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.98]
+      eps: 1e-8
+      foreach: False
+      fused: False
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 10 # warmup_steps
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        # max_num_steps - warmup_steps = cosine steps
+        T_max: 40
+        eta_min: 2e-6
+    - milestones: [10]
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  dataset_name: "tulu3_sft_mixture"
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 20
+  test_size: 0.05
+  # max_samples: 10000 # remove this line to use all data
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  num_val_samples_to_print: 0
+  wandb:
+    project: "nemotron-tulu-3-sft"
+    name: "nemotron-tulu-3"
+  tensorboard:
+    log_dir: "tb_logs-nemotron-tulu-3-sft"
+  mlflow:
+    experiment_name: "nemotron-tulu-3-sft"
+    run_name: "nemotron-tulu-3-sft"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
