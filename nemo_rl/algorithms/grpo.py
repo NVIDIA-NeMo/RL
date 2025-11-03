@@ -1406,7 +1406,9 @@ def grpo_train(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
             # step_finished=True here since this is the final log of our current step.
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
+            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            # TODO revert this
+            # logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
