@@ -27,6 +27,7 @@ from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
+from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 from nemo_rl.data.datasets.utils import get_extra_kwargs
 
 
@@ -93,6 +94,14 @@ def load_response_dataset(data_config, seed: int = 42):
         base_dataset: Any = Geometry3KDataset(
             split=data_config["split"],
         )
+    elif dataset_name == "tulu3_sft_mixture":
+        print("Loading allenai/tulu-3-sft-mixture for training and validation")
+        base_dataset: Any = Tulu3SftMixtureDataset(
+            test_size=data_config.get("test_size", 0.05),
+            prompt_file=data_config.get("prompt_file", None),
+            max_samples=data_config.get("max_samples", None),
+            seed=seed,
+        )
     # fall back to load from JSON file
     elif dataset_name == "ResponseDataset":
         if "train_data_path" not in data_config:
@@ -134,4 +143,5 @@ __all__ = [
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
+    "Tulu3SftMixtureDataset",
 ]
