@@ -461,7 +461,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
 
         # verify inputs have correct padding
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
@@ -495,7 +495,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             # Create a new tensor with the right size and fill with padding token
             full_output = torch.full(
-                (total_length,), self.cfg["pad_token_id"], dtype=input_ids.dtype
+                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype
             )
 
             # Copy original input (with padding) into the beginning

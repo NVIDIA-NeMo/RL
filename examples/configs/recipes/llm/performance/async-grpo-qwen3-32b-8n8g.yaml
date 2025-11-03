@@ -3,6 +3,7 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:

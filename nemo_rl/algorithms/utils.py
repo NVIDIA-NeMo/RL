@@ -401,6 +401,11 @@ def print_performance_metrics(
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
             performance_metrics["average_token_imbalance"] = average_token_imbalance
 
+    if "mean_total_tokens_per_sample" in metrics:
+        print(
+            f"  • Mean Total Tokens per Sample: {metrics['mean_total_tokens_per_sample']:.2f}"
+        )
+
     # =====================================================
     # Throughputs
     # =====================================================
