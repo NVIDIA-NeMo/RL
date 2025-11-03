@@ -32,6 +32,8 @@ grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    in_flight_weight_updates: false # Set to true to enable in-flight weight updates
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -50,7 +52,7 @@ loss_fn:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo"
-  metric_name: "val_reward"
+  metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
@@ -63,7 +65,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
-  hf_config_overrides: null
+  hf_config_overrides: {} 
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -105,7 +107,7 @@ policy:
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
-    defer_fp32_logits: null
+    defer_fp32_logits: False
 
     optimizer:
       optimizer: "adam"
@@ -147,7 +149,6 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: true
-      average_in_collective: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
