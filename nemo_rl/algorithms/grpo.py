@@ -819,6 +819,21 @@ def refit_policy_generation(
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
+def print_mem(state_dict: list, key: str):
+    """
+    Usage: print_mem(dir(), key="some key")
+    """
+    from psutil import Process
+
+
+    process = Process(os.getpid())
+    mem_info = process.memory_info()
+
+    print("-" * 40 + f"\n{key}\n")
+    print([k for k in state_dict if "__" not in k])
+    print(mem_info)
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -882,6 +897,7 @@ def grpo_train(
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Run validation at the start if configured
+    print_mem(dir(), "before validation")  # TODO remove
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
@@ -901,6 +917,7 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    print_mem(dir(), "before loop")  # TODO remove
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -922,6 +939,7 @@ def grpo_train(
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
+                print_mem(dir(), "preparing batch")  # TODO remove
                 with timer.time("data_processing"):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
@@ -941,6 +959,7 @@ def grpo_train(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
                     flush=True,
                 )
+                print_mem(dir(), "generation")  # TODO remove
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1015,6 +1034,7 @@ def grpo_train(
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
+                print_mem(dir(), "processing rewards")  # TODO remove
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
@@ -1122,6 +1142,7 @@ def grpo_train(
                     train_data.to("cpu")
 
                 print("▶ Preparing for logprob inference...", flush=True)
+                print_mem(dir(), "computing logprobs")  # TODO remove
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
@@ -1137,6 +1158,7 @@ def grpo_train(
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...", flush=True)
+                print_mem(dir(), "policy train")  # TODO remove
                 with timer.time("training_prep"):
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
@@ -1150,6 +1172,7 @@ def grpo_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
+                print_mem(dir(), "validation")  # TODO remove
                 # Run validation if it's a validation step
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
@@ -1177,6 +1200,7 @@ def grpo_train(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
 
+                print_mem(dir(), "metrics")  # TODO remove
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
@@ -1225,6 +1249,7 @@ def grpo_train(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
+                print_mem(dir(), "checkpointing")  # TODO remove
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
@@ -1298,6 +1323,7 @@ def grpo_train(
 
             # Logging
             # Log training data
+            print_mem(dir(), "logging")  # TODO remove
             log_data = {"content": flat_messages["content"]}
             log_data["rewards"] = rewards.tolist()
             if master_config["grpo"]["use_dynamic_sampling"]:
