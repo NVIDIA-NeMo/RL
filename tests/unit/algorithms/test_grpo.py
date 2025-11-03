@@ -933,6 +933,10 @@ def mock_grpo_components():
             "reward_scaling": {"enabled": False},
             "reward_shaping": {"enabled": False},
             "use_dynamic_sampling": False,
+            "async_grpo": {
+                "enabled": False,
+                "max_trajectory_age_steps": 1,
+            },
         },
         "policy": {
             "train_global_batch_size": 1,

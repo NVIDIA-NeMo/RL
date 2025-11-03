@@ -247,3 +247,8 @@ class GenerationInterface(ABC):
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError
+
+    # Optional hook; backends may override to invalidate any reusable caches
+    # (e.g., vLLM prefix/KV caches) after weight updates.
+    def invalidate_kv_cache(self) -> bool:
+        return False
