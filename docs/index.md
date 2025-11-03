@@ -6,7 +6,7 @@ This documentation provides comprehensive guides, examples, and references to he
 
 ## Getting Started
 
-::::{grid} 1 1 2 3
+::::{grid} 1 1 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`book` Overview
