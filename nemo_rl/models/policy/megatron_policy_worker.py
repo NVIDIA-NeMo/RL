@@ -910,7 +910,7 @@ class MegatronPolicyWorker:
                 module._inference_key_value_memory = None
 
         # TODO patch fix to even see if this ray.put sharding works...
-        data = data[0][data[1]]
+        data = ray.get(data[0])[data[1]]
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -1170,7 +1170,7 @@ class MegatronPolicyWorker:
         )
 
         # TODO patch fix to even see if this ray.put sharding works...
-        data = data[0][data[1]]
+        data = ray.get(data[0])[data[1]]
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
