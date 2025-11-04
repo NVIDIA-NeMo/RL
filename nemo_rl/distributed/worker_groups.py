@@ -877,7 +877,9 @@ class RayWorkerGroup:
                         # Select the appropriate slice for this axis
                         worker_args = [arg[worker_coords[axis]] for arg in worker_args]
                         worker_kwargs = {
-                            key: value[worker_coords[axis]]
+                            # key: value[worker_coords[axis]]
+                            # Here we use ray.put as suggested by https://docs.ray.io/en/latest/ray-core/patterns/closure-capture-large-objects.html#code-example
+                            key: ray.put(value[worker_coords[axis]])
                             for key, value in worker_kwargs.items()
                         }
 
