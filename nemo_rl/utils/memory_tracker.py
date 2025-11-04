@@ -1,5 +1,6 @@
 import os
 from psutil import Process
+from ray.scripts.scripts import memory_summary
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -22,11 +23,15 @@ class MemoryTrackerDataPoint(BaseModel):
         return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
 
     def get_snapshot_str(self) -> str:
+        ray_memory_summary = memory_summary()
         return f"""Memory tracker for {self.stage}:
 - Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
 - Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
 - Mem usage diff (after - before)   {self.mem_used_diff_gb:>+7.2f} GB
 - New variables: {self.new_variables}
+
+Ray memory snapshot:
+{ray_memory_summary}
 """
 
 
