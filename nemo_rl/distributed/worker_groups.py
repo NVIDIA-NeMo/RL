@@ -877,7 +877,7 @@ class RayWorkerGroup:
             if should_receive_data:
                 # Find the appropriate data slice for this worker
                 worker_args = args
-                worker_kwargs = kwargs
+                worker_kwargs = object_ref_kwargs
                 for axis in in_sharded_axes:
                     if axis in worker_coords:
                         # Select the appropriate slice for this axis
@@ -900,7 +900,7 @@ class RayWorkerGroup:
                 if make_dummy_calls_to_free_axes:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
                     worker_args = [None] * len(args)
-                    worker_kwargs = {key: None for key in kwargs.keys()}
+                    worker_kwargs = {key: None for key in object_ref_kwargs.keys()}
                     future = getattr(worker, method_name).remote(
                         *worker_args, **worker_kwargs, **common_kwargs
                     )
