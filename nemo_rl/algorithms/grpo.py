@@ -17,13 +17,11 @@ import time
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
-from psutil import Process
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -72,6 +70,7 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
+from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -819,58 +818,6 @@ def refit_policy_generation(
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
-
-
-class MemoryTrackerDataPoint(BaseModel):
-    stage: str
-    memory_used_before_stage_gb: float
-    variables_before_stage: list[str]
-
-    memory_used_after_stage_gb: Optional[float] = None
-    variables_after_stage: Optional[list[str]] = None
-
-    @property
-    def mem_used_diff_gb(self) -> float:
-        return self.memory_used_after_stage_gb - self.memory_used_before_stage_gb
-
-    @property
-    def new_variables(self) -> list[str]:
-        return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
-
-    def get_snapshot_str(self) -> str:
-        return f"""Memory tracker for {self.stage}:
-- Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
-- Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
-- Mem usage diff (after - before)   {self.mem_used_diff_gb:>+7.2f} GB
-- New variables: {self.new_variables}
-"""
-
-
-class MemoryTracker(BaseModel):
-    data_points: list[MemoryTrackerDataPoint] = Field(default_factory=list)
-
-    def model_post_init(self, context):
-        self._process = Process(os.getpid())
-        return super().model_post_init(context)
-
-    def snapshot_start_of_stage(self, stage: str, all_current_variables: list[str]) -> None:
-        mem_info = self._process.memory_info()
-        current_mem_used_gb: float = mem_info.rss / (1024 ** 3)
-
-        if self.data_points:
-            last_data_point = self.data_points[-1]
-            last_data_point.memory_used_after_stage_gb = current_mem_used_gb
-            last_data_point.variables_after_stage = all_current_variables
-
-            print(last_data_point.get_snapshot_str())
-
-        self.data_points.append(
-            MemoryTrackerDataPoint(
-                stage=stage,
-                memory_used_before_stage_gb=current_mem_used_gb,
-                variables_before_stage=all_current_variables,
-            )
-        )
 
 
 # ===============================================================================
