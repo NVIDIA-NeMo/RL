@@ -883,6 +883,9 @@ class RayWorkerGroup:
                             for key, value in worker_kwargs.items()
                         }
 
+                # TODO remove
+                print("WORKER ARGS", worker_args)
+                print("WORKER KWARGS", worker_kwargs)
                 # Call the method on the worker with its data slice
                 future = getattr(worker, method_name).remote(
                     *worker_args, **worker_kwargs, **common_kwargs
