@@ -276,6 +276,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        print("In policy get_logprobs")
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -304,6 +305,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=None,
             )
+        print("After shard by batch size")
 
         futures = self.worker_group.run_all_workers_sharded_data(
             "get_logprobs",
@@ -320,14 +322,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "pipeline_parallel",
             ],
         )
+        print("After run_all_workers_sharded_data")
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures)
         )
+        print("After get_all_worker_results")
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
         # so change it back here
         if self.use_dynamic_batches or self.use_sequence_packing:
             logprobs.reorder_data(unsorted_data_indices)
+        print("After reorder_data")
 
         return logprobs
 

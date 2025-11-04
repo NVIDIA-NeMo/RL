@@ -844,6 +844,7 @@ class RayWorkerGroup:
             key: ray.put(value)
             for key, value in kwargs.items()
         }
+        print("After object_ref_kwargs put")
 
         called_workers = []
         return_from_workers = []
@@ -889,10 +890,12 @@ class RayWorkerGroup:
                             for key, value in worker_kwargs.items()
                         }
 
+                print(f"Before worker_idx {worker_idx} remote")
                 # Call the method on the worker with its data slice
                 future = getattr(worker, method_name).remote(
                     *worker_args, **worker_kwargs, **common_kwargs
                 )
+                print(f"After worker_idx {worker_idx} remote")
                 futures.append(future)
                 called_workers.append(worker_idx)
             else:
