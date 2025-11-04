@@ -165,6 +165,11 @@ class WandbLogger(LoggerInterface):
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         self.run = wandb.init(**cfg, dir=log_dir)
+
+        if os.environ.get("RAY_BACKEND_LOG_LEVEL", None).lower() == "debug":
+            wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
+            wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
+
         self._log_code()
         self._log_diffs()
         print(
