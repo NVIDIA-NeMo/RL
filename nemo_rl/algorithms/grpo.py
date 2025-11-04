@@ -17,12 +17,13 @@ import time
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+from psutil import Process
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -820,15 +821,64 @@ def refit_policy_generation(
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
+class MemoryTrackerDataPoint(BaseModel):
+    stage: str
+    memory_used_before_stage_gb: float
+    variables_before_stage: list[str]
+
+    memory_used_after_stage_gb: Optional[float] = None
+    variables_after_stage: Optional[list[str]] = None
+
+    @property
+    def mem_used_diff_gb(self) -> float:
+        return self.memory_used_after_stage_gb - self.memory_used_before_stage_gb
+
+    @property
+    def new_variables(self) -> list[str]:
+        return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
+
+    def get_snapshot_str(self) -> str:
+        return f"""Memory tracker for {self.stage}:
+- Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
+- Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
+- Mem usage diff (after - before)   {self.mem_used_diff_gb:>+7.2f} GB
+- New variables: {self.new_variables}
+"""
+
+
+class MemoryTracker(BaseModel):
+    data_points: list[MemoryTrackerDataPoint] = Field(default_factory=list)
+
+    def model_post_init(self, context):
+        self._process = Process(os.getpid())
+        return super().model_post_init(context)
+
+    def snapshot_start_of_stage(self, stage: str, all_current_variables: list[str]) -> None:
+        mem_info = self._process.memory_info()
+        current_mem_used_gb: float = mem_info.rss / (1024 ** 3)
+
+        if self.data_points:
+            last_data_point = self.data_points[-1]
+            last_data_point.memory_used_after_stage_gb = current_mem_used_gb
+            last_data_point.variables_after_stage = all_current_variables
+
+            print(last_data_point.get_snapshot_str())
+
+        self.data_points.append(
+            MemoryTrackerDataPoint(
+                stage=stage,
+                memory_used_before_stage_gb=current_mem_used_gb,
+                variables_before_stage=all_current_variables,
+            )
+        )
+
+
 def print_mem(state_dict: list, key: str):
     """
     Usage: print_mem(dir(), key="some key")
     """
-    from psutil import Process
 
 
-    process = Process(os.getpid())
-    mem_info = process.memory_info()
 
     print("-" * 40 + f"\n{key}\n")
     print([k for k in state_dict if "__" not in k])
@@ -864,6 +914,7 @@ def grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+    memory_tracker = MemoryTracker()
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -900,9 +951,10 @@ def grpo_train(
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Run validation at the start if configured
-    print_mem(dir(), "before validation")  # TODO remove
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
+        memory_tracker.snapshot_start_of_stage("Initial validation", dir())
+
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
@@ -920,7 +972,7 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
-    print_mem(dir(), "before loop")  # TODO remove
+    memory_tracker.snapshot_start_of_stage("Start training loop", dir())
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -942,7 +994,7 @@ def grpo_train(
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                print_mem(dir(), "preparing batch")  # TODO remove
+                memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
                 with timer.time("data_processing"):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
@@ -962,7 +1014,7 @@ def grpo_train(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
                     flush=True,
                 )
-                print_mem(dir(), "generation")  # TODO remove
+                memory_tracker.snapshot_start_of_stage("Generation", dir())
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1037,7 +1089,7 @@ def grpo_train(
 
                 # Calculate rewards & advantages
                 print("▶ Processing rewards...,", flush=True)
-                print_mem(dir(), "processing rewards")  # TODO remove
+                memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
@@ -1145,11 +1197,11 @@ def grpo_train(
                     train_data.to("cpu")
 
                 print("▶ Preparing for logprob inference...", flush=True)
-                print_mem(dir(), "computing logprobs")  # TODO remove
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
+                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 with timer.time("policy_and_reference_logprobs"):
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
@@ -1161,12 +1213,12 @@ def grpo_train(
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...", flush=True)
-                print_mem(dir(), "policy train")  # TODO remove
                 with timer.time("training_prep"):
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
+                memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
@@ -1175,9 +1227,9 @@ def grpo_train(
                     and (current_step + 1 == len(dataloader))
                 )
 
-                print_mem(dir(), "validation")  # TODO remove
                 # Run validation if it's a validation step
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
+                    memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             policy, policy_generation, colocated_inference
@@ -1203,7 +1255,7 @@ def grpo_train(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
 
-                print_mem(dir(), "metrics")  # TODO remove
+                memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
@@ -1252,7 +1304,7 @@ def grpo_train(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                print_mem(dir(), "checkpointing")  # TODO remove
+                memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
                 if master_config["checkpointing"]["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
@@ -1326,7 +1378,7 @@ def grpo_train(
 
             # Logging
             # Log training data
-            print_mem(dir(), "logging")  # TODO remove
+            memory_tracker.snapshot_start_of_stage("Logging", dir())
             logging_start_time = time.time()
             log_data = {"content": flat_messages["content"]}
             log_data["rewards"] = rewards.tolist()
@@ -1420,7 +1472,7 @@ def grpo_train(
             dynamic_sampling_num_gen_batches = 0
 
             # Clear mem
-            print_mem(dir(), "before clear mem")  # TODO remove
+            memory_tracker.snapshot_start_of_stage("Before CPU memory clear", dir())
 
             # generation
             if "penguin_rollout_result" in dir():
@@ -1444,19 +1496,21 @@ def grpo_train(
             if "val_metrics" in dir():
                 del val_metrics
 
-            print_mem(dir(), "after clear mem")  # TODO remove
+            memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
             timer.reset()
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
+                memory_tracker.snapshot_start_of_stage("", dir())
                 return
             if total_steps >= max_num_steps:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
                 )
+                memory_tracker.snapshot_start_of_stage("", dir())
                 return
 
         current_epoch += 1
