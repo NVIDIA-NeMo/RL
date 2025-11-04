@@ -1438,6 +1438,8 @@ def grpo_train(
             # logging
             del log_data
             del metrics
+            if "val_metrics" in dir():
+                del val_metrics
 
             print_mem(dir(), "after clear mem")  # TODO remove
 
