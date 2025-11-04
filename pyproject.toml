@@ -21,7 +21,7 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "setuptools",
     "ninja",  # for flash-attn parallel build
-    "torch==2.8.0",
+    "torch==2.9.0",
     "triton",
     "colored==2.2.3",
     "ray[default]==2.49.2",
@@ -60,7 +60,7 @@ automodel = [
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-    "vllm==0.11.0",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
+    "vllm",  # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/811 resolved
     "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
@@ -72,7 +72,7 @@ vllm = [
     # sudo apt-get update
     # sudo apt-get install libibverbs-dev
     "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@e3908bf5bd0cc6265bcb225d15cd8c996d4759ef",
-    "vllm==0.11.0",
+    "vllm",
     "num2words>=0.5.14",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
     "flash-attn==2.8.1",
@@ -95,7 +95,7 @@ mcore = [
     "megatron-core",
     "megatron-bridge",
     # Remove this once https://github.com/NVIDIA-NeMo/RL/issues/501 resolved
-    "vllm==0.11.0",
+    "vllm",
     # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
     # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
     # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -167,6 +167,10 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", tag = "v1.5.0.post8" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4" }
+vllm = [
+  { index = "vllm-nightly", marker = "sys_platform != 'darwin'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
 
 [tool.uv.workspace]
 members = [
@@ -186,7 +190,13 @@ name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "vllm-nightly"
+url = "https://wheels.vllm.ai/nightly"
+explicit = true
+
 [tool.uv]
+prerelease = "allow"
 preview = true  # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
     "transformer-engine-torch",
@@ -207,7 +217,7 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # This override is needed because automodel/mbridge we are on is still on 2.5.0
-override-dependencies = ["transformer-engine[pytorch]==2.8.0"]
+override-dependencies = ["transformer-engine[pytorch]==2.8.0", "torch==2.9.0", "transformers==4.56.0", "xformers==v0.0.32.post1"]
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
