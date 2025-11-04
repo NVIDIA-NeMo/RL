@@ -1423,6 +1423,8 @@ def grpo_train(
             if "penguin_rollout_result" in dir():
                 del penguin_rollout_result
             del rollout_metrics
+            del input_ids
+            del repeated_batch
             # processing rewards
             del advantages
             del baseline
