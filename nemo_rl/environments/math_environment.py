@@ -44,6 +44,7 @@ class MathEnvConfig(TypedDict):
     stop_strings: NotRequired[list[str] | None]  # Default stop strings for this env
     # The verifier type. None defaults to "math".
     verifier_type: NotRequired[str | None]
+    math_verify_impl: NotRequired[str | None]
 
 
 @contextlib.contextmanager

@@ -145,7 +145,6 @@ policy: &POLICY_BASE
             grad_reduce_in_fp32: false
             overlap_grad_reduce: true
             overlap_param_gather: true
-            average_in_collective: true
             use_custom_fsdp: false
             data_parallel_sharding_strategy: "optim_grads_params"
 

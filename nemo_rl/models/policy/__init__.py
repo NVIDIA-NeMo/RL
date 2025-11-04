@@ -81,7 +81,7 @@ class MegatronSchedulerConfig(TypedDict):
     end_weight_decay: float
     weight_decay_incr_style: str
     lr_decay_style: str
-    lr_decay_iters: NotRequired[int]
+    lr_decay_iters: NotRequired[int | None]
     lr_warmup_iters: int
     lr_warmup_init: float
 
@@ -90,7 +90,6 @@ class MegatronDDPConfig(TypedDict):
     grad_reduce_in_fp32: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
-    average_in_collective: bool
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
 
