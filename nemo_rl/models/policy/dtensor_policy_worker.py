@@ -545,6 +545,10 @@ class DTensorPolicyWorker:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
+
+        # TODO patch fix to even see if this ray.put sharding works...
+        data = data[0][data[1]]
+
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
         torch.distributed.all_reduce(
@@ -926,6 +930,9 @@ class DTensorPolicyWorker:
             else self.cfg["logprob_batch_size"]
         )
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+
+        # TODO patch fix to even see if this ray.put sharding works...
+        data = data[0][data[1]]
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
