@@ -249,7 +249,6 @@ def setup_configs(args, tokenizer):
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": False,
                 "overlap_param_gather": False,
-                "average_in_collective": False,
                 "use_custom_fsdp": False,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },

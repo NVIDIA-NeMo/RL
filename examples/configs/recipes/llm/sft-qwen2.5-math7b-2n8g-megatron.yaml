@@ -1,0 +1,53 @@
+defaults: ../../sft.yaml
+sft:
+  max_num_steps: 80
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen2.5-Math-7B
+  train_global_batch_size: 512
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    context_parallel_size: 2
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      bf16: true
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      use_distributed_optimizer: false
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-11
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: 32
+data:
+  dataset_name: openmathinstruct2
+  prompt_file: examples/prompts/math.txt
+  split: train_1M
+  add_generation_prompt: true
+  output_key: generated_solution
+  num_workers: 8
+logger:
+  wandb:
+    project: nemo-rl
+    name: sft-qwen2.5-math-7b-megatron
+  tensorboard:
+    log_dir: tb_logs-sft-qwen2.5-math-7b-megatron
+  mlflow:
+    run_name: sft-qwen2.5-math-7b-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
