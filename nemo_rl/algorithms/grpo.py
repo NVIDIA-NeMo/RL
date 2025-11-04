@@ -1327,6 +1327,7 @@ def grpo_train(
             # Logging
             # Log training data
             print_mem(dir(), "logging")  # TODO remove
+            logging_start_time = time.time()
             log_data = {"content": flat_messages["content"]}
             log_data["rewards"] = rewards.tolist()
             if master_config["grpo"]["use_dynamic_sampling"]:
@@ -1408,6 +1409,8 @@ def grpo_train(
             )
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
+            logging_total_time = time.time() - logging_start_time
+            print(f"Total logging time taken: {logging_total_time:.2f}s")
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
