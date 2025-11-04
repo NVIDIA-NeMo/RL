@@ -1414,7 +1414,7 @@ def grpo_train(
             dynamic_sampling_num_gen_batches = 0
 
             # Clear mem
-            memory_tracker.snapshot_start_of_stage("Before CPU memory clear", dir())
+            memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
             # generation
             if "penguin_rollout_result" in dir():
@@ -1437,8 +1437,6 @@ def grpo_train(
             del metrics
             if "val_metrics" in dir():
                 del val_metrics
-
-            memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
             timer.reset()
             current_step += 1
