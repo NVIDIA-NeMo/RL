@@ -915,6 +915,7 @@ def grpo_train(
 
         # Run grpo/dapo training loop (single-turn)
         for batch in dataloader:
+            memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
@@ -926,7 +927,6 @@ def grpo_train(
 
             with timer.time("total_step_time"):
                 # Prepare batch
-                memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
                     # Repeat batch items
