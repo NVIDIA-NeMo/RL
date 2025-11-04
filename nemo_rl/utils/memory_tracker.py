@@ -1,4 +1,5 @@
 from psutil import Process
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -6,17 +7,17 @@ from pydantic import BaseModel, Field
 class MemoryTrackerDataPoint(BaseModel):
     stage: str
     memory_used_before_stage_gb: float
-    variables_before_stage: list[str]
+    variables_before_stage: List[str]
 
     memory_used_after_stage_gb: Optional[float] = None
-    variables_after_stage: Optional[list[str]] = None
+    variables_after_stage: Optional[List[str]] = None
 
     @property
     def mem_used_diff_gb(self) -> float:
         return self.memory_used_after_stage_gb - self.memory_used_before_stage_gb
 
     @property
-    def new_variables(self) -> list[str]:
+    def new_variables(self) -> List[str]:
         return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
 
     def get_snapshot_str(self) -> str:
@@ -29,13 +30,13 @@ class MemoryTrackerDataPoint(BaseModel):
 
 
 class MemoryTracker(BaseModel):
-    data_points: list[MemoryTrackerDataPoint] = Field(default_factory=list)
+    data_points: List[MemoryTrackerDataPoint] = Field(default_factory=list)
 
     def model_post_init(self, context):
         self._process = Process(os.getpid())
         return super().model_post_init(context)
 
-    def snapshot_start_of_stage(self, stage: str, all_current_variables: list[str]) -> None:
+    def snapshot_start_of_stage(self, stage: str, all_current_variables: List[str]) -> None:
         mem_info = self._process.memory_info()
         current_mem_used_gb: float = mem_info.rss / (1024 ** 3)
 
