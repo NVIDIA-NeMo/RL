@@ -17,10 +17,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.utils import (
-    calculate_kl_penalty_joschu2020,
-    masked_mean,
-)
+from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
@@ -37,6 +34,9 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 class ClippedPGLossConfig(TypedDict):
     reference_policy_kl_penalty: float
+    reference_policy_kl_type: str
+    kl_input_clamp_value: float | None
+    kl_output_clamp_value: float | None
     ratio_clip_min: float
     ratio_clip_max: float
     # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
@@ -110,6 +110,9 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_max = cfg["ratio_clip_max"]
         self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
         self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
+        self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
+        self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
+        self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
         self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
         self.use_importance_sampling_correction = cfg[
@@ -169,22 +172,32 @@ class ClippedPGLossFn(LossFunction):
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        # gen-kl(kl(P_gen || P_train)) = torch.exp(log_ratio) - log_ratio - 1
+        # gen-kl: kl(P_gen || P_train)
         # where log_ratio = prev_logprobs - generation_logprobs
+        gen_kl_error = calculate_kl(
+            logprobs=generation_logprobs,
+            logprobs_reference=prev_logprobs,
+            kl_type=self.reference_policy_kl_type,
+            input_clamp_value=None,
+            output_clamp_value=None,
+        )
         gen_kl_error = masked_mean(
-            torch.exp(prev_logprobs - generation_logprobs)
-            - (prev_logprobs - generation_logprobs)
-            - 1,
+            gen_kl_error,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
-        # policy-kl(kl(P_train || P_gen)) = torch.exp(log_ratio) - log_ratio - 1
-        # where log_ratio = prev_logprobs - generation_logprobs
+        # policy-kl: kl(P_train || P_gen)
+        # where log_ratio = generation_logprobs - prev_logprobs
+        policy_kl_error = calculate_kl(
+            logprobs=prev_logprobs,
+            logprobs_reference=generation_logprobs,
+            kl_type=self.reference_policy_kl_type,
+            input_clamp_value=None,
+            output_clamp_value=None,
+        )
         policy_kl_error = masked_mean(
-            torch.exp(generation_logprobs - prev_logprobs)
-            - (generation_logprobs - prev_logprobs)
-            - 1,
+            policy_kl_error,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
@@ -261,9 +274,12 @@ class ClippedPGLossFn(LossFunction):
             kl = (
                 kl_importance_weights
                 * self.reference_policy_kl_penalty
-                * calculate_kl_penalty_joschu2020(
-                    logprobs_policy=curr_logprobs,
+                * calculate_kl(
+                    logprobs=curr_logprobs,
                     logprobs_reference=reference_policy_logprobs,
+                    kl_type=self.reference_policy_kl_type,
+                    input_clamp_value=self.kl_input_clamp_value,
+                    output_clamp_value=self.kl_output_clamp_value,
                 )
             )
             if self.loss_type == LossType.TOKEN_LEVEL:
