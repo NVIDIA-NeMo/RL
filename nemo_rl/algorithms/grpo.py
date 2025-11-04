@@ -926,8 +926,8 @@ def grpo_train(
 
             with timer.time("total_step_time"):
                 # Prepare batch
-                print("▶ Preparing batch...", flush=True)
                 memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
+                print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
@@ -943,11 +943,11 @@ def grpo_train(
                     input_ids = batched_flat["token_ids"]
 
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                memory_tracker.snapshot_start_of_stage("Generation", dir())
                 print(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
                     flush=True,
                 )
-                memory_tracker.snapshot_start_of_stage("Generation", dir())
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -1030,8 +1030,8 @@ def grpo_train(
                     )
 
                 # Calculate rewards & advantages
-                print("▶ Processing rewards...,", flush=True)
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
+                print("▶ Processing rewards...,", flush=True)
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
@@ -1138,12 +1138,12 @@ def grpo_train(
                     )
                     train_data.to("cpu")
 
+                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 with timer.time("policy_and_reference_logprobs"):
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
@@ -1154,13 +1154,13 @@ def grpo_train(
                         )["reference_logprobs"]
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
+                memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
