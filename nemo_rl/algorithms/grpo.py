@@ -873,20 +873,6 @@ class MemoryTracker(BaseModel):
         )
 
 
-def print_mem(state_dict: list, key: str):
-    """
-    Usage: print_mem(dir(), key="some key")
-    """
-
-
-
-    print("-" * 40 + f"\n{key}\n")
-    print([k for k in state_dict if "__" not in k])
-
-    mem_used_gb = mem_info.rss / (1024 ** 3)
-    print(mem_info, f"Mem used: {mem_used_gb:.2f} GB")
-
-
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
