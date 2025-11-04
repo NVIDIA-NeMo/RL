@@ -977,6 +977,15 @@ def grpo_train(
                         input_ids = penguin_rollout_result.input_ids
                         repeated_batch = penguin_rollout_result.final_batch
                         rollout_metrics = penguin_rollout_result.rollout_metrics
+
+                        # Penguin responses can be very large and expensive to log. Here we have logic to opt-in to logging.
+                        env_config = master_config.get("env") or dict()
+                        should_log_penguin_responses = bool(env_config.get("should_log_penguin_responses"))
+                        if not should_log_penguin_responses:
+                            for key in list(rollout_metrics):
+                                if "full_result" in key:
+                                    rollout_metrics.pop(key)
+
                     # Use async rollouts if vLLM async engine is enabled
                     elif _should_use_async_rollouts(master_config):
                         (
