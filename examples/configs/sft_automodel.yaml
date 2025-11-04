@@ -38,10 +38,10 @@ policy:
     use_liger_kernel: false
     backend:
       _target_: nemo_automodel.components.moe.utils.BackendConfig
-      attn: flex
+      attn: te
       linear: te
       rms_norm: te
-      enable_deepep: false
+      enable_deepep: true
       fake_balanced_gate: false
       enable_hf_state_dict_adapter: true
 
@@ -74,16 +74,19 @@ policy:
   max_grad_norm: 1.0
 
   optimizer:
-    name: "torch.optim.AdamW"
+    #name: "torch.optim.AdamW"
+    name: "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
     kwargs:
       lr: 5.0e-6
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
+      store_param_remainders: true
+      master_weights: true
       # when using Dtensor, we need to set foreach
       # and fused to False
-      foreach: False
-      fused: False
+      #foreach: False
+      #fused: False
 
   # ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
@@ -104,7 +107,7 @@ policy:
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
     moe_permute_fusion: false
-    #gives ~20% training perf speedup with sequence packing 
+    #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
@@ -198,8 +201,8 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "sft-dev"
-    name: "sft-dev-${data.dataset_name}"
+    project: "hemild-rl-automodel"
+    name: "${policy.model_name}-${data.dataset_name}-attn-${policy.automodel_model_kwargs.backend.attn}-ep${policy.dtensor_cfg.expert_parallel_size}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"
   mlflow:

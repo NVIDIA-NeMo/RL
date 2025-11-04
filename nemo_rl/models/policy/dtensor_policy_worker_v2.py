@@ -30,25 +30,36 @@ from nemo_automodel import (
 from nemo_automodel._transformers.utils import (
     sliding_window_overwrite,
 )
-from nemo_automodel.components.moe.parallelizer import (
-    parallelize_model as moe_parallelize_model,
+from nemo_automodel.components.checkpoint._backports.filesystem import (
+    SerializationFormat,
 )
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    _maybe_adapt_state_dict_from_hf,
+    _maybe_adapt_state_dict_to_hf,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
+    CheckpointingConfig as AutomodelCheckpointingConfig,
+)
+from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
+)
+from nemo_automodel.components.distributed.fsdp2 import (
+    FSDP2Manager,
 )
 from nemo_automodel.components.distributed.grad_utils import (
     clip_grad_by_total_norm_,
     get_grad_norm,
 )
-from nemo_automodel.components.distributed.fsdp2 import (
-    FSDP2Manager,
-)
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.config.loader import _resolve_target
+from nemo_automodel.components.moe.parallelizer import (
+    parallelize_model as moe_parallelize_model,
+)
 from torch import nn
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
@@ -59,8 +70,10 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedModel,
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+from transformers.utils import TRANSFORMERS_CACHE
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
@@ -87,20 +100,9 @@ from nemo_rl.models.policy.utils import (
     import_class_from_path,
     resolve_model_class,
 )
-
 from nemo_rl.utils.checkpoint import CheckpointingConfig
-from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
-    CheckpointingConfig as AutomodelCheckpointingConfig,
-)
-from nemo_automodel.components.checkpoint._backports.filesystem import (
-    SerializationFormat,
-)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-
-from transformers.utils import TRANSFORMERS_CACHE
-from transformers import PreTrainedModel
 
 
 @ray.remote(
@@ -424,7 +426,7 @@ class DTensorPolicyWorkerV2:
         if init_optimizer:
             optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
+                self.model.parameters(), **self.cfg["optimizer"]["kwargs"], exp_avg_dtype=torch.bfloat16, exp_avg_sq_dtype=torch.bfloat16
             )
         else:
             self.optimizer = None
@@ -704,10 +706,11 @@ class DTensorPolicyWorkerV2:
                         )
 
                     with get_train_context(False, False, context_parallel_ctx)():
-                        with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        with nullcontext():
                             model_args = dict(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
+                                padding_mask=~attention_mask,
                                 position_ids=position_ids,
                                 use_cache=False,
                                 flash_attn_kwargs=flash_attn_kwargs,
@@ -831,7 +834,7 @@ class DTensorPolicyWorkerV2:
 
                             # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                             # but we want to sum them so we cancel out the average here
-                            loss *= self.dp_size * self.cp_size
+                            #loss *= self.dp_size * self.cp_size
                             loss.backward()
 
                     if num_valid_samples > 0:
@@ -840,7 +843,22 @@ class DTensorPolicyWorkerV2:
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    with torch.no_grad():
+                    from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+                    grad_norm = scale_grads_and_clip_grad_norm(
+            						self.max_grad_norm,
+            						[self.model],
+            						norm_type=2.0,
+            						pp_enabled=False,
+            						device_mesh=self.device_mesh,
+            						moe_mesh=self.moe_mesh,
+            						ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            						pp_axis_name=None,
+            						foreach=True,
+            						num_label_tokens=1,
+            						dp_group_size=self.dp_size*self.cp_size,
+        						)
+                    grad_norm = grad_norm.detach().cpu().float()
+                    '''with torch.no_grad():
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
                             dp_cp_group=self.dp_cp_mesh.get_group(),
@@ -853,7 +871,7 @@ class DTensorPolicyWorkerV2:
                                 max_grad_norm=self.max_grad_norm,
                                 total_norm=grad_norm,
                             )
-                        grad_norm = torch.tensor([grad_norm])
+                        grad_norm = torch.tensor([grad_norm])'''
 
                     # Update parameters
                     self.optimizer.step()
@@ -1034,7 +1052,7 @@ class DTensorPolicyWorkerV2:
                     )
 
                 with get_train_context(False, False, context_parallel_ctx)():
-                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    with nullcontext():
                         model_args = dict(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
@@ -1054,7 +1072,7 @@ class DTensorPolicyWorkerV2:
 
                         outputs = self.model(**model_args)
 
-                    logits = outputs.logits
+                    logits = outputs.logits if hasattr(outputs, "logits") else outputs
 
                     # Apply temperature scaling
                     logits = self._apply_temperature_scaling(logits)
@@ -1106,6 +1124,7 @@ class DTensorPolicyWorkerV2:
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
+                            print(f"{logits.__class__=}")
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                                 logits,
                                 input_ids,
@@ -1703,7 +1722,9 @@ class DTensorPolicyWorkerV2:
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        state_dict = self.model.state_dict()
+        state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
+        for name, tensor in state_dict.items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
@@ -1729,7 +1750,9 @@ class DTensorPolicyWorkerV2:
 
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
+            state_dict = self.model.state_dict()
+            state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
+            for name, tensor in state_dict.items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
