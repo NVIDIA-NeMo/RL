@@ -1432,6 +1432,7 @@ def grpo_train(
             del fprop_logprobs
             # logging
             del log_data
+            del metrics
 
             print_mem(dir(), "after clear mem")  # TODO remove
 
