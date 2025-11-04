@@ -1337,9 +1337,11 @@ def grpo_train(
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
             log_data["input_lengths"] = input_lengths.tolist()
+            print("after tolist")
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{total_steps + 1}.jsonl"
             )
+            print("after log_batched_dict_as_jsonl")
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -1402,6 +1404,7 @@ def grpo_train(
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
+            print("after print_performance_metrics")
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
