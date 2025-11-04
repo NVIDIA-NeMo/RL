@@ -23,7 +23,7 @@ class MemoryTrackerDataPoint(BaseModel):
         return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
 
     def get_snapshot_str(self) -> str:
-        ray_memory_summary = memory_summary(num_entries=10)
+        ray_memory_summary = memory_summary(num_entries=5)
         return f"""Memory tracker for {self.stage}:
 - Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
 - Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
