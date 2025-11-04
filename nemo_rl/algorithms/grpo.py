@@ -1415,34 +1415,21 @@ def grpo_train(
 
             # Clear mem
             print_mem(dir(), "before clear mem")  # TODO remove
-            local_vars = locals()
-            def del_var_helper(var_name: str) -> None:
-                if var_name in local_vars:
-                    print(f"Deleting {var_name}")
-                    del local_vars[var_name]
 
-            vars_to_delete = [
-                # generation
-                'generation_config',
-                'penguin_rollout_result',
-                'rollout_metrics',
-                # processing rewards
-                'advantages',
-                'baseline',
-                'ds_metrics',
-                'flat_messages',
-                'rewards',
-                'std',
-                'train_data',
-                'zero_std_mask',
-                # computing logprobs
-                'fprop_logprobs',
-                # logging
-                'log_data',
-            ]
-
-            for var_to_delete in vars_to_delete:
-                del_var_helper(var_to_delete)
+            # generation
+            del rollout_metrics
+            # processing rewards
+            del advantages
+            del baseline
+            del flat_messages
+            del rewards
+            del std
+            del train_data
+            del zero_std_mask
+            # computing logprobs
+            del fprop_logprobs
+            # logging
+            del log_data
 
             print_mem(dir(), "after clear mem")  # TODO remove
 
