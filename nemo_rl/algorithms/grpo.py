@@ -1417,6 +1417,8 @@ def grpo_train(
             print_mem(dir(), "before clear mem")  # TODO remove
 
             # generation
+            if "penguin_rollout_result" in dir():
+                del penguin_rollout_result
             del rollout_metrics
             # processing rewards
             del advantages
