@@ -22,6 +22,7 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 import numpy as np
 import ray
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -1411,6 +1412,38 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+
+            # Clear mem
+            print_mem(dir(), "before clear mem")  # TODO remove
+            local_vars = locals()
+            def del_var_helper(var_name: str) -> None:
+                if var_name in local_vars:
+                    del local_vars[var_name]
+
+            vars_to_delete = [
+                # generation
+                'generation_config',
+                'penguin_rollout_result',
+                'rollout_metrics',
+                # processing rewards
+                'advantages',
+                'baseline',
+                'ds_metrics',
+                'flat_messages',
+                'rewards',
+                'std',
+                'train_data',
+                'zero_std_mask',
+                # computing logprobs
+                'fprop_logprobs',
+                # logging
+                'log_data',
+            ]
+
+            for var_to_delete in vars_to_delete:
+                del_var_helper(vars_to_delete)
+
+            print_mem(dir(), "after clear mem")  # TODO remove
 
             timer.reset()
             current_step += 1
