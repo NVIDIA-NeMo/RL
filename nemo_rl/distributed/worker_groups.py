@@ -839,6 +839,12 @@ class RayWorkerGroup:
         if overlap:
             raise ValueError(f"Axes cannot be both sharded and replicated: {overlap}")
 
+        object_ref_kwargs = {
+            # Here we use ray.put as suggested by https://docs.ray.io/en/latest/ray-core/patterns/closure-capture-large-objects.html#code-example
+            key: ray.put(value)
+            for key, value in kwargs.items()
+        }
+
         called_workers = []
         return_from_workers = []
         # For each worker, determine what data it should receive
@@ -879,7 +885,7 @@ class RayWorkerGroup:
                         worker_kwargs = {
                             # key: value[worker_coords[axis]]
                             # Here we use ray.put as suggested by https://docs.ray.io/en/latest/ray-core/patterns/closure-capture-large-objects.html#code-example
-                            key: ray.put(value[worker_coords[axis]])
+                            key: (value, worker_coords[axis])
                             for key, value in worker_kwargs.items()
                         }
 
