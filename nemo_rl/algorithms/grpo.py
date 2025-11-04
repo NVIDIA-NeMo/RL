@@ -1442,7 +1442,7 @@ def grpo_train(
             ]
 
             for var_to_delete in vars_to_delete:
-                del_var_helper(vars_to_delete)
+                del_var_helper(var_to_delete)
 
             print_mem(dir(), "after clear mem")  # TODO remove
 
