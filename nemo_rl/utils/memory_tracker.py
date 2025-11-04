@@ -36,7 +36,7 @@ class MemoryTracker(BaseModel):
         self._process = Process(os.getpid())
         return super().model_post_init(context)
 
-    def snapshot_start_of_stage(self, stage: str, all_current_variables: List[str]) -> None:
+    def snapshot_start_of_stage(self, new_stage: str, all_current_variables: List[str]) -> None:
         mem_info = self._process.memory_info()
         current_mem_used_gb: float = mem_info.rss / (1024 ** 3)
 
@@ -49,7 +49,7 @@ class MemoryTracker(BaseModel):
 
         self.data_points.append(
             MemoryTrackerDataPoint(
-                stage=stage,
+                stage=new_stage,
                 memory_used_before_stage_gb=current_mem_used_gb,
                 variables_before_stage=all_current_variables,
             )
