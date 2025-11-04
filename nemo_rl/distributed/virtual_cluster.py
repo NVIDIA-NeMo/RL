@@ -98,6 +98,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
+    # TODO remove
+    print("RAY INIT ENV VARS", env_vars)
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
     # sort cvd to ensure consistent tag
