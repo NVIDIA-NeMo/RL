@@ -1418,6 +1418,7 @@ def grpo_train(
             local_vars = locals()
             def del_var_helper(var_name: str) -> None:
                 if var_name in local_vars:
+                    print(f"Deleting {var_name}")
                     del local_vars[var_name]
 
             vars_to_delete = [
