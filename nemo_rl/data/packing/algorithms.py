@@ -176,11 +176,21 @@ class SequencePacker(ABC):
             sequence_lengths list. The number of bins will satisfy min_bin_count
             and bin_count_multiple constraints if specified.
         """
+        from nemo_rl.utils.timer import Timer
+
+        with open("temp_sequence_lengths.json", "w") as f:
+            import json
+            json.dump(sequence_lengths, f)
+
+        timer = Timer()
+
         # Call the implementation
-        bins = self._pack_implementation(sequence_lengths)
+        with timer.time("pack implemenation"):
+            bins = self._pack_implementation(sequence_lengths)
 
         # Adjust bin count to meet constraints
-        bins = self._adjust_bin_count(bins)
+        with timer.time("adjust bin count"):
+            bins = self._adjust_bin_count(bins)
 
         # Update metrics if collection is enabled
         if self.collect_metrics and self.metrics:
