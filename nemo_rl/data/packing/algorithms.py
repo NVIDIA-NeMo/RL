@@ -626,6 +626,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         # Phase-5: FFD on leftovers
         with timer.time("phase 5"):
             leftovers = remaining_items  # renamed for clarity
+            print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
             ffd_bins: List[List[Tuple[int, int]]] = []
             for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
                 placed = False
