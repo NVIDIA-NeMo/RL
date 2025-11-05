@@ -722,7 +722,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
 def _should_use_penguin(master_config: MasterConfig) -> bool:
     """Determine if Penguin should be used for rollouts and validation based on the configuration."""
-    env_config = master_config["env"]
+    env_config = master_config.get("env") or dict()
     should_use_penguin = bool(env_config.get("should_use_penguin"))
     if not should_use_penguin:
         return should_use_penguin
