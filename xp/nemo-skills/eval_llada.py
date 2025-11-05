@@ -324,6 +324,8 @@ def main():
             f"++inference.extra_body.remasking={config['remasking']}",
             # Pass generation algorithm selection via extra_body
             f"++inference.extra_body.generation_algorithm={config['generation_algorithm']}",
+            # Set generation_key to 'predicted_answer' to match what evaluation expects
+            f"++generation_key=predicted_answer",
             f"++num_chunks=2"
         ]
         
@@ -372,6 +374,10 @@ def main():
         
         # Build extra_eval_args for evaluation-time parameters
         extra_eval_args = []
+        # Pass generation_key to evaluation step to match what generation writes
+        extra_eval_args.append("++generation_key=predicted_answer")
+        # Tell math evaluator to use the predicted_answer key directly (not extract from generation)
+        extra_eval_args.append("++eval_config.use_predicted_answer_key=True")
         if config["keep_thinking"]:
             extra_eval_args.append("++remove_thinking=False")
             print("\n⚠️  Keep-thinking mode enabled: <think> tags will NOT be removed from generations")
@@ -393,7 +399,7 @@ def main():
             # Optional parameters
             cluster=config["cluster"],
             dry_run=config["dry_run"],
-            extra_eval_args=" ".join(extra_eval_args) if extra_eval_args else None,
+            extra_eval_args=" ".join(extra_eval_args) if extra_eval_args else "",
         )
         
         print("\n" + "=" * 60)
