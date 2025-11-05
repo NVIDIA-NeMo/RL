@@ -1145,12 +1145,18 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    logprob_data = BatchedDataDict[ClippedPGLossDataDict](
+                        {
+                            "input_ids": flat_messages["token_ids"],
+                            "input_lengths": input_lengths,
+                        }
+                    )
+                    fprop_logprobs = policy.get_logprobs(logprob_data)["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
 
                     if not master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
                         reference_logprobs = policy.get_reference_policy_logprobs(
-                            train_data
+                            logprob_data
                         )["reference_logprobs"]
                         train_data["reference_policy_logprobs"] = reference_logprobs
 
@@ -1431,6 +1437,7 @@ def grpo_train(
             del train_data
             del zero_std_mask
             # computing logprobs
+            del logprob_data
             del fprop_logprobs
             # logging
             del log_data
