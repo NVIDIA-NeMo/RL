@@ -134,6 +134,8 @@ class GRPOConfig(TypedDict):
     batch_multiplier: NotRequired[float]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
+    # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
+    calculate_advantages_on_gpu: NotRequired[bool]
 
 
 class GRPOSaveState(TypedDict):
@@ -1049,14 +1051,27 @@ def grpo_train(
                     rewards = repeated_batch["total_reward"]
 
                     print("▶ Computing advantages...", flush=True)
-                    baseline, std = calculate_baseline_and_std_per_prompt(
-                        input_ids,
-                        rewards,
-                        torch.ones_like(rewards),
-                        leave_one_out_baseline=master_config["grpo"][
-                            "use_leave_one_out_baseline"
-                        ],
-                    )
+                    if master_config["grpo"].get("calculate_advantages_on_gpu"):
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            input_ids.cuda(),
+                            rewards.cuda(),
+                            torch.ones_like(rewards).cuda(),
+                            leave_one_out_baseline=master_config["grpo"][
+                                "use_leave_one_out_baseline"
+                            ],
+                        )
+                        baseline = baseline.cpu()
+                        std = std.cpu()
+                    else:
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            input_ids,
+                            rewards,
+                            torch.ones_like(rewards),
+                            leave_one_out_baseline=master_config["grpo"][
+                                "use_leave_one_out_baseline"
+                            ],
+                        )
+
                     # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                     repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
                         dynamic_sampling(
