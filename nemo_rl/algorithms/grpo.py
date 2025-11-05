@@ -725,7 +725,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
 
 def _should_use_penguin(master_config: MasterConfig) -> bool:
     """Determine if Penguin should be used for rollouts and validation based on the configuration."""
-    env_config = master_config["env"]
+    env_config = master_config.get("env") or dict()
     should_use_penguin = bool(env_config.get("should_use_penguin"))
     if not should_use_penguin:
         return should_use_penguin
@@ -744,6 +744,12 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
     )
 
     return should_use_penguin
+
+
+def _should_log_penguin_responses(master_config: MasterConfig) -> bool:
+    env_config = master_config.get("env") or dict()
+    should_log_penguin_responses = bool(env_config.get("should_log_penguin_responses"))
+    return should_log_penguin_responses
 
 
 def refit_policy_generation(
@@ -979,9 +985,7 @@ def grpo_train(
                         rollout_metrics = penguin_rollout_result.rollout_metrics
 
                         # Penguin responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        env_config = master_config.get("env") or dict()
-                        should_log_penguin_responses = bool(env_config.get("should_log_penguin_responses"))
-                        if not should_log_penguin_responses:
+                        if not _should_log_penguin_responses(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
@@ -1327,21 +1331,19 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            logging_start_time = time.time()
-            log_data = {"content": flat_messages["content"]}
-            log_data["rewards"] = rewards.tolist()
-            if master_config["grpo"]["use_dynamic_sampling"]:
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
+            if not _should_log_penguin_responses(master_config):
+                log_data = {"content": flat_messages["content"]}
+                log_data["rewards"] = rewards.tolist()
+                if master_config["grpo"]["use_dynamic_sampling"]:
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
 
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            print("after tolist")
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{total_steps + 1}.jsonl"
-            )
-            print("after log_batched_dict_as_jsonl")
+                log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{total_steps + 1}.jsonl"
+                )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -1412,8 +1414,6 @@ def grpo_train(
             )
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
-            logging_total_time = time.time() - logging_start_time
-            print(f"Total logging time taken: {logging_total_time:.2f}s")
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
