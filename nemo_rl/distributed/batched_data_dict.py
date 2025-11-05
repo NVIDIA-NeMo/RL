@@ -346,6 +346,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         >>> # This is incompatible with the batch_size argument
         ```
         """
+        print(f"Sharding BatchedDataDict into {shards} shards...")
         if allow_uneven_shards:
             assert batch_size is None, (
                 "batch_size must be None if allow_uneven_shards is True"
