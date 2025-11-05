@@ -1179,12 +1179,12 @@ def grpo_train(
                             "input_lengths": train_data["input_lengths"],
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)["logprobs"]
+                    train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)["logprobs"].clone()
 
                     if not master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
                         train_data["reference_policy_logprobs"] = policy.get_reference_policy_logprobs(
                             logprob_data
-                        )["reference_logprobs"]
+                        )["reference_logprobs"].clone()
 
                     del logprob_data
 
