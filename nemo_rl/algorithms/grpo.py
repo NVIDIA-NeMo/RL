@@ -1426,7 +1426,6 @@ def grpo_train(
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
-            print("after print_performance_metrics")
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
