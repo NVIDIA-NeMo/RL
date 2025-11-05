@@ -1052,6 +1052,7 @@ def grpo_train(
 
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
+                        print("Computing advantages on GPU!")
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(),
                             rewards.cuda(),
