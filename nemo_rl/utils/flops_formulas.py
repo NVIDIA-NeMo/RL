@@ -402,7 +402,7 @@ def deepseekv3(config: FLOPSConfig):
         )
 
     # linear layer flops
-     # Q projection: check if using MLA (q_lora_rank is set) or standard attention
+    # Q projection: check if using MLA (q_lora_rank is set) or standard attention
     if config.q_lora_rank is not None:
         # MLA for Q (e.g., DeepSeek-V3)
         per_layer_mla_params = config.hs * config.q_lora_rank + config.q_lora_rank * (
