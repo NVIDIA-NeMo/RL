@@ -97,11 +97,21 @@ class BatchAccumulator:
     
     async def _batch_distribution_loop(self):
         """Continuously check if batches are ready and distribute them."""
+        logger.info("[BatchAccumulator] Distribution loop starting...")
+        iteration = 0
         while True:
             try:
                 await asyncio.sleep(0.01)  # Small delay to prevent busy waiting
+                iteration += 1
                 
-                if not self.pending_requests or self.processing:
+                if not self.pending_requests:
+                    if iteration % 1000 == 0:  # Log every 10 seconds when idle
+                        logger.debug(f"[BatchAccumulator] Loop iteration {iteration}: No pending requests")
+                    continue
+                
+                if self.processing:
+                    if iteration % 100 == 0:  # Log every second when waiting for processing
+                        logger.debug(f"[BatchAccumulator] Loop iteration {iteration}: Already processing, queue={len(self.pending_requests)}")
                     continue
                 
                 # Check if we should distribute a batch
@@ -134,6 +144,7 @@ class BatchAccumulator:
     async def _distribute_batch(self, worker_pool):
         """Distribute a batch of requests to workers round-robin."""
         if self.processing:
+            logger.warning(f"[BatchAccumulator] Already processing a batch, skipping (queue has {len(self.pending_requests)} pending)")
             return
         
         self.processing = True
@@ -142,13 +153,16 @@ class BatchAccumulator:
         try:
             # Extract requests from the queue
             async with self.lock:
+                queue_size_before = len(self.pending_requests)
                 while self.pending_requests and len(batch_requests) < self.batch_size:
                     batch_requests.append(self.pending_requests.popleft())
+                queue_size_after = len(self.pending_requests)
             
             if not batch_requests:
+                logger.warning("[BatchAccumulator] No requests to distribute!")
                 return
             
-            logger.info(f"[BatchAccumulator] Distributing batch of {len(batch_requests)} requests to {self.num_workers} workers")
+            logger.info(f"[BatchAccumulator] Distributing batch of {len(batch_requests)} requests to {self.num_workers} workers (extracted from queue: {queue_size_before} -> {queue_size_after})")
             
             # Distribute requests round-robin to workers
             # This ensures each worker gets roughly the same number of requests per batch
@@ -176,19 +190,25 @@ class BatchAccumulator:
                         pending_req.future.set_exception(e)
             
             # Forward all requests concurrently
+            distribution_start = time.time()
             await asyncio.gather(*[
                 forward_single_request(worker_idx, pending_req)
                 for worker_idx, pending_req in distribution_tasks
             ])
+            distribution_time = time.time() - distribution_start
+            logger.info(f"[BatchAccumulator] Batch distribution completed in {distribution_time:.3f}s ({len(batch_requests)/distribution_time:.1f} req/s)")
             
         except Exception as e:
             logger.error(f"[BatchAccumulator] Batch distribution failed: {e}")
+            import traceback
+            logger.error(f"[BatchAccumulator] Traceback: {traceback.format_exc()}")
             # Set exception for all pending requests
             for pending_req in batch_requests:
                 if not pending_req.future.done():
                     pending_req.future.set_exception(e)
         finally:
             self.processing = False
+            logger.debug(f"[BatchAccumulator] Processing flag cleared. Queue now has {len(self.pending_requests)} pending requests")
     
     def get_pending_count(self) -> int:
         """Get the number of pending requests."""
@@ -202,6 +222,7 @@ class BatchAccumulator:
         """Start the batch distribution loop. Must be called when event loop is running."""
         if self._distribution_task is None:
             self._distribution_task = asyncio.create_task(self._batch_distribution_loop())
+            logger.info(f"[BatchAccumulator] Batch distribution loop started (batch_size={self.batch_size}, max_wait={self.max_wait_time}s)")
     
     async def stop(self):
         """Stop the batch distribution loop."""
