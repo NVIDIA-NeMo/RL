@@ -79,7 +79,8 @@ show_usage() {
     echo "Server Options:"
     echo "  --engine ENGINE         Inference engine (fast-dllm, dinfer, nemotron)"
     echo "  --algorithm ALGO        Specific algorithm within engine"
-    echo "  --batch-size SIZE       Batch size per worker (default: $BATCH_SIZE)"
+    echo "  --batch-size SIZE       Batch size per worker GPU (default: $BATCH_SIZE)"
+    echo "                          Note: Load balancer will use SIZE × NUM_GPUS automatically"
     echo "  --max-wait-time TIME    Max wait time for batching (default: $MAX_WAIT_TIME)"
     echo "  --verbose               Enable verbose logging"
     echo "  --no-chat-template      Disable chat template"
@@ -360,6 +361,10 @@ if [[ "$NO_CHAT_TEMPLATE" == true ]]; then
     WORKER_BASE_ARGS="$WORKER_BASE_ARGS --no-chat-template"
 fi
 
+# Calculate load balancer batch size (worker_batch_size × num_gpus)
+# This ensures the load balancer collects enough requests to distribute evenly
+LB_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
+
 # Print configuration
 echo "=============================================================="
 print_status "Multi-GPU LLaDA Batch Server Configuration"
@@ -369,6 +374,7 @@ echo "  🔢 GPU IDs: ${GPU_ARRAY[*]}"
 echo "  🌐 Load Balancer: http://$HOST:$LOAD_BALANCER_PORT"
 echo "  👷 Worker Ports: $BASE_WORKER_PORT - $((BASE_WORKER_PORT + NUM_GPUS - 1))"
 echo "  📊 Batch Size (per worker): $BATCH_SIZE"
+echo "  📊 Batch Size (load balancer): $LB_BATCH_SIZE (= $BATCH_SIZE × $NUM_GPUS)"
 echo "  ⏱️  Max Wait Time: $MAX_WAIT_TIME s"
 if [[ -n "$ENGINE" ]]; then
     echo "  ⚡ Engine: $ENGINE"
@@ -533,7 +539,8 @@ LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-ho
 LB_CMD="$LB_CMD --timeout-keep-alive 9000 --request-timeout 12000"
 
 # Add pre-load-balancer batching for consistent batch sizes across GPUs
-LB_CMD="$LB_CMD --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
+# Use LB_BATCH_SIZE (worker_batch_size × num_gpus) so each worker gets a full batch
+LB_CMD="$LB_CMD --batch-size $LB_BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
 
 if [[ "$VERBOSE" == true ]]; then
     LB_CMD="$LB_CMD --verbose"

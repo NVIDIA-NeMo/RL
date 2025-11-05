@@ -64,7 +64,8 @@ show_usage() {
     echo "Server Options:"
     echo "  --engine ENGINE         Inference engine (fast-dllm, dinfer, nemotron)"
     echo "  --algorithm ALGO        Specific algorithm within engine"
-    echo "  --batch-size SIZE       Batch size per worker (default: $BATCH_SIZE)"
+    echo "  --batch-size SIZE       Batch size per worker GPU (default: $BATCH_SIZE)"
+    echo "                          Note: Load balancer will use SIZE × NUM_GPUS automatically"
     echo "  --max-wait-time TIME    Max wait time for batching (default: $MAX_WAIT_TIME)"
     echo "  --verbose               Enable verbose logging"
     echo "  --no-chat-template      Disable chat template"
@@ -240,6 +241,10 @@ for i in $(seq 0 $((NUM_GPUS - 1))); do
     WORKER_PORTS+=($((BASE_WORKER_PORT + i)))
 done
 
+# Calculate load balancer batch size (worker_batch_size × num_gpus)
+# This ensures the load balancer collects enough requests to distribute evenly
+LB_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
+
 # Print configuration
 print_status "SLURM Multi-GPU Configuration:"
 echo "  Job name: $JOB_NAME"
@@ -251,6 +256,8 @@ echo "  Partition: $PARTITION"
 echo "  Account: $ACCOUNT"
 echo "  Load Balancer Port: $LOAD_BALANCER_PORT"
 echo "  Worker Ports: ${WORKER_PORTS[*]}"
+echo "  Batch Size (per worker): $BATCH_SIZE"
+echo "  Batch Size (load balancer): $LB_BATCH_SIZE (= $BATCH_SIZE × $NUM_GPUS)"
 
 # Create command block
 COMMAND_BLOCK=$(cat <<'EOF_OUTER'
@@ -640,7 +647,7 @@ COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_BASE_ARGS_PLACEHOLDER/$WORKER_BASE_ARGS}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_PORTS_PLACEHOLDER/${WORKER_PORTS[*]}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//DCP_ABS_PATH_PLACEHOLDER/${DCP_ABS_PATH:-}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//BASE_MODEL_PLACEHOLDER/$BASE_MODEL}"
-COMMAND_BLOCK="${COMMAND_BLOCK//BATCH_SIZE_PLACEHOLDER/$BATCH_SIZE}"
+COMMAND_BLOCK="${COMMAND_BLOCK//BATCH_SIZE_PLACEHOLDER/$LB_BATCH_SIZE}"  # Use LB batch size for load balancer
 COMMAND_BLOCK="${COMMAND_BLOCK//MAX_WAIT_TIME_PLACEHOLDER/$MAX_WAIT_TIME}"
 
 if [[ "$VERBOSE" == true ]]; then
