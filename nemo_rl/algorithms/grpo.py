@@ -911,6 +911,9 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    # A central place to store logging data that won't be deleted until the loop ends
+    metrics_logging_data = dict()
+
     memory_tracker.snapshot_start_of_stage("Start training loop", dir())
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -983,6 +986,7 @@ def grpo_train(
                         input_ids = penguin_rollout_result.input_ids
                         repeated_batch = penguin_rollout_result.final_batch
                         rollout_metrics = penguin_rollout_result.rollout_metrics
+                        del penguin_rollout_result
 
                         # Penguin responses can be very large and expensive to log. Here we have logic to opt-in to logging.
                         if not _should_log_penguin_responses(master_config):
@@ -1023,6 +1027,10 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+
+                    metrics_logging_data["mean_gen_tokens_per_sample"] = rollout_metrics["mean_gen_tokens_per_sample"]
+                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    del rollout_metrics
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1235,7 +1243,6 @@ def grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
 
-                metrics.update(rollout_metrics)
                 baseline: torch.Tensor
                 metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
                 metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
@@ -1373,7 +1380,7 @@ def grpo_train(
             else:
                 print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
-                f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}",
+                f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
             )
 
