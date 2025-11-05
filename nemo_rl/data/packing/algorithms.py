@@ -176,23 +176,15 @@ class SequencePacker(ABC):
             sequence_lengths list. The number of bins will satisfy min_bin_count
             and bin_count_multiple constraints if specified.
         """
-        from nemo_rl.utils.timer import Timer
-
-        timer = Timer()
-
         # Call the implementation
-        with timer.time("pack implemenation"):
-            bins = self._pack_implementation(sequence_lengths)
+        bins = self._pack_implementation(sequence_lengths)
 
         # Adjust bin count to meet constraints
-        with timer.time("adjust bin count"):
-            bins = self._adjust_bin_count(bins)
+        bins = self._adjust_bin_count(bins)
 
         # Update metrics if collection is enabled
         if self.collect_metrics and self.metrics:
             self.metrics.update(sequence_lengths, bins, self.bin_capacity)
-
-        print(timer.get_timing_metrics("sum"))
 
         return bins
 
@@ -567,111 +559,102 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         # Phase-1: start one bin per large item
         bins: List[List[Tuple[int, int]]] = [[item] for item in large]
 
-        from nemo_rl.utils.timer import Timer
-        timer = Timer()
-
         # Phase-2: try to add one medium item to each large bin (forward pass)
-        with timer.time("phase 2"):
-            for b in bins:
-                remaining = self.bin_capacity - sum(size for _, size in b)
-                for i, (idx, size) in enumerate(medium):
-                    if size <= remaining:
-                        b.append(medium.pop(i))
-                        break
+        for b in bins:
+            remaining = self.bin_capacity - sum(size for _, size in b)
+            for i, (idx, size) in enumerate(medium):
+                if size <= remaining:
+                    b.append(medium.pop(i))
+                    break
 
         # Phase-3: backward pass – fill with two small items where possible
-        with timer.time("phase 3"):
-            for b in reversed(bins):
-                has_medium = any(
-                    self.bin_capacity / 3 < size <= self.bin_capacity / 2 for _, size in b
-                )
-                if has_medium or len(small) < 2:
-                    continue
-                remaining = self.bin_capacity - sum(size for _, size in b)
-                if small[0][1] + small[1][1] > remaining:
-                    continue
-                first_small = small.pop(0)
-                # pick the *largest* small that fits with first_small (so iterate from end)
-                second_idx = None
-                for j in range(len(small) - 1, -1, -1):
-                    if small[j][1] <= remaining - first_small[1]:
-                        second_idx = j
-                        break
-                if second_idx is not None:
-                    second_small = small.pop(second_idx)
-                    b.extend([first_small, second_small])
+        for b in reversed(bins):
+            has_medium = any(
+                self.bin_capacity / 3 < size <= self.bin_capacity / 2 for _, size in b
+            )
+            if has_medium or len(small) < 2:
+                continue
+            remaining = self.bin_capacity - sum(size for _, size in b)
+            if small[0][1] + small[1][1] > remaining:
+                continue
+            first_small = small.pop(0)
+            # pick the *largest* small that fits with first_small (so iterate from end)
+            second_idx = None
+            for j in range(len(small) - 1, -1, -1):
+                if small[j][1] <= remaining - first_small[1]:
+                    second_idx = j
+                    break
+            if second_idx is not None:
+                second_small = small.pop(second_idx)
+                b.extend([first_small, second_small])
 
         # Phase-4: forward greedy fit of remaining items
-        with timer.time("phase 4"):
-            remaining_items = sorted(
-                medium + small + tiny, key=lambda x: x[1], reverse=True
-            )
-            for b in bins:
-                while remaining_items:
-                    rem = self.bin_capacity - sum(size for _, size in b)
-                    # if even the smallest remaining doesn't fit we break
-                    if rem < remaining_items[-1][1]:
-                        break
+        remaining_items = sorted(
+            medium + small + tiny, key=lambda x: x[1], reverse=True
+        )
+        for b in bins:
+            while remaining_items:
+                rem = self.bin_capacity - sum(size for _, size in b)
+                # if even the smallest remaining doesn't fit we break
+                if rem < remaining_items[-1][1]:
+                    break
 
-                    # pick the first (largest) that fits
-                    chosen_idx = None
-                    for i, (_, size) in enumerate(remaining_items):
-                        if size <= rem:
-                            chosen_idx = i
-                            break
-                    if chosen_idx is None:
+                # pick the first (largest) that fits
+                chosen_idx = None
+                for i, (_, size) in enumerate(remaining_items):
+                    if size <= rem:
+                        chosen_idx = i
                         break
-                    b.append(remaining_items.pop(chosen_idx))
+                if chosen_idx is None:
+                    break
+                b.append(remaining_items.pop(chosen_idx))
 
         # Phase-5: FFD on leftovers
-        with timer.time("phase 5"):
-            leftovers = remaining_items  # renamed for clarity
-            print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
+        leftovers = remaining_items  # renamed for clarity
+        print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
 
-            # Original O(n * m) implementation
-            """
-            num_iterations = 0
-            ffd_bins: List[List[Tuple[int, int]]] = []
-            for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
-                placed = False
-                for bin_ffd in ffd_bins:
-                    num_iterations += 1
-                    if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
-                        bin_ffd.append((idx, size))
-                        placed = True
-                        break
-                if not placed:
-                    ffd_bins.append([(idx, size)])
+        # Original O(n * m) implementation
+        """
+        num_iterations = 0
+        ffd_bins: List[List[Tuple[int, int]]] = []
+        for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+            placed = False
+            for bin_ffd in ffd_bins:
+                num_iterations += 1
+                if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
+                    bin_ffd.append((idx, size))
+                    placed = True
+                    break
+            if not placed:
+                ffd_bins.append([(idx, size)])
 
-            print(f"Phase 5 took {num_iterations} total iterations and ended with {len(ffd_bins)} bins")
-            """
+        print(f"Phase 5 took {num_iterations} total iterations and ended with {len(ffd_bins)} bins")
+        """
 
-            from bisect import bisect
+        from bisect import bisect
 
-            # New O(n * logn) implementation
-            ffd_bins: List[List[Tuple[int, int]]] = [[]]
-            ffd_bin_sizes: List[int] = [0]
-            for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
-                # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
-                if size <= (self.bin_capacity - ffd_bin_sizes[0]):
-                    new_bin = ffd_bins.pop(0)
-                    new_bin_size = ffd_bin_sizes.pop(0)
-                else:
-                    new_bin = []
-                    new_bin_size = 0
+        # New O(n * logn) implementation
+        ffd_bins: List[List[Tuple[int, int]]] = [[]]
+        ffd_bin_sizes: List[int] = [0]
+        for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+            # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
+            if size <= (self.bin_capacity - ffd_bin_sizes[0]):
+                new_bin = ffd_bins.pop(0)
+                new_bin_size = ffd_bin_sizes.pop(0)
+            else:
+                new_bin = []
+                new_bin_size = 0
 
-                new_bin.append((idx, size))
-                new_bin_size += size
+            new_bin.append((idx, size))
+            new_bin_size += size
 
-                new_idx = bisect(ffd_bin_sizes, new_bin_size)
-                ffd_bins.insert(new_idx, new_bin)
-                ffd_bin_sizes.insert(new_idx, new_bin_size)
+            new_idx = bisect(ffd_bin_sizes, new_bin_size)
+            ffd_bins.insert(new_idx, new_bin)
+            ffd_bin_sizes.insert(new_idx, new_bin_size)
 
-            print(f"Phase 5 ended with {len(ffd_bins)} bins")
+        print(f"Phase 5 ended with {len(ffd_bins)} bins")
 
-            bins.extend(ffd_bins)
-
-        print(timer.get_timing_metrics("sum"))
+        bins.extend(ffd_bins)
 
         # Convert to list of index lists (discard sizes)
         return [[idx for idx, _ in b] for b in bins]
