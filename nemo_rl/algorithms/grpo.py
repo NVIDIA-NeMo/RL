@@ -1175,7 +1175,7 @@ def grpo_train(
                 with timer.time("policy_and_reference_logprobs"):
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
-                            "input_ids": train_data["token_ids"],
+                            "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
                         }
                     )
