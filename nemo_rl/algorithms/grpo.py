@@ -911,9 +911,6 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
-    # A central place to store logging data that won't be deleted until the loop ends
-    metrics_logging_data = dict()
-
     memory_tracker.snapshot_start_of_stage("Start training loop", dir())
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -924,6 +921,10 @@ def grpo_train(
 
         # Run grpo/dapo training loop (single-turn)
         for batch in dataloader:
+            # A central place to store logging data that won't be deleted until the loop ends
+            metrics_logging_data = dict()
+            metrics = dict()
+
             memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
@@ -1087,12 +1088,23 @@ def grpo_train(
                         continue
                     advantages = (rewards - baseline).unsqueeze(-1)
 
+                    baseline: torch.Tensor
+                    metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
+                    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
+                    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
+                    metrics["baseline_reward/pct_mixed"] = 100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
+
                     if master_config["grpo"]["normalize_rewards"]:
                         # don't sharpen the ones with no variation
                         zero_std_mask = std > 0
                         advantages[zero_std_mask] = (
                             advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                         )
+                        del zero_std_mask
+
+                    del input_ids
+                    del baseline
+                    del std
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
@@ -1123,6 +1135,7 @@ def grpo_train(
                             message["advantages"] = advantages[i].expand(
                                 message["token_ids"].shape
                             )
+                    del advantages
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1150,6 +1163,9 @@ def grpo_train(
                     )
                     train_data.to("cpu")
 
+                    metrics_logging_data["content"] = flat_messages["content"]
+                    del flat_messages
+
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 print("▶ Preparing for logprob inference...", flush=True)
                 with timer.time("logprob_inference_prep"):
@@ -1159,8 +1175,8 @@ def grpo_train(
                 with timer.time("policy_and_reference_logprobs"):
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
+                            "input_ids": train_data["token_ids"],
+                            "input_lengths": train_data["input_lengths"],
                         }
                     )
                     train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)["logprobs"]
@@ -1217,6 +1233,7 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
+                    **metrics,
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "reward": rewards.numpy(),
@@ -1243,11 +1260,6 @@ def grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
 
-                baseline: torch.Tensor
-                metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
-                metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
-                metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
-                metrics["baseline_reward/pct_mixed"] = 100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1339,7 +1351,7 @@ def grpo_train(
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             if not _should_log_penguin_responses(master_config):
-                log_data = {"content": flat_messages["content"]}
+                log_data = {"content": metrics_logging_data["content"]}
                 log_data["rewards"] = rewards.tolist()
                 if master_config["grpo"]["use_dynamic_sampling"]:
                     log_data["filtered_rewards"] = rewards.tolist()
@@ -1431,15 +1443,9 @@ def grpo_train(
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
             # processing rewards
-            del input_ids
             del repeated_batch
-            del advantages
-            del baseline
-            del flat_messages
             del rewards
-            del std
             del train_data
-            del zero_std_mask
             # logging
             del metrics
             if "val_metrics" in dir():
