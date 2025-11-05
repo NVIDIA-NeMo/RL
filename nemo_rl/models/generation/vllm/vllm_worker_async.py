@@ -254,8 +254,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         break
 
                 # If there's no assistant message, we don't have any issues.
-                if last_assistant_message_idx is None:
-                    return res
+                # if last_assistant_message_idx is None:
+                #     return res
 
                 # Include the last assistant message itself.
                 messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
