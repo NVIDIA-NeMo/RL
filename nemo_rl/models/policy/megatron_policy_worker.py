@@ -909,11 +909,6 @@ class MegatronPolicyWorker:
             if hasattr(module, "_inference_key_value_memory"):
                 module._inference_key_value_memory = None
 
-        # TODO patch fix to even see if this ray.put sharding works...
-        print("Hit inside get_logprobs")
-        data = ray.get(data[0])[data[1]]
-        print("After ray.get inside get_logprobs")
-
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -1170,11 +1165,6 @@ class MegatronPolicyWorker:
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
-
-        # TODO patch fix to even see if this ray.put sharding works...
-        print("Hit inside get_logprobs")
-        data = ray.get(data[0])[data[1]]
-        print("After ray.get inside get_logprobs")
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
