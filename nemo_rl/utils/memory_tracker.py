@@ -24,13 +24,13 @@ class MemoryTrackerDataPoint(BaseModel):
 
     def get_snapshot_str(self) -> str:
         ray_memory_summary = memory_summary(stats_only=True, num_entries=5)
-        return f"""Memory tracker for {self.stage}:
+        return f"""💭 Driver CPU memory tracker for {self.stage}:
 - Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
 - Mem usage after                   {self.memory_used_after_stage_gb:>7.2f} GB
 - Mem usage diff (after - before)   {self.mem_used_diff_gb:>+7.2f} GB
 - New variables: {self.new_variables}
 
-Ray memory snapshot:
+⚡️ Ray memory snapshot:
 {ray_memory_summary}
 """
 
