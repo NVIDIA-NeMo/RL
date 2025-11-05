@@ -85,7 +85,8 @@ class BatchAccumulator:
         
         async with self.lock:
             self.pending_requests.append(pending_request)
-            logger.debug(f"[BatchAccumulator] Added request {request_id} to batch queue. Queue size: {len(self.pending_requests)}")
+            queue_size = len(self.pending_requests)
+            logger.info(f"[BatchAccumulator] Added request {request_id} to batch queue. Queue size: {queue_size}/{self.batch_size}")
         
         # Wait for the result
         try:
@@ -105,15 +106,22 @@ class BatchAccumulator:
                 
                 # Check if we should distribute a batch
                 should_distribute = False
+                reason = ""
+                current_queue_size = 0
                 async with self.lock:
-                    if len(self.pending_requests) >= self.batch_size:
+                    current_queue_size = len(self.pending_requests)
+                    if current_queue_size >= self.batch_size:
                         should_distribute = True
+                        reason = f"batch full ({current_queue_size}/{self.batch_size})"
                     elif self.pending_requests:
                         oldest_request_time = self.pending_requests[0].timestamp
-                        if time.time() - oldest_request_time >= self.max_wait_time:
+                        wait_time = time.time() - oldest_request_time
+                        if wait_time >= self.max_wait_time:
                             should_distribute = True
+                            reason = f"timeout ({wait_time:.3f}s >= {self.max_wait_time}s, queue_size={current_queue_size})"
                 
                 if should_distribute:
+                    logger.info(f"[BatchAccumulator] Triggering batch distribution: {reason}")
                     if hasattr(self, '_worker_pool') and self._worker_pool is not None:
                         await self._distribute_batch(self._worker_pool)
                     else:
@@ -497,8 +505,17 @@ async def proxy_request(path: str, request: Request):
     global batch_accumulator
     
     # If batch accumulator is enabled, use it for batching before distribution
-    if batch_accumulator is not None and request.method == "POST" and path.startswith("v1/chat/completions"):
+    # Check for chat completions endpoint (with or without leading slash)
+    is_chat_completion = (
+        request.method == "POST" and 
+        (path == "v1/chat/completions" or path.startswith("v1/chat/completions"))
+    )
+    
+    logger.debug(f"[Proxy] {request.method} /{path} - is_chat_completion={is_chat_completion}, batch_enabled={batch_accumulator is not None}")
+    
+    if batch_accumulator is not None and is_chat_completion:
         # For chat completion requests, use batch accumulator
+        logger.debug(f"[Proxy] Routing to batch accumulator: /{path}")
         body = await request.body()
         headers = dict(request.headers)
         headers.pop('host', None)
@@ -513,6 +530,7 @@ async def proxy_request(path: str, request: Request):
         )
     else:
         # For other requests, forward directly (no batching)
+        logger.debug(f"[Proxy] Forwarding directly (no batching): {request.method} /{path}")
         return await worker_pool.forward_request(request.method, f"/{path}", request)
 
 
