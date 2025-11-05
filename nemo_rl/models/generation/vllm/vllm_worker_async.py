@@ -257,12 +257,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 if last_assistant_message_idx is None:
                     # If there's no assistant message, we just use the entire thing.
-                    messages_to_last_assistant_message = messages_for_replace_prefix_tokens
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
                 else:
                     # Include the last assistant message itself.
-                    messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
-                        : last_assistant_message_idx + 1
-                    ]
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
 
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
