@@ -911,7 +911,7 @@ def grpo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
-    memory_tracker.snapshot_start_of_stage("Start training loop", dir())
+    memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -925,7 +925,6 @@ def grpo_train(
             metrics_logging_data = dict()
             metrics = dict()
 
-            memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
                 flush=True,
