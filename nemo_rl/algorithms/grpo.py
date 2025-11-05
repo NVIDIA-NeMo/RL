@@ -1257,8 +1257,11 @@ def grpo_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
-                    else:
+                    elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                    else:
+                        # TODO remove this
+                        print(f"Skipping aggregation for {k} ({type(v)})")
 
                 total_valid_tokens += metrics["global_valid_toks"]
 
