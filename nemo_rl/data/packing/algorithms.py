@@ -643,7 +643,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
                     ffd_bins.append([(idx, size)])
             bins.extend(ffd_bins)
 
-            print(f"Phase 5 took {num_iterations} total iterations was not able to place {num_not_placed} sequences")
+            print(f"Phase 5 took {num_iterations} total iterations was not able to place {num_not_placed} sequences. Ended with {len(ffd_bins)} bins")
 
         print(timer.get_timing_metrics("sum"))
 
