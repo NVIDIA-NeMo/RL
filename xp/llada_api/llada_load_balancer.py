@@ -60,6 +60,7 @@ class BatchAccumulator:
         self.processing = False
         self._distribution_task = None
         self._worker_pool = None
+        self._next_worker_idx = 0  # Track which worker to send the next batch to
     
     async def add_request(
         self, 
@@ -140,17 +141,16 @@ class BatchAccumulator:
             if not batch_requests:
                 return
             
-            logger.info(f"[BatchAccumulator] Distributing batch of {len(batch_requests)} requests to {self.num_workers} workers")
+            # Send entire batch to a single worker for optimal batching
+            # Round-robin across workers: this batch goes to one worker, next batch goes to next worker
+            worker_idx = self._next_worker_idx
+            self._next_worker_idx = (self._next_worker_idx + 1) % self.num_workers
             
-            # Distribute requests round-robin to workers
-            # This ensures each worker gets roughly the same number of requests per batch
-            distribution_tasks = []
-            for i, pending_req in enumerate(batch_requests):
-                worker_idx = i % self.num_workers
-                distribution_tasks.append((worker_idx, pending_req))
+            logger.info(f"[BatchAccumulator] Sending batch of {len(batch_requests)} requests to worker {worker_idx}")
             
-            # Forward all requests in parallel
-            async def forward_single_request(worker_idx: int, pending_req: PendingRequest):
+            # Forward all requests to the selected worker concurrently
+            # This ensures they arrive together and the worker's batch processor can handle them as a batch
+            async def forward_single_request(pending_req: PendingRequest):
                 try:
                     response = await worker_pool.forward_request_to_worker(
                         worker_idx=worker_idx,
@@ -167,10 +167,11 @@ class BatchAccumulator:
                     if not pending_req.future.done():
                         pending_req.future.set_exception(e)
             
-            # Forward all requests concurrently
+            # Forward all requests concurrently to the same worker
+            # Workers have their own batch processors, so sending them together increases
+            # the chance they'll be processed in the same batch
             await asyncio.gather(*[
-                forward_single_request(worker_idx, pending_req)
-                for worker_idx, pending_req in distribution_tasks
+                forward_single_request(req) for req in batch_requests
             ])
             
         except Exception as e:
