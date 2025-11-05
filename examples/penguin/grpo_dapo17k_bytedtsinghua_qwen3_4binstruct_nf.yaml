@@ -26,6 +26,7 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: true
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -228,7 +229,7 @@ data:
 
 env:
   should_use_penguin: true
-  penguin:
+  penguin:  # This is passed into Penguin as the initial_global_config_dict
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/library_judge_math/configs/library_judge_math.yaml

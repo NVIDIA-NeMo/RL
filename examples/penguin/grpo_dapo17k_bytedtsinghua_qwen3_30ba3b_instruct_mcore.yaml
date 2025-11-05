@@ -10,7 +10,7 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0
   ratio_clip_min: 3e-4
-  ratio_clip_max: 4e-4
+  ratio_clip_max: 3e-4
   ratio_clip_c: null
   use_on_policy_kl_approximation: false
   # We observe importance sampling correction here to have very interesting effects on training dynamics. Usually it is fine to leave this off.
@@ -22,6 +22,7 @@ loss_fn:
 
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  logprob_chunk_size: null
 
   # max_total_sequence_length goes up to 131072, but we default to 32768 to make training more efficient for this instruct model which doesn't initially have such long output length.
   # max_total_sequence_length: 131072
@@ -42,7 +43,7 @@ policy:
 
   generation:
     vllm_cfg:
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4
       # This is a very low GPU mem utilization. We GPU OOM in two places:
       # Refit after train, refit before validation.
       gpu_memory_utilization: 0.5
@@ -69,9 +70,9 @@ policy:
     sequence_parallel: true
     # Apparently freezing the MoE router and using fp64 here stabilizes training
     # This is possibly related to some refit issues.
-    freeze_moe_router: true
-    moe_router_dtype: "fp64"
-    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: global_aux_loss # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
     moe_permute_fusion: false

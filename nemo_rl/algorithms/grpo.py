@@ -25,6 +25,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from wandb import Histogram
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
@@ -117,6 +118,7 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
+    skip_reference_policy_logprobs_calculation: bool
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
@@ -853,6 +855,12 @@ def grpo_train(
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
+    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+        print(
+            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+        )
+
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
     total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
@@ -1120,11 +1128,13 @@ def grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data
-                    )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    if not master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data
+                        )["reference_logprobs"]
+                        train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -1195,6 +1205,11 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
 
                 metrics.update(rollout_metrics)
+                baseline: torch.Tensor
+                metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
+                metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
+                metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
+                metrics["baseline_reward/pct_mixed"] = 100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1362,7 +1377,8 @@ def grpo_train(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            # step_finished=True here since this is the final log of our current step.
+            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
