@@ -430,18 +430,20 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             from nemo_rl.utils.timer import Timer
             timer = Timer()
 
-            bin_packer = get_packer(
-                algorithm=sequence_packing_args["algorithm"],
-                bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
-                collect_metrics=False,  # TODO(ahmadki): make configurable
-                min_bin_count=shards,
-                bin_count_multiple=shards,
-            )
+            with timer.time("get packer"):
+                bin_packer = get_packer(
+                    algorithm=sequence_packing_args["algorithm"],
+                    bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
+                    collect_metrics=False,  # TODO(ahmadki): make configurable
+                    min_bin_count=shards,
+                    bin_count_multiple=shards,
+                )
 
-            input_lengths_key = sequence_packing_args["input_lengths_key"]
-            input_lens = self.data[input_lengths_key]
-            if not isinstance(input_lens, torch.Tensor):
-                input_lens = torch.tensor(input_lens)
+            with timer.time("input lens"):
+                input_lengths_key = sequence_packing_args["input_lengths_key"]
+                input_lens = self.data[input_lengths_key]
+                if not isinstance(input_lens, torch.Tensor):
+                    input_lens = torch.tensor(input_lens)
 
             pad_multiple = sequence_packing_args["sequence_length_pad_multiple"]
 
@@ -456,17 +458,19 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 chunk_start = chunk_idx * batch_size
                 chunk_end = (chunk_idx + 1) * batch_size
 
-                # Get sequence lengths for this chunk
-                chunk_seqlens = input_lens[chunk_start:chunk_end]
-                chunk_padded_seqlens_list = [
-                    _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
-                ]
+                with timer.time("_get_padded_seqlen"):
+                    # Get sequence lengths for this chunk
+                    chunk_seqlens = input_lens[chunk_start:chunk_end]
+                    chunk_padded_seqlens_list = [
+                        _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
+                    ]
 
-                # Pack sequences in this chunk into bins
-                chunk_bin_assignments = bin_packer.pack(
-                    sequence_lengths=chunk_padded_seqlens_list,
-                )
-                all_chunk_bin_assignments.append(chunk_bin_assignments)
+                with timer.time("bin packer pack"):
+                    # Pack sequences in this chunk into bins
+                    chunk_bin_assignments = bin_packer.pack(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                    )
+                    all_chunk_bin_assignments.append(chunk_bin_assignments)
 
             # create shards with the packed bins
             sharded_data: list[list[dict]] = [[] for _ in range(shards)]
@@ -485,56 +489,63 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 num_bins = len(all_chunk_bin_assignments[chunk_idx])
                 chunk_start = chunk_idx * batch_size
                 for bin_idx in range(num_bins):
-                    shard_idx = bin_idx % shards
-                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
-                    global_bin_indices = [i + chunk_start for i in bin_indices]
+                    with timer.time("iterate bins / select / global_bin_indices"):
+                        shard_idx = bin_idx % shards
+                        bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
+                        global_bin_indices = [i + chunk_start for i in bin_indices]
                     with timer.time("iterate bins / select / select_indices"):
                         sharded_data[shard_idx].append(
                             self.select_indices(global_bin_indices)
                         )
-                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    bin_seqlen = sum(
-                        [
-                            _get_padded_seqlen(input_lens[i].item())
-                            for i in global_bin_indices
-                        ]
-                    )
-
-                    if chunk_sharded_micro_indices[shard_idx] == []:
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [0, len(bin_indices)]
+                    with timer.time("iterate bins / select / extend global bin indices"):
+                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                    with timer.time("iterate bins / select / _get_padded_seqlen"):
+                        bin_seqlen = sum(
+                            [
+                                _get_padded_seqlen(input_lens[i].item())
+                                for i in global_bin_indices
+                            ]
                         )
-                    else:
-                        prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [prev_bin_end, prev_bin_end + len(bin_indices)]
-                        )
-                    chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
 
+                    with timer.time("iterate bins / select / sharded micro"):
+                        if chunk_sharded_micro_indices[shard_idx] == []:
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [0, len(bin_indices)]
+                            )
+                        else:
+                            prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [prev_bin_end, prev_bin_end + len(bin_indices)]
+                            )
+                        chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
+
+                with timer.time("sharded micro append"):
+                    for shard_idx in range(shards):
+                        sharded_micro_indices[shard_idx].append(
+                            chunk_sharded_micro_indices[shard_idx]
+                        )
+                        sharded_micro_lengths[shard_idx].append(
+                            chunk_sharded_micro_lengths[shard_idx]
+                        )
+                        sharded_elem_counts_per_gb[shard_idx].append(
+                            chunk_sharded_micro_indices[shard_idx][-1][1]
+                        )
+
+            with timer.time("flatten global_indices_per_shard"):
+                # flatten global_indices_per_shard
+                batch_sorted_indices = []
                 for shard_idx in range(shards):
-                    sharded_micro_indices[shard_idx].append(
-                        chunk_sharded_micro_indices[shard_idx]
-                    )
-                    sharded_micro_lengths[shard_idx].append(
-                        chunk_sharded_micro_lengths[shard_idx]
-                    )
-                    sharded_elem_counts_per_gb[shard_idx].append(
-                        chunk_sharded_micro_indices[shard_idx][-1][1]
-                    )
-
-            # flatten global_indices_per_shard
-            batch_sorted_indices = []
-            for shard_idx in range(shards):
-                batch_sorted_indices.extend(global_indices_per_shard[shard_idx])
+                    batch_sorted_indices.extend(global_indices_per_shard[shard_idx])
 
             aggregated_shards = []
             for shard_idx in range(shards):
                 with timer.time("aggregate shards / from batches"):
                     shard = SlicedDataDict.from_batches(sharded_data[shard_idx])
-                shard.micro_batch_indices = sharded_micro_indices[shard_idx]
-                shard.micro_batch_lengths = sharded_micro_lengths[shard_idx]
-                shard.elem_counts_per_gb = sharded_elem_counts_per_gb[shard_idx]
-                aggregated_shards.append(shard)
+                with timer.time("aggregate shards / index and append"):
+                    shard.micro_batch_indices = sharded_micro_indices[shard_idx]
+                    shard.micro_batch_lengths = sharded_micro_lengths[shard_idx]
+                    shard.elem_counts_per_gb = sharded_elem_counts_per_gb[shard_idx]
+                    aggregated_shards.append(shard)
 
             print("Sharded data dict times taken:", timer.get_timing_metrics("sum"))
 
