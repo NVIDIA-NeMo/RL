@@ -627,6 +627,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         with timer.time("phase 5"):
             leftovers = remaining_items  # renamed for clarity
             print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
+            num_not_placed = 0
             ffd_bins: List[List[Tuple[int, int]]] = []
             for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
                 placed = False
@@ -636,8 +637,11 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
                         placed = True
                         break
                 if not placed:
+                    num_not_placed += 1
                     ffd_bins.append([(idx, size)])
             bins.extend(ffd_bins)
+
+            print(f"Phase 5 was not able to place {num_not_placed} sequences")
 
         print(timer.get_timing_metrics("sum"))
 
