@@ -276,6 +276,19 @@ class DTensorPolicyWorkerV2:
         assert world_size == dp_size * tp_size * cp_size, (
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )
+        
+        # Log parallelism configuration (only rank 0 to avoid spam)
+        if self.rank == 0:
+            print("=" * 80)
+            print(f"[PARALLELISM CONFIG]")
+            print(f"  world_size = {world_size}")
+            print(f"  tensor_parallel_size (TP) = {tp_size}")
+            print(f"  context_parallel_size (CP) = {cp_size}")
+            print(f"  data_parallel_size (DP/FSDP) = {dp_size}")
+            print(f"  sequence_parallel = {sequence_parallel_enabled}")
+            print(f"  FSDP shards model across {dp_size} workers")
+            print(f"  Each worker has ~1/{dp_size} of model parameters")
+            print("=" * 80, flush=True)
 
         if sequence_parallel_enabled and tp_size == 1:
             print(
@@ -1678,16 +1691,88 @@ class DTensorPolicyWorkerV2:
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
+            import time
+            zmq_addr = self.get_zmq_address()
+            print(f"[POLICY WORKER rank={self.rank}] Initializing ZMQ socket at {zmq_addr} at time={time.time()}", flush=True)
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)  # set timeout to 120 seconds (policy workers need time to prepare)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
+            self.zmq_socket.bind(zmq_addr)
+            print(f"[POLICY WORKER rank={self.rank}] Successfully bound ZMQ socket at {zmq_addr} at time={time.time()}", flush=True)
 
+    def _diagnose_model_sharding(self) -> None:
+        """Diagnose and report model sharding configuration."""
+        from torch.distributed._tensor import DTensor
+        
+        state_dict = self.model.state_dict()
+        total_params = 0
+        dtensor_params = 0
+        regular_params = 0
+        total_local_bytes = 0
+        total_global_bytes = 0
+        
+        # Sample a few tensors for detailed inspection
+        sample_dtensors = []
+        
+        for name, tensor in state_dict.items():
+            num_params = tensor.numel()
+            total_params += num_params
+            
+            if isinstance(tensor, DTensor):
+                dtensor_params += num_params
+                # Get local tensor size (what this worker actually stores)
+                local_tensor = tensor.to_local()
+                local_bytes = local_tensor.numel() * local_tensor.element_size()
+                total_local_bytes += local_bytes
+                
+                # Get full tensor size (what would be gathered)
+                global_bytes = tensor.numel() * tensor.element_size()
+                total_global_bytes += global_bytes
+                
+                # Sample first few DTensors for detailed reporting
+                if len(sample_dtensors) < 3:
+                    sample_dtensors.append((name, tensor, local_tensor))
+            else:
+                regular_params += num_params
+                local_bytes = tensor.numel() * tensor.element_size()
+                total_local_bytes += local_bytes
+                total_global_bytes += local_bytes
+        
+        # Only rank 0 prints to avoid spam
+        if self.rank == 0:
+            print("=" * 80)
+            print(f"[MODEL SHARDING DIAGNOSTICS - Rank {self.rank}]")
+            print(f"  Total parameters: {total_params:,}")
+            print(f"  DTensor parameters: {dtensor_params:,} ({100*dtensor_params/total_params:.1f}%)")
+            print(f"  Regular parameters: {regular_params:,} ({100*regular_params/total_params:.1f}%)")
+            print(f"  Local storage (this worker): {total_local_bytes / 1e9:.2f} GB")
+            print(f"  Global storage (full model): {total_global_bytes / 1e9:.2f} GB")
+            print(f"  Shard ratio: 1/{total_global_bytes/total_local_bytes:.1f} (this worker has 1/{total_global_bytes/total_local_bytes:.0f} of model)")
+            
+            if sample_dtensors:
+                print(f"\n  Sample DTensor placements:")
+                for name, dtensor, local_tensor in sample_dtensors:
+                    print(f"    {name}:")
+                    print(f"      Global shape: {dtensor.shape}")
+                    print(f"      Local shape: {local_tensor.shape}")
+                    print(f"      Placements: {dtensor.placements}")
+                    print(f"      Device mesh: {dtensor.device_mesh}")
+            
+            print("=" * 80, flush=True)
+    
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # IMPORTANT: Initialize ZMQ socket here to ensure bind() happens before VLLM workers connect()
+        self.maybe_init_zmq()
+        
+        # Diagnose model sharding configuration (only on first call)
+        if not hasattr(self, "_sharding_diagnosed"):
+            self._diagnose_model_sharding()
+            self._sharding_diagnosed = True
+        
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
@@ -1706,7 +1791,20 @@ class DTensorPolicyWorkerV2:
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
+        import time
+        start_time = time.time()
+        
+        # Check if model is initialized and ready
+        tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
+        world_size = torch.distributed.get_world_size()
+        dp_size = world_size // tp_size
+        
+        if self.rank == 0:
+            print(f"[POLICY rank={self.rank}] stream_weights_via_ipc_zmq started", flush=True)
+            print(f"[POLICY rank={self.rank}] full_tensor() will do {dp_size}-way all-gather across DP workers", flush=True)
+        
         self.maybe_init_zmq()
+        
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
@@ -1715,10 +1813,28 @@ class DTensorPolicyWorkerV2:
 
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
+            state_dict = self.model.state_dict()
+            
+            tensor_idx = 0
+            for name, tensor in state_dict.items():
+                tensor_idx += 1
+                
                 if isinstance(tensor, DTensor):
+                    # Only log the first tensor to diagnose straggler issues
+                    if tensor_idx == 1:
+                        enter_time = time.time()
+                        print(f"[POLICY rank={self.rank}] ENTERING full_tensor() at absolute_time={enter_time:.6f}, elapsed_from_start={enter_time-start_time:.2f}s", flush=True)
+                    
                     # Convert DTensor to full tensor for streaming
+                    # THIS IS A BLOCKING COLLECTIVE - all workers must call this before ANY worker proceeds
                     full_tensor = tensor.full_tensor()
+                    
+                    # Only log the first tensor to diagnose straggler issues
+                    if tensor_idx == 1:
+                        exit_time = time.time()
+                        collective_time = exit_time - enter_time
+                        print(f"[POLICY rank={self.rank}] EXITED full_tensor() at absolute_time={exit_time:.6f}, collective_took={collective_time:.2f}s", flush=True)
+                    
                     # Convert to target dtype
                     yield (
                         name,
@@ -1736,6 +1852,11 @@ class DTensorPolicyWorkerV2:
             rank=self.rank,
             worker_name=str(self),
         )
+        
+        # Log if this worker was unusually slow (potential straggler)
+        total_time = time.time() - start_time
+        if total_time > 90:
+            print(f"[POLICY rank={self.rank}] ⚠️  STRAGGLER WARNING: Took {total_time:.2f}s (>90s expected ~77s)", flush=True)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:

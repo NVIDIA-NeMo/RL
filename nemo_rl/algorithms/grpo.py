@@ -517,6 +517,7 @@ def setup(
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n", flush=True)
+    # ray.timeline(filename="/tmp/ray_timeline.json")
 
     return (
         policy,
@@ -785,13 +786,38 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
+            import time
+            refit_start_time = time.time()
+            print(f"[REFIT] ======== Starting refit operation at time={refit_start_time} ========", flush=True)
+            print(f"[REFIT] Starting policy weight streaming at time={time.time()}", flush=True)
+            
+            # Launch policy workers to start preparing and streaming weights
+            # Note: They will spend significant time preparing weights before actually sending
             futures_train = policy.stream_weights_via_ipc_zmq(
                 buffer_size_bytes=buffer_size_bytes
             )
+            
+            # CRITICAL: Wait longer to ensure policy workers have prepared weights and started sending
+            # Based on logs, policy workers take ~36-50 seconds to prepare before first send
+            # This is due to 128-way all-gather across 16 nodes during DTensor.full_tensor()
+            # We need VLLM workers to connect AFTER policy workers start sending
+            wait_time = float(os.getenv("NRL_REFIT_SYNC_WAIT_SECONDS", "50"))
+            print(f"[REFIT] Waiting {wait_time} seconds for policy workers to prepare and start sending weights...", flush=True)
+            print(f"[REFIT] (Policy workers are doing 128-way all-gather which takes ~36s)", flush=True)
+            time.sleep(wait_time)
+            
+            print(f"[REFIT] Starting VLLM weight receiving at time={time.time()}, elapsed={time.time()-refit_start_time:.2f}s", flush=True)
             futures_inference = policy_generation.update_weights_via_ipc_zmq()
+            
             # wait for all futures to complete
+            print(f"[REFIT] Waiting for policy workers to complete streaming...", flush=True)
             ray.get(futures_train)
+            print(f"[REFIT] Policy workers completed at time={time.time()}, elapsed={time.time()-refit_start_time:.2f}s", flush=True)
             results = ray.get(futures_inference)
+            refit_end_time = time.time()
+            refit_total_time = refit_end_time - refit_start_time
+            print(f"[REFIT] ======== Refit operation completed at time={refit_end_time} ========", flush=True)
+            print(f"[REFIT] ======== Total refit time: {refit_total_time:.2f} seconds ========", flush=True)
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl

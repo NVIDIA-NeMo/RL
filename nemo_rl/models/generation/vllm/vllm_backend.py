@@ -73,14 +73,18 @@ class VllmInternalWorkerExtension:
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
+            import time
+            zmq_addr = self.get_zmq_address()
+            print(f"[VLLM WORKER device={self.device.index}] Attempting to connect to ZMQ socket at {zmq_addr} at time={time.time()}", flush=True)
             self.zmq_context = zmq.Context()  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
             )
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)  # set timeout to 120 seconds (wait for policy workers to prepare weights)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.connect(self.get_zmq_address())
+            self.zmq_socket.connect(zmq_addr)
+            print(f"[VLLM WORKER device={self.device.index}] Successfully connected to ZMQ socket at {zmq_addr} at time={time.time()}", flush=True)
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
@@ -102,18 +106,25 @@ class VllmInternalWorkerExtension:
         weights = None
 
         try:
+            import time
             self.maybe_init_zmq()
+            iteration = 0
             while True:
                 # Blocking receive with timeout (this is the main operation)
+                print(f"[VLLM device={self.device.index}] Waiting to receive payload (iteration {iteration}) at time={time.time()}", flush=True)
                 payload = self.zmq_socket.recv_pyobj()
+                print(f"[VLLM device={self.device.index}] Received payload (iteration {iteration}) at time={time.time()}", flush=True)
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    print(f"[VLLM device={self.device.index}] Received COMPLETE signal, sending ACK at time={time.time()}", flush=True)
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
                 ipc_handle, list_keys, used_bytes = payload
+                print(f"[VLLM device={self.device.index}] Rebuilding tensor from IPC (iteration {iteration}, {len(list_keys)} keys, {used_bytes} bytes) at time={time.time()}", flush=True)
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                iteration += 1
 
                 weights = []
                 offset = 0
@@ -137,7 +148,9 @@ class VllmInternalWorkerExtension:
                 )
                 # Load weights into the model
                 from nemo_rl.models.generation import fp8
+                import time
 
+                print(f"[VLLM device={self.device.index}] Loading weights into model at time={time.time()}", flush=True)
                 if fp8.is_fp8_model(self.model_runner.vllm_config):
                     # the fp8 load_weights additionally casts bf16 weights into fp8
                     fp8.load_weights(weights, self.model_runner)
@@ -154,6 +167,7 @@ class VllmInternalWorkerExtension:
                 del weights, buffer
                 weights = None
                 buffer = None
+                print(f"[VLLM device={self.device.index}] Sending ACK after loading weights at time={time.time()}", flush=True)
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
             gc.collect()
