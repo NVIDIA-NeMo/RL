@@ -174,6 +174,7 @@ class BatchAccumulator:
             # Forward all requests in parallel
             async def forward_single_request(worker_idx: int, pending_req: PendingRequest):
                 try:
+                    logger.debug(f"[BatchAccumulator] Forwarding request {pending_req.request_id} to worker {worker_idx}")
                     response = await worker_pool.forward_request_to_worker(
                         worker_idx=worker_idx,
                         method=pending_req.method,
@@ -182,6 +183,7 @@ class BatchAccumulator:
                         headers=pending_req.headers,
                         query_params=pending_req.query_params
                     )
+                    logger.debug(f"[BatchAccumulator] Request {pending_req.request_id} completed from worker {worker_idx}")
                     if not pending_req.future.done():
                         pending_req.future.set_result(response)
                 except Exception as e:
@@ -190,12 +192,19 @@ class BatchAccumulator:
                         pending_req.future.set_exception(e)
             
             # Forward all requests concurrently
+            # Use return_exceptions=True to prevent one failure from cancelling all requests
             distribution_start = time.time()
-            await asyncio.gather(*[
+            results = await asyncio.gather(*[
                 forward_single_request(worker_idx, pending_req)
                 for worker_idx, pending_req in distribution_tasks
-            ])
+            ], return_exceptions=True)
             distribution_time = time.time() - distribution_start
+            
+            # Count successes and failures
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                logger.warning(f"[BatchAccumulator] Batch had {len(errors)}/{len(batch_requests)} failures")
+            
             logger.info(f"[BatchAccumulator] Batch distribution completed in {distribution_time:.3f}s ({len(batch_requests)/distribution_time:.1f} req/s)")
             
         except Exception as e:
