@@ -498,7 +498,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dp_size,
                 batch_size=batch_size,
             )
-        print("After shard batch size")
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
