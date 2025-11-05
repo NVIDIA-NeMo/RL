@@ -178,10 +178,6 @@ class SequencePacker(ABC):
         """
         from nemo_rl.utils.timer import Timer
 
-        with open("temp_sequence_lengths.json", "w") as f:
-            import json
-            json.dump(sequence_lengths, f)
-
         timer = Timer()
 
         # Call the implementation
