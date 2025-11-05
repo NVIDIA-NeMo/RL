@@ -486,21 +486,19 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 chunk_start = chunk_idx * batch_size
                 for bin_idx in range(num_bins):
                     shard_idx = bin_idx % shards
-                    with timer.time("iterate bins / select / init"):
-                        bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
-                        global_bin_indices = [i + chunk_start for i in bin_indices]
+                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
+                    global_bin_indices = [i + chunk_start for i in bin_indices]
                     with timer.time("iterate bins / select / select_indices"):
                         sharded_data[shard_idx].append(
                             self.select_indices(global_bin_indices)
                         )
-                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    with timer.time("iterate bins / select / bin_seqlen"):
-                        bin_seqlen = sum(
-                            [
-                                _get_padded_seqlen(input_lens[i].item())
-                                for i in global_bin_indices
-                            ]
-                        )
+                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                    bin_seqlen = sum(
+                        [
+                            _get_padded_seqlen(input_lens[i].item())
+                            for i in global_bin_indices
+                        ]
+                    )
 
                     if chunk_sharded_micro_indices[shard_idx] == []:
                         chunk_sharded_micro_indices[shard_idx].append(
