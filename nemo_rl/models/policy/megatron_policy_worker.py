@@ -50,7 +50,6 @@ from megatron.bridge.training.initialize import (
 )
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.setup import (
-    HAVE_FSDP2,
     _update_model_config_funcs,
 )
 from megatron.bridge.training.state import GlobalState
@@ -61,6 +60,7 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.bridge.utils.instantiate_utils import InstantiationMode
+from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
@@ -74,6 +74,9 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
+)
+from megatron.core.inference.text_generation_server.run_mcore_engine import (
+    run_mcore_engine,
 )
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -91,9 +94,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
-from megatron.inference.text_generation.mcore_engine_server import (
-    run_mcore_engine,
-)
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from ray.util.queue import Queue
 from transformers import PreTrainedTokenizerBase
@@ -131,6 +132,15 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+try:
+    from megatron.core.distributed import (
+        TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
+    )
+
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -240,12 +250,12 @@ def setup_megatron_model(
         tensor_model_parallel_size=cfg.model.tensor_model_parallel_size,
         trust_remote_code=True,
     )
-    if not cfg.model.vocab_size:
-        cfg.model.vocab_size = cfg.tokenizer.padded_vocab_size
+    assert cfg.model.vocab_size, "vocab size must be specified in model config"
 
     torch.distributed.barrier()
 
     pre_wrap_hook = []
+    mixed_precision_wrapper = Float16Module
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
         def freeze_moe_router(megatron_model):
@@ -262,23 +272,12 @@ def setup_megatron_model(
                     if hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
-        # Re-enable float32 expert bias for moe router to avoid parameter dtype inconsistency
-        # see https://github.com/NVIDIA/Megatron-LM/blob/e6c510ff3c1159f8955589b26f7c395bdf0607d9/megatron/core/transformer/moe/router.py#L149
-        def re_enable_float32_expert_bias(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
-                # Handle both wrapped (Float16Module) and unwrapped models
-                if isinstance(model_module, Float16Module):
-                    model_module = model_module.module
-                # Handle VLM models
-                if hasattr(model_module, "language_model"):
-                    model_module = model_module.language_model
-                for layer in model_module.decoder.layers:
-                    if hasattr(layer.mlp, "router"):
-                        layer.mlp.router._maintain_float32_expert_bias()
+        mixed_precision_wrapper = CustomFloat16Module
+        pre_wrap_hook.extend([freeze_moe_router])
 
-        pre_wrap_hook.extend([freeze_moe_router, re_enable_float32_expert_bias])
+    # If deferring fp32 logits, disable mixed-precision wrapper entirely
+    if policy_cfg["megatron_cfg"].get("defer_fp32_logits", None):
+        mixed_precision_wrapper = None
 
     # Model, optimizer, and learning rate.
     model = get_model(
@@ -288,9 +287,7 @@ def setup_megatron_model(
         overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
-        wrap_cast_model_output_to_fp32=(
-            not policy_cfg["megatron_cfg"].get("defer_fp32_logits", False)
-        ),
+        mixed_precision_wrapper=mixed_precision_wrapper,
     )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
@@ -777,15 +774,20 @@ class MegatronPolicyWorker:
             ref_state = GlobalState()
             ref_state.cfg = ref_megatron_cfg
 
+            # Configure mixed precision wrapper for reference model
+            ref_mixed_precision_wrapper = Float16Module
+            if self.cfg["megatron_cfg"].get("freeze_moe_router", False):
+                ref_mixed_precision_wrapper = CustomFloat16Module
+            if self.cfg["megatron_cfg"].get("defer_fp32_logits", None):
+                ref_mixed_precision_wrapper = None
+
             reference_model = get_model(
                 self.megatron_cfg.model,
                 self.megatron_cfg.ddp,
                 use_torch_fsdp2=self.megatron_cfg.dist.use_torch_fsdp2,
                 overlap_param_gather_with_optimizer_step=self.megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
                 pre_wrap_hook=self.megatron_cfg.rng.data_parallel_random_init,
-                wrap_cast_model_output_to_fp32=(
-                    not self.cfg["megatron_cfg"].get("defer_fp32_logits", False)
-                ),
+                mixed_precision_wrapper=ref_mixed_precision_wrapper,
             )
             print("Loading the Reference Model")
             if (
@@ -827,8 +829,6 @@ class MegatronPolicyWorker:
             align_grad_reduce=self.megatron_cfg.dist.align_grad_reduce,
         )
 
-        from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
-
         tokenizer_config = TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
             tokenizer_model=hf_model_name,
@@ -843,7 +843,11 @@ class MegatronPolicyWorker:
             ],
             trust_remote_code=True,
         )
-        self.final_padded_vocab_size = tokenizer_config.padded_vocab_size
+        self.final_padded_vocab_size = calculate_padded_vocab_size(
+            self.megatron_cfg.model.vocab_size,
+            self.megatron_cfg.model.make_vocab_size_divisible_by,
+            self.cfg["megatron_cfg"]["tensor_model_parallel_size"],
+        )
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
             hf_model_name, trust_remote_code=True
@@ -2299,3 +2303,40 @@ class MegatronPolicyWorker:
             "total_params": total_params,
             "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
         }
+
+
+class CustomFloat16Module(Float16Module):
+    """Float 16 Module.
+
+    Attributes:
+        config (TransformerConfig): Transformer config
+        fp16 (bool) : Specifies if the model runs in fp16 mode
+        bf16 (bool) : Specifies if the model runs in bf16 mode
+
+    Args:
+        config (TransformerConfig): The transformer config used to initalize the model
+    """
+
+    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+        super(CustomFloat16Module, self).__init__(config, module)
+        self.re_enable_float32_expert_bias()
+
+    def re_enable_float32_expert_bias(self) -> None:
+        """Ensure MoE router expert bias stays in float32 for numerical stability.
+
+        Walks the wrapped module to find MoE routers and invokes the
+        `_maintain_float32_expert_bias()` helper which recreates or casts the
+        expert bias tensors to float32 as required by Megatron-LM.
+        """
+        module = self.module
+        # Handle VLM models where language model is nested
+        if hasattr(module, "language_model"):
+            module = module.language_model
+        if hasattr(module, "decoder") and hasattr(module.decoder, "layers"):
+            for layer in module.decoder.layers:
+                mlp = getattr(layer, "mlp", None)
+                router = getattr(mlp, "router", None) if mlp is not None else None
+                if router is not None and hasattr(
+                    router, "_maintain_float32_expert_bias"
+                ):
+                    router._maintain_float32_expert_bias()
