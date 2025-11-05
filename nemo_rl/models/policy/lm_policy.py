@@ -526,6 +526,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return all_handles
 
+    def get_model_config(self):
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_model_config"
+        )
+        results = ray.get(futures)
+        # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(

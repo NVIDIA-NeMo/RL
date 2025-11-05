@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 from nemo_rl.algorithms.loss_functions import (
     NLLLoss, MDLMCrossEntropyLoss,
 )
-from nemo_rl.algorithms.utils import set_seed, prepare_for_mdlm_train_data
+from nemo_rl.algorithms.utils import set_seed, prepare_for_mdlm_train_data, prepare_for_mdlm_train_data_blockwise
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
 from nemo_rl.data.interfaces import TaskDataSpec
@@ -373,6 +373,7 @@ def sft_train(
     # get type of the policy (mdlm or gpt)
     is_mdlm = master_config["policy"].get("is_mdlm", False)
     is_dqwn = master_config["policy"].get("is_dqwn", False)
+    tok_mask_half_life_ratio = master_config["policy"].get("mdlm", {}).get("tok_mask_half_life_ratio", None)
 
     if sft_save_state is None:
         sft_save_state = _default_sft_save_state()
@@ -447,7 +448,8 @@ def sft_train(
                             # deactivate eos/pad tokens
                             pad_value_dict = {"token_ids": tokenizer.pad_token_id, "token_loss_mask": 0}
                             pad_block_value_dict = {"token_ids": tokenizer.eos_token_id, "token_loss_mask": 1}
-                            pad_block_size = master_config["policy"]["mdlm"]["pad_block_size"]
+                            #pad_block_size = master_config["policy"]["mdlm"]["pad_block_size"]
+                            pad_block_size = policy.get_model_config()["block_size"] if tok_mask_half_life_ratio is not None else master_config["policy"]["mdlm"].get("pad_block_size", 1)
                     else:
                         pad_value_dict = {"token_ids": tokenizer.pad_token_id}
                         pad_block_value_dict = None
@@ -463,7 +465,10 @@ def sft_train(
                     )
 
                     if is_dqwn:
-                        cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=151662)
+                        if tok_mask_half_life_ratio is not None:
+                            cat_and_padded = prepare_for_mdlm_train_data_blockwise(cat_and_padded, mask_token_id=151662, block_size=policy.get_model_config()["block_size"], half_life_ratio=tok_mask_half_life_ratio)
+                        else:
+                            cat_and_padded = prepare_for_mdlm_train_data(cat_and_padded, mask_token_id=151662)
                         train_data: BatchedDataDict = BatchedDataDict(
                             {
                                 "input_ids": cat_and_padded["token_ids"],   # diff: masking happens internally in the model forward pass

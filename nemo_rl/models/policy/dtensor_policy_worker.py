@@ -251,6 +251,8 @@ class DTensorPolicyWorker:
                 model_config.dlm_type = "llada"
                 if "mdlm" in self.cfg and self.cfg["mdlm"].get("use_block_diff", False):
                     model_config.dlm_paradigm = "block_diff"
+                if "mdlm" in self.cfg and self.cfg["mdlm"].get("block_size") is not None:
+                    model_config.block_size = self.cfg["mdlm"]["block_size"]
             else:
                 model_class = AutoModelForCausalLM
 
@@ -1457,3 +1459,6 @@ class DTensorPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def get_model_config(self):
+        return self.model.config.to_dict()
