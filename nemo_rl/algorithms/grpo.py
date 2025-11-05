@@ -1187,11 +1187,6 @@ def grpo_train(
 
                     del logprob_data
 
-                # TODO remove
-                import subprocess
-                with open("logprob_mem.log", "w") as f:
-                    f.write(subprocess.run("ray memory", shell=True, capture_output=True).stdout.decode())
-
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -1201,8 +1196,6 @@ def grpo_train(
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
-                with open("policy_train.log", "w") as f:
-                    f.write(subprocess.run("ray memory", shell=True, capture_output=True).stdout.decode())
 
                 is_last_step = (total_steps + 1 >= max_num_steps) or (
                     (current_epoch + 1 == max_num_epochs)
