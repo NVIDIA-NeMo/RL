@@ -892,7 +892,7 @@ class RayWorkerGroup:
                 if make_dummy_calls_to_free_axes:
                     # If make_dummy_calls_to_free_axes is True, just call the method with None
                     worker_args = [None] * len(args)
-                    worker_kwargs = {key: None for key in object_ref_kwargs.keys()}
+                    worker_kwargs = {key: None for key in kwargs.keys()}
                     future = getattr(worker, method_name).remote(
                         *worker_args, **worker_kwargs, **common_kwargs
                     )
