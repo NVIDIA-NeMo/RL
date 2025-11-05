@@ -547,7 +547,9 @@ class DTensorPolicyWorker:
             mbs = self.cfg["train_micro_batch_size"]
 
         # TODO patch fix to even see if this ray.put sharding works...
+        print("Hit inside get_logprobs")
         data = ray.get(data[0])[data[1]]
+        print("After ray.get inside get_logprobs")
 
         local_gbs = gbs // self.dp_size
         total_dataset_size = torch.tensor(data.size, device="cuda")
@@ -932,7 +934,9 @@ class DTensorPolicyWorker:
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # TODO patch fix to even see if this ray.put sharding works...
+        print("Hit inside get_logprobs")
         data = ray.get(data[0])[data[1]]
+        print("After ray.get inside get_logprobs")
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
         sequence_dim = 1
