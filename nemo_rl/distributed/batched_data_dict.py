@@ -485,7 +485,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 num_bins = len(all_chunk_bin_assignments[chunk_idx])
                 chunk_start = chunk_idx * batch_size
                 for bin_idx in range(num_bins):
-                        shard_idx = bin_idx % shards
+                    shard_idx = bin_idx % shards
                     with timer.time("iterate bins / select / init"):
                         bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
                         global_bin_indices = [i + chunk_start for i in bin_indices]
