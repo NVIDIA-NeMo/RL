@@ -628,7 +628,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
             leftovers = remaining_items  # renamed for clarity
             print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
 
-            # Original implementation
+            # Original O(n * m) implementation
             """
             num_iterations = 0
             ffd_bins: List[List[Tuple[int, int]]] = []
@@ -648,6 +648,7 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
 
             from bisect import bisect
 
+            # New O(n * logn) implementation
             ffd_bins: List[List[Tuple[int, int]]] = [[]]
             ffd_bin_sizes: List[int] = [0]
             for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
