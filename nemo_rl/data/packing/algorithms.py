@@ -627,7 +627,9 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         with timer.time("phase 5"):
             leftovers = remaining_items  # renamed for clarity
             print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
-            num_not_placed = 0
+
+            # Original implementation
+            """
             num_iterations = 0
             ffd_bins: List[List[Tuple[int, int]]] = []
             for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
@@ -639,11 +641,34 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
                         placed = True
                         break
                 if not placed:
-                    num_not_placed += 1
                     ffd_bins.append([(idx, size)])
-            bins.extend(ffd_bins)
 
-            print(f"Phase 5 took {num_iterations} total iterations was not able to place {num_not_placed} sequences. Ended with {len(ffd_bins)} bins")
+            print(f"Phase 5 took {num_iterations} total iterations and ended with {len(ffd_bins)} bins")
+            """
+
+            from bisect import bisect
+
+            ffd_bins: List[List[Tuple[int, int]]] = [[]]
+            ffd_bin_sizes: List[int] = [0]
+            for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+                # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
+                if size <= (self.bin_capacity - ffd_bin_sizes[0]):
+                    new_bin = ffd_bins.pop(0)
+                    new_bin_size = ffd_bin_sizes.pop(0)
+                else:
+                    new_bin = []
+                    new_bin_size = 0
+
+                new_bin.append((idx, size))
+                new_bin_size += size
+
+                new_idx = bisect(ffd_bin_sizes, new_bin_size)
+                ffd_bins.insert(new_idx, new_bin)
+                ffd_bin_sizes.insert(new_idx, new_bin_size)
+
+            print(f"Phase 5 ended with {len(ffd_bins)} bins")
+
+            bins.extend(ffd_bins)
 
         print(timer.get_timing_metrics("sum"))
 
