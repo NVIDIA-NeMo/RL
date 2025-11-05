@@ -567,69 +567,78 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
         # Phase-1: start one bin per large item
         bins: List[List[Tuple[int, int]]] = [[item] for item in large]
 
+        from nemo_rl.utils.timer import Timer
+        timer = Timer()
+
         # Phase-2: try to add one medium item to each large bin (forward pass)
-        for b in bins:
-            remaining = self.bin_capacity - sum(size for _, size in b)
-            for i, (idx, size) in enumerate(medium):
-                if size <= remaining:
-                    b.append(medium.pop(i))
-                    break
+        with timer.time("phase 2"):
+            for b in bins:
+                remaining = self.bin_capacity - sum(size for _, size in b)
+                for i, (idx, size) in enumerate(medium):
+                    if size <= remaining:
+                        b.append(medium.pop(i))
+                        break
 
         # Phase-3: backward pass – fill with two small items where possible
-        for b in reversed(bins):
-            has_medium = any(
-                self.bin_capacity / 3 < size <= self.bin_capacity / 2 for _, size in b
-            )
-            if has_medium or len(small) < 2:
-                continue
-            remaining = self.bin_capacity - sum(size for _, size in b)
-            if small[0][1] + small[1][1] > remaining:
-                continue
-            first_small = small.pop(0)
-            # pick the *largest* small that fits with first_small (so iterate from end)
-            second_idx = None
-            for j in range(len(small) - 1, -1, -1):
-                if small[j][1] <= remaining - first_small[1]:
-                    second_idx = j
-                    break
-            if second_idx is not None:
-                second_small = small.pop(second_idx)
-                b.extend([first_small, second_small])
+        with timer.time("phase 3"):
+            for b in reversed(bins):
+                has_medium = any(
+                    self.bin_capacity / 3 < size <= self.bin_capacity / 2 for _, size in b
+                )
+                if has_medium or len(small) < 2:
+                    continue
+                remaining = self.bin_capacity - sum(size for _, size in b)
+                if small[0][1] + small[1][1] > remaining:
+                    continue
+                first_small = small.pop(0)
+                # pick the *largest* small that fits with first_small (so iterate from end)
+                second_idx = None
+                for j in range(len(small) - 1, -1, -1):
+                    if small[j][1] <= remaining - first_small[1]:
+                        second_idx = j
+                        break
+                if second_idx is not None:
+                    second_small = small.pop(second_idx)
+                    b.extend([first_small, second_small])
 
         # Phase-4: forward greedy fit of remaining items
-        remaining_items = sorted(
-            medium + small + tiny, key=lambda x: x[1], reverse=True
-        )
-        for b in bins:
-            while remaining_items:
-                rem = self.bin_capacity - sum(size for _, size in b)
-                # if even the smallest remaining doesn't fit we break
-                if rem < remaining_items[-1][1]:
-                    break
-
-                # pick the first (largest) that fits
-                chosen_idx = None
-                for i, (_, size) in enumerate(remaining_items):
-                    if size <= rem:
-                        chosen_idx = i
+        with timer.time("phase 4"):
+            remaining_items = sorted(
+                medium + small + tiny, key=lambda x: x[1], reverse=True
+            )
+            for b in bins:
+                while remaining_items:
+                    rem = self.bin_capacity - sum(size for _, size in b)
+                    # if even the smallest remaining doesn't fit we break
+                    if rem < remaining_items[-1][1]:
                         break
-                if chosen_idx is None:
-                    break
-                b.append(remaining_items.pop(chosen_idx))
+
+                    # pick the first (largest) that fits
+                    chosen_idx = None
+                    for i, (_, size) in enumerate(remaining_items):
+                        if size <= rem:
+                            chosen_idx = i
+                            break
+                    if chosen_idx is None:
+                        break
+                    b.append(remaining_items.pop(chosen_idx))
 
         # Phase-5: FFD on leftovers
-        leftovers = remaining_items  # renamed for clarity
-        ffd_bins: List[List[Tuple[int, int]]] = []
-        for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
-            placed = False
-            for bin_ffd in ffd_bins:
-                if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
-                    bin_ffd.append((idx, size))
-                    placed = True
-                    break
-            if not placed:
-                ffd_bins.append([(idx, size)])
-        bins.extend(ffd_bins)
+        with timer.time("phase 5"):
+            leftovers = remaining_items  # renamed for clarity
+            ffd_bins: List[List[Tuple[int, int]]] = []
+            for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+                placed = False
+                for bin_ffd in ffd_bins:
+                    if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
+                        bin_ffd.append((idx, size))
+                        placed = True
+                        break
+                if not placed:
+                    ffd_bins.append([(idx, size)])
+            bins.extend(ffd_bins)
+
+        print(timer.get_timing_metrics("sum"))
 
         # Convert to list of index lists (discard sizes)
         return [[idx for idx, _ in b] for b in bins]
