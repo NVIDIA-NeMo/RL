@@ -192,6 +192,8 @@ class SequencePacker(ABC):
         if self.collect_metrics and self.metrics:
             self.metrics.update(sequence_lengths, bins, self.bin_capacity)
 
+        print(timer.get_timing_metrics("sum"))
+
         return bins
 
     def reset_metrics(self) -> None:
