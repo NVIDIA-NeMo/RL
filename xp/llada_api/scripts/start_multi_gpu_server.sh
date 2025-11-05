@@ -532,6 +532,9 @@ LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-ho
 # Add timeout configuration for long evaluations (9000s/12000s = handles 1319 samples with 4x slowdown)
 LB_CMD="$LB_CMD --timeout-keep-alive 9000 --request-timeout 12000"
 
+# Add pre-load-balancer batching for consistent batch sizes across GPUs
+LB_CMD="$LB_CMD --batch-size $BATCH_SIZE --max-wait-time $MAX_WAIT_TIME"
+
 if [[ "$VERBOSE" == true ]]; then
     LB_CMD="$LB_CMD --verbose"
 fi

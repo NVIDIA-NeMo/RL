@@ -529,7 +529,7 @@ echo "All workers initialized successfully!"
 sleep 5
 
 echo "[5/5] Starting load balancer..."
-$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 9000 --request-timeout 12000 VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
+$VENV_DIR/bin/python "LB_SCRIPT_PLACEHOLDER" --host 0.0.0.0 --port LOAD_BALANCER_PORT_PLACEHOLDER --worker-host localhost --worker-ports WORKER_PORTS_PLACEHOLDER --timeout-keep-alive 9000 --request-timeout 12000 --batch-size BATCH_SIZE_PLACEHOLDER --max-wait-time MAX_WAIT_TIME_PLACEHOLDER VERBOSE_FLAG_PLACEHOLDER 2>&1 | while IFS= read -r line; do
     echo "$line"
     
     if [[ "$line" =~ "Uvicorn running on".*":LOAD_BALANCER_PORT_PLACEHOLDER" ]]; then
@@ -640,6 +640,8 @@ COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_BASE_ARGS_PLACEHOLDER/$WORKER_BASE_ARGS}"
 COMMAND_BLOCK="${COMMAND_BLOCK//WORKER_PORTS_PLACEHOLDER/${WORKER_PORTS[*]}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//DCP_ABS_PATH_PLACEHOLDER/${DCP_ABS_PATH:-}}"
 COMMAND_BLOCK="${COMMAND_BLOCK//BASE_MODEL_PLACEHOLDER/$BASE_MODEL}"
+COMMAND_BLOCK="${COMMAND_BLOCK//BATCH_SIZE_PLACEHOLDER/$BATCH_SIZE}"
+COMMAND_BLOCK="${COMMAND_BLOCK//MAX_WAIT_TIME_PLACEHOLDER/$MAX_WAIT_TIME}"
 
 if [[ "$VERBOSE" == true ]]; then
     COMMAND_BLOCK="${COMMAND_BLOCK//VERBOSE_FLAG_PLACEHOLDER/--verbose}"
