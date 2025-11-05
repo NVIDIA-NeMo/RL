@@ -1351,6 +1351,7 @@ def grpo_train(
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
                 )
+                del log_data
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
@@ -1440,7 +1441,6 @@ def grpo_train(
             del train_data
             del zero_std_mask
             # logging
-            del log_data
             del metrics
             if "val_metrics" in dir():
                 del val_metrics
