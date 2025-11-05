@@ -58,9 +58,8 @@ class BatchAccumulator:
         self.pending_requests: deque = deque()
         self.lock = asyncio.Lock()
         self.processing = False
-        
-        # Start the batch distribution loop
-        asyncio.create_task(self._batch_distribution_loop())
+        self._distribution_task = None
+        self._worker_pool = None
     
     async def add_request(
         self, 
@@ -190,8 +189,21 @@ class BatchAccumulator:
     def set_worker_pool(self, worker_pool):
         """Set the worker pool for batch distribution."""
         self._worker_pool = worker_pool
-        # Replace the distribution loop to use worker_pool
-        # We'll do this by modifying the loop
+    
+    def start(self):
+        """Start the batch distribution loop. Must be called when event loop is running."""
+        if self._distribution_task is None:
+            self._distribution_task = asyncio.create_task(self._batch_distribution_loop())
+    
+    async def stop(self):
+        """Stop the batch distribution loop."""
+        if self._distribution_task is not None:
+            self._distribution_task.cancel()
+            try:
+                await self._distribution_task
+            except asyncio.CancelledError:
+                pass
+            self._distribution_task = None
 
 
 class WorkerPool:
@@ -414,6 +426,7 @@ async def lifespan(app: FastAPI):
     # Initialize batch accumulator if batching is enabled
     if batch_accumulator is not None:
         batch_accumulator.set_worker_pool(worker_pool)
+        batch_accumulator.start()  # Start the batch distribution loop now that event loop is running
         logger.info(f"Batch accumulator initialized: batch_size={batch_accumulator.batch_size}, max_wait_time={batch_accumulator.max_wait_time}s")
     
     # Start periodic health checks
@@ -423,6 +436,8 @@ async def lifespan(app: FastAPI):
     
     # Cleanup
     health_check_task.cancel()
+    if batch_accumulator is not None:
+        await batch_accumulator.stop()
     await worker_pool.cleanup()
     logger.info("Load balancer shut down")
 
