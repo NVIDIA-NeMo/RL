@@ -12,5 +12,5 @@ grpo:
   val_period: 1
 
 checkpointing:
-  checkpoint_must_save_by: "00:03:15:00"
+  checkpoint_must_save_by: "00:03:30:00"
   save_period: 1
