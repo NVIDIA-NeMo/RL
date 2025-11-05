@@ -202,6 +202,6 @@ def preference_collate_fn(
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
     if rewards:
-        data["rewards"] = rewards
+        data["rewards"] = torch.Tensor(rewards)
 
     return data

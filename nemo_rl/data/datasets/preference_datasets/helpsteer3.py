@@ -48,8 +48,16 @@ def to_preference_data_format(
         if isinstance(data["context"], str)
         else data["context"],
         "completions": [
-            {"rank": 0, "completion": [{"role": "assistant", "content": chosen}]},
-            {"rank": 1, "completion": [{"role": "assistant", "content": rejected}]},
+            {
+                "rank": 0,
+                "completion": [{"role": "assistant", "content": chosen}],
+                "reward": abs(overall_preference),
+            },
+            {
+                "rank": 1,
+                "completion": [{"role": "assistant", "content": rejected}],
+                "reward": 0,
+            },
         ],
     }
 
