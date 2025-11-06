@@ -76,7 +76,7 @@ def calculate_baseline_and_std_per_prompt(
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
     else:
-        reward_device = torch.device(reward_device)
+        reward_device = torch.device(rewards.device)
 
     for i in range(len(unique_prompts)):
         is_matching_prompt = (prompts == unique_prompts[i]).all(1)

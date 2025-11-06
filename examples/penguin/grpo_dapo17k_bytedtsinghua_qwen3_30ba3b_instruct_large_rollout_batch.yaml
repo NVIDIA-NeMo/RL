@@ -10,7 +10,9 @@ grpo:
   num_generations_per_prompt: 16
   # Each "step" in NeMo RL is all 16 minibatch steps we want to take. So we val and save every step.
   val_period: 1
+  # The advantages are much larger and this becomes non-trivially expensive.
+  calculate_advantages_on_gpu: true
 
 checkpointing:
-  checkpoint_must_save_by: "00:03:15:00"
+  checkpoint_must_save_by: "00:03:30:00"
   save_period: 1

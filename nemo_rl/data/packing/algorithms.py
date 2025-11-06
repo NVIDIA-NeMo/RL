@@ -611,16 +611,46 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
 
         # Phase-5: FFD on leftovers
         leftovers = remaining_items  # renamed for clarity
+
+        # Original O(n * m) implementation
+        """
+        num_iterations = 0
         ffd_bins: List[List[Tuple[int, int]]] = []
         for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
             placed = False
             for bin_ffd in ffd_bins:
+                num_iterations += 1
                 if size <= self.bin_capacity - sum(s for _, s in bin_ffd):
                     bin_ffd.append((idx, size))
                     placed = True
                     break
             if not placed:
                 ffd_bins.append([(idx, size)])
+
+        print(f"Phase 5 took {num_iterations} total iterations and ended with {len(ffd_bins)} bins")
+        """
+
+        from bisect import bisect
+
+        # New O(n * logn) implementation
+        ffd_bins: List[List[Tuple[int, int]]] = [[]]
+        ffd_bin_sizes: List[int] = [0]
+        for idx, size in sorted(leftovers, key=lambda x: x[1], reverse=True):
+            # We only need to check the first bin since we guarantee the order of ffd_bin_sizes to be sorted from smallest to largest.
+            if size <= (self.bin_capacity - ffd_bin_sizes[0]):
+                new_bin = ffd_bins.pop(0)
+                new_bin_size = ffd_bin_sizes.pop(0)
+            else:
+                new_bin = []
+                new_bin_size = 0
+
+            new_bin.append((idx, size))
+            new_bin_size += size
+
+            new_idx = bisect(ffd_bin_sizes, new_bin_size)
+            ffd_bins.insert(new_idx, new_bin)
+            ffd_bin_sizes.insert(new_idx, new_bin_size)
+
         bins.extend(ffd_bins)
 
         # Convert to list of index lists (discard sizes)

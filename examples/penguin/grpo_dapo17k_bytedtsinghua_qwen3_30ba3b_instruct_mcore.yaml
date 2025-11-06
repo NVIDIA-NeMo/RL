@@ -46,7 +46,7 @@ policy:
       tensor_parallel_size: 4
       # This is a very low GPU mem utilization. We GPU OOM in two places:
       # Refit after train, refit before validation.
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.7
 
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -75,7 +75,7 @@ policy:
     moe_router_load_balancing_type: global_aux_loss # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
