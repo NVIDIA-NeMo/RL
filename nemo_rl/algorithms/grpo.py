@@ -1053,10 +1053,11 @@ def grpo_train(
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
+                        device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(),
-                            rewards.cuda(),
-                            torch.ones_like(rewards).cuda(),
+                            input_ids.cuda(device_id),
+                            rewards.cuda(device_id),
+                            torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config["grpo"][
                                 "use_leave_one_out_baseline"
                             ],
