@@ -31,6 +31,51 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def log_worker_error(worker_idx: int, worker_url: str, error_type: str, details: dict, context: str = ""):
+    """
+    Centralized worker error logging - only logs informative errors, not timeouts.
+    
+    Args:
+        worker_idx: Index of the failing worker
+        worker_url: URL of the failing worker  
+        error_type: Type of error (HTTP_ERROR, EXCEPTION, TIMEOUT, etc.)
+        details: Dictionary with error details  
+        context: Additional context (batch info, request info, etc.)
+    """
+    # Skip logging for common health check timeouts - they're not informative
+    if error_type == "HEALTH_CHECK_EXCEPTION" and "ReadTimeout" in str(details.get("error_type", "")):
+        return
+    if error_type == "HEALTH_CHECK_EXCEPTION" and "timeout" in str(details.get("error", "")).lower():
+        return
+    
+    # Log concise, informative worker errors only
+    if error_type == "HTTP_ERROR":
+        status_code = details.get("status_code", "unknown")
+        response_body = details.get("response_body", "")
+        # Only show first few lines of response body
+        body_preview = response_body.split('\n')[0][:200] if response_body else ""
+        logger.error(f"🚨 Worker #{worker_idx} ({worker_url}) HTTP {status_code}: {body_preview}")
+        
+        # Show full response body only if it contains useful error info (not just HTML)
+        if response_body and len(response_body) < 1000 and not response_body.startswith('<!DOCTYPE'):
+            logger.error(f"   Response: {response_body}")
+            
+    elif error_type == "HEALTH_CHECK_FAILED":
+        status_code = details.get("status_code", "unknown") 
+        response_body = details.get("response_body", "")
+        body_preview = response_body.split('\n')[0][:200] if response_body else ""
+        logger.error(f"🚨 Worker #{worker_idx} ({worker_url}) health check failed (HTTP {status_code}): {body_preview}")
+        
+    elif error_type == "EXCEPTION":
+        error = details.get("error", "unknown error")
+        error_type_name = details.get("error_type", "")
+        logger.error(f"🚨 Worker #{worker_idx} ({worker_url}) {error_type_name}: {error}")
+        
+    else:
+        # Generic error logging for other types
+        error = details.get("error", str(details))
+        logger.error(f"🚨 Worker #{worker_idx} ({worker_url}) {error_type}: {error}")
+
 
 @dataclass
 class BatchRequest:
@@ -227,6 +272,9 @@ class CentralizedBatchProcessor:
     async def _send_single_request_with_future(self, worker_idx: int, worker_url: str, batch_request: BatchRequest):
         """Send a single request to a worker and handle the future result."""
         try:
+            # Track that we're sending a request to this worker
+            self.worker_pool.worker_last_activity[worker_idx] = time.time()
+            
             result = await self._send_single_request(worker_idx, worker_url, batch_request)
             batch_request.future.set_result(result)
         except Exception as e:
@@ -253,20 +301,43 @@ class CentralizedBatchProcessor:
                 except:
                     error_body = f"<Could not decode response body>"
                 
-                logger.error(f"❌ HTTP ERROR: Worker {worker_idx} returned status {response.status_code}")
-                logger.error(f"   URL: {target_url}")
-                logger.error(f"   Request ID: {batch_request.request_id}")
-                logger.error(f"   Response Headers: {dict(response.headers)}")
-                logger.error(f"   Response Body:")
-                for line in error_body.split('\n'):
-                    if line.strip():
-                        logger.error(f"     {line}")
+                # Use centralized error logging
+                log_worker_error(
+                    worker_idx=worker_idx,
+                    worker_url=worker_url,
+                    error_type="HTTP_ERROR",
+                    details={
+                        "status_code": response.status_code,
+                        "url": target_url,
+                        "request_id": batch_request.request_id,
+                        "response_headers": dict(response.headers),
+                        "response_body": error_body
+                    },
+                    context=f"Batch request processing"
+                )
                 
                 # Update error stats
                 async with self.worker_pool.lock:
                     self.worker_pool.worker_error_counts[worker_idx] += 1
-                    if response.status_code >= 500:  # Server errors make worker unhealthy
-                        self.worker_pool.healthy_workers.discard(worker_idx)
+                    # Only mark worker unhealthy after multiple consecutive server errors
+                    # Single 500s during processing are expected and shouldn't remove workers
+                    if response.status_code >= 500:
+                        # Track consecutive errors instead of immediate removal
+                        if not hasattr(self.worker_pool, 'consecutive_errors'):
+                            self.worker_pool.consecutive_errors = [0] * len(self.worker_pool.worker_urls)
+                        
+                        self.worker_pool.consecutive_errors[worker_idx] += 1
+                        
+                        # Only mark unhealthy after 3 consecutive errors
+                        if self.worker_pool.consecutive_errors[worker_idx] >= 3:
+                            self.worker_pool.healthy_workers.discard(worker_idx)
+                            logger.warning(f"⚠️ Worker {worker_idx} marked UNHEALTHY after {self.worker_pool.consecutive_errors[worker_idx]} consecutive errors")
+                        else:
+                            logger.debug(f"Worker {worker_idx} error count: {self.worker_pool.consecutive_errors[worker_idx]}/3")
+                    else:
+                        # Reset consecutive error count on successful response
+                        if hasattr(self.worker_pool, 'consecutive_errors'):
+                            self.worker_pool.consecutive_errors[worker_idx] = 0
                 
                 raise HTTPException(
                     status_code=response.status_code, 
@@ -276,19 +347,31 @@ class CentralizedBatchProcessor:
             # Update worker stats for successful requests
             async with self.worker_pool.lock:
                 self.worker_pool.worker_request_counts[worker_idx] += 1
+                # Reset consecutive error count on successful response
+                if hasattr(self.worker_pool, 'consecutive_errors'):
+                    self.worker_pool.consecutive_errors[worker_idx] = 0
+                # Track worker activity to avoid false unhealthy marking
+                self.worker_pool.worker_last_activity[worker_idx] = time.time()
             
             return response.json()
             
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
-            logger.error(f"❌ ERROR: Request to worker {worker_idx} ({worker_url}) failed:")
-            logger.error(f"   Request ID: {batch_request.request_id}")
-            logger.error(f"   Error: {e}")
-            logger.error(f"   Full traceback:")
-            for line in error_details.split('\n'):
-                if line.strip():
-                    logger.error(f"     {line}")
+            
+            # Use centralized error logging
+            log_worker_error(
+                worker_idx=worker_idx,
+                worker_url=worker_url,
+                error_type="EXCEPTION",
+                details={
+                    "request_id": batch_request.request_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": error_details
+                },
+                context=f"Batch request processing failed"
+            )
             
             async with self.worker_pool.lock:
                 self.worker_pool.worker_error_counts[worker_idx] += 1
@@ -313,14 +396,18 @@ class CentralizedBatchProcessor:
 class WorkerPool:
     """Manages a pool of worker servers and distributes requests among them."""
     
-    def __init__(self, worker_urls: List[str], health_check_interval: float = 30.0, request_timeout: float = 600.0, 
+    def __init__(self, worker_urls: List[str], health_check_interval: float = 60.0, request_timeout: float = 600.0, 
                  enable_centralized_batching: bool = True, batch_size: int = 8, batch_wait_time: float = 0.02):
         self.worker_urls = worker_urls
         self.current_index = 0
         self.healthy_workers = set(range(len(worker_urls)))
-        self.health_check_interval = health_check_interval
+        self.health_check_interval = health_check_interval  # Increased from 30s to 60s
         self.request_timeout = request_timeout
         self.lock = asyncio.Lock()
+        
+        # Track when workers are busy to avoid marking them unhealthy
+        self.worker_last_activity = [time.time()] * len(worker_urls)
+        self.worker_busy_count = [0] * len(worker_urls)
         
         # Centralized batching
         self.enable_centralized_batching = enable_centralized_batching
@@ -362,26 +449,127 @@ class WorkerPool:
     
     async def start_health_checks(self):
         """Start periodic health checks for all workers."""
+        last_status_report = 0
+        status_report_interval = 300  # Report status every 5 minutes
+        
         while True:
             await asyncio.sleep(self.health_check_interval)
             await self._check_all_workers()
+            
+            # Periodic status report
+            current_time = time.time()
+            if current_time - last_status_report >= status_report_interval:
+                await self._log_worker_status_summary()
+                last_status_report = current_time
+    
+    async def _log_worker_status_summary(self):
+        """Log a summary of worker health status."""
+        async with self.lock:
+            healthy_count = len(self.healthy_workers)
+            total_count = len(self.worker_urls)
+            
+            logger.info(f"📊 Worker Status: {healthy_count}/{total_count} healthy")
+            
+            # Only log details for unhealthy workers or if there are errors
+            has_issues = False
+            for i, url in enumerate(self.worker_urls):
+                if i not in self.healthy_workers:
+                    errors = self.worker_error_counts[i]
+                    logger.info(f"  Worker {i} ({url}): UNHEALTHY (errors: {errors})")
+                    has_issues = True
+                elif self.worker_error_counts[i] > 0:
+                    requests = self.worker_request_counts[i]
+                    errors = self.worker_error_counts[i]
+                    logger.info(f"  Worker {i} ({url}): HEALTHY but has errors (reqs: {requests}, errors: {errors})")
+                    has_issues = True
+            
+            if healthy_count == 0:
+                logger.error("🚨 WARNING: No healthy workers! All requests will fail.")
+            elif not has_issues:
+                total_requests = sum(self.worker_request_counts)
+                logger.info(f"  All workers healthy, {total_requests} total requests processed")
     
     async def _check_all_workers(self):
-        """Check health of all workers."""
+        """Check health of all workers with consideration for busy workers."""
         for i, url in enumerate(self.worker_urls):
+            was_healthy = i in self.healthy_workers
+            current_time = time.time()
+            last_activity = self.worker_last_activity[i]
+            time_since_activity = current_time - last_activity
+            
             try:
-                response = await self.client.get(f"{url}/health", timeout=5.0)
+                # Use longer timeout for health checks (15s instead of 5s) to account for busy workers
+                health_timeout = 15.0 if time_since_activity < 120 else 5.0  # Longer timeout if recently active
+                response = await self.client.get(f"{url}/health", timeout=health_timeout)
+                
                 if response.status_code == 200:
                     async with self.lock:
                         self.healthy_workers.add(i)
+                    # Log when a worker becomes healthy again
+                    if not was_healthy:
+                        logger.info(f"✅ Worker {i} ({url}) is now HEALTHY")
                 else:
-                    logger.warning(f"Worker {i} ({url}) unhealthy: status {response.status_code}")
+                    # Get response body for more details
+                    error_body = ""
+                    try:
+                        error_body = response.text
+                    except:
+                        error_body = "<Could not decode response body>"
+                    
+                    # Be more lenient with health check failures if worker was recently active
+                    if time_since_activity < 60:  # If active within last 60 seconds
+                        logger.debug(f"Worker {i} health check failed but was recently active ({time_since_activity:.1f}s ago) - keeping healthy")
+                        async with self.lock:
+                            self.healthy_workers.add(i)  # Keep it healthy
+                    else:
+                        # Only log informative health check failures (not just status codes)
+                        if response.status_code not in [503, 500] or "model" in error_body.lower() or "error" in error_body.lower():
+                            log_worker_error(
+                                worker_idx=i,
+                                worker_url=url,
+                                error_type="HEALTH_CHECK_FAILED",
+                                details={
+                                    "status_code": response.status_code,
+                                    "response_body": error_body,
+                                    "time_since_activity": time_since_activity
+                                }
+                            )
+                        
+                        async with self.lock:
+                            self.healthy_workers.discard(i)
+                            
+            except Exception as e:
+                # Be more lenient with timeouts if worker was recently active
+                is_timeout = "timeout" in str(e).lower() or "ReadTimeout" in type(e).__name__
+                
+                if is_timeout and time_since_activity < 90:  # If active within last 90 seconds
+                    logger.debug(f"Worker {i} health check timeout but was recently active ({time_since_activity:.1f}s ago) - keeping healthy")
+                    async with self.lock:
+                        self.healthy_workers.add(i)  # Keep it healthy
+                else:
+                    # Only log non-timeout exceptions (timeouts are expected during high load)
+                    if not is_timeout:
+                        log_worker_error(
+                            worker_idx=i,
+                            worker_url=url,
+                            error_type="HEALTH_CHECK_EXCEPTION",
+                            details={
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "time_since_activity": time_since_activity
+                            }
+                        )
+                    
                     async with self.lock:
                         self.healthy_workers.discard(i)
-            except Exception as e:
-                logger.warning(f"Worker {i} ({url}) health check failed: {e}")
-                async with self.lock:
-                    self.healthy_workers.discard(i)
+                        
+                        # If all workers become unhealthy, try to recover by assuming they're just busy
+                        if len(self.healthy_workers) == 0:
+                            logger.warning("⚠️ All workers marked unhealthy - likely overloaded. Attempting recovery...")
+                            for j in range(len(self.worker_urls)):
+                                if current_time - self.worker_last_activity[j] < 300:  # Active within 5 minutes
+                                    self.healthy_workers.add(j)
+                                    logger.info(f"🔄 Restored Worker {j} to healthy (was active {current_time - self.worker_last_activity[j]:.1f}s ago)")
     
     async def get_next_worker(self) -> Optional[tuple[int, str]]:
         """Get the next healthy worker using round-robin."""
@@ -497,25 +685,51 @@ class WorkerPool:
                 except:
                     error_body = f"<Could not decode response body>"
                 
-                logger.error(f"❌ HTTP ERROR: Worker {worker_idx} returned status {response.status_code}")
-                logger.error(f"   URL: {target_url}")
-                logger.error(f"   Method: {method} {path}")
-                logger.error(f"   Response Headers: {dict(response.headers)}")
-                logger.error(f"   Response Body:")
-                for line in error_body.split('\n'):
-                    if line.strip():
-                        logger.error(f"     {line}")
+                # Use centralized error logging
+                log_worker_error(
+                    worker_idx=worker_idx,
+                    worker_url=worker_url,
+                    error_type="HTTP_ERROR",
+                    details={
+                        "status_code": response.status_code,
+                        "url": target_url,
+                        "method": f"{method} {path}",
+                        "response_headers": dict(response.headers),
+                        "response_body": error_body
+                    },
+                    context=f"Direct request forwarding"
+                )
                 
                 # Update error stats
                 async with self.lock:
                     self.worker_error_counts[worker_idx] += 1
-                    if response.status_code >= 500:  # Server errors make worker unhealthy
-                        self.healthy_workers.discard(worker_idx)
+                    # Only mark worker unhealthy after multiple consecutive server errors
+                    if response.status_code >= 500:
+                        if not hasattr(self, 'consecutive_errors'):
+                            self.consecutive_errors = [0] * len(self.worker_urls)
+                        
+                        self.consecutive_errors[worker_idx] += 1
+                        
+                        # Only mark unhealthy after 3 consecutive errors
+                        if self.consecutive_errors[worker_idx] >= 3:
+                            self.healthy_workers.discard(worker_idx)
+                            logger.warning(f"⚠️ Worker {worker_idx} marked UNHEALTHY after {self.consecutive_errors[worker_idx]} consecutive errors (HTTP {response.status_code})")
+                        else:
+                            logger.debug(f"Worker {worker_idx} error count: {self.consecutive_errors[worker_idx]}/3 (HTTP {response.status_code})")
+                    else:
+                        # Reset consecutive error count on successful response
+                        if hasattr(self, 'consecutive_errors'):
+                            self.consecutive_errors[worker_idx] = 0
             else:
                 # Update stats only for successful requests
                 async with self.lock:
                     self.total_requests += 1
                     self.worker_request_counts[worker_idx] += 1
+                    # Reset consecutive error count on successful response
+                    if hasattr(self, 'consecutive_errors'):
+                        self.consecutive_errors[worker_idx] = 0
+                    # Track worker activity
+                    self.worker_last_activity[worker_idx] = time.time()
             
             # Return the response (including errors, so client can see them)
             return Response(
@@ -528,19 +742,36 @@ class WorkerPool:
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
-            logger.error(f"❌ ERROR: Forwarding request to worker {worker_idx} ({worker_url}) failed:")
-            logger.error(f"   Method: {method} {path}")
-            logger.error(f"   Error: {e}")
-            logger.error(f"   Full traceback:")
-            for line in error_details.split('\n'):
-                if line.strip():
-                    logger.error(f"     {line}")
+            
+            # Use centralized error logging
+            log_worker_error(
+                worker_idx=worker_idx,
+                worker_url=worker_url,
+                error_type="EXCEPTION",
+                details={
+                    "method": f"{method} {path}",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": error_details
+                },
+                context=f"Direct request forwarding failed"
+            )
             
             # Update error stats
             async with self.lock:
                 self.worker_error_counts[worker_idx] += 1
-                # Mark worker as unhealthy if it's failing
-                self.healthy_workers.discard(worker_idx)
+                # Only mark unhealthy after consecutive errors (not single failures)
+                if not hasattr(self, 'consecutive_errors'):
+                    self.consecutive_errors = [0] * len(self.worker_urls)
+                
+                self.consecutive_errors[worker_idx] += 1
+                
+                # Mark unhealthy after 3 consecutive errors
+                if self.consecutive_errors[worker_idx] >= 3:
+                    self.healthy_workers.discard(worker_idx)
+                    logger.warning(f"⚠️ Worker {worker_idx} marked UNHEALTHY after {self.consecutive_errors[worker_idx]} consecutive errors (last error: {e})")
+                else:
+                    logger.debug(f"Worker {worker_idx} error count: {self.consecutive_errors[worker_idx]}/3 (error: {e})")
             
             raise HTTPException(status_code=502, detail=f"Worker {worker_idx} error: {e}")
     
@@ -568,6 +799,12 @@ class WorkerPool:
                 stats["centralized_batching"] = self.centralized_batch_processor.get_stats()
             else:
                 stats["centralized_batching"] = {"enabled": False}
+            
+            # Add consecutive error counts for debugging
+            if hasattr(self, 'consecutive_errors'):
+                stats["worker_consecutive_errors"] = self.consecutive_errors
+            else:
+                stats["worker_consecutive_errors"] = [0] * len(self.worker_urls)
             
             return stats
     
@@ -603,9 +840,17 @@ async def lifespan(app: FastAPI):
     total_count = len(worker_pool.worker_urls)
     
     if healthy_count == 0:
-        logger.error("No healthy workers found! Server may not work properly.")
+        logger.error("🚨 NO HEALTHY WORKERS FOUND!")
+        logger.error("Common issues: workers not started yet, model loading failed, or network issues")
+        logger.error("Check worker error messages above (if any) or check worker processes directly")
     else:
-        logger.info(f"Found {healthy_count}/{total_count} healthy workers")
+        logger.info(f"✅ Found {healthy_count}/{total_count} healthy workers")
+        
+        # Only log details if some workers are unhealthy
+        if healthy_count < total_count:
+            for i, url in enumerate(worker_pool.worker_urls):
+                if i not in worker_pool.healthy_workers:
+                    logger.info(f"  Worker {i}: {url} - ❌ UNHEALTHY")
     
     # Start periodic health checks
     health_check_task = asyncio.create_task(worker_pool.start_health_checks())
@@ -662,6 +907,39 @@ async def get_stats():
     """Get detailed load balancer statistics."""
     return await worker_pool.get_stats()
 
+@app.get("/worker-status") 
+async def get_worker_status():
+    """Get simple worker health status for monitoring."""
+    stats = await worker_pool.get_stats()
+    current_time = time.time()
+    
+    worker_status = []
+    for worker in stats["workers"]:
+        worker_idx = worker["index"]
+        last_activity = worker_pool.worker_last_activity[worker_idx]
+        time_since_activity = current_time - last_activity
+        
+        status = {
+            "worker_id": worker_idx,
+            "url": worker["url"],
+            "healthy": worker["healthy"],
+            "requests_served": worker["requests_served"],
+            "errors": worker["errors"],
+            "consecutive_errors": stats["worker_consecutive_errors"][worker_idx],
+            "last_activity_seconds_ago": round(time_since_activity, 1),
+            "recently_active": time_since_activity < 90,
+            "status": "busy" if time_since_activity < 30 else "idle" if worker["healthy"] else "unhealthy"
+        }
+        worker_status.append(status)
+    
+    return {
+        "timestamp": current_time,
+        "healthy_workers": stats["healthy_workers"],
+        "total_workers": stats["total_workers"],
+        "workers": worker_status,
+        "system_status": "overloaded" if all(w["recently_active"] for w in worker_status) else "normal"
+    }
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_request(path: str, request: Request):
@@ -715,16 +993,13 @@ Examples:
         # Ensure we see ERROR messages even in non-verbose mode
         logging.getLogger().setLevel(logging.INFO)
     
-    # Also set up console handler to ensure errors go to stdout
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.ERROR)
-    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_formatter)
-    
-    # Add console handler if not already present
-    root_logger = logging.getLogger()
-    if not any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers):
-        root_logger.addHandler(console_handler)
+    # Ensure ERROR level messages are visible (avoid duplicate handlers)
+    if not any(isinstance(handler, logging.StreamHandler) for handler in logging.getLogger().handlers):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.ERROR)
+        console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logging.getLogger().addHandler(console_handler)
     
     # Create worker URLs
     worker_urls = [f"http://{args.worker_host}:{port}" for port in args.worker_ports]
