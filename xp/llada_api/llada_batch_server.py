@@ -281,11 +281,10 @@ class BatchRequest:
 class BatchProcessor:
     """Handles batching of requests and processing them together."""
     
-    def __init__(self, max_batch_size: int = 8, max_wait_time: float = 0.1):
+    def __init__(self, max_batch_size: int = 8, max_wait_time: float = 0.01):
         self.max_batch_size = max_batch_size
-        self.max_wait_time = max_wait_time
+        self.max_wait_time = max_wait_time  # Reduced for better responsiveness
         self.pending_requests: deque = deque()
-        self.processing = False
         self.lock = asyncio.Lock()
         
         # Start the batch processing loop
@@ -314,40 +313,39 @@ class BatchProcessor:
             raise
     
     async def _batch_processing_loop(self):
-        """Continuously process batches of requests."""
+        """Continuously process batches of requests with parallel processing capability."""
         while True:
             try:
-                await asyncio.sleep(0.01)  # Small delay to prevent busy waiting
+                await asyncio.sleep(0.005)  # Reduced delay for better responsiveness
                 
-                if not self.pending_requests or self.processing:
+                if not self.pending_requests:
                     continue
                 
-                # Check if we should process a batch
+                # Check if we should process a batch - allow multiple batches in parallel
                 should_process = False
                 async with self.lock:
                     if len(self.pending_requests) >= self.max_batch_size:
                         should_process = True
+                        logger.debug(f"Triggering batch: reached max_batch_size ({self.max_batch_size})")
                     elif self.pending_requests:
                         oldest_request_time = self.pending_requests[0].timestamp
                         if time.time() - oldest_request_time >= self.max_wait_time:
                             should_process = True
+                            logger.debug(f"Triggering batch: exceeded max_wait_time ({self.max_wait_time}s)")
                 
                 if should_process:
-                    await self._process_batch()
+                    # Process batch in parallel - multiple batches can run simultaneously
+                    asyncio.create_task(self._process_batch())
                     
             except Exception as e:
                 logger.error(f"Error in batch processing loop: {e}")
     
     async def _process_batch(self):
-        """Process a batch of requests."""
-        if self.processing:
-            return
-        
-        self.processing = True
+        """Process a batch of requests with parallel processing capability."""
         batch_requests = []
         
         try:
-            # Extract requests from the queue
+            # Extract requests from the queue (keep lock time minimal)
             async with self.lock:
                 while self.pending_requests and len(batch_requests) < self.max_batch_size:
                     batch_requests.append(self.pending_requests.popleft())
@@ -355,14 +353,21 @@ class BatchProcessor:
             if not batch_requests:
                 return
             
-            logger.info(f"Processing batch of {len(batch_requests)} requests")
+            batch_size = len(batch_requests)
             batch_start_time = time.time()
+            
+            logger.info(f"🔧 Worker processing batch of {batch_size} requests (max_batch_size: {self.max_batch_size})")
+            
+            # Safety check: Warn if batch size is unexpectedly small
+            if batch_size < self.max_batch_size and batch_size > 0:
+                logger.warning(f"⚠️ Processing partial batch: {batch_size}/{self.max_batch_size} requests")
             
             # Process the batch
             results = await self._process_batch_requests(batch_requests)
             
             batch_time = time.time() - batch_start_time
-            logger.info(f"Batch of {len(batch_requests)} completed in {batch_time:.3f}s ({len(batch_requests)/batch_time:.1f} req/s)")
+            throughput = batch_size / batch_time if batch_time > 0 else 0
+            logger.info(f"✅ Worker batch of {batch_size} completed in {batch_time:.3f}s ({throughput:.1f} req/s)")
             
             # Return results to waiting futures
             for batch_request, result in zip(batch_requests, results):
@@ -372,13 +377,11 @@ class BatchProcessor:
                     batch_request.future.set_result(result)
                     
         except Exception as e:
-            logger.error(f"Batch processing failed: {e}")
+            logger.error(f"❌ Worker batch processing failed: {e}")
             # Set exception for all pending requests
             for batch_request in batch_requests:
                 if not batch_request.future.done():
                     batch_request.future.set_exception(e)
-        finally:
-            self.processing = False
     
     async def _process_batch_requests(self, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
         """Process a batch of requests using Fast-dLLM batch capabilities."""
@@ -802,7 +805,6 @@ async def batch_stats():
         "max_batch_size": batch_processor.max_batch_size,
         "max_wait_time": batch_processor.max_wait_time,
         "pending_requests": len(batch_processor.pending_requests),
-        "currently_processing": batch_processor.processing
     }
 
 @app.get("/generation/algorithms")
@@ -862,7 +864,7 @@ Examples:
                        help="Specific algorithm within engine (optional, uses engine default if not specified)")
     parser.add_argument("--batch-size", type=int, default=8, 
                        help="Maximum batch size for processing requests")
-    parser.add_argument("--max-wait-time", type=float, default=0.1,
+    parser.add_argument("--max-wait-time", type=float, default=0.01,
                        help="Maximum time to wait for batch to fill (seconds)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose debug logging (very verbose, use for troubleshooting)")
