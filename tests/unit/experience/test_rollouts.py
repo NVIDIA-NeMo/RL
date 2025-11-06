@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 # These are all fixtures
 from tests.unit.environments.test_penguin import (
+    PENGUIN_INSTALLED,
     cluster,  # noqa: F401
     penguin,  # noqa: F401
     penguin_sanity_test_data,  # noqa: F401
@@ -746,6 +747,10 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
 
+@pytest.mark.skipif(
+    not PENGUIN_INSTALLED,
+    reason="Skipping Penguin test since Penguin is not installed!",
+)
 def test_run_async_penguin_rollout(
     penguin,  # noqa: F811
     penguin_vllm_generation,  # noqa: F811
