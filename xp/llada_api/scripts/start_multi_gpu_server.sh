@@ -16,8 +16,8 @@ BASE_MODEL="GSAI-ML/LLaDA-8B-Instruct"
 TEMP_DIR="/tmp/llada_hf_converted"
 ENGINE=""
 ALGORITHM=""
-BATCH_SIZE=8
-MAX_WAIT_TIME=0.1
+BATCH_SIZE=16  # Optimized for better GPU utilization
+MAX_WAIT_TIME=0.01  # Optimized for lower latency
 VERBOSE=false
 NO_CHAT_TEMPLATE=false
 HOST="0.0.0.0"
@@ -368,8 +368,10 @@ echo "  🖥️  Total GPUs: $NUM_GPUS"
 echo "  🔢 GPU IDs: ${GPU_ARRAY[*]}"
 echo "  🌐 Load Balancer: http://$HOST:$LOAD_BALANCER_PORT"
 echo "  👷 Worker Ports: $BASE_WORKER_PORT - $((BASE_WORKER_PORT + NUM_GPUS - 1))"
-echo "  📊 Batch Size (per worker): $BATCH_SIZE"
-echo "  ⏱️  Max Wait Time: $MAX_WAIT_TIME s"
+echo "  📊 Centralized Batch Size (LB): $BATCH_SIZE"
+echo "  📊 Worker Batch Size: $BATCH_SIZE"
+echo "  ⏱️  Centralized Wait Time (LB): $MAX_WAIT_TIME s"
+echo "  ⏱️  Worker Wait Time: $MAX_WAIT_TIME s"
 if [[ -n "$ENGINE" ]]; then
     echo "  ⚡ Engine: $ENGINE"
 fi
@@ -528,6 +530,10 @@ echo ""
 # Start load balancer
 print_lb "Starting load balancer on port $LOAD_BALANCER_PORT"
 LB_CMD="python3 '$LB_SCRIPT' --host $HOST --port $LOAD_BALANCER_PORT --worker-host localhost --worker-ports ${WORKER_PORTS[*]}"
+
+# Add batch configuration to match worker settings
+# This synchronizes centralized batching (LB) with worker batching for optimal performance
+LB_CMD="$LB_CMD --batch-size $BATCH_SIZE --batch-wait-time $MAX_WAIT_TIME"
 
 # Add timeout configuration for long evaluations (9000s/12000s = handles 1319 samples with 4x slowdown)
 LB_CMD="$LB_CMD --timeout-keep-alive 9000 --request-timeout 12000"

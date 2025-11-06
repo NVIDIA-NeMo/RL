@@ -17,10 +17,10 @@ TEMP_DIR="/tmp/llada_hf_converted"
 ENGINE=""  # Auto-detected based on model type (LLaDA→dinfer, Nemotron→nemotron)
 ALGORITHM=""  # Optional specific algorithm within engine
 
-# Default values - Batch Processing
+# Default values - Batch Processing (Optimized for performance)
 SERVER_MODE="batch"  # "batch" or "streaming"
-BATCH_SIZE=8
-MAX_WAIT_TIME=0.1
+BATCH_SIZE=16  # Increased for better GPU utilization
+MAX_WAIT_TIME=0.01  # Reduced for lower latency
 VERBOSE=false
 NO_CHAT_TEMPLATE=false
 
