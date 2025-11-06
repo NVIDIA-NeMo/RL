@@ -1007,7 +1007,9 @@ def run_async_penguin_rollout(
     with timer.time(f"{timer_prefix}/run_rollouts"):
         penguin_environment = task_to_env["penguin"]
         results, rollout_loop_timing_metrics = ray.get(
-            penguin_environment.run_rollouts.remote(penguin_rows, tokenizer, timer_prefix)
+            penguin_environment.run_rollouts.remote(
+                penguin_rows, tokenizer, timer_prefix
+            )
         )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
@@ -1024,7 +1026,8 @@ def run_async_penguin_rollout(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"]) == max_total_tokens_per_sample,
+                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
+                == max_total_tokens_per_sample,
             }
             for r in results
         ]
@@ -1049,9 +1052,13 @@ def run_async_penguin_rollout(
                 "gen_tokens_per_sample",
             ),
             **_calculate_single_metric(
-                [m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"
+                [m["total_reward"] for m in all_sample_metrics],
+                batch_size,
+                "total_reward",
             ),
-            "natural_termination_rate": sum(not m["hit_max_tokens"] for m in all_sample_metrics)
+            "natural_termination_rate": sum(
+                not m["hit_max_tokens"] for m in all_sample_metrics
+            )
             / batch_size,
             "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
             / batch_size,
@@ -1075,7 +1082,9 @@ def run_async_penguin_rollout(
             keys = agent_results[0].keys()
             for key in keys:
                 values = [
-                    float(r[key]) for r in agent_results if isinstance(r.get(key), (bool, int, float))
+                    float(r[key])
+                    for r in agent_results
+                    if isinstance(r.get(key), (bool, int, float))
                 ]
                 if values:
                     per_agent_metrics.update(

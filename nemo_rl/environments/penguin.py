@@ -48,7 +48,9 @@ class Penguin(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/penguin.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = self.cfg.get("initial_global_config_dict") or dict()
+        initial_global_config_dict = (
+            self.cfg.get("initial_global_config_dict") or dict()
+        )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -56,7 +58,9 @@ class Penguin(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        initial_global_config_dict.setdefault("global_aiohttp_connector_limit_per_host", 16_384)
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_connector_limit_per_host", 16_384
+        )
         initial_global_config_dict.setdefault("global_aiohttp_connector_limit", 65_536)
         print(
             f"""Set global_aiohttp_connector_limit_per_host={initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} and global_aiohttp_connector_limit={initial_global_config_dict["global_aiohttp_connector_limit"]}.
@@ -99,7 +103,12 @@ Depending on your data shape, you may want to change these values."""
     def health_check(self) -> bool:
         return True
 
-    async def run_rollouts(self, penguin_examples: list[dict], tokenizer: PreTrainedTokenizerBase, timer_prefix: str) -> list[dict]:
+    async def run_rollouts(
+        self,
+        penguin_examples: list[dict],
+        tokenizer: PreTrainedTokenizerBase,
+        timer_prefix: str,
+    ) -> list[dict]:
         timer = Timer()
 
         penguin_result_iterator = self.rch.run_examples(
@@ -113,18 +122,24 @@ Depending on your data shape, you may want to change these values."""
                 penguin_result = await task
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(penguin_result, tokenizer)
+                nemo_rl_result = self._postprocess_penguin_to_nemo_rl_result(
+                    penguin_result, tokenizer
+                )
 
             nemo_rl_results.append(nemo_rl_result)
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
         total_time = timing_metrics.pop("_run_rollouts_total")
-        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = 100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        )
 
         return nemo_rl_results, timing_metrics
 
-    def _postprocess_penguin_to_nemo_rl_result(self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase) -> dict:
+    def _postprocess_penguin_to_nemo_rl_result(
+        self, penguin_result: dict, tokenizer: PreTrainedTokenizerBase
+    ) -> dict:
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         for output_item_dict in penguin_result["response"]["output"]:
@@ -148,9 +163,9 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["prompt_token_ids"][
-                        len(seen_token_ids) :
-                    ]),
+                    "token_ids": torch.tensor(
+                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
+                    ),
                 }
             )
             nemo_rl_message_log.append(
@@ -158,7 +173,9 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "role": "assistant",
                     "content": "",
                     "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(output_item_dict["generation_log_probs"]),
+                    "generation_logprobs": torch.tensor(
+                        output_item_dict["generation_log_probs"]
+                    ),
                 }
             )
 
@@ -166,8 +183,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(output_item_dict.pop("prompt_token_ids"))
-            output_item_dict["generation_str"] = tokenizer.decode(output_item_dict.pop("generation_token_ids"))
+            output_item_dict["prompt_str"] = tokenizer.decode(
+                output_item_dict.pop("prompt_token_ids")
+            )
+            output_item_dict["generation_str"] = tokenizer.decode(
+                output_item_dict.pop("generation_token_ids")
+            )
             output_item_dict.pop("generation_log_probs")
 
         return {
