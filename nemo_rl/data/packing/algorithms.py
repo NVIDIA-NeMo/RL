@@ -611,7 +611,6 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
 
         # Phase-5: FFD on leftovers
         leftovers = remaining_items  # renamed for clarity
-        print(f"Phase 5 found {len(leftovers)} leftovers out of {len(sequence_lengths)} items")
 
         # Original O(n * m) implementation
         """
@@ -651,8 +650,6 @@ class ModifiedFirstFitDecreasingPacker(SequencePacker):
             new_idx = bisect(ffd_bin_sizes, new_bin_size)
             ffd_bins.insert(new_idx, new_bin)
             ffd_bin_sizes.insert(new_idx, new_bin_size)
-
-        print(f"Phase 5 ended with {len(ffd_bins)} bins")
 
         bins.extend(ffd_bins)
 
