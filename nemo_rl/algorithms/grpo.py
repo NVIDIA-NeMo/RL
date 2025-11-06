@@ -1053,6 +1053,7 @@ def grpo_train(
                     print("▶ Computing advantages...", flush=True)
                     if master_config["grpo"].get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
+                        # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
