@@ -1,9 +1,9 @@
 import os
-from psutil import Process
-from ray.scripts.scripts import memory_summary
 from typing import List, Optional
 
+from psutil import Process
 from pydantic import BaseModel, Field
+from ray.scripts.scripts import memory_summary
 
 
 class MemoryTrackerDataPoint(BaseModel):
@@ -20,7 +20,11 @@ class MemoryTrackerDataPoint(BaseModel):
 
     @property
     def new_variables(self) -> List[str]:
-        return [v for v in self.variables_after_stage if v not in self.variables_before_stage]
+        return [
+            v
+            for v in self.variables_after_stage
+            if v not in self.variables_before_stage
+        ]
 
     def get_snapshot_str(self) -> str:
         ray_memory_summary = memory_summary(stats_only=True, num_entries=5)
@@ -41,9 +45,11 @@ class MemoryTracker(BaseModel):
         self._process = Process(os.getpid())
         return super().model_post_init(context)
 
-    def snapshot_start_of_stage(self, new_stage: str, all_current_variables: List[str]) -> None:
+    def snapshot_start_of_stage(
+        self, new_stage: str, all_current_variables: List[str]
+    ) -> None:
         mem_info = self._process.memory_info()
-        current_mem_used_gb: float = mem_info.rss / (1024 ** 3)
+        current_mem_used_gb: float = mem_info.rss / (1024**3)
 
         if self.data_points:
             last_data_point = self.data_points[-1]

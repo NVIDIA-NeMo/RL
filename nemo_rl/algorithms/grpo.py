@@ -1036,7 +1036,9 @@ def grpo_train(
                         )
                     policy_generation.finish_generation()
 
-                    metrics_logging_data["mean_gen_tokens_per_sample"] = rollout_metrics["mean_gen_tokens_per_sample"]
+                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
+                        rollout_metrics["mean_gen_tokens_per_sample"]
+                    )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
                     del rollout_metrics
 
@@ -1113,9 +1115,17 @@ def grpo_train(
 
                     baseline: torch.Tensor
                     metrics["baseline_reward/histogram"] = Histogram(baseline.numpy())
-                    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
-                    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
-                    metrics["baseline_reward/pct_mixed"] = 100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
+                    metrics["baseline_reward/pct_0"] = (
+                        100 * (baseline == 0).float().mean().item()
+                    )
+                    metrics["baseline_reward/pct_1"] = (
+                        100 * (baseline == 1).float().mean().item()
+                    )
+                    metrics["baseline_reward/pct_mixed"] = (
+                        100
+                        - metrics["baseline_reward/pct_0"]
+                        - metrics["baseline_reward/pct_1"]
+                    )
 
                     if master_config["grpo"]["normalize_rewards"]:
                         # don't sharpen the ones with no variation
@@ -1202,12 +1212,18 @@ def grpo_train(
                             "input_lengths": train_data["input_lengths"],
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)["logprobs"]
+                    train_data["prev_logprobs"] = policy.get_logprobs(logprob_data)[
+                        "logprobs"
+                    ]
 
-                    if not master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
-                        train_data["reference_policy_logprobs"] = policy.get_reference_policy_logprobs(
-                            logprob_data
-                        )["reference_logprobs"]
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        train_data["reference_policy_logprobs"] = (
+                            policy.get_reference_policy_logprobs(logprob_data)[
+                                "reference_logprobs"
+                            ]
+                        )
 
                     del logprob_data
 
@@ -1383,7 +1399,9 @@ def grpo_train(
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
 
-                log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 logger.log_batched_dict_as_jsonl(
@@ -1458,7 +1476,12 @@ def grpo_train(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
             # step_finished=True here since this is the final log of our current step.
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train", step_finished=True)
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None

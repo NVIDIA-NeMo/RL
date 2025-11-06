@@ -179,7 +179,9 @@ class WandbLogger(LoggerInterface):
         self.run = wandb.init(**cfg, dir=log_dir)
 
         if os.environ.get("RAY_BACKEND_LOG_LEVEL", "").lower() == "debug":
-            print("Uploading raylet.out and raylet.err files to W&B since environment variable RAY_BACKEND_LOG_LEVEL=debug")
+            print(
+                "Uploading raylet.out and raylet.err files to W&B since environment variable RAY_BACKEND_LOG_LEVEL=debug"
+            )
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 

@@ -21,6 +21,7 @@ from typing import Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
+
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
 import ray
@@ -37,8 +38,8 @@ from nemo_rl.algorithms.grpo import (
     TokenizerType,
     _should_use_penguin,
     grpo_train,
-    setup,
     refit_policy_generation,
+    setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -245,7 +246,9 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
-    is_trajectory_collection = config["env"]["penguin"].pop("is_trajectory_collection", False) or False
+    is_trajectory_collection = (
+        config["env"]["penguin"].pop("is_trajectory_collection", False) or False
+    )
     penguin_config = PenguinConfig(
         model_name=policy_generation.cfg["model_name"],
         base_urls=policy_generation.dp_openai_server_base_urls,
