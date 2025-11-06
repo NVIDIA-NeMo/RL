@@ -17,6 +17,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.rollout_is import compute_rollout_importance_weights
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -50,6 +51,14 @@ class ClippedPGLossConfig(TypedDict):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: NotRequired[bool]
+    # Rollout Importance Sampling (IS) configuration
+    # Corrects for distribution mismatch between rollout policy (e.g., vLLM BF16) and training policy (e.g., FSDP FP32)
+    enable_rollout_is: NotRequired[bool]
+    rollout_is_level: NotRequired[str]  # "token", "sequence", or "geometric"
+    rollout_is_mode: NotRequired[str]  # "truncate" or "mask"
+    rollout_is_threshold: NotRequired[float]  # Upper threshold for IS weights
+    rollout_is_threshold_lower: NotRequired[float | None]  # Lower threshold (defaults to 1/upper)
+    rollout_is_veto_threshold: NotRequired[float | None]  # Catastrophic token threshold
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -62,6 +71,7 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    rollout_logprobs: NotRequired[torch.Tensor]  # Log probs from rollout policy (for rollout IS)
     __extra__: Any
 
 
@@ -129,6 +139,14 @@ class ClippedPGLossFn(LossFunction):
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
+        # Rollout Importance Sampling (IS) configuration
+        self.enable_rollout_is = cfg.get("enable_rollout_is", False)
+        self.rollout_is_level = cfg.get("rollout_is_level", "token")
+        self.rollout_is_mode = cfg.get("rollout_is_mode", "truncate")
+        self.rollout_is_threshold = cfg.get("rollout_is_threshold", None)
+        self.rollout_is_threshold_lower = cfg.get("rollout_is_threshold_lower", None)
+        self.rollout_is_veto_threshold = cfg.get("rollout_is_veto_threshold", None)
+
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
@@ -139,6 +157,16 @@ class ClippedPGLossFn(LossFunction):
             )
             assert self.truncated_importance_sampling_ratio > 0, (
                 "truncated_importance_sampling_ratio should be positive"
+            )
+        if self.enable_rollout_is:
+            assert self.rollout_is_threshold is not None, (
+                "rollout_is_threshold must be provided when enable_rollout_is is True"
+            )
+            assert self.rollout_is_level in ["token", "sequence", "geometric"], (
+                f"rollout_is_level must be 'token', 'sequence', or 'geometric', got {self.rollout_is_level}"
+            )
+            assert self.rollout_is_mode in ["truncate", "mask"], (
+                f"rollout_is_mode must be 'truncate' or 'mask', got {self.rollout_is_mode}"
             )
 
     def __call__(
@@ -259,6 +287,38 @@ class ClippedPGLossFn(LossFunction):
                 dim=-1, index=next_tokens.unsqueeze(-1)
             ).squeeze(-1)
 
+        # -------------------------------------------------------------
+        # Rollout Importance Sampling (IS) correction
+        # -------------------------------------------------------------
+        # Corrects for distribution mismatch between rollout policy (e.g., vLLM BF16)
+        # and training policy (e.g., FSDP FP32)
+        rollout_is_weights = torch.ones_like(curr_logprobs)
+        rollout_is_metrics = {}
+        if self.enable_rollout_is:
+            (
+                rollout_is_weights,
+                modified_token_mask,
+                rollout_is_metrics,
+            ) = compute_rollout_importance_weights(
+                train_log_prob=prev_logprobs,
+                rollout_log_prob=generation_logprobs,
+                token_mask=mask,
+                rollout_is_level=self.rollout_is_level,
+                rollout_is_mode=self.rollout_is_mode,
+                rollout_is_threshold=self.rollout_is_threshold,
+                rollout_is_threshold_lower=self.rollout_is_threshold_lower,
+                rollout_is_veto_threshold=self.rollout_is_veto_threshold,
+                global_valid_tokens=global_valid_toks,
+                global_valid_seqs=global_valid_seqs,
+            )
+            mask = modified_token_mask
+            mult_prob_error_after_masking = masked_mean(
+                torch.exp(lp_error * modified_token_mask),
+                modified_token_mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            rollout_is_metrics["mult_prob_error_after_masking"] = mult_prob_error_after_masking
+
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
             if self.use_on_policy_kl_approximation:
@@ -365,6 +425,10 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
+        # Multiply with rollout IS weights (corrects for rollout-training distribution mismatch)
+        # This is applied on top of the actor importance sampling correction
+        importance_weights_to_use = importance_weights_to_use * rollout_is_weights
+
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
                 importance_weights_to_use * clip_loss,
@@ -422,22 +486,25 @@ class ClippedPGLossFn(LossFunction):
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
-        return (
-            loss,
-            {
-                "loss": loss.item(),
-                "probs_ratio": probs_ratio,
-                "probs_ratio_clamped": probs_ratio_clamped,
-                "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
-                "token_mult_prob_error": mult_prob_error,
-                "gen_kl_error": gen_kl_error,
-                "policy_kl_error": policy_kl_error,
-                "js_divergence_error": js_divergence_error,
-                "sampling_importance_ratio": sample_importance_ratio.item(),
-                "num_valid_samples": sample_mask.sum().item(),
-                "approx_entropy": seq_entropy_approx.item(),
-            },
-        )
+        metrics_dict = {
+            "loss": loss.item(),
+            "probs_ratio": probs_ratio,
+            "probs_ratio_clamped": probs_ratio_clamped,
+            "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+            "token_mult_prob_error": mult_prob_error,
+            "gen_kl_error": gen_kl_error,
+            "policy_kl_error": policy_kl_error,
+            "js_divergence_error": js_divergence_error,
+            "sampling_importance_ratio": sample_importance_ratio.item(),
+            "num_valid_samples": sample_mask.sum().item(),
+            "approx_entropy": seq_entropy_approx.item(),
+            "global_valid_seqs": global_valid_seqs.item(),
+            "global_valid_toks": global_valid_toks.item(),
+        }
+        # Add rollout IS metrics if available
+        metrics_dict.update(rollout_is_metrics)
+
+        return (loss, metrics_dict)
 
 
 class NLLLoss(LossFunction):

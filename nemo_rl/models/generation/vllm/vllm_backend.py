@@ -122,6 +122,8 @@ class VllmInternalWorkerExtension:
 
                 weights = []
                 offset = 0
+                # print(self.state_dict_info.keys())
+                # print(self.state_dict_info)
                 for key in list_keys:
                     shape, dtype = self.state_dict_info[key]  # pyrefly
                     if isinstance(shape, list):
@@ -135,6 +137,12 @@ class VllmInternalWorkerExtension:
                             .view(shape),
                         )
                     )
+                    if torch.isnan(weights[-1][1]).any() or (weights[-1][1] == 0).all():
+                        reason = "NaN" if torch.isnan(weights[-1][1]).any() else "all zeros"
+                        print(f"{reason} found in weights for key: {key}")
+                        # print(weights[-1][1])
+                        raise ValueError(f"{reason} found in weights for key: {key}")
+
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
                 assert offset == used_bytes, (
@@ -169,6 +177,8 @@ class VllmInternalWorkerExtension:
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
+            import traceback
+            traceback.print_exc()
             return False
 
     @wrap_with_nvtx_name(

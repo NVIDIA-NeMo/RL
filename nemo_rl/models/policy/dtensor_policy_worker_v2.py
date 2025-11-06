@@ -35,8 +35,6 @@ from nemo_automodel.components.checkpoint._backports.filesystem import (
 )
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
-    _maybe_adapt_state_dict_from_hf,
-    _maybe_adapt_state_dict_to_hf,
 )
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
@@ -103,6 +101,15 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def _maybe_adapt_tensor_to_hf(
+    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
+) -> list[tuple[str, torch.Tensor]]:
+    adapter = getattr(model_part, "state_dict_adapter", None)
+    if adapter:
+        return adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r".*_extra_state.*", quantization=quantization)
+    return [(fqn, tensor)]
 
 
 @ray.remote(
@@ -372,6 +379,7 @@ class DTensorPolicyWorkerV2:
                 tp_axis_name="tp",
                 ep_axis_name="ep",
                 ep_shard_axis_names=("ep_shard",),
+                activation_checkpointing=self.cfg["dtensor_cfg"]["activation_checkpointing"],
             )
         else:
             self.model = manager.parallelize(self.model)
@@ -427,7 +435,7 @@ class DTensorPolicyWorkerV2:
         if init_optimizer:
             optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"], exp_avg_dtype=torch.bfloat16, exp_avg_sq_dtype=torch.bfloat16
+                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]#, exp_avg_dtype=torch.bfloat16, exp_avg_sq_dtype=torch.bfloat16
             )
         else:
             self.optimizer = None
@@ -874,8 +882,12 @@ class DTensorPolicyWorkerV2:
                             )
                         grad_norm = torch.tensor([grad_norm])'''
 
-                    # Update parameters
-                    self.optimizer.step()
+                    if not torch.isfinite(grad_norm):
+                        print(f"WARN: grad_norm is not finite: {grad_norm}")
+                        self.optimizer.zero_grad()
+                    else:
+                        # Update parameters
+                        self.optimizer.step()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -1727,11 +1739,12 @@ class DTensorPolicyWorkerV2:
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        state_dict = self.model.state_dict()
-        state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
-        for name, tensor in state_dict.items():
+        for name, tensor in self.model.state_dict().items():
+            full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-            state_dict_info[name] = (tensor.shape, self.dtype)
+            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+            for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
 
         return state_dict_info
 
@@ -1755,20 +1768,12 @@ class DTensorPolicyWorkerV2:
 
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict = self.model.state_dict()
-            state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
-            for name, tensor in state_dict.items():
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
+            for name, tensor in self.model.state_dict().items():
+                full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+                for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                     # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+                    yield adapted_fqn, adapted_tensor.to(self.dtype, non_blocking=True).contiguous()
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
@@ -2055,7 +2060,7 @@ class DTensorPolicyWorkerV2:
                 dp_rank=dp_rank,
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,
-                moe_mesh=None,
+                moe_mesh=self.moe_mesh,
             )
         else:
             # Update mutable config fields on the existing instance
