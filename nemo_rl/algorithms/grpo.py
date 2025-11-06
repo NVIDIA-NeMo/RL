@@ -119,7 +119,7 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
-    skip_reference_policy_logprobs_calculation: bool
+    skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
     overlong_filtering: NotRequired[bool]
