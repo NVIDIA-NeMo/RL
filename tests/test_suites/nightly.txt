@@ -67,6 +67,8 @@ tests/test_suites/llm/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3.sh
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron.sh
 # sequence packing
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron-seqpack.sh
+# validate TP/DP
+tests/test_suites/llm/sft-qwen2.5-math7b-2n8g-megatron.sh
 
 #######
 # DPO #

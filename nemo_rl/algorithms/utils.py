@@ -30,22 +30,49 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 
 
-def calculate_kl_penalty_joschu2020(
-    logprobs_policy: torch.Tensor,
+def calculate_kl(
+    logprobs: torch.Tensor,
     logprobs_reference: torch.Tensor,
-    clamp_value: Optional[float] = 20.0,
+    kl_type: str = "k3",
+    input_clamp_value: float | None = 20.0,
+    output_clamp_value: float | None = 10.0,
 ) -> torch.Tensor:
-    """Calculates a per-token estimate of the KL Divergence between two log_probs.
+    """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
-    From Schulman 2020, always positive.
+    From Schulman 2020, http://joschu.net/blog/kl-approx.html.
 
-    logprobs_policy:    torch.Tensor (b, s)
-    logprobs_reference: torch.Tensor (b, s)
+    Args:
+        logprobs: torch.Tensor (b, s)
+        logprobs_reference: torch.Tensor (b, s)
+        kl_type: Type of KL approximation to use. Valid values: "k1", "k2", "k3".
+        input_clamp_value: Optional clamping value for logr to prevent numerical instability.
+                           If None, no clamping is applied.
+        output_clamp_value: Optional clamping value for kl to prevent numerical instability.
+                           If None, no clamping is applied.
+
+    Returns:
+        torch.Tensor: Per-token KL penalty values (b, s)
     """
-    r = logprobs_reference - logprobs_policy
-    if clamp_value is not None:
-        r = r.clamp(min=-clamp_value, max=clamp_value)
-    return torch.exp(r) - r - 1
+    logr = logprobs_reference - logprobs
+    if input_clamp_value is not None:
+        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+
+    if kl_type == "k1":
+        kl = -logr
+
+    elif kl_type == "k2":
+        kl = torch.square(logr) / 2
+
+    elif kl_type == "k3":
+        kl = torch.exp(logr) - 1 - logr
+
+    else:
+        raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if output_clamp_value is not None:
+        kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
+
+    return kl
 
 
 def calculate_baseline_and_std_per_prompt(
