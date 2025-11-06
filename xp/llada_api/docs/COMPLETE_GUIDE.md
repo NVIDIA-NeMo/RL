@@ -166,17 +166,23 @@ tail -f /tmp/llada_worker_0.log
   - More steps = higher quality, slower
   - Recommended: 64-256
 - `block_length`: Semi-autoregressive block size (default: 32)
+  - Recommended: 32-64 for optimal performance with dInfer v0.1
+  - Larger values (64) may improve throughput but increase memory usage
 - `remasking`: Token selection ("low_confidence" | "random")
 - `threshold`: Confidence threshold (0.0-1.0, optional)
 - `factor`: Parallel decoding factor (1.0-4.0, optional)
 
 **Fast-dLLM/dInfer Parameters** (LLaDA only):
 - Engine selection (auto-detected):
-  - `dinfer`: 10x+ faster (default for LLaDA)
+  - `dinfer`: 10x+ faster (default for LLaDA, updated to v0.1)
   - `fast-dllm`: Alternative acceleration
 - Algorithm selection via `generation_algorithm`:
-  - `dinfer_blockwise`, `dinfer_hierarchy`, `dinfer_credit`
-  - `basic`, `prefix_cache`, `dual_cache`
+  - dInfer algorithms (recommended):
+    - `dinfer_blockwise` - Threshold-based parallel decoding (recommended)
+    - `dinfer_hierarchy` - Hierarchical parallel decoding
+    - `dinfer_credit` - Credit-based parallel decoding with EMA fusion
+  - Fast-dLLM algorithms:
+    - `basic`, `prefix_cache`, `dual_cache`
 
 ### Other Endpoints
 
@@ -241,7 +247,10 @@ The batch server automatically batches requests:
 ### Engine Selection
 
 ```bash
-# LLaDA: Use dInfer (10x+ faster than Fast-dLLM)
+# LLaDA: Use dInfer v0.1 (10x+ faster than Fast-dLLM)
+--engine dinfer --algorithm dinfer_blockwise
+
+# Or with hierarchical decoding for enhanced parallel strategy
 --engine dinfer --algorithm dinfer_hierarchy
 
 # Or Fast-dLLM
@@ -250,6 +259,12 @@ The batch server automatically batches requests:
 # Nemotron: Auto-selects nemotron engine
 --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 ```
+
+**dInfer v0.1 Updates**:
+- New credit-based decoding algorithm (`dinfer_credit`)
+- Improved hierarchical decoding with segment-based strategies
+- Enhanced KV-cache management with vicinity refresh
+- Recommended `block_length` values: 32-64 for optimal performance
 
 ---
 
@@ -294,7 +309,13 @@ export HF_TOKEN=your_token_here
 
 # Or use smaller model
 --model-path GSAI-ML/LLaDA-4B-Instruct  # If available
+
+# For dInfer: Use recommended block_length (32-64)
+# Very small block_length values (e.g., 8) can increase memory usage
+# due to more diffusion iterations per generation
 ```
+
+**Note**: With dInfer v0.1, using `block_length` between 32-64 provides optimal memory/performance trade-off. Values too small (<16) or too large (>128) may cause OOM or performance issues.
 
 #### 4. Import Errors
 
@@ -325,7 +346,9 @@ ssh -N -L 8000:compute-node:8000 user@login-node
 
 **Slow generation**:
 - Reduce `steps` (64 instead of 256)
-- Use dInfer engine for LLaDA
+- Use dInfer v0.1 engine for LLaDA (10x+ faster than Fast-dLLM)
+  - Recommended: `--engine dinfer --algorithm dinfer_blockwise`
+- Use optimal `block_length` (32-64)
 - Enable batch processing
 - Use multi-GPU for throughput
 
@@ -499,7 +522,9 @@ tail -f /tmp/llada_worker_0.log
 - ✅ OpenAI-compatible API
 - ✅ Multi-GPU load balancing
 - ✅ Automatic batch processing
-- ✅ Fast-dLLM/dInfer acceleration (LLaDA)
+- ✅ Fast-dLLM/dInfer v0.1 acceleration (LLaDA)
+  - 10x+ speedup with dInfer
+  - Multiple decoding strategies (threshold, hierarchical, credit-based)
 - ✅ DCP checkpoint support
 - ✅ HuggingFace model support
 - ✅ Streaming responses
@@ -509,7 +534,9 @@ tail -f /tmp/llada_worker_0.log
 
 1. **Always set HF_TOKEN** for multi-GPU setups
 2. **Start with HuggingFace models** for testing
-3. **Use dInfer engine** for LLaDA (10x+ faster)
+3. **Use dInfer v0.1 engine** for LLaDA (10x+ faster than Fast-dLLM)
+   - Recommended algorithm: `dinfer_blockwise` for general use
+   - Use `block_length` 32-64 for optimal performance
 4. **Enable batch processing** for throughput
 5. **Use multi-GPU** for large-scale evaluations
 6. **Monitor logs** during development

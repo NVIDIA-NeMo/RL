@@ -52,12 +52,14 @@ class BlockWiseGeneration(DInferGeneration):
         if not DINFER_AVAILABLE:
             raise RuntimeError("dInfer is not available")
         
-        # Create decoder with threshold-based parallel decoding
+        # Create decoder with threshold-based parallel decoding (updated API)
         decoder = ThresholdParallelDecoder(
             temperature=1.0,
             threshold=0.9,
+            remasking='low_confidence',
             mask_id=MASK_ID,
-            eos_id=EOS_ID
+            eos_id=EOS_ID,
+            use_float64=False
         )
         
         # Create the BlockWise diffusion LLM
