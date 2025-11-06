@@ -751,6 +751,12 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
 def _should_log_penguin_responses(master_config: MasterConfig) -> bool:
     env_config = master_config.get("env") or dict()
     should_log_penguin_responses = bool(env_config.get("should_log_penguin_responses"))
+
+    if should_log_penguin_responses:
+        import wandb.util
+        # Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
+        wandb.util.VALUE_BYTES_LIMIT = 10_000_000
+
     return should_log_penguin_responses
 
 
