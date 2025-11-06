@@ -22,8 +22,12 @@ DINFER_PATH = os.path.join(
 DINFER_AVAILABLE = False
 LLaDAModelLM = None
 BlockWiseDiffusionLLM = None
-SlidingWindowDiffusionLLM = None
+VicinityCacheDiffusionLLM = None
+IterSmoothDiffusionLLM = None
+IterSmoothWithVicinityCacheDiffusionLLM = None
 BlockWiseDiffusionLLMWithSP = None
+BlockDiffusionLLMAttnmask = None
+BlockDiffusionLLM = None
 ThresholdParallelDecoder = None
 CreditThresholdParallelDecoder = None
 HierarchyDecoder = None
@@ -38,8 +42,12 @@ if os.path.exists(DINFER_PATH):
         from dinfer.model import LLaDAModelLM as _LLaDAModelLM
         from dinfer import (
             BlockWiseDiffusionLLM as _BlockWiseDiffusionLLM,
-            SlidingWindowDiffusionLLM as _SlidingWindowDiffusionLLM,
+            VicinityCacheDiffusionLLM as _VicinityCacheDiffusionLLM,
+            IterSmoothDiffusionLLM as _IterSmoothDiffusionLLM,
+            IterSmoothWithVicinityCacheDiffusionLLM as _IterSmoothWithVicinityCacheDiffusionLLM,
             BlockWiseDiffusionLLMWithSP as _BlockWiseDiffusionLLMWithSP,
+            BlockDiffusionLLMAttnmask as _BlockDiffusionLLMAttnmask,
+            BlockDiffusionLLM as _BlockDiffusionLLM,
             ThresholdParallelDecoder as _ThresholdParallelDecoder,
             CreditThresholdParallelDecoder as _CreditThresholdParallelDecoder,
             HierarchyDecoder as _HierarchyDecoder,
@@ -49,8 +57,12 @@ if os.path.exists(DINFER_PATH):
         
         LLaDAModelLM = _LLaDAModelLM
         BlockWiseDiffusionLLM = _BlockWiseDiffusionLLM
-        SlidingWindowDiffusionLLM = _SlidingWindowDiffusionLLM
+        VicinityCacheDiffusionLLM = _VicinityCacheDiffusionLLM
+        IterSmoothDiffusionLLM = _IterSmoothDiffusionLLM
+        IterSmoothWithVicinityCacheDiffusionLLM = _IterSmoothWithVicinityCacheDiffusionLLM
         BlockWiseDiffusionLLMWithSP = _BlockWiseDiffusionLLMWithSP
+        BlockDiffusionLLMAttnmask = _BlockDiffusionLLMAttnmask
+        BlockDiffusionLLM = _BlockDiffusionLLM
         ThresholdParallelDecoder = _ThresholdParallelDecoder
         CreditThresholdParallelDecoder = _CreditThresholdParallelDecoder
         HierarchyDecoder = _HierarchyDecoder
@@ -77,8 +89,12 @@ __all__ = [
     'DINFER_AVAILABLE',
     'LLaDAModelLM',
     'BlockWiseDiffusionLLM',
-    'SlidingWindowDiffusionLLM',
+    'VicinityCacheDiffusionLLM',
+    'IterSmoothDiffusionLLM',
+    'IterSmoothWithVicinityCacheDiffusionLLM',
     'BlockWiseDiffusionLLMWithSP',
+    'BlockDiffusionLLMAttnmask',
+    'BlockDiffusionLLM',
     'ThresholdParallelDecoder',
     'CreditThresholdParallelDecoder',
     'HierarchyDecoder',

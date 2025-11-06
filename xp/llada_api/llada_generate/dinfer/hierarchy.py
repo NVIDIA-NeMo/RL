@@ -40,12 +40,14 @@ class HierarchyGeneration(DInferGeneration):
         if not DINFER_AVAILABLE:
             raise RuntimeError("dInfer is not available")
         
-        # Create hierarchy decoder
+        # Create hierarchy decoder (updated API)
         decoder = HierarchyDecoder(
             temperature=1.0,
-            threshold=0.9,
+            remasking='low_confidence',
             mask_id=MASK_ID,
-            eos_id=EOS_ID
+            eos_id=EOS_ID,
+            threshold=0.9,
+            low_threshold=0.4
         )
         
         # Create the BlockWise diffusion LLM
