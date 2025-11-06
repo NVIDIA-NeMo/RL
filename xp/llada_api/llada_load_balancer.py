@@ -44,7 +44,7 @@ class BatchRequest:
 
 
 class CentralizedBatchProcessor:
-    """Handles centralized batching at the load balancer level."""
+    """Handles centralized batching at the load balancer level with parallel multi-worker dispatch."""
     
     def __init__(self, max_batch_size: int = 8, max_wait_time: float = 0.02, worker_pool=None):
         self.max_batch_size = max_batch_size
@@ -52,14 +52,14 @@ class CentralizedBatchProcessor:
         self.worker_pool = worker_pool
         self.pending_requests: deque = deque()
         self.lock = asyncio.Lock()
-        self.batch_semaphore = asyncio.Semaphore(1)  # Prevent overlapping batch processing
+        self.worker_round_robin_index = 0  # For distributing batches across workers
         
         # Statistics
         self.total_batches_processed = 0
         self.total_requests_batched = 0
         self.batch_size_histogram = {}  # Track batch size distribution
         
-        logger.info(f"Centralized batching enabled: batch_size={max_batch_size}, wait_time={max_wait_time}s")
+        logger.info(f"Parallel multi-worker batching enabled: batch_size={max_batch_size}, wait_time={max_wait_time}s")
         
         # Task will be started later when event loop is running
         self._batch_task = None
@@ -106,7 +106,7 @@ class CentralizedBatchProcessor:
             raise
     
     async def _batch_processing_loop(self):
-        """Continuously process batches of requests with proper coordination."""
+        """Continuously process batches of requests with parallel multi-worker dispatch."""
         while True:
             try:
                 await asyncio.sleep(0.005)  # Reduced delay for better responsiveness
@@ -114,12 +114,8 @@ class CentralizedBatchProcessor:
                 if not self.pending_requests:
                     continue
                 
-                # Check if we should process a batch and if no batch is currently processing
+                # Check if we should process a batch - allow multiple batches in parallel
                 should_process = False
-                if self.batch_semaphore.locked():
-                    # Another batch is already processing, skip this iteration
-                    continue
-                    
                 async with self.lock:
                     if len(self.pending_requests) >= self.max_batch_size:
                         should_process = True
@@ -131,81 +127,102 @@ class CentralizedBatchProcessor:
                             logger.debug(f"Triggering batch: exceeded max_wait_time ({self.max_wait_time}s)")
 
                 if should_process:
-                    # Process batch - only one will run due to semaphore
+                    # Process batch in parallel - don't block other batch formation
                     asyncio.create_task(self._process_batch())
                     
             except Exception as e:
                 logger.error(f"Error in centralized batch processing loop: {e}")
     
     async def _process_batch(self):
-        """Process a batch of requests by sending them in parallel to a worker with proper coordination."""
-        # Use semaphore to ensure only one batch processes at a time
-        async with self.batch_semaphore:
-            batch_requests = []
+        """Process a batch of requests by dispatching to workers in parallel across multiple workers."""
+        batch_requests = []
+        
+        try:
+            # Extract requests from the queue (keep lock time minimal)  
+            async with self.lock:
+                while self.pending_requests and len(batch_requests) < self.max_batch_size:
+                    batch_requests.append(self.pending_requests.popleft())
             
-            try:
-                # Extract requests from the queue
-                async with self.lock:
-                    while self.pending_requests and len(batch_requests) < self.max_batch_size:
-                        batch_requests.append(self.pending_requests.popleft())
-                
-                if not batch_requests:
-                    return
-                
-                batch_size = len(batch_requests)
-                logger.info(f"🔄 Processing centralized batch of {batch_size} requests (max_batch_size: {self.max_batch_size})")
-                
-                # Safety check: Warn if batch size is unexpectedly small
-                if batch_size < self.max_batch_size:
-                    logger.warning(f"⚠️ Sending partial batch: {batch_size}/{self.max_batch_size} requests")
-                batch_start_time = time.time()
-                
-                # Find the best worker (least loaded)
-                worker_info = await self.worker_pool.get_least_loaded_worker()
-                if worker_info is None:
-                    # No workers available - return errors
-                    error = HTTPException(status_code=503, detail="No healthy workers available")
-                    for batch_request in batch_requests:
-                        batch_request.future.set_exception(error)
-                    return
-                
-                worker_idx, worker_url = worker_info
-                
-                # Send all requests in parallel to the same worker
-                # This allows the worker's internal batching to collect them naturally
-                tasks = []
+            if not batch_requests:
+                return
+            
+            batch_size = len(batch_requests)
+            batch_start_time = time.time()
+            
+            # Get next worker using round-robin distribution
+            worker_info = await self._get_next_worker_round_robin()
+            if worker_info is None:
+                # No workers available - return errors
+                error = HTTPException(status_code=503, detail="No healthy workers available")
                 for batch_request in batch_requests:
-                    task = asyncio.create_task(
-                        self._send_single_request_with_future(worker_idx, worker_url, batch_request)
-                    )
-                    tasks.append(task)
-                
-                # Wait for all requests to complete
-                await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Update statistics
-                self.total_batches_processed += 1
-                self.total_requests_batched += batch_size
-                self.batch_size_histogram[batch_size] = self.batch_size_histogram.get(batch_size, 0) + 1
-                
-                batch_time = time.time() - batch_start_time
-                logger.info(f"✅ Centralized batch of {batch_size} completed in {batch_time:.3f}s → Worker {worker_idx}")
-                
-            except Exception as e:
-                import traceback
-                error_details = traceback.format_exc()
-                logger.error(f"❌ ERROR: Centralized batch processing failed:")
-                logger.error(f"   Batch size: {len(batch_requests)}")
-                logger.error(f"   Error: {e}")
-                logger.error(f"   Full traceback:")
-                for line in error_details.split('\n'):
-                    if line.strip():
-                        logger.error(f"     {line}")
-                
-                # Set exception for all pending requests that haven't been handled
-                for batch_request in batch_requests:
-                    if not batch_request.future.done():
-                        batch_request.future.set_exception(HTTPException(status_code=500, detail=f"Batch processing failed: {e}"))
+                    batch_request.future.set_exception(error)
+                return
+            
+            worker_idx, worker_url = worker_info
+            
+            logger.info(f"🚀 Dispatching batch of {batch_size} requests → Worker {worker_idx} (parallel processing)")
+            
+            # Safety check: Warn if batch size is unexpectedly small
+            if batch_size < self.max_batch_size:
+                logger.warning(f"⚠️ Sending partial batch: {batch_size}/{self.max_batch_size} requests")
+            
+            # Send all requests in parallel to the selected worker
+            # Don't wait for completion - fire and forget to enable parallel batching
+            tasks = []
+            for batch_request in batch_requests:
+                task = asyncio.create_task(
+                    self._send_single_request_with_future(worker_idx, worker_url, batch_request)
+                )
+                tasks.append(task)
+            
+            # Update statistics immediately (don't wait for completion)
+            self.total_batches_processed += 1
+            self.total_requests_batched += batch_size
+            self.batch_size_histogram[batch_size] = self.batch_size_histogram.get(batch_size, 0) + 1
+            
+            # Start all requests in parallel but don't block - this enables the next batch to form immediately
+            asyncio.create_task(self._wait_for_batch_completion(tasks, batch_start_time, batch_size, worker_idx))
+            
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"❌ ERROR: Batch dispatch failed:")
+            logger.error(f"   Batch size: {len(batch_requests)}")
+            logger.error(f"   Error: {e}")
+            logger.error(f"   Full traceback:")
+            for line in error_details.split('\n'):
+                if line.strip():
+                    logger.error(f"     {line}")
+            
+            # Set exception for all pending requests that haven't been handled
+            for batch_request in batch_requests:
+                if not batch_request.future.done():
+                    batch_request.future.set_exception(HTTPException(status_code=500, detail=f"Batch processing failed: {e}"))
+    
+    async def _get_next_worker_round_robin(self) -> Optional[tuple[int, str]]:
+        """Get next worker using round-robin distribution across healthy workers."""
+        if not self.worker_pool or not self.worker_pool.healthy_workers:
+            return None
+        
+        healthy_workers = list(self.worker_pool.healthy_workers)
+        if not healthy_workers:
+            return None
+        
+        # Round-robin through healthy workers
+        worker_idx = healthy_workers[self.worker_round_robin_index % len(healthy_workers)]
+        self.worker_round_robin_index += 1
+        
+        return worker_idx, self.worker_pool.worker_urls[worker_idx]
+    
+    async def _wait_for_batch_completion(self, tasks: List[asyncio.Task], batch_start_time: float, batch_size: int, worker_idx: int):
+        """Wait for batch completion and log results without blocking batch formation."""
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            batch_time = time.time() - batch_start_time
+            throughput = batch_size / batch_time if batch_time > 0 else 0
+            logger.info(f"✅ Batch of {batch_size} completed in {batch_time:.3f}s → Worker {worker_idx} ({throughput:.1f} req/s)")
+        except Exception as e:
+            logger.error(f"❌ Batch completion monitoring failed: {e}")
     
     async def _send_single_request_with_future(self, worker_idx: int, worker_url: str, batch_request: BatchRequest):
         """Send a single request to a worker and handle the future result."""

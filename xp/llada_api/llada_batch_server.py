@@ -286,7 +286,6 @@ class BatchProcessor:
         self.max_wait_time = max_wait_time  # Reduced for better responsiveness
         self.pending_requests: deque = deque()
         self.lock = asyncio.Lock()
-        self.batch_semaphore = asyncio.Semaphore(1)  # Allow only one batch processing at a time
         
         # Start the batch processing loop
         asyncio.create_task(self._batch_processing_loop())
@@ -314,7 +313,7 @@ class BatchProcessor:
             raise
     
     async def _batch_processing_loop(self):
-        """Continuously process batches of requests with proper coordination."""
+        """Continuously process batches of requests with parallel processing capability."""
         while True:
             try:
                 await asyncio.sleep(0.005)  # Reduced delay for better responsiveness
@@ -322,12 +321,8 @@ class BatchProcessor:
                 if not self.pending_requests:
                     continue
                 
-                # Check if we should process a batch and if no batch is currently processing
+                # Check if we should process a batch - allow multiple batches in parallel
                 should_process = False
-                if self.batch_semaphore.locked():
-                    # Another batch is already processing, skip this iteration
-                    continue
-                    
                 async with self.lock:
                     if len(self.pending_requests) >= self.max_batch_size:
                         should_process = True
@@ -339,53 +334,54 @@ class BatchProcessor:
                             logger.debug(f"Triggering batch: exceeded max_wait_time ({self.max_wait_time}s)")
                 
                 if should_process:
-                    # Process batch - only one will run due to semaphore
+                    # Process batch in parallel - multiple batches can run simultaneously
                     asyncio.create_task(self._process_batch())
                     
             except Exception as e:
                 logger.error(f"Error in batch processing loop: {e}")
     
     async def _process_batch(self):
-        """Process a batch of requests with proper coordination to prevent overlapping batches."""
-        # Use semaphore to ensure only one batch processes at a time
-        async with self.batch_semaphore:
-            batch_requests = []
+        """Process a batch of requests with parallel processing capability."""
+        batch_requests = []
+        
+        try:
+            # Extract requests from the queue (keep lock time minimal)
+            async with self.lock:
+                while self.pending_requests and len(batch_requests) < self.max_batch_size:
+                    batch_requests.append(self.pending_requests.popleft())
             
-            try:
-                # Extract requests from the queue
-                async with self.lock:
-                    while self.pending_requests and len(batch_requests) < self.max_batch_size:
-                        batch_requests.append(self.pending_requests.popleft())
-                
-                if not batch_requests:
-                    return
-                
-                # Safety check: Warn if batch size is unexpectedly small
-                if len(batch_requests) < self.max_batch_size and len(batch_requests) > 0:
-                    logger.warning(f"⚠️ Processing partial batch: {len(batch_requests)}/{self.max_batch_size} requests")
-                
-                logger.info(f"🔧 Processing batch of {len(batch_requests)} requests (max_batch_size: {self.max_batch_size})")
-                batch_start_time = time.time()
-                
-                # Process the batch
-                results = await self._process_batch_requests(batch_requests)
-                
-                batch_time = time.time() - batch_start_time
-                logger.info(f"Batch of {len(batch_requests)} completed in {batch_time:.3f}s ({len(batch_requests)/batch_time:.1f} req/s)")
-                
-                # Return results to waiting futures
-                for batch_request, result in zip(batch_requests, results):
-                    if isinstance(result, Exception):
-                        batch_request.future.set_exception(result)
-                    else:
-                        batch_request.future.set_result(result)
-                        
-            except Exception as e:
-                logger.error(f"Batch processing failed: {e}")
-                # Set exception for all pending requests
-                for batch_request in batch_requests:
-                    if not batch_request.future.done():
-                        batch_request.future.set_exception(e)
+            if not batch_requests:
+                return
+            
+            batch_size = len(batch_requests)
+            batch_start_time = time.time()
+            
+            logger.info(f"🔧 Worker processing batch of {batch_size} requests (max_batch_size: {self.max_batch_size})")
+            
+            # Safety check: Warn if batch size is unexpectedly small
+            if batch_size < self.max_batch_size and batch_size > 0:
+                logger.warning(f"⚠️ Processing partial batch: {batch_size}/{self.max_batch_size} requests")
+            
+            # Process the batch
+            results = await self._process_batch_requests(batch_requests)
+            
+            batch_time = time.time() - batch_start_time
+            throughput = batch_size / batch_time if batch_time > 0 else 0
+            logger.info(f"✅ Worker batch of {batch_size} completed in {batch_time:.3f}s ({throughput:.1f} req/s)")
+            
+            # Return results to waiting futures
+            for batch_request, result in zip(batch_requests, results):
+                if isinstance(result, Exception):
+                    batch_request.future.set_exception(result)
+                else:
+                    batch_request.future.set_result(result)
+                    
+        except Exception as e:
+            logger.error(f"❌ Worker batch processing failed: {e}")
+            # Set exception for all pending requests
+            for batch_request in batch_requests:
+                if not batch_request.future.done():
+                    batch_request.future.set_exception(e)
     
     async def _process_batch_requests(self, batch_requests: List[BatchRequest]) -> List[Union[ChatCompletionResponse, Exception]]:
         """Process a batch of requests using Fast-dLLM batch capabilities."""
