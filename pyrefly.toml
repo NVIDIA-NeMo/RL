@@ -107,7 +107,6 @@ project-includes = [
     "nemo_rl/utils/checkpoint.py",
     "nemo_rl/utils/config.py",
     "nemo_rl/utils/native_checkpoint.py",
-    "nemo_rl/utils/automodel_checkpoint.py",
     "nemo_rl/utils/nsys.py",
     "nemo_rl/utils/nvml.py",
     "nemo_rl/utils/packed_tensor.py",
