@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import traceback
 from typing import Any
 
 import torch
@@ -160,8 +161,9 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            print(
-                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}"
+            raise RuntimeError(
+                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
+                f"{traceback.format_exc()}"
             )
             return False
 
