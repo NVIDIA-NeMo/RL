@@ -279,24 +279,22 @@ The validation set you pass in will directly be used for validation with no addi
         - using 32 nodes (tp4 vLLM, tp4cp2 mcore)
 
         Consists of:
-         1. 30 mins Rollouts
-         2.  1 mins Ray comm + postprocessing
-         3.  2 mins Advantage calculation
-         4.  4 mins Batched data dict sharding for log prob calculation
-         5.  4 mins Log prob calculation
-         6.  2 mins Batched data dict sharding for policy train
-         7.  2 mins Ray comm for policy train
-         8.  6 mins Policy train
-         9.  3 mins Validation
-        10.  8 mins Checkpointing
+        1. 30 mins Rollouts
+        2.  2 mins Ray comm + postprocessing
+        3.  2 mins Advantage calculation (IP)
+        4.  4 mins Log prob calculation
+        5.  3 mins Ray comm for policy train
+        6.  6 mins Policy train
+        7.  3 mins Validation
+        8.  8 mins Checkpointing
 
-        Total: 62 mins for 16 steps. => 3 * 16 = 48 steps in ~3.5 hours.
+        Total: 58 mins for 16 steps. => 3 * 16 = 48 steps in ~3.5 hours.
         If we train for roughly 250 steps, this would take 3.5 * 5 = 17.5 hours.
         In order to get job results by 9am, we would need to launch it around 4PM.
 
         There are several steps where the GPU is unused:
-        - steps 2, 3, 4, 6, 7, 10
-        - which amounts to 1 + 2 + 4 + 2 + 2 + 8 = 19 mins or 31% of the total step time.
+        - steps 2, 3, 5, 8
+        - which amounts to 2 + 2 + 3 + 8 = 15 mins or 26% of the total step time.
 
         If we optimize these steps somehow, the time taken for 16 steps reduces to 43 mins => 5 * 16 = 80 steps in ~4 hours.
         If we train for roughly 250 steps, this would take 4 * 3 = 12 hours.
