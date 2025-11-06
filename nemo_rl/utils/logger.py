@@ -130,6 +130,11 @@ class TensorboardLogger(LoggerInterface):
             step_metric: Optional step metric name (ignored in TensorBoard)
         """
         for name, value in metrics.items():
+            # Penguin will add additional metrics like wandb histograms. However, some people will log to Tensorboard instead which may not be compatible
+            # This logic catches non-compatible objects being logged.
+            if not isinstance(value, (int, float, bool, str)):
+                continue
+
             if prefix:
                 name = f"{prefix}/{name}"
 

@@ -1111,6 +1111,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert len(base_urls) == cluster.num_gpus_per_node
 
     body = dict(
+        model=generation_config["model_name"],
         messages=[
             {"role": "user", "content": "count to 5"},
         ],

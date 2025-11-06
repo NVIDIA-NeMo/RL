@@ -305,6 +305,7 @@ class BaseVllmGenerationWorker:
 
         llm_kwargs = dict(
             model=self.model_name,
+            served_model_name=self.model_name,
             load_format=load_format,
             # Set in nemo_rl.models.generation.configure_generation_config
             skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
