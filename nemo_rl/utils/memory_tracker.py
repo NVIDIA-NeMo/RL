@@ -31,8 +31,7 @@ class MemoryTrackerDataPoint(BaseModel):
 - New variables: {self.new_variables}
 
 ⚡️ Ray memory snapshot:
-{ray_memory_summary}
-"""
+{ray_memory_summary}"""
 
 
 class MemoryTracker(BaseModel):
