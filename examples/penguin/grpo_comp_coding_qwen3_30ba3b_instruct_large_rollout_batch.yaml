@@ -12,6 +12,6 @@ env:
     comp_coding:
       resources_servers:
         comp_coding:
-          num_processes: 64
+          num_processes: 4096  # Assuming 128 procs per node for 32 nodes => 128 * 32 = 2048
           unit_test_timeout_secs: 10
           debug: false
