@@ -488,14 +488,14 @@ def stream_weights_via_ipc_zmq_impl(
             f"{worker_name} (rank {rank}): ZMQ communication timeout after {timeout_ms}ms in policy worker side. "
             f"The generation worker may be dead or unresponsive. "
             f"This typically indicates the generation worker has crashed or is not responding to weight streaming."
-        )
+        ) from None
     except zmq.ZMQError as e:
         raise RuntimeError(
             f"{worker_name} (rank {rank}): ZMQ error during weight streaming: {e} (errno: {e.errno}). "
             f"Error details: {e.strerror}. "
             f"This may indicate network issues or the peer process has terminated unexpectedly.\n"
             f"{traceback.format_exc()}"
-        )
+        ) from e
 
     finally:
         # Clean up buffers in finally block to ensure cleanup even on exceptions
