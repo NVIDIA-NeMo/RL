@@ -19,6 +19,10 @@ import pprint
 from itertools import chain, repeat
 from typing import Optional
 
+# Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
+import wandb.util
+wandb.util.VALUE_BYTES_LIMIT = 10_000_000
+
 import ray
 from omegaconf import OmegaConf
 from wandb import Table
