@@ -102,7 +102,7 @@ print(response.choices[0].message.content)
 
 ```
 Client → Load Balancer (port 8000)
-           ↓
+           ↓ Centralized Batching
     ┌──────┼──────┐
     ↓      ↓      ↓
 Worker 0  Worker 1  Worker 2
@@ -115,6 +115,23 @@ port 8001 port 8002 port 8003
 - ✅ Linear scaling
 - ✅ Better fault tolerance
 - ✅ Simple debugging
+
+### Centralized Batching
+
+The load balancer implements **centralized batching** for optimal GPU utilization:
+
+**How it works**:
+1. **Request Accumulation**: Load balancer collects incoming requests
+2. **Batch Formation**: Forms batches (default: 8 requests, 20ms timeout)
+3. **Parallel Dispatch**: Sends entire batch to least-loaded worker
+4. **Round-Robin Distribution**: Batches distributed across all workers
+5. **True Parallelization**: Multiple workers process different batches simultaneously
+
+**Benefits**:
+- ✅ **Better GPU utilization**: Workers receive full batches instead of single requests
+- ✅ **Parallel processing**: All workers active simultaneously
+- ✅ **Load balancing**: Batches distributed evenly across workers
+- ✅ **Lower latency**: No artificial wait times, immediate dispatch when batch ready
 
 ### Quick Start
 
@@ -134,10 +151,26 @@ export HF_TOKEN=your_token_here
 # Check load balancer stats
 curl http://localhost:8000/stats
 
+# Check worker health and activity
+curl http://localhost:8000/worker-status
+
+# Use dedicated monitoring tool
+python xp/llada_api/check_worker_status.py
+
+# Monitor continuously
+python xp/llada_api/check_worker_status.py --monitor
+
 # View logs
 tail -f /tmp/llada_load_balancer.log
 tail -f /tmp/llada_worker_0.log
 ```
+
+**Key metrics to monitor**:
+- `healthy_workers`: Number of active workers
+- `avg_batch_size`: Batching efficiency (should be close to max batch size)
+- `batch_size_histogram`: Distribution of batch sizes
+- `system_status`: Overall system health ("normal" vs "overloaded")
+- `worker_status`: Individual worker states ("busy", "idle", "unhealthy")
 
 ### Performance
 
@@ -190,6 +223,7 @@ tail -f /tmp/llada_worker_0.log
 - `GET /v1/models` - List models
 - `GET /batch/stats` - Batch statistics (batch server)
 - `GET /stats` - Load balancer stats (multi-GPU)
+- `GET /worker-status` - Worker health and activity status (multi-GPU)
 - `GET /generation/algorithms` - Available algorithms
 
 ---
@@ -317,7 +351,27 @@ export HF_TOKEN=your_token_here
 
 **Note**: With dInfer v0.1, using `block_length` between 32-64 provides optimal memory/performance trade-off. Values too small (<16) or too large (>128) may cause OOM or performance issues.
 
-#### 4. Import Errors
+#### 4. "No Healthy Workers Available" (Multi-GPU)
+
+**Problem**: `503: No healthy workers available` error during high load
+
+**Cause**: Workers marked unhealthy when they're just busy processing batches
+
+**Solution**: System now automatically handles busy workers (v2.0+):
+- Health checks are more lenient for recently active workers
+- Workers stay healthy even during long batch processing
+- Automatic recovery when all workers appear unavailable
+
+**Manual check**:
+```bash
+# Check worker status
+python xp/llada_api/check_worker_status.py
+
+# Look for "busy" workers (this is good - means system is working)
+curl http://localhost:8000/worker-status
+```
+
+#### 5. Import Errors
 
 **Problem**: `ModuleNotFoundError: No module named 'nemo_rl'`
 
@@ -330,7 +384,7 @@ export HF_TOKEN=your_token_here
 uv sync --locked --no-install-project
 ```
 
-#### 5. Connection Issues
+#### 6. Connection Issues
 
 **Local**: Check server is running
 ```bash
@@ -369,8 +423,16 @@ curl http://localhost:8000/health
 # Check load balancer stats (multi-GPU)
 curl http://localhost:8000/stats | jq
 
+# Check worker status and activity (multi-GPU)
+curl http://localhost:8000/worker-status | jq
+python xp/llada_api/check_worker_status.py
+
+# Monitor worker health continuously
+python xp/llada_api/check_worker_status.py --monitor
+
 # View logs
 tail -f /tmp/llada_worker_0.log
+tail -f /tmp/llada_load_balancer.log
 
 # Check GPU usage
 nvidia-smi
@@ -456,11 +518,18 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 Client → FastAPI Server → Model → Response
 ```
 
-**Multi-GPU Flow**:
+**Multi-GPU Flow (Centralized Batching)**:
 ```
-Client → Load Balancer → Worker (Round-robin)
-                       → Worker
-                       → Worker
+Client → Load Balancer (Batch Formation) → Worker 0 (Full Batch)
+       → Load Balancer (Batch Formation) → Worker 1 (Full Batch)  
+       → Load Balancer (Batch Formation) → Worker 2 (Full Batch)
+```
+
+**Traditional Round-Robin** (legacy):
+```
+Client → Load Balancer → Worker (Single Request)
+                       → Worker (Single Request)
+                       → Worker (Single Request)
 ```
 
 **Batch Processing**:
