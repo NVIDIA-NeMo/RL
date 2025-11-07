@@ -43,6 +43,7 @@ grpo:
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
     in_flight_weight_updates: false  # Enable for faster weight synchronization
     recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    max_num_in_flight_batches_in_generation: ${grpo.async_grpo.max_trajectory_age_steps} # Controls the maximum number of in-flight prompts to regulate average off-policyness.
 ```
 
 ### Complete Example Config
@@ -69,6 +70,7 @@ grpo:
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false  # Enable for faster weight synchronization
     recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    max_num_in_flight_batches_in_generation: ${grpo.async_grpo.max_trajectory_age_steps} # Controls the maximum number of in-flight prompts to regulate average off-policyness.
 
 cluster:
   num_nodes: 2
@@ -165,7 +167,10 @@ sequenceDiagram
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
 
 5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
-KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
+KV caches after weight update by configuring `recompute_kv_cache_after_weight_update` configuration.
+
+6. **Control Max Number of In-Flight Batches**: Use `max_num_in_flight_batches_in_generation` (1 ≤ value ≤ `max_trajectory_age_steps`) to cap concurrent prompt batches to control average trajectory age; 
+number of effective in-flight prompts = value × `num_prompts_per_step`. Keep it equal to `max_trajectory_age_steps` for maximum throughput; lower it when to reduce off-policyness.
 
 ## Why Importance Sampling Correction Is Required for Async
 
