@@ -125,16 +125,9 @@ def compute_rollout_importance_weights(
     # Apply NaN mask to token_mask
     token_mask = token_mask * nan_mask
 
-    # Track NaN statistics
-    nan_metrics = {}
-    nan_metrics["rollout/nan_token_fraction"] = masked_mean(has_nan.float(), token_mask + has_nan.float(), global_normalization_factor=global_valid_tokens) if (token_mask.sum() + has_nan.sum()) > 0 else torch.tensor(0.0)
-    nan_metrics["rollout/nan_seq_fraction"] = seq_has_nan.float().mean()
-    nan_metrics["rollout/nan_train_token_fraction"] = masked_mean(has_nan_train.float(), token_mask + has_nan_train.float(), global_normalization_factor=global_valid_tokens) if (token_mask.sum() + has_nan_train.sum()) > 0 else torch.tensor(0.0)
-    nan_metrics["rollout/nan_rollout_token_fraction"] = masked_mean(has_nan_rollout.float(), token_mask + has_nan_rollout.float(), global_normalization_factor=global_valid_tokens) if (token_mask.sum() + has_nan_rollout.sum()) > 0 else torch.tensor(0.0)
-
     if rollout_is_threshold is None:
         # Return identity weights and unchanged mask
-        return torch.ones_like(train_log_prob), token_mask, nan_metrics
+        return torch.ones_like(train_log_prob), token_mask, {}
 
     # Parse thresholds: if lower not specified, use 1/upper (reciprocal)
     upper_threshold = rollout_is_threshold
@@ -162,8 +155,7 @@ def compute_rollout_importance_weights(
 
         # Apply safety bound to prevent overflow
         log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        # rollout_is_weights = torch.exp(log_ratio_safe)
-        rollout_is_weights = torch.ones_like(train_log_prob)
+        rollout_is_weights = torch.exp(log_ratio_safe)
 
     elif rollout_is_level == "sequence":
         # Sequence-level IS: π_train(y|x) / π_rollout(y|x) for entire sequence
@@ -286,9 +278,6 @@ def compute_rollout_importance_weights(
         train_log_prob=train_log_prob, rollout_log_prob=rollout_log_prob, token_mask=token_mask
     )
     metrics.update(mismatch_metrics)
-
-    # Merge NaN metrics
-    metrics.update(nan_metrics)
 
     # Convert all tensor metrics to scalars for logging
     metrics_scalar = {}

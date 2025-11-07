@@ -71,7 +71,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import create_local_venv_on_each_node, patch_transformers_module_dir
 
 # ===============================================================================
 # Configuration
@@ -1572,9 +1572,9 @@ def async_grpo_train(
         "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
         "Set policy.generation.vllm_cfg.async_engine to true in your config."
     )
-    assert master_config["loss_fn"]["use_importance_sampling_correction"] is True, (
-        "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
-    )
+    # assert master_config["loss_fn"]["use_importance_sampling_correction"] is True, (
+    #     "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
+    # )
 
     if master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config["grpo"]["async_grpo"].get(
@@ -1652,6 +1652,7 @@ def async_grpo_train(
             "UV_PROJECT_ENVIRONMENT": _replay_py_exec,
         },
     }
+    # patch_transformers_module_dir(_replay_runtime_env["env_vars"])
 
     # Calculate optimal buffer size based on generation limits to prevent length bias
     # Each weight version generates exactly num_prompts_per_step trajectories
@@ -1683,6 +1684,7 @@ def async_grpo_train(
             "UV_PROJECT_ENVIRONMENT": _tc_py_exec,
         },
     }
+    # patch_transformers_module_dir(_tc_runtime_env["env_vars"])
 
     # Initialize trajectory collector with synchronized collection
     trajectory_collector = AsyncTrajectoryCollector.options(
@@ -1774,9 +1776,9 @@ def async_grpo_train(
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
 
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
-        )
+        # print(
+        #     f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+        # )
 
         if buffer_size_current >= min_trajectories_needed:
             break

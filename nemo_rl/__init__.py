@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 
+from nemo_rl.utils.venvs import patch_transformers_module_dir
+
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
 add Megatron-LM to the python path. This is because the only sub-package
@@ -114,3 +116,5 @@ def _patch_nsight_file():
 
 # Apply the patch
 _patch_nsight_file()
+
+patch_transformers_module_dir(os.environ)

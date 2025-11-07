@@ -1790,17 +1790,20 @@ class DTensorPolicyWorkerV2:
             )
             self.model = self.move_to_cuda(self.model)
 
-        def _dtensor_post_iter_func(tensor, dtype):
-            if isinstance(tensor, DTensor):
-                tensor = tensor.full_tensor()
-            tensor = tensor.to(dtype, non_blocking=True)
-            return tensor
+        def dtensor_params_generator():
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format."""
+            for name, tensor in self.model.state_dict().items():
+                full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+                for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+                    # Convert to target dtype
+                    yield adapted_fqn, adapted_tensor.to(self.dtype, non_blocking=True).contiguous()
 
         # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+        dtensor_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=iter(self.model.state_dict().items()),
+            iterator=dtensor_params_generator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
