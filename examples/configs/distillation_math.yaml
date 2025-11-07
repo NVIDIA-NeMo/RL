@@ -41,6 +41,8 @@ policy: &POLICY_BASE
     precision: "bfloat16"
     logprob_chunk_size: null
 
+    offload_optimizer_for_logprob: false
+
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
         _v2: true
