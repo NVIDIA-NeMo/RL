@@ -126,7 +126,6 @@ def load_response_dataset(data_config, seed: int = 42):
 __all__ = [
     "CLEVRCoGenTDataset",
     "DeepScalerDataset",
-    "DAPOMath17KDataset",
     "Geometry3KDataset",
     "OpenAIFormatDataset",
     "OasstDataset",

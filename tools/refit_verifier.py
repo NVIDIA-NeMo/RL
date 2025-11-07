@@ -158,7 +158,6 @@ def setup_configs(args, tokenizer):
             "max_total_sequence_length": args.max_sequence_length,
             "max_new_tokens": args.max_sequence_length,
             "do_sample": False,
-            "temperature": 1.0,
             "pad_token_id": tokenizer.eos_token_id,
             "colocated": {
                 "enabled": True,
@@ -213,8 +212,6 @@ def setup_configs(args, tokenizer):
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "pipeline_dtype": "bfloat16",
-            "train_iters": 1,
-            "bias_activation_fusion": False,
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "optimizer": {
@@ -252,13 +249,15 @@ def setup_configs(args, tokenizer):
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": False,
                 "overlap_param_gather": False,
+                "average_in_collective": False,
                 "use_custom_fsdp": False,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
     }
 
-    # vLLM Configuration (match new VllmGeneration expectations: TP/PP/EP provided separately)
+    # vLLM Configuration
+    vllm_tp = args.tp_size * args.ep_size * args.pp_size
     vllm_config = {
         "backend": "vllm",
         "model_name": args.model_name,
@@ -273,9 +272,8 @@ def setup_configs(args, tokenizer):
         "stop_token_ids": None,
         "stop_strings": None,
         "vllm_cfg": {
-            "tensor_parallel_size": args.tp_size,
-            "pipeline_parallel_size": args.pp_size,
-            "expert_parallel_size": args.ep_size,
+            "tensor_parallel_size": vllm_tp,
+            "pipeline_parallel_size": 1,
             "gpu_memory_utilization": 0.6,
             "max_model_len": args.max_sequence_length,
             "precision": "bfloat16",
