@@ -139,19 +139,7 @@ class TensorboardLogger(LoggerInterface):
 
             if prefix:
                 name = f"{prefix}/{name}"
-
-            # Skip non-scalar values that TensorBoard can't handle
-            if isinstance(value, (dict, list)):
-                print(
-                    f"Warning: Skipping non-scalar metric '{name}' for TensorBoard logging (type: {type(value).__name__})"
-                )
-                continue
-
-            try:
-                self.writer.add_scalar(name, value, step)
-            except Exception as e:
-                print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
-                continue
+            self.writer.add_scalar(name, value, step)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to Tensorboard.
