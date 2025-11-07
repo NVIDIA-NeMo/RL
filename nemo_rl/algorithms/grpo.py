@@ -203,6 +203,9 @@ def setup(
     Returns:
         tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
     """
+    # Start timing the entire setup process
+    setup_start_time = time.perf_counter()
+
     # Extract individual configs for easier access
     policy_config = master_config["policy"]
     generation_config = master_config["policy"]["generation"]
@@ -436,6 +439,9 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
+    # Dictionary to store worker initialization timing stats for logging
+    worker_init_timing_metrics = {}
+
     if backend == "megatron":
         policy_generation = None
         print(
@@ -459,6 +465,19 @@ def setup(
         # Worker groups are not initialized until the first call to run something on workergroups.
         # vllm 0.8 fails in initialization if its called in the first training step since it has no clean view of the GPU memory (HF is sharing the same memory).
         policy_generation.finish_generation()
+
+        # Collect vLLM worker initialization timing stats
+        vllm_timing = policy_generation.worker_group.init_timing_stats
+        if vllm_timing:
+            worker_init_timing_metrics["vllm_total_time_s"] = vllm_timing["total_time"]
+            worker_init_timing_metrics["vllm_num_workers"] = vllm_timing["num_workers"]
+            worker_init_timing_metrics["vllm_worker_min_s"] = vllm_timing["min"]
+            worker_init_timing_metrics["vllm_worker_max_s"] = vllm_timing["max"]
+            worker_init_timing_metrics["vllm_worker_mean_s"] = vllm_timing["mean"]
+            worker_init_timing_metrics["vllm_worker_p50_s"] = vllm_timing["p50"]
+            worker_init_timing_metrics["vllm_worker_p95_s"] = vllm_timing["p95"]
+            worker_init_timing_metrics["vllm_worker_p99_s"] = vllm_timing["p99"]
+
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -488,6 +507,19 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
     )
+
+    # Collect policy worker initialization timing stats
+    policy_timing = policy.worker_group.init_timing_stats
+    if policy_timing:
+        worker_init_timing_metrics["policy_total_time_s"] = policy_timing["total_time"]
+        worker_init_timing_metrics["policy_num_workers"] = policy_timing["num_workers"]
+        worker_init_timing_metrics["policy_worker_min_s"] = policy_timing["min"]
+        worker_init_timing_metrics["policy_worker_max_s"] = policy_timing["max"]
+        worker_init_timing_metrics["policy_worker_mean_s"] = policy_timing["mean"]
+        worker_init_timing_metrics["policy_worker_p50_s"] = policy_timing["p50"]
+        worker_init_timing_metrics["policy_worker_p95_s"] = policy_timing["p95"]
+        worker_init_timing_metrics["policy_worker_p99_s"] = policy_timing["p99"]
+
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
@@ -515,8 +547,20 @@ def setup(
 
     loss_fn = ClippedPGLossFn(loss_config)
 
+    # Calculate total setup time
+    total_setup_time = time.perf_counter() - setup_start_time
+    worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
+
+    # Log worker initialization timing metrics to logger
+    if worker_init_timing_metrics:
+        print("\n▶ Worker Initialization Timing Summary:")
+        for key, value in worker_init_timing_metrics.items():
+            print(f"  {key}: {value:.3f}", flush=True)
+        logger.log_metrics(worker_init_timing_metrics, step=0, prefix="timing/setup")
+
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
+    print(f"  Total setup time: {total_setup_time:.2f}s")
     print("=" * 60 + "\n", flush=True)
 
     return (

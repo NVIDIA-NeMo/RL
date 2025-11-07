@@ -13,6 +13,7 @@
 # limitations under the License.
 import importlib
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -20,6 +21,7 @@ from typing import Any, Optional, Union
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tqdm import tqdm
 
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -30,6 +32,31 @@ from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
+
+
+def _compute_timing_stats(worker_times: list[float]) -> dict[str, float]:
+    """Compute timing statistics from a list of worker initialization times.
+
+    Args:
+        worker_times: List of initialization times in seconds for each worker
+
+    Returns:
+        Dictionary with timing statistics (min, max, mean, p50, p95, p99)
+    """
+    if not worker_times:
+        return {}
+
+    import numpy as np
+
+    sorted_times = sorted(worker_times)
+    return {
+        "min": float(np.min(sorted_times)),
+        "max": float(np.max(sorted_times)),
+        "mean": float(np.mean(sorted_times)),
+        "p50": float(np.percentile(sorted_times, 50)),
+        "p95": float(np.percentile(sorted_times, 95)),
+        "p99": float(np.percentile(sorted_times, 99)),
+    }
 
 
 @dataclass
@@ -340,6 +367,9 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
+        self.init_timing_stats: dict[
+            str, float
+        ] = {}  # Timing statistics for worker initialization
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -561,12 +591,54 @@ class RayWorkerGroup:
 
                 global_rank += 1
 
+        # Wait for all workers to initialize with timing and progress bar
+        num_workers = len(worker_futures)
+        worker_refs = [future for future, _ in worker_futures]
+
+        # Track timing for each worker as they complete
+        worker_completion_times = []
+        start_time = time.perf_counter()
+
+        # Use ray.wait() to track individual worker completion times
+        remaining_refs = worker_refs.copy()
+
+        with tqdm(
+            total=num_workers,
+            desc=f"Initializing {self.name_prefix} workers",
+            unit="worker",
+            disable=False,
+        ) as pbar:
+            while remaining_refs:
+                # Wait for at least one worker to complete
+                ready_refs, remaining_refs = ray.wait(
+                    remaining_refs, num_returns=1, timeout=None
+                )
+
+                # Record completion time for each ready worker
+                current_time = time.perf_counter()
+                for _ in ready_refs:
+                    worker_completion_times.append(current_time - start_time)
+                    pbar.update(1)
+
+        # Get all worker results
+        workers = ray.get(worker_refs)
+        total_init_time = time.perf_counter() - start_time
+
+        # Compute timing statistics
+        timing_stats = _compute_timing_stats(worker_completion_times)
+        timing_stats["total_time"] = total_init_time
+        timing_stats["num_workers"] = num_workers
+
+        # Store timing stats for later access
+        self.init_timing_stats = timing_stats
+
         print(
-            f"Waiting for {len(worker_futures)} workers to finish initializing...",
+            f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s "
+            f"(min: {timing_stats['min']:.2f}s, max: {timing_stats['max']:.2f}s, "
+            f"mean: {timing_stats['mean']:.2f}s, p50: {timing_stats['p50']:.2f}s, "
+            f"p95: {timing_stats['p95']:.2f}s)",
             flush=True,
         )
-        worker_refs = [future for future, _ in worker_futures]
-        workers = ray.get(worker_refs)
 
         for idx, (worker, (_, initializer)) in enumerate(zip(workers, worker_futures)):
             worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = initializer
