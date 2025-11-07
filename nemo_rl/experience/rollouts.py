@@ -48,6 +48,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -934,14 +935,6 @@ def run_async_multi_turn_rollout(
     return asyncio.run(_async_rollout_implementation())
 
 
-def _tensorize_by_key(message_logs: list, key: str):
-    if not message_logs or key not in message_logs[0]:
-        return
-
-    for m in message_logs:
-        m[key] = torch.tensor(m[key])
-
-
 @dataclass
 class AsyncPenguinRolloutResult:
     input_ids: torch.Tensor
@@ -995,6 +988,10 @@ def run_async_penguin_rollout(
         "Top k is not supported in the generation config in Penguin path!"
     )
 
+    timer = Timer()
+    timer_prefix = "timing/rollout"
+    timer.start(f"{timer_prefix}/total")
+
     for row in penguin_rows:
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
@@ -1007,116 +1004,109 @@ def run_async_penguin_rollout(
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
 
-    penguin_environment = task_to_env["penguin"]
-    results = ray.get(penguin_environment.run_rollouts.remote(penguin_rows))
-
-    # Tensorize all token ids
-    for r in results:
-        _tensorize_by_key(r["input_message_log"], "token_ids")
-        _tensorize_by_key(r["message_log"], "token_ids")
-        _tensorize_by_key(
-            [m for m in r["message_log"] if m["role"] == "assistant"],
-            "generation_logprobs",
+    with timer.time(f"{timer_prefix}/run_rollouts"):
+        penguin_environment = task_to_env["penguin"]
+        results, rollout_loop_timing_metrics = ray.get(
+            penguin_environment.run_rollouts.remote(
+                penguin_rows, tokenizer, timer_prefix
+            )
         )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
-    batch_size = len(penguin_rows)
-    max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
-    all_sample_metrics = [
-        {
-            "total_reward": r["full_result"]["reward"],
-            "assistant_tokens": sum(
-                len(m["token_ids"])
-                for m in r["message_log"]
-                if m["role"] == "assistant"
-            ),
-            "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
-            "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-            "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-            == max_total_tokens_per_sample,
-        }
-        for r in results
-    ]
+    with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
+        batch_size = len(penguin_rows)
+        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        all_sample_metrics = [
+            {
+                "total_reward": r["full_result"]["reward"],
+                "assistant_tokens": sum(
+                    len(m["token_ids"])
+                    for m in r["message_log"]
+                    if m["role"] == "assistant"
+                ),
+                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
+                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
+                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
+                == max_total_tokens_per_sample,
+            }
+            for r in results
+        ]
 
     # Aggregate metrics across all samples
-    rollout_metrics = {
-        **_calculate_single_metric(
-            [m["turn_count"] for m in all_sample_metrics],
-            batch_size,
-            "turns_per_sample",
-        ),
-        **_calculate_single_metric(
-            [m["total_tokens"] for m in all_sample_metrics],
-            batch_size,
-            "total_tokens_per_sample",
-        ),
-        **_calculate_single_metric(
-            [m["assistant_tokens"] for m in all_sample_metrics],
-            batch_size,
-            "gen_tokens_per_sample",
-        ),
-        **_calculate_single_metric(
-            [m["total_reward"] for m in all_sample_metrics], batch_size, "total_reward"
-        ),
-        "natural_termination_rate": sum(
-            not m["hit_max_tokens"] for m in all_sample_metrics
-        )
-        / batch_size,
-        "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
-        / batch_size,
-        # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
-        # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
-        # "mean_env_tokens_per_sample": sum(
-        #     m["env_tokens"] for m in all_sample_metrics
-        # )
-        # / batch_size,
-    }
+    with timer.time(f"{timer_prefix}/aggregate_metrics"):
+        rollout_metrics = {
+            **rollout_loop_timing_metrics,
+            **_calculate_single_metric(
+                [m["turn_count"] for m in all_sample_metrics],
+                batch_size,
+                "turns_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["total_tokens"] for m in all_sample_metrics],
+                batch_size,
+                "total_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["assistant_tokens"] for m in all_sample_metrics],
+                batch_size,
+                "gen_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["total_reward"] for m in all_sample_metrics],
+                batch_size,
+                "total_reward",
+            ),
+            "natural_termination_rate": sum(
+                not m["hit_max_tokens"] for m in all_sample_metrics
+            )
+            / batch_size,
+            "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
+            / batch_size,
+            # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
+            # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
+            # "mean_env_tokens_per_sample": sum(
+            #     m["env_tokens"] for m in all_sample_metrics
+            # )
+            # / batch_size,
+        }
 
     # Per-agent misc metrics
-    agent_to_results: dict[str, list[dict]] = defaultdict(list)
-    for penguin_row, result in zip(penguin_rows, results):
-        agent_name = penguin_row["agent_ref"]["name"]
-        agent_to_results[agent_name].append(result["full_result"])
+    with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
+        agent_to_results: dict[str, list[dict]] = defaultdict(list)
+        for penguin_row, result in zip(penguin_rows, results):
+            agent_name = penguin_row["agent_ref"]["name"]
+            agent_to_results[agent_name].append(result["full_result"])
 
-    per_agent_metrics = {}
-    for agent_name, agent_results in agent_to_results.items():
-        keys = agent_results[0].keys()
-        for key in keys:
-            values = []
-            for r in agent_results:
-                if isinstance(r.get(key), (bool, int, float)):
-                    values.append(float(r[key]))
-
-            if values:
-                per_agent_metrics.update(
-                    _calculate_single_metric(
-                        values, len(agent_results), f"{agent_name}/{key}"
+        per_agent_metrics = {}
+        for agent_name, agent_results in agent_to_results.items():
+            keys = agent_results[0].keys()
+            for key in keys:
+                values = [
+                    float(r[key])
+                    for r in agent_results
+                    if isinstance(r.get(key), (bool, int, float))
+                ]
+                if values:
+                    per_agent_metrics.update(
+                        _calculate_single_metric(
+                            values, len(agent_results), f"{agent_name}/{key}"
+                        )
                     )
-                )
 
-        # Log the full result
-        to_log = []
-        for r in agent_results:
-            r = copy.deepcopy(r)
-            # Remove tokens from logging
-            for output_item in r["response"]["output"]:
-                output_item.pop("prompt_token_ids", None)
-                output_item.pop("generation_token_ids", None)
-                output_item.pop("generation_log_probs", None)
+            # Log the full result
+            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
+            per_agent_metrics[f"{agent_name}/full_result"] = Table(
+                data=to_log, columns=["Full result"]
+            )
 
-            r = json.dumps(r, separators=((",", ":")))
-            to_log.append([r])
-
-        per_agent_metrics[f"{agent_name}/full_result"] = Table(
-            data=to_log, columns=["Full result"]
-        )
-
-    rollout_metrics.update(per_agent_metrics)
+        rollout_metrics.update(per_agent_metrics)
 
     # Necessary for downstream nemo rl logging/printing.
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
+    timer.stop(f"{timer_prefix}/total")
+    rollout_metrics.update(timer.get_timing_metrics("sum"))
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
