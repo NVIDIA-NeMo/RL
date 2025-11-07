@@ -137,7 +137,7 @@ policy:
       data_parallel_sharding_strategy: "optim_grads_params"
 
   generation:
-    backend: "megatron"
+    backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     top_p: 1.0
