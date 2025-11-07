@@ -142,7 +142,12 @@ def penguin_sanity_test_data():
     not PENGUIN_INSTALLED,
     reason="Skipping Penguin test since Penguin is not installed!",
 )
-def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generation):
+def test_penguin_sanity(
+    penguin,
+    penguin_sanity_test_data,
+    penguin_vllm_generation,
+    penguin_tokenizer,  # noqa: F811
+):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
     # We need to match NeMo RL generation config params before sending to Penguin
@@ -154,10 +159,20 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
         ]
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
 
-    actual_result = ray.get(
-        penguin.run_rollouts.remote(penguin_sanity_test_data["input"])
+    actual_result, _ = ray.get(
+        penguin.run_rollouts.remote(
+            penguin_sanity_test_data["input"], penguin_tokenizer, ""
+        )
     )
     expected_result = penguin_sanity_test_data["expected_output"]
+
+    # These are tensors originally and we swap them back to a list for comparison below
+    for d in actual_result:
+        for message in d["input_message_log"]:
+            message["token_ids"] = message["token_ids"].tolist()
+        # Right now, we don't need to swap the token ids in the message log since they pointto the same underlying dictionary as above.
+        # for message in d["message_log"][:1]:
+        #     message["token_ids"] = message["token_ids"].tolist()
 
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
@@ -170,6 +185,10 @@ def test_penguin_sanity(penguin, penguin_sanity_test_data, penguin_vllm_generati
                 message["token_ids"] = []
             if "generation_logprobs" in message:
                 message["generation_logprobs"] = []
+            if "prompt_str" in message:
+                message["prompt_str"] = "dummy prompt_str"
+            if "generation_str" in message:
+                message["generation_str"] = "dummy generation_str"
 
         return d
 

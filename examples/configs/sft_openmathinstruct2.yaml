@@ -27,6 +27,8 @@ policy:
   max_total_sequence_length: 4096
   precision: "bfloat16"
 
+  offload_optimizer_for_logprob: false
+
   dtensor_cfg:
     enabled: true
     cpu_offload: False
