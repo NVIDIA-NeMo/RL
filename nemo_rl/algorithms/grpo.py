@@ -1190,16 +1190,31 @@ def grpo_train(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
 
+                # Get flat advantages and token mask for masked metrics computation
+                flat_advantages = flat_messages["advantages"]
+                flat_token_mask = flat_messages["token_loss_mask"]
+
+                # Filter advantages using token mask (only valid response tokens)
+                valid_advantages = torch.masked_select(
+                    flat_advantages, flat_token_mask.bool()
+                )
+
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "reward": rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
-                    # Add advantages tracking metrics
-                    "advantages/mean": torch.mean(advantages).detach().item(),
-                    "advantages/max": torch.max(advantages).detach().item(),
-                    "advantages/min": torch.min(advantages).detach().item(),
+                    # Add masked advantages tracking metrics (only for valid response tokens)
+                    "advantages/mean": torch.mean(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/max": torch.max(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/min": torch.min(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
                     **ds_metrics,
                 }
                 if master_config["grpo"]["use_dynamic_sampling"]:
@@ -2082,16 +2097,31 @@ def async_grpo_train(
 
                     # Resume trajectory collection after validation
                     trajectory_collector.resume.remote()
+                # Get flat advantages and token mask for masked metrics computation
+                flat_advantages = flat_messages["advantages"]
+                flat_token_mask = flat_messages["token_loss_mask"]
+
+                # Filter advantages using token mask (only valid response tokens)
+                valid_advantages = torch.masked_select(
+                    flat_advantages, flat_token_mask.bool()
+                )
+
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
-                    # Add advantages tracking metrics
-                    "advantages/mean": torch.mean(advantages).detach().item(),
-                    "advantages/max": torch.max(advantages).detach().item(),
-                    "advantages/min": torch.min(advantages).detach().item(),
+                    # Add masked advantages tracking metrics (only for valid response tokens)
+                    "advantages/mean": torch.mean(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/max": torch.max(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
+                    "advantages/min": torch.min(valid_advantages).detach().item()
+                    if valid_advantages.numel() > 0
+                    else 0.0,
                 }
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():
