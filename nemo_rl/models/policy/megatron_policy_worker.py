@@ -1750,6 +1750,10 @@ class MegatronPolicyWorker:
         """
         no_grad = torch.no_grad()
         no_grad.__enter__()
+        
+        if self.should_disable_forward_pre_hook:
+            self.model = self.move_model(self.model, "cuda", move_params=True, move_grads=False)
+
         self.model.config.flash_decode = True
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
@@ -1801,11 +1805,17 @@ class MegatronPolicyWorker:
         # self.tokenizer.decode(prompt)
         # for prompt in data.get("input_ids")
         # ]
+
+        input_ids = data["input_ids"]
+        tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - input_ids.size(1)
+        
+        padding = torch.full((input_ids.shape[0],tokens_to_generate), self.megatron_tokenizer.eod_id, dtype = input_ids.dtype, device= input_ids.device)
+        prompt_tokens_tensor = torch.cat([input_ids, padding], dim=1)
         # apply chat template
         out = run_mcore_engine(
             engine=inference_engine,
             # prompts = detokenized_prompts,
-            prompt_tokens_tensor=data["input_ids"],
+            prompt_tokens_tensor=prompt_tokens_tensor,
             prompt_lengths_tensor=data["input_lengths"],
             tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
             - data["input_ids"].size(1),

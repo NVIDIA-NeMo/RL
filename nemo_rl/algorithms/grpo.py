@@ -511,7 +511,8 @@ def setup(
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
-    policy_generation.prepare_refit_info(state_dict_info)
+    if policy_generation is not None:
+        policy_generation.prepare_refit_info(state_dict_info)
 
     loss_fn = ClippedPGLossFn(loss_config)
 
