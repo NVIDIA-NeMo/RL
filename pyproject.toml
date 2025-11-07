@@ -47,7 +47,7 @@ dependencies = [
     "pillow>=11.3.0",
     "torchvision>=0.22.0",
     "num2words>=0.5.14",   # for SmolVLM
-    "mlflow",
+    "mlflow>=3.5.0,<3.6.0",
     "nvidia-nvshmem-cu12", # for deep_ep build
     "swanlab",
     "pyzmq",
