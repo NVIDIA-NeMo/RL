@@ -532,7 +532,7 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
-                patch_transformers_module_dir(runtime_env["env_vars"])
+                # patch_transformers_module_dir(runtime_env["env_vars"])
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
