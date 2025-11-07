@@ -1785,6 +1785,8 @@ class MegatronPolicyWorker:
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
+        from megatron.core.inference.sampling_params import SamplingParams
+        from megatron.core.inference.inference_request import InferenceRequest
 
         inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
 
@@ -1800,27 +1802,42 @@ class MegatronPolicyWorker:
             max_batch_size=self.cfg["generation_batch_size"],
         )
 
-        # detokenize the prompts
-        # detokenized_prompts = [
-        # self.tokenizer.decode(prompt)
-        # for prompt in data.get("input_ids")
-        # ]
-
         input_ids = data["input_ids"]
         tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - input_ids.size(1)
         
         padding = torch.full((input_ids.shape[0],tokens_to_generate), self.megatron_tokenizer.eod_id, dtype = input_ids.dtype, device= input_ids.device)
         prompt_tokens_tensor = torch.cat([input_ids, padding], dim=1)
-        # apply chat template
-        out = run_mcore_engine(
-            engine=inference_engine,
-            # prompts = detokenized_prompts,
-            prompt_tokens_tensor=prompt_tokens_tensor,
-            prompt_lengths_tensor=data["input_lengths"],
-            tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  # type: ignore
-            - data["input_ids"].size(1),
+        prompt_lengths_tensor = data["input_lengths"]
+
+        sampling_params = SamplingParams(
+            temperature=1.0,
+            top_k=0,
+            top_p=0.0,
+            return_segments=False,
+            return_log_probs=True,
+            num_tokens_to_generate=tokens_to_generate,
+            top_n_logprobs=0,
+            return_prompt_top_n_logprobs=False,
         )
-        # print(out)
+        requests = []
+        for p, l in zip(prompt_tokens_tensor, prompt_lengths_tensor):
+            tokenized_prompt =  p[:l].cpu().numpy().tolist()
+            detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
+            req = InferenceRequest(
+                prompt=detokenized_prompt,
+                prompt_tokens=tokenized_prompt,
+                sampling_params=sampling_params,
+                request_id=inference_engine.get_new_request_id(),
+            )
+            requests.append(req)
+            
+        result = inference_engine.generate(inference_requests=requests)
+
+        out = {
+            "text": [x.prompt + x.generated_text for x in result],
+            "tokens": [x.prompt_tokens + x.generated_tokens.tolist() for x in result],
+            "logprobs" : [x.prompt_log_probs + x.generated_log_probs for x in result]
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
