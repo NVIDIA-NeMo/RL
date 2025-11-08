@@ -68,6 +68,7 @@ def release_test_suite():
                 release_suite.append(line)
     return release_suite
 
+
 @pytest.fixture
 def performance_test_suite():
     performance_suite = []
