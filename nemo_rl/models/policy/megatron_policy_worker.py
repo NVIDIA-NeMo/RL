@@ -1831,8 +1831,10 @@ class MegatronPolicyWorker:
             return_prompt_top_n_logprobs=False,
         )
         requests = []
-        for p, l in zip(prompt_tokens_tensor, prompt_lengths_tensor):
-            tokenized_prompt = p[:l].cpu().numpy().tolist()
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            tokenized_prompt = p[:prompt_len].cpu().numpy().tolist()
             detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
             req = InferenceRequest(
                 prompt=detokenized_prompt,
