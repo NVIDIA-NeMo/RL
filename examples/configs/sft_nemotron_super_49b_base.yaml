@@ -1,8 +1,8 @@
-# SFT on Tulu3-SFT-Mixture dataset
+# Base SFT Configuration for Nemotron Super 49B
 sft:
   max_num_epochs: 1
-  max_num_steps: 50
-  val_period: 5
+  max_num_steps: 100
+  val_period: 10
   val_batches: 8
   val_global_batch_size: 128
   val_micro_batch_size: 1
@@ -22,7 +22,7 @@ policy:
   model_name: "/lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf"
   tokenizer:
     name: ${policy.model_name}
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 4096
   precision: "bfloat16"
   train_global_batch_size: 128
   train_micro_batch_size: 1
@@ -30,12 +30,12 @@ policy:
   dtensor_cfg:
     _v2: true
     activation_checkpointing: true
-    context_parallel_size: 8
+    context_parallel_size: 2
     cpu_offload: false
     enabled: true
     sequence_parallel: false
     tensor_parallel_size: 4
-    custom_parallel_plan: examples.configs.recipes.llm.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
+    custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
 
   megatron_cfg:
     enabled: false
@@ -60,56 +60,59 @@ policy:
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
-      lr: 1e-5
+      lr: 2e-5
       weight_decay: 0.01
       betas: [0.9, 0.98]
       eps: 1e-8
       foreach: False
       fused: False
-  scheduler:
-    - name: "torch.optim.lr_scheduler.LinearLR"
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 10 # warmup_steps
-    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
-      kwargs:
-        # max_num_steps - warmup_steps = cosine steps
-        T_max: 40
-        eta_min: 2e-6
-    - milestones: [10]
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
-  dataset_name: "tulu3_sft_mixture"
   add_bos: true
   add_eos: true
   add_generation_prompt: false
   shuffle: true
   num_workers: 20
-  test_size: 0.05
-  # max_samples: 10000 # remove this line to use all data
+  dataset_name: "squad"
+  # You can use custom response datasets for training and validation. For example:
+  #   data:
+  #     dataset_name: ResponseDataset
+  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
+  #     val_data_path: <PathToValidationDataset>
+  #     input_key: <QuestionKey>, default is "input"
+  #     output_key: <AnswerKey>, default is "output"
+  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
+  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
+  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
+
+  ## unused with squad dataset
+  prompt_file: null
+  split: null
+  output_key: null
+  seed: null
 
 logger:
   log_dir: "logs"
   wandb_enabled: true
   tensorboard_enabled: false
   mlflow_enabled: false
-  monitor_gpus: true
+  monitor_gpus: false
   swanlab_enabled: false
   num_val_samples_to_print: 0
   wandb:
-    project: "nemotron-tulu-3-sft"
-    name: "nemotron-tulu-3"
+    project: "sft-nemotron-super-49b"
+    name: "sft-nemotron-super-49b"
   tensorboard:
-    log_dir: "tb_logs-nemotron-tulu-3-sft"
+    log_dir: "tb_logs-sft-nemotron-super-49b"
   mlflow:
-    experiment_name: "nemotron-tulu-3-sft"
-    run_name: "nemotron-tulu-3-sft"
+    experiment_name: "sft-nemotron-super-49b"
+    run_name: "sft-nemotron-super-49b"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 8
+  num_nodes: 1
+
