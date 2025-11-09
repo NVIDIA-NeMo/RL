@@ -819,6 +819,7 @@ class DTensorPolicyWorker:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            logprob_chunk_size=self.cfg.get("logprob_chunk_size", None),
                         )
                         del logits
 
