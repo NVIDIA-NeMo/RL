@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict, Union
+from typing import Any, Dict, Literal, NotRequired, TypedDict, Union
 
 
 class ResponseDatasetConfig(TypedDict):
@@ -72,6 +72,11 @@ class DataConfig(TypedDict):
     ]
     # default settings for all datasets, will be overridden by dataset-specific settings
     default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
+    # Specifies input sequence length for synthetic datasets.
+    # - int: fixed input length
+    # - Dict[str, Any]: generator config with 'mean' and 'std' keys for sampling from normal distribution
+    # Used by RandomDataset for benchmarking. Recommended default: not set (dataset-specific).
+    input_len_or_input_len_generator: NotRequired[Dict[str, Any] | int]
 
 
 # ===============================================================================
