@@ -1,4 +1,4 @@
-defaults: ./grpo-qwen3-235b-32n8g.yaml
+defaults: ./grpo-qwen3-235b-16n8g.yaml
 grpo:
   async_grpo:
     enabled: true
