@@ -1,0 +1,49 @@
+defaults: ../../sft_nemotron_super_49b_base.yaml
+
+# SFT on Tulu3-SFT-Mixture dataset
+sft:
+  max_num_steps: 50
+  val_period: 5
+
+policy:
+  max_total_sequence_length: 32768
+  train_micro_batch_size: 1
+
+  dtensor_cfg:
+    context_parallel_size: 8
+
+  optimizer:
+    kwargs:
+      lr: 1e-5
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 10 # warmup_steps
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        # max_num_steps - warmup_steps = cosine steps
+        T_max: 40
+        eta_min: 2e-6
+    - milestones: [10]
+
+data:
+  dataset_name: "tulu3_sft_mixture"
+  test_size: 0.05
+  # max_samples: 10000 # remove this line to use all data
+
+logger:
+  monitor_gpus: true
+  wandb:
+    project: "nemotron-tulu-3-sft"
+    name: "nemotron-tulu-3"
+  tensorboard:
+    log_dir: "tb_logs-nemotron-tulu-3-sft"
+  mlflow:
+    experiment_name: "nemotron-tulu-3-sft"
+    run_name: "nemotron-tulu-3-sft"
+
+cluster:
+  num_nodes: 8
