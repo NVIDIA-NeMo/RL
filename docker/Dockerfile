@@ -10,6 +10,8 @@ ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
 FROM ${BASE_IMAGE} AS base
+# An environment variable to indicate that we are in a container.
+ENV NRL_CONTAINER=1
 
 # It is more convenient for users to run as root
 USER root
@@ -76,12 +78,14 @@ ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+# Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN <<"EOF" bash -exu
+uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh
     source 3rdparty/vllm/nemo-rl.env
@@ -127,6 +131,11 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
+
+# Generate container fingerprint for frozen environment support
+# Store outside /opt/nemo-rl to avoid being overwritten by user mounts
+RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
