@@ -7,7 +7,7 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/async-grpo-qwen3-235b-32n8g
+  checkpoint_dir: results/grpo-qwen3-235b-32n8g-async-1off
 policy:
   megatron_cfg:
     tensor_model_parallel_size: 4
@@ -27,9 +27,9 @@ policy:
       gpu_memory_utilization: 0.8
       async_engine: true
 logger:
-  log_dir: logs/async-grpo-qwen3-235b-32n8g-16T16G
+  log_dir: logs/grpo-qwen3-235b-32n8g-16T16G-async-1off
   wandb:
-    name: async-grpo-qwen3-235b-32n8g-16T16G
+    name: grpo-qwen3-235b-32n8g-16T16G-async-1off
 cluster:
   gpus_per_node: 8
   num_nodes: 32
