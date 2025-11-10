@@ -826,6 +826,7 @@ def mock_grpo_components():
             "token_mult_prob_error": [
                 1.0
             ],  # Must be <= 1.05 to avoid logging extra plots
+            "gen_kl_error": [0.0001],
         },
     }
     policy.generate.return_value = {
