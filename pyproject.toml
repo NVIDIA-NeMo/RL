@@ -43,9 +43,9 @@ dependencies = [
     "sympy>=1.14.0",
     "pillow>=11.3.0",
     "torchvision>=0.22.0",
-    "num2words>=0.5.14",    # for SmolVLM
-    "mlflow",
-    "nvidia-nvshmem-cu12",  # for deep_ep build
+    "num2words>=0.5.14",   # for SmolVLM
+    "mlflow>=3.5.0,<3.6.0",
+    "nvidia-nvshmem-cu12", # for deep_ep build
     "swanlab",
     "pyzmq",
 ]
@@ -186,7 +186,7 @@ url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv]
-preview = true # Enable preview features like extra-build-dependencies
+preview = true  # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
     "transformer-engine-torch",
     "transformer-engine",
@@ -194,7 +194,7 @@ no-build-isolation-package = [
     "mamba-ssm",
     "causal-conv1d",
     "deep_gemm",
-    "deep_ep",
+    "deep_ep"
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -226,18 +226,26 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
+# This version has to match the version in the commit/rev/tag used
+version = "1.5.0.post8"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
+# This version has to match the version in the commit/rev/tag used
+version = "2.2.4"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
+# This version has to match the version in the commit/rev/tag used
+version = "v1.1.0+e3908bf"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
+# This version has to match the version in the commit/rev/tag used
+version = "v2.0.0+7b6b556"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.black]

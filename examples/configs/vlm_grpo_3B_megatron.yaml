@@ -30,6 +30,11 @@ grpo:
     max_trajectory_age_steps: 1
 loss_fn:
   reference_policy_kl_penalty: 0.01
+  # Can be set to k1, k2, k3
+  # For more details, see http://joschu.net/blog/kl-approx.html
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
   ratio_clip_min: 0.2
   ratio_clip_max: 0.2
   ratio_clip_c: null
@@ -55,6 +60,7 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 2048
   precision: bfloat16
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
   dtensor_cfg:
     _v2: true
     enabled: false
