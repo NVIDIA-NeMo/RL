@@ -1820,10 +1820,20 @@ class MegatronPolicyWorker:
         prompt_tokens_tensor = torch.cat([input_ids, padding], dim=1)
         prompt_lengths_tensor = data["input_lengths"]
 
+        # Handle None values for top_k - convert to integer as required by Megatron
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        # Use temperature 0.0 for greedy, 1.0 otherwise
+        temperature = 0.0 if greedy else 1.0
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = float(top_p_cfg) if top_p_cfg is not None else 0.0
+
         sampling_params = SamplingParams(
-            temperature=1.0,
-            top_k=self.cfg["generation"]["top_k"],
-            top_p=self.cfg["generation"]["top_p"],
+            temperature=temperature,
+            top_k=top_k_val,
+            top_p=top_p_val,
             return_segments=False,
             return_log_probs=True,
             num_tokens_to_generate=tokens_to_generate,
