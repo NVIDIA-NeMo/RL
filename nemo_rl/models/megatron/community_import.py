@@ -53,25 +53,10 @@ def import_model_from_hf_name(
     orig_pipeline_dtype = model_provider.pipeline_dtype
 
     if megatron_config is not None:
-        model_provider.tensor_model_parallel_size = megatron_config[
-            "tensor_model_parallel_size"
-        ]
-        model_provider.pipeline_model_parallel_size = megatron_config[
-            "pipeline_model_parallel_size"
-        ]
-        model_provider.expert_model_parallel_size = megatron_config[
-            "expert_model_parallel_size"
-        ]
-        model_provider.expert_tensor_parallel_size = megatron_config[
-            "expert_tensor_parallel_size"
-        ]
-        model_provider.num_layers_in_first_pipeline_stage = megatron_config[
-            "num_layers_in_first_pipeline_stage"
-        ]
-        model_provider.num_layers_in_last_pipeline_stage = megatron_config[
-            "num_layers_in_last_pipeline_stage"
-        ]
-        model_provider.pipeline_dtype = megatron_config["pipeline_dtype"]
+        for k in megatron_config.keys():
+            if hasattr(model_provider, k):
+                setattr(model_provider, k, megatron_config[k])  # type: ignore
+
     model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
     megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
