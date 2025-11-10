@@ -142,8 +142,8 @@ class DTensorPolicyWorkerV2:
         self.cfg = config
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
-        backend = "nccl" if not self.cpu_offload else "cuda:nccl,cpu:gloo"
-        torch.distributed.init_process_group(backend=backend)
+        # backend = "nccl" if not self.cpu_offload else "cuda:nccl,cpu:gloo"
+        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo")
         self.rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
@@ -438,6 +438,82 @@ class DTensorPolicyWorkerV2:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
+        # TO REMOVE #
+        if self.rank == 0:
+            print("=" * 80)
+            print(f"[PARALLELISM CONFIG]")
+            print(f"  world_size = {world_size}")
+            print(f"  tensor_parallel_size (TP) = {tp_size}")
+            print(f"  context_parallel_size (CP) = {cp_size}")
+            print(f"  data_parallel_size (DP/FSDP) = {dp_size}")
+            print(f"  data_parallel_replicate_size = {dp_replicate_size}")
+            print(f"  sequence_parallel = {sequence_parallel_enabled}")
+            print(f"  FSDP shards model across {dp_size} workers")
+            print(f"  Each worker has ~1/{dp_size} of model parameters")
+            print("=" * 80, flush=True)
+
+        self._diagnose_model_sharding()
+
+    def _diagnose_model_sharding(self) -> None:
+        """Diagnose and report model sharding configuration."""
+        from torch.distributed._tensor import DTensor
+        
+        state_dict = self.model.state_dict()
+        total_params = 0
+        dtensor_params = 0
+        regular_params = 0
+        total_local_bytes = 0
+        total_global_bytes = 0
+        
+        # Sample a few tensors for detailed inspection
+        sample_dtensors = []
+        
+        for name, tensor in state_dict.items():
+            num_params = tensor.numel()
+            total_params += num_params
+            
+            if isinstance(tensor, DTensor):
+                dtensor_params += num_params
+                # Get local tensor size (what this worker actually stores)
+                local_tensor = tensor.to_local()
+                local_bytes = local_tensor.numel() * local_tensor.element_size()
+                total_local_bytes += local_bytes
+                
+                # Get full tensor size (what would be gathered)
+                global_bytes = tensor.numel() * tensor.element_size()
+                total_global_bytes += global_bytes
+                
+                # Sample first few DTensors for detailed reporting
+                if len(sample_dtensors) < 3:
+                    sample_dtensors.append((name, tensor, local_tensor))
+            else:
+                regular_params += num_params
+                local_bytes = tensor.numel() * tensor.element_size()
+                total_local_bytes += local_bytes
+                total_global_bytes += local_bytes
+        
+        # Only rank 0 prints to avoid spam
+        if self.rank == 0:
+            print("=" * 80)
+            print(f"[MODEL SHARDING DIAGNOSTICS - Rank {self.rank}]")
+            print(f"  Total parameters: {total_params:,}")
+            print(f"  DTensor parameters: {dtensor_params:,} ({100*dtensor_params/total_params:.1f}%)")
+            print(f"  Regular parameters: {regular_params:,} ({100*regular_params/total_params:.1f}%)")
+            print(f"  Local storage (this worker): {total_local_bytes / 1e9:.2f} GB")
+            print(f"  Global storage (full model): {total_global_bytes / 1e9:.2f} GB")
+            print(f"  Shard ratio: 1/{total_global_bytes/total_local_bytes:.1f} (this worker has 1/{total_global_bytes/total_local_bytes:.0f} of model)")
+            
+            if sample_dtensors:
+                print(f"\n  Sample DTensor placements:")
+                for name, dtensor, local_tensor in sample_dtensors:
+                    print(f"    {name}:")
+                    print(f"      Global shape: {dtensor.shape}")
+                    print(f"      Local shape: {local_tensor.shape}")
+                    print(f"      Placements: {dtensor.placements}")
+                    print(f"      Device mesh: {dtensor.device_mesh}")
+                    print(f"      Device mesh shape: {dtensor.device_mesh.shape}")
+            
+            print("=" * 80, flush=True)
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
@@ -807,7 +883,7 @@ class DTensorPolicyWorkerV2:
                     with torch.no_grad():
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
-                            dp_cp_group=self.dp_cp_mesh.get_group(),
+                            dp_cp_group=self.dp_shard_cp_mesh.get_group(),
                             tp_group=self.tp_mesh.get_group(),
                             dtype=torch.float32,
                         )
