@@ -1790,40 +1790,41 @@ class MegatronPolicyWorker:
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
-        from megatron.core.inference.contexts import StaticInferenceContext
         from megatron.core.inference.sampling_params import SamplingParams
-
-        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
-        inference_wrapped_model = GPTInferenceWrapper(
-            self.model, inference_wrapper_config, inference_context
-        )
+        from megatron.core.inference.inference_request import InferenceRequest
         
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model,
-            tokenizer=self.megatron_tokenizer,
-        )
         inference_max_batch_size = inference_wrapper_config.inference_max_requests
         max_batch_size = inference_max_batch_size
-        buffer_size_gb = 30
+        print(f'Max batch size: {max_batch_size}')
+        buffer_size_gb = 5 # 10 and max_batch_size * 3 works
         buffer_guaranteed_fraction = 0.1
         num_cuda_graphs = 1
-        model_config = text_generation_controller.inference_wrapped_model.model.config
+        model_config = self.model.config
+        model_config.cuda_graph_impl = "local"
         dynamic_context = DynamicInferenceContext(
             params_dtype=inference_wrapper_config.params_dtype,
             num_layers=model_config.num_layers,
             kv_channels=model_config.kv_channels,
             num_attention_heads=model_config.num_query_groups,
-            max_sequence_length=inference_wrapper_config.inference_max_seq_length,
+            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
             buffer_size_gb=buffer_size_gb,
             buffer_guaranteed_fraction=buffer_guaranteed_fraction,
             materialize_only_last_token_logits=False,
-            max_requests_override=max_batch_size,
+            max_requests_override=None,
             num_cuda_graphs=num_cuda_graphs,
             use_flashinfer_fused_rope=None,            
         )
-        text_generation_controller.inference_wrapped_model.inference_context = dynamic_context
-        text_generation_controller.inference_wrapped_model.prep_model_for_inference()
-        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+        inference_wrapped_model = GPTInferenceWrapper(
+            self.model, inference_wrapper_config, dynamic_context
+        )
+        inference_wrapped_model.prep_model_for_inference()
+
+        text_generation_controller = TextGenerationController(
+                    inference_wrapped_model=inference_wrapped_model,
+                    tokenizer=self.megatron_tokenizer,
+                )
+
+        #text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
         dynamic_engine = DynamicInferenceEngine(
                             controller=text_generation_controller,
                             random_seed=1234,
@@ -1831,11 +1832,6 @@ class MegatronPolicyWorker:
                             enable_cuda_graph=True,
                             termination_id = self.megatron_tokenizer.eod
                         )
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:  # 'RuntimeError: There is no current event loop...'
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
         
         tokens_to_generate=self.cfg["generation"]["max_new_tokens"] - data["input_ids"].size(1)
 
@@ -1850,7 +1846,6 @@ class MegatronPolicyWorker:
         top_p_val = (
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
-
         sampling_params = SamplingParams(
             temperature=temperature,
             top_k=top_k_val,
@@ -1861,20 +1856,56 @@ class MegatronPolicyWorker:
             top_n_logprobs=0,
             return_prompt_top_n_logprobs=False,
         )
+        sampling_params = SamplingParams(
+            temperature = 1.0,
+            top_k = 0,
+            top_p = 0.0,
+            return_segments = True,
+            return_log_probs = True,
+            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  - data["input_ids"].size(1),
+        )
 
-        detokenized_prompts = [ self.tokenizer.decode(prompt) for prompt in data.get("input_ids") ]
+        input_ids = data["input_ids"]
+        prompt_tokens_tensor = input_ids
+        prompt_lengths_tensor = data["input_lengths"]
+        request_id = 0
+        request_dict = {}
+        for p, prompt_len in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        ):
+            tokenized_prompt = p[:prompt_len].cuda()
+            detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
+            req = InferenceRequest(
+                    prompt=detokenized_prompt,
+                    prompt_tokens=tokenized_prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+            request_dict[request_id] = req
+            dynamic_engine.add_request(request_id, tokenized_prompt, num_tokens_to_generate = tokens_to_generate)
+            request_id += 1
+
         import time
         start_time = time.time()
-        result = dynamic_engine.generate(prompts=detokenized_prompts, sampling_params=sampling_params)
+        while dynamic_engine.has_unfinished_requests():
+            result = dynamic_engine.step_modern(sampling_params, verbose=True)
+            for finished_request in result["finished_requests"]:
+                request = request_dict[finished_request.request_id]
+                request.generated_tokens = finished_request.generated_tokens
+                if sampling_params.return_log_probs:
+                    request.generated_log_probs = finished_request.generated_log_probs
+                    request.prompt_log_probs = finished_request.prompt_log_probs
+                    request.generated_text = finished_request.generated_text
+
+        result = list(request_dict.values())
         end_time = time.time()
         print(f"Time taken: {end_time - start_time} seconds")
         # Need to add x.prompt
-        response_dict = {
-            "text": [x.generated_text for x in result],
-            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
-        }
-        out = response_dict     
+        out = {
+                "text": [x.prompt + x.generated_text for x in result],
+                "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
+                "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+            }     
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
