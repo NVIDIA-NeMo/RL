@@ -4,7 +4,7 @@ sft:
   val_period: 500
 checkpointing:
   enabled: false
-  checkpoint_dir: results/sft-qwen3-next-80ba3b-instruct-1n8g-megatron
+  checkpoint_dir: results/sft-qwen3-next-80ba3b-instruct-8n8g-megatron
   save_period: 100
 policy:
   model_name: Qwen/Qwen3-Next-80B-A3B-Instruct
@@ -12,7 +12,7 @@ policy:
     name: Qwen/Qwen3-Next-80B-A3B-Instruct
     chat_template: default
   train_global_batch_size: 512
-  train_micro_batch_size: 2
+  train_micro_batch_size: 1
   max_total_sequence_length: 4096
   dtensor_cfg:
     enabled: false
@@ -38,11 +38,12 @@ data:
   output_key: generated_solution
   seed: 42
 logger:
-  log_dir: logs/sft-qwen3-next-80ba3b-instruct-1n8g-megatron
+  log_dir: logs/sft-qwen3-next-80ba3b-instruct-8n8g-megatron
   wandb:
     project: nemo-rl
-    name: sft-qwen3-next-80ba3b-instruct-1n8g-megatron
+    name: sft-qwen3-next-80ba3b-instruct-8n8g-megatron
   tensorboard:
     log_dir: tb_logs-sft-dev-openmathinstruct2
 cluster:
+  num_nodes: 8
   gpus_per_node: 8
