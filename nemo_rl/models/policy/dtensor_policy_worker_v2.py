@@ -279,6 +279,7 @@ class DTensorPolicyWorkerV2:
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
         dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
+        dp_replicate_size = self.cfg["dtensor_cfg"].get("data_parallel_replicate_size", 1)
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
@@ -308,10 +309,6 @@ class DTensorPolicyWorkerV2:
             assert not self.is_vlm, (
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
-
-        # For FSDP2 compatibility, we need to support HSDP structure
-        # For now, we use dp_replicate_size = 1 (no hybrid sharding)
-        dp_replicate_size = 1
 
         manager = FSDP2Manager(
             dp_size=dp_size,
