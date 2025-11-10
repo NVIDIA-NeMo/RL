@@ -34,12 +34,10 @@ from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
 )
+from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.grad_utils import (
     clip_grad_by_total_norm_,
     get_grad_norm,
-)
-from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -53,7 +51,6 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    OffloadPolicy,
 )
 from torch.distributed.tensor import DTensor, Shard
 from transformers import (
@@ -95,8 +92,6 @@ from nemo_rl.utils.automodel_checkpoint import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
-
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
 
 @ray.remote(
@@ -184,8 +179,13 @@ class DTensorPolicyWorkerV2:
         # - CP > 1 requires SDPA
         attn_impl = (
             "flash_attention_2"
-            if (self.enable_seq_packing and self.cfg["dtensor_cfg"]["context_parallel_size"] == 1)
-            else ("sdpa" if self.cfg["dtensor_cfg"]["context_parallel_size"] > 1 else None)
+            if (
+                self.enable_seq_packing
+                and self.cfg["dtensor_cfg"]["context_parallel_size"] == 1
+            )
+            else (
+                "sdpa" if self.cfg["dtensor_cfg"]["context_parallel_size"] > 1 else None
+            )
         )
 
         model_config = AutoConfig.from_pretrained(
@@ -326,7 +326,9 @@ class DTensorPolicyWorkerV2:
                 reduce_dtype=torch.float32,
                 output_dtype=torch.float32,
             ),
-            offload_policy=CPUOffloadPolicy(pin_memory=False) if self.cpu_offload else None,
+            offload_policy=CPUOffloadPolicy(pin_memory=False)
+            if self.cpu_offload
+            else None,
             world_size=world_size,
         )
         self.device_mesh = manager.device_mesh
