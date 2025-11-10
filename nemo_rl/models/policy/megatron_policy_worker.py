@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 import gc
 import math
 import os
@@ -66,9 +65,6 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
-)
-from megatron.core.inference.engines import (
-    StaticInferenceEngine,
 )
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -1758,7 +1754,7 @@ class MegatronPolicyWorker:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-            
+
         # Verify input is right padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1785,18 +1781,20 @@ class MegatronPolicyWorker:
             inference_max_requests=self.cfg["generation_batch_size"],
         )
 
-        from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
-        from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+        from megatron.core.inference.contexts.dynamic_context import (
+            DynamicInferenceContext,
+        )
+        from megatron.core.inference.engines.dynamic_engine import (
+            DynamicInferenceEngine,
+        )
         from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
             GPTInferenceWrapper,
         )
         from megatron.core.inference.sampling_params import SamplingParams
-        from megatron.core.inference.inference_request import InferenceRequest
-        
+
         inference_max_batch_size = inference_wrapper_config.inference_max_requests
         max_batch_size = inference_max_batch_size
-        print(f'Max batch size: {max_batch_size}')
-        buffer_size_gb = 5 # 10 and max_batch_size * 3 works
+        buffer_size_gb = 10
         buffer_guaranteed_fraction = 0.1
         num_cuda_graphs = 1
         model_config = self.model.config
@@ -1812,7 +1810,7 @@ class MegatronPolicyWorker:
             materialize_only_last_token_logits=False,
             max_requests_override=None,
             num_cuda_graphs=num_cuda_graphs,
-            use_flashinfer_fused_rope=None,            
+            use_flashinfer_fused_rope=None,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             self.model, inference_wrapper_config, dynamic_context
@@ -1820,20 +1818,22 @@ class MegatronPolicyWorker:
         inference_wrapped_model.prep_model_for_inference()
 
         text_generation_controller = TextGenerationController(
-                    inference_wrapped_model=inference_wrapped_model,
-                    tokenizer=self.megatron_tokenizer,
-                )
+            inference_wrapped_model=inference_wrapped_model,
+            tokenizer=self.megatron_tokenizer,
+        )
 
-        #text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
+        text_generation_controller.inference_wrapped_model.model.config.cuda_graph_impl = "local"
         dynamic_engine = DynamicInferenceEngine(
-                            controller=text_generation_controller,
-                            random_seed=1234,
-                            context=dynamic_context,
-                            enable_cuda_graph=True,
-                            termination_id = self.megatron_tokenizer.eod
-                        )
-        
-        tokens_to_generate=self.cfg["generation"]["max_new_tokens"] - data["input_ids"].size(1)
+            controller=text_generation_controller,
+            random_seed=1234,
+            context=dynamic_context,
+            enable_cuda_graph=True,
+            termination_id=self.megatron_tokenizer.eod,
+        )
+
+        tokens_to_generate = self.cfg["generation"]["max_new_tokens"] - data[
+            "input_ids"
+        ].size(1)
 
         # Handle None values for top_k - convert to integer as required by Megatron
         top_k_cfg = self.cfg["generation"]["top_k"]
@@ -1857,55 +1857,44 @@ class MegatronPolicyWorker:
             return_prompt_top_n_logprobs=False,
         )
         sampling_params = SamplingParams(
-            temperature = 1.0,
-            top_k = 0,
-            top_p = 0.0,
-            return_segments = True,
-            return_log_probs = True,
-            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"]  - data["input_ids"].size(1),
+            temperature=1.0,
+            top_k=0,
+            top_p=0.0,
+            return_segments=True,
+            return_log_probs=True,
+            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"]
+            - data["input_ids"].size(1),
         )
 
         input_ids = data["input_ids"]
         prompt_tokens_tensor = input_ids
         prompt_lengths_tensor = data["input_lengths"]
         request_id = 0
-        request_dict = {}
         for p, prompt_len in zip(
             prompt_tokens_tensor, prompt_lengths_tensor, strict=True
         ):
-            tokenized_prompt = p[:prompt_len].cuda()
+            tokenized_prompt = p[:prompt_len]  # .cuda()
             detokenized_prompt = self.tokenizer.decode(tokenized_prompt)
-            req = InferenceRequest(
-                    prompt=detokenized_prompt,
-                    prompt_tokens=tokenized_prompt,
-                    sampling_params=sampling_params,
-                    request_id=request_id,
-                )
-            request_dict[request_id] = req
-            dynamic_engine.add_request(request_id, tokenized_prompt, num_tokens_to_generate = tokens_to_generate)
+            dynamic_engine.add_request(
+                request_id,
+                detokenized_prompt,
+                num_tokens_to_generate=tokens_to_generate,
+            )
             request_id += 1
 
-        import time
-        start_time = time.time()
+        result = []
         while dynamic_engine.has_unfinished_requests():
-            result = dynamic_engine.step_modern(sampling_params, verbose=True)
-            for finished_request in result["finished_requests"]:
-                request = request_dict[finished_request.request_id]
-                request.generated_tokens = finished_request.generated_tokens
-                if sampling_params.return_log_probs:
-                    request.generated_log_probs = finished_request.generated_log_probs
-                    request.prompt_log_probs = finished_request.prompt_log_probs
-                    request.generated_text = finished_request.generated_text
+            result_step = dynamic_engine.step_modern(sampling_params, verbose=False)
+            if result_step["finished_requests"] is not None:
+                result.extend(result_step["finished_requests"])
 
-        result = list(request_dict.values())
-        end_time = time.time()
-        print(f"Time taken: {end_time - start_time} seconds")
-        # Need to add x.prompt
+        # Sort results by request_id to maintain original batch order
+        result.sort(key=lambda x: x.request_id)
+
         out = {
-                "text": [x.prompt + x.generated_text for x in result],
-                "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
-                "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
-            }     
+            "tokens": [x.prompt_tokens.tolist() + x.generated_tokens for x in result],
+            "logprobs": [x.prompt_log_probs + x.generated_log_probs for x in result],
+        }
 
         input_lengths = data["input_lengths"]
         # pad the out "tokens" and "logprobs" and make them into tensors from lists
