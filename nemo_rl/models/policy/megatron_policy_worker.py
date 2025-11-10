@@ -1828,7 +1828,9 @@ class MegatronPolicyWorker:
         temperature = 0.0 if greedy else 1.0
 
         top_p_cfg = self.cfg["generation"]["top_p"]
-        top_p_val = float(top_p_cfg) if top_p_cfg is not None else 0.0
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
+        )
 
         sampling_params = SamplingParams(
             temperature=temperature,
