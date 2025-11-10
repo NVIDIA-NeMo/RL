@@ -65,7 +65,8 @@ tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp2.sh
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-dynamicbatch.sh
 
 # Functional 32b test
-tests/test_suites/llm/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3.sh
+# TODO(ahmadki): enable once https://github.com/NVIDIA-NeMo/Automodel/issues/652 is fixed
+# tests/test_suites/llm/sft-qwen2.5-32b-4n8g-fsdp2tp8sp-actckpt.v3.sh
 
 # Megatron
 tests/test_suites/llm/sft-llama3.1-8b-1n8g-megatron.sh
