@@ -206,8 +206,9 @@ default-groups = ["dev", "build"]
 #  --link-mode=copy (slower but more reliable; supresses warning)
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
-# This override is needed because automodel/mbridge we are on is still on 2.5.0
-override-dependencies = ["transformer-engine[pytorch]==2.8.0"]
+# The TE override is needed because automodel/mbridge we are on is still on 2.5.0
+# The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
+override-dependencies = ["transformer-engine[pytorch]==2.8.0", "opencv-python-headless>=4.11.0"]
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]

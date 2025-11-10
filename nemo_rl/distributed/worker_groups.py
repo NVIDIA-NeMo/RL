@@ -29,7 +29,6 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
-    patch_transformers_module_dir,
 )
 
 
@@ -384,8 +383,7 @@ class RayWorkerGroup:
             ):
                 if worker_count > pg.bundle_count:
                     raise ValueError(
-                        f"Placement group {i} has {pg.bundle_count} bundles, "
-                        f"but {worker_count} workers were requested"
+                        f"Placement group {i} has {pg.bundle_count} bundles, but {worker_count} workers were requested"
                     )
 
                 for bundle_idx in range(worker_count):
@@ -532,7 +530,6 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
-                patch_transformers_module_dir(runtime_env["env_vars"])
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
