@@ -472,6 +472,7 @@ def generation_setup(request, tiny_llama_model_path):
             tiny_llama_model_path,
             tp=tp,
             pp=pp,
+            precision="bfloat16",  # FlashAttention requires fp16 or bf16
             generation_backend=generation_backend,
         )
 
