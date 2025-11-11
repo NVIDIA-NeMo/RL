@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for dtensor_core.py functions."""
+"""Unit tests for dtensor_init.py functions."""
 
 import os
 from unittest.mock import MagicMock, Mock, patch
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
-from nemo_rl.models.policy.dtensor_core import (
+from nemo_rl.models.policy.dtensor_init import (
     DistributedState,
     ModelAndOptimizerState,
     ValidatedState,
@@ -71,10 +71,10 @@ def mock_autoconfig():
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_basic_validation(
         self,
         mock_sliding_window,
@@ -108,10 +108,10 @@ class TestValidateAndSetConfig:
         assert result.ep_size == 1
         assert result.sequence_parallel_enabled is False
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_vlm_detection(
         self,
         mock_sliding_window,
@@ -135,10 +135,10 @@ class TestValidateAndSetConfig:
 
         assert result.is_vlm is True
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_precision_validation_invalid(
         self,
         mock_sliding_window,
@@ -157,10 +157,10 @@ class TestValidateAndSetConfig:
                 rank=0,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_sequence_packing_with_vlm_raises_error(
         self,
         mock_sliding_window,
@@ -182,11 +182,11 @@ class TestValidateAndSetConfig:
                 rank=0,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
-    @patch("nemo_rl.models.policy.dtensor_core.NeMoAutoModelForSequenceClassification")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.NeMoAutoModelForSequenceClassification")
     def test_reward_model_bradley_terry(
         self,
         mock_rm_class,
@@ -216,10 +216,10 @@ class TestValidateAndSetConfig:
         # Verify num_labels was set to 1
         assert mock_autoconfig.num_labels == 1
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_context_parallel_with_sequence_packing_raises_error(
         self,
         mock_sliding_window,
@@ -241,10 +241,10 @@ class TestValidateAndSetConfig:
                 rank=0,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_sequence_parallel_with_large_tp_raises_error(
         self,
         mock_sliding_window,
@@ -264,10 +264,10 @@ class TestValidateAndSetConfig:
                 rank=0,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_attention_implementation_selection(
         self,
         mock_sliding_window,
@@ -299,10 +299,10 @@ class TestValidateAndSetConfig:
         result = validate_and_set_config(mock_config, None, 0)
         assert result.attn_impl is None
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_precision_types(
         self,
         mock_sliding_window,
@@ -327,10 +327,10 @@ class TestValidateAndSetConfig:
         result = validate_and_set_config(mock_config, None, 0)
         assert result.dtype == torch.float16
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     @patch("os.environ", {})
     def test_generation_colocated(
         self,
@@ -352,10 +352,10 @@ class TestValidateAndSetConfig:
         assert result.is_generation_colocated is True
         assert "NCCL_CUMEM_ENABLE" not in os.environ
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_sequence_packing_enabled_print(
         self,
         mock_sliding_window,
@@ -379,10 +379,10 @@ class TestValidateAndSetConfig:
         assert "Sequence packing is enabled" in captured.out
         assert "Using FlashAttention2" in captured.out
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_hf_config_overrides_none(
         self,
         mock_sliding_window,
@@ -401,11 +401,11 @@ class TestValidateAndSetConfig:
         result = validate_and_set_config(mock_config, None, 0)
         assert result.hf_config_overrides == {}
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
-    @patch("nemo_rl.models.policy.dtensor_core.NeMoAutoModelForSequenceClassification")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.NeMoAutoModelForSequenceClassification")
     def test_reward_model_with_num_labels_equals_one(
         self,
         mock_rm_class,
@@ -431,10 +431,10 @@ class TestValidateAndSetConfig:
         # num_labels should remain 1
         assert mock_autoconfig.num_labels == 1
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_reward_model_with_sequence_packing_error(
         self,
         mock_sliding_window,
@@ -461,10 +461,10 @@ class TestValidateAndSetConfig:
         ):
             validate_and_set_config(mock_config, None, 0)
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_reward_model_with_unknown_type(
         self,
         mock_sliding_window,
@@ -486,10 +486,10 @@ class TestValidateAndSetConfig:
         with pytest.raises(ValueError, match="Unknown reward model type"):
             validate_and_set_config(mock_config, None, 0)
 
-    @patch("nemo_rl.models.policy.dtensor_core.AutoConfig")
-    @patch("nemo_rl.models.policy.dtensor_core.resolve_model_class")
-    @patch("nemo_rl.models.policy.dtensor_core.configure_dynamo_cache")
-    @patch("nemo_rl.models.policy.dtensor_core.sliding_window_overwrite")
+    @patch("nemo_rl.models.policy.dtensor_init.AutoConfig")
+    @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
+    @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
+    @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
     def test_sequence_parallel_with_tp_size_one_warning(
         self,
         mock_sliding_window,
@@ -518,10 +518,10 @@ class TestValidateAndSetConfig:
 class TestSetupDistributed:
     """Tests for setup_distributed function."""
 
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.init_process_group")
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.get_rank")
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.get_world_size")
-    @patch("nemo_rl.models.policy.dtensor_core.FSDP2Manager")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.get_rank")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.get_world_size")
+    @patch("nemo_rl.models.policy.dtensor_init.FSDP2Manager")
     def test_basic_distributed_setup(
         self,
         mock_manager_class,
@@ -589,10 +589,10 @@ class TestSetupDistributed:
         # Verify init_process_group was called
         mock_init_pg.assert_called_once_with(backend="nccl")
 
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.init_process_group")
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.get_rank")
-    @patch("nemo_rl.models.policy.dtensor_core.torch.distributed.get_world_size")
-    @patch("nemo_rl.models.policy.dtensor_core.FSDP2Manager")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.get_rank")
+    @patch("nemo_rl.models.policy.dtensor_init.torch.distributed.get_world_size")
+    @patch("nemo_rl.models.policy.dtensor_init.FSDP2Manager")
     def test_cpu_offload_enabled(
         self,
         mock_manager_class,
@@ -648,7 +648,7 @@ class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
     @patch("torch.optim.lr_scheduler.LambdaLR")
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
     @patch("nemo_automodel.components.distributed.tensor_utils.get_cpu_state_dict")
     def test_basic_model_setup(
@@ -749,7 +749,7 @@ class TestSetupModelAndOptimizer:
         assert result.reference_model_state_dict is not None
         assert len(result.model_state_dict_keys) > 0
 
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
     def test_model_setup_without_optimizer(
         self,
@@ -830,7 +830,7 @@ class TestSetupModelAndOptimizer:
         assert result.scheduler is None
         assert result.reference_model_state_dict is None
 
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     def test_context_parallel_with_gemma3_raises_error(
         self,
         mock_init_empty,
@@ -901,7 +901,7 @@ class TestSetupModelAndOptimizer:
             )
 
     @patch("torch.optim.lr_scheduler.SequentialLR")
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
     def test_scheduler_as_list(
         self,
@@ -1007,7 +1007,7 @@ class TestSetupModelAndOptimizer:
 
         assert result.scheduler == mock_final_scheduler
 
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
     def test_context_parallel_with_tp_and_sp_error(
         self,
@@ -1074,7 +1074,7 @@ class TestSetupModelAndOptimizer:
                 worker_instance=mock_worker,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_core.init_empty_weights")
+    @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     def test_context_parallel_with_vlm_error(
         self,
         mock_init_empty,

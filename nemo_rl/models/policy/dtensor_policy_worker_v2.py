@@ -60,6 +60,11 @@ from nemo_rl.models.huggingface.common import (
     pack_sequences,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dtensor_init import (
+    setup_distributed,
+    setup_model_and_optimizer,
+    validate_and_set_config,
+)
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
@@ -74,7 +79,9 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-def _copy_dataclass_fields(target: Any, source: Any, fields: Optional[list[str]] = None) -> None:
+def _copy_dataclass_fields(
+    target: Any, source: Any, fields: Optional[list[str]] = None
+) -> None:
     """Copy fields from a dataclass to target object.
 
     Args:
@@ -105,7 +112,9 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
-@ray.remote(runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2"))  # pragma: no cover
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
 class DTensorPolicyWorkerV2:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -129,12 +138,6 @@ class DTensorPolicyWorkerV2:
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
-        from nemo_rl.models.policy.dtensor_core import (
-            setup_distributed,
-            setup_model_and_optimizer,
-            validate_and_set_config,
-        )
-
         # Store tokenizer and processor
         self.tokenizer = tokenizer
         self.processor = processor
@@ -221,18 +224,24 @@ class DTensorPolicyWorkerV2:
         if weights_path:
             self.load_checkpoint(weights_path, optimizer_path)
         else:
-            print("No weights path provided. Loaded base HF weights via Checkpointer (default policy init)")
+            print(
+                "No weights path provided. Loaded base HF weights via Checkpointer (default policy init)"
+            )
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
 
-    def init_collective(self, ip: str, port: int, world_size: int, *, train_world_size: int) -> None:
+    def init_collective(
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
+    ) -> None:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
-        pg = StatelessProcessGroup.create(host=ip, port=port, rank=self.rank, world_size=world_size)
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=self.rank, world_size=world_size
+        )
         device = torch.cuda.current_device()
         self.model_update_group = PyNcclCommunicator(pg, device=device)
 
@@ -242,7 +251,10 @@ class DTensorPolicyWorkerV2:
     def check_model_allow_flash_attn_args(self, model_config) -> bool:
         # Some models doesn't support flash_attn_kwargs
         # Check nemotron nas.
-        if model_config.architectures[0] == "DeciLMForCausalLM" and model_config.model_type == "nemotron-nas":
+        if (
+            model_config.architectures[0] == "DeciLMForCausalLM"
+            and model_config.model_type == "nemotron-nas"
+        ):
             return False
 
         return True
@@ -303,22 +315,30 @@ class DTensorPolicyWorkerV2:
             for gb_idx in range(num_global_batches):
                 global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
 
-                assert "sample_mask" in global_batch, "sample_mask must be present in the data!"
+                assert "sample_mask" in global_batch, (
+                    "sample_mask must be present in the data!"
+                )
                 ## get the normalization factor for the loss
                 local_valid_seqs = torch.sum(global_batch["sample_mask"])
 
                 if not "token_mask" in global_batch:
-                    local_valid_toks = local_valid_seqs * global_batch["input_ids"].shape[1]
+                    local_valid_toks = (
+                        local_valid_seqs * global_batch["input_ids"].shape[1]
+                    )
                 else:
                     local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:] * global_batch["sample_mask"].unsqueeze(-1)
+                        global_batch["token_mask"][:, 1:]
+                        * global_batch["sample_mask"].unsqueeze(-1)
                     )
 
                 to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
                 torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
                 global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
 
-                if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
+                if (
+                    hasattr(loss_fn, "loss_type")
+                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
+                ):
                     assert "token_mask" in global_batch, (
                         "token_mask must be present in the data when using token-level loss"
                     )
@@ -334,27 +354,41 @@ class DTensorPolicyWorkerV2:
                     mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
                 elif self.enable_seq_packing:
-                    mb_iterator = batch.make_microbatch_iterator_for_packable_sequences()
-                    iterator_len, max_seqlen = batch.get_microbatch_iterator_for_packable_sequences_len()
+                    mb_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
+                    iterator_len, max_seqlen = (
+                        batch.get_microbatch_iterator_for_packable_sequences_len()
+                    )
                     max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                    torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                    torch.distributed.all_reduce(
+                        max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                    )
 
                     # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
                     # We add dummy batches to the end of the iterator to make the batch counts equal.
                     dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                    dummy_iterator = batch.make_microbatch_iterator_for_packable_sequences()
-                    dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                    dummy_iterator = (
+                        batch.make_microbatch_iterator_for_packable_sequences()
+                    )
+                    dummy_iterator = itertools.islice(
+                        itertools.cycle(dummy_iterator), dummy_batch_ct
+                    )
                 else:
                     mb_iterator = batch.make_microbatch_iterator(mbs)
                     iterator_len = batch.size // mbs
 
-                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get("clear_cache_every_n_steps")
+                empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+                    "clear_cache_every_n_steps"
+                )
                 if empty_cache_steps:
                     warnings.warn(
                         f"Emptying cache every {empty_cache_steps} microbatches, doing so unnnecessarily would incur a large performance overhead."
                     )
 
-                for mb_idx, mb in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+                for mb_idx, mb in enumerate(
+                    itertools.chain(mb_iterator, dummy_iterator)
+                ):
                     # Conditioanlly empty cache when sensitive to fragmentation
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
@@ -389,11 +423,15 @@ class DTensorPolicyWorkerV2:
                                 dtype=torch.bool,
                                 device=input_ids.device,
                             )
-                            position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                            position_ids = torch.arange(
+                                seq_len, device=input_ids.device
+                            ).repeat(batch_size, 1)
                             flash_attn_kwargs = {}
 
                         # add vlm kwargs to model call
-                        vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+                        vlm_kwargs = mb.get_multimodal_dict(
+                            as_tensors=True, device=input_ids.device
+                        )
                         if len(vlm_kwargs) > 0:
                             position_ids = None
                             assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
@@ -405,8 +443,14 @@ class DTensorPolicyWorkerV2:
                         assert len(vlm_kwargs) == 0, (
                             f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
                         )
-                        seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
-                        cp_buffers = [input_ids, position_ids, seq_index] if self.cp_size > 1 else []
+                        seq_index = torch.arange(
+                            seq_len, device=input_ids.device
+                        ).repeat(1, 1)
+                        cp_buffers = (
+                            [input_ids, position_ids, seq_index]
+                            if self.cp_size > 1
+                            else []
+                        )
 
                         # Create context parallel context
                         context_parallel_ctx = create_context_parallel_ctx(
@@ -438,7 +482,10 @@ class DTensorPolicyWorkerV2:
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
-                            if not self.allow_flash_attn_args and "flash_attn_kwargs" in model_args:
+                            if (
+                                not self.allow_flash_attn_args
+                                and "flash_attn_kwargs" in model_args
+                            ):
                                 del model_args["flash_attn_kwargs"]
 
                             outputs = self.model(**model_args)
@@ -486,9 +533,10 @@ class DTensorPolicyWorkerV2:
 
                             if isinstance(logits, DTensor):
                                 # Must be tp sharded
-                                assert logits.device_mesh.ndim == 1 and logits.device_mesh.mesh_dim_names[0] == "tp", (
-                                    "logits must be tp sharded"
-                                )
+                                assert (
+                                    logits.device_mesh.ndim == 1
+                                    and logits.device_mesh.mesh_dim_names[0] == "tp"
+                                ), "logits must be tp sharded"
 
                                 # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
                                 logits = DTensor.from_local(
@@ -562,7 +610,8 @@ class DTensorPolicyWorkerV2:
                         device_mesh=self.device_mesh,
                         moe_mesh=self.moe_mesh,
                         ep_axis_name="ep"
-                        if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
+                        if self.moe_mesh is not None
+                        and "ep" in self.moe_mesh.mesh_dim_names
                         else None,
                         pp_axis_name=None,
                         foreach=True,
@@ -606,7 +655,9 @@ class DTensorPolicyWorkerV2:
             # Compute global loss across all ranks
             with torch.no_grad():
                 global_loss = torch.tensor(losses, device="cuda")
-                torch.distributed.all_reduce(global_loss, group=self.dp_mesh.get_group())
+                torch.distributed.all_reduce(
+                    global_loss, group=self.dp_mesh.get_group()
+                )
             # Aggregate metrics across all microbatches
             mb_metrics = defaultdict(list)
             for m in all_mb_metrics:
@@ -641,7 +692,11 @@ class DTensorPolicyWorkerV2:
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
-        logprob_batch_size = micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
@@ -664,33 +719,47 @@ class DTensorPolicyWorkerV2:
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
                 mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = data.get_microbatch_iterator_for_packable_sequences_len()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
                 max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
 
                 # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
                 # We add dummy batches to the end of the iterator to make the batch counts equal.
                 dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
                 dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
             else:
                 mb_iterator = data.make_microbatch_iterator(logprob_batch_size)
                 iterator_len = data.size // logprob_batch_size
 
             step = 0
-            for batch_idx, lp_batch in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
-                vlm_kwargs = lp_batch.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+                vlm_kwargs = lp_batch.get_multimodal_dict(
+                    as_tensors=True, device=input_ids.device
+                )
 
                 batch_size, seq_len = input_ids.shape
                 if self.enable_seq_packing:
-                    assert len(vlm_kwargs) == 0, "multimodal kwargs are not supported for sequence packing"
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for sequence packing"
+                    )
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
-                        packed_sequence_size=[batch_size],  # flash attention 2 expects flattened input
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
                         padding_value=self.tokenizer.eos_token_id,
                         return_attention_mask=False,
                     )
@@ -701,14 +770,18 @@ class DTensorPolicyWorkerV2:
                     )
                 else:
                     # Create post_attention_mask for right-padded data for masking token after forwarding.
-                    post_attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=input_ids.device)
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
                         post_attention_mask[i, :length] = 1
 
                     # explicitly create position ids for the input, otherwise the sharding
                     # for DTensor will be incorrect
-                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
                     # DTensor requires the casual attention kernel to hit,
@@ -727,8 +800,12 @@ class DTensorPolicyWorkerV2:
 
                 context_parallel_ctx = None
                 if self.cp_size > 1:
-                    assert len(vlm_kwargs) == 0, "multimodal kwargs are not supported for context parallel"
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for context parallel"
+                    )
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
@@ -752,7 +829,10 @@ class DTensorPolicyWorkerV2:
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
 
-                        if not self.allow_flash_attn_args and "flash_attn_kwargs" in model_args:
+                        if (
+                            not self.allow_flash_attn_args
+                            and "flash_attn_kwargs" in model_args
+                        ):
                             del model_args["flash_attn_kwargs"]
 
                         outputs = self.model(**model_args)
@@ -781,9 +861,10 @@ class DTensorPolicyWorkerV2:
 
                         if isinstance(logits, DTensor):
                             # Must be tp sharded
-                            assert logits.device_mesh.ndim == 1 and logits.device_mesh.mesh_dim_names[0] == "tp", (
-                                "logits must be tp sharded"
-                            )
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
 
                             # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
                             logits = DTensor.from_local(
@@ -817,7 +898,9 @@ class DTensorPolicyWorkerV2:
                         else:
                             if logprob_chunk_size is not None:
                                 logits_seq_len = int(logits.shape[1])
-                                num_chunks = (logits_seq_len + logprob_chunk_size - 1) // logprob_chunk_size
+                                num_chunks = (
+                                    logits_seq_len + logprob_chunk_size - 1
+                                ) // logprob_chunk_size
                                 chunked_log_probs = []
                                 for chunk_idx in range(num_chunks):
                                     chunk_start = chunk_idx * logprob_chunk_size
@@ -825,14 +908,20 @@ class DTensorPolicyWorkerV2:
                                         logits_seq_len,
                                         (chunk_idx + 1) * logprob_chunk_size,
                                     )
-                                    chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
-                                    log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
+                                    chunk_logits = logits[
+                                        :, chunk_start:chunk_end, :
+                                    ].to(torch.float32)
+                                    log_probs = torch.nn.functional.log_softmax(
+                                        chunk_logits, dim=-1
+                                    )
                                     chunked_log_probs.append(log_probs)
                                 log_probs = torch.cat(chunked_log_probs, dim=1)
                                 del chunked_log_probs
                             else:
                                 logits = logits.to(torch.float32)
-                                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                                log_probs = torch.nn.functional.log_softmax(
+                                    logits, dim=-1
+                                )
                             # Extract logprobs for each token in the sequence by gathering the logprob
                             # corresponding to the next token at each position
                             # Input shapes:
@@ -842,12 +931,16 @@ class DTensorPolicyWorkerV2:
                             # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
                             next_tokens = input_ids[:, 1:]
                             log_probs = log_probs[:, :-1]
-                            token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(-1)
+                            token_logprobs = log_probs.gather(
+                                dim=-1, index=next_tokens.unsqueeze(-1)
+                            ).squeeze(-1)
                             del log_probs
 
                 del outputs, logits
 
-                token_logprobs = torch.cat([torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1)
+                token_logprobs = torch.cat(
+                    [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+                )
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:
@@ -868,7 +961,9 @@ class DTensorPolicyWorkerV2:
                         start = cu_seqlens[i].item() + 1
                         end = cu_seqlens[i + 1].item()
                         seq_len_actual = input_lengths[i].item()
-                        unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
+                        unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[
+                            0, start:end
+                        ]
                     token_logprobs = unpacked_logprobs
 
                 all_log_probs.append(token_logprobs)
@@ -880,7 +975,9 @@ class DTensorPolicyWorkerV2:
         for lp in all_log_probs:
             padding_needed = seq_dim_size - lp.shape[1]
             if padding_needed > 0:
-                lp = torch.nn.functional.pad(lp, (0, padding_needed), mode="constant", value=0.0)
+                lp = torch.nn.functional.pad(
+                    lp, (0, padding_needed), mode="constant", value=0.0
+                )
             all_log_probs_padded.append(lp)
         return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
 
@@ -908,18 +1005,26 @@ class DTensorPolicyWorkerV2:
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
                 mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = data.get_microbatch_iterator_for_packable_sequences_len()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
                 max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
                 dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
                 dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
             else:
                 mb_iterator = data.make_microbatch_iterator(global_batch_size)
                 iterator_len = data.size // global_batch_size
             step = 0
             all_rm_scores = []
-            for batch_idx, generate_batch in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+            for batch_idx, generate_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
                 step += 1
                 input_ids = generate_batch.get("input_ids").cuda()
                 input_lengths = generate_batch.get("input_lengths")
@@ -928,7 +1033,9 @@ class DTensorPolicyWorkerV2:
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
-                        packed_sequence_size=[batch_size],  # flash attention 2 expects flattened input
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
                         padding_value=self.tokenizer.eos_token_id,
                         return_attention_mask=False,
                     )
@@ -939,11 +1046,15 @@ class DTensorPolicyWorkerV2:
                     )
                 else:
                     # Create attention mask for right-padded data
-                    post_attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=input_ids.device)
+                    post_attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.bool, device=input_ids.device
+                    )
                     for i, length in enumerate(input_lengths):
                         # For right-padded sequence, set 1s at the beginning of the sequence
                         post_attention_mask[i, :length] = 1
-                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
 
                     attention_mask = torch.ones(
                         (batch_size, seq_len),
@@ -952,7 +1063,9 @@ class DTensorPolicyWorkerV2:
                     )
                 context_parallel_ctx = None
                 if self.cp_size > 1:
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
@@ -1013,7 +1126,11 @@ class DTensorPolicyWorkerV2:
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
-        topk_batch_size = micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
 
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
@@ -1031,20 +1148,28 @@ class DTensorPolicyWorkerV2:
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
                 mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                iterator_len, max_seqlen = data.get_microbatch_iterator_for_packable_sequences_len()
+                iterator_len, max_seqlen = (
+                    data.get_microbatch_iterator_for_packable_sequences_len()
+                )
                 max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(
+                    max_batch_ct, op=torch.distributed.ReduceOp.MAX
+                )
 
                 # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
                 # We add dummy batches to the end of the iterator to make the batch counts equal.
                 dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
                 dummy_iterator = data.make_microbatch_iterator_for_packable_sequences()
-                dummy_iterator = itertools.islice(itertools.cycle(dummy_iterator), dummy_batch_ct)
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(dummy_iterator), dummy_batch_ct
+                )
             else:
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
 
-            for batch_idx, lp_batch in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+            for batch_idx, lp_batch in enumerate(
+                itertools.chain(mb_iterator, dummy_iterator)
+            ):
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
 
@@ -1057,7 +1182,9 @@ class DTensorPolicyWorkerV2:
                     input_ids, position_ids, _ = pack_sequences(
                         input_ids=input_ids,
                         input_lengths=input_lengths,
-                        packed_sequence_size=[batch_size],  # flash attention 2 expects flattened input
+                        packed_sequence_size=[
+                            batch_size
+                        ],  # flash attention 2 expects flattened input
                         padding_value=self.tokenizer.eos_token_id,
                         return_attention_mask=False,
                     )
@@ -1068,11 +1195,15 @@ class DTensorPolicyWorkerV2:
                     )
                 else:
                     # Build attention mask (right-padded inputs)
-                    attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.long, device=input_ids.device)
+                    attention_mask = torch.zeros(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                    )
                     for i, length in enumerate(input_lengths):
                         attention_mask[i, :length] = 1
 
-                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
 
                     flash_attn_kwargs = {}
 
@@ -1083,7 +1214,9 @@ class DTensorPolicyWorkerV2:
 
                 context_parallel_ctx = None
                 if self.cp_size > 1:
-                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
                     cp_buffers = [input_ids, position_ids, seq_index]
 
                     # Create context parallel context
@@ -1116,9 +1249,10 @@ class DTensorPolicyWorkerV2:
                     if self.cp_size > 1:
                         if isinstance(logits, DTensor):
                             # Must be tp sharded
-                            assert logits.device_mesh.ndim == 1 and logits.device_mesh.mesh_dim_names[0] == "tp", (
-                                "logits must be tp sharded"
-                            )
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
 
                             # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
                             logits = DTensor.from_local(
@@ -1153,8 +1287,12 @@ class DTensorPolicyWorkerV2:
 
                         cp_group = self.cp_mesh.get_group()
 
-                        vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
-                        idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
+                        )
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
+                        )
                         # [B, S, k]
                     else:
                         # Compute top-k over full sequence length (do not drop last position)
@@ -1230,16 +1368,24 @@ class DTensorPolicyWorkerV2:
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0)
-                idx = torch.nn.functional.pad(idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0)
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
 
         ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0) if len(all_topk_vals_padded) > 1 else all_topk_vals_padded[0]
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
         ).cpu()
         ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0) if len(all_topk_idx_padded) > 1 else all_topk_idx_padded[0]
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
         ).cpu()
         return ret
 
@@ -1253,7 +1399,9 @@ class DTensorPolicyWorkerV2:
         with torch.no_grad():
             try:
                 # Save train model state_dict
-                curr_state_dict = get_cpu_state_dict(self.model.state_dict().items(), pin_memory=True)
+                curr_state_dict = get_cpu_state_dict(
+                    self.model.state_dict().items(), pin_memory=True
+                )
 
                 # Swap reference model state_dict to self.model
                 for k, v in self.model.state_dict().items():
@@ -1330,8 +1478,12 @@ class DTensorPolicyWorkerV2:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
@@ -1340,9 +1492,13 @@ class DTensorPolicyWorkerV2:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
-            full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            full_tensor = (
+                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            )
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+                self.model, name, full_tensor
+            )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
 
@@ -1369,8 +1525,12 @@ class DTensorPolicyWorkerV2:
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
             for name, tensor in self.model.state_dict().items():
-                full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+                full_tensor = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+                    self.model, name, full_tensor
+                )
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                     # Convert to target dtype
                     yield (
@@ -1401,8 +1561,12 @@ class DTensorPolicyWorkerV2:
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format."""
             for name, tensor in self.model.state_dict().items():
-                full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(self.model, name, full_tensor)
+                full_tensor = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+                    self.model, name, full_tensor
+                )
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                     # Convert to target dtype
                     yield (
@@ -1488,7 +1652,9 @@ class DTensorPolicyWorkerV2:
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        print(
+            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():
@@ -1500,7 +1666,9 @@ class DTensorPolicyWorkerV2:
         model = self.move_buffer_to_device(model, device)
         return model.to(device)
 
-    def move_buffer_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
+    def move_buffer_to_device(
+        self, model: nn.Module, device: str | torch.device
+    ) -> nn.Module:
         # FSDP modules do not move buffers to the device automatically
         for v in model.buffers():
             v.data = v.data.to(device)
@@ -1531,7 +1699,9 @@ class DTensorPolicyWorkerV2:
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
         if checkpointing_cfg is None:
-            raise ValueError("checkpointing_cfg must be provided when saving checkpoint")
+            raise ValueError(
+                "checkpointing_cfg must be provided when saving checkpoint"
+            )
 
         # Extract only the checkpointing configuration keys that exist
         checkpoint_kwargs = {
@@ -1553,7 +1723,9 @@ class DTensorPolicyWorkerV2:
         checkpoint_root = _infer_checkpoint_root(weights_path)
 
         # Ensure a persistent Checkpointer exists and is configured
-        self._ensure_checkpointer(config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root)
+        self._ensure_checkpointer(
+            config_updates=checkpoint_kwargs, checkpoint_root=checkpoint_root
+        )
 
         self.checkpointer.save_model(
             model=self.model,
@@ -1586,7 +1758,11 @@ class DTensorPolicyWorkerV2:
         model_save_format, is_peft = detect_checkpoint_format(weights_path)
 
         weights_dir = os.path.dirname(weights_path)
-        checkpoint_root = os.path.dirname(weights_dir) if weights_dir.endswith("weights") else weights_dir
+        checkpoint_root = (
+            os.path.dirname(weights_dir)
+            if weights_dir.endswith("weights")
+            else weights_dir
+        )
 
         # Ensure a persistent Checkpointer exists and is configured
         self._ensure_checkpointer(
@@ -1597,7 +1773,11 @@ class DTensorPolicyWorkerV2:
             checkpoint_root=checkpoint_root,
         )
 
-        model_dir = weights_path if weights_path.endswith("/model") else os.path.join(weights_path, "model")
+        model_dir = (
+            weights_path
+            if weights_path.endswith("/model")
+            else os.path.join(weights_path, "model")
+        )
 
         self.checkpointer.load_model(
             model=self.model,
@@ -1612,7 +1792,9 @@ class DTensorPolicyWorkerV2:
                 scheduler=self.scheduler,
             )
 
-    def _ensure_checkpointer(self, config_updates=None, checkpoint_root: Optional[str] = None) -> None:
+    def _ensure_checkpointer(
+        self, config_updates=None, checkpoint_root: Optional[str] = None
+    ) -> None:
         """Create or update a persistent Automodel Checkpointer bound to this worker ranks.
 
         Args:
@@ -1632,14 +1814,18 @@ class DTensorPolicyWorkerV2:
             base_cfg = AutomodelCheckpointingConfig(
                 enabled=True,
                 checkpoint_dir=checkpoint_root or "",
-                model_save_format=config_updates.get("model_save_format", "safetensors"),
+                model_save_format=config_updates.get(
+                    "model_save_format", "safetensors"
+                ),
                 model_cache_dir=config_updates.get("model_cache_dir", ""),
                 model_repo_id=config_updates.get("model_repo_id", ""),
                 save_consolidated=config_updates.get("save_consolidated", False),
                 is_peft=config_updates.get("is_peft", False),
                 model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
                 is_async=config_updates.get("is_async", False),
-                dequantize_base_checkpoint=config_updates.get("dequantize_base_checkpoint", False),
+                dequantize_base_checkpoint=config_updates.get(
+                    "dequantize_base_checkpoint", False
+                ),
             )
             self.checkpoint_config = base_cfg
             self.checkpointer = Checkpointer(
