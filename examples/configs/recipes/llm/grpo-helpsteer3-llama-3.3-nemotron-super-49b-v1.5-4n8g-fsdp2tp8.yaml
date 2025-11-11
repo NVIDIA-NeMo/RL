@@ -1,57 +1,61 @@
-defaults: ../../grpo_helpsteer3.yaml
-
-# GRPO Algorithm Configuration for Llama-3.3-Nemotron-Super-49B-v1.5 with HelpSteer3
+defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 64
-  max_num_epochs: 1
   max_num_steps: 10
-
 checkpointing:
-  checkpoint_dir: "results/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-3"
-
+  checkpoint_dir: results/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+  metric_name: val_reward
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf
   max_total_sequence_length: 32768
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
-
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
   dtensor_cfg:
     activation_checkpointing: true
     context_parallel_size: 4
     cpu_offload: true
-    sequence_parallel: false
     tensor_parallel_size: 8
     custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
-
   optimizer:
     kwargs:
-      lr: 3.0e-7
-
+      lr: 3.0e-07
   scheduler:
-    - name: "torch.optim.lr_scheduler.LinearLR"
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 13
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: [13]
-
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 13
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 13
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
-
+data:
+  prompt_file: null
+  dataset_name: HelpSteer3
+env:
+  helpsteer3:
+    num_workers: 8
+    reward_model: preference_based
 logger:
+  wandb_enabled: true
+  monitor_gpus: false
   wandb:
-    project: "grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5"
-    name: "grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp${policy.dtensor_cfg.tensor_parallel_size}"
+    project: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
+    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp8
   tensorboard:
-    log_dir: "tb_logs-grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5"
+    log_dir: tb_logs-grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
   mlflow:
-    run_name: "grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5"
-
+    run_name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
 cluster:
+  gpus_per_node: 8
   num_nodes: 16
