@@ -1,118 +1,47 @@
-# Base SFT Configuration for Nemotron Super 49B
+# TODO @rayen: remove this file after refactor
+defaults: sft.yaml
 sft:
-  max_num_epochs: 1
   max_num_steps: 100
-  val_period: 10
-  val_batches: 8
   val_global_batch_size: 128
-  val_micro_batch_size: 1
-  val_at_start: true
-  seed: 42
-
 checkpointing:
-  enabled: true
-  checkpoint_dir: "results/sft_nemotron_super_49b"
-  metric_name: "val_loss"
-  higher_is_better: false
+  checkpoint_dir: results/sft_nemotron_super_49b
+  metric_name: val_loss
   keep_top_k: 100
   save_period: 500
-  checkpoint_must_save_by: null
-
 policy:
-  model_name: "/lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf"
-  tokenizer:
-    name: ${policy.model_name}
+  model_name: /lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf
   max_total_sequence_length: 4096
-  precision: "bfloat16"
   train_global_batch_size: 128
-  train_micro_batch_size: 1
-
   dtensor_cfg:
     _v2: true
     activation_checkpointing: true
     context_parallel_size: 2
-    cpu_offload: false
-    enabled: true
-    sequence_parallel: false
     tensor_parallel_size: 4
     custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
-
-  megatron_cfg:
-    enabled: false
-
   dynamic_batching:
-    enabled: false
     train_mb_tokens: 4096
     logprob_mb_tokens: 8192
-    sequence_length_round: 64
-
-  sequence_packing:
-    enabled: false
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-
-  # makes the training sequence length divisible by the tensor parallel size
-  # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size}, 2}, ${policy.max_total_sequence_length}}
+  make_sequence_length_divisible_by: ${max:${mul:${policy.dtensor_cfg.context_parallel_size},
+    2}, ${policy.max_total_sequence_length}}
   max_grad_norm: null
-
   optimizer:
-    name: "torch.optim.AdamW"
     kwargs:
-      lr: 2e-5
+      lr: 2.0e-05
       weight_decay: 0.01
-      betas: [0.9, 0.98]
-      eps: 1e-8
-      foreach: False
-      fused: False
-
+      eps: 1.0e-08
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length}
-  add_bos: true
-  add_eos: true
-  add_generation_prompt: false
-  shuffle: true
   num_workers: 20
-  dataset_name: "squad"
-  # You can use custom response datasets for training and validation. For example:
-  #   data:
-  #     dataset_name: ResponseDataset
-  #     train_data_path: <PathToTrainingDataset>  # e.g., /path/to/local/dataset.jsonl or hf_org/hf_dataset_name (HuggingFace)
-  #     val_data_path: <PathToValidationDataset>
-  #     input_key: <QuestionKey>, default is "input"
-  #     output_key: <AnswerKey>, default is "output"
-  #     train_split: <TrainSplit>, default is None  # used for HuggingFace datasets
-  #     val_split: <ValSplit>, default is None  # used for HuggingFace datasets
-  # See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets for more details.
-
-  ## unused with squad dataset
-  prompt_file: null
-  split: null
-  output_key: null
-  seed: null
-
 logger:
-  log_dir: "logs"
-  wandb_enabled: true
   tensorboard_enabled: false
-  mlflow_enabled: false
   monitor_gpus: false
-  swanlab_enabled: false
   num_val_samples_to_print: 0
   wandb:
-    project: "sft-nemotron-super-49b"
-    name: "sft-nemotron-super-49b"
+    project: sft-nemotron-super-49b
+    name: sft-nemotron-super-49b
   tensorboard:
-    log_dir: "tb_logs-sft-nemotron-super-49b"
+    log_dir: tb_logs-sft-nemotron-super-49b
   mlflow:
-    experiment_name: "sft-nemotron-super-49b"
-    run_name: "sft-nemotron-super-49b"
-  gpu_monitoring:
-    collection_interval: 10
-    flush_interval: 10
-
+    experiment_name: sft-nemotron-super-49b
+    run_name: sft-nemotron-super-49b
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
-
