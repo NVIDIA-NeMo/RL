@@ -17,6 +17,7 @@ import os
 import pprint
 from collections import defaultdict
 from typing import Any, Optional
+
 from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
@@ -42,9 +43,12 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Run GRPO training with HelpSteer3 configuration")
+    parser = argparse.ArgumentParser(
+        description="Run GRPO training with HelpSteer3 configuration"
+    )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
     )
@@ -69,7 +73,7 @@ def helpsteer3_data_processor(
     idx: int,
 ) -> DatumSpec:
     """Process a HelpSteer3 preference datum into a DatumSpec for GRPO training.
-    
+
     This function converts HelpSteer3 preference data to work with GRPO by:
     1. Using the context as the prompt
     2. Using the preferred completion as the target response
@@ -78,35 +82,41 @@ def helpsteer3_data_processor(
     # Extract context and completions from HelpSteer3 format
     context = datum_dict["context"]
     completions = datum_dict["completions"]
-    
+
     # Sort completions by rank (0 is preferred, 1 is rejected)
     completions = sorted(completions, key=lambda x: x["rank"])
     preferred_completion = completions[0]["completion"]
-    
+
     # Build the conversation from context
     message_log: LLMMessageLogType = []
-    
+
     # Add context messages
     if isinstance(context, list):
         for msg in context:
-            message_log.append({
-                "role": msg["role"],
-                "content": msg["content"],
-            })
+            message_log.append(
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+            )
     else:
         # If context is a string, treat it as a user message
-        message_log.append({
-            "role": "user",
-            "content": context,
-        })
-    
+        message_log.append(
+            {
+                "role": "user",
+                "content": context,
+            }
+        )
+
     # Add the preferred completion as the target
     for completion_msg in preferred_completion:
-        message_log.append({
-            "role": completion_msg["role"],
-            "content": completion_msg["content"],
-        })
-    
+        message_log.append(
+            {
+                "role": completion_msg["role"],
+                "content": completion_msg["content"],
+            }
+        )
+
     # Apply chat template and tokenize
     formatted_conversation = tokenizer.apply_chat_template(
         message_log,
@@ -114,35 +124,39 @@ def helpsteer3_data_processor(
         add_generation_prompt=False,
         add_special_tokens=True,
     )
-    
+
     # Tokenize the entire conversation
     full_tokens = tokenizer(
         formatted_conversation,
         return_tensors="pt",
         add_special_tokens=False,  # Already added by chat template
     )["input_ids"][0]
-    
+
     # For simplicity, assign all tokens to the first message
     # In a more sophisticated implementation, you might want to split tokens properly
     message_log[0]["token_ids"] = full_tokens
     message_log[0]["content"] = formatted_conversation
-    
+
     # Clear token_ids for other messages to avoid double counting
     for i in range(1, len(message_log)):
-        message_log[i]["token_ids"] = tokenizer("", return_tensors="pt")["input_ids"][0]  # Empty tensor
-    
+        message_log[i]["token_ids"] = tokenizer("", return_tensors="pt")["input_ids"][
+            0
+        ]  # Empty tensor
+
     length = sum(len(m["token_ids"]) for m in message_log)
-    
+
     # Create ground truth from the preferred completion for environment evaluation
     ground_truth = " ".join([msg["content"] for msg in preferred_completion])
     extra_env_info = {"ground_truth": ground_truth}
-    
+
     loss_multiplier = 1.0
     if length > max_seq_length:
         # Truncate if too long
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
-                : min(max_seq_length // len(message_log), len(chat_message["token_ids"]))
+                : min(
+                    max_seq_length // len(message_log), len(chat_message["token_ids"])
+                )
             ]
         loss_multiplier = 0.1  # Reduce loss for truncated sequences
 
@@ -182,7 +196,10 @@ def setup_data(
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (helpsteer3_task_spec, helpsteer3_data_processor))
     )
-    task_data_processors["helpsteer3"] = (helpsteer3_task_spec, helpsteer3_data_processor)
+    task_data_processors["helpsteer3"] = (
+        helpsteer3_task_spec,
+        helpsteer3_data_processor,
+    )
 
     # Setup dedicated HelpSteer3Environment
     helpsteer3_env = HelpSteer3Environment.options(  # type: ignore # it's wrapped with ray.remote
@@ -217,7 +234,7 @@ def setup_data(
     # Map tasks to environments
     task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: helpsteer3_env)
     task_to_env["helpsteer3"] = helpsteer3_env
-    
+
     return dataset, val_dataset, task_to_env, task_to_env
 
 
@@ -228,7 +245,11 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "recipes", "llm", "grpo-helpsteer3-llama-3.2-1b-1n8g-fsdp2tp1.yaml"
+            os.path.dirname(__file__),
+            "configs",
+            "recipes",
+            "llm",
+            "grpo-helpsteer3-llama-3.2-1b-1n8g-fsdp2tp1.yaml",
         )
 
     config = load_config(args.config)
