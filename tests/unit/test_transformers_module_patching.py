@@ -17,8 +17,6 @@ import os
 import tempfile
 from unittest.mock import patch
 
-import pytest
-
 from nemo_rl import patch_transformers_module_dir
 
 
@@ -70,18 +68,18 @@ class TestPatchTransformersModuleDir:
             # Should prepend modules_dir to existing PYTHONPATH
             assert result["PYTHONPATH"] == f"{modules_dir}:{existing_path}"
 
-    def test_patching_fails_when_modules_dir_not_exist(self):
-        """Test that function raises AssertionError when modules directory doesn't exist."""
+    def test_patching_returns_early_when_modules_dir_not_exist(self):
+        """Test that function returns unchanged env_vars when modules directory doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Don't create the modules directory
             env_vars = {"OTHER_VAR": "value"}
 
             with patch.dict(os.environ, {"HF_HOME": tmpdir}):
-                with pytest.raises(
-                    AssertionError,
-                    match="Transformers modules directory .* does not exist",
-                ):
-                    patch_transformers_module_dir(env_vars)
+                result = patch_transformers_module_dir(env_vars)
+
+            # Should return unchanged env_vars
+            assert result == {"OTHER_VAR": "value"}
+            assert "PYTHONPATH" not in result
 
     def test_patching_with_nested_hf_home(self):
         """Test patching works with nested HF_HOME path."""

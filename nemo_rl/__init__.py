@@ -124,9 +124,9 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
         return env_vars
 
     module_dir = os.path.join(hf_home, "modules")
-    assert os.path.isdir(module_dir), (
-        f"Transformers modules directory {module_dir} does not exist."
-    )
+    if not os.path.isdir(module_dir):
+        return env_vars
+
     if "PYTHONPATH" not in env_vars:
         env_vars["PYTHONPATH"] = module_dir
     else:
