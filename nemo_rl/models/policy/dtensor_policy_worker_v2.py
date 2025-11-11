@@ -16,6 +16,8 @@ import gc
 import itertools
 import os
 import warnings
+import socket
+import time
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
@@ -280,6 +282,7 @@ class DTensorPolicyWorkerV2:
         sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
         dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
         dp_replicate_size = self.cfg["dtensor_cfg"].get("data_parallel_replicate_size", 1)
+        self.dp_replicate_size = dp_replicate_size
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
                 "Context parallel is not supported for sequence packing. Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
@@ -336,6 +339,7 @@ class DTensorPolicyWorkerV2:
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
         self.dp_size = manager.dp_size
+        self.dp_shard_size = manager.dp_shard_size
         self.tp_size = manager.tp_size
         self.cp_size = manager.cp_size
 
@@ -453,6 +457,7 @@ class DTensorPolicyWorkerV2:
             print("=" * 80, flush=True)
 
         self._diagnose_model_sharding()
+        self._diagnose_mesh_locality()
 
     def _diagnose_model_sharding(self) -> None:
         """Diagnose and report model sharding configuration."""
@@ -519,6 +524,54 @@ class DTensorPolicyWorkerV2:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
+
+    def _diagnose_mesh_locality(self) -> None:
+        """Print device mesh shape and host locality of dp_replicate groups.
+
+        This helps verify HSDP placement (dp_shard_cp collectives should be node-local).
+        """
+        try:
+            world_size = torch.distributed.get_world_size()
+            my_info = {
+                "rank": self.rank,
+                "host": socket.gethostname(),
+                # get_coordinate returns a tuple matching mesh_dim_names order
+                "coord": tuple(self.device_mesh.get_coordinate()),
+            }
+            gathered: list[dict[str, Any]] = [None] * world_size  # type: ignore
+            torch.distributed.all_gather_object(gathered, my_info)
+
+            if self.rank == 0:
+                mesh_names = tuple(self.device_mesh.mesh_dim_names)
+                mesh_shape = tuple(self.device_mesh.shape)
+                print("=" * 80)
+                print("[MESH LOCALITY]")
+                print(f"  mesh shape: {mesh_shape}")
+                print(f"  mesh dims : {mesh_names}")
+                # summarize hosts per replicate
+                if "dp_replicate" in mesh_names:
+                    rep_axis = mesh_names.index("dp_replicate")
+                    hosts_by_rep: dict[int, set[str]] = {}
+                    ranks_by_rep: dict[int, list[int]] = {}
+                    for it in gathered:
+                        rep_idx = int(it["coord"][rep_axis])
+                        hosts_by_rep.setdefault(rep_idx, set()).add(it["host"])
+                        ranks_by_rep.setdefault(rep_idx, []).append(int(it["rank"]))
+                    for rep in sorted(hosts_by_rep):
+                        hosts = sorted(hosts_by_rep[rep])
+                        ranks = sorted(ranks_by_rep[rep])
+                        print(f"  dp_replicate={rep}: hosts={hosts}; ranks={ranks}")
+                print(
+                    f"  dp_replicate_size={self.dp_replicate_size}, "
+                    f"dp_shard_size={self.dp_shard_size}, cp_size={self.cp_size}"
+                )
+                print(
+                    f"  expected dp_shard_cp group size: {self.dp_shard_size * self.cp_size}"
+                )
+                print("=" * 80, flush=True)
+        except Exception as e:
+            if self.rank == 0:
+                print(f"[WARN] Mesh locality diagnostics failed: {e}", flush=True)
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
