@@ -39,10 +39,10 @@ class HelpSteer3EnvironmentMetadata(TypedDict):
 @ray.remote  # pragma: no cover
 class HelpSteer3VerifyWorker:
     """Worker for evaluating HelpSteer3 responses based on preference alignment."""
-    
+
     def __init__(self) -> None:
         pass
-    
+
     def verify(
         self,
         pred_responses: list[str],
@@ -50,15 +50,15 @@ class HelpSteer3VerifyWorker:
         return_extracted_answer: bool = False,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
         """Verify HelpSteer3 responses against preferred completions.
-        
+
         For HelpSteer3, we use a simple text similarity approach to evaluate
         how well the model's response aligns with the preferred completion.
-        
+
         Args:
             pred_responses: list[str]. The predicted responses from the LLM.
             ground_truths: list[str]. The preferred completion responses.
             return_extracted_answer: bool. Whether to return extracted answers.
-            
+
         Returns:
             Union[list[float], tuple[list[float], list[str | None]]].
             If return_extracted_answer is False, returns only the scores.
@@ -66,85 +66,87 @@ class HelpSteer3VerifyWorker:
         """
         results = []
         extracted_answers: list[str | None] = []
-        
+
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
                 # Simple reward based on text similarity/alignment
                 # This is a basic implementation - could be enhanced with more sophisticated metrics
                 score = self._calculate_preference_score(response, ground_truth)
                 results.append(float(score))
-                
+
                 if return_extracted_answer:
                     # For HelpSteer3, the "extracted answer" is the full response
                     extracted_answers.append(response.strip())
-                    
+
             except Exception:
                 results.append(0.0)
                 if return_extracted_answer:
                     extracted_answers.append(None)
-        
+
         if return_extracted_answer:
             return results, extracted_answers
         else:
             return results
-    
+
     def _calculate_preference_score(self, response: str, ground_truth: str) -> float:
         """Calculate a preference alignment score between response and ground truth.
-        
+
         This is a simplified scoring function. In practice, you might want to use:
         - Semantic similarity models
         - BLEU/ROUGE scores
         - Human preference models
         - Quality metrics specific to HelpSteer3
-        
+
         Args:
             response: The model's response
             ground_truth: The preferred completion
-            
+
         Returns:
             float: Score between 0.0 and 1.0
         """
         # Normalize both texts
         response_clean = response.strip().lower()
         ground_truth_clean = ground_truth.strip().lower()
-        
+
         # Simple exact match (could be enhanced)
         if response_clean == ground_truth_clean:
             return 1.0
-        
+
         # Basic similarity based on common words
         response_words = set(response_clean.split())
         ground_truth_words = set(ground_truth_clean.split())
-        
+
         if not ground_truth_words:
             return 0.0
-            
+
         # Jaccard similarity
         intersection = len(response_words & ground_truth_words)
         union = len(response_words | ground_truth_words)
-        
+
         if union == 0:
             return 0.0
-            
+
         jaccard_score = intersection / union
-        
+
         # Length penalty for responses that are too short or too long
-        len_ratio = min(len(response_clean), len(ground_truth_clean)) / max(len(response_clean), len(ground_truth_clean), 1)
-        
+        len_ratio = min(len(response_clean), len(ground_truth_clean)) / max(
+            len(response_clean), len(ground_truth_clean), 1
+        )
+
         # Combine scores
         final_score = jaccard_score * len_ratio
-        
+
         return min(1.0, max(0.0, final_score))
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata]):
     """Environment for evaluating HelpSteer3 preference alignment."""
-    
+
     def __init__(self, cfg: HelpSteer3EnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        
+
         # Create worker pool
         self.workers = [
             HelpSteer3VerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
@@ -152,12 +154,12 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
             ).remote()
             for _ in range(self.num_workers)
         ]
-    
+
     def shutdown(self) -> None:
         """Shutdown all workers."""
         for worker in self.workers:
             ray.kill(worker)
-    
+
     def step(
         self,
         message_log_batch: list[LLMMessageLogType],
@@ -165,12 +167,12 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
         return_extracted_answer: bool = False,
     ) -> EnvironmentReturn[HelpSteer3EnvironmentMetadata]:
         """Runs a step in the HelpSteer3 environment.
-        
+
         Args:
             message_log_batch: Batch of OpenAI-API-like message logs.
             metadata: Batch of HelpSteer3EnvironmentMetadata with ground truth.
             return_extracted_answer: Whether to return extracted answers.
-            
+
         Returns:
             EnvironmentReturn: Tuple containing observations, metadata, stop strings, rewards, and done flags.
         """
@@ -183,15 +185,15 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
                 if interaction["role"] == "assistant"
             ]
             assistant_response_batch.append("".join(assistant_responses))
-        
+
         ground_truths = [g["ground_truth"] for g in metadata]
-        
+
         # Chunk work across workers
         chunked_assistant_response_batch = chunk_list_to_workers(
             assistant_response_batch, self.num_workers
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
-        
+
         # Process each chunk in parallel
         futures = [
             self.workers[i].verify.remote(
@@ -201,15 +203,15 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
-        
+
         worker_results = ray.get(futures)
-        
+
         # Flatten the results and extract both scores and answers
         results = []
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
-        
+
         for worker_result in worker_results:
             if return_extracted_answer:
                 worker_scores, worker_answers = worker_result
@@ -217,7 +219,7 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
                 extracted_answers.extend(worker_answers)
             else:
                 results.extend(worker_result)
-        
+
         # Create observations based on preference alignment
         observations = [
             {
@@ -228,12 +230,12 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
             }
             for result in results
         ]
-        
+
         # Create reward and done tensors
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
         next_stop_strings = [None] * len(message_log_batch)
-        
+
         return EnvironmentReturn(
             observations=observations,
             metadata=metadata,
@@ -242,18 +244,18 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
             terminateds=done,
             answers=extracted_answers,
         )
-    
+
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         """Post-process batch and compute metrics for HelpSteer3."""
         # Calculate preference alignment metrics
         rewards = batch["rewards"]
-        
+
         metrics = {
             "preference_alignment_rate": float(torch.mean((rewards > 0.5).float())),
             "average_preference_score": float(torch.mean(rewards)),
             "high_alignment_rate": float(torch.mean((rewards > 0.8).float())),
         }
-        
+
         return batch, metrics
