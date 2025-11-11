@@ -21,8 +21,9 @@ policy:
   megatron_cfg:
     enabled: true
     converter_type: Qwen3NextForCausalLM
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 8
     optimizer:
       lr: 2.0e-05
       min_lr: 1.99999e-05
