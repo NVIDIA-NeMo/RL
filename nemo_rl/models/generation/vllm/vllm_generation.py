@@ -53,11 +53,6 @@ class VllmGeneration(GenerationInterface):
         workers_per_node: Optional[Union[int, list[int]]] = None,
     ):
         """Initialize a vLLM policy with distributed workers."""
-        import time
-
-        _t0 = time.perf_counter()
-        print("[DEBUG VllmGeneration] Starting __init__", flush=True)
-
         # Store config
         self.cfg = config
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -151,20 +146,9 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Initialize placement groups with the appropriate mode
-        _t1 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] Config validation done: {_t1 - _t0:.2f}s",
-            flush=True,
-        )
-
         cluster._init_placement_groups(
             strategy=strategy,
             use_unified_pg=needs_cross_node_parallelism,
-        )
-        _t2 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] Placement groups init: {_t2 - _t1:.2f}s",
-            flush=True,
         )
 
         # Create worker builder for VllmGenerationWorker
@@ -198,15 +182,6 @@ class VllmGeneration(GenerationInterface):
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
 
         # Check if we need parallelism-aware worker group creation
-        _t3 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] Worker builder created: {_t3 - _t2:.2f}s",
-            flush=True,
-        )
-
-        # Time the full worker initialization (actor spawn + __init__ completion)
-        _worker_init_start = time.perf_counter()
-
         if self.model_parallel_size > 1:
             # For parallelism, create node-aware worker groups
             node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
@@ -230,40 +205,12 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        _t4 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] RayWorkerGroup created (actors spawned): {_t4 - _t3:.2f}s",
-            flush=True,
-        )
-
         # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
         # This is necessary for async engine to work
-        # NOTE: This waits for worker __init__ to complete before calling post_init()
         self._post_init()
-        _t5 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] _post_init() done (workers fully initialized): {_t5 - _t4:.2f}s",
-            flush=True,
-        )
-
-        # Store the full initialization time (actor spawn + __init__ completion)
-        full_worker_init_time = _t5 - _worker_init_start
-        self.worker_group.init_timing_stats["full_init_time"] = full_worker_init_time
-        self.worker_group.init_timing_stats["actor_spawn_time"] = (
-            self.worker_group.init_timing_stats.get("total_time", 0)
-        )
-        print(
-            f"[DEBUG VllmGeneration] Full worker init time (spawn + __init__): {full_worker_init_time:.2f}s",
-            flush=True,
-        )
 
         # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
         self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
-        _t6 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] _report_dp_openai_server_base_urls() done: {_t6 - _t5:.2f}s",
-            flush=True,
-        )
 
         # Number of data parallel groups is the number of tied worker groups
         assert self.dp_size == self.worker_group.dp_size, (
@@ -275,14 +222,6 @@ class VllmGeneration(GenerationInterface):
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
-        _t7 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration] _report_device_id() done: {_t7 - _t6:.2f}s",
-            flush=True,
-        )
-        print(
-            f"[DEBUG VllmGeneration] Total __init__ time: {_t7 - _t0:.2f}s", flush=True
-        )
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -430,47 +369,16 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def _post_init(self):
-        import time
-
-        _t0 = time.perf_counter()
-        print("[DEBUG VllmGeneration._post_init] Starting", flush=True)
-
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
-        _t1 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration._post_init] Method name chosen: {method_name}, time: {_t1 - _t0:.2f}s",
-            flush=True,
-        )
-
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
         )
-        _t2 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration._post_init] Futures created: {_t2 - _t1:.2f}s",
-            flush=True,
-        )
-
         # Wait for all futures to complete
-        print(
-            f"[DEBUG VllmGeneration._post_init] About to call ray.get() on {len(futures)} futures",
-            flush=True,
-        )
         results = ray.get(futures)
-        _t3 = time.perf_counter()
-        print(
-            f"[DEBUG VllmGeneration._post_init] ray.get() completed in {_t3 - _t2:.2f}s",
-            flush=True,
-        )
-        print(
-            f"[DEBUG VllmGeneration._post_init] Total _post_init time: {_t3 - _t0:.2f}s",
-            flush=True,
-        )
-
         return results
 
     def init_collective(

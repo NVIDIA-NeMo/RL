@@ -129,11 +129,6 @@ class BaseVllmGenerationWorker:
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
         """
-        import time
-
-        _init_start = time.perf_counter()
-        print("[DEBUG VllmWorker.__init__] Starting worker __init__", flush=True)
-
         self.cfg = config
 
         self.model_name = self.cfg["model_name"]
@@ -331,26 +326,11 @@ class BaseVllmGenerationWorker:
             **vllm_kwargs,
         )
 
-        import time
-
-        _t0 = time.perf_counter()
-        print("[DEBUG VllmWorker] About to call _create_engine", flush=True)
         self._create_engine(llm_kwargs)
-        _t1 = time.perf_counter()
-        print(
-            f"[DEBUG VllmWorker] _create_engine completed in {_t1 - _t0:.2f}s",
-            flush=True,
-        )
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
-
-        _init_end = time.perf_counter()
-        print(
-            f"[DEBUG VllmWorker.__init__] Worker __init__ completed in {_init_end - _init_start:.2f}s",
-            flush=True,
-        )
 
     def llm(self):
         return self.llm
@@ -417,31 +397,12 @@ class BaseVllmGenerationWorker:
 )  # pragma: no cover
 class VllmGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
-        import time
-
         import vllm
 
-        _t0 = time.perf_counter()
-        print(
-            "[DEBUG VllmWorker._create_engine] Starting vllm.LLM() creation", flush=True
-        )
         self.llm = vllm.LLM(**llm_kwargs)
-        _t1 = time.perf_counter()
-        print(
-            f"[DEBUG VllmWorker._create_engine] vllm.LLM() completed in {_t1 - _t0:.2f}s",
-            flush=True,
-        )
 
     def post_init(self):
-        import time
-
-        _t0 = time.perf_counter()
-        print("[DEBUG VllmWorker] post_init() called", flush=True)
         self.vllm_device_ids = self.report_device_id()
-        _t1 = time.perf_counter()
-        print(
-            f"[DEBUG VllmWorker] post_init() completed in {_t1 - _t0:.2f}s", flush=True
-        )
 
     def init_collective(
         self,
