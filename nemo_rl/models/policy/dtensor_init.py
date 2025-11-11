@@ -41,6 +41,7 @@ class ValidatedState:
     is_generation_colocated: Optional[bool]
     dtype: torch.dtype
     cpu_offload: bool
+    offload_optimizer_for_logprob: bool
     max_grad_norm: float
     enable_seq_packing: bool
     attn_impl: Optional[str]
@@ -131,6 +132,7 @@ def validate_and_set_config(
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
+    offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
@@ -230,6 +232,7 @@ def validate_and_set_config(
         is_generation_colocated=is_generation_colocated,
         dtype=dtype,
         cpu_offload=cpu_offload,
+        offload_optimizer_for_logprob=offload_optimizer_for_logprob,
         max_grad_norm=max_grad_norm,
         enable_seq_packing=enable_seq_packing,
         attn_impl=attn_impl,

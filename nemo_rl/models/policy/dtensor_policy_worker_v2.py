@@ -177,6 +177,7 @@ class DTensorPolicyWorkerV2:
                 "is_generation_colocated",
                 "dtype",
                 "cpu_offload",
+                "offload_optimizer_for_logprob",
                 "max_grad_norm",
                 "enable_seq_packing",
                 "allow_flash_attn_args",
