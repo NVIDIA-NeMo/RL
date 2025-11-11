@@ -1811,13 +1811,7 @@ class MegatronPolicyWorker:
             1
         )
 
-        padding = torch.full(
-            (input_ids.shape[0], tokens_to_generate),
-            self.megatron_tokenizer.eod_id,
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        prompt_tokens_tensor = torch.cat([input_ids, padding], dim=1)
+        prompt_tokens_tensor = input_ids
         prompt_lengths_tensor = data["input_lengths"]
 
         # Handle None values for top_k - convert to integer as required by Megatron
