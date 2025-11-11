@@ -47,8 +47,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
-from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -60,10 +59,21 @@ from nemo_rl.models.huggingface.common import (
     pack_sequences,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dtensor_data import (
+    get_microbatch_iterator,
+    process_global_batch,
+    process_microbatch,
+)
 from nemo_rl.models.policy.dtensor_init import (
     setup_distributed,
     setup_model_and_optimizer,
     validate_and_set_config,
+)
+from nemo_rl.models.policy.dtensor_train import (
+    cleanup_after_training,
+    forward_backward,
+    optimizer_step,
+    setup_train_loop,
 )
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
@@ -248,17 +258,6 @@ class DTensorPolicyWorkerV2:
     def is_alive(self) -> bool:
         return True
 
-    def check_model_allow_flash_attn_args(self, model_config) -> bool:
-        # Some models doesn't support flash_attn_kwargs
-        # Check nemotron nas.
-        if (
-            model_config.architectures[0] == "DeciLMForCausalLM"
-            and model_config.model_type == "nemotron-nas"
-        ):
-            return False
-
-        return True
-
     def reset_peak_memory_stats(self) -> None:
         torch.cuda.reset_peak_memory_stats()
 
@@ -280,23 +279,11 @@ class DTensorPolicyWorkerV2:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
-        local_gbs = gbs // self.dp_size
-        total_dataset_size = torch.tensor(data.size, device="cuda")
-        torch.distributed.all_reduce(
-            total_dataset_size,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self.dp_mesh.get_group(),
-        )
-        num_global_batches = int(total_dataset_size.item()) // gbs
 
-        # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Setup training loop parameters
+        setup_params = setup_train_loop(data, gbs, self.dp_size, self.dp_mesh)
+        local_gbs = setup_params["local_gbs"]
+        num_global_batches = setup_params["num_global_batches"]
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -313,70 +300,21 @@ class DTensorPolicyWorkerV2:
             losses = []
             all_mb_metrics = []
             for gb_idx in range(num_global_batches):
-                global_batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-
-                assert "sample_mask" in global_batch, (
-                    "sample_mask must be present in the data!"
+                # Process global batch and get normalization factors
+                gb_result = process_global_batch(
+                    data, gb_idx, local_gbs, loss_fn, self.dp_mesh
                 )
-                ## get the normalization factor for the loss
-                local_valid_seqs = torch.sum(global_batch["sample_mask"])
-
-                if not "token_mask" in global_batch:
-                    local_valid_toks = (
-                        local_valid_seqs * global_batch["input_ids"].shape[1]
-                    )
-                else:
-                    local_valid_toks = torch.sum(
-                        global_batch["token_mask"][:, 1:]
-                        * global_batch["sample_mask"].unsqueeze(-1)
-                    )
-
-                to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-                torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
-                global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
-
-                if (
-                    hasattr(loss_fn, "loss_type")
-                    and loss_fn.loss_type == LossType.TOKEN_LEVEL
-                ):
-                    assert "token_mask" in global_batch, (
-                        "token_mask must be present in the data when using token-level loss"
-                    )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
 
                 self.optimizer.zero_grad()
                 mb_losses = []
-                batch = data.get_batch(batch_idx=gb_idx, batch_size=local_gbs)
-                # Calculate number of microbatches to process
-                # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
-                # so its safe to not check for the case where the last data slice is smaller than mbs
-                dummy_iterator = iter([])
-                if self.cfg["dynamic_batching"]["enabled"]:
-                    mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
-                    iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
-                elif self.enable_seq_packing:
-                    mb_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
-                    )
-                    iterator_len, max_seqlen = (
-                        batch.get_microbatch_iterator_for_packable_sequences_len()
-                    )
-                    max_batch_ct = torch.tensor([iterator_len], device="cuda")
-                    torch.distributed.all_reduce(
-                        max_batch_ct, op=torch.distributed.ReduceOp.MAX
-                    )
 
-                    # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
-                    # We add dummy batches to the end of the iterator to make the batch counts equal.
-                    dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
-                    dummy_iterator = (
-                        batch.make_microbatch_iterator_for_packable_sequences()
-                    )
-                    dummy_iterator = itertools.islice(
-                        itertools.cycle(dummy_iterator), dummy_batch_ct
-                    )
-                else:
-                    mb_iterator = batch.make_microbatch_iterator(mbs)
-                    iterator_len = batch.size // mbs
+                # Get microbatch iterator
+                mb_iterator, iterator_len, dummy_iterator = get_microbatch_iterator(
+                    batch, self.cfg, self.enable_seq_packing, mbs, self.dp_mesh
+                )
 
                 empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
                     "clear_cache_every_n_steps"
@@ -394,203 +332,46 @@ class DTensorPolicyWorkerV2:
                         torch.cuda.empty_cache()
 
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
-                        if self.enable_seq_packing:
-                            input_ids = mb.get("input_ids").cuda()
-                            input_ids, position_ids, _ = pack_sequences(
-                                input_ids=input_ids,
-                                input_lengths=mb["input_lengths"],
-                                packed_sequence_size=[
-                                    len(mb["input_lengths"])
-                                ],  # flash attention 2 expects flattened input
-                                padding_value=self.tokenizer.eos_token_id,
-                                return_attention_mask=False,
-                                min_seq_len=self.cfg["sequence_packing"][
-                                    "train_mb_tokens"
-                                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
-                            )
-                            seq_len = input_ids.shape[1]
-                            attention_mask = None
-                            flash_attn_kwargs = get_flash_attention_kwargs(
-                                input_lengths=mb["input_lengths"],
-                            )
-
-                        else:
-                            input_ids = mb.get("input_ids").cuda()
-                            batch_size, seq_len = input_ids.shape
-
-                            attention_mask = torch.ones(
-                                (batch_size, seq_len),
-                                dtype=torch.bool,
-                                device=input_ids.device,
-                            )
-                            position_ids = torch.arange(
-                                seq_len, device=input_ids.device
-                            ).repeat(batch_size, 1)
-                            flash_attn_kwargs = {}
-
-                        # add vlm kwargs to model call
-                        vlm_kwargs = mb.get_multimodal_dict(
-                            as_tensors=True, device=input_ids.device
-                        )
-                        if len(vlm_kwargs) > 0:
-                            position_ids = None
-                            assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
-                                "Sequence parallel is not supported with multimodal since there's an issue when you do not pass position_ids. See https://github.com/NVIDIA-NeMo/Automodel/issues/652"
-                            )
-
-                    context_parallel_ctx = None
-                    if self.cp_size > 1:
-                        assert len(vlm_kwargs) == 0, (
-                            f"multimodal kwargs={vlm_kwargs} are not supported for context parallel"
-                        )
-                        seq_index = torch.arange(
-                            seq_len, device=input_ids.device
-                        ).repeat(1, 1)
-                        cp_buffers = (
-                            [input_ids, position_ids, seq_index]
-                            if self.cp_size > 1
-                            else []
-                        )
-
-                        # Create context parallel context
-                        context_parallel_ctx = create_context_parallel_ctx(
-                            cp_mesh=self.cp_mesh,
-                            cp_buffers=cp_buffers,
-                            cp_seq_dims=[sequence_dim] * len(cp_buffers),
-                            cp_no_restore_buffers=set(cp_buffers),
-                        )
-
-                    with get_train_context(False, False, context_parallel_ctx)():
-                        with nullcontext():
-                            model_args = dict(
-                                input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                padding_mask=~attention_mask,
-                                position_ids=position_ids,
-                                use_cache=False,
-                                flash_attn_kwargs=flash_attn_kwargs,
-                                **vlm_kwargs,
-                            )
-
-                            if self._is_reward_model:
-                                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
-                                # Note that it should be empty anyway since sequence packing
-                                # is not supported for reward models.
-                                assert not flash_attn_kwargs
-                                del model_args["flash_attn_kwargs"]
-                            # remove flash_attn_kwargs if there are multimodal kwargs
-                            if len(vlm_kwargs) > 0:
-                                del model_args["flash_attn_kwargs"]
-
-                            if (
-                                not self.allow_flash_attn_args
-                                and "flash_attn_kwargs" in model_args
-                            ):
-                                del model_args["flash_attn_kwargs"]
-
-                            outputs = self.model(**model_args)
-
-                        # Get logprobs
-                        if isinstance(outputs, (torch.Tensor, DTensor)):
-                            # custom models (e.g., those coming from AutoModel) can output logits directly
-                            logits = outputs
-                        else:
-                            if not hasattr(outputs, "logits"):
-                                logits = self.model.lm_head(outputs.last_hidden_state)
-                            else:
-                                logits = outputs.logits
-                        del outputs
-
-                        # Apply temperature scaling
-                        logits = self._apply_temperature_scaling(logits)
-
-                        if self.cp_size > 1:
-                            seq_index_dtensor = (
-                                DTensor.from_local(
-                                    seq_index,
-                                    device_mesh=self.cp_mesh,
-                                    placements=[Shard(1)],
-                                )
-                                .full_tensor()
-                                .squeeze(0)
-                            )
-
-                            mb["seq_index"] = seq_index_dtensor
-
-                            for tensor_name in mb:
-                                current_tensor = mb[tensor_name]
-                                for buffer in cp_buffers:
-                                    if current_tensor is buffer:
-                                        assert type(current_tensor) == torch.Tensor, (
-                                            f"tensor {tensor_name} is not a tensor"
-                                        )
-                                        mb[tensor_name] = DTensor.from_local(
-                                            current_tensor,
-                                            device_mesh=self.cp_mesh,
-                                            placements=[Shard(sequence_dim)],
-                                        )
-                                        break
-
-                            if isinstance(logits, DTensor):
-                                # Must be tp sharded
-                                assert (
-                                    logits.device_mesh.ndim == 1
-                                    and logits.device_mesh.mesh_dim_names[0] == "tp"
-                                ), "logits must be tp sharded"
-
-                                # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
-                                logits = DTensor.from_local(
-                                    logits.to_local(),
-                                    device_mesh=self.device_mesh[("cp", "tp")],
-                                    placements=[Shard(sequence_dim), Shard(-1)],
-                                )
-                            else:
-                                logits = DTensor.from_local(
-                                    logits,
-                                    device_mesh=self.device_mesh[("cp", "tp")],
-                                    placements=[Shard(sequence_dim), Shard(-1)],
-                                )
-
-                        if self.enable_seq_packing:
-                            loss_fn_ = SequencePackingLossWrapper(
-                                loss_fn=loss_fn,
-                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
-                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
-                            )
-                        else:
-                            loss_fn_ = loss_fn
-
-                        loss, loss_metrics = loss_fn_(
-                            logits,
+                        # Process microbatch inputs
+                        processed_inputs = process_microbatch(
                             mb,
-                            global_valid_seqs,
-                            global_valid_toks,
+                            self.tokenizer,
+                            self.enable_seq_packing,
+                            self.cfg,
+                            self.cp_size,
                         )
-                        del logits
 
-                        # skip the update for dummy batches
-                        if mb_idx < iterator_len:
-                            ## scale by the number of global batches so we get the correct
-                            ## value when summing metrics across all microbatches
-                            for k in loss_metrics.keys():
-                                loss_metrics[k] /= num_global_batches
-                            num_valid_samples = loss_metrics["num_valid_samples"]
-                            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
-                        else:
-                            loss *= 0
+                    # Forward and backward pass
+                    loss, loss_metrics = forward_backward(
+                        self.model,
+                        mb,
+                        loss_fn,
+                        global_valid_seqs,
+                        global_valid_toks,
+                        processed_inputs,
+                        self.dtype,
+                        self.cp_size,
+                        self.cp_mesh,
+                        self.device_mesh,
+                        self.enable_seq_packing,
+                        self._is_reward_model,
+                        self.allow_flash_attn_args,
+                        eval_mode,
+                        self._apply_temperature_scaling,
+                    )
 
-                        # Backward pass
-                        if not eval_mode:
-                            ## NOTE: invalid samples should be multiplied
-                            ## by zero in the loss function to prevent them
-                            ## from affecting the gradient calculation
-
-                            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-                            # but we want to sum them so we cancel out the average here
-                            # loss *= self.dp_size * self.cp_size
-                            loss.backward()
+                    # skip the update for dummy batches
+                    if mb_idx < iterator_len:
+                        ## scale by the number of global batches so we get the correct
+                        ## value when summing metrics across all microbatches
+                        for k in loss_metrics.keys():
+                            loss_metrics[k] /= num_global_batches
+                        num_valid_samples = loss_metrics["num_valid_samples"]
+                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                    else:
+                        loss *= 0
 
                     if num_valid_samples > 0:
                         mb_losses.append(loss.item())
@@ -598,59 +379,20 @@ class DTensorPolicyWorkerV2:
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    from nemo_automodel.components.training.utils import (
-                        scale_grads_and_clip_grad_norm,
-                    )
-
-                    grad_norm = scale_grads_and_clip_grad_norm(
+                    grad_norm = optimizer_step(
+                        self.optimizer,
+                        self.model,
                         self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
+                        self.device_mesh,
+                        self.moe_mesh,
+                        self.dp_size,
+                        self.cp_size,
                     )
-                    grad_norm = grad_norm.detach().cpu().float()
-                    """with torch.no_grad():
-                        grad_norm = get_grad_norm(
-                            self.model.parameters(),
-                            dp_cp_group=self.dp_cp_mesh.get_group(),
-                            tp_group=self.tp_mesh.get_group(),
-                            dtype=torch.float32,
-                        )
-                        if self.max_grad_norm is not None:
-                            clip_grad_by_total_norm_(
-                                self.model.parameters(),
-                                max_grad_norm=self.max_grad_norm,
-                                total_norm=grad_norm,
-                            )
-                        grad_norm = torch.tensor([grad_norm])"""
-
-                    if not torch.isfinite(grad_norm):
-                        print(f"WARN: grad_norm is not finite: {grad_norm}")
-                        self.optimizer.zero_grad()
-                    else:
-                        # Update parameters
-                        self.optimizer.step()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-            # release gradient memory before rollouts
-            self.optimizer.zero_grad()
-            # increment scheduler after all batches in rollout are processed
-            if not eval_mode:
-                self.scheduler.step()
-            # dynamic batch and sequence dims causes alot of fragmentation, so clear
-            # the memory allocator before moving on
-            torch.cuda.empty_cache()
+            # Cleanup after training batches
+            cleanup_after_training(self.optimizer, self.scheduler, eval_mode)
 
             # Compute global loss across all ranks
             with torch.no_grad():
