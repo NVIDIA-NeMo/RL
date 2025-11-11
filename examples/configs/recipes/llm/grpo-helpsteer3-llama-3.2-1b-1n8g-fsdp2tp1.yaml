@@ -1,24 +1,36 @@
-defaults: ../../grpo_helpsteer3.yaml
-
-# GRPO Algorithm Configuration for Llama-3.2-1B with HelpSteer3
+defaults: ../../grpo_math_1B.yaml
 grpo:
   max_num_epochs: 3
-
+  max_num_steps: 500
 checkpointing:
-  checkpoint_dir: "results/grpo-helpsteer3-llama-3.2-1b-5"
-
+  checkpoint_dir: results/grpo-helpsteer3-llama-3.2-1b
+  metric_name: val_reward
 policy:
+  model_name: meta-llama/Llama-3.2-1B-Instruct
+  max_total_sequence_length: 2048
   generation:
-    stop_token_ids: 
-      - 128009  # <|eot_id|> for Llama-3.2
-
+    stop_token_ids:
+    - 128009
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+data:
+  prompt_file: null
+  dataset_name: HelpSteer3
+env:
+  helpsteer3:
+    num_workers: 8
+    reward_model: preference_based
 logger:
+  wandb_enabled: true
   tensorboard_enabled: true
-  monitor_gpus: true
   wandb:
-    project: "grpo-helpsteer3-llama-3.2-1b"
-    name: "grpo-helpsteer3-llama-3.2-1b-tp${policy.dtensor_cfg.tensor_parallel_size}"
+    project: grpo-helpsteer3-llama-3.2-1b
+    name: grpo-helpsteer3-llama-3.2-1b
   tensorboard:
-    log_dir: "tb_logs-grpo-helpsteer3-llama-3.2-1b"
+    log_dir: tb_logs-grpo-helpsteer3-llama-3.2-1b
   mlflow:
-    run_name: "grpo-helpsteer3-llama-3.2-1b"
+    run_name: grpo-helpsteer3-llama-3.2-1b
+cluster:
+  gpus_per_node: 8
