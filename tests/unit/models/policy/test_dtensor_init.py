@@ -37,6 +37,7 @@ def mock_config():
         "model_name": "gpt2",
         "precision": "bfloat16",
         "max_grad_norm": 1.0,
+        "offload_optimizer_for_logprob": False,
         "sequence_packing": {"enabled": False},
         "dtensor_cfg": {
             "cpu_offload": False,
@@ -100,6 +101,7 @@ class TestValidateAndSetConfig:
         assert result.is_vlm is False
         assert result.dtype == torch.bfloat16
         assert result.cpu_offload is False
+        assert result.offload_optimizer_for_logprob is False
         assert result.max_grad_norm == 1.0
         assert result.enable_seq_packing is False
         assert result.is_reward_model is False
@@ -556,6 +558,7 @@ class TestSetupDistributed:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -622,6 +625,7 @@ class TestSetupDistributed:
             is_generation_colocated=None,
             dtype=torch.float32,
             cpu_offload=True,  # Enable CPU offload
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -695,6 +699,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -780,6 +785,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -859,6 +865,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -950,6 +957,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -1032,6 +1040,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -1097,6 +1106,7 @@ class TestSetupModelAndOptimizer:
             is_generation_colocated=None,
             dtype=torch.bfloat16,
             cpu_offload=False,
+            offload_optimizer_for_logprob=False,
             max_grad_norm=1.0,
             enable_seq_packing=False,
             attn_impl=None,
@@ -1149,6 +1159,7 @@ class TestDataclasses:
             is_generation_colocated=False,
             dtype=torch.float32,
             cpu_offload=True,
+            offload_optimizer_for_logprob=True,
             max_grad_norm=1.5,
             enable_seq_packing=False,
             attn_impl="flash_attention_2",
@@ -1166,6 +1177,7 @@ class TestDataclasses:
 
         assert state.is_vlm is True
         assert state.dtype == torch.float32
+        assert state.offload_optimizer_for_logprob is True
         assert state.tp_size == 2
         assert state.dp_size == 4
 

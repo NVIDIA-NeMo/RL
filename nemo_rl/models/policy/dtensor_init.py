@@ -20,7 +20,6 @@ from typing import Any, Optional
 
 import torch
 from accelerate import init_empty_weights
-from nemo_automodel import NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.utils import sliding_window_overwrite
 from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
@@ -182,6 +181,8 @@ def validate_and_set_config(
     )
 
     if is_reward_model:
+        from nemo_automodel import NeMoAutoModelForSequenceClassification
+
         # Validate reward model configuration
         if enable_seq_packing:
             raise NotImplementedError(
