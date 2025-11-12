@@ -24,9 +24,14 @@ from torch import nn
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.dtensor_train import (
+    _handle_context_parallel_sharding,
+    _process_logits,
     cleanup_after_training,
     forward_backward,
+    model_forward,
     optimizer_step,
+    process_output_for_train,
+    process_outputs_for_logprobs,
     setup_train_loop,
 )
 
@@ -941,6 +946,456 @@ class TestCleanupAfterTraining:
 
         # Verify torch.cuda.empty_cache was called
         mock_empty_cache.assert_called_once()
+
+
+class TestProcessLogits:
+    """Tests for _process_logits helper function."""
+
+    def test_process_logits_from_tensor(self):
+        """Test processing logits when model returns tensor directly."""
+        # Create mock model output as tensor
+        outputs = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+        model = MagicMock(spec=nn.Module)
+        apply_temperature_fn = lambda x: x
+
+        logits = _process_logits(outputs, model, apply_temperature_fn)
+
+        assert logits is outputs
+        assert logits.shape == (4, 64, 1000)
+
+    def test_process_logits_from_output_with_logits_attr(self):
+        """Test processing logits from model output with logits attribute."""
+        # Create mock output with logits attribute
+        outputs = MagicMock()
+        outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+
+        model = MagicMock(spec=nn.Module)
+        apply_temperature_fn = lambda x: x
+
+        logits = _process_logits(outputs, model, apply_temperature_fn)
+
+        assert logits is outputs.logits
+        assert logits.shape == (4, 64, 1000)
+
+    def test_process_logits_from_last_hidden_state(self):
+        """Test processing logits from last_hidden_state via lm_head."""
+
+        # Create a simple namespace object without logits attribute
+        class ModelOutput:
+            def __init__(self):
+                self.last_hidden_state = torch.randn(4, 64, 768, device="cuda")
+
+        outputs = ModelOutput()
+
+        # Create mock model with lm_head
+        model = MagicMock()
+        lm_head_output = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+        model.lm_head = MagicMock(return_value=lm_head_output)
+
+        apply_temperature_fn = lambda x: x
+
+        logits = _process_logits(outputs, model, apply_temperature_fn)
+
+        # Verify lm_head was called with last_hidden_state
+        model.lm_head.assert_called_once_with(outputs.last_hidden_state)
+        assert logits is lm_head_output
+
+    def test_process_logits_with_temperature_scaling(self):
+        """Test that temperature scaling is applied correctly."""
+        outputs = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+        model = MagicMock(spec=nn.Module)
+
+        temperature = 2.0
+        apply_temperature_fn = lambda x: x / temperature
+
+        logits = _process_logits(outputs, model, apply_temperature_fn)
+
+        # Verify temperature was applied
+        expected_logits = outputs / temperature
+        assert torch.allclose(logits, expected_logits)
+
+
+class TestHandleContextParallelSharding:
+    """Tests for _handle_context_parallel_sharding helper function."""
+
+    @pytest.mark.skip(
+        reason="Context parallel sharding requires real DTensor environment"
+    )
+    def test_sharding_logits_only(self):
+        """Test sharding only logits without microbatch tensors.
+
+        This is the use case for logprob extraction.
+        """
+        # This test would require a real DTensor/distributed environment
+        pass
+
+    @pytest.mark.skip(
+        reason="Context parallel sharding requires real DTensor environment"
+    )
+    def test_sharding_with_microbatch(self):
+        """Test sharding both logits and microbatch tensors.
+
+        This is the use case for training.
+        """
+        # This test would require a real DTensor/distributed environment
+        pass
+
+    @pytest.mark.skip(
+        reason="Context parallel sharding requires real DTensor environment"
+    )
+    def test_sharding_with_tp_and_cp(self):
+        """Test sharding with both tensor parallel and context parallel."""
+        # This test would require a real DTensor/distributed environment
+        pass
+
+    def test_optional_parameters_signature(self):
+        """Test that mb and cp_buffers are truly optional in the signature."""
+        # Verify the function signature allows optional parameters
+        import inspect
+
+        sig = inspect.signature(_handle_context_parallel_sharding)
+        params = sig.parameters
+
+        # Check that mb and cp_buffers have default values
+        assert params["mb"].default is None
+        assert params["cp_buffers"].default is None
+
+
+class TestModelForward:
+    """Tests for model_forward function."""
+
+    def test_basic_model_forward(self, mock_model):
+        """Test basic model forward pass."""
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify flash_attn_kwargs was passed
+        call_kwargs = mock_model.call_args[1]
+        assert "flash_attn_kwargs" in call_kwargs
+
+    def test_model_forward_with_reward_model(self, mock_model):
+        """Test model forward without flash_attn_kwargs for reward model."""
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=True,
+            allow_flash_attn_args=False,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify flash_attn_kwargs was NOT passed
+        call_kwargs = mock_model.call_args[1]
+        assert "flash_attn_kwargs" not in call_kwargs
+
+    def test_model_forward_with_multimodal(self, mock_model):
+        """Test model forward with multimodal inputs."""
+        vlm_kwargs = {
+            "pixel_values": torch.randn(4, 3, 224, 224).cuda(),
+        }
+
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": None,  # None for multimodal
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": vlm_kwargs,
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify VLM kwargs were passed and flash_attn_kwargs was removed
+        call_kwargs = mock_model.call_args[1]
+        assert "pixel_values" in call_kwargs
+        assert "flash_attn_kwargs" not in call_kwargs
+
+    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
+    @patch("nemo_rl.models.policy.dtensor_train.create_context_parallel_ctx")
+    def test_model_forward_with_context_parallel(
+        self, mock_create_cp_ctx, mock_model, mock_cp_mesh
+    ):
+        """Test model forward with context parallel enabled."""
+        # This would require real distributed setup
+        pass
+
+
+class TestProcessOutputForTrain:
+    """Tests for process_output_for_train function."""
+
+    def test_basic_train_output_processing(self, mock_model, mock_loss_fn):
+        """Test basic train output processing."""
+        # Create mock outputs
+        outputs = MagicMock()
+        outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        global_valid_seqs = torch.tensor(8.0).cuda()
+        global_valid_toks = torch.tensor(512.0).cuda()
+        apply_temperature_fn = lambda x: x
+
+        loss, loss_metrics = process_output_for_train(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            loss_fn=mock_loss_fn,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            enable_seq_packing=False,
+            eval_mode=True,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Verify loss function was called
+        mock_loss_fn.assert_called_once()
+        assert loss is not None
+        assert isinstance(loss_metrics, dict)
+
+    @patch("nemo_rl.models.policy.dtensor_train.SequencePackingLossWrapper")
+    def test_train_output_with_sequence_packing(
+        self, mock_seq_packing_wrapper, mock_model, mock_loss_fn
+    ):
+        """Test train output processing with sequence packing."""
+        # Create mock outputs
+        outputs = MagicMock()
+        outputs.logits = torch.randn(1, 204, 1000, device="cuda", requires_grad=True)
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (1, 204)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        flash_attn_kwargs = MagicMock()
+        flash_attn_kwargs.cu_seqlens_q = torch.tensor([0, 32, 80, 140, 204]).cuda()
+
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": None,
+            "position_ids": torch.arange(204).unsqueeze(0).cuda(),
+            "flash_attn_kwargs": flash_attn_kwargs,
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 204,
+        }
+
+        global_valid_seqs = torch.tensor(8.0).cuda()
+        global_valid_toks = torch.tensor(512.0).cuda()
+        apply_temperature_fn = lambda x: x
+
+        # Mock the wrapped loss function
+        wrapped_loss_fn = MagicMock()
+        wrapped_loss_fn.return_value = (
+            torch.tensor(0.5, device="cuda", requires_grad=True),
+            {"loss": 0.5},
+        )
+        mock_seq_packing_wrapper.return_value = wrapped_loss_fn
+
+        loss, loss_metrics = process_output_for_train(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            loss_fn=mock_loss_fn,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            enable_seq_packing=True,
+            eval_mode=True,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Verify sequence packing wrapper was created
+        mock_seq_packing_wrapper.assert_called_once()
+        wrapped_loss_fn.assert_called_once()
+
+    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
+    def test_train_output_with_context_parallel(self):
+        """Test train output processing with context parallel."""
+        # This would require real DTensor/distributed environment
+        pass
+
+
+class TestProcessOutputsForLogprobs:
+    """Tests for process_outputs_for_logprobs function."""
+
+    def test_basic_logprob_extraction(self, mock_model):
+        """Test basic logprob extraction without CP."""
+        # Create mock outputs
+        outputs = MagicMock()
+        outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        input_ids = torch.randint(0, 1000, (4, 64)).cuda()
+
+        processed_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        token_logprobs = process_outputs_for_logprobs(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            input_ids=input_ids,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+            logprob_chunk_size=None,
+        )
+
+        # Verify shape: [batch_size, seq_len]
+        assert token_logprobs.shape == (4, 64)
+
+        # Verify first token has zero logprob (prepended)
+        assert torch.all(token_logprobs[:, 0] == 0.0)
+
+    def test_logprob_extraction_with_chunking(self, mock_model):
+        """Test logprob extraction with chunking for memory efficiency."""
+        # Create mock outputs
+        outputs = MagicMock()
+        outputs.logits = torch.randn(4, 128, 1000, device="cuda", requires_grad=True)
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 128)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        input_ids = torch.randint(0, 1000, (4, 128)).cuda()
+
+        processed_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(4, 128, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(128).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 128,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        # Use chunking with chunk_size=64
+        token_logprobs = process_outputs_for_logprobs(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            input_ids=input_ids,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+            logprob_chunk_size=64,
+        )
+
+        # Verify shape
+        assert token_logprobs.shape == (4, 128)
+
+        # Verify first token has zero logprob
+        assert torch.all(token_logprobs[:, 0] == 0.0)
+
+    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
+    def test_logprob_extraction_with_context_parallel(self):
+        """Test logprob extraction with context parallel."""
+        # This would require real DTensor/distributed environment
+        pass
 
 
 class TestIntegrationScenarios:
