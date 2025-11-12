@@ -255,6 +255,76 @@ def _parallelize_qwen(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_diffusion_qwen(
+    model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a Qwen2ForCausalLM model across data and tensor parallel dimensions."""
+
+    class Qwen3QKNorm(SequenceParallel):
+        @staticmethod
+        def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
+            input_tensor = inputs[0]
+
+            if isinstance(input_tensor, DTensor):
+                assert input_tensor.placements == (Shard(dim=2),)
+                return input_tensor
+            elif isinstance(input_tensor, torch.Tensor):
+                # assume the input passed in already sharded on the sequence dim and create the DTensor
+                return DTensor.from_local(
+                    input_tensor, device_mesh, sequence_sharding, run_check=False
+                )
+            else:
+                raise ValueError(
+                    f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
+                )
+
+    if sequence_parallel:
+        base_model_tp_plan = {
+            "diffusion_head": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1),
+                use_local_output=False,
+            ),
+            "encoder.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "encoder.rotary_emb": RotaryEmbedParallel(),
+            "encoder.norm": SequenceParallel(),
+            "encoder.layers.*.input_layernorm": SequenceParallel(),
+            "encoder.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
+            "encoder.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
+            "encoder.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+            "encoder.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+            "encoder.layers.*.self_attn.q_norm": Qwen3QKNorm(),
+            "encoder.layers.*.self_attn.k_norm": Qwen3QKNorm(),
+            "encoder.layers.*.post_attention_layernorm": SequenceParallel(),
+            "encoder.layers.*.mlp.up_proj": ColwiseParallel(),
+            "encoder.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "encoder.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        }
+
+    else:
+        base_model_tp_plan = {
+            "diffusion_head": ColwiseParallel(
+                output_layouts=Shard(-1), use_local_output=False
+            ),
+            "encoder.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+            ),
+            "encoder.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "encoder.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "encoder.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "encoder.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "encoder.layers.*.mlp.up_proj": ColwiseParallel(),
+            "encoder.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "encoder.layers.*.mlp.down_proj": RowwiseParallel(),
+        }
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 PARALLIZE_FUNCTIONS: dict[
     type[torch.nn.Module], Callable[..., dict[str, ParallelStyle]]
 ] = {
@@ -409,7 +479,7 @@ def _parallelize_model(
         layers: torch.nn.ModuleList = model.model.transformer.blocks
         num_attention_heads = model.model.config.n_heads
         num_key_value_heads = model.model.config.n_kv_heads
-    elif "Nemotron-Diffusion-Research-4B-v0" in str(model_cls):
+    elif "Nemotron-Diffusion-Research" in str(model_cls):
         layers: torch.nn.ModuleList = model.encoder.layers  
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
@@ -444,7 +514,10 @@ def _parallelize_model(
                         "3. A path to a function that returns a dictionary"
                     )
             print("Using custom parallel plan.")
-
+        # special logic for nvidia diffusion models
+        elif "Nemotron-Diffusion-Research" in str(model_cls):
+            model_parallel_plan= _parallelize_diffusion_qwen(model, sequence_parallel)
+            print("Using optimized Nvidia DiffusionQwen parallel plan.")
         # second use our optimized parallel plan
         elif model_cls in PARALLIZE_FUNCTIONS:
             # try to use our optimized parallel plan

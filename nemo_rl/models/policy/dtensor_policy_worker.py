@@ -244,7 +244,7 @@ class DTensorPolicyWorker:
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # Check if the model requires AutoModel instead of AutoModelForCausalLM
-            if "nvidia/Nemotron-Diffusion-Research-4B-v0" in model_name:
+            if model_name in ["nvidia/Nemotron-Diffusion-Research-4B-v0", "nvidia/Nemotron-Diffusion-Research-8B-v0"]:
                 print(f"[Rank {self.rank}] Model {model_name} is not a causal LM, using AutoModel instead.")
                 from transformers import AutoModel
                 model_class = AutoModel

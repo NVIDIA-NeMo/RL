@@ -76,13 +76,13 @@ policy:
     - name: "torch.optim.lr_scheduler.ConstantLR"
       kwargs:
         factor: 1.0
-        total_iters: 2460
+        total_iters: 9967
     - name: "torch.optim.lr_scheduler.LinearLR"
       kwargs:
         start_factor: 1.0
         end_factor: 0.1
-        total_iters: 280
-    - milestones: [50,2510]
+        total_iters: 1113
+    - milestones: [50,10017]
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
