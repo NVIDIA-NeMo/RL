@@ -2,6 +2,8 @@
 
 High-performance LLaDA generation algorithms using dInfer (10x+ faster than Fast-dLLM).
 
+> **Note**: These algorithms have been updated for dInfer v0.1. See [MIGRATION_NOTES.md](./MIGRATION_NOTES.md) for details on API changes.
+
 ## Structure
 
 ```

@@ -40,10 +40,14 @@ class CreditGeneration(DInferGeneration):
         if not DINFER_AVAILABLE:
             raise RuntimeError("dInfer is not available")
         
-        # Create credit threshold decoder
+        # Create credit threshold decoder (updated API - inherits from ThresholdParallelDecoder)
         decoder = CreditThresholdParallelDecoder(
+            credit_alpha=0.7,
+            boost_gamma=0.2,
+            decay_beta=0.8,
             temperature=1.0,
             threshold=0.9,
+            remasking='low_confidence',
             mask_id=MASK_ID,
             eos_id=EOS_ID
         )

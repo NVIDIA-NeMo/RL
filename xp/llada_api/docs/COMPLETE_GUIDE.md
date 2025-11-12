@@ -102,7 +102,7 @@ print(response.choices[0].message.content)
 
 ```
 Client → Load Balancer (port 8000)
-           ↓
+           ↓ Centralized Batching
     ┌──────┼──────┐
     ↓      ↓      ↓
 Worker 0  Worker 1  Worker 2
@@ -115,6 +115,23 @@ port 8001 port 8002 port 8003
 - ✅ Linear scaling
 - ✅ Better fault tolerance
 - ✅ Simple debugging
+
+### Centralized Batching
+
+The load balancer implements **centralized batching** for optimal GPU utilization:
+
+**How it works**:
+1. **Request Accumulation**: Load balancer collects incoming requests
+2. **Batch Formation**: Forms batches (default: 8 requests, 20ms timeout)
+3. **Parallel Dispatch**: Sends entire batch to least-loaded worker
+4. **Round-Robin Distribution**: Batches distributed across all workers
+5. **True Parallelization**: Multiple workers process different batches simultaneously
+
+**Benefits**:
+- ✅ **Better GPU utilization**: Workers receive full batches instead of single requests
+- ✅ **Parallel processing**: All workers active simultaneously
+- ✅ **Load balancing**: Batches distributed evenly across workers
+- ✅ **Lower latency**: No artificial wait times, immediate dispatch when batch ready
 
 ### Quick Start
 
@@ -134,10 +151,26 @@ export HF_TOKEN=your_token_here
 # Check load balancer stats
 curl http://localhost:8000/stats
 
+# Check worker health and activity
+curl http://localhost:8000/worker-status
+
+# Use dedicated monitoring tool
+python xp/llada_api/check_worker_status.py
+
+# Monitor continuously
+python xp/llada_api/check_worker_status.py --monitor
+
 # View logs
 tail -f /tmp/llada_load_balancer.log
 tail -f /tmp/llada_worker_0.log
 ```
+
+**Key metrics to monitor**:
+- `healthy_workers`: Number of active workers
+- `avg_batch_size`: Batching efficiency (should be close to max batch size)
+- `batch_size_histogram`: Distribution of batch sizes
+- `system_status`: Overall system health ("normal" vs "overloaded")
+- `worker_status`: Individual worker states ("busy", "idle", "unhealthy")
 
 ### Performance
 
@@ -166,17 +199,23 @@ tail -f /tmp/llada_worker_0.log
   - More steps = higher quality, slower
   - Recommended: 64-256
 - `block_length`: Semi-autoregressive block size (default: 32)
+  - Recommended: 32-64 for optimal performance with dInfer v0.1
+  - Larger values (64) may improve throughput but increase memory usage
 - `remasking`: Token selection ("low_confidence" | "random")
 - `threshold`: Confidence threshold (0.0-1.0, optional)
 - `factor`: Parallel decoding factor (1.0-4.0, optional)
 
 **Fast-dLLM/dInfer Parameters** (LLaDA only):
 - Engine selection (auto-detected):
-  - `dinfer`: 10x+ faster (default for LLaDA)
+  - `dinfer`: 10x+ faster (default for LLaDA, updated to v0.1)
   - `fast-dllm`: Alternative acceleration
 - Algorithm selection via `generation_algorithm`:
-  - `dinfer_blockwise`, `dinfer_hierarchy`, `dinfer_credit`
-  - `basic`, `prefix_cache`, `dual_cache`
+  - dInfer algorithms (recommended):
+    - `dinfer_blockwise` - Threshold-based parallel decoding (recommended)
+    - `dinfer_hierarchy` - Hierarchical parallel decoding
+    - `dinfer_credit` - Credit-based parallel decoding with EMA fusion
+  - Fast-dLLM algorithms:
+    - `basic`, `prefix_cache`, `dual_cache`
 
 ### Other Endpoints
 
@@ -184,6 +223,7 @@ tail -f /tmp/llada_worker_0.log
 - `GET /v1/models` - List models
 - `GET /batch/stats` - Batch statistics (batch server)
 - `GET /stats` - Load balancer stats (multi-GPU)
+- `GET /worker-status` - Worker health and activity status (multi-GPU)
 - `GET /generation/algorithms` - Available algorithms
 
 ---
@@ -241,7 +281,10 @@ The batch server automatically batches requests:
 ### Engine Selection
 
 ```bash
-# LLaDA: Use dInfer (10x+ faster than Fast-dLLM)
+# LLaDA: Use dInfer v0.1 (10x+ faster than Fast-dLLM)
+--engine dinfer --algorithm dinfer_blockwise
+
+# Or with hierarchical decoding for enhanced parallel strategy
 --engine dinfer --algorithm dinfer_hierarchy
 
 # Or Fast-dLLM
@@ -250,6 +293,12 @@ The batch server automatically batches requests:
 # Nemotron: Auto-selects nemotron engine
 --model-path nvidia/Nemotron-Diffusion-Research-4B-v0
 ```
+
+**dInfer v0.1 Updates**:
+- New credit-based decoding algorithm (`dinfer_credit`)
+- Improved hierarchical decoding with segment-based strategies
+- Enhanced KV-cache management with vicinity refresh
+- Recommended `block_length` values: 32-64 for optimal performance
 
 ---
 
@@ -294,9 +343,35 @@ export HF_TOKEN=your_token_here
 
 # Or use smaller model
 --model-path GSAI-ML/LLaDA-4B-Instruct  # If available
+
+# For dInfer: Use recommended block_length (32-64)
+# Very small block_length values (e.g., 8) can increase memory usage
+# due to more diffusion iterations per generation
 ```
 
-#### 4. Import Errors
+**Note**: With dInfer v0.1, using `block_length` between 32-64 provides optimal memory/performance trade-off. Values too small (<16) or too large (>128) may cause OOM or performance issues.
+
+#### 4. "No Healthy Workers Available" (Multi-GPU)
+
+**Problem**: `503: No healthy workers available` error during high load
+
+**Cause**: Workers marked unhealthy when they're just busy processing batches
+
+**Solution**: System now automatically handles busy workers (v2.0+):
+- Health checks are more lenient for recently active workers
+- Workers stay healthy even during long batch processing
+- Automatic recovery when all workers appear unavailable
+
+**Manual check**:
+```bash
+# Check worker status
+python xp/llada_api/check_worker_status.py
+
+# Look for "busy" workers (this is good - means system is working)
+curl http://localhost:8000/worker-status
+```
+
+#### 5. Import Errors
 
 **Problem**: `ModuleNotFoundError: No module named 'nemo_rl'`
 
@@ -309,7 +384,7 @@ export HF_TOKEN=your_token_here
 uv sync --locked --no-install-project
 ```
 
-#### 5. Connection Issues
+#### 6. Connection Issues
 
 **Local**: Check server is running
 ```bash
@@ -325,7 +400,9 @@ ssh -N -L 8000:compute-node:8000 user@login-node
 
 **Slow generation**:
 - Reduce `steps` (64 instead of 256)
-- Use dInfer engine for LLaDA
+- Use dInfer v0.1 engine for LLaDA (10x+ faster than Fast-dLLM)
+  - Recommended: `--engine dinfer --algorithm dinfer_blockwise`
+- Use optimal `block_length` (32-64)
 - Enable batch processing
 - Use multi-GPU for throughput
 
@@ -346,8 +423,16 @@ curl http://localhost:8000/health
 # Check load balancer stats (multi-GPU)
 curl http://localhost:8000/stats | jq
 
+# Check worker status and activity (multi-GPU)
+curl http://localhost:8000/worker-status | jq
+python xp/llada_api/check_worker_status.py
+
+# Monitor worker health continuously
+python xp/llada_api/check_worker_status.py --monitor
+
 # View logs
 tail -f /tmp/llada_worker_0.log
+tail -f /tmp/llada_load_balancer.log
 
 # Check GPU usage
 nvidia-smi
@@ -433,11 +518,18 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 Client → FastAPI Server → Model → Response
 ```
 
-**Multi-GPU Flow**:
+**Multi-GPU Flow (Centralized Batching)**:
 ```
-Client → Load Balancer → Worker (Round-robin)
-                       → Worker
-                       → Worker
+Client → Load Balancer (Batch Formation) → Worker 0 (Full Batch)
+       → Load Balancer (Batch Formation) → Worker 1 (Full Batch)  
+       → Load Balancer (Batch Formation) → Worker 2 (Full Batch)
+```
+
+**Traditional Round-Robin** (legacy):
+```
+Client → Load Balancer → Worker (Single Request)
+                       → Worker (Single Request)
+                       → Worker (Single Request)
 ```
 
 **Batch Processing**:
@@ -499,7 +591,9 @@ tail -f /tmp/llada_worker_0.log
 - ✅ OpenAI-compatible API
 - ✅ Multi-GPU load balancing
 - ✅ Automatic batch processing
-- ✅ Fast-dLLM/dInfer acceleration (LLaDA)
+- ✅ Fast-dLLM/dInfer v0.1 acceleration (LLaDA)
+  - 10x+ speedup with dInfer
+  - Multiple decoding strategies (threshold, hierarchical, credit-based)
 - ✅ DCP checkpoint support
 - ✅ HuggingFace model support
 - ✅ Streaming responses
@@ -509,7 +603,9 @@ tail -f /tmp/llada_worker_0.log
 
 1. **Always set HF_TOKEN** for multi-GPU setups
 2. **Start with HuggingFace models** for testing
-3. **Use dInfer engine** for LLaDA (10x+ faster)
+3. **Use dInfer v0.1 engine** for LLaDA (10x+ faster than Fast-dLLM)
+   - Recommended algorithm: `dinfer_blockwise` for general use
+   - Use `block_length` 32-64 for optimal performance
 4. **Enable batch processing** for throughput
 5. **Use multi-GPU** for large-scale evaluations
 6. **Monitor logs** during development
