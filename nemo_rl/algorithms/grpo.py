@@ -1124,11 +1124,12 @@ def grpo_train(
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    if not master_config["policy"].get("fuse_lp_and_train", False):
+                        fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                        train_data["prev_logprobs"] = fprop_logprobs
                     reference_logprobs = policy.get_reference_policy_logprobs(
                         train_data
                     )["reference_logprobs"]
-                    train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
 
                 print("▶ Preparing for training...", flush=True)
