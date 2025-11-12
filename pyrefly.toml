@@ -23,7 +23,7 @@ project-includes = [
     #"examples/**/*.py",
     #"docs/*.py",
     #"tools/**/*.py",
-    
+
     # Generate the list of errors per file
     # uv run --group dev pyrefly check $(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py') --output-format json | jq -r --slurpfile all_files <(git ls-files 'nemo_rl/**/*.py' 'examples/**/*.py' 'docs/*.py' 'tools/**/*.py' | jq -R -s 'split("\n")[:-1]') --arg pwd "$(pwd)/" '(.errors | group_by(.path) | map({(.[0].path | sub($pwd; "")): length}) | add // {}) as $error_counts | $all_files[0][] | . as $file | "\($error_counts[$file] // 0)\t\($file)"' | sort -n
 
@@ -107,7 +107,6 @@ project-includes = [
     "nemo_rl/utils/checkpoint.py",
     "nemo_rl/utils/config.py",
     "nemo_rl/utils/native_checkpoint.py",
-    "nemo_rl/utils/automodel_checkpoint.py",
     "nemo_rl/utils/nsys.py",
     "nemo_rl/utils/nvml.py",
     "nemo_rl/utils/packed_tensor.py",

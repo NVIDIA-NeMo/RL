@@ -31,7 +31,7 @@ try:
 except ImportError:
     print("[WARNING] Flash Attention not available")
 
-# Test vllm import (part of automodel extra) 
+# Test vllm import (part of automodel extra)
 try:
     import vllm
     print(f"[vLLM available: {vllm.__version__}]")
@@ -45,13 +45,6 @@ EOF
 uv run --extra automodel --no-build-isolation python <<"EOF"
 # This must be the first import to get all of the automodel packages added to the path
 import nemo_rl
-
-# Test automodel utilities
-try:
-    from nemo_rl.utils.automodel_checkpoint import detect_checkpoint_format, load_checkpoint, save_checkpoint
-    print("[Automodel checkpoint utilities import successful]")
-except ImportError as e:
-    print(f"[Automodel checkpoint utilities import failed: {e}]")
 
 # Test automodel factory
 try:
