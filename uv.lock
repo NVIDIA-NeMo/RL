@@ -24,7 +24,10 @@ members = [
     "nemo-rl",
     "penguin",
 ]
-overrides = [{ name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" }]
+overrides = [
+    { name = "opencv-python-headless", specifier = ">=4.11.0" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
+]
 
 [[manifest.dependency-metadata]]
 name = "causal-conv1d"
