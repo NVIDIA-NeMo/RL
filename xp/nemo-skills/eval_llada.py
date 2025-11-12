@@ -372,16 +372,12 @@ def main():
                 generation_args.append("++max_samples=10")  # Only 10 problems
             print(f"\n🚀 QUICK TEST MODE: Running with {config['benchmarks']} and limited samples")
         
-        # Build extra_eval_args for evaluation-time parameters
-        extra_eval_args = []
-        # Pass generation_key to evaluation step to match what generation writes
-        #extra_eval_args.append("++generation_key=predicted_answer")
-        # Tell math evaluator to use the predicted_answer key directly (not extract from generation)
-        #extra_eval_args.append("++eval_config.use_predicted_answer_key=True")
+        # Add keep_thinking parameter to generation_args if needed
         if config["keep_thinking"]:
-            extra_eval_args.append("++remove_thinking=False")
+            generation_args.append("++remove_thinking=False")
             print("\n⚠️  Keep-thinking mode enabled: <think> tags will NOT be removed from generations")
             print("   This helps when model outputs are truncated and missing </think> tags")
+        
         #print("#### generation_args: ", str(wrap_arguments(" ".join(generation_args))), flush=True)
         #exit(2)
         # Call the evaluation function with direct parameters
@@ -400,7 +396,6 @@ def main():
             # Optional parameters
             cluster=config["cluster"],
             dry_run=config["dry_run"],
-            extra_eval_args=" ".join(extra_eval_args) if extra_eval_args else "",
         )
         
         print("\n" + "=" * 60)
