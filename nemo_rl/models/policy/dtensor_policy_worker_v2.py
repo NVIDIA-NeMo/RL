@@ -16,8 +16,6 @@ import gc
 import itertools
 import os
 import warnings
-import socket
-import time
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
@@ -281,7 +279,9 @@ class DTensorPolicyWorkerV2:
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
         sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
         dp_size = self.cfg["dtensor_cfg"].get("data_parallel_size", None)
-        dp_replicate_size = self.cfg["dtensor_cfg"].get("data_parallel_replicate_size", 1)
+        dp_replicate_size = self.cfg["dtensor_cfg"].get(
+            "data_parallel_replicate_size", 1
+        )
         self.dp_replicate_size = dp_replicate_size
         if cp_size > 1 and self.enable_seq_packing:
             raise ValueError(
@@ -442,136 +442,11 @@ class DTensorPolicyWorkerV2:
             print(
                 "No weights path provided. Starting from scratch (default policy init)"
             )
-        # TO REMOVE #
-        if self.rank == 0:
-            print("=" * 80)
-            print(f"[PARALLELISM CONFIG]")
-            print(f"  world_size = {world_size}")
-            print(f"  tensor_parallel_size (TP) = {tp_size}")
-            print(f"  context_parallel_size (CP) = {cp_size}")
-            print(f"  data_parallel_size (DP/FSDP) = {dp_size}")
-            print(f"  data_parallel_replicate_size = {dp_replicate_size}")
-            print(f"  sequence_parallel = {sequence_parallel_enabled}")
-            print(f"  FSDP shards model across {dp_size} workers")
-            print(f"  Each worker has ~1/{dp_size} of model parameters")
-            print("=" * 80, flush=True)
-
-        self._diagnose_model_sharding()
-        self._diagnose_mesh_locality()
-
-    def _diagnose_model_sharding(self) -> None:
-        """Diagnose and report model sharding configuration."""
-        from torch.distributed._tensor import DTensor
-        
-        state_dict = self.model.state_dict()
-        total_params = 0
-        dtensor_params = 0
-        regular_params = 0
-        total_local_bytes = 0
-        total_global_bytes = 0
-        
-        # Sample a few tensors for detailed inspection
-        sample_dtensors = []
-        
-        for name, tensor in state_dict.items():
-            num_params = tensor.numel()
-            total_params += num_params
-            
-            if isinstance(tensor, DTensor):
-                dtensor_params += num_params
-                # Get local tensor size (what this worker actually stores)
-                local_tensor = tensor.to_local()
-                local_bytes = local_tensor.numel() * local_tensor.element_size()
-                total_local_bytes += local_bytes
-                
-                # Get full tensor size (what would be gathered)
-                global_bytes = tensor.numel() * tensor.element_size()
-                total_global_bytes += global_bytes
-                
-                # Sample first few DTensors for detailed reporting
-                if len(sample_dtensors) < 3:
-                    sample_dtensors.append((name, tensor, local_tensor))
-            else:
-                regular_params += num_params
-                local_bytes = tensor.numel() * tensor.element_size()
-                total_local_bytes += local_bytes
-                total_global_bytes += local_bytes
-        
-        # Only rank 0 prints to avoid spam
-        if self.rank == 0:
-            print("=" * 80)
-            print(f"[MODEL SHARDING DIAGNOSTICS - Rank {self.rank}]")
-            print(f"  Total parameters: {total_params:,}")
-            print(f"  DTensor parameters: {dtensor_params:,} ({100*dtensor_params/total_params:.1f}%)")
-            print(f"  Regular parameters: {regular_params:,} ({100*regular_params/total_params:.1f}%)")
-            print(f"  Local storage (this worker): {total_local_bytes / 1e9:.2f} GB")
-            print(f"  Global storage (full model): {total_global_bytes / 1e9:.2f} GB")
-            print(f"  Shard ratio: 1/{total_global_bytes/total_local_bytes:.1f} (this worker has 1/{total_global_bytes/total_local_bytes:.0f} of model)")
-            
-            if sample_dtensors:
-                print(f"\n  Sample DTensor placements:")
-                for name, dtensor, local_tensor in sample_dtensors:
-                    print(f"    {name}:")
-                    print(f"      Global shape: {dtensor.shape}")
-                    print(f"      Local shape: {local_tensor.shape}")
-                    print(f"      Placements: {dtensor.placements}")
-                    print(f"      Device mesh: {dtensor.device_mesh}")
-                    print(f"      Device mesh shape: {dtensor.device_mesh.shape}")
-            
-            print("=" * 80, flush=True)
 
     def _apply_temperature_scaling(self, logits: torch.Tensor) -> torch.Tensor:
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             logits.div_(self.cfg["generation"]["temperature"])
         return logits
-
-    def _diagnose_mesh_locality(self) -> None:
-        """Print device mesh shape and host locality of dp_replicate groups.
-
-        This helps verify HSDP placement (dp_shard_cp collectives should be node-local).
-        """
-        try:
-            world_size = torch.distributed.get_world_size()
-            my_info = {
-                "rank": self.rank,
-                "host": socket.gethostname(),
-                # get_coordinate returns a tuple matching mesh_dim_names order
-                "coord": tuple(self.device_mesh.get_coordinate()),
-            }
-            gathered: list[dict[str, Any]] = [None] * world_size  # type: ignore
-            torch.distributed.all_gather_object(gathered, my_info)
-
-            if self.rank == 0:
-                mesh_names = tuple(self.device_mesh.mesh_dim_names)
-                mesh_shape = tuple(self.device_mesh.shape)
-                print("=" * 80)
-                print("[MESH LOCALITY]")
-                print(f"  mesh shape: {mesh_shape}")
-                print(f"  mesh dims : {mesh_names}")
-                # summarize hosts per replicate
-                if "dp_replicate" in mesh_names:
-                    rep_axis = mesh_names.index("dp_replicate")
-                    hosts_by_rep: dict[int, set[str]] = {}
-                    ranks_by_rep: dict[int, list[int]] = {}
-                    for it in gathered:
-                        rep_idx = int(it["coord"][rep_axis])
-                        hosts_by_rep.setdefault(rep_idx, set()).add(it["host"])
-                        ranks_by_rep.setdefault(rep_idx, []).append(int(it["rank"]))
-                    for rep in sorted(hosts_by_rep):
-                        hosts = sorted(hosts_by_rep[rep])
-                        ranks = sorted(ranks_by_rep[rep])
-                        print(f"  dp_replicate={rep}: hosts={hosts}; ranks={ranks}")
-                print(
-                    f"  dp_replicate_size={self.dp_replicate_size}, "
-                    f"dp_shard_size={self.dp_shard_size}, cp_size={self.cp_size}"
-                )
-                print(
-                    f"  expected dp_shard_cp group size: {self.dp_shard_size * self.cp_size}"
-                )
-                print("=" * 80, flush=True)
-        except Exception as e:
-            if self.rank == 0:
-                print(f"[WARN] Mesh locality diagnostics failed: {e}", flush=True)
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
