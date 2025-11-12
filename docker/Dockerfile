@@ -124,8 +124,3 @@ COPY --from=nemo-rl . /opt/nemo-rl
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 
-# TODO(ahmadki): should be removed, but without it I get:
-# ModuleNotFoundError: No module named 'ray.scripts.scripts` with batch scripts on 
-# ray head node
-RUN rm -rf /opt/nemo_rl_venv/
-RUN NRL_FORCE_REBUILD_VENVS=true uv sync --extra mcore --extra vllm --extra automodel
