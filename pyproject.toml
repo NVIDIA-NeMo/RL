@@ -64,6 +64,7 @@ automodel = [
     "flash-attn==2.8.1",
     "mamba-ssm",
     "causal-conv1d",
+    "transformers>=4.57.1",
 ]
 vllm = [
     "cuda-python",

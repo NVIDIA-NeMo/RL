@@ -224,7 +224,14 @@ class DTensorPolicyWorkerV2:
         _copy_dataclass_fields(
             self,
             model_state,
-            ["model", "model_state_dict_keys", "optimizer", "scheduler"],
+            [
+                "model",
+                "model_state_dict_keys",
+                "optimizer",
+                "scheduler",
+                "is_hf_model",
+                "is_moe_model",
+            ],
         )
         if init_reference_model:
             self.reference_model_state_dict = model_state.reference_model_state_dict
@@ -503,6 +510,8 @@ class DTensorPolicyWorkerV2:
                     self.cp_mesh,
                     self._is_reward_model,
                     self.allow_flash_attn_args,
+                    self.is_hf_model,
+                    self.is_moe_model,
                 )
 
                 # Process outputs for logprobs

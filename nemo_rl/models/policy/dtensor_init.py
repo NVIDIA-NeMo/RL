@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import torch
 from accelerate import init_empty_weights
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.utils import sliding_window_overwrite
 from nemo_automodel.components.config.loader import _resolve_target
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
@@ -83,6 +84,8 @@ class ModelAndOptimizerState:
     optimizer: Optional[torch.optim.Optimizer]
     scheduler: Optional[Any]
     reference_model_state_dict: Optional[dict[str, torch.Tensor]]
+    is_hf_model: bool
+    is_moe_model: bool
 
 
 def validate_and_set_config(
@@ -423,8 +426,11 @@ def setup_model_and_optimizer(
             )
 
     # Parallelize model
+    is_hf_model = (
+        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+    )
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
-    if not isinstance(model, PreTrainedModel) and is_moe_model:
+    if not isinstance(model, PreTrainedModel) and is_moe_model and not is_hf_model:
         moe_parallelize_model(
             model=model,
             world_mesh=device_mesh,
@@ -539,4 +545,6 @@ def setup_model_and_optimizer(
         optimizer=optimizer,
         scheduler=scheduler,
         reference_model_state_dict=reference_model_state_dict,
+        is_hf_model=is_hf_model,
+        is_moe_model=is_moe_model,
     )

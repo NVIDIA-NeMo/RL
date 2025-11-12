@@ -188,7 +188,7 @@ class TestValidateAndSetConfig:
     @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
     @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
     @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
-    @patch("nemo_rl.models.policy.dtensor_init.NeMoAutoModelForSequenceClassification")
+    @patch("nemo_automodel.NeMoAutoModelForSequenceClassification")
     def test_reward_model_bradley_terry(
         self,
         mock_rm_class,
@@ -407,7 +407,7 @@ class TestValidateAndSetConfig:
     @patch("nemo_rl.models.policy.dtensor_init.resolve_model_class")
     @patch("nemo_rl.models.policy.dtensor_init.configure_dynamo_cache")
     @patch("nemo_rl.models.policy.dtensor_init.sliding_window_overwrite")
-    @patch("nemo_rl.models.policy.dtensor_init.NeMoAutoModelForSequenceClassification")
+    @patch("nemo_automodel.NeMoAutoModelForSequenceClassification")
     def test_reward_model_with_num_labels_equals_one(
         self,
         mock_rm_class,
@@ -753,6 +753,8 @@ class TestSetupModelAndOptimizer:
         assert result.scheduler == mock_scheduler
         assert result.reference_model_state_dict is not None
         assert len(result.model_state_dict_keys) > 0
+        assert isinstance(result.is_hf_model, bool)
+        assert isinstance(result.is_moe_model, bool)
 
     @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
@@ -835,6 +837,8 @@ class TestSetupModelAndOptimizer:
         assert result.optimizer is None
         assert result.scheduler is None
         assert result.reference_model_state_dict is None
+        assert isinstance(result.is_hf_model, bool)
+        assert isinstance(result.is_moe_model, bool)
 
     @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     def test_context_parallel_with_gemma3_raises_error(
@@ -1014,6 +1018,8 @@ class TestSetupModelAndOptimizer:
         )
 
         assert result.scheduler == mock_final_scheduler
+        assert isinstance(result.is_hf_model, bool)
+        assert isinstance(result.is_moe_model, bool)
 
     @patch("nemo_rl.models.policy.dtensor_init.init_empty_weights")
     @patch("nemo_rl.models.policy.utils.import_class_from_path")
@@ -1211,6 +1217,8 @@ class TestDataclasses:
             optimizer=MagicMock(),
             scheduler=MagicMock(),
             reference_model_state_dict={"layer.weight": torch.zeros(10, 10)},
+            is_hf_model=False,
+            is_moe_model=True,
         )
 
         assert state.model is not None
@@ -1218,3 +1226,5 @@ class TestDataclasses:
         assert state.optimizer is not None
         assert state.scheduler is not None
         assert state.reference_model_state_dict is not None
+        assert state.is_hf_model is False
+        assert state.is_moe_model is True

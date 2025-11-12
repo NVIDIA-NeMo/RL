@@ -88,6 +88,8 @@ def forward_backward(
     enable_seq_packing: bool,
     is_reward_model: bool,
     allow_flash_attn_args: bool,
+    is_hf_model: bool,
+    is_moe_model: bool,
     eval_mode: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -107,6 +109,8 @@ def forward_backward(
         enable_seq_packing: Whether sequence packing is enabled
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether model supports flash_attn_kwargs
+        is_hf_model: Whether the model is an HF model
+        is_moe_model: Whether the model is a MoE model
         eval_mode: Whether in evaluation mode
         apply_temperature_fn: Function to apply temperature scaling to logits
 
@@ -121,6 +125,8 @@ def forward_backward(
         cp_mesh,
         is_reward_model,
         allow_flash_attn_args,
+        is_hf_model,
+        is_moe_model,
     )
 
     # Process outputs for training (loss + backward)
@@ -230,6 +236,8 @@ def model_forward(
     cp_mesh: Any,
     is_reward_model: bool,
     allow_flash_attn_args: bool,
+    is_hf_model: bool,
+    is_moe_model: bool,
 ) -> Any:
     """Perform model forward pass.
 
@@ -240,7 +248,8 @@ def model_forward(
         cp_mesh: Context parallel mesh
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether model supports flash_attn_kwargs
-
+        is_hf_model: Whether the model is an HF model
+        is_moe_model: Whether the model is a MoE model
     Returns:
         Model outputs
     """
@@ -268,12 +277,14 @@ def model_forward(
             model_args = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                padding_mask=~attention_mask if attention_mask is not None else None,
                 position_ids=position_ids,
                 use_cache=False,
                 flash_attn_kwargs=flash_attn_kwargs,
                 **vlm_kwargs,
             )
+            if is_moe_model and not is_hf_model:
+                padding_mask = ~attention_mask if attention_mask is not None else None
+                model_args["padding_mask"] = padding_mask
 
             if is_reward_model:
                 # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
@@ -291,7 +302,7 @@ def model_forward(
             # Remove None attention_mask padding_mask if present
             if model_args.get("attention_mask") is None:
                 del model_args["attention_mask"]
-            if model_args.get("padding_mask") is None:
+            if "padding_mask" in model_args and model_args.get("padding_mask") is None:
                 del model_args["padding_mask"]
 
             outputs = model(**model_args)

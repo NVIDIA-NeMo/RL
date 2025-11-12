@@ -303,6 +303,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -359,6 +361,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=False,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -416,6 +420,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=True,
             allow_flash_attn_args=False,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -473,6 +479,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -597,6 +605,8 @@ class TestForwardBackward:
             enable_seq_packing=True,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -651,6 +661,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -706,6 +718,8 @@ class TestForwardBackward:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
@@ -1156,6 +1170,8 @@ class TestModelForward:
             cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         # Verify model was called
@@ -1185,6 +1201,8 @@ class TestModelForward:
             cp_mesh=None,
             is_reward_model=True,
             allow_flash_attn_args=False,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         # Verify model was called
@@ -1218,6 +1236,8 @@ class TestModelForward:
             cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
         )
 
         # Verify model was called
@@ -1227,6 +1247,102 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "pixel_values" in call_kwargs
         assert "flash_attn_kwargs" not in call_kwargs
+
+    def test_model_forward_with_moe_padding_mask(self, mock_model):
+        """Test model forward with MoE model sets padding_mask correctly."""
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        # Test with MoE model (not HF) - padding_mask should be set
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=True,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify padding_mask was passed
+        call_kwargs = mock_model.call_args[1]
+        assert "padding_mask" in call_kwargs
+
+    def test_model_forward_with_hf_moe_no_padding_mask(self, mock_model):
+        """Test model forward with HF MoE model does not set padding_mask."""
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        # Test with HF MoE model - padding_mask should NOT be set
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=True,
+            is_moe_model=True,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify padding_mask was NOT passed
+        call_kwargs = mock_model.call_args[1]
+        assert "padding_mask" not in call_kwargs
+
+    def test_model_forward_with_non_moe_no_padding_mask(self, mock_model):
+        """Test model forward with non-MoE model does not set padding_mask."""
+        processed_inputs = {
+            "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        # Test with non-MoE model - padding_mask should NOT be set
+        outputs = model_forward(
+            model=mock_model,
+            processed_inputs=processed_inputs,
+            cp_size=1,
+            cp_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify padding_mask was NOT passed
+        call_kwargs = mock_model.call_args[1]
+        assert "padding_mask" not in call_kwargs
 
     @pytest.mark.skip(reason="Context parallel requires real distributed environment")
     @patch("nemo_rl.models.policy.dtensor_train.create_context_parallel_ctx")
@@ -1730,6 +1846,8 @@ class TestIntegrationScenarios:
             enable_seq_packing=False,
             is_reward_model=False,
             allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
             eval_mode=False,
             apply_temperature_fn=apply_temperature_fn,
         )
