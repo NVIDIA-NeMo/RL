@@ -149,6 +149,7 @@ def dtensor_from_parallel_logits_to_logprobs(
     tp_group: torch.distributed.ProcessGroup,
     inference_only: bool = False,
     seq_index: Optional[torch.Tensor] = None,
+    shift_logits: bool = True,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -186,13 +187,15 @@ def dtensor_from_parallel_logits_to_logprobs(
         _, sorted_indices = torch.sort(seq_index)
         # Recover the original order of the target
         target = target.full_tensor()[:, sorted_indices]
-        target = target.roll(shifts=-1, dims=-1)[:, seq_index]
+        if shift_logits:
+            target = target.roll(shifts=-1, dims=-1)[:, seq_index]
 
         # Reshard
         target = distribute_tensor(target, cp_mesh, cp_placements)
         target = target.to_local()
     else:
-        target = target.roll(shifts=-1, dims=-1)
+        if shift_logits:
+            target = target.roll(shifts=-1, dims=-1)
 
     probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
         vocab_parallel_logits,
@@ -210,7 +213,10 @@ def dtensor_from_parallel_logits_to_logprobs(
         probs = probs_dtensor.full_tensor()[:, sorted_indices]
         assert probs.shape == target_shape
 
-    return probs[:, :-1]
+    if shift_logits:
+        return probs[:, :-1]
+    else:
+        return probs
 
 
 def from_parallel_logits_to_logprobs(

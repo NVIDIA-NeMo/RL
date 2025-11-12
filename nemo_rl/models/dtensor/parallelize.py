@@ -701,6 +701,7 @@ def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
     seq_index: Optional[torch.Tensor] = None,
+    shift_logits: bool = True,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -741,4 +742,5 @@ def get_logprobs_from_vocab_parallel_logits(
         tp_group,
         inference_only=not torch.is_grad_enabled(),
         seq_index=seq_index,
+        shift_logits=shift_logits,
     )

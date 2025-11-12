@@ -351,7 +351,7 @@ class NLLLoss(LossFunction):
             token_logprobs = token_logprobs[:, : data["input_ids"].shape[1] - 1]
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                next_token_logits, data["input_ids"]
+                next_token_logits, data["input_ids"], shift_logits=not mdlm_loss
             )
         else:
             if not mdlm_loss:
