@@ -3,7 +3,6 @@ sft:
   max_num_steps: 250
   val_period: 500
 checkpointing:
-  enabled: false
   checkpoint_dir: results/sft-qwen3-next-80ba3b-instruct-8n8g-megatron
   save_period: 100
 policy:
