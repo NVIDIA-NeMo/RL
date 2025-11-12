@@ -266,10 +266,12 @@ def setup_megatron_model(
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
                 # Handle VLM models
+                if hasattr(model_module, "llava_model"):
+                    model_module = model_module.llava_model
                 if hasattr(model_module, "language_model"):
                     model_module = model_module.language_model
                 for layer in model_module.decoder.layers:
-                    if hasattr(layer.mlp, "router"):
+                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
 
         mixed_precision_wrapper = CustomFloat16Module
@@ -660,6 +662,8 @@ class MegatronPolicyWorker:
             "train_iters must be set in megatron_cfg. For an example, see "
             "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
         )
+
+        model_cfg.perform_initialization = True
 
         self.megatron_cfg = ConfigContainer(
             model=model_cfg,
@@ -1239,16 +1243,22 @@ class MegatronPolicyWorker:
             multimodal_data = data_dict.get_multimodal_dict(
                 as_tensors=True, device=input_ids.device
             )
-            if len(multimodal_data) > 0:
-                position_ids = None
+            # if len(multimodal_data) > 0:
+            #     position_ids = None
 
+            multimodal_data["images"] = multimodal_data["pixel_values"].to(
+                torch.bfloat16
+            )
+            del multimodal_data["pixel_values"]
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
+                # packed_seq_params=packed_seq_params,
                 **multimodal_data,
             )
+            if type(output_tensor) == tuple:
+                output_tensor = output_tensor[0]
 
             # Apply temperature scaling to logits for training
             # This matches the dtensor worker's _apply_temperature_scaling in the train method

@@ -877,6 +877,7 @@ def grpo_train(
         dynamic_sampling_num_gen_batches = 0
 
         # Run grpo/dapo training loop (single-turn)
+        ddd = dataloader.dataset[0]
         for batch in dataloader:
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(dataloader), max_num_steps)} {'=' * 25}",
@@ -1257,6 +1258,8 @@ def grpo_train(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            print(f"  • Grad Norm: {metrics['grad_norm']:.4f}")
+            print(f"  • Token Mult Prob Error: {metrics['token_mult_prob_error']:.4f}")
             if master_config["grpo"]["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(

@@ -84,6 +84,7 @@ def print_problematic_embeddings(
 
 def find_output_embeddings(model):
     """Find the output embeddings layer in various model architectures."""
+    model = model.language_model
     if hasattr(model, "get_output_embeddings"):
         return model.get_output_embeddings()
     elif hasattr(model, "lm_head"):
@@ -220,7 +221,7 @@ def main():
     summaries = []
 
     # Check input embeddings
-    input_embeddings = model.get_input_embeddings()
+    input_embeddings = model.language_model.get_input_embeddings()
     if input_embeddings is not None:
         input_summary = check_embedding_layer(
             input_embeddings,
