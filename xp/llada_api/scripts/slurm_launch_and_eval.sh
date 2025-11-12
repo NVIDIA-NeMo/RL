@@ -480,19 +480,66 @@ echo ""
 # Step 2: Monitor server log for node and port information
 print_status "Step 2: Waiting for server to be ready..."
 print_status "Monitoring server log for connection information..."
+print_status ""
+print_status "📋 You can monitor the server log in real-time with:"
+print_status "   tail -f $SERVER_LOG"
+print_status ""
 
 SERVER_NODE=""
 MAX_WAIT=600  # Wait up to 10 minutes
 WAITED=0
 
+# Try to get node from SLURM directly (more reliable than log parsing)
+if command -v squeue &> /dev/null; then
+    print_status "Attempting to get node assignment from SLURM..."
+    sleep 10  # Give SLURM time to allocate and start the job
+    
+    # Try to find the job by looking for srun processes with our job name
+    for attempt in {1..10}; do
+        # Look for running jobs with our job name
+        SLURM_NODE=$(squeue --me --name="$SERVER_JOB_NAME" --states=RUNNING --format="%N" --noheader 2>/dev/null | head -1 || true)
+        
+        if [[ -n "$SLURM_NODE" ]]; then
+            SERVER_NODE="$SLURM_NODE"
+            print_status "✓ Got server node from SLURM: $SERVER_NODE"
+            break
+        fi
+        
+        sleep 2
+    done
+fi
+
 while [[ -z "$SERVER_NODE" && $WAITED -lt $MAX_WAIT ]]; do
     if [[ -f "$SERVER_LOG" ]]; then
-        # Look for the line that shows the compute node
-        SERVER_NODE=$(grep -m1 "Server starting on compute node:" "$SERVER_LOG" | awk '{print $NF}' || true)
+        # Look for the line that shows the compute node (multiple possible patterns)
+        # Pattern 1: "Server starting on compute node: hostname"
+        SERVER_NODE=$(grep -i "server starting on compute node:" "$SERVER_LOG" 2>/dev/null | tail -1 | awk '{print $NF}' || true)
+        
+        # Pattern 2: Any line with "on compute node:"
+        if [[ -z "$SERVER_NODE" ]]; then
+            SERVER_NODE=$(grep -i "on compute node:" "$SERVER_LOG" 2>/dev/null | tail -1 | awk '{print $NF}' || true)
+        fi
+        
+        # Pattern 3: Look for SLURMD_NODENAME in the log (set by SLURM)
+        if [[ -z "$SERVER_NODE" ]]; then
+            SERVER_NODE=$(grep "SLURMD_NODENAME" "$SERVER_LOG" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' "' || true)
+        fi
         
         if [[ -n "$SERVER_NODE" ]]; then
             print_status "Server detected on node: $SERVER_NODE"
             break
+        fi
+        
+        # Show progress every 30 seconds
+        if [[ $((WAITED % 30)) -eq 0 ]] && [[ $WAITED -gt 0 ]]; then
+            print_status "Still waiting for server startup (${WAITED}s elapsed)... Checking log for patterns"
+            print_status "Last 5 lines of server log:"
+            tail -5 "$SERVER_LOG" 2>/dev/null || echo "  (log file empty or not readable)"
+        fi
+    else
+        # Log file doesn't exist yet
+        if [[ $((WAITED % 30)) -eq 0 ]] && [[ $WAITED -gt 0 ]]; then
+            print_status "Waiting for server log file to be created (${WAITED}s elapsed)..."
         fi
     fi
     
@@ -510,6 +557,11 @@ done
 if [[ -z "$SERVER_NODE" ]]; then
     print_error "Timeout waiting for server to start (waited ${MAX_WAIT}s)"
     print_error "Check server log: $SERVER_LOG"
+    print_error ""
+    print_error "Debug: Showing last 20 lines of server log:"
+    tail -20 "$SERVER_LOG" 2>/dev/null || echo "  (log file not readable)"
+    print_error ""
+    print_error "If the server is actually running, you may need to check the log patterns."
     kill $SERVER_PID 2>/dev/null || true
     exit 1
 fi
