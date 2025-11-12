@@ -14,6 +14,7 @@ BASE_MODEL="nvidia/Nemotron-Diffusion-Research-4B-v0"
 MODEL_NAME="nemotron-4b"
 GENERATION_ALGORITHM="nemotron"
 THRESHOLD=0.9
+FACTOR=""
 TOKENS_TO_GENERATE=512
 STEPS=512
 BLOCK_LENGTH=32
@@ -62,6 +63,7 @@ Model Options:
 Inference Options:
   --generation-algorithm ALGO Algorithm (default: $GENERATION_ALGORITHM)
   --threshold VAL             Threshold (default: $THRESHOLD)
+  --factor VAL                Factor for dynamic decoding (optional)
   --tokens-to-generate NUM    Max tokens (default: $TOKENS_TO_GENERATE)
   --steps NUM                 Diffusion steps (default: $STEPS)
   --block-length NUM          Block length (default: $BLOCK_LENGTH)
@@ -121,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --output-base-dir) OUTPUT_BASE_DIR="$2"; shift 2 ;;
         --generation-algorithm) GENERATION_ALGORITHM="$2"; shift 2 ;;
         --threshold) THRESHOLD="$2"; shift 2 ;;
+        --factor) FACTOR="$2"; shift 2 ;;
         --tokens-to-generate) TOKENS_TO_GENERATE="$2"; shift 2 ;;
         --steps) STEPS="$2"; shift 2 ;;
         --block-length) BLOCK_LENGTH="$2"; shift 2 ;;
@@ -273,6 +276,11 @@ for i in "${!CHECKPOINTS[@]}"; do
     EVAL_ARGS="$EVAL_ARGS --output-dir '$output_dir' --benchmark '$BENCHMARK'"
     EVAL_ARGS="$EVAL_ARGS --model-name '$MODEL_NAME' --generation-algorithm '$GENERATION_ALGORITHM'"
     EVAL_ARGS="$EVAL_ARGS --threshold $THRESHOLD --tokens-to-generate $TOKENS_TO_GENERATE"
+    
+    if [[ -n "$FACTOR" ]]; then
+        EVAL_ARGS="$EVAL_ARGS --factor $FACTOR"
+    fi
+    
     EVAL_ARGS="$EVAL_ARGS --steps $STEPS --block-length $BLOCK_LENGTH"
     EVAL_ARGS="$EVAL_ARGS --batch-size $BATCH_SIZE --server-gpus $SERVER_GPUS --port $PORT"
     

@@ -43,6 +43,8 @@ EXPNAME=""
 MAX_SAMPLES=""
 QUICK_TEST=false
 KEEP_THINKING=false
+THRESHOLD=""
+FACTOR=""
 
 # Default values - Evaluation SLURM
 EVAL_JOB_NAME="llada-eval"
@@ -139,6 +141,8 @@ Diffusion Options:
   --cfg-scale SCALE           CFG scale (default: $CFG_SCALE)
   --remasking STRATEGY        Remasking strategy (default: $REMASKING)
   --generation-algorithm ALGO Generation algorithm (default: $GENERATION_ALGORITHM)
+  --threshold VAL             Confidence threshold (optional)
+  --factor VAL                Factor for dynamic decoding (optional)
   
 Evaluation SLURM Options:
   --eval-job-name NAME        Eval job name (default: $EVAL_JOB_NAME)
@@ -315,6 +319,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --generation-algorithm)
             GENERATION_ALGORITHM="$2"
+            shift 2
+            ;;
+        --threshold)
+            THRESHOLD="$2"
+            shift 2
+            ;;
+        --factor)
+            FACTOR="$2"
             shift 2
             ;;
         # Evaluation SLURM options
@@ -539,6 +551,14 @@ EVAL_ARGS="$EVAL_ARGS --tokens-to-generate $TOKENS_TO_GENERATE"
 EVAL_ARGS="$EVAL_ARGS --steps $STEPS --block-length $BLOCK_LENGTH"
 EVAL_ARGS="$EVAL_ARGS --cfg-scale $CFG_SCALE --remasking '$REMASKING'"
 EVAL_ARGS="$EVAL_ARGS --generation-algorithm '$GENERATION_ALGORITHM'"
+
+if [[ -n "$THRESHOLD" ]]; then
+    EVAL_ARGS="$EVAL_ARGS --threshold $THRESHOLD"
+fi
+
+if [[ -n "$FACTOR" ]]; then
+    EVAL_ARGS="$EVAL_ARGS --factor $FACTOR"
+fi
 
 if [[ -n "$EXPNAME" ]]; then
     EVAL_ARGS="$EVAL_ARGS --expname '$EXPNAME'"
