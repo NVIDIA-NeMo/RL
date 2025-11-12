@@ -234,7 +234,7 @@ data:
 
 env:
   clevr-cogent:
-    num_workers: 8
+    num_workers: 1
     reward_functions:
       - name: format
         weight: 0.2
@@ -274,5 +274,5 @@ logger:
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
 
 cluster:
-  gpus_per_node: 2
+  gpus_per_node: 1
   num_nodes: 1

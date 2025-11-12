@@ -471,6 +471,90 @@ def _parallelize_nm5_h(
     )
 
 
+def _parallelize_nm5_h_vl(
+    model,
+    dp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    sequence_parallel: bool = False,
+    activation_checkpointing: bool = False,
+    cpu_offload: bool = False,
+    custom_parallel_plan: Optional[Union[dict, str]] = None,
+) -> torch.distributed.fsdp.FSDPModule:
+    """Parallelize a NemotronH_Nano_VL_V2 model across data and tensor parallel dimensions."""
+    assert not sequence_parallel, (
+        "Sequence parallelism is not supported for NemotronH_Nano_VL_V2"
+    )
+    assert custom_parallel_plan is None, (
+        "Custom parallel plan is not supported for NemotronH_Nano_VL_V2"
+    )
+
+    llm_tp_plan: dict[str, ParallelStyle] = {
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    llm_mlp_tp_plan: dict[str, ParallelStyle] = {
+        "mixer.up_proj": ColwiseParallel(),
+        "mixer.down_proj": RowwiseParallel(),
+    }
+
+    vit_mlp_tp_plan: dict[str, ParallelStyle] = {
+        "mlp.fc1": ColwiseParallel(),
+        "mlp.fc2": RowwiseParallel(),
+    }
+
+    llm_layers: torch.nn.ModuleList = model.language_model.backbone.layers
+    parallelize_module(model.language_model, tp_mesh, llm_tp_plan)
+
+    for layer in llm_layers:
+        if layer.block_type == "mlp":
+            parallelize_module(layer, tp_mesh, llm_mlp_tp_plan)
+
+    vit_layers = model.vision_model.model.blocks
+    for layer in vit_layers:
+        parallelize_module(layer, tp_mesh, vit_mlp_tp_plan)
+
+    if activation_checkpointing:
+        for i in range(len(llm_layers)):
+            if llm_layers[i].block_type == "mlp":
+                llm_layers[i] = checkpoint_wrapper(llm_layers[i])
+
+            elif llm_layers[i].block_type == "mamba":
+                llm_layers[i] = checkpoint_wrapper(llm_layers[i])
+
+        for i in range(len(vit_layers)):
+            vit_layers[i] = checkpoint_wrapper(vit_layers[i])
+
+        model.mlp1 = checkpoint_wrapper(model.mlp1)
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    offload_policy = (
+        CPUOffloadPolicy(pin_memory=False)
+        if cpu_offload
+        else torch.distributed.fsdp.OffloadPolicy()
+    )
+
+    for layer in llm_layers + vit_layers + [model.mlp1]:
+        fully_shard(
+            layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+        )
+
+    # do not reshard after forward for root model
+    # because its parameters will be used in backward immediately
+    return fully_shard(
+        model,
+        mesh=dp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=False,
+    )
+
+
 def _parallelize_model(
     model: Union[
         Qwen2ForCausalLM,
@@ -552,6 +636,18 @@ def _parallelize_model(
 
         num_attention_heads = model.language_model.config.num_attention_heads
         num_key_value_heads = model.language_model.config.num_key_value_heads
+
+    elif model_cls.__name__ == "NemotronH_Nano_VL_V2":
+        return _parallelize_nm5_h_vl(
+            model,
+            dp_mesh,
+            tp_mesh,
+            param_dtype,
+            sequence_parallel,
+            activation_checkpointing,
+            cpu_offload,
+            custom_parallel_plan,
+        )
 
     elif model_cls == SmolVLMForConditionalGeneration:
         layers: list = []
