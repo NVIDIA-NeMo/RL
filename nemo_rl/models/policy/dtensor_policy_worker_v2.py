@@ -349,21 +349,23 @@ class DTensorPolicyWorkerV2:
 
                     # Forward and backward pass
                     loss, loss_metrics = forward_backward(
-                        self.model,
-                        mb,
-                        loss_fn,
-                        global_valid_seqs,
-                        global_valid_toks,
-                        processed_inputs,
-                        self.dtype,
-                        self.cp_size,
-                        self.cp_mesh,
-                        self.device_mesh,
-                        self.enable_seq_packing,
-                        self._is_reward_model,
-                        self.allow_flash_attn_args,
-                        eval_mode,
-                        self._apply_temperature_scaling,
+                        model=self.model,
+                        mb=mb,
+                        loss_fn=loss_fn,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        processed_inputs=processed_inputs,
+                        dtype=self.dtype,
+                        cp_size=self.cp_size,
+                        cp_mesh=self.cp_mesh,
+                        device_mesh=self.device_mesh,
+                        enable_seq_packing=self.enable_seq_packing,
+                        is_reward_model=self._is_reward_model,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        is_hf_model=self.is_hf_model,
+                        is_moe_model=self.is_moe_model,
+                        eval_mode=eval_mode,
+                        apply_temperature_fn=self._apply_temperature_scaling,
                     )
 
                     # skip the update for dummy batches

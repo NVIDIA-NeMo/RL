@@ -134,7 +134,7 @@ def validate_and_set_config(
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
-    offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
+    offload_optimizer_for_logprob = config.get("offload_optimizer_for_logprob", False)
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
