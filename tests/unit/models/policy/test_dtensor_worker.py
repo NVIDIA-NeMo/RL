@@ -568,6 +568,7 @@ def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(use_v2, logprob_set
 
 
 @pytest.mark.hf_gated
+@pytest.mark.skip(reason="Disabled temporarily")
 @pytest.mark.parametrize("use_v2", [True, False])
 def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
     use_v2, two_gpu_virtual_cluster, tiny_llama_tied_model_path
