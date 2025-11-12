@@ -20,6 +20,9 @@ from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
     get_train_context,
 )
+from nemo_automodel.components.training.utils import (
+    scale_grads_and_clip_grad_norm,
+)
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
 
@@ -163,10 +166,6 @@ def optimizer_step(
     Returns:
         Gradient norm (or None if not computed)
     """
-    from nemo_automodel.components.training.utils import (
-        scale_grads_and_clip_grad_norm,
-    )
-
     grad_norm = scale_grads_and_clip_grad_norm(
         max_grad_norm,
         [model],
@@ -181,6 +180,12 @@ def optimizer_step(
         foreach=True,
         num_label_tokens=1,
         dp_group_size=dp_size * cp_size,
+    )
+    grad_norm = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else grad_norm
+    grad_norm = (
+        torch.tensor(grad_norm)
+        if not isinstance(grad_norm, torch.Tensor)
+        else grad_norm
     )
     grad_norm = grad_norm.detach().cpu().float()
 

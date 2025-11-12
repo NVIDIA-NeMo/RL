@@ -717,7 +717,7 @@ class TestForwardBackward:
 class TestOptimizerStep:
     """Tests for optimizer_step function."""
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_basic_optimizer_step(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
@@ -745,7 +745,7 @@ class TestOptimizerStep:
         assert grad_norm is not None
         assert grad_norm == 1.5
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_with_moe_mesh(
         self,
         mock_scale_grads,
@@ -776,7 +776,7 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_with_context_parallel(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
@@ -801,7 +801,7 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_with_no_max_grad_norm(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
@@ -826,7 +826,7 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_infinite_grad_norm_handling(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
@@ -855,7 +855,7 @@ class TestOptimizerStep:
         assert grad_norm is not None
         assert torch.isinf(torch.tensor(grad_norm))
 
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     def test_nan_grad_norm_handling(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
@@ -883,6 +883,77 @@ class TestOptimizerStep:
         # Verify gradient norm was still returned
         assert grad_norm is not None
         assert torch.isnan(torch.tensor(grad_norm))
+
+    @pytest.mark.skip(reason="DTensor conversion requires real distributed environment")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    def test_grad_norm_dtensor_conversion(
+        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+    ):
+        """Test that grad_norm is properly converted from DTensor to regular tensor."""
+        # This test would require a real DTensor environment
+        # The conversion logic is:
+        # 1. If DTensor, call .full_tensor()
+        # 2. If not a tensor, convert to tensor
+        # 3. Call .detach().cpu().float()
+        pass
+
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    def test_grad_norm_scalar_conversion(
+        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+    ):
+        """Test that grad_norm is properly converted from scalar to tensor."""
+        # Mock scalar gradient norm (not a tensor)
+        mock_scale_grads.return_value = 1.5  # Plain Python float
+
+        grad_norm = optimizer_step(
+            optimizer=mock_optimizer,
+            model=mock_model,
+            max_grad_norm=1.0,
+            device_mesh=mock_device_mesh,
+            moe_mesh=None,
+            dp_size=2,
+            cp_size=1,
+        )
+
+        # Verify scale_grads_and_clip_grad_norm was called
+        mock_scale_grads.assert_called_once()
+
+        # Verify optimizer.step was called
+        mock_optimizer.step.assert_called_once()
+
+        # Verify gradient norm was returned as a float
+        assert grad_norm is not None
+        assert isinstance(grad_norm, (float, torch.Tensor))
+        if isinstance(grad_norm, torch.Tensor):
+            assert grad_norm.item() == 1.5
+
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    def test_grad_norm_already_tensor(
+        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
+    ):
+        """Test that grad_norm works correctly when already a regular tensor."""
+        # Mock tensor gradient norm (already a tensor)
+        mock_scale_grads.return_value = torch.tensor(2.3).cuda()
+
+        grad_norm = optimizer_step(
+            optimizer=mock_optimizer,
+            model=mock_model,
+            max_grad_norm=1.0,
+            device_mesh=mock_device_mesh,
+            moe_mesh=None,
+            dp_size=2,
+            cp_size=1,
+        )
+
+        # Verify scale_grads_and_clip_grad_norm was called
+        mock_scale_grads.assert_called_once()
+
+        # Verify optimizer.step was called
+        mock_optimizer.step.assert_called_once()
+
+        # Verify gradient norm was returned correctly
+        assert grad_norm is not None
+        assert abs(float(grad_norm) - 2.3) < 1e-5
 
 
 class TestCleanupAfterTraining:
@@ -1402,7 +1473,7 @@ class TestIntegrationScenarios:
     """Integration tests combining multiple functions."""
 
     @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
-    @patch("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
     @patch("nemo_rl.models.policy.dtensor_train.torch.cuda.empty_cache")
     def test_full_training_loop(
         self,
