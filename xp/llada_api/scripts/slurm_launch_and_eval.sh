@@ -482,7 +482,7 @@ print_status "Step 2: Waiting for server to be ready..."
 print_status "Monitoring server log for connection information..."
 
 SERVER_NODE=""
-MAX_WAIT=300  # Wait up to 5 minutes
+MAX_WAIT=600  # Wait up to 10 minutes
 WAITED=0
 
 while [[ -z "$SERVER_NODE" && $WAITED -lt $MAX_WAIT ]]; do
