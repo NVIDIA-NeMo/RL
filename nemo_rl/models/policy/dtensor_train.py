@@ -609,3 +609,106 @@ def process_outputs_for_logprobs(
     )
 
     return token_logprobs
+
+
+def process_outputs_for_topk(
+    outputs: Any,
+    model: nn.Module,
+    mb: BatchedDataDict[Any],
+    processed_inputs: dict[str, Any],
+    k: int,
+    cp_size: int,
+    cp_mesh: Any,
+    device_mesh: Any,
+    tp_mesh: Any,
+    enable_seq_packing: bool,
+    apply_temperature_fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Process model outputs for top-k logits extraction.
+
+    Args:
+        outputs: Model outputs from forward pass
+        model: The model (not used currently but kept for consistency)
+        mb: Microbatch data
+        processed_inputs: Processed inputs from process_microbatch
+        k: Number of top logits to return
+        cp_size: Context parallel size
+        cp_mesh: Context parallel mesh
+        device_mesh: Full device mesh
+        tp_mesh: Tensor parallel mesh
+        enable_seq_packing: Whether sequence packing is enabled
+        apply_temperature_fn: Function to apply temperature scaling to logits
+
+    Returns:
+        Tuple of (topk_values, topk_indices) with shape [B, S, k]
+    """
+    from nemo_rl.distributed.model_utils import (
+        allgather_cp_sharded_tensor,
+        distributed_vocab_topk,
+    )
+
+    sequence_dim = 1
+    seq_index = processed_inputs["seq_index"]
+
+    with get_train_context(False, False, None)():
+        # Process logits from model outputs
+        logits = _process_logits(outputs, model, apply_temperature_fn)
+        del outputs
+
+        if cp_size > 1:
+            # Shard logits for CP (without modifying mb)
+            logits, seq_index_tensor = _handle_context_parallel_sharding(
+                logits,
+                seq_index,
+                cp_mesh,
+                device_mesh,
+                sequence_dim,
+            )
+
+            # Deal with TP first
+            local_logits = logits.to_local()  # [B, S_cp, V_tp]
+
+            tp_group = tp_mesh.get_group()
+            tp_rank = torch.distributed.get_rank(tp_group)
+            V_local = int(local_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+
+            vals, idx = distributed_vocab_topk(
+                local_logits,
+                k=k,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+            # [B, S_cp, k]
+
+            cp_group = cp_mesh.get_group()
+
+            vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
+            idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
+            # [B, S, k]
+        else:
+            # Compute top-k over full sequence length (do not drop last position)
+            if isinstance(logits, DTensor):
+                local_logits = logits.to_local()  # [B, S, V_local]
+                tp_group = tp_mesh.get_group()
+                tp_rank = torch.distributed.get_rank(tp_group)
+                V_local = int(local_logits.shape[-1])
+                vocab_start_index = tp_rank * V_local
+                vocab_end_index = (tp_rank + 1) * V_local
+
+                vals, idx = distributed_vocab_topk(
+                    local_logits,
+                    k=k,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
+            else:
+                full_logits = logits.to(torch.float32)
+                vals, idx = torch.topk(full_logits, k=k, dim=-1)
+
+        del logits
+
+    return vals, idx

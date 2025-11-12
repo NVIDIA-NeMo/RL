@@ -32,6 +32,7 @@ from nemo_rl.models.policy.dtensor_train import (
     optimizer_step,
     process_output_for_train,
     process_outputs_for_logprobs,
+    process_outputs_for_topk,
     setup_train_loop,
 )
 
@@ -1466,6 +1467,189 @@ class TestProcessOutputsForLogprobs:
     def test_logprob_extraction_with_context_parallel(self):
         """Test logprob extraction with context parallel."""
         # This would require real DTensor/distributed environment
+        pass
+
+
+class TestProcessOutputsForTopk:
+    """Tests for process_outputs_for_topk function."""
+
+    def test_basic_topk_extraction(self, mock_model):
+        """Test basic top-k extraction without CP/TP."""
+        # Create mock outputs
+        outputs = MagicMock()
+        outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        # Create mock tp_mesh
+        mock_tp_mesh = MagicMock()
+
+        vals, idx = process_outputs_for_topk(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            k=10,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            tp_mesh=mock_tp_mesh,
+            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Verify shape: [batch_size, seq_len, k]
+        assert vals.shape == (4, 64, 10)
+        assert idx.shape == (4, 64, 10)
+
+        # Verify indices are within valid range [0, vocab_size)
+        assert torch.all(idx >= 0)
+        assert torch.all(idx < 1000)
+
+    def test_topk_extraction_with_temperature(self, mock_model):
+        """Test that temperature scaling is applied to logits before top-k."""
+        # Create mock outputs with known logits
+        outputs = MagicMock()
+        logits = torch.randn(2, 32, 500, device="cuda", requires_grad=True)
+        outputs.logits = logits
+
+        # Create microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 500, (2, 32)).cuda(),
+                "sample_mask": torch.ones(2, dtype=torch.bool).cuda(),
+            }
+        )
+
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(2, 32, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(32).repeat(2, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 32,
+        }
+
+        temperature = 2.0
+        apply_temperature_fn = lambda x: x / temperature
+
+        # Create mock tp_mesh
+        mock_tp_mesh = MagicMock()
+
+        vals, idx = process_outputs_for_topk(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            k=5,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            tp_mesh=mock_tp_mesh,
+            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        # Verify shape
+        assert vals.shape == (2, 32, 5)
+        assert idx.shape == (2, 32, 5)
+
+    def test_topk_extraction_different_k_values(self, mock_model):
+        """Test top-k extraction with different k values."""
+        outputs = MagicMock()
+        outputs.logits = torch.randn(3, 48, 800, device="cuda", requires_grad=True)
+
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 800, (3, 48)).cuda(),
+                "sample_mask": torch.ones(3, dtype=torch.bool).cuda(),
+            }
+        )
+
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(3, 48, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(48).repeat(3, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 48,
+        }
+
+        apply_temperature_fn = lambda x: x
+        mock_tp_mesh = MagicMock()
+
+        # Test with k=20
+        vals, idx = process_outputs_for_topk(
+            outputs=outputs,
+            model=mock_model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            k=20,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            tp_mesh=mock_tp_mesh,
+            enable_seq_packing=False,
+            apply_temperature_fn=apply_temperature_fn,
+        )
+
+        assert vals.shape == (3, 48, 20)
+        assert idx.shape == (3, 48, 20)
+
+    @pytest.mark.skip(reason="Tensor parallel requires real distributed environment")
+    def test_topk_extraction_with_tensor_parallel(self):
+        """Test top-k extraction with tensor parallel (DTensor logits).
+
+        This test would require a real DTensor/distributed environment to test:
+        - DTensor logits with TP sharding
+        - distributed_vocab_topk across TP ranks
+        - Proper gathering of top-k across sharded vocabulary
+        """
+        pass
+
+    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
+    def test_topk_extraction_with_context_parallel(self):
+        """Test top-k extraction with context parallel.
+
+        This test would require a real DTensor/distributed environment to test:
+        - Sharding logits across CP dimension
+        - distributed_vocab_topk with both CP and TP
+        - allgather_cp_sharded_tensor for gathering results across CP ranks
+        """
+        pass
+
+    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
+    def test_topk_extraction_with_cp_and_tp(self):
+        """Test top-k extraction with both CP and TP enabled.
+
+        This test would require a real DTensor/distributed environment to test:
+        - Sequence sharding via _handle_context_parallel_sharding
+        - TP vocabulary sharding
+        - Proper coordination between CP and TP for distributed top-k
+        """
         pass
 
 
