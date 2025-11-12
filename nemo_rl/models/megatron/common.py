@@ -460,8 +460,8 @@ def forward_step_arbitrary_loss(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
-    if len(multimodal_data) > 0:
-        position_ids = None
+    # if len(multimodal_data) > 0:
+    #     position_ids = None
 
     additional_kwargs = {}
     # Mamba models currently do not support packed_seq_params
@@ -472,6 +472,8 @@ def forward_step_arbitrary_loss(
         additional_kwargs["fp32_output"] = False
 
     with straggler_timer:
+        multimodal_data["images"] = multimodal_data["pixel_values"].to(torch.bfloat16)
+        del multimodal_data["pixel_values"]
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
@@ -479,6 +481,8 @@ def forward_step_arbitrary_loss(
             **additional_kwargs,
             **multimodal_data,
         )
+        if type(output_tensor) == tuple:
+            output_tensor = output_tensor[0]
 
         # Apply temperature scaling to logits for training
         # This matches the dtensor worker's _apply_temperature_scaling in the train method
