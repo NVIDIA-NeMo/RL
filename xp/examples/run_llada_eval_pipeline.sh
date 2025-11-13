@@ -48,6 +48,10 @@ SEQ_EVAL_EXTRA_ARGS="${SEQ_EVAL_EXTRA_ARGS:-}"
 # Additional flags that should be applied to every evaluation launch
 GLOBAL_EVAL_FLAGS="${GLOBAL_EVAL_FLAGS:-}"
 
+# Control whether to wait for sequential eval to complete before launching parallel evals
+# Set to "false" to launch sequential eval in background and immediately proceed to parallel evals
+WAIT_FOR_SEQUENTIAL="${WAIT_FOR_SEQUENTIAL:-true}"
+
 # Parallel evaluation jobs (newline-separated list; edit or override as needed)
 read -r -d '' DEFAULT_PARALLEL_JOBS <<'EOF' || true
 --job-name llada-eval-par-1 --cpus 64 --time 03:00:00 --server-info-file ${SERVER_INFO_FILE} -- --benchmark gsm8k:1 --generation-algorithm nemotron --model nemotron-4b --threshold 0.9 --tokens-to-generate 512 --steps 512 --block-length 32 --expname llada-gsm8k-par-1
@@ -175,32 +179,87 @@ for attempt in {1..180}; do
   if [[ -f "$SERVER_INFO_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$SERVER_INFO_FILE"
-    if [[ "${SERVER_STATUS:-}" == "running" && "${SERVER_ADDRESS:-}" != "" && "${SERVER_ADDRESS}" != *"0.0.0.0"* ]]; then
-      echo "[pipeline] server ready at $SERVER_ADDRESS"
-      break
+    # Check all fields required by the eval launcher
+    if [[ "${SERVER_STATUS:-}" == "running" && -n "${SERVER_ADDRESS:-}" && "${SERVER_ADDRESS:-}" != *"0.0.0.0"* ]]; then
+      # For SLURM servers, also verify SERVER_CLIENT_HOST is set
+      if [[ "${SERVER_INFO_SOURCE:-}" == "slurm" ]]; then
+        if [[ -n "${SERVER_CLIENT_HOST:-}" && "${SERVER_CLIENT_HOST:-}" != "0.0.0.0" ]]; then
+          echo "[pipeline] server ready at $SERVER_ADDRESS"
+          echo "[pipeline] server info: STATUS=$SERVER_STATUS, ADDRESS=$SERVER_ADDRESS, CLIENT_HOST=$SERVER_CLIENT_HOST, PORT=${SERVER_PORT:-unset}"
+          break
+        fi
+      else
+        # For local servers, CLIENT_HOST check not required
+        echo "[pipeline] server ready at $SERVER_ADDRESS"
+        echo "[pipeline] server info: STATUS=$SERVER_STATUS, ADDRESS=$SERVER_ADDRESS, PORT=${SERVER_PORT:-unset}"
+        break
+      fi
+    fi
+    if [[ $attempt -eq 1 || $((attempt % 12)) -eq 0 ]]; then
+      echo "[pipeline] waiting... (attempt $attempt/180, status=${SERVER_STATUS:-unset}, source=${SERVER_INFO_SOURCE:-unset}, client_host=${SERVER_CLIENT_HOST:-unset})"
     fi
   fi
   sleep 5
   if [[ $attempt -eq 180 ]]; then
     echo "[pipeline] ERROR: server never reached running state" >&2
+    echo "[pipeline] Last known status: SERVER_STATUS=${SERVER_STATUS:-unset}, SERVER_ADDRESS=${SERVER_ADDRESS:-unset}, SERVER_CLIENT_HOST=${SERVER_CLIENT_HOST:-unset}" >&2
     exit 1
   fi
 done
 
 echo "[pipeline] launching sequential eval job..."
-"$EVAL_LAUNCHER" "${SEQ_EVAL_ARGS[@]}"
+echo "[pipeline] eval launcher: $EVAL_LAUNCHER"
+echo "[pipeline] eval args: ${SEQ_EVAL_ARGS[*]}"
+
+# Launch the eval job in background to capture PID
+"$EVAL_LAUNCHER" "${SEQ_EVAL_ARGS[@]}" &
+SEQ_EVAL_PID=$!
+echo "[pipeline] sequential eval job launched with PID $SEQ_EVAL_PID"
+
+if [[ "$WAIT_FOR_SEQUENTIAL" == "true" ]]; then
+  echo "[pipeline] waiting for sequential eval job to complete (WAIT_FOR_SEQUENTIAL=true)..."
+  echo "[pipeline] TIP: Check SLURM queue with 'squeue -u $USER' if this hangs"
+  if wait "$SEQ_EVAL_PID"; then
+    echo "[pipeline] sequential eval job completed successfully"
+  else
+    SEQ_STATUS=$?
+    echo "[pipeline] WARNING: sequential eval job exited with status $SEQ_STATUS" >&2
+  fi
+else
+  echo "[pipeline] not waiting for sequential eval (WAIT_FOR_SEQUENTIAL=false)"
+  echo "[pipeline] sequential eval job running in background with PID $SEQ_EVAL_PID"
+fi
 
 echo "[pipeline] launching parallel eval jobs..."
 PARALLEL_PIDS=()
-for eval_cmd in "${PAR_EVAL_ARGS_LIST[@]}"; do
-  eval "$EVAL_LAUNCHER $eval_cmd &"
-  PARALLEL_PIDS+=($!)
-done
+if [[ ${#PAR_EVAL_ARGS_LIST[@]} -eq 0 ]]; then
+  echo "[pipeline] no parallel eval jobs configured (PARALLEL_EVAL_JOBS_OVERRIDE is empty)"
+else
+  echo "[pipeline] launching ${#PAR_EVAL_ARGS_LIST[@]} parallel eval job(s)..."
+  for eval_cmd in "${PAR_EVAL_ARGS_LIST[@]}"; do
+    eval "$EVAL_LAUNCHER $eval_cmd &"
+    PARALLEL_PIDS+=($!)
+  done
+fi
 
-echo "[pipeline] waiting for parallel eval jobs to finish..."
-for pid in "${PARALLEL_PIDS[@]}"; do
-  wait "$pid"
-done
+# Collect all eval PIDs to wait for
+ALL_EVAL_PIDS=()
+if [[ "$WAIT_FOR_SEQUENTIAL" != "true" ]] && kill -0 "$SEQ_EVAL_PID" 2>/dev/null; then
+  echo "[pipeline] will wait for sequential eval (PID $SEQ_EVAL_PID) to complete"
+  ALL_EVAL_PIDS+=("$SEQ_EVAL_PID")
+fi
+ALL_EVAL_PIDS+=("${PARALLEL_PIDS[@]}")
+
+if [[ ${#ALL_EVAL_PIDS[@]} -gt 0 ]]; then
+  echo "[pipeline] waiting for ${#ALL_EVAL_PIDS[@]} eval job(s) to finish..."
+  for pid in "${ALL_EVAL_PIDS[@]}"; do
+    if wait "$pid"; then
+      echo "[pipeline] eval job with PID $pid completed successfully"
+    else
+      echo "[pipeline] WARNING: eval job with PID $pid failed" >&2
+    fi
+  done
+fi
 
 echo "[pipeline] all evaluation jobs completed. Use Ctrl+C or scancel to stop the server when finished."
 

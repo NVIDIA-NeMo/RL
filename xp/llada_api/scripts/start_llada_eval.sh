@@ -200,9 +200,11 @@ if [[ -z "$USER_PROVIDED_SERVER_ADDRESS" && -f "$SERVER_INFO_FILE" ]]; then
         INFO_WAIT_INTERVAL=5
         INFO_WAIT_TIMEOUT=900
         INFO_WAIT_ELAPSED=0
+        INFO_WAIT_ITERATIONS=0
         while true; do
             sleep "$INFO_WAIT_INTERVAL"
             INFO_WAIT_ELAPSED=$((INFO_WAIT_ELAPSED + INFO_WAIT_INTERVAL))
+            INFO_WAIT_ITERATIONS=$((INFO_WAIT_ITERATIONS + 1))
             # shellcheck disable=SC1090
             source "$SERVER_INFO_FILE"
             if [[ "${SERVER_STATUS:-}" == "running" && -n "${SERVER_ADDRESS:-}" && "${SERVER_ADDRESS:-}" != *"0.0.0.0"* ]]; then
@@ -210,8 +212,13 @@ if [[ -z "$USER_PROVIDED_SERVER_ADDRESS" && -f "$SERVER_INFO_FILE" ]]; then
                     break
                 fi
             fi
+            # Print progress every minute (12 iterations)
+            if (( INFO_WAIT_ITERATIONS == 1 || INFO_WAIT_ITERATIONS % 12 == 0 )); then
+                print_status "Still waiting... (${INFO_WAIT_ELAPSED}s elapsed, status=${SERVER_STATUS:-unset}, client_host=${SERVER_CLIENT_HOST:-unset})"
+            fi
             if (( INFO_WAIT_ELAPSED >= INFO_WAIT_TIMEOUT )); then
                 print_error "Timed out waiting for server info update in $SERVER_INFO_FILE"
+                print_error "Last status: SERVER_STATUS=${SERVER_STATUS:-unset}, SERVER_ADDRESS=${SERVER_ADDRESS:-unset}, SERVER_CLIENT_HOST=${SERVER_CLIENT_HOST:-unset}"
                 exit 1
             fi
         done
