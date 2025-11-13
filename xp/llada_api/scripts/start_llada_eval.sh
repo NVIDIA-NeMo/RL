@@ -375,6 +375,8 @@ COMMAND_BLOCK=$(cat <<EOF
 set -euo pipefail
 
 unset UV_CACHE_DIR
+
+# Environment setup
 export PATH="/root/.local/bin:\$PATH"
 export PYTHONPATH="$PROJECT_DIR:\${PYTHONPATH:-}"
 VENV_DIR="/opt/nemo_rl_venv"
@@ -384,16 +386,26 @@ echo "LLaDA Evaluation job starting on node: \$(hostname)"
 echo "Using Python environment at: \${VENV_DIR}"
 echo "===================================================================="
 
+# Activate the container's existing Python environment
+echo "[1/3] Activating container's Python environment..."
 if [ -f "\$VENV_DIR/bin/activate" ]; then
-    source "\$VENV_DIR/bin/activate"
+    source \$VENV_DIR/bin/activate
+    echo "Container Python environment activated."
 else
-    echo "[WARN] No activation script at \$VENV_DIR/bin/activate - using default environment"
+    echo "Warning: No activation script found at \$VENV_DIR/bin/activate"
+    echo "Proceeding with container's default Python environment..."
 fi
 
-echo "[1/3] Syncing dependencies from uv.lock..."
+# Step 2: Prepare environment from uv.lock
+echo "[2/3] Syncing dependencies from uv.lock..."
 uv sync --locked --no-install-project --extra eval
-echo "[2/3] Dependencies ready."
+if [ \$? -ne 0 ]; then
+    echo "Error: Failed to sync dependencies from uv.lock. Exiting."
+    exit 1
+fi
+echo "Dependencies synced successfully."
 
+echo "[3/3] Checking server readiness..."
 SERVER_HEALTH_URL="$SERVER_HEALTH_URL"
 WAIT_FOR_SERVER="$WAIT_FOR_SERVER"
 if [[ "\$WAIT_FOR_SERVER" == "true" ]]; then
@@ -427,7 +439,8 @@ else
     echo "[Eval] Skipping server health check (--no-wait-for-server)."
 fi
 
-echo "[3/3] Running evaluation script..."
+echo ""
+echo "[4/4] Running evaluation script..."
 CMD="\$VENV_DIR/bin/python '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED"
 echo "[Eval] Command: \$CMD"
 eval "\$CMD"
@@ -448,7 +461,7 @@ srun --job-name="$JOB_NAME" \
      --container-workdir="$PROJECT_DIR" \
      --container-mounts="$CONTAINER_MOUNTS" \
      --unbuffered \
-     bash -lc "$COMMAND_BLOCK"
+     bash -c "$COMMAND_BLOCK"
 
 print_status "Evaluation job completed"
 
