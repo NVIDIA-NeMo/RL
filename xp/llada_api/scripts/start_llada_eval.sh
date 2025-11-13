@@ -330,6 +330,19 @@ if [[ "$LOCAL_MODE" == true ]]; then
     export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
     print_status "Checking Python dependencies..."
     uv sync --locked --no-install-project --extra eval
+    
+    # Apply NeMo-Skills patch for extra_body parameter
+    print_status "Applying NeMo-Skills patch for extra_body parameter..."
+    PATCH_SCRIPT="$PROJECT_DIR/xp/nemo-skills/patch_openai_extra_body.py"
+    if [[ -f "$PATCH_SCRIPT" ]]; then
+        python3 "$PATCH_SCRIPT" || {
+            print_warning "Patch script failed. extra_body parameters may not work correctly."
+        }
+    else
+        print_warning "Patch script not found at $PATCH_SCRIPT"
+        print_warning "extra_body parameters (including generation-algorithm) may not work correctly."
+    fi
+    
     if [[ "$WAIT_FOR_SERVER" == true ]]; then
         if command -v curl >/dev/null 2>&1; then
             print_status "Waiting for server health at $SERVER_HEALTH_URL ..."
@@ -441,7 +454,7 @@ else
 fi
 
 # Step 2: Prepare environment from uv.lock
-echo "[2/3] Syncing dependencies from uv.lock..."
+echo "[2/5] Syncing dependencies from uv.lock..."
 if command -v uv >/dev/null 2>&1; then
     echo "[DEBUG] uv command is available, running sync..."
     uv sync --locked --no-install-project --extra eval
@@ -455,7 +468,24 @@ else
     echo "If you encounter missing dependencies, install uv in the container or use a container with uv pre-installed."
 fi
 
-echo "[3/3] Checking server readiness..."
+# Step 2.5: Determine Python binary to use
+PYTHON_BIN="\$VENV_DIR/bin/python"
+echo "[DEBUG] Python binary set to: \$PYTHON_BIN"
+
+# Step 3: Apply NeMo-Skills patch for extra_body parameter
+echo "[3/5] Applying NeMo-Skills patch for extra_body parameter..."
+PATCH_SCRIPT="$PROJECT_DIR/xp/nemo-skills/patch_openai_extra_body.py"
+if [ -f "\$PATCH_SCRIPT" ]; then
+    echo "[DEBUG] Running patch script: \$PYTHON_BIN \$PATCH_SCRIPT"
+    \$PYTHON_BIN "\$PATCH_SCRIPT" || {
+        echo "Warning: Patch script failed. extra_body parameters may not work correctly."
+    }
+else
+    echo "Warning: Patch script not found at \$PATCH_SCRIPT"
+    echo "extra_body parameters (including generation-algorithm) may not work correctly."
+fi
+
+echo "[4/5] Checking server readiness..."
 SERVER_HEALTH_URL="$SERVER_HEALTH_URL"
 WAIT_FOR_SERVER="$WAIT_FOR_SERVER"
 echo "[Eval] Current node: \$(hostname)"
@@ -497,11 +527,11 @@ else
     echo "[Eval] Skipping server health check (--no-wait-for-server)."
 fi
 
-# Step 3b: Prepare benchmark data
+# Step 4b: Prepare benchmark data
 BENCHMARK_NAME_TO_PREPARE="$BENCHMARK_NAME"
 if [[ -n "\$BENCHMARK_NAME_TO_PREPARE" ]]; then
     echo ""
-    echo "[3b/4] Preparing benchmark data for '\$BENCHMARK_NAME_TO_PREPARE'..."
+    echo "[4.5/5] Preparing benchmark data for '\$BENCHMARK_NAME_TO_PREPARE'..."
     NS_BIN="\$VENV_DIR/bin/ns"
     if [ -f "\$NS_BIN" ]; then
         \$NS_BIN prepare_data "\$BENCHMARK_NAME_TO_PREPARE"
@@ -515,23 +545,9 @@ else
 fi
 
 echo ""
-echo "[4/4] Running evaluation script..."
+echo "[5/5] Running evaluation script..."
 
-# Debug: Check what's actually available
-echo "[DEBUG] VENV_DIR is set to: \$VENV_DIR"
-if [ -d "\$VENV_DIR" ]; then
-    echo "[DEBUG] \$VENV_DIR exists"
-    echo "[DEBUG] Looking for Python in \$VENV_DIR/bin:"
-    ls -la "\$VENV_DIR/bin/" | grep -E "python|Python" || echo "[DEBUG] No python files found in directory listing"
-else
-    echo "[DEBUG] ERROR: \$VENV_DIR does NOT exist"
-    exit 1
-fi
-
-# Use the venv python directly (matching server script approach)
-# The venv is built into the container and should always have python
-PYTHON_BIN="\$VENV_DIR/bin/python"
-
+# Verify Python binary
 echo "[DEBUG] Using Python: \$PYTHON_BIN"
 
 # Show symlink info if applicable
