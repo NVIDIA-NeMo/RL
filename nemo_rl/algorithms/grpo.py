@@ -613,9 +613,6 @@ def setup(
     print(" " * 18 + "SETUP COMPLETE")
     print(f"  Total setup time: {total_setup_time:.1f}s")
     print("=" * 60 + "\n", flush=True)
-    import sys
-
-    sys.exit(0)
 
     return (
         policy,
