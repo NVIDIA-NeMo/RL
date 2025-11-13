@@ -487,6 +487,24 @@ fi
 echo ""
 echo "[4/4] Running evaluation script..."
 
+# Debug: Check what's actually available
+echo "[DEBUG] VENV_DIR is set to: \$VENV_DIR"
+echo "[DEBUG] Checking if \$VENV_DIR exists..."
+if [ -d "\$VENV_DIR" ]; then
+    echo "[DEBUG] \$VENV_DIR exists"
+    echo "[DEBUG] Contents of \$VENV_DIR/bin:"
+    ls -la "\$VENV_DIR/bin/" | head -20
+else
+    echo "[DEBUG] \$VENV_DIR does NOT exist"
+fi
+
+echo "[DEBUG] Looking for Python executables..."
+echo "[DEBUG] Checking common locations:"
+ls -la /usr/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/bin/"
+ls -la /usr/local/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/local/bin/"
+which python python3 2>/dev/null || echo "[DEBUG] No python in PATH"
+
+echo "[DEBUG] Attempting to run with \$VENV_DIR/bin/python..."
 # Use the same Python command as the server script
 \$VENV_DIR/bin/python '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
 EOF
