@@ -1,5 +1,6 @@
 #!/bin/bash
 # Minimal preset launcher for the Nemotron diffusion evaluation pipeline.
+# This version uses the --use-same-node fix for proper network connectivity.
 
 set -euo pipefail
 
@@ -17,14 +18,13 @@ export SEQ_EVAL_STEPS="512"
 export SEQ_EVAL_BLOCK_LENGTH="32"
 export SEQ_EVAL_EXTRA_ARGS="--model nemotron-4b"
 
-# NETWORK FIX: Skip health check since eval must run on 'cpu' partition
-# which likely can't reach GPU nodes on 'interactive' partition
-export SEQ_EVAL_NO_WAIT_SERVER="true"
-
-# Note: Cannot use SEQ_EVAL_USE_SAME_NODE="true" because the cpu partition
-# doesn't include GPU nodes where the server runs (interactive partition)
+# RECOMMENDED FIX: Run eval on same node as server for network connectivity
+export SEQ_EVAL_USE_SAME_NODE="true"
+# Also change partition to same as server so the node is available
+export SEQ_EVAL_PARTITION="interactive"
 
 export PARALLEL_EVAL_JOBS_OVERRIDE=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec "$SCRIPT_DIR/run_llada_eval_pipeline.sh"
+

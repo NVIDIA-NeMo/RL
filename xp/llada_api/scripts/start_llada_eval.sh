@@ -41,6 +41,7 @@ Core options:
   --server-info-file PATH    Path to server info file written by start_llada_batch_server.sh
                              (default: xp/llada_api/.llada_server_info)
   --no-wait-for-server       Do not poll the server /health endpoint before running evaluation
+  --use-same-node            Run eval on same SLURM node as server (reads from server info file)
 
 SLURM options (ignored with --local):
   --job-name NAME            SLURM job name (default: llada-eval)
@@ -77,6 +78,8 @@ USER_PROVIDED_SERVER_ADDRESS=""
 WAIT_FOR_SERVER=true
 ACCOUNT_VALUE="${ACCOUNT:-}"
 VERBOSE=false
+USE_SAME_NODE=false
+NODELIST=""
 
 EVAL_ARGS=()
 
@@ -130,6 +133,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-wait-for-server)
             WAIT_FOR_SERVER=false
+            shift 1
+            ;;
+        --use-same-node)
+            USE_SAME_NODE=true
             shift 1
             ;;
         --verbose)
@@ -355,6 +362,20 @@ if [[ -n "$EVAL_OUTPUT_DIR" ]]; then
     fi
 fi
 
+# Determine node constraint if --use-same-node is set
+if [[ "$USE_SAME_NODE" == true ]]; then
+    if [[ -n "${SLURMD_NODENAME:-}" ]]; then
+        NODELIST="$SLURMD_NODENAME"
+        print_status "Will run eval on same node as server: $NODELIST"
+    elif [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+        NODELIST="$SLURM_JOB_NODELIST"
+        print_status "Will run eval on same node as server: $NODELIST"
+    else
+        print_warning "--use-same-node requested but no server node information found in $SERVER_INFO_FILE"
+        print_warning "Proceeding without node constraint"
+    fi
+fi
+
 print_status "Submitting SLURM evaluation job"
 echo "  • Job name: $JOB_NAME"
 echo "  • Time limit: $TIME"
@@ -364,6 +385,9 @@ echo "  • Partition: $PARTITION"
 echo "  • Account: $ACCOUNT_VALUE"
 echo "  • Container: $CONTAINER_IMAGE"
 echo "  • Server: $SERVER_ADDRESS"
+if [[ -n "$NODELIST" ]]; then
+    echo "  • Node constraint: $NODELIST (co-located with server)"
+fi
 
 if [[ "$WAIT_FOR_SERVER" == true ]]; then
     print_status "Server readiness check enabled (health URL: $SERVER_HEALTH_URL)"
@@ -408,9 +432,14 @@ echo "Dependencies synced successfully."
 echo "[3/3] Checking server readiness..."
 SERVER_HEALTH_URL="$SERVER_HEALTH_URL"
 WAIT_FOR_SERVER="$WAIT_FOR_SERVER"
+echo "[Eval] Current node: \$(hostname)"
+echo "[Eval] Server health URL: \$SERVER_HEALTH_URL"
 if [[ "\$WAIT_FOR_SERVER" == "true" ]]; then
     if command -v curl >/dev/null 2>&1; then
         echo "[Eval] Waiting for server health at \$SERVER_HEALTH_URL ..."
+        echo "[Eval] Testing initial connectivity..."
+        curl -v --connect-timeout 2 "\$SERVER_HEALTH_URL" 2>&1 | head -20 || true
+        echo ""
         ATTEMPT=0
         TIMEOUT=900
         INTERVAL=5
@@ -418,9 +447,12 @@ if [[ "\$WAIT_FOR_SERVER" == "true" ]]; then
             ATTEMPT=\$((ATTEMPT + 1))
             ELAPSED=\$((ATTEMPT * INTERVAL))
             
-            # Show progress every minute (12 attempts)
+            # Show progress every minute (12 attempts) with more diagnostics
             if [[ \$((ATTEMPT % 12)) -eq 0 ]]; then
                 echo "[Eval] Still waiting for server... (\${ELAPSED}s elapsed, timeout at \${TIMEOUT}s)"
+                echo "[Eval] Health URL: \$SERVER_HEALTH_URL"
+                echo "[Eval] Diagnostic curl output:"
+                curl -v --connect-timeout 2 "\$SERVER_HEALTH_URL" 2>&1 | head -20 || true
             fi
             
             if [[ \$ELAPSED -ge \$TIMEOUT ]]; then
@@ -451,17 +483,25 @@ print_status "Submitting job to SLURM (this will block until job completes)..."
 print_status "Job will run on partition: $PARTITION"
 echo ""
 
-srun --job-name="$JOB_NAME" \
-     --time="$TIME" \
-     --cpus-per-task="$CPUS_PER_TASK" \
-     --mem="$MEM" \
-     --partition="$PARTITION" \
-     --account="$ACCOUNT_VALUE" \
-     --container-image="$CONTAINER_IMAGE" \
-     --container-workdir="$PROJECT_DIR" \
-     --container-mounts="$CONTAINER_MOUNTS" \
-     --unbuffered \
-     bash -c "$COMMAND_BLOCK"
+SRUN_ARGS=(
+    "--job-name=$JOB_NAME"
+    "--time=$TIME"
+    "--cpus-per-task=$CPUS_PER_TASK"
+    "--mem=$MEM"
+    "--partition=$PARTITION"
+    "--account=$ACCOUNT_VALUE"
+    "--container-image=$CONTAINER_IMAGE"
+    "--container-workdir=$PROJECT_DIR"
+    "--container-mounts=$CONTAINER_MOUNTS"
+    "--unbuffered"
+)
+
+if [[ -n "$NODELIST" ]]; then
+    SRUN_ARGS+=("--nodelist=$NODELIST")
+    print_status "Running on specific node: $NODELIST"
+fi
+
+srun "${SRUN_ARGS[@]}" bash -c "$COMMAND_BLOCK"
 
 print_status "Evaluation job completed"
 

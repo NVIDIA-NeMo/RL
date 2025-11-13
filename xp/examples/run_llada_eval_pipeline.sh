@@ -28,6 +28,7 @@ SEQ_EVAL_CPUS="${SEQ_EVAL_CPUS:-48}"
 SEQ_EVAL_TIME="${SEQ_EVAL_TIME:-02:00:00}"
 SEQ_EVAL_PARTITION="${SEQ_EVAL_PARTITION:-cpu}"
 SEQ_EVAL_NO_WAIT_SERVER="${SEQ_EVAL_NO_WAIT_SERVER:-false}"
+SEQ_EVAL_USE_SAME_NODE="${SEQ_EVAL_USE_SAME_NODE:-false}"
 
 # === Pipeline / model configuration =========================================
 SERVER_INFO_FILE="${SERVER_INFO_FILE:-/lustre/fsw/portfolios/llmservice/users/${USER}/tmp/llada_server.env}"
@@ -117,6 +118,9 @@ SEQ_EVAL_ARGS=(
 )
 if [[ "$SEQ_EVAL_NO_WAIT_SERVER" == "true" ]]; then
   SEQ_EVAL_ARGS+=("--no-wait-for-server")
+fi
+if [[ "$SEQ_EVAL_USE_SAME_NODE" == "true" ]]; then
+  SEQ_EVAL_ARGS+=("--use-same-node")
 fi
 SEQ_EVAL_ARGS+=("--")
 if [[ -n "$SEQ_EVAL_BENCHMARK" ]]; then
