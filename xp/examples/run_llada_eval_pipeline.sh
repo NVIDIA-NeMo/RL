@@ -49,7 +49,7 @@ SEQ_EVAL_EXTRA_ARGS="${SEQ_EVAL_EXTRA_ARGS:-}"
 GLOBAL_EVAL_FLAGS="${GLOBAL_EVAL_FLAGS:-}"
 
 # Parallel evaluation jobs (newline-separated list; edit or override as needed)
-read -r -d '' DEFAULT_PARALLEL_JOBS <<'EOF'
+read -r -d '' DEFAULT_PARALLEL_JOBS <<'EOF' || true
 --job-name llada-eval-par-1 --cpus 64 --time 03:00:00 --server-info-file ${SERVER_INFO_FILE} -- --benchmark gsm8k:1 --generation-algorithm nemotron --model nemotron-4b --threshold 0.9 --tokens-to-generate 512 --steps 512 --block-length 32 --expname llada-gsm8k-par-1
 --job-name llada-eval-par-2 --cpus 64 --time 03:00:00 --server-info-file ${SERVER_INFO_FILE} -- --benchmark gsm8k:1 --generation-algorithm nemotron --model nemotron-4b --threshold 0.9 --tokens-to-generate 512 --steps 512 --block-length 32 --expname llada-gsm8k-par-2
 EOF
@@ -153,8 +153,22 @@ fi
 
 trap 'echo "[pipeline] terminating..."; [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
+echo "[pipeline] server launcher: $SERVER_LAUNCHER"
+echo "[pipeline] server args: ${SERVER_ARGS[*]}"
+
 "$SERVER_LAUNCHER" "${SERVER_ARGS[@]}" &
 SERVER_PID=$!
+sleep 2
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  if wait "$SERVER_PID"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  echo "[pipeline] server launcher exited immediately (status $STATUS)." >&2
+  exit "$STATUS"
+fi
+
 
 echo "[pipeline] waiting for server info at $SERVER_INFO_FILE ..."
 for attempt in {1..180}; do
