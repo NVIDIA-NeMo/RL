@@ -302,7 +302,7 @@ if [[ "$LOCAL_MODE" == true ]]; then
     print_status "Running evaluation locally (no SLURM)"
     export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
     print_status "Checking Python dependencies..."
-    uv sync --locked --no-install-project
+    uv sync --locked --no-install-project --extra eval
     if [[ "$WAIT_FOR_SERVER" == true ]]; then
         if command -v curl >/dev/null 2>&1; then
             print_status "Waiting for server health at $SERVER_HEALTH_URL ..."
@@ -384,7 +384,7 @@ else
 fi
 
 echo "[1/3] Syncing dependencies from uv.lock..."
-uv sync --locked --no-install-project
+uv sync --locked --no-install-project --extra eval
 echo "[2/3] Dependencies ready."
 
 SERVER_HEALTH_URL="$SERVER_HEALTH_URL"
