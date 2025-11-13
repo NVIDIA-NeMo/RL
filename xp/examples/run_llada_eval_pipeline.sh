@@ -57,8 +57,6 @@ WAIT_FOR_SEQUENTIAL="${WAIT_FOR_SEQUENTIAL:-true}"
 
 # Parallel evaluation jobs (newline-separated list; edit or override as needed)
 read -r -d '' DEFAULT_PARALLEL_JOBS <<'EOF' || true
---job-name llada-eval-par-1 --cpus 64 --time 03:00:00 --server-info-file ${SERVER_INFO_FILE} -- --benchmark gsm8k:1 --generation-algorithm nemotron --model nemotron-4b --threshold 0.9 --tokens-to-generate 512 --steps 512 --block-length 32 --expname llada-gsm8k-par-1
---job-name llada-eval-par-2 --cpus 64 --time 03:00:00 --server-info-file ${SERVER_INFO_FILE} -- --benchmark gsm8k:1 --generation-algorithm nemotron --model nemotron-4b --threshold 0.9 --tokens-to-generate 512 --steps 512 --block-length 32 --expname llada-gsm8k-par-2
 EOF
 PARALLEL_EVAL_JOBS="${PARALLEL_EVAL_JOBS_OVERRIDE:-$DEFAULT_PARALLEL_JOBS}"
 # ===========================================================================
