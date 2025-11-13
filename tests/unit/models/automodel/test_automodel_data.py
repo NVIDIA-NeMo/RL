@@ -48,6 +48,7 @@ def mock_dp_mesh():
     return mesh
 
 
+@pytest.mark.automodel
 class TestGetMicrobatchIterator:
     def test_regular_batching(self):
         # Create test data
@@ -217,6 +218,7 @@ class TestGetMicrobatchIterator:
         assert len(dummy_batches) == 2
 
 
+@pytest.mark.automodel
 class TestProcessMicrobatch:
     def test_regular_batching(self, mock_tokenizer):
         # Create test microbatch
@@ -434,6 +436,7 @@ class TestProcessMicrobatch:
             )
 
 
+@pytest.mark.automodel
 class TestProcessGlobalBatch:
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_basic_processing(self, mock_all_reduce, mock_loss_fn, mock_dp_mesh):
@@ -662,6 +665,7 @@ class TestProcessGlobalBatch:
         data.get_batch.assert_any_call(batch_idx=1, batch_size=4)
 
 
+@pytest.mark.automodel
 class TestIntegrationScenarios:
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_full_pipeline_regular_batching(

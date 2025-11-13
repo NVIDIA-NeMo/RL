@@ -381,6 +381,7 @@ def test_dtensor_worker_training(use_v2, training_setup):
 
     # Call prepare_for_training if available
     print("\nPreparing for training...")
+    print(f"policy: {policy.__class__.__name__}")
     policy.prepare_for_training()
 
     losses = []

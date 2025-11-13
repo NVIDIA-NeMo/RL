@@ -102,6 +102,7 @@ def mock_optimizer():
     return optimizer
 
 
+@pytest.mark.automodel
 class TestSetupTrainLoop:
     @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_basic_setup(self, mock_all_reduce, mock_dp_mesh):
@@ -242,6 +243,7 @@ class TestSetupTrainLoop:
         assert result["sequence_dim"] == 1
 
 
+@pytest.mark.automodel
 class TestForwardBackward:
     def test_basic_forward_backward_eval_mode(self, mock_model, mock_loss_fn):
         # Create test microbatch
@@ -687,6 +689,7 @@ class TestForwardBackward:
         assert loss is not None
 
 
+@pytest.mark.automodel
 class TestOptimizerStep:
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_basic_optimizer_step(
@@ -906,6 +909,7 @@ class TestOptimizerStep:
         assert abs(float(grad_norm) - 2.3) < 1e-5
 
 
+@pytest.mark.automodel
 class TestCleanupAfterTraining:
     def test_cleanup_in_train_mode(self, mock_optimizer):
         # Create mock scheduler
@@ -963,6 +967,7 @@ class TestCleanupAfterTraining:
         mock_empty_cache.assert_called_once()
 
 
+@pytest.mark.automodel
 class TestProcessLogits:
     def test_process_logits_from_tensor(self):
         # Create mock model output as tensor
@@ -1023,6 +1028,7 @@ class TestProcessLogits:
         assert torch.allclose(logits, expected_logits)
 
 
+@pytest.mark.automodel
 class TestModelForward:
     def test_basic_model_forward(self, mock_model):
         processed_inputs = {
@@ -1201,6 +1207,7 @@ class TestModelForward:
         assert "padding_mask" not in call_kwargs
 
 
+@pytest.mark.automodel
 class TestForwardWithProcessor:
     def test_with_get_loss_processor(self, mock_model, mock_loss_fn):
         """Test forward_with_processor with get_loss as the processor."""
@@ -1231,7 +1238,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor with get_loss as processor
         loss, loss_metrics = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=get_loss,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1244,6 +1250,7 @@ class TestForwardWithProcessor:
             is_moe_model=False,
             apply_temperature_fn=apply_temperature_fn,
             processor_kwargs={
+                "mb": mb,
                 "loss_fn": mock_loss_fn,
                 "global_valid_seqs": global_valid_seqs,
                 "global_valid_toks": global_valid_toks,
@@ -1290,7 +1297,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor with get_logprobs as processor
         token_logprobs = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=get_logprobs,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1304,7 +1310,6 @@ class TestForwardWithProcessor:
             apply_temperature_fn=apply_temperature_fn,
             processor_kwargs={
                 "input_ids": input_ids,
-                "enable_seq_packing": False,
                 "logprob_chunk_size": None,
             },
         )
@@ -1346,7 +1351,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor with get_topk_logits as processor
         vals, idx = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=get_topk_logits,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1361,7 +1365,6 @@ class TestForwardWithProcessor:
             processor_kwargs={
                 "k": 10,
                 "tp_mesh": mock_tp_mesh,
-                "enable_seq_packing": False,
             },
         )
 
@@ -1379,7 +1382,6 @@ class TestForwardWithProcessor:
         def custom_processor(
             outputs,
             model,
-            mb,
             processed_inputs,
             cp_size,
             cp_mesh,
@@ -1414,7 +1416,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor with custom processor
         result = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=custom_processor,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1442,7 +1443,6 @@ class TestForwardWithProcessor:
         def simple_processor(
             outputs,
             model,
-            mb,
             processed_inputs,
             cp_size,
             cp_mesh,
@@ -1476,7 +1476,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor without processor_kwargs
         result = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=simple_processor,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1529,7 +1528,6 @@ class TestForwardWithProcessor:
         # Call forward_with_processor
         loss, loss_metrics = forward_with_processor(
             model=mock_model,
-            mb=mb,
             processor_fn=get_loss,
             processed_inputs=processed_inputs,
             dtype=torch.float16,
@@ -1542,6 +1540,7 @@ class TestForwardWithProcessor:
             is_moe_model=False,
             apply_temperature_fn=apply_temperature_fn,
             processor_kwargs={
+                "mb": mb,
                 "loss_fn": mock_loss_fn,
                 "global_valid_seqs": global_valid_seqs,
                 "global_valid_toks": global_valid_toks,
@@ -1553,6 +1552,7 @@ class TestForwardWithProcessor:
         apply_temperature_fn.assert_called()
 
 
+@pytest.mark.automodel
 class TestGetLoss:
     def test_basic_train_output_processing(self, mock_model, mock_loss_fn):
         # Create mock outputs
@@ -1664,6 +1664,7 @@ class TestGetLoss:
         wrapped_loss_fn.assert_called_once()
 
 
+@pytest.mark.automodel
 class TestGetLogprobs:
     def test_basic_logprob_extraction(self, mock_model):
         # Create mock outputs
@@ -1696,13 +1697,11 @@ class TestGetLogprobs:
         token_logprobs = get_logprobs(
             outputs=outputs,
             model=mock_model,
-            mb=mb,
             processed_inputs=processed_inputs,
             input_ids=input_ids,
             cp_size=1,
             cp_mesh=None,
             device_mesh=None,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
             logprob_chunk_size=None,
         )
@@ -1745,13 +1744,11 @@ class TestGetLogprobs:
         token_logprobs = get_logprobs(
             outputs=outputs,
             model=mock_model,
-            mb=mb,
             processed_inputs=processed_inputs,
             input_ids=input_ids,
             cp_size=1,
             cp_mesh=None,
             device_mesh=None,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
             logprob_chunk_size=64,
         )
@@ -1763,6 +1760,7 @@ class TestGetLogprobs:
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
 
+@pytest.mark.automodel
 class TestGetTopkLogits:
     def test_basic_topk_extraction(self, mock_model):
         # Create mock outputs
@@ -1796,14 +1794,12 @@ class TestGetTopkLogits:
         vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
-            mb=mb,
             processed_inputs=processed_inputs,
             k=10,
             cp_size=1,
             cp_mesh=None,
             device_mesh=None,
             tp_mesh=mock_tp_mesh,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1849,14 +1845,12 @@ class TestGetTopkLogits:
         vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
-            mb=mb,
             processed_inputs=processed_inputs,
             k=5,
             cp_size=1,
             cp_mesh=None,
             device_mesh=None,
             tp_mesh=mock_tp_mesh,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1893,14 +1887,12 @@ class TestGetTopkLogits:
         vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
-            mb=mb,
             processed_inputs=processed_inputs,
             k=20,
             cp_size=1,
             cp_mesh=None,
             device_mesh=None,
             tp_mesh=mock_tp_mesh,
-            enable_seq_packing=False,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1908,6 +1900,7 @@ class TestGetTopkLogits:
         assert idx.shape == (3, 48, 20)
 
 
+@pytest.mark.automodel
 class TestIntegrationScenarios:
     @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")

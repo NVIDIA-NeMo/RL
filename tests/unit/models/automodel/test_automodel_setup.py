@@ -65,6 +65,7 @@ def mock_autoconfig():
     return config
 
 
+@pytest.mark.automodel
 class TestValidateAndSetConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -495,6 +496,7 @@ class TestValidateAndSetConfig:
         assert "sequence_parallel=True, but tp_size=1" in captured.out
 
 
+@pytest.mark.automodel
 class TestSetupDistributed:
     @patch("nemo_rl.models.automodel.setup.torch.distributed.init_process_group")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -622,6 +624,7 @@ class TestSetupDistributed:
         assert call_kwargs["offload_policy"] is not None
 
 
+@pytest.mark.automodel
 class TestSetupModelAndOptimizer:
     @patch("torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.init_empty_weights")

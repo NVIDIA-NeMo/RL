@@ -115,7 +115,9 @@ def forward_backward(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     sequence_dim = 1
     cp_buffers = processed_inputs["cp_buffers"]
-    with get_train_context(cp_size, cp_mesh, cp_buffers, sequence_dim, dtype):
+    with get_train_context(
+        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=is_hf_model
+    ):
         outputs = model_forward(
             model,
             processed_inputs,
@@ -155,7 +157,6 @@ def forward_backward(
 
 def forward_with_processor(
     model: nn.Module,
-    mb: BatchedDataDict[Any],
     processor_fn: Any,
     processed_inputs: dict[str, Any],
     dtype: torch.dtype,
@@ -175,7 +176,9 @@ def forward_with_processor(
     sequence_dim = 1
     cp_buffers = processed_inputs["cp_buffers"]
 
-    with get_train_context(cp_size, cp_mesh, cp_buffers, sequence_dim, dtype):
+    with get_train_context(
+        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=is_hf_model
+    ):
         outputs = model_forward(
             model,
             processed_inputs,
@@ -191,7 +194,6 @@ def forward_with_processor(
         result = processor_fn(
             outputs=outputs,
             model=model,
-            mb=mb,
             processed_inputs=processed_inputs,
             cp_size=cp_size,
             cp_mesh=cp_mesh,
@@ -453,18 +455,15 @@ def get_loss(
 def get_logprobs(
     outputs: Any,
     model: nn.Module,
-    mb: BatchedDataDict[Any],
     processed_inputs: dict[str, Any],
     input_ids: torch.Tensor,
     cp_size: int,
     cp_mesh: Any,
     device_mesh: Any,
-    enable_seq_packing: bool,
     apply_temperature_fn,
     logprob_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     sequence_dim = 1
-    cp_buffers = processed_inputs["cp_buffers"]
     seq_index = processed_inputs["seq_index"]
     seq_len = processed_inputs["seq_len"]
 
@@ -548,14 +547,12 @@ def get_logprobs(
 def get_topk_logits(
     outputs: Any,
     model: nn.Module,
-    mb: BatchedDataDict[Any],
     processed_inputs: dict[str, Any],
     k: int,
     cp_size: int,
     cp_mesh: Any,
     device_mesh: Any,
     tp_mesh: Any,
-    enable_seq_packing: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from nemo_rl.distributed.model_utils import (

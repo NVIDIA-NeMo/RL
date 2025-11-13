@@ -506,7 +506,6 @@ class DTensorPolicyWorkerV2:
                 # Model forward pass and logprobs processing
                 token_logprobs = forward_with_processor(
                     model=self.model,
-                    mb=lp_batch,
                     processor_fn=get_logprobs,
                     processed_inputs=processed_inputs,
                     dtype=self.dtype,
@@ -520,7 +519,6 @@ class DTensorPolicyWorkerV2:
                     apply_temperature_fn=self._apply_temperature_scaling,
                     processor_kwargs={
                         "input_ids": input_ids,
-                        "enable_seq_packing": self.enable_seq_packing,
                         "logprob_chunk_size": logprob_chunk_size,
                     },
                 )
@@ -753,7 +751,6 @@ class DTensorPolicyWorkerV2:
                 # Model forward pass and top-k processing
                 vals, idx = forward_with_processor(
                     model=self.model,
-                    mb=lp_batch,
                     processor_fn=get_topk_logits,
                     processed_inputs=processed_inputs,
                     dtype=self.dtype,
@@ -768,7 +765,6 @@ class DTensorPolicyWorkerV2:
                     processor_kwargs={
                         "k": k,
                         "tp_mesh": self.tp_mesh,
-                        "enable_seq_packing": self.enable_seq_packing,
                     },
                 )
 
