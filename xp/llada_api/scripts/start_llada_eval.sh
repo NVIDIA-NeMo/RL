@@ -400,8 +400,8 @@ set -euo pipefail
 
 unset UV_CACHE_DIR
 
-# Environment setup
-export PATH="/root/.local/bin:\$PATH"
+# Environment setup - ensure uv is in PATH
+export PATH="/root/.local/bin:/usr/local/bin:\$PATH"
 export PYTHONPATH="$PROJECT_DIR:\${PYTHONPATH:-}"
 VENV_DIR="/opt/nemo_rl_venv"
 
@@ -410,11 +410,18 @@ echo "LLaDA Evaluation job starting on node: \$(hostname)"
 echo "Using Python environment at: \${VENV_DIR}"
 echo "===================================================================="
 
+# Debug: Check where uv is located
+echo "[DEBUG] Searching for uv command..."
+which uv 2>/dev/null && echo "[DEBUG] uv found at: \$(which uv)" || echo "[DEBUG] uv not found in PATH"
+echo "[DEBUG] Current PATH: \$PATH"
+
 # Activate the container's existing Python environment
 echo "[1/3] Activating container's Python environment..."
 if [ -f "\$VENV_DIR/bin/activate" ]; then
     source \$VENV_DIR/bin/activate
     echo "Container Python environment activated."
+    echo "[DEBUG] PATH after activation: \$PATH"
+    which uv 2>/dev/null && echo "[DEBUG] uv found after activation at: \$(which uv)" || echo "[DEBUG] uv still not found"
 else
     echo "Warning: No activation script found at \$VENV_DIR/bin/activate"
     echo "Proceeding with container's default Python environment..."
@@ -422,12 +429,18 @@ fi
 
 # Step 2: Prepare environment from uv.lock
 echo "[2/3] Syncing dependencies from uv.lock..."
-uv sync --locked --no-install-project --extra eval
-if [ \$? -ne 0 ]; then
-    echo "Error: Failed to sync dependencies from uv.lock. Exiting."
-    exit 1
+if command -v uv >/dev/null 2>&1; then
+    echo "[DEBUG] uv command is available, running sync..."
+    uv sync --locked --no-install-project --extra eval
+    if [ \$? -ne 0 ]; then
+        echo "Warning: uv sync failed, but continuing with container's existing environment..."
+    else
+        echo "Dependencies synced successfully."
+    fi
+else
+    echo "Warning: uv command not found. Using container's pre-installed environment."
+    echo "If you encounter missing dependencies, install uv in the container or use a container with uv pre-installed."
 fi
-echo "Dependencies synced successfully."
 
 echo "[3/3] Checking server readiness..."
 SERVER_HEALTH_URL="$SERVER_HEALTH_URL"
