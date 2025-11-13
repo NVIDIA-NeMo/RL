@@ -14,8 +14,11 @@
 
 set -euo pipefail
 
+export EVAL_OUTPUT_DIR="/lustre/fsw/portfolios/llmservice/users/$USER/llada-eval"
+
 # Run SERVER on interactive partition (REQUIRED for GPU access)
 export SERVER_PARTITION="batch_singlenode"
+export SERVER_INFO_FILE="${EVAL_OUTPUT_DIR}/server_info.env"
 export SERVER_GPUS=8
 export SERVER_BATCH_SIZE=1
 export SERVER_MODEL_PATH="nvidia/Nemotron-Diffusion-Research-4B-v0"
@@ -27,6 +30,7 @@ export SERVER_EXTRA_ARGS="--verbose"
 # Run EVAL on cpu partition (attempt same node via --use-same-node)
 export SEQ_EVAL_PARTITION="cpu"
 export SEQ_EVAL_BENCHMARK="gsm8k:1"
+export SEQ_EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR}"
 export SEQ_EVAL_GENERATION_ALGORITHM="nemotron"
 export SEQ_EVAL_THRESHOLD="0.9"
 export SEQ_EVAL_TOKENS_TO_GENERATE="512"
