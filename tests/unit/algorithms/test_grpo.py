@@ -24,6 +24,7 @@ from nemo_rl.algorithms.grpo import (
     async_grpo_train,
     dynamic_sampling,
     grpo_train,
+    normalize_advantages_with_epsilon,
 )
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -1208,3 +1209,75 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
             assert not (line.startswith("Step ") and "Step 9" in line), (
                 f"Training continued to next step after timeout: {line}"
             )
+
+
+# ============================================================================
+# Tests for normalize_advantages_with_epsilon function
+# ============================================================================
+
+
+def test_normalize_advantages_with_epsilon_basic():
+    """Test basic functionality of normalize_advantages_with_epsilon."""
+    # Test case with normal values
+    advantages = torch.tensor([[2.0], [4.0], [6.0]])
+    std = torch.tensor([1.0, 2.0, 3.0])
+    epsilon = 1e-6
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    expected = torch.tensor([[2.0], [2.0], [2.0]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_zero_std():
+    """Test normalize_advantages_with_epsilon when std contains zeros."""
+    advantages = torch.tensor([[1.0], [2.0], [3.0]])
+    std = torch.tensor([0.0, 1.0, 0.0])  # Zero std for indices 0 and 2
+    epsilon = 1e-6
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    # When std=0, result should be advantages / epsilon
+    expected = torch.tensor([[1.0 / epsilon], [2.0], [3.0 / epsilon]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_all_zero_std():
+    """Test normalize_advantages_with_epsilon when all std values are zero."""
+    advantages = torch.tensor([[1.5], [2.5], [3.5]])
+    std = torch.tensor([0.0, 0.0, 0.0])
+    epsilon = 1e-8
+
+    result = normalize_advantages_with_epsilon(advantages, std, epsilon)
+
+    expected = advantages / epsilon
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_tensor_shapes():
+    """Test normalize_advantages_with_epsilon with different tensor shapes."""
+    # Test with batch size 1
+    advantages = torch.tensor([[5.0]])
+    std = torch.tensor([2.0])
+    result = normalize_advantages_with_epsilon(advantages, std)
+    expected = torch.tensor([[2.5]])
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+    # Test with larger batch
+    batch_size = 10
+    advantages = torch.ones(batch_size, 1) * 3.0
+    std = torch.ones(batch_size) * 1.5
+    result = normalize_advantages_with_epsilon(advantages, std)
+    expected = torch.ones(batch_size, 1) * 2.0
+    assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_epsilon_negative_advantages():
+    """Test normalize_advantages_with_epsilon with negative advantages."""
+    advantages = torch.tensor([[-2.0], [3.0], [-1.5]])
+    std = torch.tensor([1.0, 1.5, 0.5])
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+
+    expected = torch.tensor([[-2.0], [2.0], [-3.0]])
+    assert torch.allclose(result, expected, rtol=1e-5)
