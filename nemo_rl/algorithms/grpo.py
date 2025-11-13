@@ -436,6 +436,7 @@ def setup(
     # ==========================
     print("\n▶ Setting up model and training...", flush=True)
 
+    # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
@@ -645,6 +646,9 @@ def setup(
     print(" " * 18 + "SETUP COMPLETE")
     print(f"  Total setup time: {total_setup_time:.1f}s")
     print("=" * 60 + "\n", flush=True)
+    import sys
+
+    sys.exit(0)
 
     return (
         policy,
