@@ -49,22 +49,17 @@ from transformers import (
 
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.huggingface.common import (
-    get_flash_attention_kwargs,
-    pack_sequences,
-)
-from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.dtensor_data import (
+from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
     process_microbatch,
 )
-from nemo_rl.models.policy.dtensor_init import (
+from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
     validate_and_set_config,
 )
-from nemo_rl.models.policy.dtensor_train import (
+from nemo_rl.models.automodel.train import (
     cleanup_after_training,
     forward_backward,
     model_forward,
@@ -73,6 +68,11 @@ from nemo_rl.models.policy.dtensor_train import (
     process_outputs_for_topk,
     setup_train_loop,
 )
+from nemo_rl.models.huggingface.common import (
+    get_flash_attention_kwargs,
+    pack_sequences,
+)
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
@@ -179,9 +179,9 @@ class DTensorPolicyWorkerV2:
                 "max_grad_norm",
                 "enable_seq_packing",
                 "allow_flash_attn_args",
+                "is_reward_model",
             ],
         )
-        self._is_reward_model = validated_state.is_reward_model
 
         print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
 
@@ -231,10 +231,9 @@ class DTensorPolicyWorkerV2:
                 "scheduler",
                 "is_hf_model",
                 "is_moe_model",
+                "reference_model_state_dict",
             ],
         )
-        if init_reference_model:
-            self.reference_model_state_dict = model_state.reference_model_state_dict
 
         # Load checkpoint if provided
         if weights_path:
@@ -360,7 +359,7 @@ class DTensorPolicyWorkerV2:
                         cp_mesh=self.cp_mesh,
                         device_mesh=self.device_mesh,
                         enable_seq_packing=self.enable_seq_packing,
-                        is_reward_model=self._is_reward_model,
+                        is_reward_model=self.is_reward_model,
                         allow_flash_attn_args=self.allow_flash_attn_args,
                         is_hf_model=self.is_hf_model,
                         is_moe_model=self.is_moe_model,
@@ -510,7 +509,7 @@ class DTensorPolicyWorkerV2:
                     processed_inputs,
                     self.cp_size,
                     self.cp_mesh,
-                    self._is_reward_model,
+                    self.is_reward_model,
                     self.allow_flash_attn_args,
                     self.is_hf_model,
                     self.is_moe_model,
@@ -762,7 +761,7 @@ class DTensorPolicyWorkerV2:
                     processed_inputs,
                     self.cp_size,
                     self.cp_mesh,
-                    self._is_reward_model,
+                    self.is_reward_model,
                     self.allow_flash_attn_args,
                 )
 

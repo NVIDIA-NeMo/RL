@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for dtensor_train.py functions."""
-
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -23,8 +21,7 @@ from torch import nn
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.dtensor_train import (
-    _handle_context_parallel_sharding,
+from nemo_rl.models.automodel.train import (
     _process_logits,
     cleanup_after_training,
     forward_backward,
@@ -39,7 +36,6 @@ from nemo_rl.models.policy.dtensor_train import (
 
 @pytest.fixture
 def mock_dp_mesh():
-    """Create a mock data parallel mesh."""
     mesh = MagicMock()
     mesh.get_group.return_value = MagicMock()
     return mesh
@@ -47,7 +43,6 @@ def mock_dp_mesh():
 
 @pytest.fixture
 def mock_device_mesh():
-    """Create a mock device mesh."""
     mesh = MagicMock()
     mesh.ndim = 2
     mesh.mesh_dim_names = ["cp", "tp"]
@@ -56,7 +51,6 @@ def mock_device_mesh():
 
 @pytest.fixture
 def mock_cp_mesh():
-    """Create a mock context parallel mesh."""
     mesh = MagicMock()
     mesh.ndim = 1
     mesh.mesh_dim_names = ["cp"]
@@ -65,7 +59,6 @@ def mock_cp_mesh():
 
 @pytest.fixture
 def mock_moe_mesh():
-    """Create a mock MoE mesh."""
     mesh = MagicMock()
     mesh.mesh_dim_names = ["ep"]
     return mesh
@@ -73,7 +66,6 @@ def mock_moe_mesh():
 
 @pytest.fixture
 def mock_loss_fn():
-    """Create a mock loss function."""
     loss_fn = MagicMock(spec=LossFunction)
     loss_fn.loss_type = LossType.SEQUENCE_LEVEL
 
@@ -89,7 +81,6 @@ def mock_loss_fn():
 
 @pytest.fixture
 def mock_model():
-    """Create a mock model."""
     model = MagicMock(spec=nn.Module)
 
     # Create mock output with logits
@@ -106,17 +97,13 @@ def mock_model():
 
 @pytest.fixture
 def mock_optimizer():
-    """Create a mock optimizer."""
     optimizer = MagicMock(spec=torch.optim.Optimizer)
     return optimizer
 
 
 class TestSetupTrainLoop:
-    """Tests for setup_train_loop function."""
-
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_basic_setup(self, mock_all_reduce, mock_dp_mesh):
-        """Test basic setup with valid data."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -146,9 +133,8 @@ class TestSetupTrainLoop:
         # Verify all_reduce was called
         mock_all_reduce.assert_called_once()
 
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_multiple_global_batches(self, mock_all_reduce, mock_dp_mesh):
-        """Test setup with multiple global batches."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -175,9 +161,8 @@ class TestSetupTrainLoop:
         assert result["num_global_batches"] == 4  # 64 / 16
         assert result["sequence_dim"] == 1
 
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_sequence_dim_validation(self, mock_all_reduce, mock_dp_mesh):
-        """Test that sequence dimension validation works correctly."""
         # Create test data with consistent sequence dimension
         data = BatchedDataDict(
             {
@@ -203,9 +188,8 @@ class TestSetupTrainLoop:
         )
         assert result["sequence_dim"] == 1
 
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_sequence_dim_validation_failure(self, mock_all_reduce, mock_dp_mesh):
-        """Test that sequence dimension validation fails with inconsistent shapes."""
         # Create test data with inconsistent sequence dimension
         data = BatchedDataDict(
             {
@@ -228,9 +212,8 @@ class TestSetupTrainLoop:
         with pytest.raises(AssertionError, match="Dim 1 must be the sequence dim"):
             setup_train_loop(data=data, gbs=gbs, dp_size=dp_size, dp_mesh=mock_dp_mesh)
 
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
     def test_with_single_rank(self, mock_all_reduce, mock_dp_mesh):
-        """Test setup with single data parallel rank."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -259,10 +242,7 @@ class TestSetupTrainLoop:
 
 
 class TestForwardBackward:
-    """Tests for forward_backward function."""
-
     def test_basic_forward_backward_eval_mode(self, mock_model, mock_loss_fn):
-        """Test basic forward pass in eval mode (no backward)."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -320,7 +300,6 @@ class TestForwardBackward:
         assert isinstance(loss_metrics, dict)
 
     def test_forward_backward_with_backward_pass(self, mock_model, mock_loss_fn):
-        """Test forward and backward pass in train mode."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -379,7 +358,6 @@ class TestForwardBackward:
         assert loss is not None
 
     def test_with_reward_model(self, mock_model, mock_loss_fn):
-        """Test forward pass with reward model (no flash_attn_kwargs)."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -434,7 +412,6 @@ class TestForwardBackward:
         assert "flash_attn_kwargs" not in call_args[1]
 
     def test_with_multimodal_inputs(self, mock_model, mock_loss_fn):
-        """Test forward pass with multimodal inputs."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -495,26 +472,9 @@ class TestForwardBackward:
         # Verify flash_attn_kwargs was removed due to multimodal inputs
         assert "flash_attn_kwargs" not in call_args[1]
 
-    @pytest.mark.skip(
-        reason="Context parallel with DTensor requires real distributed environment"
-    )
-    @patch("nemo_rl.models.policy.dtensor_train.get_train_context")
-    @patch("nemo_rl.models.policy.dtensor_train.create_context_parallel_ctx")
-    def test_with_context_parallel(
-        self, mock_create_cp_ctx, mock_get_train_ctx, mock_model, mock_loss_fn
-    ):
-        """Test forward pass with context parallel enabled.
-
-        Note: This test is skipped because context parallel operations require a real
-        distributed environment with DTensor support. Testing this properly requires
-        integration tests with multiple processes and real device meshes.
-        """
-        pass
-
-    @patch("nemo_rl.models.policy.dtensor_train.get_train_context")
-    @patch("nemo_rl.models.policy.dtensor_train.create_context_parallel_ctx")
+    @patch("nemo_rl.models.automodel.train.get_train_context")
+    @patch("nemo_rl.models.automodel.train.create_context_parallel_ctx")
     def test_context_parallel_setup(self, mock_create_cp_ctx, mock_get_train_ctx):
-        """Test that context parallel context is created when cp_size > 1."""
         # This test verifies the setup logic without executing the full CP path
 
         # Mock CP mesh
@@ -549,11 +509,10 @@ class TestForwardBackward:
             assert mock_create_cp_ctx.call_args[1]["cp_mesh"] == mock_cp_mesh
             assert len(mock_create_cp_ctx.call_args[1]["cp_buffers"]) == 3
 
-    @patch("nemo_rl.models.policy.dtensor_train.SequencePackingLossWrapper")
+    @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_with_sequence_packing(
         self, mock_seq_packing_wrapper, mock_model, mock_loss_fn
     ):
-        """Test forward pass with sequence packing enabled."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -619,7 +578,6 @@ class TestForwardBackward:
         wrapped_loss_fn.assert_called_once()
 
     def test_with_temperature_scaling(self, mock_model, mock_loss_fn):
-        """Test that temperature scaling is applied to logits."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -671,7 +629,6 @@ class TestForwardBackward:
         apply_temperature_fn.assert_called_once()
 
     def test_model_output_as_tensor(self, mock_loss_fn):
-        """Test handling of model output when it returns logits directly as tensor."""
         # Create a model that returns tensor directly
         mock_model = MagicMock(spec=nn.Module)
         mock_model.return_value = torch.randn(
@@ -730,13 +687,10 @@ class TestForwardBackward:
 
 
 class TestOptimizerStep:
-    """Tests for optimizer_step function."""
-
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_basic_optimizer_step(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test basic optimizer step with gradient clipping."""
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(1.5).cuda()
 
@@ -760,7 +714,7 @@ class TestOptimizerStep:
         assert grad_norm is not None
         assert grad_norm == 1.5
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_with_moe_mesh(
         self,
         mock_scale_grads,
@@ -769,7 +723,6 @@ class TestOptimizerStep:
         mock_device_mesh,
         mock_moe_mesh,
     ):
-        """Test optimizer step with MoE mesh."""
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(1.2).cuda()
 
@@ -791,11 +744,10 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_with_context_parallel(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test optimizer step with context parallel."""
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(0.8).cuda()
 
@@ -816,11 +768,10 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_with_no_max_grad_norm(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test optimizer step without gradient clipping."""
         # Mock the gradient norm
         mock_scale_grads.return_value = torch.tensor(5.0).cuda()
 
@@ -841,11 +792,10 @@ class TestOptimizerStep:
         # Verify optimizer.step was called
         mock_optimizer.step.assert_called_once()
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_infinite_grad_norm_handling(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test handling of infinite gradient norm."""
         # Mock infinite gradient norm
         mock_scale_grads.return_value = torch.tensor(float("inf")).cuda()
 
@@ -870,11 +820,10 @@ class TestOptimizerStep:
         assert grad_norm is not None
         assert torch.isinf(torch.tensor(grad_norm))
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_nan_grad_norm_handling(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test handling of NaN gradient norm."""
         # Mock NaN gradient norm
         mock_scale_grads.return_value = torch.tensor(float("nan")).cuda()
 
@@ -899,24 +848,10 @@ class TestOptimizerStep:
         assert grad_norm is not None
         assert torch.isnan(torch.tensor(grad_norm))
 
-    @pytest.mark.skip(reason="DTensor conversion requires real distributed environment")
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
-    def test_grad_norm_dtensor_conversion(
-        self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
-    ):
-        """Test that grad_norm is properly converted from DTensor to regular tensor."""
-        # This test would require a real DTensor environment
-        # The conversion logic is:
-        # 1. If DTensor, call .full_tensor()
-        # 2. If not a tensor, convert to tensor
-        # 3. Call .detach().cpu().float()
-        pass
-
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_grad_norm_scalar_conversion(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test that grad_norm is properly converted from scalar to tensor."""
         # Mock scalar gradient norm (not a tensor)
         mock_scale_grads.return_value = 1.5  # Plain Python float
 
@@ -942,11 +877,10 @@ class TestOptimizerStep:
         if isinstance(grad_norm, torch.Tensor):
             assert grad_norm.item() == 1.5
 
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
     def test_grad_norm_already_tensor(
         self, mock_scale_grads, mock_optimizer, mock_model, mock_device_mesh
     ):
-        """Test that grad_norm works correctly when already a regular tensor."""
         # Mock tensor gradient norm (already a tensor)
         mock_scale_grads.return_value = torch.tensor(2.3).cuda()
 
@@ -972,10 +906,7 @@ class TestOptimizerStep:
 
 
 class TestCleanupAfterTraining:
-    """Tests for cleanup_after_training function."""
-
     def test_cleanup_in_train_mode(self, mock_optimizer):
-        """Test cleanup after training in train mode."""
         # Create mock scheduler
         mock_scheduler = MagicMock()
 
@@ -992,7 +923,6 @@ class TestCleanupAfterTraining:
         mock_scheduler.step.assert_called_once()
 
     def test_cleanup_in_eval_mode(self, mock_optimizer):
-        """Test cleanup after training in eval mode."""
         # Create mock scheduler
         mock_scheduler = MagicMock()
 
@@ -1009,7 +939,6 @@ class TestCleanupAfterTraining:
         mock_scheduler.step.assert_not_called()
 
     def test_cleanup_without_scheduler(self, mock_optimizer):
-        """Test cleanup without a scheduler."""
         cleanup_after_training(
             optimizer=mock_optimizer,
             scheduler=None,
@@ -1021,9 +950,8 @@ class TestCleanupAfterTraining:
 
         # No scheduler, so nothing to verify for scheduler.step
 
-    @patch("nemo_rl.models.policy.dtensor_train.torch.cuda.empty_cache")
+    @patch("nemo_rl.models.automodel.train.torch.cuda.empty_cache")
     def test_cuda_cache_cleared(self, mock_empty_cache, mock_optimizer):
-        """Test that CUDA cache is cleared after cleanup."""
         cleanup_after_training(
             optimizer=mock_optimizer,
             scheduler=None,
@@ -1035,10 +963,7 @@ class TestCleanupAfterTraining:
 
 
 class TestProcessLogits:
-    """Tests for _process_logits helper function."""
-
     def test_process_logits_from_tensor(self):
-        """Test processing logits when model returns tensor directly."""
         # Create mock model output as tensor
         outputs = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
         model = MagicMock(spec=nn.Module)
@@ -1050,7 +975,6 @@ class TestProcessLogits:
         assert logits.shape == (4, 64, 1000)
 
     def test_process_logits_from_output_with_logits_attr(self):
-        """Test processing logits from model output with logits attribute."""
         # Create mock output with logits attribute
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1064,8 +988,6 @@ class TestProcessLogits:
         assert logits.shape == (4, 64, 1000)
 
     def test_process_logits_from_last_hidden_state(self):
-        """Test processing logits from last_hidden_state via lm_head."""
-
         # Create a simple namespace object without logits attribute
         class ModelOutput:
             def __init__(self):
@@ -1087,7 +1009,6 @@ class TestProcessLogits:
         assert logits is lm_head_output
 
     def test_process_logits_with_temperature_scaling(self):
-        """Test that temperature scaling is applied correctly."""
         outputs = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
         model = MagicMock(spec=nn.Module)
 
@@ -1101,57 +1022,8 @@ class TestProcessLogits:
         assert torch.allclose(logits, expected_logits)
 
 
-class TestHandleContextParallelSharding:
-    """Tests for _handle_context_parallel_sharding helper function."""
-
-    @pytest.mark.skip(
-        reason="Context parallel sharding requires real DTensor environment"
-    )
-    def test_sharding_logits_only(self):
-        """Test sharding only logits without microbatch tensors.
-
-        This is the use case for logprob extraction.
-        """
-        # This test would require a real DTensor/distributed environment
-        pass
-
-    @pytest.mark.skip(
-        reason="Context parallel sharding requires real DTensor environment"
-    )
-    def test_sharding_with_microbatch(self):
-        """Test sharding both logits and microbatch tensors.
-
-        This is the use case for training.
-        """
-        # This test would require a real DTensor/distributed environment
-        pass
-
-    @pytest.mark.skip(
-        reason="Context parallel sharding requires real DTensor environment"
-    )
-    def test_sharding_with_tp_and_cp(self):
-        """Test sharding with both tensor parallel and context parallel."""
-        # This test would require a real DTensor/distributed environment
-        pass
-
-    def test_optional_parameters_signature(self):
-        """Test that mb and cp_buffers are truly optional in the signature."""
-        # Verify the function signature allows optional parameters
-        import inspect
-
-        sig = inspect.signature(_handle_context_parallel_sharding)
-        params = sig.parameters
-
-        # Check that mb and cp_buffers have default values
-        assert params["mb"].default is None
-        assert params["cp_buffers"].default is None
-
-
 class TestModelForward:
-    """Tests for model_forward function."""
-
     def test_basic_model_forward(self, mock_model):
-        """Test basic model forward pass."""
         processed_inputs = {
             "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
             "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
@@ -1182,7 +1054,6 @@ class TestModelForward:
         assert "flash_attn_kwargs" in call_kwargs
 
     def test_model_forward_with_reward_model(self, mock_model):
-        """Test model forward without flash_attn_kwargs for reward model."""
         processed_inputs = {
             "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
             "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
@@ -1213,7 +1084,6 @@ class TestModelForward:
         assert "flash_attn_kwargs" not in call_kwargs
 
     def test_model_forward_with_multimodal(self, mock_model):
-        """Test model forward with multimodal inputs."""
         vlm_kwargs = {
             "pixel_values": torch.randn(4, 3, 224, 224).cuda(),
         }
@@ -1249,7 +1119,6 @@ class TestModelForward:
         assert "flash_attn_kwargs" not in call_kwargs
 
     def test_model_forward_with_moe_padding_mask(self, mock_model):
-        """Test model forward with MoE model sets padding_mask correctly."""
         processed_inputs = {
             "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
             "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
@@ -1281,7 +1150,6 @@ class TestModelForward:
         assert "padding_mask" in call_kwargs
 
     def test_model_forward_with_hf_moe_no_padding_mask(self, mock_model):
-        """Test model forward with HF MoE model does not set padding_mask."""
         processed_inputs = {
             "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
             "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
@@ -1313,7 +1181,6 @@ class TestModelForward:
         assert "padding_mask" not in call_kwargs
 
     def test_model_forward_with_non_moe_no_padding_mask(self, mock_model):
-        """Test model forward with non-MoE model does not set padding_mask."""
         processed_inputs = {
             "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
             "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
@@ -1344,21 +1211,9 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "padding_mask" not in call_kwargs
 
-    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
-    @patch("nemo_rl.models.policy.dtensor_train.create_context_parallel_ctx")
-    def test_model_forward_with_context_parallel(
-        self, mock_create_cp_ctx, mock_model, mock_cp_mesh
-    ):
-        """Test model forward with context parallel enabled."""
-        # This would require real distributed setup
-        pass
-
 
 class TestProcessOutputForTrain:
-    """Tests for process_output_for_train function."""
-
     def test_basic_train_output_processing(self, mock_model, mock_loss_fn):
-        """Test basic train output processing."""
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1407,11 +1262,10 @@ class TestProcessOutputForTrain:
         assert loss is not None
         assert isinstance(loss_metrics, dict)
 
-    @patch("nemo_rl.models.policy.dtensor_train.SequencePackingLossWrapper")
+    @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
     def test_train_output_with_sequence_packing(
         self, mock_seq_packing_wrapper, mock_model, mock_loss_fn
     ):
-        """Test train output processing with sequence packing."""
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(1, 204, 1000, device="cuda", requires_grad=True)
@@ -1470,18 +1324,9 @@ class TestProcessOutputForTrain:
         mock_seq_packing_wrapper.assert_called_once()
         wrapped_loss_fn.assert_called_once()
 
-    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
-    def test_train_output_with_context_parallel(self):
-        """Test train output processing with context parallel."""
-        # This would require real DTensor/distributed environment
-        pass
-
 
 class TestProcessOutputsForLogprobs:
-    """Tests for process_outputs_for_logprobs function."""
-
     def test_basic_logprob_extraction(self, mock_model):
-        """Test basic logprob extraction without CP."""
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1530,7 +1375,6 @@ class TestProcessOutputsForLogprobs:
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
     def test_logprob_extraction_with_chunking(self, mock_model):
-        """Test logprob extraction with chunking for memory efficiency."""
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 128, 1000, device="cuda", requires_grad=True)
@@ -1579,18 +1423,9 @@ class TestProcessOutputsForLogprobs:
         # Verify first token has zero logprob
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
-    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
-    def test_logprob_extraction_with_context_parallel(self):
-        """Test logprob extraction with context parallel."""
-        # This would require real DTensor/distributed environment
-        pass
-
 
 class TestProcessOutputsForTopk:
-    """Tests for process_outputs_for_topk function."""
-
     def test_basic_topk_extraction(self, mock_model):
-        """Test basic top-k extraction without CP/TP."""
         # Create mock outputs
         outputs = MagicMock()
         outputs.logits = torch.randn(4, 64, 1000, device="cuda", requires_grad=True)
@@ -1642,7 +1477,6 @@ class TestProcessOutputsForTopk:
         assert torch.all(idx < 1000)
 
     def test_topk_extraction_with_temperature(self, mock_model):
-        """Test that temperature scaling is applied to logits before top-k."""
         # Create mock outputs with known logits
         outputs = MagicMock()
         logits = torch.randn(2, 32, 500, device="cuda", requires_grad=True)
@@ -1692,7 +1526,6 @@ class TestProcessOutputsForTopk:
         assert idx.shape == (2, 32, 5)
 
     def test_topk_extraction_different_k_values(self, mock_model):
-        """Test top-k extraction with different k values."""
         outputs = MagicMock()
         outputs.logits = torch.randn(3, 48, 800, device="cuda", requires_grad=True)
 
@@ -1735,46 +1568,11 @@ class TestProcessOutputsForTopk:
         assert vals.shape == (3, 48, 20)
         assert idx.shape == (3, 48, 20)
 
-    @pytest.mark.skip(reason="Tensor parallel requires real distributed environment")
-    def test_topk_extraction_with_tensor_parallel(self):
-        """Test top-k extraction with tensor parallel (DTensor logits).
-
-        This test would require a real DTensor/distributed environment to test:
-        - DTensor logits with TP sharding
-        - distributed_vocab_topk across TP ranks
-        - Proper gathering of top-k across sharded vocabulary
-        """
-        pass
-
-    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
-    def test_topk_extraction_with_context_parallel(self):
-        """Test top-k extraction with context parallel.
-
-        This test would require a real DTensor/distributed environment to test:
-        - Sharding logits across CP dimension
-        - distributed_vocab_topk with both CP and TP
-        - allgather_cp_sharded_tensor for gathering results across CP ranks
-        """
-        pass
-
-    @pytest.mark.skip(reason="Context parallel requires real distributed environment")
-    def test_topk_extraction_with_cp_and_tp(self):
-        """Test top-k extraction with both CP and TP enabled.
-
-        This test would require a real DTensor/distributed environment to test:
-        - Sequence sharding via _handle_context_parallel_sharding
-        - TP vocabulary sharding
-        - Proper coordination between CP and TP for distributed top-k
-        """
-        pass
-
 
 class TestIntegrationScenarios:
-    """Integration tests combining multiple functions."""
-
-    @patch("nemo_rl.models.policy.dtensor_train.torch.distributed.all_reduce")
-    @patch("nemo_rl.models.policy.dtensor_train.scale_grads_and_clip_grad_norm")
-    @patch("nemo_rl.models.policy.dtensor_train.torch.cuda.empty_cache")
+    @patch("nemo_rl.models.automodel.train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.train.scale_grads_and_clip_grad_norm")
+    @patch("nemo_rl.models.automodel.train.torch.cuda.empty_cache")
     def test_full_training_loop(
         self,
         mock_empty_cache,
@@ -1786,7 +1584,6 @@ class TestIntegrationScenarios:
         mock_dp_mesh,
         mock_device_mesh,
     ):
-        """Test a complete training loop with all functions."""
         # Step 1: Setup training loop
         data = BatchedDataDict(
             {

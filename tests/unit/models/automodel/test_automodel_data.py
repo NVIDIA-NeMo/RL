@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for dtensor_data.py functions."""
-
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.interfaces import LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.policy.dtensor_data import (
+from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
     process_microbatch,
@@ -30,7 +28,6 @@ from nemo_rl.models.policy.dtensor_data import (
 
 @pytest.fixture
 def mock_tokenizer():
-    """Create a mock tokenizer."""
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     tokenizer.pad_token_id = 0
@@ -39,7 +36,6 @@ def mock_tokenizer():
 
 @pytest.fixture
 def mock_loss_fn():
-    """Create a mock loss function."""
     loss_fn = MagicMock()
     loss_fn.loss_type = LossType.SEQUENCE_LEVEL
     return loss_fn
@@ -47,17 +43,13 @@ def mock_loss_fn():
 
 @pytest.fixture
 def mock_dp_mesh():
-    """Create a mock data parallel mesh."""
     mesh = MagicMock()
     mesh.get_group.return_value = MagicMock()
     return mesh
 
 
 class TestGetMicrobatchIterator:
-    """Tests for get_microbatch_iterator function."""
-
     def test_regular_batching(self):
-        """Test regular batching with fixed microbatch size."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -91,7 +83,6 @@ class TestGetMicrobatchIterator:
         assert list(dummy_iterator) == []
 
     def test_dynamic_batching(self):
-        """Test dynamic batching mode."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -128,9 +119,8 @@ class TestGetMicrobatchIterator:
         # Verify dummy iterator is empty
         assert list(dummy_iterator) == []
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_sequence_packing(self, mock_all_reduce):
-        """Test sequence packing mode."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -179,9 +169,8 @@ class TestGetMicrobatchIterator:
         # Verify dummy iterator is empty (when all ranks have same batch count)
         assert list(dummy_iterator) == []
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_sequence_packing_with_uneven_batch_counts(self, mock_all_reduce):
-        """Test sequence packing with uneven batch counts across DP ranks."""
         # Create test data
         data = BatchedDataDict(
             {
@@ -229,10 +218,7 @@ class TestGetMicrobatchIterator:
 
 
 class TestProcessMicrobatch:
-    """Tests for process_microbatch function."""
-
     def test_regular_batching(self, mock_tokenizer):
-        """Test processing microbatch with regular batching."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -267,12 +253,11 @@ class TestProcessMicrobatch:
         assert result["seq_index"] is None
         assert result["seq_len"] == 64
 
-    @patch("nemo_rl.models.policy.dtensor_data.pack_sequences")
-    @patch("nemo_rl.models.policy.dtensor_data.get_flash_attention_kwargs")
+    @patch("nemo_rl.models.automodel.data.pack_sequences")
+    @patch("nemo_rl.models.automodel.data.get_flash_attention_kwargs")
     def test_sequence_packing(
         self, mock_get_flash_attn, mock_pack_sequences, mock_tokenizer
     ):
-        """Test processing microbatch with sequence packing."""
         # Create test microbatch
         input_ids = torch.randint(0, 1000, (4, 64))
         input_lengths = torch.tensor([32, 48, 60, 64])
@@ -324,7 +309,6 @@ class TestProcessMicrobatch:
         assert result["vlm_kwargs"] == {}
 
     def test_with_multimodal_inputs(self, mock_tokenizer):
-        """Test processing microbatch with multimodal inputs."""
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(
             {
@@ -358,7 +342,6 @@ class TestProcessMicrobatch:
         assert result["position_ids"] is None
 
     def test_with_context_parallel(self, mock_tokenizer):
-        """Test processing microbatch with context parallel enabled."""
         # Create test microbatch
         mb = BatchedDataDict(
             {
@@ -389,7 +372,6 @@ class TestProcessMicrobatch:
         assert result["vlm_kwargs"] == {}
 
     def test_context_parallel_with_multimodal_raises_error(self, mock_tokenizer):
-        """Test that context parallel with multimodal inputs raises an error."""
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(
             {
@@ -421,7 +403,6 @@ class TestProcessMicrobatch:
             )
 
     def test_sequence_parallel_with_multimodal_raises_error(self, mock_tokenizer):
-        """Test that sequence parallel with multimodal inputs raises an error."""
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(
             {
@@ -454,11 +435,8 @@ class TestProcessMicrobatch:
 
 
 class TestProcessGlobalBatch:
-    """Tests for process_global_batch function."""
-
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_basic_processing(self, mock_all_reduce, mock_loss_fn, mock_dp_mesh):
-        """Test basic global batch processing."""
         # Create test data
         input_ids = torch.randint(0, 1000, (16, 64))
         sample_mask = torch.ones(16, dtype=torch.bool)
@@ -505,9 +483,8 @@ class TestProcessGlobalBatch:
         # Verify all_reduce was called
         mock_all_reduce.assert_called_once()
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_with_token_mask(self, mock_all_reduce, mock_loss_fn, mock_dp_mesh):
-        """Test global batch processing with token mask."""
         # Create test data
         input_ids = torch.randint(0, 1000, (8, 64))
         sample_mask = torch.ones(8, dtype=torch.bool)
@@ -553,9 +530,8 @@ class TestProcessGlobalBatch:
         assert "token_mask" in result["batch"]
         assert result["batch"]["token_mask"].shape == (4, 64)
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_token_level_loss_requires_token_mask(self, mock_all_reduce, mock_dp_mesh):
-        """Test that token-level loss requires token_mask."""
         # Create loss function with token-level loss
         loss_fn = MagicMock()
         loss_fn.loss_type = LossType.TOKEN_LEVEL
@@ -595,11 +571,10 @@ class TestProcessGlobalBatch:
                 dp_mesh=mock_dp_mesh,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_missing_sample_mask_raises_error(
         self, mock_all_reduce, mock_loss_fn, mock_dp_mesh
     ):
-        """Test that missing sample_mask raises an error."""
         # Create test data WITHOUT sample_mask
         input_ids = torch.randint(0, 1000, (8, 64))
         data = BatchedDataDict(
@@ -625,11 +600,10 @@ class TestProcessGlobalBatch:
                 dp_mesh=mock_dp_mesh,
             )
 
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_multiple_batch_processing(
         self, mock_all_reduce, mock_loss_fn, mock_dp_mesh
     ):
-        """Test processing multiple batches from the same data."""
         # Create test data
         input_ids = torch.randint(0, 1000, (16, 64))
         sample_mask = torch.ones(16, dtype=torch.bool)
@@ -689,13 +663,10 @@ class TestProcessGlobalBatch:
 
 
 class TestIntegrationScenarios:
-    """Integration tests combining multiple functions."""
-
-    @patch("nemo_rl.models.policy.dtensor_data.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_full_pipeline_regular_batching(
         self, mock_all_reduce, mock_tokenizer, mock_loss_fn, mock_dp_mesh
     ):
-        """Test full pipeline with regular batching."""
         # Create test data
         input_ids = torch.randint(0, 1000, (16, 64))
         sample_mask = torch.ones(16, dtype=torch.bool)
