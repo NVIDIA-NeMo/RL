@@ -16,6 +16,7 @@ from itertools import product
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from transformers import AutoModelForCausalLM
 
@@ -23,6 +24,7 @@ from nemo_rl.models.dtensor.parallelize import (
     _parallelize_gemma3,
     _parallelize_llama,
     _parallelize_qwen,
+    get_grad_norm,
 )
 
 
@@ -67,3 +69,46 @@ def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
     assert set(parallel_plan.keys()) == applied_keys, (
         f"Missing keys: {set(parallel_plan.keys()) - applied_keys}"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "grad_dtype, norm_dtype, norm_order",
+    [
+        (torch.float32, torch.float32, 1),
+        (torch.float32, torch.float32, 2),
+        (torch.float32, torch.float32, torch.inf),
+        (torch.bfloat16, torch.float32, 1),
+        (torch.bfloat16, torch.float32, 2),
+        (torch.bfloat16, torch.float32, torch.inf),
+    ],
+)
+def test_get_grad_norm_precision(monkeypatch, grad_dtype, norm_dtype, norm_order):
+    """Checks numerical precision of get_grad_norm."""
+
+    def noop_all_reduce(tensor, op=None, group=None):
+        return None
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", noop_all_reduce, raising=False)
+
+    n = 65536
+    vals = torch.logspace(-2, 2, steps=n, device="cuda", dtype=grad_dtype)
+    signs = (torch.rand(n, device="cuda") > 0.5).to(grad_dtype) * 2 - 1
+    grads_full = vals * signs
+
+    p1 = torch.zeros(n // 2, device="cuda", dtype=grad_dtype, requires_grad=True)
+    p2 = torch.zeros(n - n // 2, device="cuda", dtype=grad_dtype, requires_grad=True)
+    p1.grad = grads_full[: n // 2].clone()
+    p2.grad = grads_full[n // 2 :].clone()
+
+    expected = torch.linalg.vector_norm(
+        grads_full.to(torch.float64), ord=norm_order
+    ).item()
+    norm = get_grad_norm(
+        [p1, p2],
+        dp_cp_group=None,
+        tp_group=None,
+        norm_type=norm_order,
+        dtype=norm_dtype,
+    )
+    assert norm == pytest.approx(expected)

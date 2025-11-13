@@ -12,23 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import ray
+import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss_functions import NLLLoss
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import (
-    RayVirtualCluster,
-    _get_node_ip_and_free_port,
-)
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _replace_prefix_tokens,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -42,7 +48,13 @@ basic_vllm_test_config: VllmConfig = {
     },
     "dtype": "bfloat16",
     "max_new_tokens": 5,  # Small number of tokens for testing
-    "temperature": 0.8,
+    # Set temperature=1.0 to ensure consistent probability scaling when comparing vLLM and HF policy outputs.
+    # Note: greedy=True is only used in tests for deterministic behavior and not used in the real training.
+    # In vLLM, enabling greedy=True disables temperature scaling (temperature is overridden to None).
+    # The HF policy worker does not currently support greedy=True for get_logprobs.
+    # Using temperature=1.0 allows us to meaningfully test the average probability multiplicative error between the two implementations,
+    # while still maintaining the deterministic behavior.
+    "temperature": 1.0,
     "top_p": 1.0,
     "top_k": None,
     "stop_token_ids": None,
@@ -51,6 +63,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -81,6 +94,7 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_new_tokens": 16,
     "do_sample": False,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -120,6 +134,7 @@ def get_basic_megatron_test_config(
     precision: str = "float32",
     activation_checkpointing: bool = False,
     sequence_parallel: bool = False,
+    empty_unused_memory_level: int = 0,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     # Use the exact same model as vLLM tests for perfect compatibility
@@ -134,6 +149,7 @@ def get_basic_megatron_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -145,7 +161,7 @@ def get_basic_megatron_test_config(
         },
         "megatron_cfg": {
             "enabled": True,
-            "empty_unused_memory_level": 0,
+            "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
             "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
@@ -161,7 +177,10 @@ def get_basic_megatron_test_config(
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
+            "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -176,6 +195,8 @@ def get_basic_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -190,7 +211,6 @@ def get_basic_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
@@ -305,17 +325,6 @@ def test_input_data(tokenizer):
     )
 
 
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
-
-
 def test_vllm_missing_required_config_key(cluster):
     """Test that an assertion error is raised when a required config key is missing."""
     # Create a config missing a required key by removing 'model_name'
@@ -338,6 +347,43 @@ def test_vllm_missing_required_config_key(cluster):
         "Error should mention the missing 'model_name' key"
     )
     print(f"Successfully caught missing config key with error: {error_message}")
+
+
+def test_vllm_top_p_top_k_validation(cluster):
+    """Test that top_p and top_k validation works correctly with threshold-based logic."""
+    # Test that values above thresholds are allowed
+    config_above_thresholds = deepcopy(basic_vllm_test_config)
+    config_above_thresholds["top_p"] = 0.99  # Above TOP_P_THRESHOLD
+    config_above_thresholds["top_k"] = 8000  # Above TOP_K_THRESHOLD
+
+    # Should not raise an error
+    try:
+        VllmGeneration(cluster, config_above_thresholds)
+        print("Successfully initialized with top_p=0.99 and top_k=8000")
+    except Exception as e:
+        pytest.fail(f"Should not raise error with values above thresholds: {e}")
+
+    # Test that values below thresholds are rejected
+    config_below_thresholds = deepcopy(basic_vllm_test_config)
+    config_below_thresholds["top_p"] = 0.9  # Below TOP_P_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_below_thresholds)
+
+    error_message = str(excinfo.value)
+    assert "top_p sampling with values < 0.99 is not supported" in error_message
+    print(f"Successfully caught low top_p value with error: {error_message}")
+
+    # Test that low top_k values are rejected
+    config_low_top_k = deepcopy(basic_vllm_test_config)
+    config_low_top_k["top_k"] = 7999  # Below TOP_K_THRESHOLD
+
+    with pytest.raises(ValueError) as excinfo:
+        VllmGeneration(cluster, config_low_top_k)
+
+    error_message = str(excinfo.value)
+    assert "top_k sampling with values < 8000 is not supported" in error_message
+    print(f"Successfully caught low top_k value with error: {error_message}")
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
@@ -393,7 +439,7 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
 
     # Extract in correct order
     outputs = [item for _, item in collected_indexed_outputs]
-    pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    pad_token_id = vllm_policy.cfg.get("_pad_token_id", tokenizer.pad_token_id)
     outputs = BatchedDataDict.from_batches(
         outputs,
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
@@ -626,28 +672,15 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
         torch.cuda.empty_cache()
 
 
-@pytest.mark.timeout(140)
-@pytest.mark.asyncio
-@pytest.mark.parametrize("async_engine", [True, False])
-async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine):
-    """1. Use vLLM for generation
+async def run_hf_train_process(
+    lm_policy, vllm_policy, tokenizer, async_engine, colocated, vllm_precision
+):
+    """Validates that the two policies can work together.
+
+    1. Use vLLM for generation
     2. Use HF policy for training and logprob computation
-
-    This test validates that the two policies can work together.
     """
-    from nemo_rl.models.policy.lm_policy import Policy
     from tests.unit.test_utils import SimpleNLLLoss
-
-    # Create separate configs for each policy
-    vllm_config = deepcopy(basic_vllm_test_config)
-    vllm_config["vllm_cfg"]["async_engine"] = async_engine
-    vllm_config = configure_generation_config(vllm_config, tokenizer)
-
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["train_global_batch_size"] = 4
-
-    vllm_policy = None
-    lm_policy = None
 
     try:
         prompts = [
@@ -680,22 +713,8 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
             }
         )
 
-        # Create both policies
-        print("Creating vLLM policy...")
-        vllm_policy = VllmGeneration(cluster, vllm_config)
-        vllm_policy.finish_generation()
-
-        print("Creating DTensor policy...")
-        lm_policy = Policy(cluster, dtensor_config, tokenizer)
-
-        print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
-        vllm_policy.prepare_refit_info(state_dict_info)
-
         print("refitting vllm policy...")
-        refit_policy_generation(
-            lm_policy, vllm_policy, vllm_config["colocated"]["enabled"]
-        )
+        refit_policy_generation(lm_policy, vllm_policy, colocated)
 
         # Step 1: Use vLLM for generation
         print("Using vLLM policy for fast generation...")
@@ -760,7 +779,14 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
         )
 
         print(f"Average probability multiplicative error: {avg_prob_mult_error}")
-        assert avg_prob_mult_error <= 1.043, "vLLM and HF logprobs should closely match"
+        if vllm_precision == "fp8":
+            assert avg_prob_mult_error <= 1.080, (
+                "vLLM and HF logprobs should closely match"
+            )
+        else:
+            assert avg_prob_mult_error <= 1.043, (
+                "vLLM and HF logprobs should closely match"
+            )
 
         # Step 2: Prepare simplified training data (smaller and with padding removed to prevent OOM)
         # Use a very small sequence for training to ensure it works
@@ -797,7 +823,7 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
         print(f"Training loss: {results['loss']}")
 
         lm_policy.finish_training()
-        lm_policy.offload_after_refit()
+        refit_policy_generation(lm_policy, vllm_policy, colocated)
 
         # Step 4: Use vLLM for generation again to complete the workflow
         print("Using vLLM for generation again...")
@@ -822,6 +848,125 @@ async def test_vllm_generation_with_hf_training(cluster, tokenizer, async_engine
             vllm_policy.shutdown()
         if lm_policy and hasattr(lm_policy, "shutdown"):
             lm_policy.shutdown()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
+)
+async def test_vllm_generation_with_hf_training_colocated(
+    cluster, tokenizer, async_engine, cpu_offload, vllm_precision
+):
+    """This test validates that DTensor policy can work together with colocated vLLM policy."""
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
+    # Create VllmGeneration Policy
+    print("Creating vLLM policy...")
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+    vllm_policy.finish_generation()
+
+    # Create Policy
+    print("Creating DTensor policy...")
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["train_global_batch_size"] = 4
+    lm_policy = Policy(cluster, dtensor_config, tokenizer)
+
+    # Prepare refit info
+    print("Preparing refit info...")
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
+    # Test
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, True, vllm_precision
+    )
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("async_engine", "cpu_offload", "vllm_precision"),
+    [
+        (True, False, "bfloat16"),
+        (False, True, "bfloat16"),
+        (True, False, "fp8"),
+        (False, True, "fp8"),
+    ],
+)
+async def test_vllm_generation_with_hf_training_non_colocated(
+    policy_cluster_separate, tokenizer, async_engine, cpu_offload, vllm_precision
+):
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
+    """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
+    generation_cluster_separate = get_generation_cluster_separate(1)
+
+    # Create VllmGeneration Policy
+    print("Creating vLLM policy...")
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["async_engine"] = async_engine
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
+    vllm_policy.finish_generation()
+
+    # Create Policy
+    print("Creating DTensor policy...")
+    dtensor_config = deepcopy(basic_dtensor_test_config)
+    dtensor_config["generation"]["colocated"]["enabled"] = False
+    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["train_global_batch_size"] = 4
+    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+
+    # Refit
+    # initialize collective communication for update weights
+    ip, port = policy_cluster_separate.get_master_address_and_port()
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    ray.get(futures_train + futures_inference)
+
+    # prepare refit info
+    state_dict_info = lm_policy.prepare_refit_info()
+    vllm_policy.prepare_refit_info(state_dict_info)
+
+    # Test
+    await run_hf_train_process(
+        lm_policy, vllm_policy, tokenizer, async_engine, False, vllm_precision
+    )
 
 
 def test_vllm_policy_tensor_parallel(cluster, tokenizer):
@@ -916,19 +1061,490 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
+def configure_http_server_config(tokenizer) -> VllmConfig:
+    # Create separate configs for each policy
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(
+        generation_config, tokenizer, is_eval=True
+    )
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    return generation_config
+
+
+def _wait_for_vllm_http_server_spinup(base_url: str):
+    while True:
+        try:
+            requests.get(base_url, timeout=5)
+            # We don't check the status code since there may not be a route at /
+            break
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            Exception,
+        ):
+            pass
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    body = dict(
+        model=generation_config["model_name"],
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    actual_result = response.json()
+
+    # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
+    expected_result = {
+        "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
+        "object": "chat.completion",
+        "created": 1756421711,
+        "model": "Qwen/Qwen3-0.6B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>",
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning_content": None,
+                },
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:151667",
+                            "logprob": -0.00023779425828251988,
+                            "bytes": [60, 116, 104, 105, 110, 107, 62],
+                            "top_logprobs": [],
+                        }
+                    ]
+                },
+                "finish_reason": "length",
+                "stop_reason": None,
+                "token_ids": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "prompt_token_ids": None,
+        "kv_transfer_params": None,
+    }
+
+    def _standardize(d: dict) -> dict:
+        d = deepcopy(d)
+        d.pop("id")
+        d.pop("created")
+        # We don't want to implicate log prob accuracy in this test.
+        d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        return d
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that tokenization route works
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Clean up
+    vllm_generation.shutdown()
+
+    # We should not be able to connect after shutdown
+    with pytest.raises(requests.ConnectionError):
+        requests.post(
+            url=f"{base_urls[0]}/chat/completions",
+            json=dict(
+                messages=[
+                    {"role": "user", "content": "count to 5"},
+                ],
+                temperature=0.0,
+                logprobs=True,
+                return_tokens_as_token_ids=True,
+                max_tokens=1,
+            ),
+        )
+
+
+def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id == 151645
+
+    data_fpath = Path(__file__).with_name(
+        "test_vllmasyncgenerationworker_replace_prefix_worker.json"
+    )
+    with data_fpath.open() as f:
+        data = json.load(f)
+
+    og_model_token_ids = data["og_model_token_ids"]
+    model_token_ids = data["model_token_ids"]
+    template_token_ids = data["template_token_ids"]
+
+    og_model_str = tokenizer.decode(og_model_token_ids)
+    model_str = tokenizer.decode(model_token_ids)
+    template_str = tokenizer.decode(template_token_ids)
+    assert og_model_str == template_str
+    assert model_str != template_str
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+
+def test_replace_prefix_tokens_empty_model_prefix_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = []
+    template_prefix_token_ids = [9, 2]
+    template_token_ids = [9, 2, 33, 44]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 2]
+    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
+    template_token_ids = [9, 9, 9, 2, 10]
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+
+
+def test_replace_prefix_tokens_tokenizer_without_eos_raises():
+    class _T:
+        eos_token_id = None
+
+    tokenizer = _T()
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[1],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2],
+        )
+
+
+def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [100, 2]
+    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_token_ids = [9, 2, 9, 2, 77, 88]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == [100, 2, 77, 88]
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
+    cluster, tokenizer
+):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    detokenized_str = " Skinny"
+    initial_tokenized_ids = [26951, 3834]
+    re_tokenized_ids = [94224]
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": detokenized_str},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Check that the re-tokenized ids are the same with the reference and different without the reference.
+    # WITHOUT reference token IDs
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 9,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            *re_tokenized_ids,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # WITH reference token IDs
+    initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
+    initial_tokenized_query_ids = [
+        *initial_tokenized_query_ids_prefix,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
+    body_with_reference_token_ids = body | {
+        "required_prefix_token_ids": initial_tokenized_query_ids_prefix
+    }
+    response = requests.post(
+        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+    )
+    actual_result = response.json()
+    expected_result = {
+        "count": 10,
+        "max_model_len": 1024,
+        "tokens": initial_tokenized_query_ids,
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Generate and check result
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+    )
+    vllm_http_server_result = response.json()
+    vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
+        "logprobs"
+    ]["content"][0]
+    vllm_http_server_generated_token_id = int(
+        vllm_http_server_generated_token["token"].removeprefix("token_id:")
+    )
+
+    async for _, generate_result in vllm_generation.generate_async(
+        BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": torch.tensor([initial_tokenized_query_ids]),
+                "input_lengths": torch.tensor([len(initial_tokenized_query_ids)]),
+            }
+        )
+    ):
+        pass
+
+    generate_generated_token_id = generate_result["output_ids"][0][
+        len(initial_tokenized_query_ids)
+    ].item()
+
+    # We just check the first token here to check the alignment
+    assert vllm_http_server_generated_token_id == generate_generated_token_id
+
+    # Clean up
+    vllm_generation.shutdown()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-@pytest.mark.parametrize("enable_dtensor", [True, False])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
-    cluster, tokenizer, tensor_parallel_size, enable_dtensor
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
+
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
+
     from nemo_rl.models.policy.lm_policy import Policy
 
     # Create configs
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
+
     if tensor_parallel_size > 1:
         vllm_config["vllm_kwargs"] = {"distributed_executor_backend": "ray"}
 
@@ -982,11 +1598,11 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         )
 
         print("Updating vLLM weights from HF policy...")
-        grouped_param_keys = lm_policy.prepare_weights_for_ipc()
-        for keys in grouped_param_keys:
-            ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
-            assert update_success, "Weight update should succeed"
+
+        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=buffer_size_bytes)
+        update_success = vllm_policy.update_weights_via_ipc_zmq()
+        assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
         print("Running Generation 2 (Weights Updated, Cache Still Active)...")
@@ -1024,8 +1640,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("enable_dtensor", [True, False])
-def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
+def test_vllm_weight_update_memory(cluster, tokenizer):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1064,7 +1679,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
         lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
 
@@ -1084,12 +1699,8 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
     assert current_reserved == 0.0, "Memory should be 0 after refit completed"
     # memory threshold: memory during non-streaming weight update on 0.6B model on 2 GPUs
     # memory during streaming weight update should less than this baseline threshold
-    if enable_dtensor:
-        assert peak_allocated < 4005, "Peak allocated memory should < 4005 MB"
-        assert peak_reserved < 4016, "Peak reserved memory should < 4016 MB"
-    else:
-        assert peak_allocated < 5736, "Peak allocated memory should < 5736 MB"
-        assert peak_reserved < 5748, "Peak reserved memory should < 5748 MB"
+    assert peak_allocated < 4005, "Peak allocated memory should < 4005 MB"
+    assert peak_reserved < 4016, "Peak reserved memory should < 4016 MB"
 
     # Clean up
     vllm_policy.shutdown()
@@ -1097,10 +1708,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, enable_dtensor):
 
 
 @pytest.mark.parametrize("is_eval", [True, False])
-@pytest.mark.parametrize("enable_dtensor", [True, False])
-def test_vllm_generation_with_stop(
-    cluster, test_input_data, tokenizer, is_eval, enable_dtensor
-):
+def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval):
     """Test vLLM generation with stop."""
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -1200,12 +1808,14 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
-async def test_vllm_refit_non_collocated_update_weights(
+@pytest.mark.parametrize("policy_type", ["dtensor", "megatron"])
+async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
     tokenizer,
     test_input_data,
     async_engine,
     tensor_parallel_size,
+    policy_type,
 ):
     # Skip tensor_parallel_size == 2 until we have resources in CI
     if tensor_parallel_size == 2:
@@ -1223,23 +1833,47 @@ async def test_vllm_refit_non_collocated_update_weights(
             "Test requires at least two GPUs to run policies on separate clusters."
         )
 
-    # Create Policy on its own cluster
-    dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["generation"]["colocated"]["enabled"] = False
-    lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
+    # Get policy config
+    if policy_type == "dtensor":
+        lm_config = deepcopy(basic_dtensor_test_config)
+    else:
+        assert policy_type == "megatron"
+        lm_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    lm_config["generation"]["colocated"]["enabled"] = False
 
-    # Create VllmGeneration policy on its own cluster
+    # Get vllm config
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
     vllm_config["vllm_cfg"]["async_engine"] = async_engine
     vllm_config["vllm_cfg"]["tensor_parallel_size"] = tensor_parallel_size
     vllm_config["colocated"]["enabled"] = False
+
+    # Megatron config with Qwen2.5-0.5B
+    if policy_type == "megatron":
+        model_name = "Qwen/Qwen2.5-0.5B"
+        tokenizer = get_tokenizer({"name": model_name})
+
+        lm_config["model_name"] = model_name
+        lm_config["tokenizer"]["name"] = model_name
+
+        vllm_config["model_name"] = model_name
+        vllm_config["tokenizer"]["name"] = model_name
+
+    # Create Policy and VllmGeneration
+    lm_policy = Policy(policy_cluster_separate, lm_config, tokenizer)
     vllm_generation = VllmGeneration(generation_cluster_separate, vllm_config)
 
     # initialize collective communication for update weights
-    ip, port = ray.get(_get_node_ip_and_free_port.remote())
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=2)
+    ip, port = policy_cluster_separate.get_master_address_and_port()
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1247,9 +1881,7 @@ async def test_vllm_refit_non_collocated_update_weights(
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
-    refit_policy_generation(
-        lm_policy, vllm_generation, vllm_config["colocated"]["enabled"]
-    )
+    refit_policy_generation(lm_policy, vllm_generation, False)
 
     # test generate
     if async_engine:
@@ -1258,12 +1890,23 @@ async def test_vllm_refit_non_collocated_update_weights(
         )
     else:
         outputs = vllm_generation.generate(test_input_data, greedy=True)
+
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    assert generated_texts == [
-        "Hello, my name is Lina. I'm",
-        "The capital of France is Paris. The capital of",
-    ], "Output should be the same as the expected output"
+
+    if policy_type == "dtensor":
+        expected_texts = [
+            "Hello, my name is Lina. I'm",
+            "The capital of France is Paris. The capital of",
+        ]
+    else:
+        expected_texts = [
+            "Hello, my name is Kaitlin and I",
+            "The capital of France is Paris. It is the",
+        ]
+    assert generated_texts == expected_texts, (
+        "Output should be the same as the expected output"
+    )
 
     # Clean up
     vllm_generation.shutdown()
@@ -1274,15 +1917,24 @@ async def test_vllm_refit_non_collocated_update_weights(
         print(f"Error during generation_cluster_separate shutdown: {e}")
 
 
-@pytest.mark.timeout(210)
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_generation_with_megatron_training(
-    cluster, tokenizer, tensor_parallel_size
+    cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that uses vLLM for generation and Megatron policy for training and logprob computation.
 
     This test validates that vLLM and Megatron policies can work together.
     """
+
+    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
+    if vllm_precision == "fp8":
+        major_capability, _ = torch.cuda.get_device_capability()
+        if major_capability < 9:
+            pytest.skip(
+                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            )
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
@@ -1298,6 +1950,7 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config["vllm_cfg"]["async_engine"] = False
+    vllm_config["vllm_cfg"]["precision"] = vllm_precision
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
@@ -1455,7 +2108,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     )
 
     # Megatron config with same model
-    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config = get_basic_megatron_test_config(
+        tp=1, pp=1, precision="float32", empty_unused_memory_level=1
+    )
     megatron_config["model_name"] = model_name
     megatron_config["tokenizer"]["name"] = model_name
 
@@ -1482,7 +2137,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])

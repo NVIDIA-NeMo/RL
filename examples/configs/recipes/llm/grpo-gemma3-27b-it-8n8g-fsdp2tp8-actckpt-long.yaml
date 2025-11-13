@@ -1,0 +1,42 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+  max_num_steps: 20
+checkpointing:
+  checkpoint_dir: results/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
+  model_save_format: null
+policy:
+  model_name: google/gemma-3-27b-it
+  tokenizer:
+    name: google/gemma-3-27b-it
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 8
+    _v2: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 4
+      max_model_len: 16384
+data:
+  max_input_seq_length: 16384
+logger:
+  log_dir: logs/grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-gemma3-27b-it-8n8g-fsdp2tp8sp-actckpt-long
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8

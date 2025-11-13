@@ -8,6 +8,7 @@ grpo:
 checkpointing:
   enabled: false
   checkpoint_dir: "results/grpo_8b_megatron"
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
@@ -29,7 +30,7 @@ policy:
 
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 0
+    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 1
     # On H100, can run with pp=1 for better performance with expandable segments (which is enabled by default)
@@ -51,7 +52,7 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: null
+      lr_decay_iters: 1000
       lr_warmup_iters: 13
       lr_warmup_init: 3.0e-8
 

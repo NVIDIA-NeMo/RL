@@ -1,0 +1,54 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+  max_num_steps: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-32b-32n8g-fsdp2tp8sp-actckpt
+policy:
+  model_name: Qwen/Qwen2.5-32B
+  tokenizer:
+    name: Qwen/Qwen2.5-32B
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 8
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1
+      total_iters: 13
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1
+      total_iters: 10000000000
+  - milestones:
+    - 13
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 4
+      max_model_len: 16384
+data:
+  max_input_seq_length: 16384
+logger:
+  log_dir: logs/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32

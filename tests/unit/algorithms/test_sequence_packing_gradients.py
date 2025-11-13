@@ -128,11 +128,16 @@ class SequencePackingGradientTestActor:
 
         loss_config = {
             "reference_policy_kl_penalty": 0.1,
+            "reference_policy_kl_type": "k3",
+            "kl_input_clamp_value": 20.0,
+            "kl_output_clamp_value": 10.0,
             "ratio_clip_min": 0.2,
             "ratio_clip_max": 0.2,
             "ratio_clip_c": 3.0,
             "use_on_policy_kl_approximation": False,
             "use_importance_sampling_correction": False,
+            "truncated_importance_sampling_ratio": None,
+            "sequence_level_importance_ratios": False,
             "token_level_loss": True,
         }
 

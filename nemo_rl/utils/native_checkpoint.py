@@ -152,6 +152,8 @@ def save_checkpoint(
         optimizer: Optional optimizer to save
         scheduler: Optional scheduler to save
         optimizer_path: Path to save optimizer state (required if optimizer provided)
+        tokenizer: Optional tokenizer to save
+        tokenizer_path: Path to save tokenizer state (required if tokenizer provided)
     """
     model_state = {"model": ModelState(model)}
     dcp.save(model_state, checkpoint_id=weights_path)
@@ -169,6 +171,7 @@ def save_checkpoint(
             raise ValueError(
                 "tokenizer_path must be provided when saving tokenizer state"
             )
+        print(f"Saving tokenizer (or processor) to {tokenizer_path}")
         tokenizer.save_pretrained(tokenizer_path)
 
 
@@ -208,6 +211,7 @@ def convert_dcp_to_hf(
     model_name_or_path: str,
     tokenizer_name_or_path: str,
     overwrite: bool = False,
+    hf_overrides: Optional[dict[str, Any]] = {},
 ) -> str:
     """Convert a Torch DCP checkpoint to a Hugging Face checkpoint.
 
@@ -244,7 +248,9 @@ def convert_dcp_to_hf(
     )
     torch.save(state_dict["model"], weights_path)
 
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=True, **hf_overrides
+    )
     config.save_pretrained(hf_ckpt_path)
 
     # TODO: After the following PR gets merged:

@@ -26,12 +26,16 @@ guides/sft-openmathinstruct2.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
+guides/dapo.md
 guides/grpo.md
 guides/grpo-deepscaler.md
+guides/grpo-sliding-puzzle.md
 guides/rm.md
+guides/environments.md
 guides/eval.md
 guides/deepseek.md
 model-quirks.md
+guides/async-grpo.md
 ```
 
 ```{toctree}
@@ -49,6 +53,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+fp8.md
 guides/use-custom-vllm.md
 apidocs/index.rst
 ```

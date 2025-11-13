@@ -1,4 +1,14 @@
+# Usage:
+# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
+# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
+# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push https://github.com/NVIDIA-NeMo/RL.git
+# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
+
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
+FROM scratch AS nemo-rl
+ARG NRL_GIT_REF=main
+ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
 FROM ${BASE_IMAGE} AS base
 
 # It is more convenient for users to run as root
@@ -34,7 +44,7 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv and python
-ARG UV_VERSION=0.7.2
+ARG UV_VERSION=0.9.7
 ARG PYTHON_VERSION=3.12
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
@@ -43,6 +53,10 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
 ENV RAY_USAGE_STATS_ENABLED=0
+# After ray>=2.47, this feature is enabled by default which creates uv venvs for any py_executable starting with `uv run`.
+# There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
+# need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 
@@ -54,24 +68,25 @@ WORKDIR /opt/nemo-rl
 # setting these to 1.
 ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
+# Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
+ARG BUILD_CUSTOM_VLLM
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# This step is to warm the uv cache with flash-attn without invalidating it due to COPY layers
-# This layer has to be manually updated
-RUN <<"EOF" bash -exu
-uv venv ${UV_PROJECT_ENVIRONMENT}
-
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink setuptools torch==2.7.0 psutil ninja --torch-backend=cu128
-VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT uv pip install --link-mode symlink flash-attn==2.7.4.post1 --no-build-isolation
-EOF
+# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
 # First copy only the dependency files
-COPY pyproject.toml uv.lock ./
-COPY --link 3rdparty/ ./3rdparty/
+COPY --from=nemo-rl pyproject.toml uv.lock ./
+COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN <<"EOF" bash -exu
+if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
+    bash tools/build-custom-vllm.sh
+    source 3rdparty/vllm/nemo-rl.env
+fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -82,6 +97,7 @@ RUN <<"EOF" bash -exu
 uv sync --link-mode symlink --locked --no-install-project
 uv sync --link-mode symlink --locked --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
+uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 EOF
 
@@ -103,7 +119,11 @@ LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
-# Copy in source and prefetch all virtual environments
-COPY . /opt/nemo-rl
+# Copy in source from build context (defaults to cloned repo, can be overridden)
+COPY --from=nemo-rl . /opt/nemo-rl
+# Unshallow the repo to get the full history (in the case it was from the scratch layer).
+# Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
+# so do a quick check before trying to unshallow.
+RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
 

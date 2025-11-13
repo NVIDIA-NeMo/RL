@@ -13,7 +13,7 @@
 # limitations under the License.
 import math
 import warnings
-from typing import Any, Optional, cast
+from typing import Any, Optional, Union, cast
 
 import torch
 from datasets import Dataset
@@ -23,6 +23,10 @@ from nemo_rl.data.interfaces import (
     FlatMessagesType,
     LLMMessageLogType,
     TaskDataSpec,
+)
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    get_multimodal_keys_from_processor,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -61,6 +65,19 @@ def message_log_to_flat_messages(
     ['Hello', 'Hi there']
     >>> flat_msgs['token_ids']
     tensor([1, 2, 3, 4, 5, 6, 7])
+    >>>
+    >>> # Multimodal example:
+    >>> from nemo_rl.data.multimodal_utils import PackedTensor
+    >>> img1 = torch.randn(2, 3, 4, 4)
+    >>> img2 = torch.randn(3, 3, 4, 4)
+    >>> mm_log = [
+    ...     {'role': 'user', 'content': 'see', 'token_ids': torch.tensor([1]), 'images': PackedTensor(img1, dim_to_pack=0)},
+    ...     {'role': 'assistant', 'content': 'ok', 'token_ids': torch.tensor([2, 3]), 'images': PackedTensor(img2, dim_to_pack=0)},
+    ... ]
+    >>> flat_mm = message_log_to_flat_messages(mm_log)
+    >>> tuple(flat_mm['images'].as_tensor().shape)
+    (5, 3, 4, 4)
+    >>>
     ```
     """
     result: dict[str, list[Any]] = {}
@@ -95,6 +112,14 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
+        elif result[key] and isinstance(result[key][0], PackedTensor):
+            try:
+                concat[key] = PackedTensor.concat(result[key])
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error concatenating packed multimodal data for {key=}"
+                ) from e
+
     output: FlatMessagesType = {**result, **concat}
     return output
 
@@ -273,6 +298,26 @@ def batched_message_log_to_flat_message(
     >>> input_lengths
     tensor([7, 9], dtype=torch.int32)
     >>>
+    >>> # Multimodal example: include images on both conversations and verify packing
+    >>> from nemo_rl.data.multimodal_utils import PackedTensor
+    >>> mm_batch = [
+    ...     [
+    ...         {'role': 'user', 'content': 'look', 'token_ids': torch.tensor([1, 2, 3]), 'images': PackedTensor(torch.randn(2, 3, 4, 4), dim_to_pack=0)},
+    ...         {'role': 'assistant', 'content': 'ok', 'token_ids': torch.tensor([4])}
+    ...     ],
+    ...     [
+    ...         {'role': 'user', 'content': 'again', 'token_ids': torch.tensor([5, 6]), 'images': PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0)},
+    ...         {'role': 'assistant', 'content': 'fine', 'token_ids': torch.tensor([7, 8])}
+    ...     ]
+    ... ]
+    >>> mm_flat, mm_lengths = batched_message_log_to_flat_message(mm_batch, pad_value_dict={'token_ids': 0})
+    >>> isinstance(mm_flat['images'], PackedTensor)
+    True
+    >>> tuple(mm_flat['images'].as_tensor().shape)  # 2 + 1 images
+    (3, 3, 4, 4)
+    >>> mm_lengths
+    tensor([4, 4], dtype=torch.int32)
+    >>>
     ```
     """
     if pad_block_size < 1:
@@ -291,6 +336,7 @@ def batched_message_log_to_flat_message(
     max_len = 0
     tensor_keys = []
     block_size = pad_block_size
+    multimodal_keys = []
     for seq in sequenced_lists:
         for key, value in seq.items():
             if isinstance(value, Tensor):
@@ -334,6 +380,10 @@ def batched_message_log_to_flat_message(
     result = BatchedDataDict()
     for key in all_keys:
         values = [seq.get(key) for seq in sequenced_lists]
+        # if the values are PackedTensors, create a new PackedTensor from the list of values
+        if values and isinstance(values[0], PackedTensor):
+            result[key] = PackedTensor.flattened_concat(values)
+            continue
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
@@ -414,6 +464,24 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
+def get_images_from_message(message: dict[str, Any]) -> list[Any]:
+    """Get all images from a message log item."""
+    # Handle None or missing content (e.g., assistant messages with only tool_calls)
+    if message.get("content") is None:
+        return []
+    # Handle string content (no images)
+    if isinstance(message["content"], str):
+        return []
+    # iterate over the content list
+    images = []
+    for item in message["content"]:
+        if item["type"] == "image":
+            images.extend(list(item["image"])) if isinstance(
+                item["image"], (list, tuple)
+            ) else images.append(item["image"])
+    return images
+
+
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -421,6 +489,7 @@ def get_formatted_message_log(
     add_bos_token: bool = True,
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
+    tools: Optional[list[dict[str, Any]]] = None,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -431,7 +500,7 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
-
+        tools: Optional list of tool/function definitions to pass to the chat template. Default: None
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
@@ -441,22 +510,78 @@ def get_formatted_message_log(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
 
+    multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+
+    def _format_content_helper(
+        content: Union[str, list[dict[str, Any]]],
+    ) -> Union[str, list[dict[str, Any]]]:
+        """This function formats the text portion of the first user message with the task prompt.
+
+        The `content` argument could either be a string (user text prompt) or a dict (user text prompt + multimodal data).
+
+        Examples of `content` argument include strings or dicts from the following conversation turns:
+        - {"role": "user", "content": "What is the capital of France?"}
+        - {"role": "user", "content": [{"type": "text", "text": "What is the capital of the city in the image?"}, {"type": "image", "image": "path/to/image.jpg"}]}
+        - {"role": "user", "content": [{"type": "text", "text": "Does the animal in the image match the sound it makes in the audio?"}, {"type": "image", "image": "path/to/image.jpg"}, {"type": "audio", "audio": "path/to/audio.mp3"}]}
+
+        In all cases, the text portion of the message is formatted with the task prompt.
+
+        Previously, the `content` argument was modified using
+        >>> message_log_strs = [
+        ...     {
+        ...         "role": "user",
+        ...         "content": task_data_spec.prompt.format(message_log_strs[0]["content"]),
+        ...     }
+        ... ] + message_log_strs[1:]
+        >>>
+
+        which assumes that the first message is a string (not true for multimodal data). This helper function correctly handles all cases.
+        """
+        if isinstance(content, str):
+            return task_data_spec.prompt.format(content)
+        # this is a list of dicts, format only the text ones
+        for item in content:
+            if item["type"] == "text":
+                item["text"] = task_data_spec.prompt.format(item["text"])
+        return content
+
+    # ignore any system prompts
+    first_user_msg_id = 0
+    for i, msg in enumerate(message_log_strs):
+        if msg["role"] == "user":
+            first_user_msg_id = i
+            break
+
     if task_data_spec.prompt:
-        message_log_strs = [
-            {
-                "role": "user",
-                "content": task_data_spec.prompt.format(message_log_strs[0]["content"]),
-            }
-        ] + message_log_strs[1:]
+        message_log_strs = (
+            message_log_strs[:first_user_msg_id]
+            + [
+                {
+                    "role": "user",
+                    "content": _format_content_helper(
+                        message_log_strs[first_user_msg_id]["content"]
+                    ),
+                }
+            ]
+            + message_log_strs[first_user_msg_id + 1 :]
+        )
 
     for i, message in enumerate(message_log_strs):
         # If enabled, add_generation_prompt is only used on user messages to include
         # the assistant's generation prompt as part of the user message.
+
+        # Only pass tools parameter if tools exist
+        template_kwargs = {
+            "add_generation_prompt": add_generation_prompt
+            and message["role"] in ["user", "tool"],
+            "tokenize": False,
+            "add_special_tokens": False,
+        }
+        if tools is not None:
+            template_kwargs["tools"] = tools
+
         formatted_message: str = tokenizer.apply_chat_template(  # type: ignore
-            message_log_strs[: i + 1],
-            add_generation_prompt=add_generation_prompt and message["role"] == "user",
-            tokenize=False,
-            add_special_tokens=False,
+            message_log_strs[: i + 1], **template_kwargs
         )
 
         ## get the length of the previous message, excluding the eos token (if present)
@@ -468,6 +593,31 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
+        # Debug: Print each message turn separately (only once for the first sample)
+        if not hasattr(get_formatted_message_log, "_debug_printed"):
+            if i == 0:
+                # Print header only at the start of first message
+                print("\n" + "=" * 80)
+                print("DEBUG: Individual message turns from apply_chat_template")
+                print("=" * 80)
+
+            print(f"\n[Turn {i + 1}/{len(message_log_strs)}] Role: {message['role']}")
+            print("-" * 40)
+            print("Extracted message chunk:")
+            print(repr(message_chunk))  # Using repr to show special characters
+            print(f"Raw text (len={len(message_chunk)}):")
+            print(message_chunk)
+            print("-" * 40)
+
+            if i == len(message_log_strs) - 1:
+                # Mark as printed after processing all turns of the first sample
+                get_formatted_message_log._debug_printed = True
+                print("\n" + "=" * 80)
+                print("DEBUG: Complete formatted conversation:")
+                print("-" * 80)
+                print(formatted_message)
+                print("=" * 80 + "\n")
+
         if i == 0:
             if add_bos_token:
                 if tokenizer.bos_token is None:
@@ -478,28 +628,74 @@ def get_formatted_message_log(
                     message_chunk = tokenizer.bos_token + message_chunk
 
         if i == len(message_log_strs) - 1:
-            message_chunk = message_chunk.rstrip("\n")
+            r"""
+            This is an attempt to robustly append the eos token. The origin is Qwen
+            chat templates always append <eos>\n and some models like gemma do not
+            use the <eos> at all in the chat template. Adding a <eos> if the <eos> is
+            already at the end, is likely a user error, and since we know Qwen likes to
+            have <eos>\n we'll check for that case.
+
+            This makes the logic slightly more robust to the model family's chat template
+            so users don't need to know whether they need to add add_eos or not.
+            """
+            stripped_message_chunk = message_chunk.rstrip("\n")
             if add_eos_token:
                 if tokenizer.eos_token is None:
                     warnings.warn(
                         "add_eos_token is True but the tokenizer does not have an EOS token. Skipping EOS token addition."
                     )
-                elif not message_chunk.endswith(tokenizer.eos_token):
+                elif not stripped_message_chunk.endswith(tokenizer.eos_token):
                     message_chunk += tokenizer.eos_token
 
+        # get images too (extend this for other modalities)
+        images_cur_message = get_images_from_message(message)
+
         new_message = message.copy()
-        new_message["token_ids"] = tokenizer(
-            message_chunk, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
+        # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
+        if len(images_cur_message) == 0:
+            new_message["token_ids"] = tokenizer(
+                text=message_chunk, return_tensors="pt", add_special_tokens=False
+            )["input_ids"][0]
+        else:
+            # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            processed_chunk = tokenizer(
+                text=[message_chunk],
+                images=images_cur_message,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            new_message["token_ids"] = processed_chunk["input_ids"][0]
+
+            # add all vlm keys to the message
+            for key in multimodal_keys:
+                if key in processed_chunk:
+                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
             # which causes `_validate_tensor_consistency` to fail. To fix this, we convert the
             # empty tensor to int64.
             new_message["token_ids"] = new_message["token_ids"].to(torch.int64)  # type: ignore
 
-        new_message["content"] = message_chunk
-        new_message_log.append(new_message)
+        # format content correctly
+        content = message.get("content")
+        if content is None or not content:
+            # Handle None or missing content (e.g., assistant messages with only tool_calls)
+            new_message["content"] = message_chunk
+        elif isinstance(content, str):
+            new_message["content"] = message_chunk
+        else:
+            # format the content list of new message the same way as the original message but replace the text with the new message chunk
+            new_message["content"] = []
+            for item in content:
+                if item["type"] == "text":
+                    new_message["content"].append(
+                        {"type": "text", "text": message_chunk}
+                    )
+                else:
+                    new_message["content"].append(item)
 
+        new_message_log.append(new_message)
         prev_formatted_message = formatted_message
 
     return new_message_log

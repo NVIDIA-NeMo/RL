@@ -46,6 +46,7 @@ from nemo_rl.package_info import (
 )
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
 
 
 def _patch_nsight_file():
@@ -113,3 +114,25 @@ def _patch_nsight_file():
 
 # Apply the patch
 _patch_nsight_file()
+
+
+# Need to set PYTHONPATH to include transformers downloaded modules.
+# Assuming the cache directory is the same cross venvs.
+def patch_transformers_module_dir(env_vars: dict[str, str]):
+    hf_home = os.environ.get("HF_HOME", None)
+    if hf_home is None:
+        return env_vars
+
+    module_dir = os.path.join(hf_home, "modules")
+    if not os.path.isdir(module_dir):
+        return env_vars
+
+    if "PYTHONPATH" not in env_vars:
+        env_vars["PYTHONPATH"] = module_dir
+    else:
+        env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
+
+    return env_vars
+
+
+patch_transformers_module_dir(os.environ)

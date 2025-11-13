@@ -1,0 +1,157 @@
+defaults: distillation_math.yaml
+
+checkpointing:
+    checkpoint_dir: "checkpoints/distillation-megatron-${policy.model_name}"
+
+policy: &POLICY_BASE
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    tokenizer:
+        name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
+    train_global_batch_size: 64
+    train_micro_batch_size: 1
+    generation_batch_size: 64
+    logprob_batch_size: 1
+    max_total_sequence_length: 8192
+    precision: "bfloat16"
+    logprob_chunk_size: null
+
+    dtensor_cfg:
+        enabled: false
+
+    dynamic_batching:
+        enabled: false
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        sequence_length_round: 64
+
+    sequence_packing:
+        enabled: true
+        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
+        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        algorithm: "modified_first_fit_decreasing"
+        sequence_length_round: 64
+
+    max_grad_norm: 1.0
+
+    make_sequence_length_divisible_by: ${mul:${mul:${.megatron_cfg.tensor_model_parallel_size}, ${.megatron_cfg.context_parallel_size}}, 2}
+
+    megatron_cfg: &MEGATRON_BASE
+        enabled: true
+        empty_unused_memory_level: 0
+        activation_checkpointing: false
+        converter_type: "Qwen3ForCausalLM"
+        tensor_model_parallel_size: 2
+        expert_tensor_parallel_size: 1
+        expert_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
+        num_layers_in_first_pipeline_stage: null
+        num_layers_in_last_pipeline_stage: null
+        context_parallel_size: 2
+        pipeline_dtype: ${policy.precision}
+        sequence_parallel: false
+        freeze_moe_router: true
+        moe_router_dtype: "fp64"
+        moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
+        moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+        moe_permute_fusion: false
+        #gives ~20% training perf speedup with sequence packing 
+        apply_rope_fusion: True
+        bias_activation_fusion: True
+        defer_fp32_logits: False
+        
+        optimizer:
+            optimizer: "adam"
+            lr: 2.00001e-5
+            min_lr: 2.0e-5
+            weight_decay: 0.01
+            bf16: true
+            fp16: false
+            params_dtype: "float32"
+
+            #adam
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            adam_eps: 1e-8
+
+            #sgd
+            sgd_momentum: 0.9
+
+            #distributed optimizer
+            use_distributed_optimizer: true
+            use_precision_aware_optimizer: true
+
+            # optimizer cpu offload
+            optimizer_cpu_offload: false
+            optimizer_offload_fraction: 0.0
+
+            clip_grad: ${policy.max_grad_norm}
+
+        scheduler:
+            start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+            weight_decay_incr_style: "constant"
+            lr_decay_style: "constant"
+            lr_decay_iters: 1000
+            lr_warmup_iters: 10
+            lr_warmup_init: 2.0e-6
+
+        distributed_data_parallel_config:
+            grad_reduce_in_fp32: false
+            overlap_grad_reduce: true
+            overlap_param_gather: true
+            use_custom_fsdp: false
+            data_parallel_sharding_strategy: "optim_grads_params"
+
+    generation:
+        backend: "vllm"
+        max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
+        temperature: 1.0
+        top_p: 1.0
+        top_k: null
+        stop_token_ids: null
+        stop_strings: null
+        vllm_cfg:
+            async_engine: false
+            precision: ${...precision}
+            tensor_parallel_size: 1
+            pipeline_parallel_size: 1
+            expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
+            gpu_memory_utilization: 0.6
+            max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
+            enforce_eager: False
+            use_deep_gemm: False
+            num_last_layers_in_bf16: 0
+            num_first_layers_in_bf16: 0
+            distributed_executor_backend: null
+
+        colocated:
+            # true: generation shares training GPUs
+            # false: uses dedicated generation resources
+            enabled: true
+            # only relevant when enabled is false
+            resources:
+                gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+                num_nodes: null # Decides number of nodes to be dedicated to generation
+
+teacher:
+    <<: *POLICY_BASE
+    model_name: "Qwen/Qwen3-4B"
+    megatron_cfg:
+        <<: *MEGATRON_BASE
+        context_parallel_size: 2
+        tensor_model_parallel_size: 2
+        pipeline_model_parallel_size: 2
+
+logger:
+    wandb_enabled: true
+    wandb:
+        project: "nemo-distillation"
+        name: "distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    tensorboard:
+        log_dir: "tb_logs-distillation-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    mlflow:
+        run_name: "distillation-math-megatron-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+
+cluster:
+    gpus_per_node: 8
+    num_nodes: 1

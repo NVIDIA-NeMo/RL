@@ -6,18 +6,26 @@ grpo:
   num_generations_per_prompt: 16
   max_rollout_turns: 50 # Maximum turns allowed per rollout
   max_num_steps: 10000
+  max_num_epochs: 1
 
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo-sliding-puzzle"
-  metric_name: "val_reward"
+  metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 3072
+  max_total_sequence_length: 1024
+
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: true
+    activation_checkpointing: true
+    sequence_parallel: true
 
   generation:
     backend: "vllm"
@@ -33,19 +41,21 @@ policy:
       async_engine: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
+      expert_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
 
 data:
   add_system_prompt: false
+  shuffle: false  # disable dataloader shuffle, shuffle is handled within the dataset
 
 env:
   sliding_puzzle_game:
     cfg:
       game_config:
         size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)
-        shuffle_moves: 15 # Number of random moves to shuffle the solved state
-      max_moves: 50 # Maximum moves allowed per episode
+        shuffle_moves: 10 # Number of random moves to shuffle the solved state
+      max_moves: 30 # Maximum moves allowed per episode
 
 logger:
   log_dir: "logs"  # Base directory for all logs
@@ -53,6 +63,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"

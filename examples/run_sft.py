@@ -16,15 +16,15 @@ import argparse
 import os
 import pprint
 from functools import partial
-from typing import Any
+from typing import Any, Callable, Optional
 
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data import DataConfig, hf_datasets
-from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data import DataConfig
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.interfaces import DatumSpec, TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -59,8 +59,13 @@ def sft_preprocessor(
     add_bos: bool = True,
     add_eos: bool = True,
     add_generation_prompt: bool = False,
+    datum_preprocessor: Optional[Callable] = None,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
+    # optional preprocessor
+    if datum_preprocessor is not None:
+        datum_dict = datum_preprocessor(datum_dict)
+
     message_log = get_formatted_message_log(
         datum_dict["messages"],
         tokenizer,
@@ -68,6 +73,7 @@ def sft_preprocessor(
         add_bos_token=add_bos,
         add_eos_token=add_eos,
         add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),  # Pass tools from data if present
     )
 
     length = sum(len(m["token_ids"]) for m in message_log)
@@ -91,43 +97,26 @@ def sft_preprocessor(
     return output
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
+def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig, seed: int):
     print("\n▶ Setting up data...")
-    data_cls = data_config["dataset_name"]
-    if data_cls == "open_assistant":
-        data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
-    elif data_cls == "squad":
-        data = hf_datasets.SquadDataset()
-    elif data_cls == "prompt_response_dataset":
-        data = hf_datasets.PromptResponseDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["input_key"],
-            data_config["output_key"],
-        )
-    elif data_cls == "openmathinstruct2":
-        data = hf_datasets.OpenMathInstruct2Dataset(
-            split=data_config["split"],
-            output_key=data_config["output_key"],
-            prompt_file=data_config["prompt_file"],
-        )
-    elif data_cls == "openai_format":
-        data = hf_datasets.OpenAIFormatDataset(
-            data_config["train_data_path"],
-            data_config["val_data_path"],
-            data_config["chat_key"],
-            data_config["system_key"],
-            data_config["system_prompt"],
-        )
-    else:
-        raise ValueError(f"Unknown dataset class: {data_cls}")
-    print(
-        f"  ✓ Training and validation datasets loaded with {len(data.formatted_ds['train'])} and {len(data.formatted_ds['validation'])} samples, respectively."
-    )
 
+    # load dataset
+    data = load_response_dataset(data_config, seed)
     train_dataset = data.formatted_ds["train"]
     val_dataset = data.formatted_ds["validation"]
     sft_task_spec = data.task_spec
+    print(
+        f"  ✓ Training and validation datasets loaded with {len(train_dataset)} and {len(val_dataset)} samples, respectively."
+    )
+
+    # add preprocessor if needed
+    datum_preprocessor = None
+    if "dataset_name" in data_config and data_config["dataset_name"] == "clevr_cogent":
+        from nemo_rl.data.datasets.response_datasets.clevr import (
+            format_clevr_cogent_dataset,
+        )
+
+        datum_preprocessor = partial(format_clevr_cogent_dataset, return_pil=True)
 
     train_dataset = AllTaskProcessedDataset(
         train_dataset,
@@ -138,6 +127,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config["add_bos"],
             add_eos=data_config["add_eos"],
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -151,6 +141,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_bos=data_config.get("add_bos", True),
             add_eos=data_config.get("add_eos", True),
             add_generation_prompt=data_config["add_generation_prompt"],
+            datum_preprocessor=datum_preprocessor,
         ),
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -158,7 +149,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     return train_dataset, val_dataset, sft_task_spec
 
 
-def main():
+def main(is_vlm: bool = False):
     """Main entry point."""
     # Parse arguments
     args, overrides = parse_args()
@@ -189,15 +180,15 @@ def main():
 
     init_ray()
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    # setup tokenizer (or processor)
+    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
 
     # setup data
     (
         dataset,
         val_dataset,
         sft_task_spec,
-    ) = setup_data(tokenizer, config["data"])
+    ) = setup_data(tokenizer, config["data"], config["sft"]["seed"])
 
     (
         policy,
@@ -210,6 +201,7 @@ def main():
         sft_save_state,
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
+
     sft_train(
         policy,
         train_dataloader,

@@ -34,6 +34,19 @@ class ReferenceLogprobOutputSpec(TypedDict):
     reference_logprobs: torch.Tensor
 
 
+class ScoreOutputSpec(TypedDict):
+    """scores: Tensor of scores."""
+
+    scores: torch.Tensor
+
+
+class TopkLogitsOutputSpec(TypedDict):
+    """Per-position top-k logits and corresponding global token indices."""
+
+    topk_logits: torch.Tensor
+    topk_indices: torch.Tensor
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -68,6 +81,20 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get per-position top-k logits and global indices for a batch of inputs.
+
+        Notes:
+            - Aligns to next-token positions → returns S-1 positions.
+        """
+        pass
+
+    @abstractmethod
     def train(
         self,
         data: BatchedDataDict,
@@ -85,6 +112,13 @@ class PolicyInterface(ABC):
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
         """
+        pass
+
+    @abstractmethod
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
         pass
 
     @abstractmethod
@@ -107,7 +141,7 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int
+        self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -124,11 +158,9 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_weights_for_ipc(self, *args: Any, **kwargs: Any) -> list[list[str]]:
-        pass
-
-    @abstractmethod
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    def stream_weights_via_ipc_zmq(
+        self, *args: Any, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
         pass
 
     @abstractmethod

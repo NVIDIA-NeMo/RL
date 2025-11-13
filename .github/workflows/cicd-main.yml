@@ -21,6 +21,8 @@ on:
     types: [labeled, opened, synchronize, reopened]
   merge_group:
     types: [checks_requested]
+  schedule:
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       test_to_run:
@@ -95,6 +97,11 @@ jobs:
             TEST_LEVEL="none"
           fi
 
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "Setting test level to L1 for nightly scheduled run"
+            TEST_LEVEL="L1"
+          fi
+
           # Override test level if specified in workflow_dispatch
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             echo "Overriding test level from $TEST_LEVEL to ${{ inputs.test_to_run }}"
@@ -103,16 +110,45 @@ jobs:
 
           echo "test_level=$TEST_LEVEL" | tee -a "$GITHUB_OUTPUT"
 
-  submodule-check:
-    name: Check submodule fast-forward
+  pr-branch-up-to-date-check:
+    name: Check if PR branch is up to date
     needs: [pre-flight]
-    if: github.event_name == 'pull_request'
-    uses: ./.github/workflows/_submodule_check.yml
-    with:
-      base_ref: ${{ github.base_ref }}
-      head_ref: ${{ github.head_ref }}
-      pr_number: ${{ github.event.number }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    env:
+      MAX_COMMITS_BEHIND: 10
+    steps:
+      - name: Check how many commits behind target branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+        run: |
+          echo "Repository: $REPO"
+          echo "Base branch: $BASE_REF (SHA: $BASE_SHA)"
+          echo "PR head: $HEAD_LABEL (SHA: $HEAD_SHA)"
+          echo "Maximum commits behind allowed: $MAX_COMMITS_BEHIND"
+
+          API_RESPONSE=$(gh api "repos/$REPO/compare/$HEAD_SHA...$BASE_REF" --jq '{behind_by: .behind_by, ahead_by: .ahead_by, status: .status}')
+
+          COMMITS_BEHIND=$(echo "$API_RESPONSE" | jq -r '.ahead_by')
+          COMMITS_AHEAD=$(echo "$API_RESPONSE" | jq -r '.behind_by')
+          STATUS=$(echo "$API_RESPONSE" | jq -r '.status')
+
+          echo "Comparison status: $STATUS"
+          echo "PR is $COMMITS_BEHIND commits behind and $COMMITS_AHEAD commits ahead of $BASE_REF"
+
+          # Check if we're behind by more than the allowed number
+          if [ "$COMMITS_BEHIND" -gt "$MAX_COMMITS_BEHIND" ]; then
+            echo "❌ ERROR: This PR is $COMMITS_BEHIND commits behind $BASE_REF, which exceeds the maximum allowed ($MAX_COMMITS_BEHIND commits)."
+            echo "Please rebase or merge the latest changes from $BASE_REF into your PR branch."
+            exit 1
+          else
+            echo "✅ PR is acceptably fresh ($COMMITS_BEHIND commits behind, limit is $MAX_COMMITS_BEHIND)"
+          fi
 
   lint-check:
     name: Lint check
@@ -126,7 +162,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.7.2"
+          version: "0.9.1"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
@@ -149,7 +185,7 @@ jobs:
               ((missing_count++))
             fi
           done
-          
+
           exit $missing_count
       - name: Minimize uv cache
         run: uv cache prune --ci
@@ -157,119 +193,113 @@ jobs:
   sphinx-build:
     needs: [pre-flight]
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.48.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
 
   build-container:
     if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
     needs: [pre-flight]
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.30.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_container.yml@v0.52.0
     with:
       build-ref: ${{ github.sha }}
       image-name: nemo_rl_container
       dockerfile: docker/Dockerfile
       image-label: nemo-rl
       target: hermetic
+      build-contexts: |
+        nemo-rl=${{ github.run_id }}/
       build-args: |
         MAX_JOBS=32
         NEMO_RL_COMMIT=${{ github.sha }}
 
-  tests:
-    name: Tests
-    needs: [build-container, pre-flight]
-    uses: ./.github/workflows/_run_test.yml
-    if: ${{ needs.pre-flight.outputs.test_level != 'none' }}
-    with:
-      RUNNER: self-hosted-azure
-      TIMEOUT: 180
-      UNIT_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then
-          uv run --no-sync bash -x ./tests/run_unit.sh --cov=nemo_rl --hf-gated
-          uv run --extra mcore bash -x ./tests/run_unit.sh --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
-        else
-          echo Skipping unit tests for docs-only level
-        fi
-      DOC_TEST_SCRIPT: |
-        cd /opt/nemo-rl/docs
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(docs|L0|L1|L2)$ ]]; then
-          uv run --no-sync sphinx-build -b doctest . _build/doctest
-        else
-          echo Skipping doc tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      FUNCTIONAL_TEST_SCRIPT: |
-        cd /opt/nemo-rl
-        if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L1|L2)$ ]]; then
-          time uv run --no-sync bash ./tests/functional/sft.sh
-          time uv run --no-sync bash ./tests/functional/grpo.sh
-          time uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-          time uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
-          time uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
-          time uv run --no-sync bash ./tests/functional/dpo.sh
-          time uv run --no-sync bash ./tests/functional/rm.sh
-          time uv run --no-sync bash ./tests/functional/eval.sh
-          time uv run --no-sync bash ./tests/functional/eval_async.sh
-          time uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
-        else
-          echo Skipping functional tests for level ${{ needs.pre-flight.outputs.test_level }}
-        fi
-      # TODO: enable once we have convergence tests in CI
-      #CONVERGENCE_TEST_SCRIPT: |
-      #  cd /opt/nemo-rl
-      #  if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L2)$  ]]; then
-      #    echo "Running convergence tests"
-      #    # Add your convergence test commands here
-      #    # uv run --no-sync bash ./tests/convergence/test.sh
-      #  else
-      #    echo "Skipping convergence tests for level ${{ needs.pre-flight.outputs.test_level }}"
-      #  fi
-      AFTER_SCRIPT: |
-        cd /opt/nemo-rl
-        cat <<EOF | tee -a $GITHUB_STEP_SUMMARY
-        # Test Summary for level: ${{ needs.pre-flight.outputs.test_level }}
-
-        ## Unit test results
-        \`\`\`json
-        $(if [[ "${{ needs.pre-flight.outputs.test_level }}" =~ ^(L0|L1|L2)$ ]]; then cat tests/unit/unit_results.json || echo "n/a"; else echo "Not run"; fi)
-        \`\`\`
-
-        ## Test Level: ${{ needs.pre-flight.outputs.test_level }}
-        EOF
-    secrets:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-  coverage:
-    name: Upload coverage to Codecov
-    needs: [tests]
-    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
-    runs-on: ubuntu-latest
+  cicd-doc-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: Docs_Tests
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container]
+    if: ${{ contains('docs L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    environment: nemo-ci
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Download coverage artifact
-        uses: actions/download-artifact@v4
+      - name: main
+        uses: ./.github/actions/test-template
         with:
-          name: unit-test-coverage-report
-          path: .
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          is_doc_test: "true"
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+  cicd-unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L0_Unit_Tests_Generation
+            runner: self-hosted-azure
+          - script: L0_Unit_Tests_Policy
+            runner: self-hosted-azure
+          - script: L0_Unit_Tests_Other
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container, cicd-doc-tests]
+    if: ${{ contains('L0 L1 L2', needs.pre-flight.outputs.test_level) }}
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.script }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.json
-          flags: unit-tests
-          verbose: true
-          override_branch: ${{ github.event_name == 'merge_group' && 'main' || '' }}
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          is_unit_test: "true"
+          cpu-only: ${{ matrix.cpu-only || false }}
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
+
+  cicd-functional-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: L1_Functional_Tests_GPU
+            runner: self-hosted-azure
+    needs: [pre-flight, build-container, cicd-unit-tests]
+    runs-on: ${{ matrix.runner }}
+    if: ${{ contains('L1 L2', needs.pre-flight.outputs.test_level) }}
+    name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
+    environment: nemo-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          runner: ${{ runner.name }}
+          script: ${{ matrix.script }}
+          is_fork_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name }}
 
   CI_QA_Gate:
-    name: CI quality check
+    name: "CI quality check${{ needs.pre-flight.outputs.test_level == 'none' && ' (No tests run: Label CI:L*)' || '' }}"
     if: always()
     runs-on: ubuntu-latest
     needs:
       - pre-flight
+      - pr-branch-up-to-date-check
       - lint-check
       - sphinx-build
-      - tests
+      - build-container
+      - cicd-doc-tests
+      - cicd-unit-tests
+      - cicd-functional-tests
     steps:
       - name: main
         env:
@@ -278,12 +308,17 @@ jobs:
           ALL_SUCCESS: >-
             ${{
               needs.lint-check.result == 'success' &&
+              (needs.pr-branch-up-to-date-check.result == 'success' || needs.pr-branch-up-to-date-check.result == 'skipped') &&
               (
-                needs.pre-flight.outputs.test_level == 'none' ||
+                needs.pre-flight.outputs.test_level != 'none' &&
+                needs.sphinx-build.result == 'success' &&
+                needs.build-container.result == 'success' &&
                 (
-                  needs.pre-flight.outputs.test_level != 'none' &&
-                  needs.sphinx-build.result == 'success' &&
-                  needs.tests.result == 'success'
+                  (
+                    needs.cicd-doc-tests.result == 'success' &&
+                    (needs.cicd-unit-tests.result == 'skipped' || needs.cicd-unit-tests.result == 'success') &&
+                    (needs.cicd-functional-tests.result == 'skipped' || needs.cicd-functional-tests.result == 'success')
+                  )
                 )
               )
             }}
@@ -293,13 +328,99 @@ jobs:
           SUMMARY=$(echo $JOB_RESULTS | jq 'to_entries[] | .key + ": " + .value.result' | tr -d '"')
           echo '🤖: CICD Result for test level: ${{ needs.pre-flight.outputs.test_level }}' >> $GITHUB_STEP_SUMMARY
           echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+          test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
 
-          if [[ "$TEST_LEVEL" == "none" ]]; then
-            echo "No tests were run, passing gate" >> $GITHUB_STEP_SUMMARY
-            exit 0
+  notify-nightly-failure:
+    name: Notify nightly test failure
+    runs-on: ubuntu-latest
+    needs: [CI_QA_Gate]
+    environment: main
+    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
+        run: |
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" "$SLACK_WEBHOOK"
+
+  Coverage:
+    runs-on: ubuntu-latest
+    needs:
+      - CI_QA_Gate
+      - cicd-doc-tests
+      - cicd-unit-tests
+      - cicd-functional-tests
+    if: always()
+    strategy:
+      matrix:
+        flag: [doc-test, unit-test, e2e]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download coverage reports of current branch
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-${{ matrix.flag }}-*
+
+      - name: Check if artifacts were downloaded
+        id: check-artifacts
+        run: |
+          # Check if any coverage directories were downloaded
+          if ls coverage-* 1> /dev/null 2>&1; then
+            echo "artifacts-found=true" >> $GITHUB_OUTPUT
+            echo "Found coverage artifacts for ${{ matrix.flag }}"
+          else
+            echo "artifacts-found=false" >> $GITHUB_OUTPUT
+            echo "No coverage artifacts found for ${{ matrix.flag }}"
           fi
 
-          test "$ALL_SUCCESS" = "true" || test "$CI_SKIP" = "true"
+      - name: Get total coverage of current branch
+        shell: bash -x -e -u -o pipefail {0}
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        run: |
+          pip install coverage
+
+          ls -al .
+          ls -al coverage-*/
+          coverage combine --keep $(ls coverage-*/.coverage)
+          coverage report -i --show-missing
+          rm -rf coverage-*
+          ls -al
+
+      - name: Skip coverage processing
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'false' }}
+        run: |
+          echo "No coverage artifacts found for ${{ matrix.flag }}, skipping coverage processing"
+
+      - name: Upload coverage reports to Codecov
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          flags: ${{ matrix.flag }}
+
+      - name: Upload artifacts
+        if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.flag }}-aggregated
+          path: |
+            .coverage
+          include-hidden-files: true
 
   DCO_merge_group:
     name: DCO

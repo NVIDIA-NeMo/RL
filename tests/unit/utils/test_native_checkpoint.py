@@ -42,6 +42,7 @@ simple_policy_config = {
     "logprob_batch_size": 1,
     "max_total_sequence_length": 1024,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -128,17 +129,6 @@ def policy(cluster, tokenizer):
     )
     yield policy
     policy.worker_group.shutdown()
-
-
-@pytest.fixture(scope="module", autouse=True)
-def skip_tied_weight_check_for_all():
-    """Automatically skip tied weight check for all tests in this module."""
-    os.environ["NRL_SKIP_TIED_WEIGHT_CHECK"] = "1"
-
-    yield
-
-    # Restore the original value
-    os.environ.pop("NRL_SKIP_TIED_WEIGHT_CHECK", None)
 
 
 def get_dummy_state_dict(state_dict, dummy_dict={}):

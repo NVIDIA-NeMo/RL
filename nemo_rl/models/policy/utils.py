@@ -12,14 +12,177 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import importlib
 import os
-from typing import Any
+import traceback
+from enum import Enum
+from typing import Any, Dict, Optional
 
 import torch
-from transformers import AutoConfig
+import zmq
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoModelForTextToWaveform,
+)
+
+# Try to import nemo_automodel classes, fallback to None if not available
+try:
+    from nemo_automodel.components._transformers.auto_model import (
+        NeMoAutoModelForCausalLM,
+        NeMoAutoModelForImageTextToText,
+        NeMoAutoModelForTextToWaveform,
+    )
+
+    NEMO_AUTOMODEL_AVAILABLE = True
+except ImportError:
+    # nemo_automodel is not installed, classes will be None
+    NeMoAutoModelForCausalLM = None  # type: ignore
+    NeMoAutoModelForImageTextToText = None  # type: ignore
+    NeMoAutoModelForTextToWaveform = None  # type: ignore
+    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+
+# an automodel factory for loading the huggingface models from correct class
+
+AUTOMODEL_FACTORY: Dict[str, Any] = {
+    "qwen2_5_vl": AutoModelForImageTextToText,
+    "qwen2_vl": AutoModelForImageTextToText,
+    "qwen2_5_omni": AutoModelForTextToWaveform,
+    "llava": AutoModelForImageTextToText,
+    "internvl": AutoModelForImageTextToText,
+    "gemma3": AutoModelForImageTextToText,
+    "smolvlm": AutoModelForImageTextToText,
+    "mistral3": AutoModelForImageTextToText,
+    "llama4": AutoModelForImageTextToText,
+}
+
+if NEMO_AUTOMODEL_AVAILABLE:
+    AUTOMODEL_FACTORY = {
+        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_vl": NeMoAutoModelForImageTextToText,
+        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "llava": NeMoAutoModelForImageTextToText,
+        "internvl": NeMoAutoModelForImageTextToText,
+        "gemma3": NeMoAutoModelForImageTextToText,
+        "smolvlm": NeMoAutoModelForImageTextToText,
+        "mistral3": NeMoAutoModelForImageTextToText,
+        "llama4": NeMoAutoModelForImageTextToText,
+    }
+
+
+class IPCProtocol(Enum):
+    """IPC protocol constants for ZMQ weight streaming."""
+
+    COMPLETE = "complete"
+    ACK = "ack"
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> torch.Tensor:
+    """Apply top-k and top-p masks to the logits.
+
+    Simplified version of VLLM's implementation for scalar parameters.
+
+    Based on VLLM's implementation:
+    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
+    SPDX-License-Identifier: Apache-2.0
+    Copyright contributors to the vLLM project
+
+    Args:
+        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
+        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
+        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
+
+    Returns:
+        Filtered logits with sampling parameters applied
+    """
+    if top_p is None or top_p == 1.0:
+        if top_k is None or top_k == -1:
+            return logits
+        # Avoid sorting vocab for top-k only case
+        return apply_top_k_only(logits, top_k)
+
+    # Apply top-p (requires sorting)
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+
+    if top_k is not None and top_k != -1:
+        # Apply top-k first
+        top_k_index = logits_sort.size(-1) - top_k
+        # Get all the top_k values - need to broadcast the index across all dimensions
+        index_tensor = torch.full(
+            logits_sort.shape[:-1],
+            top_k_index,
+            device=logits_sort.device,
+            dtype=torch.long,
+        )
+        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
+        top_k_mask = logits_sort < top_k_threshold
+        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+
+    # Apply top-p
+    probs_sort = logits_sort.softmax(dim=-1)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    top_p_mask = probs_sum <= 1 - top_p
+    # at least one
+    top_p_mask[..., -1] = False
+    logits_sort.masked_fill_(top_p_mask, -float("inf"))
+
+    # Re-sort the probabilities
+    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+    return logits
+
+
+def apply_top_k_only(
+    logits: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Apply top-k mask to the logits.
+
+    Simplified version of VLLM's implementation for scalar parameters.
+    This implementation doesn't involve sorting the entire vocab.
+
+    Based on VLLM's implementation:
+    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
+    SPDX-License-Identifier: Apache-2.0
+    Copyright contributors to the vLLM project
+
+    Args:
+        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
+        top_k: Top-k sampling parameter.
+
+    Returns:
+        Filtered logits with top-k applied
+    """
+    if top_k >= logits.shape[-1] or top_k == -1:
+        return logits
+
+    # Get top-k values and create mask
+    top_k_values, _ = torch.topk(logits, top_k, dim=-1)
+    threshold = top_k_values[..., -1:].expand_as(logits)
+    mask = logits >= threshold
+
+    # Apply mask: keep top-k values, set others to -inf
+    logits = torch.where(
+        mask,
+        logits,
+        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
+    )
+    return logits
+
+
+def resolve_model_class(model_name: str) -> Any:
+    """Resolve the appropriate model class for a given model name."""
+    if NEMO_AUTOMODEL_AVAILABLE:
+        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -140,49 +303,6 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
-def configure_expandable_segments() -> None:
-    """Configure expandable_segments on Hopper and newer architectures (compute capability 9.x+).
-
-    This helps with memory allocation but causes crashes on Ampere GPUs, so we only enable it
-    on newer architectures. If PYTORCH_CUDA_ALLOC_CONF is already set, preserves existing values.
-    """
-    compute_capability = torch.cuda.get_device_properties(0).major
-
-    if compute_capability >= 9:  # Hopper+
-        existing_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-
-        # Check if expandable_segments is already configured
-        if "expandable_segments" in existing_conf:
-            print(f"expandable_segments already configured: {existing_conf}")
-            # Already configured, don't override
-            return
-
-        # Add expandable_segments to existing configuration
-        if existing_conf:
-            # Append to existing configuration
-            new_conf = f"{existing_conf},expandable_segments:True"
-        else:
-            # Set new configuration
-            new_conf = "expandable_segments:True"
-
-        print(f"Setting PYTORCH_CUDA_ALLOC_CONF to {new_conf}")
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = new_conf
-
-    else:
-        ## make sure that expandable_segments is not set to True
-        if "expandable_segments" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
-            conf_items = os.environ["PYTORCH_CUDA_ALLOC_CONF"].split(",")
-            for item in conf_items:
-                if item.strip().startswith("expandable_segments"):
-                    key_value = item.split(":")
-                    if len(key_value) == 2 and key_value[1].strip().lower() == "true":
-                        raise RuntimeError(
-                            "expandable_segments is enabled in PYTORCH_CUDA_ALLOC_CONF, "
-                            "but this is not supported on architectures older than Hopper (compute capability < 9). "
-                            "Please set expandable_segments to False."
-                        )
-
-
 def configure_dynamo_cache() -> None:
     """Disable dynamo autotune_local_cache.
 
@@ -238,3 +358,163 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
 
     # skip serializing the function for better refit performance
     return reduce_tensor(tensor.detach())[1:]
+
+
+def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
+    """Calculate aligned size for memory alignment.
+
+    Args:
+        size_bytes(int): Size in bytes to align
+        alignment(int): Alignment boundary in bytes (default 512)
+
+    Returns:
+        Aligned size in bytes(int).
+    """
+    return int(((size_bytes + alignment - 1) // alignment) * alignment)
+
+
+def stream_weights_via_ipc_zmq_impl(
+    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+) -> None:
+    """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
+
+    Uses ping-pong double buffering to enable overlapping communication while reusing buffers
+    to reduce memory allocation overhead and improve stability.
+
+    Args:
+        params_generator: Generator yielding (name, tensor) pairs
+        buffer_size_bytes: total size of buffer in bytes for batching parameters
+        zmq_socket: ZMQ socket for communication
+        rank: Worker rank for logging
+        worker_name: Name of the worker for logging
+    """
+    # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
+    buffer_size_bytes = buffer_size_bytes // 2
+
+    def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
+        """Send a group of parameters and return new pending_recv state."""
+        # Synchronize before getting IPC handle to ensure data is ready
+        torch.cuda.current_stream().synchronize()
+        cuda_ipc_handle = get_handle_from_tensor(buffer)
+
+        if await_recv:
+            zmq_socket.recv()
+
+        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
+        payload = (cuda_ipc_handle, param_names, used_bytes)
+        zmq_socket.send_pyobj(payload)
+        return True  # pending_recv = True
+
+    def allocate_buffer(device):
+        """Allocate a new aligned buffer with proper memory alignment."""
+        aligned_size = calculate_aligned_size(buffer_size_bytes)
+        return torch.empty(
+            aligned_size,
+            device=device,
+            dtype=torch.uint8,
+            requires_grad=False,
+        )
+
+    def pack_tensor(buffer, tensor, used_bytes) -> int:
+        """Pack tensor into buffer and return new used_bytes."""
+        tensor_bytes = tensor.nbytes
+        buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
+            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+        )
+        return used_bytes + calculate_aligned_size(tensor_bytes)
+
+    # Initialize ping-pong double buffering
+    buffer_a: torch.Tensor | None = None
+    buffer_b: torch.Tensor | None = None
+    current_buffer: torch.Tensor | None = None
+
+    used_bytes = 0
+    param_names = []
+    await_recv = False
+    count_of_groups = 0
+
+    try:
+        for name, tensor in params_generator:
+            # Initialize device and buffers on first tensor
+            if buffer_a is None:
+                buffer_a = allocate_buffer(tensor.device)
+                buffer_b = allocate_buffer(tensor.device)
+                current_buffer = buffer_a
+
+            aligned_size = calculate_aligned_size(tensor.nbytes)
+            assert aligned_size <= buffer_size_bytes, (
+                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
+            )
+
+            # Check if we need to send current buffer and switch to the other one
+            if used_bytes + aligned_size > buffer_size_bytes:
+                await_recv = send_buffer_group_overlap(
+                    current_buffer, param_names, used_bytes, await_recv
+                )
+                count_of_groups += 1
+
+                # Switch buffers for ping-pong double buffering
+                current_buffer = buffer_b if current_buffer is buffer_a else buffer_a
+                used_bytes, param_names = 0, []
+
+            # Pack tensor into current buffer
+            param_names.append(name)
+            used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
+
+        # Send remaining tensors
+        if param_names:
+            await_recv = send_buffer_group_overlap(
+                current_buffer, param_names, used_bytes, await_recv
+            )
+            count_of_groups += 1
+
+        # Complete transmission
+        if await_recv:
+            zmq_socket.recv()
+
+        # Final synchronization and completion signal
+        torch.cuda.current_stream().synchronize()
+        zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
+        zmq_socket.recv()
+
+        if rank == 0:
+            print(
+                f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
+            )
+
+    except zmq.Again:
+        timeout_ms = zmq_socket.getsockopt(zmq.RCVTIMEO)
+        raise TimeoutError(
+            f"{worker_name} (rank {rank}): ZMQ communication timeout after {timeout_ms}ms in policy worker side. "
+            f"The generation worker may be dead or unresponsive. "
+            f"This typically indicates the generation worker has crashed or is not responding to weight streaming."
+        ) from None
+    except zmq.ZMQError as e:
+        raise RuntimeError(
+            f"{worker_name} (rank {rank}): ZMQ error during weight streaming: {e} (errno: {e.errno}). "
+            f"Error details: {e.strerror}. "
+            f"This may indicate network issues or the peer process has terminated unexpectedly.\n"
+            f"{traceback.format_exc()}"
+        ) from e
+
+    finally:
+        # Clean up buffers in finally block to ensure cleanup even on exceptions
+        if buffer_a is not None:
+            del buffer_a
+        if buffer_b is not None:
+            del buffer_b
+
+        # Force garbage collection and clear CUDA cache
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def rebuild_cuda_tensor_from_ipc(
+    cuda_ipc_handle: tuple, device_id: int
+) -> torch.Tensor:
+    """Rebuild a CUDA tensor from an IPC handle."""
+    func = rebuild_cuda_tensor
+    args = cuda_ipc_handle[0]
+    list_args = list(args)
+    list_args[6] = device_id
+    return func(*list_args)
