@@ -47,7 +47,7 @@ SLURM options (ignored with --local):
   --time TIME                Wall clock time limit (default: 2:00:00)
   --cpus NUM                 CPUs per task (default: 32)
   --mem SIZE                 Memory per node (default: 64G)
-  --partition PART           SLURM partition (default: interactive)
+  --partition PART           SLURM partition (default: batch)
   --container IMAGE          Container image path (default matches server launcher)
   --account ACCOUNT          SLURM account (defaults to \$ACCOUNT environment variable)
 
@@ -69,7 +69,7 @@ JOB_NAME="llada-eval"
 TIME="2:00:00"
 CPUS_PER_TASK=32
 MEM="64G"
-PARTITION="interactive"
+PARTITION="batch"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/mfathi/containers/nemo_rl_base.sqsh"
 SERVER_ADDRESS=""
 SERVER_INFO_FILE=""

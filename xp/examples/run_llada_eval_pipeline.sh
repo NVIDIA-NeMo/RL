@@ -26,6 +26,7 @@ SERVER_GPUS="${SERVER_GPUS:-8}"
 SEQ_EVAL_JOB_NAME="${SEQ_EVAL_JOB_NAME:-llada-eval-sequential}"
 SEQ_EVAL_CPUS="${SEQ_EVAL_CPUS:-48}"
 SEQ_EVAL_TIME="${SEQ_EVAL_TIME:-02:00:00}"
+SEQ_EVAL_PARTITION="${SEQ_EVAL_PARTITION:-batch}"
 
 # === Pipeline / model configuration =========================================
 SERVER_INFO_FILE="${SERVER_INFO_FILE:-/lustre/fsw/portfolios/llmservice/users/${USER}/tmp/llada_server.env}"
@@ -110,6 +111,7 @@ SEQ_EVAL_ARGS=(
   "--job-name" "$SEQ_EVAL_JOB_NAME"
   "--cpus" "$SEQ_EVAL_CPUS"
   "--time" "$SEQ_EVAL_TIME"
+  "--partition" "$SEQ_EVAL_PARTITION"
   "--server-info-file" "$SERVER_INFO_FILE"
   "--"
 )
