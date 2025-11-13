@@ -62,10 +62,10 @@ from nemo_rl.models.automodel.setup import (
 from nemo_rl.models.automodel.train import (
     cleanup_after_training,
     forward_backward,
-    model_forward,
+    forward_with_processor,
+    get_logprobs,
+    get_topk_logits,
     optimizer_step,
-    process_outputs_for_logprobs,
-    process_outputs_for_topk,
     setup_train_loop,
 )
 from nemo_rl.models.huggingface.common import (
@@ -503,31 +503,26 @@ class DTensorPolicyWorkerV2:
                     for i, length in enumerate(input_lengths):
                         post_attention_mask[i, :length] = 1
 
-                # Model forward pass
-                outputs = model_forward(
-                    self.model,
-                    processed_inputs,
-                    self.cp_size,
-                    self.cp_mesh,
-                    self.is_reward_model,
-                    self.allow_flash_attn_args,
-                    self.is_hf_model,
-                    self.is_moe_model,
-                )
-
-                # Process outputs for logprobs
-                token_logprobs = process_outputs_for_logprobs(
-                    outputs,
-                    self.model,
-                    lp_batch,
-                    processed_inputs,
-                    input_ids,
-                    self.cp_size,
-                    self.cp_mesh,
-                    self.device_mesh,
-                    self.enable_seq_packing,
-                    self._apply_temperature_scaling,
-                    logprob_chunk_size,
+                # Model forward pass and logprobs processing
+                token_logprobs = forward_with_processor(
+                    model=self.model,
+                    mb=lp_batch,
+                    processor_fn=get_logprobs,
+                    processed_inputs=processed_inputs,
+                    dtype=self.dtype,
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    device_mesh=self.device_mesh,
+                    is_reward_model=self.is_reward_model,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    is_hf_model=self.is_hf_model,
+                    is_moe_model=self.is_moe_model,
+                    apply_temperature_fn=self._apply_temperature_scaling,
+                    processor_kwargs={
+                        "input_ids": input_ids,
+                        "enable_seq_packing": self.enable_seq_packing,
+                        "logprob_chunk_size": logprob_chunk_size,
+                    },
                 )
 
                 # skip keeping the logprobs for the dummy batches
@@ -755,29 +750,26 @@ class DTensorPolicyWorkerV2:
                         self.cp_size,
                     )
 
-                # Model forward pass
-                outputs = model_forward(
-                    self.model,
-                    processed_inputs,
-                    self.cp_size,
-                    self.cp_mesh,
-                    self.is_reward_model,
-                    self.allow_flash_attn_args,
-                )
-
-                # Process outputs for top-k
-                vals, idx = process_outputs_for_topk(
-                    outputs,
-                    self.model,
-                    lp_batch,
-                    processed_inputs,
-                    k,
-                    self.cp_size,
-                    self.cp_mesh,
-                    self.device_mesh,
-                    self.tp_mesh,
-                    self.enable_seq_packing,
-                    self._apply_temperature_scaling,
+                # Model forward pass and top-k processing
+                vals, idx = forward_with_processor(
+                    model=self.model,
+                    mb=lp_batch,
+                    processor_fn=get_topk_logits,
+                    processed_inputs=processed_inputs,
+                    dtype=self.dtype,
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    device_mesh=self.device_mesh,
+                    is_reward_model=self.is_reward_model,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    is_hf_model=self.is_hf_model,
+                    is_moe_model=self.is_moe_model,
+                    apply_temperature_fn=self._apply_temperature_scaling,
+                    processor_kwargs={
+                        "k": k,
+                        "tp_mesh": self.tp_mesh,
+                        "enable_seq_packing": self.enable_seq_packing,
+                    },
                 )
 
                 # Skip keeping the results for the dummy batches

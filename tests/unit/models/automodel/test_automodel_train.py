@@ -25,11 +25,12 @@ from nemo_rl.models.automodel.train import (
     _process_logits,
     cleanup_after_training,
     forward_backward,
+    forward_with_processor,
+    get_logprobs,
+    get_loss,
+    get_topk_logits,
     model_forward,
     optimizer_step,
-    process_output_for_train,
-    process_outputs_for_logprobs,
-    process_outputs_for_topk,
     setup_train_loop,
 )
 
@@ -1038,13 +1039,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1069,13 +1067,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=True,
             allow_flash_attn_args=False,
             is_hf_model=False,
             is_moe_model=False,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1104,13 +1099,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1137,13 +1129,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=True,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1169,13 +1158,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
             is_hf_model=True,
             is_moe_model=True,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1201,13 +1187,10 @@ class TestModelForward:
         outputs = model_forward(
             model=mock_model,
             processed_inputs=processed_inputs,
-            cp_size=1,
-            cp_mesh=None,
             is_reward_model=False,
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
-            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1218,7 +1201,359 @@ class TestModelForward:
         assert "padding_mask" not in call_kwargs
 
 
-class TestProcessOutputForTrain:
+class TestForwardWithProcessor:
+    def test_with_get_loss_processor(self, mock_model, mock_loss_fn):
+        """Test forward_with_processor with get_loss as the processor."""
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        global_valid_seqs = torch.tensor(8.0).cuda()
+        global_valid_toks = torch.tensor(512.0).cuda()
+        apply_temperature_fn = lambda x: x
+
+        # Call forward_with_processor with get_loss as processor
+        loss, loss_metrics = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=get_loss,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            processor_kwargs={
+                "loss_fn": mock_loss_fn,
+                "global_valid_seqs": global_valid_seqs,
+                "global_valid_toks": global_valid_toks,
+                "enable_seq_packing": False,
+            },
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify loss function was called
+        mock_loss_fn.assert_called_once()
+
+        # Verify loss and metrics were returned
+        assert loss is not None
+        assert isinstance(loss_metrics, dict)
+
+    def test_with_get_logprobs_processor(self, mock_model):
+        """Test forward_with_processor with get_logprobs as the processor."""
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        input_ids = mb["input_ids"]
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        # Call forward_with_processor with get_logprobs as processor
+        token_logprobs = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=get_logprobs,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            processor_kwargs={
+                "input_ids": input_ids,
+                "enable_seq_packing": False,
+                "logprob_chunk_size": None,
+            },
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify shape: [batch_size, seq_len]
+        assert token_logprobs.shape == (4, 64)
+
+        # Verify first token has zero logprob (prepended)
+        assert torch.all(token_logprobs[:, 0] == 0.0)
+
+    def test_with_get_topk_logits_processor(self, mock_model):
+        """Test forward_with_processor with get_topk_logits as the processor."""
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+        mock_tp_mesh = MagicMock()
+
+        # Call forward_with_processor with get_topk_logits as processor
+        vals, idx = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=get_topk_logits,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            processor_kwargs={
+                "k": 10,
+                "tp_mesh": mock_tp_mesh,
+                "enable_seq_packing": False,
+            },
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify shape: [batch_size, seq_len, k]
+        assert vals.shape == (4, 64, 10)
+        assert idx.shape == (4, 64, 10)
+
+    def test_with_custom_processor(self, mock_model):
+        """Test forward_with_processor with a custom processor function."""
+
+        # Create a custom processor that just returns the logits shape
+        def custom_processor(
+            outputs,
+            model,
+            mb,
+            processed_inputs,
+            cp_size,
+            cp_mesh,
+            device_mesh,
+            apply_temperature_fn,
+        ):
+            logits = _process_logits(outputs, model, apply_temperature_fn)
+            return logits.shape
+
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        # Call forward_with_processor with custom processor
+        result = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=custom_processor,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            processor_kwargs={},
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify result is the logits shape
+        assert result == torch.Size([4, 64, 1000])
+
+    def test_with_none_processor_kwargs(self, mock_model):
+        """Test forward_with_processor with None processor_kwargs (default)."""
+
+        # Create a simple processor that doesn't need extra kwargs
+        def simple_processor(
+            outputs,
+            model,
+            mb,
+            processed_inputs,
+            cp_size,
+            cp_mesh,
+            device_mesh,
+            apply_temperature_fn,
+        ):
+            return "success"
+
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        apply_temperature_fn = lambda x: x
+
+        # Call forward_with_processor without processor_kwargs
+        result = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=simple_processor,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            # processor_kwargs not provided (defaults to None)
+        )
+
+        # Verify model was called
+        mock_model.assert_called_once()
+
+        # Verify result
+        assert result == "success"
+
+    def test_with_temperature_scaling(self, mock_model, mock_loss_fn):
+        """Test forward_with_processor with temperature scaling applied."""
+        # Create test microbatch
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)).cuda(),
+                "sample_mask": torch.ones(4, dtype=torch.bool).cuda(),
+            }
+        )
+
+        # Create processed inputs
+        processed_inputs = {
+            "input_ids": mb["input_ids"],
+            "attention_mask": torch.ones(4, 64, dtype=torch.bool).cuda(),
+            "position_ids": torch.arange(64).repeat(4, 1).cuda(),
+            "flash_attn_kwargs": {},
+            "vlm_kwargs": {},
+            "cp_buffers": [],
+            "seq_index": None,
+            "seq_len": 64,
+        }
+
+        global_valid_seqs = torch.tensor(8.0).cuda()
+        global_valid_toks = torch.tensor(512.0).cuda()
+
+        # Mock temperature function that scales logits
+        temperature = 2.0
+        apply_temperature_fn = MagicMock(side_effect=lambda x: x / temperature)
+
+        # Call forward_with_processor
+        loss, loss_metrics = forward_with_processor(
+            model=mock_model,
+            mb=mb,
+            processor_fn=get_loss,
+            processed_inputs=processed_inputs,
+            dtype=torch.float16,
+            cp_size=1,
+            cp_mesh=None,
+            device_mesh=None,
+            is_reward_model=False,
+            allow_flash_attn_args=True,
+            is_hf_model=False,
+            is_moe_model=False,
+            apply_temperature_fn=apply_temperature_fn,
+            processor_kwargs={
+                "loss_fn": mock_loss_fn,
+                "global_valid_seqs": global_valid_seqs,
+                "global_valid_toks": global_valid_toks,
+                "enable_seq_packing": False,
+            },
+        )
+
+        # Verify temperature function was called
+        apply_temperature_fn.assert_called()
+
+
+class TestGetLoss:
     def test_basic_train_output_processing(self, mock_model, mock_loss_fn):
         # Create mock outputs
         outputs = MagicMock()
@@ -1247,7 +1582,7 @@ class TestProcessOutputForTrain:
         global_valid_toks = torch.tensor(512.0).cuda()
         apply_temperature_fn = lambda x: x
 
-        loss, loss_metrics = process_output_for_train(
+        loss, loss_metrics = get_loss(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1259,7 +1594,6 @@ class TestProcessOutputForTrain:
             cp_mesh=None,
             device_mesh=None,
             enable_seq_packing=False,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1310,7 +1644,7 @@ class TestProcessOutputForTrain:
         )
         mock_seq_packing_wrapper.return_value = wrapped_loss_fn
 
-        loss, loss_metrics = process_output_for_train(
+        loss, loss_metrics = get_loss(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1322,7 +1656,6 @@ class TestProcessOutputForTrain:
             cp_mesh=None,
             device_mesh=None,
             enable_seq_packing=True,
-            eval_mode=True,
             apply_temperature_fn=apply_temperature_fn,
         )
 
@@ -1331,7 +1664,7 @@ class TestProcessOutputForTrain:
         wrapped_loss_fn.assert_called_once()
 
 
-class TestProcessOutputsForLogprobs:
+class TestGetLogprobs:
     def test_basic_logprob_extraction(self, mock_model):
         # Create mock outputs
         outputs = MagicMock()
@@ -1360,7 +1693,7 @@ class TestProcessOutputsForLogprobs:
 
         apply_temperature_fn = lambda x: x
 
-        token_logprobs = process_outputs_for_logprobs(
+        token_logprobs = get_logprobs(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1409,7 +1742,7 @@ class TestProcessOutputsForLogprobs:
         apply_temperature_fn = lambda x: x
 
         # Use chunking with chunk_size=64
-        token_logprobs = process_outputs_for_logprobs(
+        token_logprobs = get_logprobs(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1430,7 +1763,7 @@ class TestProcessOutputsForLogprobs:
         assert torch.all(token_logprobs[:, 0] == 0.0)
 
 
-class TestProcessOutputsForTopk:
+class TestGetTopkLogits:
     def test_basic_topk_extraction(self, mock_model):
         # Create mock outputs
         outputs = MagicMock()
@@ -1460,7 +1793,7 @@ class TestProcessOutputsForTopk:
         # Create mock tp_mesh
         mock_tp_mesh = MagicMock()
 
-        vals, idx = process_outputs_for_topk(
+        vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1513,7 +1846,7 @@ class TestProcessOutputsForTopk:
         # Create mock tp_mesh
         mock_tp_mesh = MagicMock()
 
-        vals, idx = process_outputs_for_topk(
+        vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
             mb=mb,
@@ -1557,7 +1890,7 @@ class TestProcessOutputsForTopk:
         mock_tp_mesh = MagicMock()
 
         # Test with k=20
-        vals, idx = process_outputs_for_topk(
+        vals, idx = get_topk_logits(
             outputs=outputs,
             model=mock_model,
             mb=mb,

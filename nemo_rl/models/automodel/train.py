@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+import contextlib
+from typing import Any, Generator, Optional
 
 import torch
 from nemo_automodel.components.distributed.cp_utils import (
     create_context_parallel_ctx,
-    get_train_context,
+)
+from nemo_automodel.components.distributed.cp_utils import (
+    get_train_context as get_train_context_automodel,
 )
 from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
@@ -49,7 +52,7 @@ def setup_train_loop(
     # dim 1 is always assumed to be the sequence dim, sanity check this here
     sequence_dim = 1
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
-    for k, v in data.items():
+    for _, v in data.items():
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
@@ -60,6 +63,35 @@ def setup_train_loop(
         "num_global_batches": num_global_batches,
         "sequence_dim": sequence_dim,
     }
+
+
+@contextlib.contextmanager
+def get_train_context(
+    cp_size: int,
+    cp_mesh: Any,
+    cp_buffers: list,
+    sequence_dim: int,
+    dtype: torch.dtype,
+    autocast_enabled: bool = True,
+) -> Generator[None, None, None]:
+    """Create combined context manager for training with context parallel and autocast."""
+    with contextlib.ExitStack() as stack:
+        context_parallel_ctx = None
+        if cp_size > 1:
+            # Create context parallel context
+            context_parallel_ctx = create_context_parallel_ctx(
+                cp_mesh=cp_mesh,
+                cp_buffers=cp_buffers,
+                cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                cp_no_restore_buffers=set(cp_buffers),
+            )
+
+        stack.enter_context(
+            get_train_context_automodel(False, False, context_parallel_ctx)()
+        )
+        if autocast_enabled:
+            stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
+        yield
 
 
 def forward_backward(
@@ -81,35 +113,94 @@ def forward_backward(
     eval_mode: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    outputs = model_forward(
-        model,
-        processed_inputs,
-        cp_size,
-        cp_mesh,
-        is_reward_model,
-        allow_flash_attn_args,
-        is_hf_model,
-        is_moe_model,
-        dtype,
-    )
+    sequence_dim = 1
+    cp_buffers = processed_inputs["cp_buffers"]
+    with get_train_context(cp_size, cp_mesh, cp_buffers, sequence_dim, dtype):
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model,
+            allow_flash_attn_args,
+            is_hf_model,
+            is_moe_model,
+        )
 
-    loss, loss_metrics = process_output_for_train(
-        outputs,
-        model,
-        mb,
-        loss_fn,
-        global_valid_seqs,
-        global_valid_toks,
-        processed_inputs,
-        cp_size,
-        cp_mesh,
-        device_mesh,
-        enable_seq_packing,
-        eval_mode,
-        apply_temperature_fn,
-    )
+        loss, loss_metrics = get_loss(
+            outputs,
+            model,
+            mb,
+            loss_fn,
+            global_valid_seqs,
+            global_valid_toks,
+            processed_inputs,
+            cp_size,
+            cp_mesh,
+            device_mesh,
+            enable_seq_packing,
+            apply_temperature_fn,
+        )
+        # Backward pass
+        if not eval_mode:
+            ## NOTE: invalid samples should be multiplied
+            ## by zero in the loss function to prevent them
+            ## from affecting the gradient calculation
+
+            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
+            # but we want to sum them so we cancel out the average here
+            # loss *= self.dp_size * self.cp_size
+            loss.backward()
 
     return loss, loss_metrics
+
+
+def forward_with_processor(
+    model: nn.Module,
+    mb: BatchedDataDict[Any],
+    processor_fn: Any,
+    processed_inputs: dict[str, Any],
+    dtype: torch.dtype,
+    cp_size: int,
+    cp_mesh: Any,
+    device_mesh: Any,
+    is_reward_model: bool,
+    allow_flash_attn_args: bool,
+    is_hf_model: bool,
+    is_moe_model: bool,
+    apply_temperature_fn,
+    processor_kwargs: Optional[dict[str, Any]] = None,
+) -> Any:
+    if processor_kwargs is None:
+        processor_kwargs = {}
+
+    sequence_dim = 1
+    cp_buffers = processed_inputs["cp_buffers"]
+
+    with get_train_context(cp_size, cp_mesh, cp_buffers, sequence_dim, dtype):
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model,
+            allow_flash_attn_args,
+            is_hf_model,
+            is_moe_model,
+        )
+
+    with get_train_context(
+        cp_size, cp_mesh, cp_buffers, sequence_dim, dtype, autocast_enabled=False
+    ):
+        result = processor_fn(
+            outputs=outputs,
+            model=model,
+            mb=mb,
+            processed_inputs=processed_inputs,
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            device_mesh=device_mesh,
+            apply_temperature_fn=apply_temperature_fn,
+            **processor_kwargs,
+        )
+
+    return result
 
 
 def optimizer_step(
@@ -174,67 +265,49 @@ def cleanup_after_training(
 def model_forward(
     model: nn.Module,
     processed_inputs: dict[str, Any],
-    cp_size: int,
-    cp_mesh: Any,
     is_reward_model: bool,
     allow_flash_attn_args: bool,
     is_hf_model: bool,
     is_moe_model: bool,
-    dtype: torch.dtype,
 ) -> Any:
-    sequence_dim = 1
-
     input_ids = processed_inputs["input_ids"]
     attention_mask = processed_inputs["attention_mask"]
     position_ids = processed_inputs["position_ids"]
     flash_attn_kwargs = processed_inputs["flash_attn_kwargs"]
     vlm_kwargs = processed_inputs["vlm_kwargs"]
-    cp_buffers = processed_inputs["cp_buffers"]
 
-    context_parallel_ctx = None
-    if cp_size > 1:
-        # Create context parallel context
-        context_parallel_ctx = create_context_parallel_ctx(
-            cp_mesh=cp_mesh,
-            cp_buffers=cp_buffers,
-            cp_seq_dims=[sequence_dim] * len(cp_buffers),
-            cp_no_restore_buffers=set(cp_buffers),
-        )
+    model_args = dict(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
+        flash_attn_kwargs=flash_attn_kwargs,
+        **vlm_kwargs,
+    )
+    if is_moe_model and not is_hf_model:
+        padding_mask = ~attention_mask if attention_mask is not None else None
+        model_args["padding_mask"] = padding_mask
 
-    with get_train_context(False, False, context_parallel_ctx)():
-        with torch.autocast(device_type="cuda", dtype=dtype):
-            model_args = dict(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                flash_attn_kwargs=flash_attn_kwargs,
-                **vlm_kwargs,
-            )
-            if is_moe_model and not is_hf_model:
-                padding_mask = ~attention_mask if attention_mask is not None else None
-                model_args["padding_mask"] = padding_mask
+    if is_reward_model:
+        # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
+        # Note that it should be empty anyway since sequence packing
+        # is not supported for reward models.
+        assert not flash_attn_kwargs
+        del model_args["flash_attn_kwargs"]
+    # remove flash_attn_kwargs if there are multimodal kwargs
+    if len(vlm_kwargs) > 0:
+        del model_args["flash_attn_kwargs"]
 
-            if is_reward_model:
-                # `flash_attn_kwarg` is not supported for `LlamaForSequenceClassification`.
-                # Note that it should be empty anyway since sequence packing
-                # is not supported for reward models.
-                assert not flash_attn_kwargs
-                del model_args["flash_attn_kwargs"]
-            # remove flash_attn_kwargs if there are multimodal kwargs
-            if len(vlm_kwargs) > 0:
-                del model_args["flash_attn_kwargs"]
+    if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
+        del model_args["flash_attn_kwargs"]
 
-            if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
-                del model_args["flash_attn_kwargs"]
+    # Remove None attention_mask padding_mask if present
+    if model_args.get("attention_mask") is None:
+        del model_args["attention_mask"]
+    if "padding_mask" in model_args and model_args.get("padding_mask") is None:
+        del model_args["padding_mask"]
 
-            # Remove None attention_mask padding_mask if present
-            if model_args.get("attention_mask") is None:
-                del model_args["attention_mask"]
-            if "padding_mask" in model_args and model_args.get("padding_mask") is None:
-                del model_args["padding_mask"]
-
-            outputs = model(**model_args)
+    outputs = model(**model_args)
 
     return outputs
 
@@ -321,7 +394,7 @@ def _handle_context_parallel_sharding(
     return logits, seq_index_dtensor
 
 
-def process_output_for_train(
+def get_loss(
     outputs: Any,
     model: nn.Module,
     mb: BatchedDataDict[Any],
@@ -333,7 +406,6 @@ def process_output_for_train(
     cp_mesh: Any,
     device_mesh: Any,
     enable_seq_packing: bool,
-    eval_mode: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     sequence_dim = 1
@@ -341,7 +413,7 @@ def process_output_for_train(
     cp_buffers = processed_inputs["cp_buffers"]
     seq_index = processed_inputs["seq_index"]
 
-    with get_train_context(False, False, None)():
+    with get_train_context_automodel(False, False, None)():
         # Process logits from model outputs
         logits = _process_logits(outputs, model, apply_temperature_fn)
         del outputs
@@ -375,21 +447,10 @@ def process_output_for_train(
         )
         del logits
 
-        # Backward pass
-        if not eval_mode:
-            ## NOTE: invalid samples should be multiplied
-            ## by zero in the loss function to prevent them
-            ## from affecting the gradient calculation
-
-            # when FSDP reduces the gradients over the DP dim, they're automatically averaged
-            # but we want to sum them so we cancel out the average here
-            # loss *= self.dp_size * self.cp_size
-            loss.backward()
-
     return loss, loss_metrics
 
 
-def process_outputs_for_logprobs(
+def get_logprobs(
     outputs: Any,
     model: nn.Module,
     mb: BatchedDataDict[Any],
@@ -407,77 +468,72 @@ def process_outputs_for_logprobs(
     seq_index = processed_inputs["seq_index"]
     seq_len = processed_inputs["seq_len"]
 
-    with get_train_context(False, False, None)():
-        # Process logits from model outputs
-        logits = _process_logits(outputs, model, apply_temperature_fn)
-        del outputs
+    # Process logits from model outputs
+    logits = _process_logits(outputs, model, apply_temperature_fn)
+    del outputs
 
-        if cp_size > 1:
-            # Shard logits for CP (without modifying mb)
-            logits, seq_index_tensor = _handle_context_parallel_sharding(
-                logits,
-                seq_index,
-                cp_mesh,
-                device_mesh,
-                sequence_dim,
-            )
+    if cp_size > 1:
+        # Shard logits for CP (without modifying mb)
+        logits, seq_index_tensor = _handle_context_parallel_sharding(
+            logits,
+            seq_index,
+            cp_mesh,
+            device_mesh,
+            sequence_dim,
+        )
 
-            # For logprob extraction, we need input_ids as DTensor
-            input_ids_dtensor = DTensor.from_local(
-                input_ids,
-                device_mesh=cp_mesh,
-                placements=[Shard(sequence_dim)],
-            )
+        # For logprob extraction, we need input_ids as DTensor
+        input_ids_dtensor = DTensor.from_local(
+            input_ids,
+            device_mesh=cp_mesh,
+            placements=[Shard(sequence_dim)],
+        )
 
+        token_logprobs = get_logprobs_from_vocab_parallel_logits(
+            logits,
+            input_ids_dtensor,
+            seq_index_tensor,
+            chunk_size=logprob_chunk_size,
+        )
+
+        assert token_logprobs.shape[1] == seq_len - 1
+    else:
+        if isinstance(logits, DTensor):
             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                 logits,
-                input_ids_dtensor,
-                seq_index_tensor,
+                input_ids,
                 chunk_size=logprob_chunk_size,
             )
-
-            assert token_logprobs.shape[1] == seq_len - 1
         else:
-            if isinstance(logits, DTensor):
-                token_logprobs = get_logprobs_from_vocab_parallel_logits(
-                    logits,
-                    input_ids,
-                    chunk_size=logprob_chunk_size,
-                )
+            if logprob_chunk_size is not None:
+                logits_seq_len = int(logits.shape[1])
+                num_chunks = (
+                    logits_seq_len + logprob_chunk_size - 1
+                ) // logprob_chunk_size
+                chunked_log_probs = []
+                for chunk_idx in range(num_chunks):
+                    chunk_start = chunk_idx * logprob_chunk_size
+                    chunk_end = min(
+                        logits_seq_len,
+                        (chunk_idx + 1) * logprob_chunk_size,
+                    )
+                    chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
+                    log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
+                    chunked_log_probs.append(log_probs)
+                log_probs = torch.cat(chunked_log_probs, dim=1)
+                del chunked_log_probs
             else:
-                if logprob_chunk_size is not None:
-                    logits_seq_len = int(logits.shape[1])
-                    num_chunks = (
-                        logits_seq_len + logprob_chunk_size - 1
-                    ) // logprob_chunk_size
-                    chunked_log_probs = []
-                    for chunk_idx in range(num_chunks):
-                        chunk_start = chunk_idx * logprob_chunk_size
-                        chunk_end = min(
-                            logits_seq_len,
-                            (chunk_idx + 1) * logprob_chunk_size,
-                        )
-                        chunk_logits = logits[:, chunk_start:chunk_end, :].to(
-                            torch.float32
-                        )
-                        log_probs = torch.nn.functional.log_softmax(
-                            chunk_logits, dim=-1
-                        )
-                        chunked_log_probs.append(log_probs)
-                    log_probs = torch.cat(chunked_log_probs, dim=1)
-                    del chunked_log_probs
-                else:
-                    logits = logits.to(torch.float32)
-                    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                logits = logits.to(torch.float32)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-                # Extract logprobs for each token in the sequence by gathering the logprob
-                # corresponding to the next token at each position
-                next_tokens = input_ids[:, 1:]
-                log_probs = log_probs[:, :-1]
-                token_logprobs = log_probs.gather(
-                    dim=-1, index=next_tokens.unsqueeze(-1)
-                ).squeeze(-1)
-                del log_probs
+            # Extract logprobs for each token in the sequence by gathering the logprob
+            # corresponding to the next token at each position
+            next_tokens = input_ids[:, 1:]
+            log_probs = log_probs[:, :-1]
+            token_logprobs = log_probs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+            del log_probs
 
         del logits
 
@@ -489,7 +545,7 @@ def process_outputs_for_logprobs(
     return token_logprobs
 
 
-def process_outputs_for_topk(
+def get_topk_logits(
     outputs: Any,
     model: nn.Module,
     mb: BatchedDataDict[Any],
@@ -510,24 +566,47 @@ def process_outputs_for_topk(
     sequence_dim = 1
     seq_index = processed_inputs["seq_index"]
 
-    with get_train_context(False, False, None)():
-        # Process logits from model outputs
-        logits = _process_logits(outputs, model, apply_temperature_fn)
-        del outputs
+    # Process logits from model outputs
+    logits = _process_logits(outputs, model, apply_temperature_fn)
+    del outputs
 
-        if cp_size > 1:
-            # Shard logits for CP (without modifying mb)
-            logits, seq_index_tensor = _handle_context_parallel_sharding(
-                logits,
-                seq_index,
-                cp_mesh,
-                device_mesh,
-                sequence_dim,
-            )
+    if cp_size > 1:
+        # Shard logits for CP (without modifying mb)
+        logits, _ = _handle_context_parallel_sharding(
+            logits,
+            seq_index,
+            cp_mesh,
+            device_mesh,
+            sequence_dim,
+        )
 
-            # Deal with TP first
-            local_logits = logits.to_local()  # [B, S_cp, V_tp]
+        # Deal with TP first
+        local_logits = logits.to_local()  # [B, S_cp, V_tp]
 
+        tp_group = tp_mesh.get_group()
+        tp_rank = torch.distributed.get_rank(tp_group)
+        V_local = int(local_logits.shape[-1])
+        vocab_start_index = tp_rank * V_local
+        vocab_end_index = (tp_rank + 1) * V_local
+
+        vals, idx = distributed_vocab_topk(
+            local_logits,
+            k=k,
+            tp_group=tp_group,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+        )
+        # [B, S_cp, k]
+
+        cp_group = cp_mesh.get_group()
+
+        vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
+        idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
+        # [B, S, k]
+    else:
+        # Compute top-k over full sequence length (do not drop last position)
+        if isinstance(logits, DTensor):
+            local_logits = logits.to_local()  # [B, S, V_local]
             tp_group = tp_mesh.get_group()
             tp_rank = torch.distributed.get_rank(tp_group)
             V_local = int(local_logits.shape[-1])
@@ -541,34 +620,10 @@ def process_outputs_for_topk(
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
-            # [B, S_cp, k]
-
-            cp_group = cp_mesh.get_group()
-
-            vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
-            idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
-            # [B, S, k]
         else:
-            # Compute top-k over full sequence length (do not drop last position)
-            if isinstance(logits, DTensor):
-                local_logits = logits.to_local()  # [B, S, V_local]
-                tp_group = tp_mesh.get_group()
-                tp_rank = torch.distributed.get_rank(tp_group)
-                V_local = int(local_logits.shape[-1])
-                vocab_start_index = tp_rank * V_local
-                vocab_end_index = (tp_rank + 1) * V_local
+            full_logits = logits.to(torch.float32)
+            vals, idx = torch.topk(full_logits, k=k, dim=-1)
 
-                vals, idx = distributed_vocab_topk(
-                    local_logits,
-                    k=k,
-                    tp_group=tp_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
-            else:
-                full_logits = logits.to(torch.float32)
-                vals, idx = torch.topk(full_logits, k=k, dim=-1)
-
-        del logits
+    del logits
 
     return vals, idx
