@@ -499,26 +499,34 @@ else
 fi
 
 echo "[DEBUG] Looking for Python executables..."
-echo "[DEBUG] Checking common locations:"
-ls -la /usr/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/bin/"
-ls -la /usr/local/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/local/bin/"
-which python python3 2>/dev/null || echo "[DEBUG] No python in PATH"
+echo "[DEBUG] Checking venv directory for python..."
+ls -la "\$VENV_DIR/bin/" | grep -E "python|Python" || echo "[DEBUG] No python files visible in listing"
 
-# Determine which Python to use
-if [ -f "\$VENV_DIR/bin/python" ]; then
-    PYTHON_BIN="\$VENV_DIR/bin/python"
-    echo "[DEBUG] Using: \$PYTHON_BIN"
-elif [ -f "\$VENV_DIR/bin/python3" ]; then
+# Use the venv python directly (matching server script approach)
+# The venv is built into the container and should always have python
+PYTHON_BIN="\$VENV_DIR/bin/python"
+
+# Verify it exists and is executable
+if [ ! -f "\$PYTHON_BIN" ]; then
+    echo "[ERROR] Python executable not found at: \$PYTHON_BIN"
+    echo "[ERROR] Trying alternative: \$VENV_DIR/bin/python3"
     PYTHON_BIN="\$VENV_DIR/bin/python3"
-    echo "[DEBUG] Using: \$PYTHON_BIN"
-else
-    # Venv exists but has no python executable - use system python
-    echo "[DEBUG] Venv exists but no python executable found"
-    echo "[DEBUG] Using system python3"
-    PYTHON_BIN="python3"
+    if [ ! -f "\$PYTHON_BIN" ]; then
+        echo "[ERROR] No python executable found in venv!"
+        echo "[ERROR] Container may be misconfigured. Venv directory contents:"
+        ls -la "\$VENV_DIR/bin/"
+        exit 1
+    fi
 fi
 
-echo "[DEBUG] Running evaluation with: \$PYTHON_BIN"
+echo "[DEBUG] Using Python: \$PYTHON_BIN"
+echo "[DEBUG] Verifying Python works..."
+\$PYTHON_BIN --version || {
+    echo "[ERROR] Python executable exists but failed to run!"
+    exit 1
+}
+
+echo "[DEBUG] Running evaluation script..."
 \$PYTHON_BIN '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
 EOF
 )
