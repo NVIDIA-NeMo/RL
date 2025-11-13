@@ -197,6 +197,7 @@ fi
 
 
 echo "[pipeline] waiting for server info at $SERVER_INFO_FILE ..."
+SERVER_SLURM_JOB_ID=""
 for attempt in {1..180}; do
   if [[ -f "$SERVER_INFO_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -208,6 +209,11 @@ for attempt in {1..180}; do
         if [[ -n "${SERVER_CLIENT_HOST:-}" && "${SERVER_CLIENT_HOST:-}" != "0.0.0.0" ]]; then
           echo "[pipeline] server ready at $SERVER_ADDRESS"
           echo "[pipeline] server info: STATUS=$SERVER_STATUS, ADDRESS=$SERVER_ADDRESS, CLIENT_HOST=$SERVER_CLIENT_HOST, PORT=${SERVER_PORT:-unset}"
+          # Capture SLURM job ID for cleanup
+          SERVER_SLURM_JOB_ID="${SLURM_JOB_ID:-}"
+          if [[ -n "$SERVER_SLURM_JOB_ID" ]]; then
+            echo "[pipeline] server SLURM job ID: $SERVER_SLURM_JOB_ID (will be cancelled at end)"
+          fi
           break
         fi
       else
@@ -299,5 +305,20 @@ if [[ ${#ALL_EVAL_PIDS[@]} -gt 0 ]]; then
   done
 fi
 
-echo "[pipeline] all evaluation jobs completed. Use Ctrl+C or scancel to stop the server when finished."
+echo "[pipeline] all evaluation jobs completed."
+
+# Shut down the server SLURM job
+if [[ -n "$SERVER_SLURM_JOB_ID" ]]; then
+  echo "[pipeline] shutting down server SLURM job $SERVER_SLURM_JOB_ID..."
+  if scancel "$SERVER_SLURM_JOB_ID" 2>/dev/null; then
+    echo "[pipeline] server job cancelled successfully"
+  else
+    echo "[pipeline] WARNING: failed to cancel server job $SERVER_SLURM_JOB_ID (may have already terminated)" >&2
+  fi
+else
+  echo "[pipeline] no SLURM job ID found for server (may be running locally)"
+  echo "[pipeline] if server is still running, use Ctrl+C or manual scancel"
+fi
+
+echo "[pipeline] pipeline completed."
 
