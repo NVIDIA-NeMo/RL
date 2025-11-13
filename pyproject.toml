@@ -104,6 +104,11 @@ mcore = [
 penguin = [
     "penguin",
 ]
+eval = [
+    # NeMo-Skills for evaluation framework
+    # Note: Has datasets<4 constraint due to LiveCodeBench compatibility
+    "nemo-skills",
+]
 
 [dependency-groups]
 
@@ -151,7 +156,9 @@ megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
 penguin = { workspace = true }
-nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
+nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", branch = "main" }
+# NeMo-Skills evaluation framework - pinned to main branch (latest)
+nemo-skills = { git = "https://github.com/NVIDIA-NeMo/Skills", branch = "main" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
@@ -208,7 +215,8 @@ default-groups = ["dev", "build"]
 link-mode = "copy"
 # The TE override is needed because automodel/mbridge we are on is still on 2.5.0
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
-override-dependencies = ["transformer-engine[pytorch]==2.8.0", "opencv-python-headless>=4.11.0"]
+# Override nemo-skills datasets constraint to match nemo-rl
+override-dependencies = ["transformer-engine[pytorch]==2.8.0", "opencv-python-headless>=4.11.0", "datasets>=4.0.0", "cryptography<43.0"]
 
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]

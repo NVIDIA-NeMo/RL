@@ -592,11 +592,11 @@ def _parallelize_model(
         layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
-    elif "GSAI-ML.LLaDA" in model_cls.__name__:
+    elif "GSAI-ML.LLaDA" in str(model_cls):
         layers: torch.nn.ModuleList = model.model.transformer.blocks
         num_attention_heads = model.model.config.n_heads
         num_key_value_heads = model.model.config.n_kv_heads
-    elif "Nemotron-Diffusion-Research" in model_cls.__name__:
+    elif "Nemotron-Diffusion-Research" in str(model_cls):
         layers: torch.nn.ModuleList = model.encoder.layers  
         num_attention_heads = model.config.num_attention_heads
         num_key_value_heads = model.config.num_key_value_heads
@@ -704,7 +704,7 @@ def _parallelize_model(
                     )
             print("Using custom parallel plan.")
         # special logic for nvidia diffusion models
-        elif "Nemotron-Diffusion-Research" in model_cls.__name__:
+        elif "Nemotron-Diffusion-Research" in str(model_cls):
             model_parallel_plan= _parallelize_diffusion_qwen(model, sequence_parallel)
             print("Using optimized Nvidia DiffusionQwen parallel plan.")
         # second use our optimized parallel plan

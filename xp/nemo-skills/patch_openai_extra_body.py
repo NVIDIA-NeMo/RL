@@ -6,13 +6,34 @@ This script patches the OpenAI model to properly include extra_body in requests.
 
 import os
 import sys
+import importlib.util
+
+def find_nemo_skills_path():
+    """Dynamically find the nemo_skills installation path."""
+    try:
+        spec = importlib.util.find_spec("nemo_skills")
+        if spec is None or spec.origin is None:
+            return None
+        # Get the package directory
+        package_dir = os.path.dirname(spec.origin)
+        openai_path = os.path.join(package_dir, "inference", "model", "openai.py")
+        if os.path.exists(openai_path):
+            return openai_path
+        return None
+    except (ImportError, AttributeError):
+        return None
 
 def patch_openai_model():
     """Apply patch to fix extra_body parameter in OpenAI model."""
     
-    nemo_skills_path = "/home/mahan/.venvs/default/lib/python3.12/site-packages/nemo_skills/inference/model/openai.py"
+    nemo_skills_path = find_nemo_skills_path()
     
-    print("🔧 Patching NeMo-Skills OpenAI model to fix extra_body parameter...")
+    if nemo_skills_path is None:
+        print("❌ Could not locate nemo_skills installation. Is it installed?")
+        return False
+    
+    print(f"🔧 Patching NeMo-Skills OpenAI model at: {nemo_skills_path}")
+    print("   This fixes missing extra_body parameter (including generation-algorithm)...")
     
     # Read the current file
     with open(nemo_skills_path, 'r') as f:
@@ -59,7 +80,6 @@ def test_patch():
     print("\n🧪 Testing the patch...")
     
     try:
-        sys.path.append('/home/mahan/.venvs/default/lib/python3.12/site-packages')
         from nemo_skills.inference.model.openai import OpenAIModel
         
         # Create client and test
@@ -102,7 +122,12 @@ def test_patch():
 
 def restore_backup():
     """Restore from backup if needed."""
-    nemo_skills_path = "/home/mahan/.venvs/default/lib/python3.12/site-packages/nemo_skills/inference/model/openai.py"
+    nemo_skills_path = find_nemo_skills_path()
+    
+    if nemo_skills_path is None:
+        print("❌ Could not locate nemo_skills installation.")
+        return False
+    
     backup_path = nemo_skills_path + ".backup"
     
     if os.path.exists(backup_path):
