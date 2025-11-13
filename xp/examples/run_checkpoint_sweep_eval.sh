@@ -276,8 +276,32 @@ Job Directory: $eval_job_dir
 Server Info File: $server_info_file
 Output Directory: $eval_output_dir
 
-Environment Variables:
-$(env | grep -E '^(SERVER_|SEQ_EVAL_|EVAL_)' | sort)
+Server Configuration:
+---------------------
+  Partition: ${SERVER_PARTITION:-unset}
+  GPUs: ${SERVER_GPUS:-unset}
+  Batch Size: ${SERVER_BATCH_SIZE:-unset}
+  Base Model: ${SERVER_BASE_MODEL:-unset}
+  DCP Path: ${SERVER_DCP_PATH:-unset}
+  Engine: ${SERVER_ENGINE:-unset}
+  Extra Args: ${SERVER_EXTRA_ARGS:-unset}
+
+Evaluation Configuration:
+-------------------------
+  Benchmark: ${SEQ_EVAL_BENCHMARK:-unset}
+  Experiment Name: ${SEQ_EVAL_EXPNAME:-unset}
+  Generation Algorithm: ${SEQ_EVAL_GENERATION_ALGORITHM:-unset}
+  Steps: ${SEQ_EVAL_STEPS:-unset}
+  Block Length: ${SEQ_EVAL_BLOCK_LENGTH:-unset}
+  Threshold: ${SEQ_EVAL_THRESHOLD:-unset}
+  Tokens to Generate: ${SEQ_EVAL_TOKENS_TO_GENERATE:-unset}
+  Partition: ${SEQ_EVAL_PARTITION:-unset}
+  Use Same Node: ${SEQ_EVAL_USE_SAME_NODE:-unset}
+  Extra Args: ${SEQ_EVAL_EXTRA_ARGS:-unset}
+
+All Environment Variables:
+--------------------------
+$(env | grep -E '^(SERVER_|SEQ_EVAL_|EVAL_|ACCOUNT)' | sort)
 METADATA
     
     print_status "Running pipeline..."
