@@ -487,20 +487,8 @@ fi
 echo ""
 echo "[4/4] Running evaluation script..."
 
-# Use Python from activated venv if available, otherwise use system python3
-if [ -f "\$VENV_DIR/bin/python" ]; then
-    PYTHON_CMD="\$VENV_DIR/bin/python"
-else
-    # Fallback to python3 from PATH (should be from activated venv if it was activated)
-    PYTHON_CMD="python3"
-fi
-
-echo "[DEBUG] Using Python: \$PYTHON_CMD"
-which \$PYTHON_CMD && echo "[DEBUG] Python location: \$(which \$PYTHON_CMD)" || echo "[DEBUG] Python not found in PATH"
-
-CMD="\$PYTHON_CMD '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED"
-echo "[Eval] Command: \$CMD"
-eval "\$CMD"
+# Use the same Python command as the server script
+\$VENV_DIR/bin/python '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
 EOF
 )
 
