@@ -459,10 +459,29 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    # Determine if parallel initialization is possible
-    # Parallel init only when: vLLM backend AND non-colocated mode (separate GPU clusters)
-    use_parallel_init = backend == "vllm" and not colocated_inference
+    # Define initialization functions that will be used in all paths
+    def init_policy():
+        """Initialize policy training workers."""
+        t0 = time.perf_counter()
+        p = Policy(
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=True,
+        )
+        return p, time.perf_counter() - t0
 
+    def init_vllm():
+        """Initialize vLLM generation workers."""
+        t0 = time.perf_counter()
+        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        pg.finish_generation()
+        return pg, time.perf_counter() - t0
+
+    # Handle backend-specific setup
     if backend == "megatron":
         # Megatron backend: policy_generation is None, only initialize policy
         policy_generation = None
@@ -471,24 +490,11 @@ def setup(
             flush=True,
         )
 
-        t0 = time.perf_counter()
-        policy = Policy(
-            cluster=train_cluster,
-            config=policy_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            init_optimizer=True,
-        )
-        worker_init_timing_metrics["policy_init_time_s"] = time.perf_counter() - t0
+        policy, policy_time = init_policy()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-    elif use_parallel_init:
-        # Parallel initialization: vLLM and Policy can initialize simultaneously
-        print(
-            "  ⚡ Using parallel worker initialization (non-colocated mode)", flush=True
-        )
-
+    elif backend == "vllm":
+        # vLLM backend: setup config, then decide parallel vs sequential init
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config["use_importance_sampling_correction"] is True, (
@@ -498,89 +504,50 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        def init_vllm():
-            """Initialize vLLM generation workers."""
-            t0 = time.perf_counter()
-            pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-            pg.finish_generation()
-            return pg, time.perf_counter() - t0
+        # Determine if parallel initialization is possible (non-colocated mode)
+        use_parallel_init = not colocated_inference
 
-        def init_policy():
-            """Initialize policy training workers."""
-            t0 = time.perf_counter()
-            p = Policy(
-                cluster=train_cluster,
-                config=policy_config,
-                tokenizer=tokenizer,
-                processor=processor,
-                weights_path=weights_path,
-                optimizer_path=optimizer_path,
-                init_optimizer=True,
+        if use_parallel_init:
+            # Parallel initialization: vLLM and Policy can initialize simultaneously
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated mode)",
+                flush=True,
             )
-            return p, time.perf_counter() - t0
 
-        # Execute both initializations in parallel
-        parallel_start_time = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            vllm_future = executor.submit(init_vllm)
-            policy_future = executor.submit(init_policy)
-            policy_generation, vllm_time = vllm_future.result()
-            policy, policy_time = policy_future.result()
-        parallel_wall_time = time.perf_counter() - parallel_start_time
+            # Execute both initializations in parallel
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                vllm_future = executor.submit(init_vllm)
+                policy_future = executor.submit(init_policy)
+                policy_generation, vllm_time = vllm_future.result()
+                policy, policy_time = policy_future.result()
+            parallel_wall_time = time.perf_counter() - parallel_start_time
 
-        # Store timing metrics
-        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
-        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-        worker_init_timing_metrics["parallel_init_enabled"] = True
+            # Store timing metrics
+            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        else:
+            # Sequential initialization: colocated mode (GPU memory requires vLLM first)
+            print(
+                "  ⚙️  Using sequential worker initialization (colocated mode)",
+                flush=True,
+            )
+
+            # Initialize vLLM first (clean GPU memory), then policy
+            policy_generation, vllm_time = init_vllm()
+            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
             flush=True,
         )
-
-    else:
-        # Sequential initialization: colocated mode (GPU memory requires vLLM first)
-        print(
-            "  ⚙️  Using sequential worker initialization (colocated mode)", flush=True
-        )
-
-        generation_config = cast(VllmConfig, generation_config)
-        if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config["use_importance_sampling_correction"] is True, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
-        )
-
-        # vllm model loading prefers clean environment, initialize policy_generation before policy
-        t0 = time.perf_counter()
-        policy_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
-        )
-        policy_generation.finish_generation()
-        vllm_time = time.perf_counter() - t0
-        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
-
-        print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-        t0 = time.perf_counter()
-        policy = Policy(
-            cluster=train_cluster,
-            config=policy_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            init_optimizer=True,
-        )
-        policy_time = time.perf_counter() - t0
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
-        worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
