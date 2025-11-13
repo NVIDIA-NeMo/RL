@@ -434,6 +434,10 @@ eval "\$CMD"
 EOF
 )
 
+print_status "Submitting job to SLURM (this will block until job completes)..."
+print_status "Job will run on partition: $PARTITION"
+echo ""
+
 srun --job-name="$JOB_NAME" \
      --time="$TIME" \
      --cpus-per-task="$CPUS_PER_TASK" \
@@ -443,6 +447,9 @@ srun --job-name="$JOB_NAME" \
      --container-image="$CONTAINER_IMAGE" \
      --container-workdir="$PROJECT_DIR" \
      --container-mounts="$CONTAINER_MOUNTS" \
+     --unbuffered \
      bash -lc "$COMMAND_BLOCK"
+
+print_status "Evaluation job completed"
 
 

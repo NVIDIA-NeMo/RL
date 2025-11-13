@@ -226,15 +226,31 @@ done
 echo "[pipeline] launching sequential eval job..."
 echo "[pipeline] eval launcher: $EVAL_LAUNCHER"
 echo "[pipeline] eval args: ${SEQ_EVAL_ARGS[*]}"
+echo ""
 
-# Launch the eval job in background to capture PID
+# Launch the eval job in background to capture PID (output will be visible)
 "$EVAL_LAUNCHER" "${SEQ_EVAL_ARGS[@]}" &
 SEQ_EVAL_PID=$!
+echo ""
 echo "[pipeline] sequential eval job launched with PID $SEQ_EVAL_PID"
+echo "[pipeline] eval job is now running via SLURM - output should appear above"
 
 if [[ "$WAIT_FOR_SEQUENTIAL" == "true" ]]; then
   echo "[pipeline] waiting for sequential eval job to complete (WAIT_FOR_SEQUENTIAL=true)..."
-  echo "[pipeline] TIP: Check SLURM queue with 'squeue -u $USER' if this hangs"
+  echo "[pipeline] TIP: If no output appears, check 'squeue -u $USER' to see job status"
+  echo ""
+  
+  # Show progress while waiting
+  WAIT_COUNT=0
+  while kill -0 "$SEQ_EVAL_PID" 2>/dev/null; do
+    sleep 10
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+    if [[ $((WAIT_COUNT % 6)) -eq 0 ]]; then
+      WAIT_TIME=$((WAIT_COUNT * 10))
+      echo "[pipeline] still waiting for eval job... (${WAIT_TIME}s elapsed)"
+    fi
+  done
+  
   if wait "$SEQ_EVAL_PID"; then
     echo "[pipeline] sequential eval job completed successfully"
   else
