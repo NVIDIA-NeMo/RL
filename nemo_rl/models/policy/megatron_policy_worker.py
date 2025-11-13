@@ -1554,11 +1554,15 @@ class MegatronPolicyWorker:
             if len(multimodal_data) > 0:
                 position_ids = None
 
+            additional_kwargs = {}
+            if packed_seq_params is not None:
+                additional_kwargs["packed_seq_params"] = packed_seq_params
+
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
+                **additional_kwargs,
                 **multimodal_data,
             )
 
