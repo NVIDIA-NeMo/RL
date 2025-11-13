@@ -312,6 +312,19 @@ if [[ -n "$EVAL_OUTPUT_DIR" ]]; then
     print_status "Evaluation outputs will be written to: $EVAL_OUTPUT_DIR"
 fi
 
+# Extract benchmark name for data preparation
+BENCHMARK_NAME=""
+for ((i=0; i<${#EVAL_ARGS[@]}; i++)); do
+    if [[ "${EVAL_ARGS[$i]}" == "--benchmark" ]]; then
+        if (( i + 1 < ${#EVAL_ARGS[@]} )); then
+            BENCHMARK_NAME_FULL="${EVAL_ARGS[$((i + 1))]}"
+            BENCHMARK_NAME="${BENCHMARK_NAME_FULL%%:*}" # a:b -> a
+            print_status "Detected benchmark: $BENCHMARK_NAME (for data preparation)"
+        fi
+        break
+    fi
+done
+
 if [[ "$LOCAL_MODE" == true ]]; then
     print_status "Running evaluation locally (no SLURM)"
     export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
@@ -482,6 +495,23 @@ if [[ "\$WAIT_FOR_SERVER" == "true" ]]; then
     fi
 else
     echo "[Eval] Skipping server health check (--no-wait-for-server)."
+fi
+
+# Step 3b: Prepare benchmark data
+BENCHMARK_NAME_TO_PREPARE="$BENCHMARK_NAME"
+if [[ -n "\$BENCHMARK_NAME_TO_PREPARE" ]]; then
+    echo ""
+    echo "[3b/4] Preparing benchmark data for '\$BENCHMARK_NAME_TO_PREPARE'..."
+    NS_BIN="\$VENV_DIR/bin/ns"
+    if [ -f "\$NS_BIN" ]; then
+        \$NS_BIN prepare_data "\$BENCHMARK_NAME_TO_PREPARE"
+        echo "Data preparation complete."
+    else
+        echo "[WARN] 'ns' command not found at \$NS_BIN. Skipping data preparation."
+        echo "[WARN] This might cause failures if the dataset is not already present."
+    fi
+else
+    echo "[DEBUG] No --benchmark argument found, skipping automatic data preparation."
 fi
 
 echo ""
