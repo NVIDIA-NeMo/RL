@@ -109,6 +109,14 @@ class AsyncGRPOConfig(TypedDict):
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
+class RouterConfig(TypedDict):
+    """Configuration for KV-aware dynamic routing."""
+    enabled: bool
+    block_size: int
+    base_kv_events_port: int
+    base_metrics_port: int
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -135,6 +143,7 @@ class GRPOConfig(TypedDict):
     batch_multiplier: NotRequired[float]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
+    router: NotRequired[RouterConfig]  # Optional dynamic router configuration
 
 
 class GRPOSaveState(TypedDict):
@@ -196,6 +205,7 @@ def setup(
     CheckpointManager,
     GRPOSaveState,
     MasterConfig,
+    Optional[Any],  # router
 ]:
     """Main entry point for running GRPO algorithm.
 
@@ -514,6 +524,42 @@ def setup(
 
     loss_fn = ClippedPGLossFn(loss_config)
 
+    # ==========================
+    #     Dynamic Router
+    # ==========================
+    router = None
+    router_config = grpo_config.get("router")
+    if router_config and router_config.get("enabled", False):
+        print("\n▶ Setting up dynamic router...", flush=True)
+        # Only initialize router if using vLLM backend
+        if backend == "vllm" and policy_generation is not None:
+            try:
+                from nemo_rl.models.generation.dynamo.standalone_router import KvRouter
+                
+                # Get the number of workers from the policy generation worker group
+                num_workers = policy_generation.worker_group.dp_size
+                
+                router = KvRouter(
+                    block_size=router_config.get("block_size", 64),
+                    num_workers=num_workers,
+                    base_kv_events_port=router_config.get("base_kv_events_port", 5557),
+                    base_metrics_port=router_config.get("base_metrics_port", 5657),
+                )
+                print(
+                    f"  ✓ Dynamic router initialized with {num_workers} workers, "
+                    f"block_size={router_config.get('block_size', 64)}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"  ⚠️ Failed to initialize router: {e}", flush=True)
+                print("  ⚠️ Continuing without router", flush=True)
+                router = None
+        else:
+            print(
+                "  ⚠️ Router is only supported with vLLM backend. Skipping router setup.",
+                flush=True,
+            )
+
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print("=" * 60 + "\n", flush=True)
@@ -529,6 +575,7 @@ def setup(
         checkpointer,
         grpo_save_state,
         master_config,
+        router,
     )
 
 
@@ -816,6 +863,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    router: Optional[Any] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
@@ -833,6 +881,21 @@ def grpo_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
+
+    # Start router background tasks if router is enabled
+    if router is not None:
+        print("▶ Starting router background tasks...", flush=True)
+        try:
+            import asyncio
+            # Start router in event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(router.start_background_tasks())
+            loop.close()
+            print("  ✓ Router background tasks started", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ Failed to start router: {e}. Continuing without router.", flush=True)
+            router = None
 
     # common config/state itmes
     current_step = grpo_save_state["current_step"]  # current step within an epoch
@@ -1490,6 +1553,7 @@ def async_grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    router: Optional[Any] = None,
     max_trajectory_age_steps: int = 1,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
@@ -1559,6 +1623,16 @@ def async_grpo_train(
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
+
+    # Start router background tasks if router is enabled
+    if router is not None:
+        print("▶ Starting router background tasks...", flush=True)
+        try:
+            await router.start_background_tasks()
+            print("  ✓ Router background tasks started", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ Failed to start router: {e}. Continuing without router.", flush=True)
+            router = None
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt
@@ -2185,5 +2259,14 @@ def async_grpo_train(
             ray.kill(replay_buffer)
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+
+        # Shutdown router if it was started
+        if router is not None:
+            print("🛑 Shutting down router...")
+            try:
+                await router.shutdown()
+                print("✅ Router shutdown complete")
+            except Exception as e:
+                print(f"Error shutting down router: {e}")
 
         print("Async GRPO training complete!")
