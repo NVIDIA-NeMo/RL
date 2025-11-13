@@ -28,7 +28,7 @@ SEQ_EVAL_CPUS="${SEQ_EVAL_CPUS:-48}"
 SEQ_EVAL_TIME="${SEQ_EVAL_TIME:-02:00:00}"
 
 # === Pipeline / model configuration =========================================
-SERVER_INFO_FILE="${SERVER_INFO_FILE:-//lustre/fsw/portfolios/llmservice/users/${USER}/tmp/llada_server.env}"
+SERVER_INFO_FILE="${SERVER_INFO_FILE:-/lustre/fsw/portfolios/llmservice/users/${USER}/tmp/llada_server.env}"
 SERVER_BATCH_SIZE="${SERVER_BATCH_SIZE:-1}"
 SERVER_MODEL_PATH="${SERVER_MODEL_PATH:-}"
 SERVER_BASE_MODEL="${SERVER_BASE_MODEL:-GSAI-ML/LLaDA-8B-Instruct}"
