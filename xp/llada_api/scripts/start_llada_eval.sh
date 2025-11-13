@@ -502,38 +502,24 @@ fi
 # The venv is built into the container and should always have python
 PYTHON_BIN="\$VENV_DIR/bin/python"
 
-# Verify it exists (use -e to handle symlinks)
-if [ ! -e "\$PYTHON_BIN" ]; then
-    echo "[ERROR] Python not found at: \$PYTHON_BIN"
-    echo "[ERROR] Trying alternative: \$VENV_DIR/bin/python3"
-    PYTHON_BIN="\$VENV_DIR/bin/python3"
-    if [ ! -e "\$PYTHON_BIN" ]; then
-        echo "[ERROR] No python executable found in venv!"
-        echo "[ERROR] Container may be misconfigured."
-        exit 1
-    fi
-fi
-
 echo "[DEBUG] Using Python: \$PYTHON_BIN"
 
-# Check if it's a symlink and show target
+# Show symlink info if applicable
 if [ -L "\$PYTHON_BIN" ]; then
-    PYTHON_TARGET=\$(readlink -f "\$PYTHON_BIN" 2>/dev/null || echo "unknown")
+    PYTHON_TARGET=\$(readlink "\$PYTHON_BIN" 2>/dev/null || echo "unknown")
     echo "[DEBUG] Python is a symlink to: \$PYTHON_TARGET"
-    if [ ! -e "\$PYTHON_TARGET" ]; then
-        echo "[ERROR] Symlink target does not exist: \$PYTHON_TARGET"
-        echo "[ERROR] This might be a container mount issue."
-        exit 1
-    fi
 fi
 
-echo "[DEBUG] Verifying Python works..."
+# Just run it - if there are issues, we'll get better error messages
+echo "[DEBUG] Testing Python..."
 \$PYTHON_BIN --version || {
-    echo "[ERROR] Python executable exists but failed to run!"
-    echo "[ERROR] This might indicate a missing dependency or broken installation."
+    echo "[ERROR] Failed to run Python!"
+    echo "[ERROR] This might be a container configuration or mount issue."
+    echo "[ERROR] The symlink target may not be accessible in the container."
     exit 1
 }
 
+echo "[DEBUG] Python verified successfully."
 echo "[DEBUG] Running evaluation script..."
 \$PYTHON_BIN '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
 EOF
