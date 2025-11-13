@@ -1044,6 +1044,7 @@ class TestModelForward:
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
+            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1074,6 +1075,7 @@ class TestModelForward:
             allow_flash_attn_args=False,
             is_hf_model=False,
             is_moe_model=False,
+            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1108,6 +1110,7 @@ class TestModelForward:
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
+            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1140,6 +1143,7 @@ class TestModelForward:
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=True,
+            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1171,6 +1175,7 @@ class TestModelForward:
             allow_flash_attn_args=True,
             is_hf_model=True,
             is_moe_model=True,
+            dtype=torch.float16,
         )
 
         # Verify model was called
@@ -1202,6 +1207,7 @@ class TestModelForward:
             allow_flash_attn_args=True,
             is_hf_model=False,
             is_moe_model=False,
+            dtype=torch.float16,
         )
 
         # Verify model was called

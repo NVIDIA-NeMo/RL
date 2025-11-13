@@ -33,18 +33,6 @@ def get_microbatch_iterator(
     mbs: int,
     dp_mesh: Any,  # noqa: ARG001
 ) -> tuple[Iterator, int, Iterator]:
-    """Create microbatch iterator based on batching strategy.
-
-    Args:
-        data: Batched data dictionary containing the data to iterate over
-        cfg: Configuration dictionary with dynamic_batching settings
-        enable_seq_packing: Whether sequence packing is enabled
-        mbs: Microbatch size for regular batching
-        dp_mesh: Data parallel mesh for synchronization in sequence packing
-
-    Returns:
-        Tuple of (mb_iterator, iterator_len, dummy_iterator)
-    """
     dummy_iterator = iter([])
 
     if cfg["dynamic_batching"]["enabled"]:
@@ -166,21 +154,6 @@ def process_global_batch(
     loss_fn: LossFunction,
     dp_mesh: Any,
 ) -> dict[str, Any]:
-    """Process a global batch and compute normalization factors.
-
-    Args:
-        data: Full dataset
-        batch_idx: Index of the batch to process
-        batch_size: Size of the batch to extract
-        loss_fn: Loss function to check loss type
-        dp_mesh: Data parallel mesh for reductions
-
-    Returns:
-        Dictionary containing:
-            - batch: The extracted batch
-            - global_valid_seqs: Total number of valid sequences across all ranks
-            - global_valid_toks: Total number of valid tokens across all ranks
-    """
     batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
 
     assert "sample_mask" in batch, "sample_mask must be present in the data!"

@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Core functions for DTensor policy worker initialization."""
-
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -35,8 +33,6 @@ from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_cl
 
 @dataclass
 class ValidatedState:
-    """Configuration values validated and derived from PolicyConfig."""
-
     is_vlm: bool
     is_generation_colocated: Optional[bool]
     dtype: torch.dtype
@@ -59,8 +55,6 @@ class ValidatedState:
 
 @dataclass
 class DistributedState:
-    """Distributed environment state."""
-
     rank: int
     world_size: int
     device_mesh: Any
@@ -77,8 +71,6 @@ class DistributedState:
 
 @dataclass
 class ModelAndOptimizerState:
-    """Model and optimizer state."""
-
     model: torch.nn.Module
     model_state_dict_keys: list[str]
     optimizer: Optional[torch.optim.Optimizer]
@@ -93,21 +85,6 @@ def validate_and_set_config(
     processor: Optional[AutoProcessor],
     rank: int,
 ) -> ValidatedState:
-    """Validate configuration and set up derived configuration values.
-
-    Args:
-        config: Policy configuration
-        processor: Optional processor for VLM models
-        rank: Distributed rank
-
-    Returns:
-        ValidatedState: Dataclass containing validated configuration values
-
-    Raises:
-        ValueError: If configuration is invalid
-        NotImplementedError: If unsupported configuration is requested
-        RuntimeError: If known broken configuration is detected
-    """
     # Set basic configuration
     is_vlm = processor is not None
     is_generation_colocated = None
@@ -257,15 +234,6 @@ def setup_distributed(
     config: PolicyConfig,
     validated_state: ValidatedState,
 ) -> DistributedState:
-    """Set up distributed environment and create device mesh.
-
-    Args:
-        config: Policy configuration
-        validated_state: ValidatedState from validate_and_set_config
-
-    Returns:
-        DistributedState: Dataclass containing distributed environment state
-    """
     # Initialize process group
     torch.distributed.init_process_group(backend="nccl")
     rank = torch.distributed.get_rank()
@@ -334,20 +302,6 @@ def setup_model_and_optimizer(
     init_optimizer: bool = True,
     init_reference_model: bool = True,
 ) -> ModelAndOptimizerState:
-    """Initialize model, load weights, and set up optimizer.
-
-    Args:
-        config: Policy configuration
-        tokenizer: Tokenizer instance
-        validated_state: ValidatedState from validate_and_set_config
-        distributed_state: DistributedState from setup_distributed
-        worker_instance: The worker instance (for accessing helper methods)
-        init_optimizer: Whether to initialize optimizer
-        init_reference_model: Whether to initialize reference model
-
-    Returns:
-        ModelAndOptimizerState: Dataclass containing model and optimizer state
-    """
     from typing import cast
 
     from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -38,17 +37,6 @@ def setup_train_loop(
     dp_size: int,
     dp_mesh: Any,
 ) -> dict[str, Any]:
-    """Setup training loop parameters and validate data.
-
-    Args:
-        data: Batched data dictionary
-        gbs: Global batch size
-        dp_size: Data parallel size
-        dp_mesh: Data parallel mesh for reductions
-
-    Returns:
-        Dictionary containing setup parameters
-    """
     local_gbs = gbs // dp_size
     total_dataset_size = torch.tensor(data.size, device="cuda")
     torch.distributed.all_reduce(
@@ -93,31 +81,6 @@ def forward_backward(
     eval_mode: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Perform forward pass, loss computation, and backward pass.
-
-    Args:
-        model: The model to train
-        mb: Microbatch data
-        loss_fn: Loss function to use
-        global_valid_seqs: Number of valid sequences across all ranks
-        global_valid_toks: Number of valid tokens across all ranks
-        processed_inputs: Processed inputs from process_microbatch
-        dtype: Model dtype for autocast
-        cp_size: Context parallel size
-        cp_mesh: Context parallel mesh
-        device_mesh: Full device mesh
-        enable_seq_packing: Whether sequence packing is enabled
-        is_reward_model: Whether this is a reward model
-        allow_flash_attn_args: Whether model supports flash_attn_kwargs
-        is_hf_model: Whether the model is an HF model
-        is_moe_model: Whether the model is a MoE model
-        eval_mode: Whether in evaluation mode
-        apply_temperature_fn: Function to apply temperature scaling to logits
-
-    Returns:
-        Tuple of (loss, loss_metrics)
-    """
-    # Perform model forward pass
     outputs = model_forward(
         model,
         processed_inputs,
@@ -127,9 +90,9 @@ def forward_backward(
         allow_flash_attn_args,
         is_hf_model,
         is_moe_model,
+        dtype,
     )
 
-    # Process outputs for training (loss + backward)
     loss, loss_metrics = process_output_for_train(
         outputs,
         model,
@@ -158,20 +121,6 @@ def optimizer_step(
     dp_size: int,
     cp_size: int,
 ) -> Optional[torch.Tensor]:
-    """Perform gradient clipping and optimizer step.
-
-    Args:
-        optimizer: Optimizer to step
-        model: Model being trained
-        max_grad_norm: Maximum gradient norm for clipping
-        device_mesh: Full device mesh
-        moe_mesh: MoE mesh (if applicable)
-        dp_size: Data parallel size
-        cp_size: Context parallel size
-
-    Returns:
-        Gradient norm (or None if not computed)
-    """
     grad_norm = scale_grads_and_clip_grad_norm(
         max_grad_norm,
         [model],
@@ -210,13 +159,6 @@ def cleanup_after_training(
     scheduler: Optional[Any],
     eval_mode: bool,
 ) -> None:
-    """Cleanup after all training batches are processed.
-
-    Args:
-        optimizer: Optimizer to zero gradients
-        scheduler: Learning rate scheduler to step (if not in eval mode)
-        eval_mode: Whether in evaluation mode
-    """
     # Release gradient memory before rollouts
     optimizer.zero_grad()
 
@@ -238,21 +180,8 @@ def model_forward(
     allow_flash_attn_args: bool,
     is_hf_model: bool,
     is_moe_model: bool,
+    dtype: torch.dtype,
 ) -> Any:
-    """Perform model forward pass.
-
-    Args:
-        model: The model to run forward
-        processed_inputs: Processed inputs from process_microbatch
-        cp_size: Context parallel size
-        cp_mesh: Context parallel mesh
-        is_reward_model: Whether this is a reward model
-        allow_flash_attn_args: Whether model supports flash_attn_kwargs
-        is_hf_model: Whether the model is an HF model
-        is_moe_model: Whether the model is a MoE model
-    Returns:
-        Model outputs
-    """
     sequence_dim = 1
 
     input_ids = processed_inputs["input_ids"]
@@ -273,7 +202,7 @@ def model_forward(
         )
 
     with get_train_context(False, False, context_parallel_ctx)():
-        with nullcontext():
+        with torch.autocast(device_type="cuda", dtype=dtype):
             model_args = dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -315,16 +244,6 @@ def _process_logits(
     model: nn.Module,
     apply_temperature_fn,
 ) -> torch.Tensor:
-    """Extract and process logits from model outputs.
-
-    Args:
-        outputs: Model outputs from forward pass
-        model: The model (for accessing lm_head if needed)
-        apply_temperature_fn: Function to apply temperature scaling to logits
-
-    Returns:
-        Processed logits tensor
-    """
     # Get logits
     if isinstance(outputs, (torch.Tensor, DTensor)):
         # custom models (e.g., those coming from AutoModel) can output logits directly
@@ -350,20 +269,6 @@ def _handle_context_parallel_sharding(
     mb: Optional[BatchedDataDict[Any]] = None,
     cp_buffers: Optional[list] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Handle context parallel sharding for logits and optionally microbatch tensors.
-
-    Args:
-        logits: Logits tensor to shard
-        seq_index: Sequence index tensor
-        cp_mesh: Context parallel mesh
-        device_mesh: Full device mesh
-        sequence_dim: Sequence dimension index
-        mb: Optional microbatch data to shard (for training)
-        cp_buffers: Optional context parallel buffers (required if mb is provided)
-
-    Returns:
-        Tuple of (sharded_logits, seq_index_dtensor)
-    """
     seq_index_dtensor = (
         DTensor.from_local(
             seq_index,
@@ -431,26 +336,6 @@ def process_output_for_train(
     eval_mode: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Process model outputs for training (loss computation and backward).
-
-    Args:
-        outputs: Model outputs from forward pass
-        model: The model
-        mb: Microbatch data
-        loss_fn: Loss function to use
-        global_valid_seqs: Number of valid sequences across all ranks
-        global_valid_toks: Number of valid tokens across all ranks
-        processed_inputs: Processed inputs from process_microbatch
-        cp_size: Context parallel size
-        cp_mesh: Context parallel mesh
-        device_mesh: Full device mesh
-        enable_seq_packing: Whether sequence packing is enabled
-        eval_mode: Whether in evaluation mode
-        apply_temperature_fn: Function to apply temperature scaling to logits
-
-    Returns:
-        Tuple of (loss, loss_metrics)
-    """
     sequence_dim = 1
     flash_attn_kwargs = processed_inputs["flash_attn_kwargs"]
     cp_buffers = processed_inputs["cp_buffers"]
@@ -517,24 +402,6 @@ def process_outputs_for_logprobs(
     apply_temperature_fn,
     logprob_chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Process model outputs for logprob extraction.
-
-    Args:
-        outputs: Model outputs from forward pass
-        model: The model (not used currently but kept for consistency)
-        mb: Microbatch data
-        processed_inputs: Processed inputs from process_microbatch
-        input_ids: Original input IDs
-        cp_size: Context parallel size
-        cp_mesh: Context parallel mesh
-        device_mesh: Full device mesh
-        enable_seq_packing: Whether sequence packing is enabled
-        apply_temperature_fn: Function to apply temperature scaling to logits
-        logprob_chunk_size: Optional chunk size for memory-efficient logprob computation
-
-    Returns:
-        Token logprobs tensor
-    """
     sequence_dim = 1
     cp_buffers = processed_inputs["cp_buffers"]
     seq_index = processed_inputs["seq_index"]
@@ -635,24 +502,6 @@ def process_outputs_for_topk(
     enable_seq_packing: bool,
     apply_temperature_fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Process model outputs for top-k logits extraction.
-
-    Args:
-        outputs: Model outputs from forward pass
-        model: The model (not used currently but kept for consistency)
-        mb: Microbatch data
-        processed_inputs: Processed inputs from process_microbatch
-        k: Number of top logits to return
-        cp_size: Context parallel size
-        cp_mesh: Context parallel mesh
-        device_mesh: Full device mesh
-        tp_mesh: Tensor parallel mesh
-        enable_seq_packing: Whether sequence packing is enabled
-        apply_temperature_fn: Function to apply temperature scaling to logits
-
-    Returns:
-        Tuple of (topk_values, topk_indices) with shape [B, S, k]
-    """
     from nemo_rl.distributed.model_utils import (
         allgather_cp_sharded_tensor,
         distributed_vocab_topk,
