@@ -489,18 +489,14 @@ echo "[4/4] Running evaluation script..."
 
 # Debug: Check what's actually available
 echo "[DEBUG] VENV_DIR is set to: \$VENV_DIR"
-echo "[DEBUG] Checking if \$VENV_DIR exists..."
 if [ -d "\$VENV_DIR" ]; then
     echo "[DEBUG] \$VENV_DIR exists"
-    echo "[DEBUG] Contents of \$VENV_DIR/bin:"
-    ls -la "\$VENV_DIR/bin/" | head -20
+    echo "[DEBUG] Looking for Python in \$VENV_DIR/bin:"
+    ls -la "\$VENV_DIR/bin/" | grep -E "python|Python" || echo "[DEBUG] No python files found in directory listing"
 else
-    echo "[DEBUG] \$VENV_DIR does NOT exist"
+    echo "[DEBUG] ERROR: \$VENV_DIR does NOT exist"
+    exit 1
 fi
-
-echo "[DEBUG] Looking for Python executables..."
-echo "[DEBUG] Checking venv directory for python..."
-ls -la "\$VENV_DIR/bin/" | grep -E "python|Python" || echo "[DEBUG] No python files visible in listing"
 
 # Use the venv python directly (matching server script approach)
 # The venv is built into the container and should always have python
