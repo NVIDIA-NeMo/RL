@@ -60,9 +60,7 @@ def import_model_from_hf_name(
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
         ]
-        model_provider.context_parallel_size = megatron_config[
-            "context_parallel_size"
-        ]
+        model_provider.context_parallel_size = megatron_config["context_parallel_size"]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"
         ]
@@ -129,6 +127,7 @@ def export_model_from_megatron(
     with temporary_distributed_context(backend="gloo"):
         # Need to set model parallel cuda manual seed for mamba mixer
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
         model_parallel_cuda_manual_seed(0)
 
         # Load the Megatron model
