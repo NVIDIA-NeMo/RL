@@ -15,6 +15,7 @@ import gc
 import os
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
@@ -435,54 +436,13 @@ def setup(
     # ==========================
     print("\n▶ Setting up model and training...", flush=True)
 
-    # vllm model loading prefers clean environment, initialize policy_generation before policy (#52 will fix this)
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    if backend == "megatron":
-        policy_generation = None
-        print(
-            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-    elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
-        if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config["use_importance_sampling_correction"] is True, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
-        ## make vllm hf overrides match the training policy
-        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
-        )
-
-        policy_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
-        )
-        # Worker groups are not initialized until the first call to run something on workergroups.
-        # vllm 0.8 fails in initialization if its called in the first training step since it has no clean view of the GPU memory (HF is sharing the same memory).
-        policy_generation.finish_generation()
-
-        # Collect vLLM worker initialization timing stats
-        vllm_timing = policy_generation.worker_group.init_timing_stats
-        if vllm_timing:
-            worker_init_timing_metrics["vllm_total_time_s"] = vllm_timing["total_time"]
-            worker_init_timing_metrics["vllm_num_workers"] = vllm_timing["num_workers"]
-            worker_init_timing_metrics["vllm_worker_min_s"] = vllm_timing["min"]
-            worker_init_timing_metrics["vllm_worker_max_s"] = vllm_timing["max"]
-            worker_init_timing_metrics["vllm_worker_mean_s"] = vllm_timing["mean"]
-            worker_init_timing_metrics["vllm_worker_p50_s"] = vllm_timing["p50"]
-            worker_init_timing_metrics["vllm_worker_p95_s"] = vllm_timing["p95"]
-            worker_init_timing_metrics["vllm_worker_p99_s"] = vllm_timing["p99"]
-
-        print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
+    # Prepare checkpoint paths
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
         optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
@@ -498,33 +458,138 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    policy = Policy(
-        cluster=train_cluster,
-        config=policy_config,
-        tokenizer=tokenizer,
-        processor=processor,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=True,
-    )
+    # Determine if parallel initialization is possible
+    # Parallel init only when: vLLM backend AND non-colocated mode (separate GPU clusters)
+    use_parallel_init = backend == "vllm" and not colocated_inference
 
-    # Collect policy worker initialization timing stats
-    policy_timing = policy.worker_group.init_timing_stats
-    if policy_timing:
-        worker_init_timing_metrics["policy_total_time_s"] = policy_timing["total_time"]
-        worker_init_timing_metrics["policy_num_workers"] = policy_timing["num_workers"]
-        worker_init_timing_metrics["policy_worker_min_s"] = policy_timing["min"]
-        worker_init_timing_metrics["policy_worker_max_s"] = policy_timing["max"]
-        worker_init_timing_metrics["policy_worker_mean_s"] = policy_timing["mean"]
-        worker_init_timing_metrics["policy_worker_p50_s"] = policy_timing["p50"]
-        worker_init_timing_metrics["policy_worker_p95_s"] = policy_timing["p95"]
-        worker_init_timing_metrics["policy_worker_p99_s"] = policy_timing["p99"]
+    if backend == "megatron":
+        # Megatron backend: policy_generation is None, only initialize policy
+        policy_generation = None
+        print(
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+        t0 = time.perf_counter()
+        policy = Policy(
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=True,
+        )
+        worker_init_timing_metrics["policy_init_time_s"] = time.perf_counter() - t0
+
+    elif use_parallel_init:
+        # Parallel initialization: vLLM and Policy can initialize simultaneously
+        print(
+            "  ⚡ Using parallel worker initialization (non-colocated mode)", flush=True
+        )
+
+        generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            assert loss_config["use_importance_sampling_correction"] is True, (
+                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            "hf_config_overrides", {}
+        )
+
+        def init_vllm():
+            """Initialize vLLM generation workers."""
+            t0 = time.perf_counter()
+            pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        def init_policy():
+            """Initialize policy training workers."""
+            t0 = time.perf_counter()
+            p = Policy(
+                cluster=train_cluster,
+                config=policy_config,
+                tokenizer=tokenizer,
+                processor=processor,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                init_optimizer=True,
+            )
+            return p, time.perf_counter() - t0
+
+        # Execute both initializations in parallel
+        parallel_start_time = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            vllm_future = executor.submit(init_vllm)
+            policy_future = executor.submit(init_policy)
+            policy_generation, vllm_time = vllm_future.result()
+            policy, policy_time = policy_future.result()
+        parallel_wall_time = time.perf_counter() - parallel_start_time
+
+        # Store timing metrics
+        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+        worker_init_timing_metrics["parallel_init_enabled"] = True
+
+        print(
+            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+    else:
+        # Sequential initialization: colocated mode (GPU memory requires vLLM first)
+        print(
+            "  ⚙️  Using sequential worker initialization (colocated mode)", flush=True
+        )
+
+        generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            assert loss_config["use_importance_sampling_correction"] is True, (
+                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+            )
+        generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            "hf_config_overrides", {}
+        )
+
+        # vllm model loading prefers clean environment, initialize policy_generation before policy
+        t0 = time.perf_counter()
+        policy_generation = VllmGeneration(
+            cluster=inference_cluster, config=generation_config
+        )
+        policy_generation.finish_generation()
+        vllm_time = time.perf_counter() - t0
+        worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+
+        print(
+            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
+        t0 = time.perf_counter()
+        policy = Policy(
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            processor=processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=True,
+        )
+        policy_time = time.perf_counter() - t0
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+
+    # Record when worker initialization completes (for calculating other setup time)
+    worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:
+        t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         # world includes all training workers and all inference workers
@@ -540,6 +605,7 @@ def setup(
         )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -553,15 +619,35 @@ def setup(
 
     # Log worker initialization timing metrics to logger
     if worker_init_timing_metrics:
-        print("\n▶ Worker Initialization Timing Summary:")
-        for key, value in worker_init_timing_metrics.items():
-            print(f"  {key}: {value:.3f}", flush=True)
+        print("\n▶ Worker Initialization Timing:")
+
+        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
+        policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
+        total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
+
+        if vllm_time:
+            print(f"  vLLM init: {vllm_time:.1f}s")
+
+        if policy_time:
+            print(f"  Policy init: {policy_time:.1f}s")
+
+        # Calculate "other" time (time after worker init completes)
+        other_time = total_setup - worker_init_complete_time
+        worker_init_timing_metrics["other_setup_time_s"] = other_time
+        print(f"  Other setup: {other_time:.1f}s")
+
+        print(f"  Total setup: {total_setup:.1f}s")
+
+        # Log all metrics to the logger for analysis
         logger.log_metrics(worker_init_timing_metrics, step=0, prefix="timing/setup")
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
     print(f"  Total setup time: {total_setup_time:.2f}s")
     print("=" * 60 + "\n", flush=True)
+    import sys
+
+    sys.exit(0)
 
     return (
         policy,

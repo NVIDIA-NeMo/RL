@@ -367,9 +367,6 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
-        self.init_timing_stats: dict[
-            str, float
-        ] = {}  # Timing statistics for worker initialization
 
         # If explicit bundle indices are provided, use those
         if bundle_indices_list is None:
@@ -628,9 +625,6 @@ class RayWorkerGroup:
         timing_stats = _compute_timing_stats(worker_completion_times)
         timing_stats["total_time"] = total_init_time
         timing_stats["num_workers"] = num_workers
-
-        # Store timing stats for later access
-        self.init_timing_stats = timing_stats
 
         print(
             f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s "
