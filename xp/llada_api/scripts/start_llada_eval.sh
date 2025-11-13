@@ -402,16 +402,24 @@ if [[ "\$WAIT_FOR_SERVER" == "true" ]]; then
         ATTEMPT=0
         TIMEOUT=900
         INTERVAL=5
-        until curl -sf --connect-timeout 2 "\$SERVER_HEALTH_URL" >/dev/null; do
+        until curl -sf --connect-timeout 2 "\$SERVER_HEALTH_URL" >/dev/null 2>&1; do
             ATTEMPT=\$((ATTEMPT + 1))
             ELAPSED=\$((ATTEMPT * INTERVAL))
+            
+            # Show progress every minute (12 attempts)
+            if [[ \$((ATTEMPT % 12)) -eq 0 ]]; then
+                echo "[Eval] Still waiting for server... (\${ELAPSED}s elapsed, timeout at \${TIMEOUT}s)"
+            fi
+            
             if [[ \$ELAPSED -ge \$TIMEOUT ]]; then
                 echo "[Eval] ERROR: Server did not respond within \$TIMEOUT seconds."
+                echo "[Eval] Last curl attempt output:"
+                curl -sf --connect-timeout 2 "\$SERVER_HEALTH_URL" 2>&1 || true
                 exit 1
             fi
             sleep \$INTERVAL
         done
-        echo "[Eval] Server is ready."
+        echo "[Eval] Server is ready!"
     else
         echo "[Eval] WARN: curl not available; skipping server health check."
     fi
