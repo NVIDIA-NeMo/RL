@@ -28,7 +28,7 @@ SEQ_EVAL_CPUS="${SEQ_EVAL_CPUS:-48}"
 SEQ_EVAL_TIME="${SEQ_EVAL_TIME:-02:00:00}"
 
 # === Pipeline / model configuration =========================================
-SERVER_INFO_FILE="${SERVER_INFO_FILE:-/lustre/${USER}/tmp/llada_server.env}"
+SERVER_INFO_FILE="${SERVER_INFO_FILE:-//lustre/fsw/portfolios/llmservice/users/${USER}/tmp/llada_server.env}"
 SERVER_BATCH_SIZE="${SERVER_BATCH_SIZE:-1}"
 SERVER_MODEL_PATH="${SERVER_MODEL_PATH:-}"
 SERVER_BASE_MODEL="${SERVER_BASE_MODEL:-GSAI-ML/LLaDA-8B-Instruct}"
@@ -64,6 +64,20 @@ export ACCOUNT
 
 # Ensure the server-info directory exists so the server launcher can write to it
 mkdir -p "$(dirname "$SERVER_INFO_FILE")"
+
+# Clear any stale server info file from previous runs to prevent race conditions
+if [[ -f "$SERVER_INFO_FILE" ]]; then
+  echo "[pipeline] removing stale server info file: $SERVER_INFO_FILE"
+  rm -f "$SERVER_INFO_FILE"
+fi
+
+# Write a placeholder to ensure we don't read stale data
+cat > "$SERVER_INFO_FILE" <<EOF
+# Placeholder - waiting for server launcher to start
+SERVER_STATUS="initializing"
+SERVER_INFO_GENERATED_AT="$(date -Iseconds)"
+EOF
+echo "[pipeline] initialized server info file: $SERVER_INFO_FILE"
 
 # Build server arguments
 SERVER_ARGS=(
