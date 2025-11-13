@@ -504,9 +504,22 @@ ls -la /usr/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/bin/"
 ls -la /usr/local/bin/python* 2>/dev/null || echo "[DEBUG] No python in /usr/local/bin/"
 which python python3 2>/dev/null || echo "[DEBUG] No python in PATH"
 
-echo "[DEBUG] Attempting to run with \$VENV_DIR/bin/python..."
-# Use the same Python command as the server script
-\$VENV_DIR/bin/python '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
+# Determine which Python to use
+if [ -f "\$VENV_DIR/bin/python" ]; then
+    PYTHON_BIN="\$VENV_DIR/bin/python"
+    echo "[DEBUG] Using: \$PYTHON_BIN"
+elif [ -f "\$VENV_DIR/bin/python3" ]; then
+    PYTHON_BIN="\$VENV_DIR/bin/python3"
+    echo "[DEBUG] Using: \$PYTHON_BIN"
+else
+    # Venv exists but has no python executable - use system python
+    echo "[DEBUG] Venv exists but no python executable found"
+    echo "[DEBUG] Using system python3"
+    PYTHON_BIN="python3"
+fi
+
+echo "[DEBUG] Running evaluation with: \$PYTHON_BIN"
+\$PYTHON_BIN '$EVAL_SCRIPT'$EVAL_ARGS_SERIALIZED
 EOF
 )
 
