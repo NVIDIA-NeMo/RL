@@ -539,6 +539,7 @@ SRUN_ARGS=(
     "--container-image=$CONTAINER_IMAGE"
     "--container-workdir=$PROJECT_DIR"
     "--container-mounts=$CONTAINER_MOUNTS"
+    "--no-container-mount-home"
     "--unbuffered"
 )
 
