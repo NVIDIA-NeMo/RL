@@ -951,6 +951,11 @@ if [[ "$GPUS_PER_NODE" -gt 1 ]]; then
         MULTI_GPU_ARGS="$MULTI_GPU_ARGS --algorithm '$ALGORITHM'"
     fi
     
+    # Pass through server info file path
+    if [[ -n "$SERVER_INFO_FILE" ]]; then
+        MULTI_GPU_ARGS="$MULTI_GPU_ARGS --server-info-file '$SERVER_INFO_FILE'"
+    fi
+    
     MULTI_GPU_ARGS="$MULTI_GPU_ARGS --num-gpus $GPUS_PER_NODE"
     MULTI_GPU_ARGS="$MULTI_GPU_ARGS --port $PORT"
     MULTI_GPU_ARGS="$MULTI_GPU_ARGS --batch-size $BATCH_SIZE"
