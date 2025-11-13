@@ -34,31 +34,6 @@ from nemo_rl.utils.venvs import (
 )
 
 
-def _compute_timing_stats(worker_times: list[float]) -> dict[str, float]:
-    """Compute timing statistics from a list of worker initialization times.
-
-    Args:
-        worker_times: List of initialization times in seconds for each worker
-
-    Returns:
-        Dictionary with timing statistics (min, max, mean, p50, p95, p99)
-    """
-    if not worker_times:
-        return {}
-
-    import numpy as np
-
-    sorted_times = sorted(worker_times)
-    return {
-        "min": float(np.min(sorted_times)),
-        "max": float(np.max(sorted_times)),
-        "mean": float(np.mean(sorted_times)),
-        "p50": float(np.percentile(sorted_times, 50)),
-        "p95": float(np.percentile(sorted_times, 95)),
-        "p99": float(np.percentile(sorted_times, 99)),
-    }
-
-
 @dataclass
 class MultiWorkerFuture:
     """Container for Ray futures with associated worker information."""
@@ -410,7 +385,8 @@ class RayWorkerGroup:
             ):
                 if worker_count > pg.bundle_count:
                     raise ValueError(
-                        f"Placement group {i} has {pg.bundle_count} bundles, but {worker_count} workers were requested"
+                        f"Placement group {i} has {pg.bundle_count} bundles, "
+                        f"but {worker_count} workers were requested"
                     )
 
                 for bundle_idx in range(worker_count):
@@ -592,8 +568,6 @@ class RayWorkerGroup:
         num_workers = len(worker_futures)
         worker_refs = [future for future, _ in worker_futures]
 
-        # Track timing for each worker as they complete
-        worker_completion_times = []
         start_time = time.perf_counter()
 
         # Use ray.wait() to track individual worker completion times
@@ -611,26 +585,16 @@ class RayWorkerGroup:
                     remaining_refs, num_returns=1, timeout=None
                 )
 
-                # Record completion time for each ready worker
-                current_time = time.perf_counter()
+                # Update progress bar for each ready worker
                 for _ in ready_refs:
-                    worker_completion_times.append(current_time - start_time)
                     pbar.update(1)
 
         # Get all worker results
         workers = ray.get(worker_refs)
         total_init_time = time.perf_counter() - start_time
 
-        # Compute timing statistics
-        timing_stats = _compute_timing_stats(worker_completion_times)
-        timing_stats["total_time"] = total_init_time
-        timing_stats["num_workers"] = num_workers
-
         print(
-            f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s "
-            f"(min: {timing_stats['min']:.2f}s, max: {timing_stats['max']:.2f}s, "
-            f"mean: {timing_stats['mean']:.2f}s, p50: {timing_stats['p50']:.2f}s, "
-            f"p95: {timing_stats['p95']:.2f}s)",
+            f"  ✓ {num_workers} workers initialized in {total_init_time:.2f}s",
             flush=True,
         )
 
