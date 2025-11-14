@@ -2,9 +2,8 @@
 
 Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
 
-```{note}
-Both training backends are independent — you can install and use either one on its own.
-```
+> [!NOTE]
+> Both training backends are independent — you can install and use either one on its own.
 
 For more examples and setup details, continue to the [Prerequisites](installation.md) section.
 
@@ -21,9 +20,8 @@ git submodule update --init --recursive
 uv venv
 ```
 
-```{note}
-If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true`. See [Tips and Tricks](tips-and-tricks.md).
-```
+> [!NOTE]
+> If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true`. See [Tips and Tricks](tips-and-tricks.md).
 
 | Native PyTorch (DTensor) | Megatron Core |
 |--------------------------|---------------|

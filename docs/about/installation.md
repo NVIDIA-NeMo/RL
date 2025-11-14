@@ -67,10 +67,9 @@ Initialize the NeMo RL project virtual environment:
 uv venv
 ```
 
-```{note}
-Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
-This ensures that the version of python used is always what we prescribe.
-```
+> [!NOTE]
+> Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
+> This ensures that the version of python used is always what we prescribe.
 
 ## Using UV to Run Commands
 
@@ -84,11 +83,10 @@ uv run python examples/run_grpo_math.py
 uv run python examples/run_grpo_math.py --config examples/configs/grpo_math_1B_megatron.yaml
 ```
 
-```{note}
-- It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
-  This ensures consistent environment usage across different shells and sessions.
-- Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
-- If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
-- **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
-```
+> [!NOTE]
+> - It is not recommended to activate the `venv`, and you should use `uv run <command>` instead to execute scripts within the managed environment.
+>   This ensures consistent environment usage across different shells and sessions.
+> - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
+> - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
+> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
 

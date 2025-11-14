@@ -2,9 +2,8 @@
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
 
-```{note}
-Distillation currently supports the DTensor and vLLM generation backend. Megatron generation/training paths are not supported yet.
-```
+> [!NOTE]
+> Distillation currently supports the DTensor and vLLM generation backend. Megatron generation/training paths are not supported yet.
 
 ## On-policy Distillation Single Node
 
