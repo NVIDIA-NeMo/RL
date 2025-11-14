@@ -44,7 +44,7 @@ class RLSampler(Sampler[int]):
             yield from self.idx_sampler
 
 
-def _tokenized_clipped_length(
+def _rank_preserving_clipped_token_length(
     seq_rank: int, idx: int, input_str: str, tokenizer, max_seq_len: int
 ) -> tuple[int, int]:
     input_ids = tokenizer.encode(
@@ -94,7 +94,7 @@ class RLBatchSampler(Sampler[list[int]]):
         self.executor = concurrent.futures.ProcessPoolExecutor(num_workers)
         n = len(self.data_source)
         data_idx_set = list(range(n))
-        if self.shuffle:
+        if shuffle:
             self.idx_sampler = RandomSampler(data_idx_set)
         else:
             self.idx_sampler = SequentialSampler(data_idx_set)
@@ -121,7 +121,7 @@ class RLBatchSampler(Sampler[list[int]]):
                     tokenize=False,
                 )
                 future = self.executor.submit(
-                    _tokenized_clipped_length,
+                    _rank_preserving_clipped_token_length,
                     seq_rank,
                     idx,
                     input_str,
