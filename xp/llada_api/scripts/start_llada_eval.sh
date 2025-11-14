@@ -318,8 +318,9 @@ for ((i=0; i<${#EVAL_ARGS[@]}; i++)); do
     if [[ "${EVAL_ARGS[$i]}" == "--benchmark" ]]; then
         if (( i + 1 < ${#EVAL_ARGS[@]} )); then
             BENCHMARK_NAME_FULL="${EVAL_ARGS[$((i + 1))]}"
-            BENCHMARK_NAME="${BENCHMARK_NAME_FULL%%:*}" # a:b -> a
-            print_status "Detected benchmark: $BENCHMARK_NAME (for data preparation)"
+            # Strip version numbers (e.g., :16) from each benchmark in the comma-separated list
+            BENCHMARK_NAME=$(echo "$BENCHMARK_NAME_FULL" | sed 's/:[0-9]\+//g')
+            print_status "Detected benchmark(s): $BENCHMARK_NAME (for data preparation)"
         fi
         break
     fi
@@ -528,13 +529,18 @@ else
 fi
 
 # Step 4b: Prepare benchmark data
-BENCHMARK_NAME_TO_PREPARE="$BENCHMARK_NAME"
-if [[ -n "\$BENCHMARK_NAME_TO_PREPARE" ]]; then
+BENCHMARKS_TO_PREPARE="$BENCHMARK_NAME"
+if [[ -n "\$BENCHMARKS_TO_PREPARE" ]]; then
     echo ""
-    echo "[4.5/5] Preparing benchmark data for '\$BENCHMARK_NAME_TO_PREPARE'..."
+    echo "[4.5/5] Preparing benchmark data for '\$BENCHMARKS_TO_PREPARE'..."
     NS_BIN="\$VENV_DIR/bin/ns"
     if [ -f "\$NS_BIN" ]; then
-        \$NS_BIN prepare_data "\$BENCHMARK_NAME_TO_PREPARE"
+        # Use comma as delimiter and read into an array
+        IFS=',' read -ra BENCHMARK_ARRAY <<< "\$BENCHMARKS_TO_PREPARE"
+        for BENCHMARK in "\${BENCHMARK_ARRAY[@]}"; do
+            echo "  > Preparing data for \$BENCHMARK..."
+            \$NS_BIN prepare_data "\$BENCHMARK"
+        done
         echo "Data preparation complete."
     else
         echo "[WARN] 'ns' command not found at \$NS_BIN. Skipping data preparation."
