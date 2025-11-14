@@ -129,6 +129,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
 
         # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
@@ -137,7 +138,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+        self.stat_loggers = [PrometheusStatLogger]
+        self.llm = AsyncLLM.from_engine_args(
+            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+        )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
@@ -159,6 +163,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+
         from vllm.entrypoints.openai.api_server import (
             BaseModelPath,
             OpenAIServingChat,
