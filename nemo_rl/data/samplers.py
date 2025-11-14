@@ -1,3 +1,4 @@
+from concurrent.futures import ProcessPoolExecutor
 from typing import Iterator, Optional
 
 from torch.utils.data import Sampler
@@ -43,6 +44,17 @@ class RLSampler(Sampler[int]):
             yield from self.idx_sampler
 
 
+def _tokenized_clipped_length(tokenizer, input_str: str, max_seq_len: int) -> int:
+    input_ids = tokenizer.encode(
+        input_str,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        max_length=max_seq_len + 32,
+    )
+    return len(input_ids)
+
+
 class RLBatchSampler(Sampler[list[int]]):
     def __init__(
         self,
@@ -51,13 +63,13 @@ class RLBatchSampler(Sampler[list[int]]):
         batch_size: Optional[int] = 1,
         shuffle: Optional[bool] = None,
         max_seq_len: Optional[int] = None,
-        num_workers: int = 0,
+        num_workers: int = 1,
     ) -> None:
         self.data_source = data_source
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
-        # TODO: multiprocessing workers for parallel tokenization.
+        self.executor = ProcessPoolExecutor(num_workers)
         n = len(self.data_source)
         data_idx_set = list(range(n))
         if self.shuffle:
@@ -73,15 +85,17 @@ class RLBatchSampler(Sampler[list[int]]):
                     yield list(batch)
                     batch.clear()
                 datum = self.data_source[idx]
-                input_ids = self.tokenizer.apply_chat_template(
+                input_str = self.tokenizer.apply_chat_template(
                     datum["message_log"],
                     add_generation_prompt=True,
-                    tokenize=True,
+                    tokenize=False,
                 )
-                input_len = len(input_ids)
+                input_len = _tokenized_clipped_length(
+                    self.tokenizer, input_str, self.max_seq_len
+                )
                 if input_len >= self.max_seq_len:
                     print(
-                        f"⚠️ WARNING: RLSampler: skipping source index {idx} with length {input_len} tokens greater than max sequence length {self.max_seq_len}.",
+                        f"⚠️ WARNING: RLBatchSampler: skipping source index {idx} with length {input_len} tokens greater than max sequence length {self.max_seq_len}.",
                         flush=True,
                     )
                     continue
