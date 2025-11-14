@@ -1079,7 +1079,8 @@ dependencies = [
     { name = "setuptools" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform == 'linux'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
 ]
 
 [[package]]
@@ -2331,7 +2332,8 @@ version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.8.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin') or sys_platform == 'win32'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine != 'aarch64' and sys_platform == 'linux'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux') or sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/31/23/be0b4dcac42d77f99406c906567cde22a7a3d71b3f3ffdfda2ac6153ec36/liger_kernel-0.6.2.tar.gz", hash = "sha256:5c5bcffffa769bc26ae838f5a4954170dd5cacde036abb1b383039f39fa5fd69", size = 3679495, upload-time = "2025-08-22T00:15:28.456Z" }
 wheels = [
@@ -3212,7 +3214,7 @@ dependencies = [
     { name = "num2words" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nvshmem-cu12" },
+    { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "pillow" },
@@ -3232,8 +3234,7 @@ dependencies = [
     { name = "torchvision", version = "0.23.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.23.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "transformers" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "sys_platform != 'darwin'" },
-    { name = "triton", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "triton", version = "3.4.0", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "wandb" },
 ]
 
@@ -3334,7 +3335,7 @@ requires-dist = [
     { name = "num2words", marker = "extra == 'vllm'", specifier = ">=0.5.14" },
     { name = "numpy" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-nvshmem-cu12" },
+    { name = "nvidia-nvshmem-cu12", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "penguin", marker = "extra == 'penguin'", editable = "3rdparty/Penguin-workspace" },
@@ -3355,8 +3356,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.22.0", index = "https://pypi.org/simple" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = "==2.8.0" },
     { name = "transformers", specifier = ">=4.55.4" },
-    { name = "triton", marker = "sys_platform != 'darwin'", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "triton", marker = "sys_platform == 'darwin'", index = "https://pypi.org/simple" },
+    { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "vllm", marker = "extra == 'automodel'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'mcore'", specifier = "==0.11.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.11.0" },
@@ -6580,17 +6580,11 @@ source = { registry = "https://download.pytorch.org/whl/cu129" }
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.13' and sys_platform == 'win32'",
-    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://download.pytorch.org/whl/triton-3.4.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" },
@@ -6606,11 +6600,15 @@ name = "triton"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.13' and sys_platform == 'darwin'",
-    "python_full_version < '3.13' and sys_platform == 'darwin'",
+    "python_full_version >= '3.13' and sys_platform == 'win32'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version < '3.13' and platform_machine != 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "setuptools", marker = "sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
 ]
 
 [[package]]
