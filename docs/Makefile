@@ -1,12 +1,24 @@
-# Makefile for Sphinx documentation
+# Makefile for building documentation with isolated UV environment
 
-# Default target shows help
 .DEFAULT_GOAL := help
 
-.PHONY: help docs-html docs-clean docs-live docs-publish ensure-docs-env check-uv
+# Cross-platform venv paths
+ifeq ($(OS),Windows_NT)
+    VENV_DIR = .venv/Scripts
+    PYTHON = $(VENV_DIR)/python.exe
+    ACTIVATE_CMD = .venv\Scripts\activate
+    RM = if exist _build rmdir /s /q _build
+else
+    VENV_DIR = .venv/bin
+    PYTHON = $(VENV_DIR)/python
+    ACTIVATE_CMD = source .venv/bin/activate
+    RM = rm -rf _build
+endif
 
-# Help target
-help: ## Show this help message
+# ------------------------------
+# Help
+# ------------------------------
+help:
 	@echo ""
 	@echo "📚 Documentation Build System"
 	@echo "=============================="
@@ -14,137 +26,58 @@ help: ## Show this help message
 	@echo "Available targets:"
 	@echo "  make docs-html      Build HTML documentation"
 	@echo "  make docs-live      Start live-reload server"
-	@echo "  make docs-publish   Build for publication (fail on warnings)"
+	@echo "  make docs-publish   Build docs (fail on warnings)"
 	@echo "  make docs-clean     Clean built documentation"
 	@echo ""
-	@echo "Note: Environment is automatically set up on first run."
+	@echo "The environment is automatically set up on first run."
+	@echo "To manually activate the docs environment, run:"
+	@echo "  $(ACTIVATE_CMD)"
 	@echo ""
 
-# Detect OS for cross-platform compatibility
-ifeq ($(OS),Windows_NT)
-    VENV_PYTHON = ../.venv-docs/Scripts/python.exe
-    VENV_ACTIVATE = ..\\.venv-docs\\Scripts\\activate
-    VENV_ACTIVATE_PS = ..\\.venv-docs\\Scripts\\Activate.ps1
-    RM_CMD = if exist _build rmdir /s /q _build
-    ECHO_BLANK = @echo.
-else
-    VENV_PYTHON = ../.venv-docs/bin/python
-    VENV_ACTIVATE = source ../.venv-docs/bin/activate
-    RM_CMD = rm -rf _build
-    ECHO_BLANK = @echo ""
-endif
-
-# Check if uv is installed
-check-uv:
-ifeq ($(OS),Windows_NT)
-	@where uv >nul 2>&1 || ( \
-		echo. && \
-		echo ❌ uv is not installed or not in PATH && \
-		echo. && \
-		echo Please install uv: https://docs.astral.sh/uv/getting-started/installation/ && \
-		exit 1 \
-	)
-else
+# ------------------------------
+# Ensure UV and isolated docs environment
+# ------------------------------
+ensure-docs-env:
 	@command -v uv >/dev/null 2>&1 || ( \
 		echo ""; \
-		echo "❌ uv is not installed or not in PATH"; \
-		echo ""; \
-		echo "Please install uv: https://docs.astral.sh/uv/getting-started/installation/"; \
-		echo ""; \
-		exit 1; \
+		echo "❌ uv is not installed. See https://docs.astral.sh/uv/getting-started/installation/"; \
+		exit 1 \
 	)
-endif
-
-# Ensure docs environment exists and is up to date
-ensure-docs-env: check-uv
-	@if [ ! -f "$(VENV_PYTHON)" ]; then \
-		echo "📦 Setting up docs environment with uv..."; \
-		cd .. && uv venv .venv-docs && uv pip install --group docs --python .venv-docs; \
-		echo "✅ Environment ready!"; \
+	@if [ ! -x "$(PYTHON)" ]; then \
+		echo "📦 Creating isolated docs environment..."; \
+		uv venv .venv; \
+		uv sync --no-config; \
+		echo "✅ Docs environment ready."; \
+		echo "📝 To activate it: $(ACTIVATE_CMD)"; \
 	fi
 
+# ------------------------------
+# Build HTML docs
+# ------------------------------
 docs-html: ensure-docs-env
 	@echo "Building HTML documentation..."
-	$(VENV_PYTHON) -m sphinx -b html . _build/html
+	$(PYTHON) -m sphinx -b html . _build/html
 
+# ------------------------------
+# Build docs for publication (fail on warnings)
+# ------------------------------
 docs-publish: ensure-docs-env
-	@echo "Building HTML documentation for publication (fail on warnings)..."
-	$(VENV_PYTHON) -m sphinx --fail-on-warning --builder html . _build/html
+	@echo "Building HTML documentation (fail on warnings)..."
+	$(PYTHON) -m sphinx --fail-on-warning -b html . _build/html
 
+# ------------------------------
+# Start live-reload server
+# ------------------------------
+docs-live: ensure-docs-env
+	@echo "Starting live-reload server..."
+	$(PYTHON) -m sphinx_autobuild . _build/html --port 8001
+	@echo ""
+	@echo "📝 To manually activate the docs environment in a shell:"
+	@echo "  $(ACTIVATE_CMD)"
+
+# ------------------------------
+# Clean built docs
+# ------------------------------
 docs-clean:
 	@echo "Cleaning built documentation..."
-	$(RM_CMD)
-
-docs-live: ensure-docs-env
-	@echo "Starting live-reload server (sphinx-autobuild)..."
-	$(VENV_PYTHON) -m sphinx_autobuild --port 8001 . _build/html
-	@echo "Setting up docs virtual environment with uv..."
-ifeq ($(OS),Windows_NT)
-	@where uv >nul 2>&1 || ( \
-		echo. && \
-		echo ❌ uv is not installed or not in PATH && \
-		echo. && \
-		echo uv is a fast Python package installer and resolver. && \
-		echo Please install it using one of the following methods: && \
-		echo. && \
-		echo 🪟 Windows PowerShell: && \
-		echo   powershell -c "irm https://astral.sh/uv/install.ps1 | iex" && \
-		echo. && \
-		echo 📦 pip: && \
-		echo   pip install uv && \
-		echo. && \
-		echo 🍺 Scoop: && \
-		echo   scoop install uv && \
-		echo. && \
-		echo After installation, you may need to: && \
-		echo 1. Restart your terminal && \
-		echo 2. Or add uv to your PATH manually && \
-		echo 3. Then run 'make docs-env' again && \
-		echo. && \
-		echo For more installation options, visit: https://docs.astral.sh/uv/getting-started/installation/ && \
-		exit 1 \
-	)
-else
-	@command -v uv >/dev/null 2>&1 || ( \
-		echo ""; \
-		echo "❌ uv is not installed or not in PATH"; \
-		echo ""; \
-		echo "uv is a fast Python package installer and resolver."; \
-		echo "Please install it using one of the following methods:"; \
-		echo ""; \
-		echo "🐧 Linux/Unix:"; \
-		echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"; \
-		echo ""; \
-		echo "🍺 Homebrew (macOS):"; \
-		echo "  brew install uv"; \
-		echo ""; \
-		echo "📦 pip:"; \
-		echo "  pip install uv"; \
-		echo ""; \
-		echo "After installation, you may need to:"; \
-		echo "1. Restart your terminal or run: source ~/.bashrc (or ~/.zshrc)"; \
-		echo "2. Or add uv to your PATH manually"; \
-		echo "3. Then run 'make docs-env' again"; \
-		echo ""; \
-		echo "For more installation options, visit: https://docs.astral.sh/uv/getting-started/installation/"; \
-		exit 1; \
-	)
-endif
-	@echo "✅ uv found, creating virtual environment..."
-	cd .. && uv venv .venv-docs
-	cd .. && uv pip install --group docs --python .venv-docs
-	$(ECHO_BLANK)
-	@echo "✅ Documentation environment setup complete!"
-	$(ECHO_BLANK)
-	@echo "📝 Note: The environment is NOT automatically activated."
-	@echo "To manually activate the docs environment, run:"
-ifeq ($(OS),Windows_NT)
-	@echo "  For Command Prompt: $(VENV_ACTIVATE)"
-	@echo "  For PowerShell: $(VENV_ACTIVATE_PS)"
-else
-	@echo "  $(VENV_ACTIVATE)"
-endif
-	$(ECHO_BLANK)
-	@echo "Once activated, you can run other docs commands like:"
-	@echo "  make docs-html    # Build HTML documentation"
-	@echo "  make docs-live    # Start live-reload server"
+	$(RM)
