@@ -9,6 +9,7 @@ import logging
 import os
 import torch
 from transformers import AutoConfig, AutoModel, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,20 @@ class GenerationAlgorithm(ABC):
             if "nemotron" in base_model.lower() or "Nemotron" in base_model:
                 model_type = "nemotron"
                 logger.info(f"Detected Nemotron model from base model: {base_model}")
+                # HACK: Manually download modeling_nvrdiff.py for Nemotron models
+                # The nemo_rl conversion scripts do not automatically handle this.
+                try:
+                    logger.info("Nemotron model detected, ensuring 'modeling_nvrdiff.py' is present...")
+                    hf_hub_download(
+                        repo_id=base_model,
+                        filename="modeling_nvrdiff.py",
+                        local_dir=hf_path,
+                        local_dir_use_symlinks=False  # Recommended for Hub downloads
+                    )
+                    logger.info("'modeling_nvrdiff.py' downloaded successfully.")
+                except Exception as e:
+                    logger.warning(f"Could not download 'modeling_nvrdiff.py': {e}")
+                    logger.warning("Proceeding without it, but loading may fail if model requires custom code.")
             else:
                 model_type = "llada"
                 logger.info(f"Detected LLaDA model from base model: {base_model}")
