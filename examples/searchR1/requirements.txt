@@ -1,0 +1,9 @@
+numpy==1.26.4
+transformers
+datasets
+pyserini
+huggingface_hub
+# faiss-gpu-cu12
+uvicorn
+fastapi
+torch==2.6.0

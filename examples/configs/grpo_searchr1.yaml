@@ -1,0 +1,40 @@
+defaults: "grpo_math_1B_megatron.yaml"
+
+env:
+  search:
+    search_url: "http://localhost:8000/retrieve"
+    max_turns: 10
+
+grpo:
+  max_rollout_turns: 10
+  num_prompts_per_step: 512
+  num_generations_per_prompt: 5
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+
+policy:
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  max_total_sequence_length: 4096
+
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+
+    optimizer:
+      lr: 1.0e-6
+
+data:
+  train_data_path: "examples/searchR1/data/searchR1/train.parquet"
+  val_data_path: "examples/searchR1/data/searchR1/validation.parquet"
+
+cluster:
+  gpus_per_node: 8
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo_searchr1"
+  metric_name: "val_reward"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
