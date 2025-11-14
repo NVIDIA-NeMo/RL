@@ -1272,6 +1272,7 @@ class MegatronPolicyWorker:
                 position_ids = None
 
             additional_kwargs = {}
+            # Mamba models currently do not support packed_seq_params
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
 
