@@ -130,13 +130,16 @@ class RLBatchSampler(Sampler[list[int]]):
                 )
                 futures_rem.add(future)
         else:
-            for idx in self.idx_sampler:
+            for seq_rank, idx in enumerate(self.idx_sampler):
                 if len(batch) == self.batch_size:
-                    yield list(batch)
+                    batch.sort()
+                    yield [idx for _, idx in batch]
                     batch.clear()
-                batch.append(idx)
+                batch.append((seq_rank, idx))
         if futures_rem:
             _drain_futures_batch(futures_rem, futures_done, batch, self.max_seq_len)
         if batch:
             batch.sort()
             yield [idx for _, idx in batch]
+
+    # TODO: state dict.
