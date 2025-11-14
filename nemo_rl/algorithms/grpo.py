@@ -49,7 +49,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.samplers import RLSampler
+from nemo_rl.data.samplers import RLBatchSampler
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -251,16 +251,25 @@ def setup(
     else:
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
 
-    sampler = RLSampler(
+    # sampler = RLSampler(
+    #     dataset,
+    #     tokenizer=tokenizer,
+    #     shuffle=data_config["shuffle"],
+    #     max_seq_len=policy_config["max_total_sequence_length"],
+    # )
+    batch_sampler = RLBatchSampler(
         dataset,
         tokenizer=tokenizer,
-        max_seq_len=policy_config["max_total_sequence_length"],
+        batch_size=dataloader_batch_size,
         shuffle=data_config["shuffle"],
+        max_seq_len=policy_config["max_total_sequence_length"],
+        num_workers=data_config["num_workers"],
     )
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=dataloader_batch_size,
-        sampler=sampler,
+        # sampler=sampler,
+        batch_sampler=batch_sampler,
         collate_fn=rl_collate_fn,
         drop_last=True,
         num_workers=data_config["num_workers"],
