@@ -45,7 +45,7 @@ class RLSampler(Sampler[int]):
 
 
 def _tokenized_clipped_length(
-    idx: int, input_str: str, tokenizer, max_seq_len: int
+    seq_rank: int, idx: int, input_str: str, tokenizer, max_seq_len: int
 ) -> tuple[int, int]:
     input_ids = tokenizer.encode(
         input_str,
@@ -54,7 +54,7 @@ def _tokenized_clipped_length(
         truncation=False,
         max_length=max_seq_len + 32,
     )
-    return idx, len(input_ids)
+    return seq_rank, idx, len(input_ids)
 
 
 def _drain_futures_batch(
@@ -65,14 +65,14 @@ def _drain_futures_batch(
         return_when=concurrent.futures.FIRST_COMPLETED,
     )
     for future in done:
-        idx, input_len = future.result()
+        seq_rank, idx, input_len = future.result()
         if input_len >= max_seq_len:
             print(
                 f"⚠️ WARNING: RLBatchSampler: skipping source index {idx} with length {input_len} tokens greater than max sequence length {max_seq_len}.",
                 flush=True,
             )
             continue
-        batch.append(idx)
+        batch.append((seq_rank, idx))
     futures_done |= done
     futures_rem -= done
 
@@ -104,11 +104,14 @@ class RLBatchSampler(Sampler[list[int]]):
         if self.max_seq_len is not None:
             futures_rem = set()
             futures_done = set()
-            for idx in self.idx_sampler:
+            for seq_rank, idx in enumerate(self.idx_sampler):
                 if len(futures_rem) + len(futures_done) >= self.batch_size:
-                    _drain_futures_batch(futures_rem, futures_done, batch, self.max_seq_len)
+                    _drain_futures_batch(
+                        futures_rem, futures_done, batch, self.max_seq_len
+                    )
                 if len(batch) == self.batch_size:
-                    yield list(batch)
+                    batch.sort()
+                    yield [idx for _, idx in batch]
                     batch.clear()
                     futures_done.clear()
                 datum = self.data_source[idx]
@@ -119,6 +122,7 @@ class RLBatchSampler(Sampler[list[int]]):
                 )
                 future = self.executor.submit(
                     _tokenized_clipped_length,
+                    seq_rank,
                     idx,
                     input_str,
                     self.tokenizer,
@@ -134,4 +138,5 @@ class RLBatchSampler(Sampler[list[int]]):
         if futures_rem:
             _drain_futures_batch(futures_rem, futures_done, batch, self.max_seq_len)
         if batch:
-            yield list(batch)
+            batch.sort()
+            yield [idx for _, idx in batch]
