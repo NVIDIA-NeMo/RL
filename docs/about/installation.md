@@ -72,25 +72,6 @@ Please do not use `-p/--python` and instead allow `uv venv` to read it from `.py
 This ensures that the version of python used is always what we prescribe.
 ```
 
-## Build Flash Attention (Optional but Recommended)
-
-If working outside a container, it can help to build [flash-attn](https://github.com/Dao-AILab/flash-attention) and warm the uv cache before your first run:
-
-```sh
-bash tools/build-flash-attn-in-uv-cache.sh
-```
-
-```{note}
-On the first install, `flash-attn` can take a while to install (approximately 45 minutes with 48 CPU hyperthreads). After it is built once, it is cached in your uv's cache directory, making subsequent installs much quicker.
-```
-
-```{tip}
-The NeMo RL Dockerfile will warm the uv cache with flash-attn.
-See [Docker documentation](../docker.md) for instructions if you are looking for the NeMo RL container.
-```
-
-If successful, you should see `flash-attn successfully added to uv cache`.
-
 ## Using UV to Run Commands
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
