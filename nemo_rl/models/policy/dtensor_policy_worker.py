@@ -708,6 +708,9 @@ class DTensorPolicyWorker:
                                 seq_len, device=input_ids.device
                             ).repeat(batch_size, 1)
                             flash_attn_kwargs = {}
+                            masked_indices = None
+                            if self._is_dqwn and self._is_mdlm:
+                                masked_indices = mb.get("token_mask").cuda()
 
                         # add vlm kwargs to model call
                         vlm_kwargs = mb.get_multimodal_dict(
@@ -728,7 +731,7 @@ class DTensorPolicyWorker:
                             seq_len, device=input_ids.device
                         ).repeat(1, 1)
                         cp_buffers = (
-                            [input_ids, position_ids, seq_index]
+                            [input_ids, masked_indices, seq_index] if self._is_dqwn and self._is_mdlm else [input_ids, position_ids, seq_index]
                             if self.cp_size > 1
                             else []
                         )
@@ -764,9 +767,10 @@ class DTensorPolicyWorker:
 
                                 model_args = {
                                     **model_args, 
-                                    "masked_indices": mb["token_mask"],
-                                    "p_mask": mb["p_mask"],
-                                    "labels": mb["input_ids"],
+                                    #"masked_indices": mb["token_mask"],
+                                    "masked_indices": masked_indices,
+                                    #"p_mask": mb["p_mask"],
+                                    "labels": input_ids,
                                 }
 
                             if self._is_reward_model:
@@ -803,6 +807,21 @@ class DTensorPolicyWorker:
                             )
 
                             mb["seq_index"] = seq_index_dtensor
+                            
+                            
+                            token_mask_dtensor_orig = (
+                                DTensor.from_local(
+                                    masked_indices,
+                                    device_mesh=self.cp_mesh,
+                                    placements=[Shard(sequence_dim)],
+                                )
+                                .full_tensor()
+                            )
+                            
+                            _, sorted_indices = torch.sort(seq_index_dtensor)
+                            token_mask_dtensor = token_mask_dtensor_orig[:, sorted_indices]
+                            
+                            mb["token_mask"] = token_mask_dtensor
 
                             for tensor_name in mb:
                                 current_tensor = mb[tensor_name]
