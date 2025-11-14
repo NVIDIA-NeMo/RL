@@ -10,13 +10,11 @@ class RLSampler(Sampler[int]):
         data_source,
         tokenizer,
         max_seq_len: Optional[int] = None,
-        skip_special_tokens: bool = False,
         shuffle: bool = False,
     ) -> None:
         self.data_source = data_source
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
-        self.skip_special_tokens = skip_special_tokens
         self.shuffle = shuffle
 
     def __iter__(self) -> Iterator[int]:
@@ -34,7 +32,6 @@ class RLSampler(Sampler[int]):
                 input_ids = self.tokenizer.apply_chat_template(
                     datum["message_log"],
                     add_generation_prompt=True,
-                    skip_special_tokens=self.skip_special_tokens,
                     tokenize=True,
                 )
                 input_len = len(input_ids)
