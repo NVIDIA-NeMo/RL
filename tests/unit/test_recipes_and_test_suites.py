@@ -28,6 +28,7 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
+performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
@@ -69,11 +70,23 @@ def release_test_suite():
 
 
 @pytest.fixture
+def performance_test_suite():
+    performance_suite = []
+    with open(performance_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                performance_suite.append(line)
+    return performance_suite
+
+
+@pytest.fixture
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
+    performance_test_suite,
 ):
-    return nightly_test_suite + release_test_suite
+    return nightly_test_suite + release_test_suite + performance_test_suite
 
 
 @pytest.fixture
@@ -91,10 +104,12 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
+        performance_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
+        "performance_test_suite",
     ],
 )
 def test_test_suites_exist(test_suite_path):
