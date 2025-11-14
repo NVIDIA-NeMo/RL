@@ -44,15 +44,24 @@ class RLSampler(Sampler[int]):
             yield from self.idx_sampler
 
 
+_WORKER_TOKENIZER = None
+
+
+def _init_worker(tokenizer) -> None:
+    global _WORKER_TOKENIZER
+    _WORKER_TOKENIZER = tokenizer
+
+
 def _rank_preserving_token_length(
-    seq_rank: int, idx: int, input_str: str, tokenizer, max_seq_len: int
+    seq_rank: int, idx: int, input_str: str
 ) -> tuple[int, int]:
-    input_ids = tokenizer.encode(
+    global _WORKER_TOKENIZER
+    assert _WORKER_TOKENIZER is not None
+    input_ids = _WORKER_TOKENIZER.encode(
         input_str,
         add_special_tokens=False,
         padding=False,
         truncation=False,
-        # max_length=max_seq_len + 32,
     )
     return seq_rank, idx, len(input_ids)
 
@@ -91,8 +100,12 @@ class RLBatchSampler(Sampler[list[int]]):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
-        self.executor = concurrent.futures.ProcessPoolExecutor(num_workers)
-        n = len(self.data_source)
+        self.executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_worker,
+            initargs=(tokenizer,),
+        )
+        n = len(data_source)
         data_idx_set = list(range(n))
         if shuffle:
             self.idx_sampler = RandomSampler(data_idx_set)
