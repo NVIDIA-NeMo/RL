@@ -311,6 +311,11 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
+    if generation_config["backend"] == "megatron":
+        raise RuntimeError(
+            "Megatron generation does not currently work in v0.4. Please follow https://github.com/NVIDIA-NeMo/RL/issues/1079 for details on the progress of enabling this feature on main."
+        )
+
     if colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
