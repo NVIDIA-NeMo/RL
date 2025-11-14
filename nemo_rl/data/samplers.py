@@ -1,4 +1,4 @@
-from concurrent.futures import ProcessPoolExecutor
+import concurrent.futures
 from typing import Iterator, Optional
 
 from torch.utils.data import Sampler
@@ -44,7 +44,9 @@ class RLSampler(Sampler[int]):
             yield from self.idx_sampler
 
 
-def _tokenized_clipped_length(tokenizer, input_str: str, max_seq_len: int) -> int:
+def _tokenized_clipped_length(
+    idx: int, input_str: str, tokenizer, max_seq_len: int
+) -> tuple[int, int]:
     input_ids = tokenizer.encode(
         input_str,
         add_special_tokens=False,
@@ -52,7 +54,27 @@ def _tokenized_clipped_length(tokenizer, input_str: str, max_seq_len: int) -> in
         truncation=False,
         max_length=max_seq_len + 32,
     )
-    return len(input_ids)
+    return idx, len(input_ids)
+
+
+def _drain_futures_batch(
+    futures_rem, futures_done, batch: list, max_seq_len: int
+) -> None:
+    done, _ = concurrent.futures.wait(
+        futures_rem,
+        return_when=concurrent.futures.FIRST_COMPLETED,
+    )
+    for future in done:
+        idx, input_len = future.result()
+        if input_len >= max_seq_len:
+            print(
+                f"⚠️ WARNING: RLBatchSampler: skipping source index {idx} with length {input_len} tokens greater than max sequence length {max_seq_len}.",
+                flush=True,
+            )
+            continue
+        batch.append(idx)
+    futures_done |= done
+    futures_rem -= done
 
 
 class RLBatchSampler(Sampler[list[int]]):
@@ -69,7 +91,7 @@ class RLBatchSampler(Sampler[list[int]]):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.max_seq_len = max_seq_len
-        self.executor = ProcessPoolExecutor(num_workers)
+        self.executor = concurrent.futures.ProcessPoolExecutor(num_workers)
         n = len(self.data_source)
         data_idx_set = list(range(n))
         if self.shuffle:
@@ -80,31 +102,36 @@ class RLBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         batch = []
         if self.max_seq_len is not None:
+            futures_rem = set()
+            futures_done = set()
             for idx in self.idx_sampler:
+                if len(futures_rem) + len(futures_done) >= self.batch_size:
+                    _drain_futures_batch(futures_rem, futures_done, batch, self.max_seq_len)
                 if len(batch) == self.batch_size:
                     yield list(batch)
                     batch.clear()
+                    futures_done.clear()
                 datum = self.data_source[idx]
                 input_str = self.tokenizer.apply_chat_template(
                     datum["message_log"],
                     add_generation_prompt=True,
                     tokenize=False,
                 )
-                input_len = _tokenized_clipped_length(
-                    self.tokenizer, input_str, self.max_seq_len
+                future = self.executor.submit(
+                    _tokenized_clipped_length,
+                    idx,
+                    input_str,
+                    self.tokenizer,
+                    self.max_seq_len,
                 )
-                if input_len >= self.max_seq_len:
-                    print(
-                        f"⚠️ WARNING: RLBatchSampler: skipping source index {idx} with length {input_len} tokens greater than max sequence length {self.max_seq_len}.",
-                        flush=True,
-                    )
-                    continue
-                batch.append(idx)
+                futures_rem.add(future)
         else:
             for idx in self.idx_sampler:
                 if len(batch) == self.batch_size:
                     yield list(batch)
                     batch.clear()
                 batch.append(idx)
+        if futures_rem:
+            _drain_futures_batch(futures_rem, futures_done, batch, self.max_seq_len)
         if batch:
             yield list(batch)
