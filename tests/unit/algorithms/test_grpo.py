@@ -1237,8 +1237,11 @@ def test_normalize_advantages_with_epsilon_zero_std():
 
     result = normalize_advantages_with_epsilon(advantages, std, epsilon)
 
-    # When std=0, result should be advantages / epsilon
-    expected = torch.tensor([[1.0 / epsilon], [2.0], [3.0 / epsilon]])
+    # When std=0 AND advantage!=0, normalization is skipped (advantages unchanged)
+    # When std>0, normal normalization occurs
+    expected = torch.tensor(
+        [[1.0], [2.0], [3.0]]
+    )  # Samples 0,2 unchanged; sample 1 normalized
     assert torch.allclose(result, expected, rtol=1e-5)
 
 
@@ -1250,7 +1253,8 @@ def test_normalize_advantages_with_epsilon_all_zero_std():
 
     result = normalize_advantages_with_epsilon(advantages, std, epsilon)
 
-    expected = advantages / epsilon
+    # When std=0 AND advantage!=0, normalization is skipped (all unchanged)
+    expected = advantages
     assert torch.allclose(result, expected, rtol=1e-5)
 
 
@@ -1281,3 +1285,51 @@ def test_normalize_advantages_with_epsilon_negative_advantages():
 
     expected = torch.tensor([[-2.0], [2.0], [-3.0]])
     assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_normalize_advantages_with_zero_std_from_leave_one_out():
+    """Test that zero std (from leave-one-out baseline) is handled gracefully by skipping normalization."""
+    # Simulate the leave-one-out case: rewards [1.0, 0.0, 0.0, 0.0]
+    # Sample 0 has baseline from [0, 0, 0] -> std=0, advantage=1.0
+    # Samples 1-3 have baseline from [1, 0, 0] -> std≈0.577, advantage≈-0.333
+    advantages = torch.tensor([[1.0], [-0.333], [-0.333], [-0.333]])
+    std = torch.tensor([0.0, 0.577, 0.577, 0.577])
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+
+    # Sample 0: std=0 AND advantage!=0 -> advantage unchanged (skip normalization)
+    assert torch.allclose(result[0], advantages[0], rtol=1e-5)
+
+    # Samples 1-3: std>0 -> normalized
+    expected_normalized = advantages[1:] / std[1:].unsqueeze(-1)
+    assert torch.allclose(result[1:], expected_normalized, rtol=1e-5)
+
+
+def test_normalize_advantages_with_zero_std_and_zero_advantage():
+    """Test that zero std with zero advantage still gets normalized (result is 0)."""
+    advantages = torch.tensor([[0.0], [1.0], [0.0]])
+    std = torch.tensor([0.0, 0.0, 1.0])
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+
+    # Sample 0: std=0 but advantage=0 -> normalize (gives 0)
+    assert torch.allclose(result[0], torch.tensor([[0.0]]), rtol=1e-5)
+
+    # Sample 1: std=0 AND advantage!=0 -> skip normalization (unchanged)
+    assert torch.allclose(result[1], advantages[1], rtol=1e-5)
+
+    # Sample 2: std>0 -> normalize
+    assert torch.allclose(result[2], advantages[2] / std[2], rtol=1e-5)
+
+
+def test_normalize_advantages_with_small_nonzero_std():
+    """Test that small but non-zero std values still get normalized (no threshold)."""
+    advantages = torch.tensor([[2.0], [3.0], [-1.0]])
+    std = torch.tensor([0.001, 0.01, 0.0001])  # All small but non-zero
+
+    result = normalize_advantages_with_epsilon(advantages, std)
+
+    # All should be normalized since std > 0
+    for i in range(len(advantages)):
+        expected = advantages[i] / (std[i] + 1e-6)
+        assert torch.allclose(result[i], expected, rtol=1e-5)
