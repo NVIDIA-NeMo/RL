@@ -21,7 +21,10 @@ members = [
     "nemo-rl",
     "penguin",
 ]
-overrides = [{ name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" }]
+overrides = [
+    { name = "opencv-python-headless", specifier = ">=4.11.0" },
+    { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.8.0" },
+]
 
 [[manifest.dependency-metadata]]
 name = "causal-conv1d"
@@ -3552,7 +3555,7 @@ requires-dist = [
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
     { name = "nvidia-nvshmem-cu13", marker = "extra == 'deepep'" },
-    { name = "opencv-python-headless", specifier = ">=4.11.0" },
+    { name = "opencv-python-headless", specifier = "==4.10.0.84" },
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
     { name = "pyyaml" },
