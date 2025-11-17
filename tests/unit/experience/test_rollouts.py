@@ -14,12 +14,15 @@
 
 import gc
 from copy import deepcopy
+from dataclasses import asdict
 
 import pytest
 import ray
 import torch
 from transformers import AutoTokenizer
 
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -29,12 +32,24 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.penguin import penguin_example_to_nemo_rl_datum_spec
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
+    run_async_penguin_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+
+# These are all fixtures
+from tests.unit.environments.test_penguin import (
+    PENGUIN_INSTALLED,
+    cluster,  # noqa: F401
+    penguin,  # noqa: F401
+    penguin_sanity_test_data,  # noqa: F401
+    penguin_tokenizer,  # noqa: F401
+    penguin_vllm_generation,  # noqa: F401
+)
 
 # Import the test environment definitions
 from tests.unit.test_envs import (
@@ -730,3 +745,133 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     assert environment_message_count > 3, "Expected at least one environment message"
 
     print("\nSliding Puzzle VLLM Test assertions passed.")
+
+
+@pytest.mark.skipif(
+    not PENGUIN_INSTALLED,
+    reason="Skipping Penguin test since Penguin is not installed!",
+)
+def test_run_async_penguin_rollout(
+    penguin,  # noqa: F811
+    penguin_vllm_generation,  # noqa: F811
+    penguin_sanity_test_data,  # noqa: F811
+    penguin_tokenizer,  # noqa: F811
+):
+    nemo_rl_compatible_examples: list[DatumSpec] = [
+        penguin_example_to_nemo_rl_datum_spec(penguin_example, idx)
+        for idx, penguin_example in enumerate(penguin_sanity_test_data["input"])
+    ]
+    input_batch: BatchedDataDict[DatumSpec] = rl_collate_fn(nemo_rl_compatible_examples)
+    actual_result = run_async_penguin_rollout(
+        policy_generation=penguin_vllm_generation,
+        input_batch=input_batch,
+        tokenizer=penguin_tokenizer,
+        task_to_env={"penguin": penguin},
+        max_seq_len=None,
+        generation_config=penguin_vllm_generation.cfg,
+        max_rollout_turns=None,
+    )
+    actual_result = asdict(actual_result)
+    actual_result["final_batch"] = actual_result["final_batch"].get_dict()
+
+    expected_result = {
+        "final_batch": {
+            "length": torch.tensor([3088, 3056]),
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "total_reward": torch.tensor([0.0, 0.0]),
+        },
+        "rollout_metrics": {
+            # core metrics
+            "timing/rollout/total": 0.0,
+            "timing/rollout/run_rollouts": 0.0,
+            "timing/rollout/await_results": 0.0,
+            "timing/rollout/postprocess_results": 0.0,
+            "timing/rollout/postprocess_results_pct": 0.0,
+            "timing/rollout/prepare_for_metrics_calculation": 0.0,
+            "timing/rollout/aggregate_metrics": 0.0,
+            "timing/rollout/per_agent_misc_metrics": 0.0,
+            "mean_gen_tokens_per_sample": None,
+            "turns_per_sample/mean": 2.0,
+            "turns_per_sample/max": 2,
+            "turns_per_sample/min": 2,
+            "turns_per_sample/median": 2.0,
+            "turns_per_sample/stddev": 0.0,
+            "turns_per_sample/histogram": None,
+            "total_tokens_per_sample/mean": 3843.0,
+            "total_tokens_per_sample/max": 3848,
+            "total_tokens_per_sample/min": 3838,
+            "total_tokens_per_sample/median": 3843.0,
+            "total_tokens_per_sample/stddev": 7.0710678118654755,
+            "total_tokens_per_sample/histogram": None,
+            "gen_tokens_per_sample/mean": 732.5,
+            "gen_tokens_per_sample/max": 748,
+            "gen_tokens_per_sample/min": 717,
+            "gen_tokens_per_sample/median": 732.5,
+            "gen_tokens_per_sample/stddev": 21.920310216782973,
+            "gen_tokens_per_sample/histogram": None,
+            "total_reward/mean": 0.0,
+            "total_reward/max": 0.0,
+            "total_reward/min": 0.0,
+            "total_reward/median": 0.0,
+            "total_reward/stddev": 0.0,
+            "total_reward/histogram": None,
+            "natural_termination_rate": None,
+            "truncation_rate": None,
+            # per agent metrics
+            "multineedle_simple_agent/full_result": None,
+            "multineedle_simple_agent/accuracy/histogram": None,
+            "multineedle_simple_agent/accuracy/max": 0.0,
+            "multineedle_simple_agent/accuracy/mean": 0.0,
+            "multineedle_simple_agent/accuracy/median": 0.0,
+            "multineedle_simple_agent/accuracy/min": 0.0,
+            "multineedle_simple_agent/accuracy/stddev": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/histogram": None,
+            "multineedle_simple_agent/order_instruction_following_failure/max": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/mean": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/median": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/min": 0.0,
+            "multineedle_simple_agent/order_instruction_following_failure/stddev": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/histogram": None,
+            "multineedle_simple_agent/original_term_minefield_hit/max": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/mean": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/median": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/min": 0.0,
+            "multineedle_simple_agent/original_term_minefield_hit/stddev": 0.0,
+            "multineedle_simple_agent/reward/histogram": None,
+            "multineedle_simple_agent/reward/max": 0.0,
+            "multineedle_simple_agent/reward/mean": 0.0,
+            "multineedle_simple_agent/reward/median": 0.0,
+            "multineedle_simple_agent/reward/min": 0.0,
+            "multineedle_simple_agent/reward/stddev": 0.0,
+            "multineedle_simple_agent/set_overlap/histogram": None,
+            "multineedle_simple_agent/set_overlap/max": 0.0,
+            "multineedle_simple_agent/set_overlap/mean": 0.0,
+            "multineedle_simple_agent/set_overlap/median": 0.0,
+            "multineedle_simple_agent/set_overlap/min": 0.0,
+            "multineedle_simple_agent/set_overlap/stddev": 0.0,
+        },
+    }
+
+    def _standardize(d: dict) -> dict:
+        final_batch = d["final_batch"].copy()
+        final_batch.pop("message_log", None)
+        final_batch["total_reward"] = final_batch["total_reward"].tolist()
+        final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
+        final_batch["length"] = final_batch["length"].tolist()
+
+        for key in d["rollout_metrics"]:
+            # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
+            d["rollout_metrics"][key] = None
+
+        return {
+            "final_batch": final_batch,
+            "rollout_metrics": d["rollout_metrics"],
+        }
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    """
+    If the result here does not match, please check the following:
+    1. In nemo_rl/experience/rollouts.py::run_async_penguin_rollout, the sampling params are passed appropriately
+    2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
+    """

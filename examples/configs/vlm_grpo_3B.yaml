@@ -66,6 +66,7 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 2048
   precision: "bfloat16"
+  offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 
   dtensor_cfg:
     _v2: true
