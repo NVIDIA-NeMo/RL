@@ -4,17 +4,17 @@ name = "nemo-rl-docs-env"
 version = "0.0.1"
 requires-python = ">=3.12"
 dependencies = [
-    "sphinx",
-    "sphinx-autobuild",
-    "sphinx-autodoc2",
-    "sphinx-copybutton",
-    "sphinx-design",
-    "myst_parser",
-    "nvidia-sphinx-theme",
-    "gitpython>=3.1.45",
-    "python-dotenv",
-    "sphinxcontrib-mermaid",
-    "swagger-plugin-for-sphinx",
+  "sphinx",
+  "sphinx-autobuild",
+  "sphinx-autodoc2",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "myst_parser",
+  "nvidia-sphinx-theme",
+  "gitpython>=3.1.45",
+  "python-dotenv",
+  "sphinxcontrib-mermaid",
+  "swagger-plugin-for-sphinx",
 ]
 
 [tool.uv]
