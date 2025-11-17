@@ -35,7 +35,7 @@ GPUS_PER_NODE=1
 CPUS_PER_TASK=16
 MEM="128G"
 PARTITION="interactive"
-CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/mfathi/containers/nemo_rl_base.sqsh"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/degert/data/enroot/nemo-rl:big-version-bump-from-githubci-18672942438.squashfs"
 
 # Colors for output
 RED='\033[0;31m'

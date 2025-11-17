@@ -88,7 +88,7 @@ policy:
     - name: "torch.optim.lr_scheduler.LinearLR"
       kwargs:
         start_factor: 1.0
-        end_factor: 0.1
+        end_factor: 1.0
         total_iters: 1113
     - milestones: [50,10017]
     

@@ -80,7 +80,8 @@ class NemotronGeneration(GenerationAlgorithm):
                 steps=validated_args['steps'],
                 block_length=validated_args['block_length'],
                 threshold=validated_args['threshold'],
-                shift_logits=validated_args['shift_logits']
+                shift_logits=validated_args['shift_logits'],
+                temperature=validated_args['temperature'],
             )
             
             return output_ids, nfe

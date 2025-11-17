@@ -100,7 +100,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Top-p (nucleus) sampling")
     top_k: int = Field(default=-1, description="Top-k sampling (-1 to disable)")
     # Fast-dLLM specific parameters
-    steps: int = Field(default=128, ge=1, le=4096, description="Diffusion steps")
+    steps: int = Field(default=128, ge=1, le=65536, description="Diffusion steps")
     block_length: int = Field(default=32, ge=1, description="Block length for generation")
     cfg_scale: float = Field(default=0.0, ge=0.0, description="Classifier-free guidance scale")
     remasking: str = Field(default="low_confidence", description="Remasking strategy")
