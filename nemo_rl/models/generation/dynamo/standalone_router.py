@@ -89,6 +89,16 @@ class KvRouter:
         self.background_tasks: list[asyncio.Task] = []
         self.load_tasks: list[asyncio.Task] = []
         self.indexer_tasks: list[asyncio.Task] = []
+        
+        # Configure logging for this module if not already configured
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            )
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        
         logger.info("Router initialized")
 
     async def start_background_tasks(self):

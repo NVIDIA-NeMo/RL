@@ -12,9 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+
+class RouterConfig(TypedDict):
+    """Configuration for the KV cache router."""
+
+    enabled: bool  # Whether to use the router for worker selection
+    mode: NotRequired[Literal["best_worker", "round_robin"]]  # Routing mode: 'best_worker' (default) or 'round_robin'
+    block_size: NotRequired[int]  # Block size for the router (default: 64)
+    base_kv_events_port: NotRequired[int]  # Base port for KV events (default: 5557)
+    base_metrics_port: NotRequired[int]  # Base port for load metrics (default: 5657)
 
 
 class VllmSpecificArgs(TypedDict):
@@ -40,3 +50,4 @@ class VllmSpecificArgs(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    router_cfg: NotRequired[RouterConfig]

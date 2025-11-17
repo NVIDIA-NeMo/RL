@@ -37,6 +37,15 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 
+# Router imports (optional, only used if router is enabled)
+try:
+    from nemo_rl.models.generation.dynamo.standalone_router import KvRouter
+    from dynamo._core import compute_block_hash_for_seq_py
+
+    ROUTER_AVAILABLE = True
+except ImportError:
+    ROUTER_AVAILABLE = False
+
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.
 # See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
@@ -222,6 +231,39 @@ class VllmGeneration(GenerationInterface):
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
+
+        # Initialize router if enabled
+        self.router: Optional[KvRouter] = None
+        self.router_enabled = False
+        self.router_mode = "best_worker"
+        if "router_cfg" in self.cfg and self.cfg["router_cfg"].get("enabled", False):
+            if not ROUTER_AVAILABLE:
+                raise ImportError(
+                    "Router is enabled in config but dynamo router dependencies are not available. "
+                    "Please install the required dependencies."
+                )
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "Router can only be used with async_engine=true. "
+                    "Please enable async_engine in your vLLM config."
+                )
+            self.router_enabled = True
+            router_cfg = self.cfg["router_cfg"]
+            self.router_mode = router_cfg.get("mode", "best_worker")
+            self.block_size = router_cfg.get("block_size", 64)
+            base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
+            base_metrics_port = router_cfg.get("base_metrics_port", 5657)
+
+            print(
+                f"[INFO] Initializing KvRouter with {self.dp_size} workers, "
+                f"block_size={self.block_size}, mode={self.router_mode}"
+            )
+            self.router = KvRouter(
+                block_size=self.block_size,
+                num_workers=self.dp_size,
+                base_kv_events_port=base_kv_events_port,
+                base_metrics_port=base_metrics_port,
+            )
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -545,10 +587,37 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
-        )
+        # Determine which DP shard (worker group) to use
+        if self.router_enabled and self.router is not None:
+            # Use router to select the best worker based on KV cache and load metrics
+            # Compute hashes from input_ids if available
+            local_hashes = []
+            num_tokens = 1  # Default if we can't compute
+
+            if "input_ids" in data and len(data["input_ids"]) > 0:
+                # For router, we typically use the first sequence's tokens for routing
+                # In a batched scenario, you might want to route based on common prefix
+                first_input_ids = data["input_ids"][0].tolist()
+                local_hashes = compute_block_hash_for_seq_py(first_input_ids, self.block_size)
+                num_tokens = len(first_input_ids)
+
+            # Get worker selection from router
+            # TODO: (sechoi) check if this dp_shard_idx is the same as the one in the else statement
+            if self.router_mode == "round_robin":
+                dp_shard_idx = await self.router.get_worker_round_robin(
+                    local_hashes, num_tokens
+                )
+            else:  # best_worker mode
+                dp_shard_idx = await self.router.get_best_worker(local_hashes, num_tokens)
+        else:
+            raise RuntimeError("Router is not enabled")
+            # Fall back to round-robin selection if router is not enabled
+            dp_shard_idx = self.current_generate_dp_shard_idx
+            self.current_generate_dp_shard_idx += 1
+            self.current_generate_dp_shard_idx %= self.worker_group.dp_size
+
+        # Determine the leader worker for the selected data parallel shard
+        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_shard_idx)
 
         # Run the async method on the selected leader worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
@@ -687,6 +756,34 @@ class VllmGeneration(GenerationInterface):
             data, "generate_async", validate_generate_data, greedy
         ):
             yield result
+    
+    async def start_router(self) -> bool:
+        """Start the router background tasks if router is enabled."""
+        if not self.router_enabled or self.router is None:
+            return True
+
+        try:
+            print("[INFO] Starting KvRouter background tasks...")
+            await self.router.start_background_tasks()
+            print("[INFO] KvRouter started successfully")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to start router: {e}")
+            return False
+
+    async def stop_router(self) -> bool:
+        """Stop the router and clean up resources if router is enabled."""
+        if not self.router_enabled or self.router is None:
+            return True
+
+        try:
+            print("[INFO] Shutting down KvRouter...")
+            await self.router.shutdown()
+            print("[INFO] KvRouter shutdown completed")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to stop router: {e}")
+            return False
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
@@ -695,6 +792,11 @@ class VllmGeneration(GenerationInterface):
             return True
 
         try:
+            if self.router_enabled and self.router is not None and not hasattr(self, '_router_started'):
+                import asyncio
+                asyncio.run(self.start_router())
+                self._router_started = True
+
             # Choose the appropriate method based on async_engine setting
             method_name = (
                 "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
@@ -740,13 +842,39 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def shutdown(self) -> bool:
-        """Shut down all vLLM workers and clean up resources."""
+        """Shut down all vLLM workers, router, and clean up resources."""
+        success = True
+        
+        # Shutdown router first if enabled
+        if self.router_enabled and self.router is not None:
+            try:
+                # Router shutdown is async, so we need to run it in an event loop
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If we're already in an async context, create a task
+                        # Note: This is a synchronous method, so we can't await
+                        print("[WARNING] Cannot cleanly shutdown router from sync context while event loop is running")
+                    else:
+                        loop.run_until_complete(self.stop_router())
+                except RuntimeError:
+                    # No event loop, create one
+                    asyncio.run(self.stop_router())
+            except Exception as e:
+                print(f"Error shutting down router: {e}")
+                success = False
+        
+        # Shutdown workers
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
-            return self.worker_group.shutdown(cleanup_method="shutdown")
+            worker_success = self.worker_group.shutdown(cleanup_method="shutdown")
+            success = success and worker_success
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
-            return False
+            success = False
+            
+        return success
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""

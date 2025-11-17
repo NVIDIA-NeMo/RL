@@ -58,6 +58,8 @@ class PY_EXECUTABLES:
     # Use Penguin dependencies
     PENGUIN = "uv run --locked --extra penguin"
 
+    # Use ai-dynamo dependencies
+    DYNAMO = "uv run --locked --extra dynamo --extra vllm"
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port() -> tuple[str, int]:

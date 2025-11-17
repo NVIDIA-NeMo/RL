@@ -126,7 +126,7 @@ def _replace_prefix_tokens(
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
-        from vllm.config import CompilationConfig
+        from vllm.config import CompilationConfig, KVEventsConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -136,8 +136,49 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 **llm_kwargs["compilation_config"]
             )
 
+        router_cfg = self.cfg.get("router_cfg", {})
+        stat_logger = None
+        if router_cfg.get("enabled"):
+            from nemo_rl.models.generation.dynamo.workers import LoggerFactory
+            
+            # Compute DP rank from bundle_indices to get unique ports per worker
+            # Each DP group is a tied worker group with the same bundle_indices
+            # We use the first bundle index divided by model_parallel_size to get DP rank
+            model_parallel_size = (
+                self.cfg["vllm_cfg"]["tensor_parallel_size"]
+                * self.cfg["vllm_cfg"]["pipeline_parallel_size"]
+            )
+            if self.bundle_indices is not None and len(self.bundle_indices) > 0:
+                # DP rank is determined by which group of model_parallel_size workers this belongs to
+                dp_rank = self.bundle_indices[0] // model_parallel_size
+            else:
+                # Fallback: try to extract from seed or default to 0
+                dp_rank = 0
+            
+            base_kv_events_port = router_cfg.get("base_kv_events_port", 5557)
+            base_metrics_port = router_cfg.get("base_metrics_port", 5657)
+            zmq_port = base_kv_events_port + dp_rank
+            metrics_port = base_metrics_port + dp_rank
+            block_size = router_cfg.get("block_size", 64)
+            
+            print(
+                f"[Router] Worker DP rank {dp_rank}: "
+                f"KV events port={zmq_port}, metrics port={metrics_port}"
+            )
+
+            llm_kwargs["kv_events_config"] = KVEventsConfig(
+                enable_kv_cache_events=True,
+                publisher="zmq",
+                endpoint=f"tcp://*:{zmq_port}",
+            )
+
+            llm_kwargs["enable_prefix_caching"] = True
+            llm_kwargs["block_size"] = block_size
+
+            stat_logger = [LoggerFactory(port=metrics_port)]
+
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args, stat_loggers=stat_logger)
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):

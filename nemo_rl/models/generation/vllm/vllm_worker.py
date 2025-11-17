@@ -130,6 +130,7 @@ class BaseVllmGenerationWorker:
             seed: Random seed for initialization
         """
         self.cfg = config
+        self.bundle_indices = bundle_indices
 
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
