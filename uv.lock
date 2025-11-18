@@ -3295,13 +3295,9 @@ docs = [
     { name = "sphinx-autobuild" },
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
-<<<<<<< HEAD
     { name = "sphinx-design" },
     { name = "sphinxcontrib-mermaid" },
     { name = "swagger-plugin-for-sphinx" },
-=======
-    { name = "sphinxcontrib-mermaid" },
->>>>>>> 7d1d7f2d (feat: allow uv-less execution and fingerprint the environment)
 ]
 test = [
     { name = "pytest" },
@@ -3397,13 +3393,9 @@ docs = [
     { name = "sphinx-autobuild" },
     { name = "sphinx-autodoc2" },
     { name = "sphinx-copybutton" },
-<<<<<<< HEAD
     { name = "sphinx-design" },
     { name = "sphinxcontrib-mermaid" },
     { name = "swagger-plugin-for-sphinx" },
-=======
-    { name = "sphinxcontrib-mermaid" },
->>>>>>> 7d1d7f2d (feat: allow uv-less execution and fingerprint the environment)
 ]
 test = [
     { name = "pytest", specifier = ">=7.0.0" },
