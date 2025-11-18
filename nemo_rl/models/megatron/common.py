@@ -348,12 +348,17 @@ def forward_step_arbitrary_loss(
     if len(multimodal_data) > 0:
         position_ids = None
 
+    additional_kwargs = {}
+    # Mamba models currently do not support packed_seq_params
+    if packed_seq_params is not None:
+        additional_kwargs["packed_seq_params"] = packed_seq_params
+
     with straggler_timer:
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
+            **additional_kwargs,
             **multimodal_data,
         )
 
