@@ -165,10 +165,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from logging import LogRecord
         from typing import List, Optional, Union
 
-        from fastapi import Request
-        from fastapi.responses import JSONResponse, StreamingResponse
-
-        from vllm.entrypoints.openai.api_server import (
+        from fastapi import Request  # pyright: ignore[reportMissingImports]
+        from fastapi.responses import (  # pyright: ignore[reportMissingImports]
+            JSONResponse,
+            StreamingResponse,
+        )
+        from vllm.entrypoints.openai.api_server import (  # pyright: ignore[reportMissingImports]
             BaseModelPath,
             OpenAIServingChat,
             OpenAIServingModels,

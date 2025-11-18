@@ -498,11 +498,13 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    vllm_logger_metrics = metrics["vllm_logger_metrics"]
-    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"][
-        "vllm_cfg"
-    ].get("enable_vllm_metrics_logger", False)
+    is_vllm_metrics_logger_enabled = (
+        master_config["policy"]["generation"]
+        .get("vllm_cfg", {})
+        .get("enable_vllm_metrics_logger", False)
+    )
     if is_vllm_metrics_logger_enabled:
+        vllm_logger_metrics = metrics["vllm_logger_metrics"]
         # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
         vllm_metrics_logger_interval = master_config["policy"]["generation"][
