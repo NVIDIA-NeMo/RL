@@ -1,0 +1,44 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_steps: 30
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-2n8g-fsdp2tp1
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-Nano-12B-v2
+  dtensor_cfg:
+    cpu_offload: true
+    activation_checkpointing: true
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      max_model_len: 512
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 13
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [13]
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-nano-v2-12b-2n8g-fsdp2tp1
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nano-v2-12b-2n8g-fsdp2tp1
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
