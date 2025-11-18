@@ -646,6 +646,18 @@ class MegatronPolicyWorker:
                 "defer_fp32_logits must be True if logprob_chunk_size is set"
             )
 
+        # Get user's preferred checkpoint format for regular save/load operations
+        user_ckpt_format = self.cfg["megatron_cfg"].get("ckpt_format", "torch_dist")
+
+        # Validate torch format requirements
+        if user_ckpt_format == "torch":
+            use_distributed_optimizer = self.cfg["megatron_cfg"]["optimizer"].get("use_distributed_optimizer", False)
+            if use_distributed_optimizer:
+                print("WARNING: torch checkpoint format requires use_distributed_optimizer=False. "
+                      "Distributed optimizer is not supported with non-distributed checkpointing.")
+
+        # For initial loading from pretrained checkpoint, always use torch_dist format
+        # We'll update this to user's preferred format after the initial loading
         checkpoint_config = CheckpointConfig(
             save_interval=100,
             save=weights_path,
@@ -655,13 +667,18 @@ class MegatronPolicyWorker:
             fully_parallel_save=True,
             fully_parallel_load=True,  # Enable fully parallel load
             load_rng=False,
+            ckpt_format="torch_dist",  # Use torch_dist for initial pretrained checkpoint loading
         )
+
+        # Reference model config - always use torch_dist for pretrained/base checkpoints
+        # since they come from HF conversion which uses torch_dist format
         ref_checkpoint_config = CheckpointConfig(
             pretrained_checkpoint=pretrained_path,  # This is the path to the pretrained ckpt for the SFT case
             save=None,
             load=None,
             fully_parallel_load=True,  # Enable fully parallel load
             load_rng=False,
+            ckpt_format="torch_dist",  # Always torch_dist for pretrained checkpoints
         )
 
         assert "train_iters" in self.cfg["megatron_cfg"], (
@@ -739,6 +756,11 @@ class MegatronPolicyWorker:
         ) = setup_megatron_model(
             policy_cfg=self.cfg, cfg=self.megatron_cfg, load_optimizer=init_optimizer
         )
+
+        # Now that initial loading is complete, update checkpoint config to user's preferred format
+        # This ensures that subsequent checkpoint saves/loads use the user's specified format
+        self.megatron_cfg.checkpoint.ckpt_format = user_ckpt_format
+        print(f"Updated checkpoint format to '{user_ckpt_format}' for subsequent checkpoint operations")
 
         # Set the param sync function for the model
         if (
