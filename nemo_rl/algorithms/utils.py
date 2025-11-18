@@ -458,7 +458,8 @@ def print_performance_metrics(
     ) -> None:
         dp_ranks = list(metric_dict.keys())
         max_timeline_length = 50
-        marker = {0: "▁", 1: "▃", 2: "▅", 3: "▆", 4: "▉"}
+        marker = {0: "▃", 1: "▅", 2: "▆", 3: "▉"}
+        zero_marker = "▁"
         # marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
 
         max_value = max(max(v) for v in metric_dict.values())
@@ -466,7 +467,9 @@ def print_performance_metrics(
 
         print(f"  - {metric_name}:")
         print(f"    - Max value: {max_value}")
-        print("    - Timeline:")
+        print(
+            f"    - Timeline (0: {zero_marker}, {', '.join(f'{1.0 if k == 0 else k * (max_value / len(marker))}-{(k + 1) * (max_value / len(marker))}: {marker[k]}' for k in marker.keys())}):"
+        )
         for dp_idx, metric_values in metric_dict.items():
             timeline = []
             length = len(metric_values)
@@ -482,7 +485,12 @@ def print_performance_metrics(
                 resized_metric_values = metric_values
 
             for i, value in enumerate(resized_metric_values):
-                timeline.append(marker[min(int(value // bin_width), len(marker) - 1)])
+                m = (
+                    zero_marker
+                    if value == 0
+                    else marker[min(int(value // bin_width), len(marker) - 1)]
+                )
+                timeline.append(m)
             if timeline_interval is not None:
                 print(
                     f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
