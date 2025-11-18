@@ -51,6 +51,7 @@ data:
 
 env:
   sliding_puzzle_game:
+    enabled: true
     cfg:
       game_config:
         size: 5 # Size of the puzzle (e.g., 2 for 2x2, 3 for 3x3)

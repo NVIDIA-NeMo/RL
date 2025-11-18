@@ -32,12 +32,12 @@ def format_math(data: dict[str, str | float | int]) -> dict[str, list[Any] | str
                 "content": data["answer"],
             },
         ],
-        # For v0.1 release, nemo rl datasets require a task_name key such that user can map a task processor per unique task.
-        "task_name": "math",
     }
 
 
-def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
+def prepare_deepscaler_dataset(
+    seed: int = 42, task_name: str = "DeepScaler"
+) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
     train_ds = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
@@ -51,6 +51,19 @@ def prepare_deepscaler_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     # Format the examples, removing original columns
     train_formatted = train_ds.map(format_math, remove_columns=train_ds.column_names)
     val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
+
+    if "task_name" in train_formatted.column_names:
+        train_formatted = train_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        train_formatted = train_formatted.add_column(
+            "task_name", [task_name] * len(train_formatted)
+        )
+    if "task_name" in val_formatted.column_names:
+        val_formatted = val_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        val_formatted = val_formatted.add_column(
+            "task_name", [task_name] * len(val_formatted)
+        )
 
     # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
     val_repeated = []
@@ -71,8 +84,11 @@ class DeepScalerDataset:
         Args:
             seed: Random seed for reproducible splitting
         """
-        self.formatted_ds = prepare_deepscaler_dataset(seed=seed)
+        self.task_name = "DeepScaler"
+        self.formatted_ds = prepare_deepscaler_dataset(
+            seed=seed, task_name=self.task_name
+        )
 
         self.task_spec = TaskDataSpec(
-            task_name="DeepScaler",
+            task_name=self.task_name,
         )

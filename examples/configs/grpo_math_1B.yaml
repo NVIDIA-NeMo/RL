@@ -262,12 +262,10 @@ data:
 
 env:
   math:
+    enabled: true
     num_workers: 8
     math_verify_impl: "hf_math_verify"
-  ## unused in this config but needed for DAPO recipe
-  dapo:
-    num_workers: 8
-    math_verify_impl: "dapo_math_verify"
+    processor: "math_hf_data_processor"
 
 logger:
   log_dir: "logs"  # Base directory for all logs

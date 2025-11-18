@@ -82,12 +82,15 @@ def setup_data(
 
     # load dataset
     data: Any = load_response_dataset(data_config, seed)
+    task_name = (
+        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
+    )
 
     # data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
+    task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     # setup math environment
     math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
@@ -120,7 +123,7 @@ def setup_data(
         val_dataset = None
 
     task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: math_env)
-    task_to_env["math"] = math_env
+    task_to_env[task_name] = math_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
