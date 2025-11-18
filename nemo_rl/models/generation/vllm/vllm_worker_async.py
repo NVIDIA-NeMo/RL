@@ -138,7 +138,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.stat_loggers = [PrometheusStatLogger]
+        self.stat_loggers = (
+            [PrometheusStatLogger]
+            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            else []
+        )
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )

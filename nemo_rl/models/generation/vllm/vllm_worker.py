@@ -329,8 +329,10 @@ class BaseVllmGenerationWorker:
 
         self._create_engine(llm_kwargs)
 
-        # Optionally start periodic vLLM metrics logging (per-actor, model-owner only)
-        self._maybe_start_vllm_metrics_logger()
+        # Optionally start periodic vLLM metrics logging if the flag is set
+        # Metrics logger only enabled for per-actor, model-owner only
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._maybe_start_vllm_metrics_logger()
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
@@ -342,11 +344,12 @@ class BaseVllmGenerationWorker:
         Controlled by env var NRL_VLLM_LOG_METRICS_INTERVAL_SEC. Set to a positive
         float (e.g. "10") to enable. Runs only on the model-owner actor.
         """
+        # Run only on the model-owner actor
         if not getattr(self, "is_model_owner", False):
             return
 
         try:
-            interval_s_str = os.environ.get("NRL_VLLM_LOG_METRICS_INTERVAL_SEC", "0.1")
+            interval_s_str = os.environ.get("NRL_VLLM_LOG_METRICS_INTERVAL_SEC", "0.5")
             if not interval_s_str:
                 return
             interval_s = float(interval_s_str)
@@ -360,6 +363,9 @@ class BaseVllmGenerationWorker:
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
 
+        self.inflight_batch_sizes: dict[int, list[int]] = {}
+        self.queued_batch_sizes: dict[int, list[int]] = {}
+
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
@@ -369,43 +375,38 @@ class BaseVllmGenerationWorker:
                 except Exception:
                     # Metrics reader not available in this vLLM build
                     print(
-                        "[DEBUG - VLLM LOGGING]🛑🛑 Metrics reader not available in this vLLM build",
+                        "⚠️[vLLM Metric Logger]⚠️ Metrics reader not available in this vLLM build",
                         flush=True,
                     )
                     return
 
-                inflight: dict[int, int] = {}
-                queued: dict[int, int] = {}
                 try:
-                    print(
-                        f"🛑[DEBUG - VLLM LOGGING]🛑 get_metrics_snapshot() = {get_metrics_snapshot()}",
-                        flush=True,
-                    )
                     for m in get_metrics_snapshot():
                         try:
                             if isinstance(m, Gauge):
+                                # Log the vllm inflight batch sizes
                                 if m.name == "vllm:num_requests_running":
                                     eng = int(m.labels.get("engine", "0"))
-                                    inflight[eng] = int(m.value)
+                                    if eng not in self.inflight_batch_sizes:
+                                        self.inflight_batch_sizes[eng] = []
+                                    self.inflight_batch_sizes[eng].append(int(m.value))
+                                # Log the vllm queued number of requests
                                 elif m.name == "vllm:num_requests_waiting":
                                     eng = int(m.labels.get("engine", "0"))
-                                    queued[eng] = int(m.value)
+                                    if eng not in self.queued_batch_sizes:
+                                        self.queued_batch_sizes[eng] = []
+                                    self.queued_batch_sizes[eng].append(int(m.value))
                         except Exception:
                             print(
-                                "[DEBUG - VLLM LOGGING]🛑🛑 Exception in vLLM metrics logger",
+                                "⚠️[vLLM Metric Logger]⚠️ Exception in vLLM metrics logger",
                                 flush=True,
                             )
                             # tolerate bad metric entries
                             pass
-                    # Print a compact single-line summary for easier grepping in Ray logs
-                    print(
-                        f"[DEBUG - VLLM LOGGING]🛑🛑 inflight={inflight if inflight else {}} queued={queued if queued else {}}",
-                        flush=True,
-                    )
                 except Exception:
                     # Avoid crashing the worker on logging issues
                     print(
-                        "[DEBUG - VLLM LOGGING]🛑🛑 Exception in vLLM metrics logger",
+                        "⚠️[vLLM Metric Logger]⚠️ Exception in vLLM metrics logger",
                         flush=True,
                     )
                     pass
@@ -413,7 +414,7 @@ class BaseVllmGenerationWorker:
                 stop_event.wait(interval_s)
 
         print(
-            "[DEBUG - VLLM LOGGING]🛑🛑🛑 Starting vLLM metrics logger thread",
+            "📋[vLLM Metric Logger]📋 Starting vLLM metrics logger thread",
             flush=True,
         )
         t = threading.Thread(
@@ -422,7 +423,7 @@ class BaseVllmGenerationWorker:
         t.start()
         self._vllm_metrics_logger_thread = t
         print(
-            "[DEBUG - VLLM LOGGING]🛑🛑🛑 vLLM metrics logger thread started",
+            "📋[vLLM Metric Logger]📋 vLLM metrics logger thread started",
             flush=True,
         )
 
