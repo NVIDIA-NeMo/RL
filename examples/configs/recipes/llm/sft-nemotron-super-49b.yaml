@@ -4,14 +4,15 @@ sft:
   max_num_steps: 100
   val_global_batch_size: 128
 checkpointing:
-  checkpoint_dir: results/sft_nemotron_super_49b
-  metric_name: val_loss
+  checkpoint_dir: results/sft-nemotron-super-49b
+  metric_name: val:loss
   keep_top_k: 100
   save_period: 500
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf
   max_total_sequence_length: 4096
   train_global_batch_size: 128
+  train_micro_batch_size: 8
   dtensor_cfg:
     _v2: true
     activation_checkpointing: true
@@ -36,12 +37,12 @@ logger:
   monitor_gpus: false
   num_val_samples_to_print: 0
   wandb:
-    project: sft-nemotron-super-49b
-    name: sft-nemotron-super-49b
+    project: sft-nemotron
+    name: sft-${data.dataset_name}-nemotron-super-49b
   tensorboard:
-    log_dir: tb_logs-sft-nemotron-super-49b
+    log_dir: tb_logs-openmathinstruct-nemorl-1M_train
   mlflow:
     experiment_name: sft-nemotron-super-49b
-    run_name: sft-nemotron-super-49b
+    run_name: openmathinstruct-nemorl-1M_train
 cluster:
   gpus_per_node: 8

@@ -4,23 +4,23 @@ grpo:
   max_num_steps: 10
 checkpointing:
   checkpoint_dir: results/grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
-  metric_name: val_reward
+  metric_name: val:reward
 policy:
   model_name: /lustre/fsw/portfolios/coreai/users/joyang/models/llama-3_3-nemotron-49b-instruct-128k-v1_2-hf
   max_total_sequence_length: 32768
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  dynamic_batching:
-    enabled: true
-  sequence_packing:
-    enabled: false
   dtensor_cfg:
     activation_checkpointing: true
     context_parallel_size: 4
     cpu_offload: true
     tensor_parallel_size: 8
     custom_parallel_plan: examples.custom_parallel.llama_nemotron_super_49b_custom_plan.custom_parallel_plan
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
   optimizer:
     kwargs:
       lr: 3.0e-07
@@ -42,19 +42,23 @@ policy:
 data:
   prompt_file: null
   dataset_name: HelpSteer3
+  split: preference
 env:
-  helpsteer3:
+  math:
+    enabled: false
+  code_jaccard:
+    enabled: true
     num_workers: 8
-    reward_model: preference_based
+    processor: helpsteer3_data_processor
 logger:
   wandb_enabled: true
-  monitor_gpus: false
   wandb:
     project: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
-    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp8
+    name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5-tp${policy.dtensor_cfg.tensor_parallel_size}
   tensorboard:
     log_dir: tb_logs-grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
   mlflow:
+    experiment_name: grpo-helpsteer3
     run_name: grpo-helpsteer3-llama-3.3-nemotron-super-49b-v1.5
 cluster:
   gpus_per_node: 8

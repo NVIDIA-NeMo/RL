@@ -34,8 +34,6 @@ def format_math(
                 "content": data[output_key],
             },
         ],
-        # For v0.1 release, nemo rl datasets require a task_name key such that user can map a task processor per unique task.
-        "task_name": "math",
     }
 
 
@@ -44,6 +42,7 @@ def prepare_openinstructmath2_dataset(
     seed: int = 42,
     test_size: float = 0.05,
     output_key: str = "expected_answer",
+    task_name: str = "OpenMathInstruct-2",
 ) -> dict[str, Dataset | None]:
     """Load and split the OpenMathInstruct-2 dataset into train and validation sets using HF's train_test_split."""
     print(
@@ -67,7 +66,19 @@ def prepare_openinstructmath2_dataset(
         remove_columns=split_ds["test"].column_names,
         fn_kwargs={"output_key": output_key},
     )
-
+    # Safely set/override task_name without creating duplicate columns
+    if "task_name" in train_formatted.column_names:
+        train_formatted = train_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        train_formatted = train_formatted.add_column(
+            "task_name", [task_name] * len(train_formatted)
+        )
+    if "task_name" in val_formatted.column_names:
+        val_formatted = val_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        val_formatted = val_formatted.add_column(
+            "task_name", [task_name] * len(val_formatted)
+        )
     return {
         "train": train_formatted,
         "validation": val_formatted,
@@ -95,11 +106,15 @@ class OpenMathInstruct2Dataset:
                 f"Invalid split: {split}. Please use 'train', 'train_1M', 'train_2M', or 'train_5M'."
             )
 
+        self.task_name = "OpenMathInstruct-2"
         self.formatted_ds = prepare_openinstructmath2_dataset(
-            split=split, seed=seed, test_size=test_size, output_key=output_key
+            split=split,
+            seed=seed,
+            test_size=test_size,
+            output_key=output_key,
+            task_name=self.task_name,
         )
-
         self.task_spec = TaskDataSpec(
-            task_name="OpenMathInstruct-2",
+            task_name=self.task_name,
             prompt_file=prompt_file,
         )

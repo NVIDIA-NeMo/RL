@@ -120,7 +120,9 @@ def test_math_data_processor():
 def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     # Initialize dataset
     data = dataset_cls()
-
+    task_name = (
+        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
+    )
     # Setup tokenizer
     tokenizer = get_tokenizer(
         TokenizerConfig(
@@ -131,7 +133,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
 
     # Configure task specification
     math_task_spec = TaskDataSpec(
-        task_name="math",
+        task_name=task_name,
         prompt_file=f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
         system_prompt_file=None,
     )
@@ -139,7 +141,7 @@ def test_math_hf_data_processor(tokenizer_name, dataset_cls):
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
         defaultdict(lambda: (math_task_spec, math_hf_data_processor))
     )
-    task_data_processors["math"] = (math_task_spec, math_hf_data_processor)
+    task_data_processors[task_name] = (math_task_spec, math_hf_data_processor)
 
     dataset = AllTaskProcessedDataset(
         dataset=data.formatted_ds["train"],
