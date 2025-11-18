@@ -364,7 +364,7 @@ class BaseVllmGenerationWorker:
         self._vllm_metrics_logger_stop_event = stop_event
 
         self.inflight_batch_sizes: dict[int, list[int]] = {}
-        self.queued_batch_sizes: dict[int, list[int]] = {}
+        self.num_pending_samples: dict[int, list[int]] = {}
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -390,12 +390,12 @@ class BaseVllmGenerationWorker:
                                     if eng not in self.inflight_batch_sizes:
                                         self.inflight_batch_sizes[eng] = []
                                     self.inflight_batch_sizes[eng].append(int(m.value))
-                                # Log the vllm queued number of requests
+                                # Log the vllm pending number of requests in the queue
                                 elif m.name == "vllm:num_requests_waiting":
                                     eng = int(m.labels.get("engine", "0"))
-                                    if eng not in self.queued_batch_sizes:
-                                        self.queued_batch_sizes[eng] = []
-                                    self.queued_batch_sizes[eng].append(int(m.value))
+                                    if eng not in self.num_pending_samples:
+                                        self.num_pending_samples[eng] = []
+                                    self.num_pending_samples[eng].append(int(m.value))
                         except Exception:
                             print(
                                 "⚠️[vLLM Metric Logger]⚠️ Exception in vLLM metrics logger",
@@ -426,6 +426,21 @@ class BaseVllmGenerationWorker:
             "📋[vLLM Metric Logger]📋 vLLM metrics logger thread started",
             flush=True,
         )
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        return {
+            "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+            "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+        }
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+        self.inflight_batch_sizes = {}
+        self.num_pending_samples = {}
 
     def llm(self):
         return self.llm

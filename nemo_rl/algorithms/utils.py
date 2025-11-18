@@ -442,6 +442,28 @@ def print_performance_metrics(
         )
 
     # =====================================================
+    # vLLM Logger Metrics (inflight batch sizes and pending samples)
+    # =====================================================
+    if "vllm_logger_metrics" in metrics:
+        vllm_logger_metrics = metrics["vllm_logger_metrics"]
+        if vllm_logger_metrics is not None:
+            print("  • vLLM Logger Metrics:")
+            for dp_idx, inflight_batch_sizes in vllm_logger_metrics[
+                "inflight_batch_sizes"
+            ].items():
+                print(
+                    f"  - vLLM Inflight Batch Sizes for DP {dp_idx}: {inflight_batch_sizes}",
+                    flush=True,
+                )
+            for dp_idx, num_pending_samples in vllm_logger_metrics[
+                "num_pending_samples"
+            ].items():
+                print(
+                    f"  - vLLM Num Pending Samples for DP {dp_idx}: {num_pending_samples}",
+                    flush=True,
+                )
+
+    # =====================================================
     # Throughputs
     # =====================================================
 

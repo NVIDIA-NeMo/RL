@@ -1038,6 +1038,9 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
+            # Clear vLLM logger metrics after each step
+            policy_generation.clear_vllm_logger_metrics()
+
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
@@ -1122,6 +1125,10 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
+
+                # Collect vLLM logger metrics for performance reporting
+                # inflight batch sizes and num pending samples are collected from each vLLM worker
+                vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1340,6 +1347,7 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
 
                 metrics.update(rollout_metrics)
+                metrics["vllm_logger_metrics"] = vllm_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
@@ -1936,6 +1944,9 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
+            # Clear vLLM logger metrics after each step
+            policy_generation.clear_vllm_logger_metrics()
+
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -2144,6 +2155,10 @@ def async_grpo_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
+                # Collect vLLM logger metrics for performance reporting
+                # inflight batch sizes and num pending samples are collected from each vLLM worker
+                vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
@@ -2241,6 +2256,7 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics["vllm_logger_metrics"] = vllm_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Checkpointing (same as sync version)
