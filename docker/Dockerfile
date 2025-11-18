@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Usage:
 # Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 # Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile --build-arg NRL_GIT_REF=r0.3.0 --tag <registry>/nemo-rl:r0.3.0 --push .
@@ -125,7 +126,8 @@ LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
-COPY --from=nemo-rl . /opt/nemo-rl
+# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
+COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
