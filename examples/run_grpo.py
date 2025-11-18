@@ -29,11 +29,10 @@ from nemo_rl.data.interfaces import (
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
-from nemo_rl.data.processors import math_hf_data_processor
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.data.processors import get_processors, math_hf_data_processor
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.reward_model_environment import RewardModelEnvironment
+from nemo_rl.environments.utils import get_env
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -42,13 +41,7 @@ OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    """Parse command line arguments.
-
-    Returns:
-        Tuple of (parsed_args, overrides) where:
-        - parsed_args: Namespace object containing parsed arguments
-        - overrides: List of remaining unparsed arguments (Hydra overrides)
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
@@ -61,7 +54,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 # ===============================================================================
-#                             Math Data Processor
+#                             Data Processor
 # ===============================================================================
 TokenizerType = PreTrainedTokenizerBase
 
@@ -77,37 +70,39 @@ def setup_data(
     dict[str, EnvironmentInterface],
     dict[str, EnvironmentInterface],
 ]:
-    print("\n▶ Setting up data...")
-    # load dataset
-    data: Any = load_response_dataset(data_config, seed)
-    task_name = (
-        data.task_name if hasattr(data, "task_name") else data.task_spec.task_name
-    )
+    print("\n▶ Setting up envs...")
+    enabled_envs = [
+        env_name
+        for env_name, env_config in env_configs.items()
+        if env_config["enabled"]
+    ]
+    assert len(enabled_envs) == 1, "Only support single environment for now"
 
-    reward_model_task_spec = TaskDataSpec(
-        task_name=task_name,
+    env_name = enabled_envs[0]
+    env = get_env(env_name=env_name, env_configs=env_configs)
+
+    print("\n▶ Setting up data...")
+    default_task_spec = TaskDataSpec(
+        task_name="math_default",
         prompt_file=data_config["prompt_file"],
         system_prompt_file=data_config["system_prompt_file"],
     )
-    # data processor
+    # define default task data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
-        defaultdict(lambda: (reward_model_task_spec, math_hf_data_processor))
+        defaultdict(lambda: (default_task_spec, math_hf_data_processor))
     )
-    task_data_processors[task_name] = (reward_model_task_spec, math_hf_data_processor)
 
-    reward_model_env = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.reward_model_environment.RewardModelEnvironment"
-            ),
-            "env_vars": dict(os.environ),  # Pass thru all user environment variables
-        }
-    ).remote(env_configs["reward_model"])
+    # load dataset
+    data: Any = load_response_dataset(data_config, seed)
+    task_spec = data.task_spec
+    task_name = data.task_name if hasattr(data, "task_name") else task_spec.task_name
+    task_processor = get_processors(env_name=env_name, env_configs=env_configs)
+    task_data_processors[task_name] = (task_spec, task_processor)
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
         tokenizer,
-        reward_model_task_spec,
+        task_spec,
         task_data_processors,
         max_seq_length=data_config["max_input_seq_length"],
     )
@@ -117,15 +112,15 @@ def setup_data(
         val_dataset = AllTaskProcessedDataset(
             data.formatted_ds["validation"],
             tokenizer,
-            reward_model_task_spec,
+            task_spec,
             task_data_processors,
             max_seq_length=data_config["max_input_seq_length"],
         )
     else:
         val_dataset = None
 
-    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: reward_model_env)
-    task_to_env[task_name] = reward_model_env
+    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: env)
+    task_to_env[task_name] = env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
@@ -136,7 +131,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "grpo_rm_1B.yaml"
+            os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
         )
 
     config = load_config(args.config)
@@ -193,24 +188,69 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    )
+    # Check if async mode is enabled
+    if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
+        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+        unsupported_features = [
+            "use_dynamic_sampling",
+            "reward_scaling",
+            "reward_shaping",
+        ]
 
-    for task_name in val_task_to_env.keys():
-        env = val_task_to_env[task_name]
-        env.shutdown.remote()
+        for feature in unsupported_features:
+            if feature not in config["grpo"]:
+                continue
+
+            if feature == "use_dynamic_sampling":
+                if config["grpo"][feature]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+            else:
+                if config["grpo"][feature]["enabled"]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+
+        from nemo_rl.algorithms.grpo import async_grpo_train
+
+        print("🚀 Running async GRPO training")
+
+        async_config = config["grpo"]["async_grpo"]
+        # Run async GRPO training
+        async_grpo_train(
+            policy=policy,
+            policy_generation=policy_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_state,
+            master_config=master_config,
+            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+        )
+    else:
+        print("🚀 Running synchronous GRPO training")
+
+        # Run standard GRPO training
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":
