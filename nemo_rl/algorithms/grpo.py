@@ -1913,6 +1913,9 @@ def async_grpo_train(
 
     print("✅ All setup complete, starting buffer wait...")
 
+    # Clear vLLM logger metrics after at start of training
+    policy_generation.clear_vllm_logger_metrics()
+
     # Wait for initial buffer fill
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
@@ -1931,9 +1934,6 @@ def async_grpo_train(
         time.sleep(1.0)
 
     print("✅ Buffer ready! Starting training loop...")
-
-    # Clear vLLM logger metrics after at start of training
-    policy_generation.clear_vllm_logger_metrics()
 
     # Main training loop
     try:
@@ -2153,16 +2153,16 @@ def async_grpo_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
-                # Collect vLLM logger metrics for performance reporting
-                # inflight batch sizes and num pending samples are collected from each vLLM worker
-                vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
-
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
+
+                    # Collect vLLM logger metrics for performance reporting
+                    # inflight batch sizes and num pending samples are collected from each vLLM worker
+                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
