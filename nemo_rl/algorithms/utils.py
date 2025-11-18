@@ -458,7 +458,8 @@ def print_performance_metrics(
     ) -> None:
         dp_ranks = list(metric_dict.keys())
         max_timeline_length = 50
-        marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
+        marker = {0: "▁", 1: "▃", 2: "▅", 3: "▆", 4: "▉"}
+        # marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
 
         max_value = max(max(v) for v in metric_dict.values())
         bin_width = (max_value + 1) / len(marker)
@@ -484,10 +485,10 @@ def print_performance_metrics(
                 timeline.append(marker[min(int(value // bin_width), len(marker) - 1)])
             if timeline_interval is not None:
                 print(
-                    f"    - Generation Worker {dp_idx:3.0f}: {' '.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
+                    f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
                 )
             else:
-                print(f"    - Generation Worker {dp_idx:3.0f}: {' '.join(timeline)}")
+                print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
     if "vllm_logger_metrics" in metrics:
         # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
