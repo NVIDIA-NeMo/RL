@@ -34,11 +34,12 @@ def format_dapo_math_17k(
                 "content": data["reward_model"]["ground_truth"],
             },
         ],
-        "task_name": "math",
     }
 
 
-def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
+def prepare_dapo_math_17k_dataset(
+    seed: int = 42, task_name: str = "DAPOMath17K"
+) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
     train_ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
@@ -55,6 +56,19 @@ def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     )
     val_formatted = val_ds.map(format_dapo_math_17k, remove_columns=val_ds.column_names)
 
+    if "task_name" in train_formatted.column_names:
+        train_formatted = train_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        train_formatted = train_formatted.add_column(
+            "task_name", [task_name] * len(train_formatted)
+        )
+    if "task_name" in val_formatted.column_names:
+        val_formatted = val_formatted.map(lambda _: {"task_name": task_name})
+    else:
+        val_formatted = val_formatted.add_column(
+            "task_name", [task_name] * len(val_formatted)
+        )
+
     return {
         "train": train_formatted,
         "validation": val_formatted,
@@ -68,8 +82,11 @@ class DAPOMath17KDataset:
         Args:
             seed: Random seed for reproducible splitting
         """
-        self.formatted_ds = prepare_dapo_math_17k_dataset(seed=seed)
+        self.task_name = "DAPOMath17K"
+        self.formatted_ds = prepare_dapo_math_17k_dataset(
+            seed=seed, task_name=self.task_name
+        )
 
         self.task_spec = TaskDataSpec(
-            task_name="DAPOMath17K",
+            task_name=self.task_name,
         )

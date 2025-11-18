@@ -29,7 +29,6 @@ def format_tulu3_sft_mixture(data: dict[str, Any]) -> dict[str, str | dict[str, 
 
     return {
         "messages": messages,
-        "task_name": "tulu3_sft_mixture",
     }
 
 
@@ -55,6 +54,8 @@ class Tulu3SftMixtureDataset:
             "WARNING: For reproducible experiments, preprocess the dataset once and define your own HfDataset subclass that directly uses the preprocessed datasets."
         )
 
+        self.task_name = "tulu3_sft_mixture"
+
         # Load the original dataset
         original_ds = load_dataset(
             path="allenai/tulu-3-sft-mixture",
@@ -79,6 +80,21 @@ class Tulu3SftMixtureDataset:
             format_tulu3_sft_mixture,
             remove_columns=split_ds["test"].column_names,
         )
+
+        if "task_name" in train_formatted.column_names:
+            train_formatted = train_formatted.map(
+                lambda _: {"task_name": self.task_name}
+            )
+        else:
+            train_formatted = train_formatted.add_column(
+                "task_name", [self.task_name] * len(train_formatted)
+            )
+        if "task_name" in val_formatted.column_names:
+            val_formatted = val_formatted.map(lambda _: {"task_name": self.task_name})
+        else:
+            val_formatted = val_formatted.add_column(
+                "task_name", [self.task_name] * len(val_formatted)
+            )
 
         self.formatted_ds = {
             "train": train_formatted,

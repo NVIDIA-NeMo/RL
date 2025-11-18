@@ -27,18 +27,18 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
-class HelpSteer3EnvConfig(TypedDict):
+class CodeJaccardEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[list[str]]  # Default stop strings for this env
 
 
-class HelpSteer3EnvironmentMetadata(TypedDict):
+class CodeJaccardEnvironmentMetadata(TypedDict):
     ground_truth: str
 
 
 @ray.remote  # pragma: no cover
-class HelpSteer3VerifyWorker:
-    """Worker for evaluating HelpSteer3 responses based on preference alignment."""
+class CodeJaccardVerifyWorker:
+    """Worker for evaluating code responses using Jaccard-based similarity."""
 
     def __init__(self) -> None:
         pass
@@ -49,15 +49,15 @@ class HelpSteer3VerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
-        """Verify HelpSteer3 responses against preferred completions.
+        """Verify code responses against ground-truth solutions using Jaccard-based similarity.
 
-        For HelpSteer3, we use a simple text similarity approach to evaluate
-        how well the model's response aligns with the preferred completion.
+        We use a simple text similarity approach (Jaccard over tokenized words)
+        to evaluate how well the model's response aligns with the ground truth.
 
         Args:
             pred_responses: list[str]. The predicted responses from the LLM.
-            ground_truths: list[str]. The preferred completion responses.
-            return_extracted_answer: bool. Whether to return extracted answers.
+            ground_truths: list[str]. The ground-truth solutions.
+            return_extracted_answer: bool. Whether to return extracted answers (here, the full response).
 
         Returns:
             Union[list[float], tuple[list[float], list[str | None]]].
@@ -75,7 +75,7 @@ class HelpSteer3VerifyWorker:
                 results.append(float(score))
 
                 if return_extracted_answer:
-                    # For HelpSteer3, the "extracted answer" is the full response
+                    # For CodeJaccard, the "extracted answer" is the full response
                     extracted_answers.append(response.strip())
 
             except Exception:
@@ -89,17 +89,22 @@ class HelpSteer3VerifyWorker:
             return results
 
     def _calculate_preference_score(self, response: str, ground_truth: str) -> float:
-        """Calculate a preference alignment score between response and ground truth.
+        """Calculate a Jaccard-based alignment score between response and ground truth.
 
         This is a simplified scoring function. In practice, you might want to use:
         - Semantic similarity models
         - BLEU/ROUGE scores
-        - Human preference models
-        - Quality metrics specific to HelpSteer3
+        - Tokenize both texts into sets A and B (here we use whitespace tokenization).
+        - Compute intersection size |A ∩ B| and union size |A ∪ B|.
+        - J(A, B) = |A ∩ B| / |A ∪ B|, with guards for union=0 -> 0.0.
+        - Optionally combine with a length-ratio penalty to discourage degenerate very short/long matches.
+
+        Complexity:
+        - Tokenization: O(n + m)
+        - Set ops: O(n + m) average (hash sets)
 
         Args:
             response: The model's response
-            ground_truth: The preferred completion
 
         Returns:
             float: Score between 0.0 and 1.0
@@ -140,16 +145,16 @@ class HelpSteer3VerifyWorker:
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
-class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata]):
-    """Environment for evaluating HelpSteer3 preference alignment."""
+class CodeJaccardEnvironment(EnvironmentInterface[CodeJaccardEnvironmentMetadata]):
+    """Environment for evaluating code responses using Jaccard similarity."""
 
-    def __init__(self, cfg: HelpSteer3EnvConfig):
+    def __init__(self, cfg: CodeJaccardEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
 
         # Create worker pool
         self.workers = [
-            HelpSteer3VerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
+            CodeJaccardVerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
             ).remote()
             for _ in range(self.num_workers)
@@ -163,14 +168,14 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
     def step(
         self,
         message_log_batch: list[LLMMessageLogType],
-        metadata: list[HelpSteer3EnvironmentMetadata],
+        metadata: list[CodeJaccardEnvironmentMetadata],
         return_extracted_answer: bool = False,
-    ) -> EnvironmentReturn[HelpSteer3EnvironmentMetadata]:
-        """Runs a step in the HelpSteer3 environment.
+    ) -> EnvironmentReturn[CodeJaccardEnvironmentMetadata]:
+        """Runs a step in the CodeJaccard environment.
 
         Args:
             message_log_batch: Batch of OpenAI-API-like message logs.
-            metadata: Batch of HelpSteer3EnvironmentMetadata with ground truth.
+            metadata: Batch of CodeJaccardEnvironmentMetadata with ground truth.
             return_extracted_answer: Whether to return extracted answers.
 
         Returns:
@@ -220,13 +225,13 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
             else:
                 results.extend(worker_result)
 
-        # Create observations based on preference alignment
+        # Create observations based on Jaccard alignment
         observations = [
             {
                 "role": "environment",
-                "content": f"Environment: preference aligned (score: {result:.2f})"
+                "content": f"Environment: jaccard aligned (score: {result:.2f})"
                 if result > 0.5
-                else f"Environment: preference misaligned (score: {result:.2f})",
+                else f"Environment: jaccard misaligned (score: {result:.2f})",
             }
             for result in results
         ]
@@ -248,7 +253,7 @@ class HelpSteer3Environment(EnvironmentInterface[HelpSteer3EnvironmentMetadata])
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        """Post-process batch and compute metrics for HelpSteer3."""
+        """Post-process batch and compute metrics for CodeJaccard."""
         # Calculate preference alignment metrics
         rewards = batch["rewards"]
 

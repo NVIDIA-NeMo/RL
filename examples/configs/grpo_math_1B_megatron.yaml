@@ -161,6 +161,7 @@ data:
 
 env:
   math:
+    enabled: true
     num_workers: 8
     math_verify_impl: "hf_math_verify"
 
