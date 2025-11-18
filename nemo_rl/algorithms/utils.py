@@ -498,32 +498,33 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    if "vllm_logger_metrics" in metrics:
-        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
+    vllm_logger_metrics = metrics["vllm_logger_metrics"]
+    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"][
+        "vllm_cfg"
+    ].get("enable_vllm_metrics_logger", False)
+    if is_vllm_metrics_logger_enabled:
+        # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
-        vllm_logger_metrics = metrics["vllm_logger_metrics"]
-
-        if vllm_logger_metrics is not None:
-            vllm_metrics_logger_interval = master_config["policy"]["generation"][
-                "vllm_cfg"
-            ]["vllm_metrics_logger_interval"]
-            print("  • vLLM Logger Metrics:")
-            # Visualize the inflight batch sizes timeline
+        vllm_metrics_logger_interval = master_config["policy"]["generation"][
+            "vllm_cfg"
+        ]["vllm_metrics_logger_interval"]
+        print("  • vLLM Logger Metrics:")
+        # Visualize the inflight batch sizes timeline
+        visualize_per_worker_timeline(
+            vllm_logger_metrics["inflight_batch_sizes"],
+            "Inflight Batch Sizes",
+            vllm_metrics_logger_interval,
+        )
+        max_num_pending_samples = max(
+            max(v) for v in vllm_logger_metrics["num_pending_samples"].values()
+        )
+        # If there is at least one pending sample, visualize the timeline
+        if max_num_pending_samples > 0:
             visualize_per_worker_timeline(
-                vllm_logger_metrics["inflight_batch_sizes"],
-                "Inflight Batch Sizes",
-                vllm_metrics_logger_interval,
+                vllm_logger_metrics["num_pending_samples"],
+                "Num Pending Samples",
+                None,
             )
-            max_num_pending_samples = max(
-                max(v) for v in vllm_logger_metrics["num_pending_samples"].values()
-            )
-            # If there is at least one pending sample, visualize the timeline
-            if max_num_pending_samples > 0:
-                visualize_per_worker_timeline(
-                    vllm_logger_metrics["num_pending_samples"],
-                    "Num Pending Samples",
-                    None,
-                )
 
     # =====================================================
     # Throughputs
