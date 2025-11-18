@@ -1038,9 +1038,6 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            # Clear vLLM logger metrics after each step
-            policy_generation.clear_vllm_logger_metrics()
-
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
@@ -1076,6 +1073,8 @@ def grpo_train(
 
                 dynamic_sampling_num_gen_batches += 1
                 with timer.time("generation"):
+                    # Clear vLLM logger metrics for each generation step
+                    policy_generation.clear_vllm_logger_metrics()
                     # Use penguin rollouts if enabled. We cascade penguin first since penguin requires async rollouts.
                     if _should_use_penguin(master_config):
                         generation_config = master_config["policy"]["generation"]
@@ -1125,10 +1124,9 @@ def grpo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
-
-                # Collect vLLM logger metrics for performance reporting
-                # inflight batch sizes and num pending samples are collected from each vLLM worker
-                vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
+                    # Collect vLLM logger metrics for performance reporting after each generation step
+                    # inflight batch sizes and num pending samples are collected from each vLLM worker
+                    vllm_logger_metrics = policy_generation.get_vllm_logger_metrics()
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1934,6 +1932,9 @@ def async_grpo_train(
 
     print("✅ Buffer ready! Starting training loop...")
 
+    # Clear vLLM logger metrics after at start of training
+    policy_generation.clear_vllm_logger_metrics()
+
     # Main training loop
     try:
         while step < master_config["grpo"]["max_num_steps"]:
@@ -1943,9 +1944,6 @@ def async_grpo_train(
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
-
-            # Clear vLLM logger metrics after each step
-            policy_generation.clear_vllm_logger_metrics()
 
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer
@@ -2178,6 +2176,9 @@ def async_grpo_train(
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
+
+                # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
+                policy_generation.clear_vllm_logger_metrics()
 
                 # Validation
                 val_metrics, validation_timings = None, None

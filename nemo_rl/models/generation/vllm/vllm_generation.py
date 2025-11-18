@@ -836,9 +836,9 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, dict[int, list[int]]]] = {
-            "inflight_batch_sizes": {},
-            "num_pending_samples": {},
+        vllm_logger_metrics: dict[str, dict[int, list[int]]] = {
+            "inflight_batch_sizes": {},  # dp_idx -> list[int]
+            "num_pending_samples": {},  # dp_idx -> list[int]
         }
 
         for dp_idx, stats in zip(dp_indices, results):

@@ -330,41 +330,44 @@ class BaseVllmGenerationWorker:
         self._create_engine(llm_kwargs)
 
         # Optionally start periodic vLLM metrics logging if the flag is set
+        # NOTE: vLLM metrics logger is only supported with async engine enabled
         # Metrics logger only enabled for per-actor, model-owner only
-        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
-            self._maybe_start_vllm_metrics_logger()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False) and self.cfg[
+            "vllm_cfg"
+        ].get("async_engine", False):
+            self._start_vllm_metrics_logger()
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
 
-    def _maybe_start_vllm_metrics_logger(self) -> None:
-        """Start a background thread that periodically prints vLLM inflight/queued sizes.
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM logger metrics.
 
-        Controlled by env var NRL_VLLM_LOG_METRICS_INTERVAL_SEC. Set to a positive
-        float (e.g. "10") to enable. Runs only on the model-owner actor.
+        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Runs only on the model-owner actor.
         """
+        assert self.cfg["vllm_cfg"].get("async_engine", False), (
+            "vLLM metrics logger is only supported with async engine enabled"
+        )
         # Run only on the model-owner actor
         if not getattr(self, "is_model_owner", False):
             return
 
-        try:
-            interval_s_str = os.environ.get("NRL_VLLM_LOG_METRICS_INTERVAL_SEC", "0.5")
-            if not interval_s_str:
-                return
-            interval_s = float(interval_s_str)
-        except Exception:
-            return
-
-        if interval_s <= 0:
-            return
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
 
         # Lazy import inside thread target to avoid import overhead if disabled
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
 
-        self.inflight_batch_sizes: dict[int, list[int]] = {}
-        self.num_pending_samples: dict[int, list[int]] = {}
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -386,25 +389,17 @@ class BaseVllmGenerationWorker:
                             if isinstance(m, Gauge):
                                 # Log the vllm inflight batch sizes
                                 if m.name == "vllm:num_requests_running":
-                                    eng = int(m.labels.get("engine", "0"))
-                                    if eng not in self.inflight_batch_sizes:
-                                        self.inflight_batch_sizes[eng] = []
-                                    self.inflight_batch_sizes[eng].append(int(m.value))
+                                    self.inflight_batch_sizes.append(int(m.value))
                                 # Log the vllm pending number of requests in the queue
                                 elif m.name == "vllm:num_requests_waiting":
-                                    eng = int(m.labels.get("engine", "0"))
-                                    if eng not in self.num_pending_samples:
-                                        self.num_pending_samples[eng] = []
-                                    self.num_pending_samples[eng].append(int(m.value))
+                                    self.num_pending_samples.append(int(m.value))
                         except Exception:
                             print(
                                 "⚠️[vLLM Metric Logger]⚠️ Exception in vLLM metrics logger",
                                 flush=True,
                             )
-                            # tolerate bad metric entries
                             pass
                 except Exception:
-                    # Avoid crashing the worker on logging issues
                     print(
                         "⚠️[vLLM Metric Logger]⚠️ Exception in vLLM metrics logger",
                         flush=True,
@@ -439,8 +434,8 @@ class BaseVllmGenerationWorker:
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
-        self.inflight_batch_sizes = {}
-        self.num_pending_samples = {}
+        self.inflight_batch_sizes = []
+        self.num_pending_samples = []
 
     def llm(self):
         return self.llm

@@ -401,12 +401,13 @@ def print_performance_metrics(
             v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 100
+        bar_length = 20
         print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
-                f"{'■' * int(per_worker_load_ratio[i] * 10)}"
-                f"{'□' * (10 - int(per_worker_load_ratio[i] * 10))}"
+                f"{'■' * int(per_worker_load_ratio[i] * bar_length)}"
+                f"{'□' * (bar_length - int(per_worker_load_ratio[i] * bar_length))}"
                 f" Count: {per_worker_token_counts_list[i] / 1000:.1f}K"
             )
         estimated_idle_ratio = 1 - sum(per_worker_load_ratio) / len(
@@ -442,25 +443,77 @@ def print_performance_metrics(
         )
 
     # =====================================================
-    # vLLM Logger Metrics (inflight batch sizes and pending samples)
+    # vLLM Logger Metrics (inflight batch sizes, num pending samples, etc.)
     # =====================================================
-    if "vllm_logger_metrics" in metrics:
-        vllm_logger_metrics = metrics["vllm_logger_metrics"]
-        if vllm_logger_metrics is not None:
-            print("  • vLLM Logger Metrics:")
-            for dp_idx, inflight_batch_sizes in vllm_logger_metrics[
-                "inflight_batch_sizes"
-            ].items():
-                print(
-                    f"  - vLLM Inflight Batch Sizes for DP {dp_idx}: {inflight_batch_sizes}",
-                    flush=True,
+    def resize_timeline(data, new_size):
+        old_size = len(data)
+        x_old = np.linspace(0, 1, old_size)
+        x_new = np.linspace(0, 1, new_size)
+        return np.interp(x_new, x_old, data)
+
+    def visualize_per_worker_timeline(
+        metric_dict: dict[int, list[int]],
+        metric_name: str,
+        timeline_interval: float | None,
+    ) -> None:
+        dp_ranks = list(metric_dict.keys())
+        max_timeline_length = 50
+        marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
+
+        max_value = max(max(v) for v in metric_dict.values())
+        bin_width = (max_value + 1) / len(marker)
+
+        print(f"  - {metric_name}:")
+        print(f"    - Max value: {max_value}")
+        print("    - Timeline:")
+        for dp_idx, metric_values in metric_dict.items():
+            timeline = []
+            length = len(metric_values)
+            if timeline_interval is not None:
+                count_zeros = lambda x: sum(v == 0 for v in x)
+                idle = count_zeros(metric_values) * timeline_interval
+                active = length * timeline_interval - idle
+            if length > max_timeline_length:
+                resized_metric_values = resize_timeline(
+                    metric_values, max_timeline_length
                 )
-            for dp_idx, num_pending_samples in vllm_logger_metrics[
-                "num_pending_samples"
-            ].items():
+            else:
+                resized_metric_values = metric_values
+
+            for i, value in enumerate(resized_metric_values):
+                timeline.append(marker[min(int(value // bin_width), len(marker) - 1)])
+            if timeline_interval is not None:
                 print(
-                    f"  - vLLM Num Pending Samples for DP {dp_idx}: {num_pending_samples}",
-                    flush=True,
+                    f"    - Generation Worker {dp_idx:3.0f}: {' '.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
+                )
+            else:
+                print(f"    - Generation Worker {dp_idx:3.0f}: {' '.join(timeline)}")
+
+    if "vllm_logger_metrics" in metrics:
+        # vllm_logger_metrics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
+        # metric_name: "inflight_batch_sizes" or "num_pending_samples"
+        vllm_logger_metrics = metrics["vllm_logger_metrics"]
+
+        if vllm_logger_metrics is not None:
+            vllm_metrics_logger_interval = master_config["policy"]["generation"][
+                "vllm_cfg"
+            ]["vllm_metrics_logger_interval"]
+            print("  • vLLM Logger Metrics:")
+            # Visualize the inflight batch sizes timeline
+            visualize_per_worker_timeline(
+                vllm_logger_metrics["inflight_batch_sizes"],
+                "Inflight Batch Sizes",
+                vllm_metrics_logger_interval,
+            )
+            max_num_pending_samples = max(
+                max(v) for v in vllm_logger_metrics["num_pending_samples"].values()
+            )
+            # If there is at least one pending sample, visualize the timeline
+            if max_num_pending_samples > 0:
+                visualize_per_worker_timeline(
+                    vllm_logger_metrics["num_pending_samples"],
+                    "Num Pending Samples",
+                    None,
                 )
 
     # =====================================================
