@@ -8,16 +8,10 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "nemo-rl",
-]
+dependencies = ["nemo-rl"]
 
 [dependency-groups]
-test = [
-    "pytest>=7.0.0",
-    "pytest-timeout",
-    "pytest-cov",
-]
+test = ["pytest>=7.0.0", "pytest-timeout", "pytest-cov"]
 
 [tool.uv.sources]
 nemo-rl = { workspace = true }
