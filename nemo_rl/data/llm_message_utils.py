@@ -552,29 +552,29 @@ def get_formatted_message_log(
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
         # Debug: Print each message turn separately (only once for the first sample)
-        if not hasattr(get_formatted_message_log, "_debug_printed"):
-            if i == 0:
-                # Print header only at the start of first message
-                print("\n" + "=" * 80)
-                print("DEBUG: Individual message turns from apply_chat_template")
-                print("=" * 80)
+        # if hasattr(get_formatted_message_log, "_debug_printed"):
+        #     if i == 0:
+        #         # Print header only at the start of first message
+        #         print("\n" + "=" * 80)
+        #         print("DEBUG: Individual message turns from apply_chat_template")
+        #         print("=" * 80)
 
-            print(f"\n[Turn {i + 1}/{len(message_log_strs)}] Role: {message['role']}")
-            print("-" * 40)
-            print("Extracted message chunk:")
-            print(repr(message_chunk))  # Using repr to show special characters
-            print(f"Raw text (len={len(message_chunk)}):")
-            print(message_chunk)
-            print("-" * 40)
+        #     print(f"\n[Turn {i + 1}/{len(message_log_strs)}] Role: {message['role']}")
+        #     print("-" * 40)
+        #     print("Extracted message chunk:")
+        #     print(repr(message_chunk))  # Using repr to show special characters
+        #     print(f"Raw text (len={len(message_chunk)}):")
+        #     print(message_chunk)
+        #     print("-" * 40)
 
-            if i == len(message_log_strs) - 1:
-                # Mark as printed after processing all turns of the first sample
-                get_formatted_message_log._debug_printed = True
-                print("\n" + "=" * 80)
-                print("DEBUG: Complete formatted conversation:")
-                print("-" * 80)
-                print(formatted_message)
-                print("=" * 80 + "\n")
+        #     if i == len(message_log_strs) - 1:
+        #         # Mark as printed after processing all turns of the first sample
+        #         get_formatted_message_log._debug_printed = True
+        #         print("\n" + "=" * 80)
+        #         print("DEBUG: Complete formatted conversation:")
+        #         print("-" * 80)
+        #         print(formatted_message)
+        #         print("=" * 80 + "\n")
 
         if i == 0:
             if add_bos_token:
