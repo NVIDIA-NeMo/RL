@@ -463,7 +463,7 @@ def print_performance_metrics(
         zero_marker = "▁"
         # marker = {0: "□", 1: "⧅", 2: "⛝", 3: "■"}
 
-        max_value = max(max(v) for v in metric_dict.values())
+        max_value = max((max(v) if v else 0) for v in metric_dict.values())
         bin_width = (max_value + 1) / len(marker)
 
         print(f"  - {metric_name}:")
@@ -521,7 +521,8 @@ def print_performance_metrics(
             vllm_metrics_logger_interval,
         )
         max_num_pending_samples = max(
-            max(v) for v in vllm_logger_metrics["num_pending_samples"].values()
+            (max(v) if v else 0)
+            for v in vllm_logger_metrics["num_pending_samples"].values()
         )
         # If there is at least one pending sample, visualize the timeline
         if max_num_pending_samples > 0:

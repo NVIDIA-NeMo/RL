@@ -332,6 +332,9 @@ class BaseVllmGenerationWorker:
         # Optionally start periodic vLLM metrics logging if the flag is set
         # NOTE: vLLM metrics logger is only supported with async engine enabled
         # Metrics logger only enabled for per-actor, model-owner only
+        # Thread synchronization for metrics access
+        self._vllm_metrics_lock = threading.Lock()
+
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False) and self.cfg[
             "vllm_cfg"
         ].get("async_engine", False):
@@ -365,9 +368,6 @@ class BaseVllmGenerationWorker:
         # Lazy import inside thread target to avoid import overhead if disabled
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
-
-        # Thread synchronization for metrics access
-        self._vllm_metrics_lock = threading.Lock()
 
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
